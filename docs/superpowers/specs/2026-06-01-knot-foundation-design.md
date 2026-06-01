@@ -47,6 +47,7 @@ Listed in §16. The headline omissions are: comments, diagrams, search, attachme
 | API style | REST (JSON) + WebSocket (binary, y-protocol) | No GraphQL until something demands it. |
 | Tenancy | Singleton workspace in v0.1; `workspace_id` column on workspace-scoped tables so multi-workspace is a future feature-flag flip, not a migration. | Keep scope tight without painting ourselves into a corner. |
 | Deployment | Single static binary (Rust musl target) with embedded SPA → distroless container image → Helm chart | Self-host-friendly primitive (smaller image than Go's `CGO_ENABLED=0` build), k8s-friendly wrapper. |
+| Allocator | `mimalloc` (global allocator on all non-MSVC targets) | musl's default mallocng has multi-threaded throughput cliffs that hurt the small-allocation churn of Yjs+WS workloads. mimalloc was picked over jemalloc: comparable throughput, much better ARM story (Apple Silicon + Graviton), smaller binary (+200 KB vs +1.5 MB), CMake build is Nix-friendly (jemalloc's autotools configure stumbles under Nix's gcc). |
 
 ## 3. Architecture overview
 

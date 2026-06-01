@@ -25,6 +25,20 @@ futures = "0.3"
 anyhow.workspace = true
 thiserror.workspace = true
 
+# Allocator: mimalloc on all platforms knot actually runs on.
+# musl's default mallocng has known throughput cliffs under multi-threaded
+# small-object churn (lots of small Yjs update buffers, WS frames, per-room
+# tokio tasks). mimalloc is the chosen mitigation:
+#   - excellent multi-threaded throughput, comparable to jemalloc
+#   - first-class ARM support (Apple Silicon, Graviton, Ampere) — knot
+#     needs to ship multi-arch images
+#   - CMake build, Nix-friendly (jemalloc's autotools configure stumbles
+#     on Nix's gcc layout)
+#   - smaller binary cost than jemalloc, simpler integration
+# cfg gate keeps Windows dev builds working without the C dep.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+mimalloc = "0.1"
+
 [dev-dependencies]
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

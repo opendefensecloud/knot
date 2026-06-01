@@ -2,6 +2,14 @@
 
 use std::process;
 
+// mimalloc as the global allocator everywhere except Windows MSVC dev
+// builds (where the C dep is fiddly and not needed for development).
+// See Cargo.toml for the rationale (ARM friendliness, Nix build hygiene,
+// multi-threaded throughput vs musl's default mallocng).
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().with_target(false).init();
