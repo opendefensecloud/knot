@@ -17,7 +17,7 @@ pub enum TokenError {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub struct SessionToken(pub [u8; TOKEN_BYTES]);
+pub struct SessionToken([u8; TOKEN_BYTES]);
 
 impl SessionToken {
     pub fn generate() -> Self {
@@ -61,7 +61,7 @@ mod tests {
     #[test]
     fn generate_returns_32_bytes() {
         let t = SessionToken::generate();
-        assert_eq!(t.0.len(), 32);
+        assert_eq!(t.as_bytes().len(), 32);
     }
 
     #[test]
