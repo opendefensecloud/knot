@@ -2,10 +2,11 @@
 resolver = "2"
 members = [
     "tools/schemagen",
+    "crates/knot-config",
     "crates/knot-crdt",
     "crates/knot-markdown",
     "crates/knot-obs",
-    "crates/knot-config",
+    "crates/knot-storage",
     "crates/knot-server",
 ]
 
@@ -59,3 +60,12 @@ proptest = "1"
 
 # IDs
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# Storage
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+
+# Testing — containers
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
