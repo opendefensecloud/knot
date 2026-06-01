@@ -12,8 +12,11 @@ name = "knot-server"
 path = "src/main.rs"
 
 [dependencies]
+knot-config = { path = "../knot-config" }
 knot-crdt = { path = "../knot-crdt" }
 knot-markdown = { path = "../knot-markdown" }
+knot-obs = { path = "../knot-obs" }
+knot-storage = { path = "../knot-storage" }
 axum.workspace = true
 tokio.workspace = true
 tower.workspace = true
