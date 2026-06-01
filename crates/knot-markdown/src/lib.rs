@@ -1,5 +1,6 @@
 //! Round-trip serializer between the canonical ProseMirror schema and Markdown.
 
+pub mod from_markdown;
 pub mod schema;
 pub mod to_markdown;
 

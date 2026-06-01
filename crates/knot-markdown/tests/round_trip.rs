@@ -256,6 +256,28 @@ impl DocBuilder {
 }
 
 #[test]
+fn round_trip_all_fixtures() {
+    let fixtures = [
+        "paragraph.md",
+        "headings.md",
+        "blockquote.md",
+        "code_block.md",
+        "horizontal_rule.md",
+        "hard_break.md",
+        "lists.md",
+        "marks.md",
+    ];
+    for name in fixtures {
+        let raw = fixture(name);
+        let (doc, _initial) = knot_markdown::from_markdown::parse(&raw)
+            .unwrap_or_else(|e| panic!("parse {name}: {e:?}"));
+        let got = knot_markdown::to_markdown::serialise(&YrsEngine, &doc)
+            .unwrap_or_else(|e| panic!("serialise {name}: {e:?}"));
+        assert_eq!(got, raw, "round-trip mismatch for {name}");
+    }
+}
+
+#[test]
 fn marks_fixture() {
     let got = DocBuilder::new()
         .marked_para(&[
