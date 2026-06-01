@@ -4,6 +4,7 @@ members = [
     "tools/schemagen",
     "crates/knot-crdt",
     "crates/knot-markdown",
+    "crates/knot-config",
     "crates/knot-server",
 ]
 
@@ -38,6 +39,9 @@ yrs = "0.21"
 
 # Markdown parsing
 pulldown-cmark = { version = "0.12", default-features = false }
+
+# Config
+figment = { version = "0.10", features = ["env", "toml", "yaml"] }
 
 # Codegen
 serde = { version = "1", features = ["derive"] }
