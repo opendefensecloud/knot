@@ -15,6 +15,7 @@ name = "knot-server"
 path = "src/main.rs"
 
 [dependencies]
+knot-auth = { path = "../knot-auth" }
 knot-config = { path = "../knot-config" }
 knot-crdt = { path = "../knot-crdt" }
 knot-markdown = { path = "../knot-markdown" }
@@ -32,6 +33,16 @@ uuid.workspace = true
 futures = "0.3"
 anyhow.workspace = true
 thiserror.workspace = true
+cookie.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+url.workspace = true
+openidconnect.workspace = true
+clap.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+base64.workspace = true
+rand.workspace = true
 
 # Allocator: mimalloc on all platforms knot actually runs on.
 # musl's default mallocng has known throughput cliffs under multi-threaded
