@@ -19,7 +19,7 @@ export default defineConfig({
   // on first invocation. After the first run, the binary is cached.
   webServer: [
     {
-      command: "cargo run --bin knot-server",
+      command: process.env.KNOT_TEST_BIN ?? "cargo run --bin knot-server",
       cwd: "..",
       port: 3000,
       reuseExistingServer: !process.env.CI,
