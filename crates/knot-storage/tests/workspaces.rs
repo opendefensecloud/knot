@@ -1,25 +1,11 @@
 //! Integration test for WorkspaceStore against an ephemeral Postgres.
 
 use knot_storage::{PgWorkspaceStore, WorkspaceRole, WorkspaceStore};
-use sqlx::postgres::PgPoolOptions;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn workspace_crud_roundtrip() {
-    let container = Postgres::default().start().await.expect("pg start");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("host port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("migrate");
+    let pool = knot_test_support::fresh_db().await.pool;
 
     let store = PgWorkspaceStore::new(pool.clone());
 

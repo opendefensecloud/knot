@@ -2,8 +2,6 @@ use knot_storage::{
     DocStore, GrantStore, PgDocStore, PgGrantStore, PgUserStore, PgWorkspaceStore, UserStore,
     WorkspaceRole, WorkspaceStore,
 };
-use sqlx::postgres::PgPoolOptions;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 
 async fn count_invalidations(pool: &sqlx::PgPool, doc_id: uuid::Uuid) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM acl_invalidations WHERE doc_id = $1")
@@ -15,16 +13,7 @@ async fn count_invalidations(pool: &sqlx::PgPool, doc_id: uuid::Uuid) -> i64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn doc_create_move_grant_each_write_invalidation() {
-    let container = Postgres::default().start().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .unwrap();
-    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
-    std::mem::forget(container);
+    let pool = knot_test_support::fresh_db().await.pool;
 
     let ws = PgWorkspaceStore::new(pool.clone())
         .create("default", "W")

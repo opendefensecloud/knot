@@ -6,21 +6,10 @@ use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
 use knot_server::{AppState, router_with_state};
 use knot_storage::WorkspaceRole;
-use sqlx::postgres::PgPoolOptions;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use tower::ServiceExt;
 
 async fn state_with_seeded_user(email: &str, password: &str) -> (AppState, uuid::Uuid) {
-    let container = Postgres::default().start().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .unwrap();
-    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
-    std::mem::forget(container);
+    let pool = knot_test_support::fresh_db().await.pool;
 
     let mut s = AppState::with_pool(pool.clone());
     s.hasher = Arc::new(Hasher::fast_for_tests());

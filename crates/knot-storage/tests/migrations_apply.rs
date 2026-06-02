@@ -1,14 +1,11 @@
 //! Verify the v0.1 migration applies cleanly against a fresh Postgres
 //! and creates the expected 11 user tables.
 
-use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-
 #[tokio::test(flavor = "multi_thread")]
 async fn migrations_apply_cleanly() {
-    let pg = Postgres::default().start().await.expect("start postgres");
-    let port = pg.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    // Empty DB on shared container; let `connect()` apply migrations
+    // so this test actually exercises that code path.
+    let url = knot_test_support::fresh_db_url().await;
 
     let pool = knot_storage::connect(&url, 4)
         .await

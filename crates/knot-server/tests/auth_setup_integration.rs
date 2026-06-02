@@ -5,21 +5,10 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use knot_auth::Hasher;
 use knot_server::{AppState, router_with_state};
-use sqlx::postgres::PgPoolOptions;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use tower::ServiceExt;
 
 async fn fresh_state() -> AppState {
-    let container = Postgres::default().start().await.expect("pg start");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .unwrap();
-    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
-    std::mem::forget(container);
+    let pool = knot_test_support::fresh_db().await.pool;
 
     let mut s = AppState::with_pool(pool);
     s.hasher = Arc::new(Hasher::fast_for_tests());

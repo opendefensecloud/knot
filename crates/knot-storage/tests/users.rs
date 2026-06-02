@@ -1,24 +1,7 @@
 use knot_storage::{PgUserStore, UserStore, UserStoreError};
-use sqlx::postgres::PgPoolOptions;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 
 async fn fresh_store() -> PgUserStore {
-    let container = Postgres::default().start().await.expect("pg start");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("migrate");
-    // Leak the container handle. testcontainers' ryuk reaper kills it after
-    // the test process exits, which is what we want for multi-test files.
-    std::mem::forget(container);
-    PgUserStore::new(pool)
+    PgUserStore::new(knot_test_support::fresh_db().await.pool)
 }
 
 #[tokio::test(flavor = "multi_thread")]

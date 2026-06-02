@@ -67,20 +67,9 @@ mod tests {
     use knot_storage::{
         DocStore, PgDocStore, PgGrantStore, PgUserStore, PgWorkspaceStore, UserStore,
     };
-    use sqlx::postgres::PgPoolOptions;
-    use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 
     async fn ctx() -> (PgWorkspaceStore, PgGrantStore, PgDocStore, Uuid, Uuid) {
-        let c = Postgres::default().start().await.unwrap();
-        let port = c.get_host_port_ipv4(5432).await.unwrap();
-        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
-            .await
-            .unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
-        std::mem::forget(c);
+        let pool = knot_test_support::fresh_db().await.pool;
 
         let ws_s = PgWorkspaceStore::new(pool.clone());
         let us = PgUserStore::new(pool.clone());

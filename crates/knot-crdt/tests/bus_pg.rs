@@ -1,23 +1,14 @@
 use knot_crdt::{Bus, PgBus};
-use sqlx::postgres::PgPoolOptions;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_reaches_subscriber_via_pg() {
-    let c = Postgres::default().start().await.unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    // Touch via sqlx to stabilize the wait.
-    let _pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
-    std::mem::forget(c);
+    // fresh_db hands back a pool already warmed against the unique DB,
+    // which stabilizes the LISTEN handshake below.
+    let db = knot_test_support::fresh_db().await;
 
-    let bus = PgBus::connect(&url).await.unwrap();
+    let bus = PgBus::connect(&db.url).await.unwrap();
     let doc = Uuid::new_v4();
     let mut sub = bus.subscribe(doc).await.unwrap();
     // LISTEN takes a tick to settle; give it head start.
@@ -32,17 +23,9 @@ async fn publish_reaches_subscriber_via_pg() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn presence_round_trip_via_pg() {
-    let c = Postgres::default().start().await.unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let _pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
-    std::mem::forget(c);
+    let db = knot_test_support::fresh_db().await;
 
-    let bus = PgBus::connect(&url).await.unwrap();
+    let bus = PgBus::connect(&db.url).await.unwrap();
     let doc = Uuid::new_v4();
     let mut sub = bus.subscribe(doc).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;

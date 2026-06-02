@@ -5,19 +5,9 @@ use knot_storage::{
     PgSessionStore, PgUserStore, PgWorkspaceStore, SessionStore, UserStore, WorkspaceRole,
     WorkspaceStore,
 };
-use sqlx::postgres::PgPoolOptions;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 
 async fn setup() -> (PgSessionStore, uuid::Uuid, uuid::Uuid) {
-    let container = Postgres::default().start().await.expect("pg start");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .unwrap();
-    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let pool = knot_test_support::fresh_db().await.pool;
 
     let ws = PgWorkspaceStore::new(pool.clone())
         .create("acme", "Acme")
@@ -31,7 +21,6 @@ async fn setup() -> (PgSessionStore, uuid::Uuid, uuid::Uuid) {
         .add_member(ws.id, u.id, WorkspaceRole::Owner)
         .await
         .unwrap();
-    std::mem::forget(container);
     (PgSessionStore::new(pool), u.id, ws.id)
 }
 
