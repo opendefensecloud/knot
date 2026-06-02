@@ -18,6 +18,7 @@ path = "src/main.rs"
 knot-auth = { path = "../knot-auth" }
 knot-config = { path = "../knot-config" }
 knot-crdt = { path = "../knot-crdt" }
+knot-docs = { path = "../knot-docs" }
 knot-markdown = { path = "../knot-markdown" }
 knot-obs = { path = "../knot-obs" }
 knot-storage = { path = "../knot-storage" }

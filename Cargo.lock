@@ -1801,6 +1801,7 @@ dependencies = [
  "knot-auth",
  "knot-config",
  "knot-crdt",
+ "knot-docs",
  "knot-markdown",
  "knot-obs",
  "knot-storage",

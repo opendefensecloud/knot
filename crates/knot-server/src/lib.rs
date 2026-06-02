@@ -11,8 +11,10 @@ use axum::{
 use knot_auth::{Hasher, Throttle};
 use knot_config::Config;
 use knot_crdt::YrsEngine;
+use knot_docs::AclCache;
 use knot_storage::{
-    PgSessionStore, PgUserStore, PgWorkspaceStore, Pool, SessionStore, UserStore, WorkspaceStore,
+    DocStore, GrantStore, PgDocStore, PgGrantStore, PgSessionStore, PgUserStore, PgWorkspaceStore,
+    Pool, SessionStore, UserStore, WorkspaceStore,
 };
 
 pub mod auth;
@@ -31,6 +33,9 @@ pub struct AppState {
     pub users: Option<Arc<dyn UserStore>>,
     pub workspaces: Option<Arc<dyn WorkspaceStore>>,
     pub sessions: Option<Arc<dyn SessionStore>>,
+    pub docs: Option<Arc<dyn DocStore>>,
+    pub grants: Option<Arc<dyn GrantStore>>,
+    pub acl: Option<Arc<AclCache>>,
     pub hasher: Arc<Hasher>,
     pub throttle: Arc<Throttle>,
     pub session_key: Vec<u8>,
@@ -48,6 +53,9 @@ impl AppState {
             users: None,
             workspaces: None,
             sessions: None,
+            docs: None,
+            grants: None,
+            acl: None,
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
@@ -67,12 +75,18 @@ impl AppState {
         let users: Arc<dyn UserStore> = Arc::new(PgUserStore::new(pool.clone()));
         let workspaces: Arc<dyn WorkspaceStore> = Arc::new(PgWorkspaceStore::new(pool.clone()));
         let sessions: Arc<dyn SessionStore> = Arc::new(PgSessionStore::new(pool.clone()));
+        let docs: Arc<dyn DocStore> = Arc::new(PgDocStore::new(pool.clone()));
+        let grants: Arc<dyn GrantStore> = Arc::new(PgGrantStore::new(pool.clone()));
+        let acl = Arc::new(AclCache::new(workspaces.clone(), grants.clone()));
         Self {
             rooms: Arc::new(Rooms::new(YrsEngine)),
             pool: Some(pool),
             users: Some(users),
             workspaces: Some(workspaces),
             sessions: Some(sessions),
+            docs: Some(docs),
+            grants: Some(grants),
+            acl: Some(acl),
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
