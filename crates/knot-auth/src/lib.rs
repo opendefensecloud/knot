@@ -2,6 +2,7 @@
 //! throttle, CSRF tokens, OIDC client helpers.
 
 pub mod csrf;
+pub mod oidc;
 pub mod password;
 pub mod session_token;
 pub mod throttle;
