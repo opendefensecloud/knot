@@ -65,6 +65,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Storage
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros", "ipnetwork"] }
+tokio-postgres = "0.7"
+futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 ipnetwork = "0.20"

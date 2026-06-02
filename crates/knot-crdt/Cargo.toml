@@ -14,3 +14,11 @@ async-trait.workspace = true
 tracing.workspace = true
 dashmap.workspace = true
 bytes.workspace = true
+tokio-postgres.workspace = true
+futures-util.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+sqlx.workspace = true
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
