@@ -76,6 +76,10 @@ testcontainers-modules = { version = "0.11", features = ["postgres"] }
 # Caching
 moka = { version = "0.12", features = ["future"] }
 
+# Concurrency primitives
+dashmap = "6"
+bytes = "1"
+
 # Auth primitives
 argon2 = "0.5"
 rand = "0.8"

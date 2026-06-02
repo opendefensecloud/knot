@@ -10,3 +10,7 @@ yrs.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+bytes.workspace = true
