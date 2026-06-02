@@ -29,6 +29,9 @@ export default [
         location: "readonly",
         localStorage: "readonly",
         fetch: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        console: "readonly",
       },
     },
     plugins: {
