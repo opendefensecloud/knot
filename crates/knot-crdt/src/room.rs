@@ -42,6 +42,10 @@ pub enum Event {
         reply: oneshot::Sender<Result<Vec<u8>, EngineError>>,
     },
     Leave(ConnId),
+    AwarenessIn {
+        from: ConnId,
+        payload: Vec<u8>,
+    },
     BusUpdate(i64),
     BusPresence(Vec<u8>),
     Shutdown,
@@ -53,8 +57,6 @@ pub struct Room {
     doc: DocHandle,
     conns: HashMap<ConnId, ConnHandle>,
     last_applied_seq: i64,
-    // Kept for T13 (presence broadcast) — writer holds its own clone.
-    #[allow(dead_code)]
     bus: Arc<dyn Bus>,
     shutdown: CancellationToken,
     rx: mpsc::Receiver<Event>,
@@ -161,7 +163,27 @@ impl Room {
                     Some(Event::Join { conn_id, handle, reply }) => {
                         self.on_join(conn_id, handle, reply).await;
                     }
-                    Some(Event::Leave(c)) => { self.conns.remove(&c); }
+                    Some(Event::Leave(c)) => {
+                        self.conns.remove(&c);
+                        // Best-effort clearing frame: an empty Vec<u8>
+                        // the frontend interprets as "re-query awareness".
+                        let _ = self.bus.publish_presence(self.doc_id, Vec::new()).await;
+                    }
+                    Some(Event::AwarenessIn { from, payload }) => {
+                        if crate::presence::is_oversize(&payload) { continue; }
+                        // Local fan-out (sans origin).
+                        let mut to_close: Vec<ConnId> = Vec::new();
+                        for (cid, conn) in &self.conns {
+                            if *cid == from { continue; }
+                            match conn.tx.try_send(payload.clone()) {
+                                Ok(_) => {}
+                                Err(_) => to_close.push(*cid),
+                            }
+                        }
+                        for cid in to_close { self.conns.remove(&cid); }
+                        // Bus fan-out to other replicas.
+                        let _ = self.bus.publish_presence(self.doc_id, payload).await;
+                    }
                     Some(Event::BusUpdate(_)) | Some(Event::BusPresence(_)) => {}
                     Some(Event::Shutdown) | None => break,
                 },
@@ -187,8 +209,15 @@ impl Room {
                 Some(_seq) = self.bus_updates_rx.recv() => {
                     // T14 wires the SELECT-since-watermark replay path.
                 }
-                Some(_payload) = self.bus_presence_rx.recv() => {
-                    // T13 wires presence fan-out.
+                Some(payload) = self.bus_presence_rx.recv() => {
+                    let mut to_close: Vec<ConnId> = Vec::new();
+                    for (cid, conn) in &self.conns {
+                        match conn.tx.try_send(payload.clone()) {
+                            Ok(_) => {}
+                            Err(_) => to_close.push(*cid),
+                        }
+                    }
+                    for cid in to_close { self.conns.remove(&cid); }
                 }
             }
         }
