@@ -23,10 +23,11 @@ pub fn spawn_listener(
     pool: PgPool,
     cache: Arc<AclCache>,
     docs: Arc<dyn knot_storage::DocStore>,
+    on_invalidate: Arc<dyn Fn(Uuid) + Send + Sync>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match run_once(&pool, &cache, &docs).await {
+            match run_once(&pool, &cache, &docs, &on_invalidate).await {
                 Ok(()) => {
                     tracing::warn!("acl listener exited cleanly; reconnecting");
                 }
@@ -43,6 +44,7 @@ async fn run_once(
     pool: &PgPool,
     cache: &AclCache,
     docs: &Arc<dyn knot_storage::DocStore>,
+    on_invalidate: &Arc<dyn Fn(Uuid) + Send + Sync>,
 ) -> Result<(), sqlx::Error> {
     let mut listener = PgListener::connect_with(pool).await?;
     listener.listen(CHANNEL).await?;
@@ -54,12 +56,14 @@ async fn run_once(
             Ok(doc_id) => {
                 tracing::debug!(%doc_id, "acl evict");
                 cache.evict_doc(doc_id);
+                on_invalidate(doc_id);
                 // Walk descendants and evict each so inherit=true grants on
                 // ancestors don't leave stale cache entries on children.
                 match docs.descendant_ids(doc_id).await {
                     Ok(ids) => {
                         for child in ids {
                             cache.evict_doc(child);
+                            on_invalidate(child);
                         }
                     }
                     Err(e) => {

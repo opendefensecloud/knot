@@ -43,6 +43,13 @@ pub async fn serve(rooms: Arc<knot_crdt::Rooms>, doc_id: Uuid, socket: WebSocket
                 return;
             }
         }
+        // Channel closed — likely an ACL revoke. Send 4403.
+        let _ = sink
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 4403,
+                reason: "acl.revoked".into(),
+            })))
+            .await;
     });
 
     while let Some(Ok(msg)) = stream.next().await {

@@ -80,6 +80,15 @@ impl Rooms {
         arc
     }
 
+    /// Send a revoke event to the room (if active). The room drops all
+    /// conns; the WS shim's writer detects the closed channel and emits
+    /// a 4403 close frame to each client.
+    pub async fn revoke_all_for_doc(&self, doc_id: Uuid) {
+        if let Some(h) = self.map.get(&doc_id) {
+            let _ = h.tx.send(crate::room::Event::Revoke).await;
+        }
+    }
+
     /// Cancel the room's actor and unsubscribe from the bus. The caller
     /// is responsible for ordering this with any in-flight WS connections.
     pub async fn evict(&self, doc_id: Uuid) {

@@ -48,6 +48,7 @@ pub enum Event {
     },
     BusUpdate(i64),
     BusPresence(Vec<u8>),
+    Revoke,
     Shutdown,
 }
 
@@ -197,6 +198,11 @@ impl Room {
                         let _ = self.bus.publish_presence(self.doc_id, payload).await;
                     }
                     Some(Event::BusUpdate(_)) | Some(Event::BusPresence(_)) => {}
+                    Some(Event::Revoke) => {
+                        // Drop all conns. WS shim's writer task sees the
+                        // closed channel and closes the socket with 4403.
+                        self.conns.clear();
+                    }
                     Some(Event::Shutdown) | None => break,
                 },
                 Some(applied) = self.applied_rx.recv() => {
@@ -415,19 +421,8 @@ mod tests {
             DocStore, PgDocStore, PgUpdatesStore, PgUserStore, PgWorkspaceStore, UpdatesStore,
             UserStore, WorkspaceRole, WorkspaceStore,
         };
-        use sqlx::postgres::PgPoolOptions;
-        use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 
-        let c = Postgres::default().start().await.unwrap();
-        let port = c.get_host_port_ipv4(5432).await.unwrap();
-        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
-            .await
-            .unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
-        std::mem::forget(c);
+        let pool = knot_test_support::fresh_db().await.pool;
 
         let ws = PgWorkspaceStore::new(pool.clone())
             .create("d", "W")
@@ -507,19 +502,8 @@ mod tests {
         use knot_storage::{
             DocStore, PgSnapshotStore, PgUpdatesStore, UpdatesStore, UserStore, WorkspaceStore,
         };
-        use sqlx::postgres::PgPoolOptions;
-        use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 
-        let c = Postgres::default().start().await.unwrap();
-        let port = c.get_host_port_ipv4(5432).await.unwrap();
-        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
-            .await
-            .unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
-        std::mem::forget(c);
+        let pool = knot_test_support::fresh_db().await.pool;
 
         let ws = knot_storage::PgWorkspaceStore::new(pool.clone())
             .create("d", "W")

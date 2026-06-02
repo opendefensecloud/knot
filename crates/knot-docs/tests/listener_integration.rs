@@ -8,21 +8,10 @@ use knot_storage::{
     DocStore, GrantStore, PgDocStore, PgGrantStore, PgUserStore, PgWorkspaceStore, UserStore,
     WorkspaceRole, WorkspaceStore,
 };
-use sqlx::postgres::PgPoolOptions;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grant_change_evicts_cache_entry() {
-    let container = Postgres::default().start().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await
-        .unwrap();
-    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
-    std::mem::forget(container);
+    let pool = knot_test_support::fresh_db().await.pool;
 
     let ws_s = PgWorkspaceStore::new(pool.clone());
     let us = PgUserStore::new(pool.clone());
@@ -37,7 +26,12 @@ async fn grant_change_evicts_cache_entry() {
     let d = ds.create(ws.id, None, "X", "m", u.id).await.unwrap();
 
     let cache = Arc::new(AclCache::new(Arc::new(ws_s.clone()), Arc::new(gs.clone())));
-    let _handle = spawn_listener(pool.clone(), cache.clone(), Arc::new(ds.clone()));
+    let _handle = spawn_listener(
+        pool.clone(),
+        cache.clone(),
+        Arc::new(ds.clone()),
+        Arc::new(|_: uuid::Uuid| {}),
+    );
     // Let the listener subscribe before emitting NOTIFYs.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -67,16 +61,7 @@ async fn grant_change_evicts_cache_entry() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grant_change_on_parent_evicts_descendants() {
-    let container = Postgres::default().start().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await
-        .unwrap();
-    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
-    std::mem::forget(container);
+    let pool = knot_test_support::fresh_db().await.pool;
 
     let ws_s = PgWorkspaceStore::new(pool.clone());
     let us = PgUserStore::new(pool.clone());
@@ -95,7 +80,12 @@ async fn grant_change_on_parent_evicts_descendants() {
         .unwrap();
 
     let cache = Arc::new(AclCache::new(Arc::new(ws_s.clone()), Arc::new(gs.clone())));
-    let _handle = spawn_listener(pool.clone(), cache.clone(), Arc::new(ds.clone()));
+    let _handle = spawn_listener(
+        pool.clone(),
+        cache.clone(),
+        Arc::new(ds.clone()),
+        Arc::new(|_: uuid::Uuid| {}),
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Prime BOTH cache entries.
