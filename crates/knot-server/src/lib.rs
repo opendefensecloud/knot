@@ -92,7 +92,8 @@ pub fn router() -> Router {
 pub fn router_with_state(state: AppState) -> Router {
     let mut r = Router::new()
         .route("/collab/:doc_id", get(collab_upgrade))
-        .merge(routes::health::router());
+        .merge(routes::health::router())
+        .merge(routes::auth::router());
 
     if let Some(deps) = state.session_deps() {
         r = r.layer(axum::middleware::from_fn_with_state(
