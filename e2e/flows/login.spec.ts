@@ -23,9 +23,9 @@ test("setup → land on landing → create doc", async ({ page }) => {
   await page.getByTestId("setup-password").fill("owner-hunter22");
   await page.getByTestId("setup-submit").click();
   await page.waitForURL(/\/$/);
-  await page.getByTestId("new-doc").first().click();
+  await page.getByTestId("new-doc").click();
   await page.waitForURL(/\/doc\/.+/);
-  await expect(page.getByTestId("doc-title").first()).toBeVisible();
+  await expect(page.getByTestId("doc-title")).toBeVisible();
 });
 
 test("unauthenticated visit redirects to login", async ({ page }) => {

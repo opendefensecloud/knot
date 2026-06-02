@@ -1,11 +1,10 @@
 import { lazy, Suspense, useEffect } from "react";
 import type { ReactNode } from "react";
-import { createBrowserRouter, Navigate, Outlet, useNavigate } from "react-router-dom";
+import { createBrowserRouter, Navigate, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
 import { RequireAuth } from "./auth/RequireAuth";
 import { AppShell } from "./components/AppShell";
-import { DocTree } from "./features/docs/DocTree";
 import { docsApi } from "./features/docs/docs.api";
 
 const LoginPage = lazy(() => import("./features/auth/LoginPage"));
@@ -19,7 +18,7 @@ function Lazy({ children }: { children: ReactNode }) {
   return <Suspense fallback={<div style={{ padding: 24 }}>Loading…</div>}>{children}</Suspense>;
 }
 
-function DocTreeAndLanding() {
+function Landing() {
   const nav = useNavigate();
   const docs = useQuery({ queryKey: ["docs"], queryFn: () => docsApi.list() });
   useEffect(() => {
@@ -29,29 +28,16 @@ function DocTreeAndLanding() {
     }
   }, [docs.data, nav]);
   return (
-    <>
-      <DocTree />
-      <div style={{ padding: 24 }}>
-        {docs.data && "ok" in docs.data && docs.data.ok.length === 0 ? (
-          <>
-            <h2>Welcome to knot</h2>
-            <p>Create your first document from the sidebar.</p>
-          </>
-        ) : (
-          "Loading…"
-        )}
-      </div>
-    </>
-  );
-}
-
-function DocTreeAndDoc() {
-  return (
-    <>
-      <DocTree />
-      <Outlet />
-      <Lazy><DocPage /></Lazy>
-    </>
+    <div style={{ padding: 24 }}>
+      {docs.data && "ok" in docs.data && docs.data.ok.length === 0 ? (
+        <>
+          <h2>Welcome to knot</h2>
+          <p>Create your first document from the sidebar.</p>
+        </>
+      ) : (
+        "Loading…"
+      )}
+    </div>
   );
 }
 
@@ -64,10 +50,10 @@ export const router = createBrowserRouter([
       {
         element: <AppShell />,
         children: [
-          { index: true, element: <DocTreeAndLanding /> },
+          { index: true, element: <Landing /> },
           {
             path: "doc/:id",
-            element: <DocTreeAndDoc />,
+            element: <Lazy><DocPage /></Lazy>,
             children: [
               { path: "permissions", element: <Lazy><PermissionsDialog /></Lazy> },
             ],

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useEffect, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
 
 import { StatusDot, type ConnStatus } from "../../components/StatusDot";
 import { useUi } from "../../stores/ui";
@@ -83,6 +83,7 @@ export default function DocPage() {
       <Suspense fallback={<p>Loading editor…</p>}>
         <KnotEditor docId={id} onStatus={setStatus} role={meta.effective_role} />
       </Suspense>
+      <Outlet />
     </section>
   );
 }

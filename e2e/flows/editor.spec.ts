@@ -22,11 +22,11 @@ test("editor connects, accepts typing, persists across reload", async ({ page })
   await page.getByTestId("setup-display-name").fill("E");
   await page.getByTestId("setup-password").fill("hunter22!hunter22");
   await page.getByTestId("setup-submit").click();
-  await page.getByTestId("new-doc").first().click();
+  await page.getByTestId("new-doc").click();
   await page.waitForURL(/\/doc\/.+/);
   const url = page.url();
 
-  await expect(page.getByTestId("status-dot").first()).toHaveAttribute("data-status", "connected", {
+  await expect(page.getByTestId("status-dot")).toHaveAttribute("data-status", "connected", {
     timeout: 10_000,
   });
 

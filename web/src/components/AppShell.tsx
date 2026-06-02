@@ -1,5 +1,6 @@
 import { Outlet } from "react-router-dom";
 
+import { DocTree } from "../features/docs/DocTree";
 import { useUi } from "../stores/ui";
 
 import { Toast } from "./Toast";
@@ -23,7 +24,7 @@ export function AppShell() {
           background: "#fafafa",
         }}
       >
-        <Outlet context={{ slot: "sidebar" }} />
+        <DocTree />
       </aside>
       <main style={{ overflow: "auto" }}>
         <Outlet />
