@@ -16,7 +16,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-testcontainers.workspace = true
-testcontainers-modules.workspace = true
+knot-test-support = { path = "../knot-test-support" }
 chrono.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

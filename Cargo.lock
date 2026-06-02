@@ -1835,9 +1835,8 @@ dependencies = [
  "dashmap",
  "futures-util",
  "knot-storage",
+ "knot-test-support",
  "sqlx",
- "testcontainers",
- "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
@@ -1854,10 +1853,9 @@ dependencies = [
  "async-trait",
  "chrono",
  "knot-storage",
+ "knot-test-support",
  "moka",
  "sqlx",
- "testcontainers",
- "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1913,6 +1911,7 @@ dependencies = [
  "knot-markdown",
  "knot-obs",
  "knot-storage",
+ "knot-test-support",
  "mimalloc",
  "openidconnect",
  "rand 0.8.6",
@@ -1921,8 +1920,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
- "testcontainers",
- "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
@@ -1942,12 +1939,22 @@ dependencies = [
  "async-trait",
  "chrono",
  "ipnetwork",
+ "knot-test-support",
  "sqlx",
- "testcontainers",
- "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "knot-test-support"
+version = "0.0.0"
+dependencies = [
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
  "uuid",
 ]
 

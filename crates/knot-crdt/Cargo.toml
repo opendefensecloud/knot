@@ -23,6 +23,5 @@ knot-storage = { path = "../knot-storage" }
 
 [dev-dependencies]
 sqlx.workspace = true
-testcontainers.workspace = true
-testcontainers-modules.workspace = true
+knot-test-support = { path = "../knot-test-support" }
 async-trait.workspace = true
