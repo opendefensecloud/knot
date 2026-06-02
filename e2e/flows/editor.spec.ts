@@ -16,30 +16,25 @@ function reset() {
 
 test.beforeAll(reset);
 
-test("two users editing concurrently converge on both screens", async ({ page }) => {
-  // v0.1 scope: real two-user convergence needs invite-with-password (Plan 8).
-  // For now, verify the WS + persistence loop works end-to-end with a single
-  // user typing + reload. Plan 8 will replace the body with the real two-user
-  // assertion.
+test("editor connects, accepts typing, persists across reload", async ({ page }) => {
   await page.goto("/setup");
-  await page.getByTestId("setup-email").fill("alice@example.com");
-  await page.getByTestId("setup-display-name").fill("Alice");
-  await page.getByTestId("setup-password").fill("hunter22-alice");
+  await page.getByTestId("setup-email").fill("e@example.com");
+  await page.getByTestId("setup-display-name").fill("E");
+  await page.getByTestId("setup-password").fill("hunter22!hunter22");
   await page.getByTestId("setup-submit").click();
-  await page.waitForURL(/\/(?:doc\/.+)?$/, { timeout: 10_000 });
   await page.getByTestId("new-doc").first().click();
   await page.waitForURL(/\/doc\/.+/);
-  const docUrl = page.url();
+  const url = page.url();
 
   await expect(page.getByTestId("status-dot").first()).toHaveAttribute("data-status", "connected", {
     timeout: 10_000,
   });
 
   await page.locator("[data-testid='editor-host'] .ProseMirror").click();
-  await page.keyboard.type("Hello from Alice.");
-  await page.waitForTimeout(800); // let writer flush
-  await page.goto(docUrl);
-  await expect(page.locator("[data-testid='editor-host']")).toContainText("Hello from Alice.", {
+  await page.keyboard.type("Editor smoke test.");
+  await page.waitForTimeout(800);
+  await page.goto(url);
+  await expect(page.locator("[data-testid='editor-host']")).toContainText("Editor smoke test.", {
     timeout: 10_000,
   });
 });
