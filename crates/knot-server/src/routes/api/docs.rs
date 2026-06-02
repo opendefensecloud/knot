@@ -267,25 +267,25 @@ async fn move_doc(
             return internal();
         }
     };
+    let end_of_siblings = || (siblings.last().map(|d| d.sort_key.as_str()), None);
     let (a, b) = match (body.after_id, body.before_id) {
-        (Some(aid), _) => {
-            let i = siblings.iter().position(|d| d.id == aid);
-            (
-                i.map(|i| siblings[i].sort_key.as_str()),
-                i.and_then(|i| siblings.get(i + 1))
+        (Some(aid), _) => match siblings.iter().position(|d| d.id == aid) {
+            Some(i) => (
+                Some(siblings[i].sort_key.as_str()),
+                siblings.get(i + 1).map(|d| d.sort_key.as_str()),
+            ),
+            None => end_of_siblings(),
+        },
+        (_, Some(bid)) => match siblings.iter().position(|d| d.id == bid) {
+            Some(i) => (
+                i.checked_sub(1)
+                    .and_then(|j| siblings.get(j))
                     .map(|d| d.sort_key.as_str()),
-            )
-        }
-        (_, Some(bid)) => {
-            let i = siblings.iter().position(|d| d.id == bid);
-            (
-                i.and_then(|i| i.checked_sub(1))
-                    .and_then(|i| siblings.get(i))
-                    .map(|d| d.sort_key.as_str()),
-                i.map(|i| siblings[i].sort_key.as_str()),
-            )
-        }
-        (None, None) => (siblings.last().map(|d| d.sort_key.as_str()), None),
+                Some(siblings[i].sort_key.as_str()),
+            ),
+            None => end_of_siblings(),
+        },
+        (None, None) => end_of_siblings(),
     };
     let sk = sort_key_between(a, b);
 

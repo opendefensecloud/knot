@@ -160,3 +160,72 @@ async fn docs_crud_happy_path() {
     assert_eq!(v["title"], "Hello");
     assert_eq!(v["effective_role"], "owner");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn move_with_unknown_anchor_falls_to_end() {
+    let (state, joined) = login_state("a@x.test", "hunter22").await;
+    let (cookie, csrf) = split_cookie_csrf(&joined);
+    let app = router_with_state(state);
+
+    // Create three top-level docs A, B, C in order.
+    async fn create_doc(
+        app: &axum::Router,
+        cookie: &str,
+        csrf: &str,
+        title: &str,
+    ) -> serde_json::Value {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/docs")
+                    .header("cookie", cookie)
+                    .header("x-csrf-token", csrf)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "title": title }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED, "create {title}");
+        let body = r.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+    let a = create_doc(&app, cookie, csrf, "A").await;
+    let _b = create_doc(&app, cookie, csrf, "B").await;
+    let c = create_doc(&app, cookie, csrf, "C").await;
+
+    // Move A with an after_id that does NOT refer to one of its siblings
+    // (use a freshly minted UUID). Expect it to land at the END of the
+    // sibling list (sort_key > C's sort_key), NOT at the first slot.
+    let nonsense_anchor = uuid::Uuid::new_v4();
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/docs/{}/move", a["id"].as_str().unwrap()))
+                .header("cookie", cookie)
+                .header("x-csrf-token", csrf)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "after_id": nonsense_anchor.to_string() }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let moved_body = r.into_body().collect().await.unwrap().to_bytes();
+    let moved: serde_json::Value = serde_json::from_slice(&moved_body).unwrap();
+    let moved_key = moved["sort_key"].as_str().unwrap();
+    let c_key = c["sort_key"].as_str().unwrap();
+
+    assert!(
+        moved_key > c_key,
+        "with unknown after_id, doc A should land at the end (key {moved_key} > C's key {c_key})",
+    );
+}
