@@ -53,6 +53,7 @@ async fn main() {
 }
 
 async fn run_server(cfg: Config) {
+    let cfg = std::sync::Arc::new(cfg);
     // 2. Init observability (logging + optional OTLP; metrics).
     let _otlp_provider = if cfg.tracing_enabled && !cfg.otlp_endpoint.is_empty() {
         match knot_obs::tracing::init_with_otlp(
@@ -123,9 +124,14 @@ async fn run_server(cfg: Config) {
             s.base_url = cfg.base_url.clone();
             s.oidc_enabled = cfg.oidc_enabled;
             s.oidc = oidc;
+            s.config = cfg.clone();
             s
         }
-        None => knot_server::AppState::in_memory(),
+        None => {
+            let mut s = knot_server::AppState::in_memory();
+            s.config = cfg.clone();
+            s
+        }
     };
     let app = knot_server::router_with_state(state);
 

@@ -163,12 +163,21 @@ async fn callback(
         .ok()
         .flatten()
         .is_none()
-        && let Err(e) = workspaces
+    {
+        if state.config.oidc_auto_provision == "off" {
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "auth.oidc.not_provisioned",
+                "existing user not auto-provisioned",
+            );
+        }
+        if let Err(e) = workspaces
             .add_member(ws.id, user.id, knot_storage::WorkspaceRole::Viewer)
             .await
-    {
-        tracing::error!(error=?e, "oidc add_member");
-        return internal();
+        {
+            tracing::error!(error=?e, "oidc add_member");
+            return internal();
+        }
     }
 
     let token = SessionToken::generate();
@@ -197,11 +206,11 @@ async fn auto_provision(
     id: &knot_auth::oidc::VerifiedIdentity,
     users: &dyn knot_storage::UserStore,
 ) -> Result<Option<knot_storage::User>, Response> {
-    let policy = std::env::var("KNOT_OIDC_AUTO_PROVISION").unwrap_or_else(|_| "off".into());
-    let allow = match policy.as_str() {
+    let policy = state.config.oidc_auto_provision.as_str();
+    let allow = match policy {
         "always" => true,
         "domain" => {
-            let domains = std::env::var("KNOT_OIDC_ALLOWED_DOMAINS").unwrap_or_default();
+            let domains = &state.config.oidc_allowed_domains;
             let user_domain = id.email.split('@').nth(1).unwrap_or("");
             domains
                 .split(',')
@@ -210,9 +219,8 @@ async fn auto_provision(
                 .any(|d| d == user_domain)
         }
         "group" => {
-            let mapping = std::env::var("KNOT_OIDC_ROLE_FROM_GROUPS").unwrap_or_default();
-            let parsed: HashMap<String, String> =
-                serde_json::from_str(&mapping).unwrap_or_default();
+            let mapping = &state.config.oidc_role_from_groups;
+            let parsed: HashMap<String, String> = serde_json::from_str(mapping).unwrap_or_default();
             id.groups.iter().any(|g| parsed.contains_key(g))
         }
         _ => false,
@@ -234,8 +242,8 @@ async fn auto_provision(
 
     // For "group" policy, attach as workspace member with the mapped role.
     if policy == "group" {
-        let mapping = std::env::var("KNOT_OIDC_ROLE_FROM_GROUPS").unwrap_or_default();
-        let parsed: HashMap<String, String> = serde_json::from_str(&mapping).unwrap_or_default();
+        let mapping = &state.config.oidc_role_from_groups;
+        let parsed: HashMap<String, String> = serde_json::from_str(mapping).unwrap_or_default();
         let role = id
             .groups
             .iter()

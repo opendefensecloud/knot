@@ -46,8 +46,6 @@ impl WorkspaceRole {
 pub enum WorkspaceStoreError {
     #[error("sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
-    #[error("not found")]
-    NotFound,
     #[error("invalid role: {0}")]
     InvalidRole(String),
 }

@@ -9,6 +9,7 @@ use axum::{
     routing::get,
 };
 use knot_auth::{Hasher, Throttle};
+use knot_config::Config;
 use knot_crdt::YrsEngine;
 use knot_storage::{
     PgSessionStore, PgUserStore, PgWorkspaceStore, Pool, SessionStore, UserStore, WorkspaceStore,
@@ -36,6 +37,7 @@ pub struct AppState {
     pub base_url: String,
     pub oidc_enabled: bool,
     pub oidc: Option<Arc<knot_auth::oidc::OidcClient>>,
+    pub config: Arc<Config>,
 }
 
 impl AppState {
@@ -52,6 +54,7 @@ impl AppState {
             base_url: "http://localhost:3000".into(),
             oidc_enabled: false,
             oidc: None,
+            config: Arc::new(Config::default()),
         }
     }
 
@@ -76,6 +79,7 @@ impl AppState {
             base_url: "http://localhost:3000".into(),
             oidc_enabled: false,
             oidc: None,
+            config: Arc::new(Config::default()),
         }
     }
 
