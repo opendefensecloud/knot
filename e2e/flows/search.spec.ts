@@ -22,31 +22,23 @@ test("Cmd+K search finds a doc by title and navigates to it", async ({ page }) =
   await page.getByTestId("setup-submit").click();
   await page.waitForURL(/\/(?:doc\/.+)?$/);
 
-  // Seed three docs by hitting the API directly so we avoid the DocPage
-  // stale-title-state bug (real SPA issue tracked separately).
-  await page.evaluate(async () => {
-    function readCookie(name: string): string | null {
-      const m = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
-      return m && m[1] ? decodeURIComponent(m[1]) : null;
-    }
-    const csrf = readCookie("csrf") ?? "";
-    for (const title of ["Findable Alpha", "Other Beta", "Some Gamma"]) {
-      const r = await fetch("/api/docs", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
-        body: JSON.stringify({ title }),
-      });
-      if (!r.ok) throw new Error(`create ${title}: ${r.status}`);
-    }
-  });
+  for (const t of ["Findable Alpha", "Other Beta", "Some Gamma"]) {
+    await page.getByTestId("new-doc").click();
+    await page.waitForURL(/\/doc\/.+/);
+    const input = page.locator("[data-testid='doc-title']");
+    await expect(input).toHaveValue("Untitled");
+    const patch = page.waitForResponse(
+      (r) => r.url().includes("/api/docs/") && r.request().method() === "PATCH",
+    );
+    await input.fill(t);
+    await input.blur();
+    await patch;
+  }
 
-  // Open the palette and search.
   await page.keyboard.press("Control+k");
   await expect(page.getByTestId("cmdk")).toBeVisible();
   await page.getByTestId("cmdk-input").fill("findable");
 
-  // Server-driven hit appears via the searchApi round-trip.
   const hit = page.locator("[data-testid^='cmdk-item-doc:']").first();
   await expect(hit).toContainText("Findable", { timeout: 5_000 });
 
