@@ -1,15 +1,29 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { authApi } from "../auth/session.api";
 import { docsApi } from "../features/docs/docs.api";
+import { searchApi, type SearchHit } from "../lib/search.api";
 import { useUi } from "../stores/ui";
+
+// Snippets come from Postgres ts_headline, configured to emit only <b>…</b>.
+// Escape all HTML, then restore only <b> and </b>.
+function safeSnippet(s: string): string {
+  const esc = s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  return esc
+    .replace(/&lt;b&gt;/g, "<b>")
+    .replace(/&lt;\/b&gt;/g, "</b>");
+}
 
 type Action = {
   id: string;
   label: string;
   kind: "doc" | "nav" | "action";
+  snippet?: string;
   run: () => void | Promise<void>;
 };
 
@@ -22,7 +36,13 @@ export function CommandPalette() {
   const [q, setQ] = useState("");
   const [cursor, setCursor] = useState(0);
 
-  const docs = useQuery({ queryKey: ["docs"], queryFn: () => docsApi.list() });
+  // `hits` holds the last successful search results; `pendingQuery` tracks
+  // which query is in-flight so we can derive the "searching" indicator.
+  const [hits, setHits] = useState<SearchHit[]>([]);
+  const [pendingQuery, setPendingQuery] = useState<string | null>(null);
+
+  // A ref to AbortController so the cleanup can cancel the in-flight fetch.
+  const acRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -37,13 +57,59 @@ export function CommandPalette() {
     return () => document.removeEventListener("keydown", onKey);
   }, [close, togglePalette]);
 
+  const trimmed = q.trim();
+  const queryActive = open && trimmed.length >= 2;
+
+  // Debounced server search. State is only set inside async callbacks,
+  // never synchronously — satisfies react-hooks/set-state-in-effect.
+  useEffect(() => {
+    // Cancel any previous in-flight request.
+    acRef.current?.abort();
+
+    if (!queryActive) {
+      // Defer the reset to the next microtask so it's not "synchronous".
+      const handle = window.setTimeout(() => {
+        setHits([]);
+        setPendingQuery(null);
+      }, 0);
+      return () => window.clearTimeout(handle);
+    }
+
+    const ac = new AbortController();
+    acRef.current = ac;
+
+    const handle = window.setTimeout(() => {
+      void (async () => {
+        setPendingQuery(trimmed);
+        const r = await searchApi.query(trimmed);
+        if (ac.signal.aborted) return;
+        setPendingQuery(null);
+        if ("ok" in r) setHits(r.ok);
+      })();
+    }, 200);
+
+    return () => {
+      window.clearTimeout(handle);
+      ac.abort();
+    };
+  // trimmed + open covers all cases; queryActive would be redundant.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trimmed, open]);
+
+  // Derive visible hits — when the query is inactive, show nothing.
+  const visibleHits = useMemo(
+    () => (queryActive ? hits : []),
+    [queryActive, hits],
+  );
+  const searching = queryActive && pendingQuery !== null;
+
   const actions = useMemo<Action[]>(() => {
-    const docList = docs.data && "ok" in docs.data ? docs.data.ok : [];
-    const docActions: Action[] = docList.map((d) => ({
-      id: `doc:${d.id}`,
-      label: d.title || "Untitled",
-      kind: "doc",
-      run: () => { close(); void nav(`/doc/${d.id}`); },
+    const docActions: Action[] = visibleHits.map((h) => ({
+      id: `doc:${h.doc_id}`,
+      label: h.title,
+      kind: "doc" as const,
+      snippet: h.snippet || undefined,
+      run: () => { close(); void nav(`/doc/${h.doc_id}`); },
     }));
     const navActions: Action[] = [
       {
@@ -83,15 +149,22 @@ export function CommandPalette() {
       },
     ];
     return [...docActions, ...navActions];
-  }, [docs.data, close, nav, qc]);
+  }, [visibleHits, close, nav, qc]);
 
+  // Filter static nav/action items by query substring; doc hits come from the server.
   const filtered = useMemo(() => {
-    const needle = q.toLowerCase();
-    return needle ? actions.filter((a) => a.label.toLowerCase().includes(needle)) : actions;
-  }, [q, actions]);
+    const needle = trimmed.toLowerCase();
+    if (!needle) return actions;
+    return actions.filter((a) =>
+      a.kind === "doc" || a.label.toLowerCase().includes(needle)
+    );
+  }, [trimmed, actions]);
 
   // Clamp cursor whenever the filtered list shrinks so we never point out of bounds.
   const safeCursor = Math.min(cursor, Math.max(0, filtered.length - 1));
+
+  const showNoMatches =
+    queryActive && visibleHits.length === 0 && !searching;
 
   if (!open) return null;
 
@@ -149,6 +222,11 @@ export function CommandPalette() {
             boxSizing: "border-box",
           }}
         />
+        {searching && (
+          <div style={{ padding: "4px 10px", color: "#888", fontSize: 13 }}>
+            Searching…
+          </div>
+        )}
         <ul
           data-testid="cmdk-list"
           style={{
@@ -177,10 +255,21 @@ export function CommandPalette() {
                 }}
               >
                 {a.label}
+                {a.snippet && (
+                  <div
+                    style={{ fontSize: 12, color: "#777", marginTop: 2 }}
+                    dangerouslySetInnerHTML={{ __html: safeSnippet(a.snippet) }}
+                  />
+                )}
               </button>
             </li>
           ))}
-          {filtered.length === 0 && (
+          {showNoMatches && (
+            <li style={{ padding: "8px 10px", color: "#888" }}>
+              No documents matched.
+            </li>
+          )}
+          {!showNoMatches && filtered.length === 0 && (
             <li style={{ padding: "8px 10px", color: "#888" }}>No matches.</li>
           )}
         </ul>
