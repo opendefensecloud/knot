@@ -32,6 +32,7 @@ export default [
         setTimeout: "readonly",
         clearTimeout: "readonly",
         console: "readonly",
+        navigator: "readonly",
         prompt: "readonly",
         confirm: "readonly",
       },
