@@ -47,6 +47,7 @@ base64.workspace = true
 rand.workspace = true
 serde_json.workspace = true
 metrics = "0.24"
+regex = "1"
 multer = "3"
 pulldown-cmark.workspace = true
 

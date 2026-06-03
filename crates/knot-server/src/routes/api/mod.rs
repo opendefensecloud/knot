@@ -6,6 +6,7 @@ use crate::AppState;
 use crate::auth::{csrf_mw, require_session_mw};
 
 pub mod blobs;
+pub mod comments;
 pub mod docs;
 pub mod grants;
 pub mod history;

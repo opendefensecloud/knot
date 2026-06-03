@@ -13,9 +13,10 @@ use knot_auth::{Hasher, Throttle};
 use knot_config::Config;
 use knot_docs::AclCache;
 use knot_storage::{
-    BlobMeta, BlobStore, DocStore, GrantStore, MarkdownCacheStore, PgBytesStore, PgDocStore,
-    PgGrantStore, PgMarkdownCache, PgSearchStore, PgSessionStore, PgShareTokenStore, PgUserStore,
-    PgWorkspaceStore, Pool, SearchStore, SessionStore, ShareTokenStore, UserStore, WorkspaceStore,
+    BlobMeta, BlobStore, CommentStore, DocStore, GrantStore, MarkdownCacheStore, PgBytesStore,
+    PgCommentStore, PgDocStore, PgGrantStore, PgMarkdownCache, PgSearchStore, PgSessionStore,
+    PgShareTokenStore, PgUserStore, PgWorkspaceStore, Pool, SearchStore, SessionStore,
+    ShareTokenStore, UserStore, WorkspaceStore,
 };
 use uuid::Uuid;
 
@@ -40,6 +41,7 @@ pub struct AppState {
     pub markdown_cache: Option<Arc<dyn MarkdownCacheStore>>,
     pub search: Option<Arc<dyn SearchStore>>,
     pub shares: Option<Arc<dyn ShareTokenStore>>,
+    pub comments: Option<Arc<dyn CommentStore>>,
     pub blob_store: Option<Arc<dyn BlobStore>>,
     pub blob_meta: Option<Arc<BlobMeta>>,
     pub snapshots: Option<Arc<dyn knot_storage::SnapshotStore>>,
@@ -67,6 +69,7 @@ impl AppState {
             markdown_cache: None,
             search: None,
             shares: None,
+            comments: None,
             blob_store: None,
             blob_meta: None,
             snapshots: None,
@@ -98,6 +101,7 @@ impl AppState {
             Arc::new(PgMarkdownCache::new(pool.clone()));
         let search: Arc<dyn SearchStore> = Arc::new(PgSearchStore::new(pool.clone()));
         let shares: Arc<dyn ShareTokenStore> = Arc::new(PgShareTokenStore::new(pool.clone()));
+        let comments: Arc<dyn CommentStore> = Arc::new(PgCommentStore::new(pool.clone()));
         let blob_store: Arc<dyn BlobStore> = Arc::new(PgBytesStore::new(pool.clone()));
         let blob_meta = Arc::new(BlobMeta::new(pool.clone()));
         let snapshots: Arc<dyn knot_storage::SnapshotStore> =
@@ -113,6 +117,7 @@ impl AppState {
             markdown_cache: Some(markdown_cache),
             search: Some(search),
             shares: Some(shares),
+            comments: Some(comments),
             blob_store: Some(blob_store),
             blob_meta: Some(blob_meta),
             snapshots: Some(snapshots),

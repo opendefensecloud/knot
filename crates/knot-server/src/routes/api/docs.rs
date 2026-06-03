@@ -79,6 +79,7 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/api/docs/:id/history/:seq/restore",
             post(crate::routes::api::history::restore),
         )
+        .merge(crate::routes::api::comments::routes())
         .layer(middleware::from_fn_with_state(state, require_doc_role_mw));
     let list_routes: Router<AppState> = Router::new().route("/api/docs", get(list).post(create));
     list_routes.merge(doc_id_routes)
