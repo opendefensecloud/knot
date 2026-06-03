@@ -7,6 +7,7 @@ import { StatusDot, type ConnStatus } from "../../components/StatusDot";
 import { useUi } from "../../stores/ui";
 
 import { docsApi } from "./docs.api";
+import { HistoryDrawer } from "./HistoryDrawer";
 
 const KnotEditor = lazy(() =>
   import("../editor/KnotEditor").then((m) => ({ default: m.KnotEditor })),
@@ -52,6 +53,7 @@ export default function DocPage() {
   const { doc: effRole } = useEffectiveRole(id);
   const notify = useUi((s) => s.notify);
   const [status, setStatus] = useState<ConnStatus>("connecting");
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   const doc = useQuery({
     queryKey: ["doc", id],
@@ -88,11 +90,31 @@ export default function DocPage() {
             Permissions
           </Link>
         )}
+        {(effRole === "owner" || effRole === "editor") && (
+          <button
+            type="button"
+            data-testid="open-history"
+            onClick={() => setHistoryOpen(true)}
+            style={{
+              marginLeft: 12,
+              background: "none",
+              border: "none",
+              color: "#0050ff",
+              cursor: "pointer",
+              textDecoration: "underline",
+            }}
+          >
+            History
+          </button>
+        )}
       </header>
       <Suspense fallback={<p>Loading editor…</p>}>
         <KnotEditor docId={id} onStatus={setStatus} role={meta.effective_role} />
       </Suspense>
       <Outlet />
+      {historyOpen && id && (
+        <HistoryDrawer docId={id} onClose={() => setHistoryOpen(false)} />
+      )}
     </section>
   );
 }
