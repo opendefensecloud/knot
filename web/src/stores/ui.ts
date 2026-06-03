@@ -6,6 +6,11 @@ export type Toast = {
   text: string;
 };
 
+export type PendingAnchor = {
+  positionY: string;
+  anchorText: string;
+};
+
 type UiState = {
   sidebarOpen: boolean;
   toggleSidebar: () => void;
@@ -16,6 +21,13 @@ type UiState = {
   openPalette: () => void;
   closePalette: () => void;
   togglePalette: () => void;
+  // Comment sidebar
+  commentSidebarOpen: boolean;
+  openCommentSidebar: () => void;
+  closeCommentSidebar: () => void;
+  pendingAnchor: PendingAnchor | null;
+  setPendingAnchor: (a: PendingAnchor) => void;
+  clearPendingAnchor: () => void;
 };
 
 let nextId = 1;
@@ -31,4 +43,10 @@ export const useUi = create<UiState>((set) => ({
   openPalette: () => set({ paletteOpen: true }),
   closePalette: () => set({ paletteOpen: false }),
   togglePalette: () => set((s) => ({ paletteOpen: !s.paletteOpen })),
+  commentSidebarOpen: false,
+  openCommentSidebar: () => set({ commentSidebarOpen: true }),
+  closeCommentSidebar: () => set({ commentSidebarOpen: false }),
+  pendingAnchor: null,
+  setPendingAnchor: (a) => set({ pendingAnchor: a }),
+  clearPendingAnchor: () => set({ pendingAnchor: null }),
 }));
