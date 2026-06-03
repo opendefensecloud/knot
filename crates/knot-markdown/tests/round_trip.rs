@@ -351,6 +351,12 @@ fn boards_sentinel_in_mixed_paragraph_preserves_text() {
         text.contains("before") && text.contains("after"),
         "surrounding text lost: {text:?}",
     );
+    // The image's alt text must not leak into the paragraph — unrecognised
+    // images are silently dropped in v0.1, including their alt text.
+    assert!(
+        !text.contains("Diagram"),
+        "image alt text leaked into paragraph: {text:?}",
+    );
 }
 
 /// Two sentinel images in the same paragraph: neither should be recognised
@@ -369,6 +375,8 @@ fn boards_two_sentinels_one_paragraph_recognises_neither() {
     let frag = txn.get_xml_fragment("default").expect("default fragment");
 
     // No excalidraw_board should be produced.
+    // Collect all paragraph text along the way to confirm no alt leak.
+    let mut all_text = String::new();
     for i in 0..frag.len(&txn) {
         if let Some(XmlOut::Element(el)) = frag.get(&txn, i) {
             assert_ne!(
@@ -376,8 +384,48 @@ fn boards_two_sentinels_one_paragraph_recognises_neither() {
                 "excalidraw_board",
                 "second sentinel image should disqualify the first",
             );
+            for j in 0..el.len(&txn) {
+                if let Some(XmlOut::Text(t)) = el.get(&txn, j) {
+                    all_text.push_str(&t.get_string(&txn));
+                }
+            }
         }
     }
+    // Neither image's alt text should leak into the paragraph.
+    assert!(
+        !all_text.contains('A') && !all_text.contains('B'),
+        "sentinel alt text leaked into paragraph: {all_text:?}",
+    );
+}
+
+/// A sentinel image with a non-default label, embedded inside mixed content,
+/// must drop the alt label entirely rather than emitting it as paragraph text.
+#[test]
+fn boards_sentinel_with_label_in_mixed_paragraph_drops_alt() {
+    use yrs::XmlOut;
+    let raw = "see ![MyLabel](knot://board/11111111-2222-3333-4444-555555555555.svg) here\n";
+    let (doc, _initial) = knot_markdown::from_markdown::parse(raw).expect("parse mixed");
+    let yrs_doc = doc.inner();
+    let txn = yrs_doc.transact();
+    let frag = txn.get_xml_fragment("default").expect("default fragment");
+
+    assert_eq!(frag.len(&txn), 1, "expected single top-level paragraph");
+    let Some(XmlOut::Element(el)) = frag.get(&txn, 0) else {
+        panic!("expected element");
+    };
+    assert_eq!(el.tag().as_ref(), "paragraph");
+
+    let mut text = String::new();
+    for j in 0..el.len(&txn) {
+        if let Some(XmlOut::Text(t)) = el.get(&txn, j) {
+            text.push_str(&t.get_string(&txn));
+        }
+    }
+    assert!(text.contains("see") && text.contains("here"));
+    assert!(
+        !text.contains("MyLabel"),
+        "non-default label leaked into paragraph: {text:?}",
+    );
 }
 
 #[test]

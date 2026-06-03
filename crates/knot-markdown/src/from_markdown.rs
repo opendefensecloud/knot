@@ -42,11 +42,21 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
         // Inner Text events append to `alt_buffer` instead of being emitted as paragraph
         // content.  Fields: (board_id, alt_buffer).
         let mut pending_board: Option<(String, String)> = None;
+        // Image nesting depth — incremented on every Tag::Image (sentinel or not) and
+        // decremented on TagEnd::Image.  When > 0, Text events are suppressed from the
+        // paragraph so that alt text of unrecognised images doesn't leak as inline
+        // content (matches the silent-drop behaviour for unsupported images in v0.1).
+        let mut image_depth: u32 = 0;
         // Set on TagEnd::Image when we just closed a sentinel image inside a paragraph
         // that was empty when the image started.  Fields: (board_id, label_alt_text).
         // At TagEnd::Paragraph we commit the sentinel only if the paragraph child count
         // is still 0 — i.e. no text or other inline content was added after the image.
         let mut paragraph_sentinel: Option<(String, String)> = None;
+        // Number of images encountered in the current paragraph.  Used to disqualify
+        // a sentinel candidate when more than one image appears in the same paragraph
+        // (we suppress image alt text from the paragraph, so the "paragraph still
+        // empty" check alone would incorrectly promote the first sentinel).
+        let mut paragraph_image_count: u32 = 0;
 
         let mut opts = Options::empty();
         opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -58,6 +68,7 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     Tag::Paragraph => {
                         let el = push_block(&frag, &stack, &mut txn, "paragraph", &[]);
                         stack.push(el);
+                        paragraph_image_count = 0;
                     }
                     Tag::Heading { level, .. } => {
                         let l: u8 = match level {
@@ -115,6 +126,10 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     Tag::Strong => active_marks.push(("bold".into(), HashMap::new())),
                     Tag::Strikethrough => active_marks.push(("strike".into(), HashMap::new())),
                     Tag::Image { dest_url, .. } => {
+                        // Track every image (sentinel or not) so we can suppress its
+                        // alt-text Text events from leaking into the paragraph.
+                        image_depth = image_depth.saturating_add(1);
+                        paragraph_image_count = paragraph_image_count.saturating_add(1);
                         // Capture sentinel-image inner text into alt_buffer only if
                         // (a) it parses as a board sentinel URL, (b) we are inside a
                         // paragraph that is currently empty (no preceding text or
@@ -156,9 +171,9 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         if let Some((board_id, alt)) = paragraph_sentinel.take()
                             && let Some(p) = para.as_ref()
                             && p.len(&txn) == 0
+                            && paragraph_image_count == 1
                         {
                             // Remove the just-popped (empty) paragraph from its parent.
-                            let _ = p;
                             remove_last_child(&frag, &stack, &mut txn);
                             let label = match alt.as_str() {
                                 "" => None,
@@ -184,6 +199,7 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         stack.pop();
                     }
                     TagEnd::Image => {
+                        image_depth = image_depth.saturating_sub(1);
                         // Promote a captured sentinel to a paragraph-level candidate.
                         // If a second sentinel image appears in the same paragraph, the
                         // `is_none()` guards in Tag::Image and here ensure we don't
@@ -206,9 +222,13 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                 },
                 Event::Text(s) => {
                     let text = s.to_string();
-                    // Sentinel image: capture alt text rather than emitting paragraph runs.
-                    if let Some((_, alt)) = pending_board.as_mut() {
-                        alt.push_str(&text);
+                    // Inside any image: never emit alt text as paragraph content.
+                    // If a sentinel image is currently pending, also capture the alt
+                    // text into its buffer for potential use as a board label.
+                    if image_depth > 0 {
+                        if let Some((_, alt)) = pending_board.as_mut() {
+                            alt.push_str(&text);
+                        }
                         continue;
                     }
                     let parent_tag = stack
