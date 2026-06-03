@@ -1,0 +1,37 @@
+# Plans + outcomes
+
+This directory is knot's planning log. Every non-trivial change lands as a **plan** (an upfront task-by-task implementation document) and, on merge, gets an **outcome doc** capturing what landed, what was non-obvious, and what's still deferred.
+
+## Plans landed
+
+| # | Date | Topic | Plan | Outcome |
+|---|---|---|---|---|
+| 1 | 2026-06-01 | Spike (yrs + y-websocket round-trip) | — | — |
+| 2 | 2026-06-01 | Config + observability skeleton | — | — |
+| 3 | 2026-06-01 | Auth (local + OIDC discovery) | — | — |
+| 4 | 2026-06-01 | Documents + ACL | — | — |
+| 5 | 2026-06-02 | CRDT Room Actor + Persistence | — | [2026-06-02-plan5-outcome.md](research/2026-06-02-plan5-outcome.md) |
+| 6 | 2026-06-02 | Frontend Shell | [plans/2026-06-02-frontend-shell.md](plans/2026-06-02-frontend-shell.md) | [2026-06-02-plan6-outcome.md](research/2026-06-02-plan6-outcome.md) |
+| 8 | 2026-06-02 | Auth Completion (change pw, invite-with-pw, OIDC e2e) | [plans/2026-06-02-auth-completion.md](plans/2026-06-02-auth-completion.md) | [2026-06-03-plan8-outcome.md](research/2026-06-03-plan8-outcome.md) |
+| 9 | 2026-06-03 | Deployment (Helm + multi-arch image) | [plans/2026-06-03-deployment.md](plans/2026-06-03-deployment.md) | [2026-06-03-plan9-outcome.md](research/2026-06-03-plan9-outcome.md) |
+| 10 | 2026-06-03 | Observability | [plans/2026-06-03-observability.md](plans/2026-06-03-observability.md) | [2026-06-03-plan10-outcome.md](research/2026-06-03-plan10-outcome.md) |
+| 7 | 2026-06-03 | UI Polish | [plans/2026-06-03-ui-polish.md](plans/2026-06-03-ui-polish.md) | [2026-06-03-plan7-outcome.md](research/2026-06-03-plan7-outcome.md) |
+| 11 | 2026-06-03 | Developer Experience | [plans/2026-06-03-developer-experience.md](plans/2026-06-03-developer-experience.md) | (in flight) |
+
+> Plan numbers reflect execution order, not always file date. Plans 1–4 predate the plan-driven workflow and don't have outcome docs.
+
+## On deck
+
+See each outcome doc's "Carryforward" section for what that plan's owner recommended next. Common candidates:
+
+- **Plan 12 — Production hardening.** Rate-limit `/auth/login` + `/auth/password`, NetworkPolicy in chart, image push CI on tag, PrometheusRule template, WS reconnect e2e.
+- **Plan 13 — File uploads / images.** Notion-style image embeds. Needs server-side blob storage decision (Postgres LO vs S3-compatible).
+- **Plan 14 — Full-text search.** Postgres FTS over markdown cache + tantivy index for richer queries.
+
+## How to add a plan
+
+1. **Brainstorm** scope. Decide what's in and what's deferred.
+2. **Write the plan** via the `superpowers:writing-plans` skill → `plans/YYYY-MM-DD-<topic>.md`. Tasks are bite-sized (2–5 minutes of work), show exact code, name exact files.
+3. **Execute** via `superpowers:subagent-driven-development`. Fresh implementer per task, two-stage review (spec + code quality).
+4. **On merge,** write `research/YYYY-MM-DD-<topic>-outcome.md` capturing status, gates, what's deferred, carryforward.
+5. **Add a row** to the table above.
