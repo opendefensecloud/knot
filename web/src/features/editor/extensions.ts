@@ -1,5 +1,6 @@
 import Collaboration from "@tiptap/extension-collaboration";
 import CollaborationCursor from "@tiptap/extension-collaboration-cursor";
+import Image from "@tiptap/extension-image";
 import Link from "@tiptap/extension-link";
 import StarterKit from "@tiptap/starter-kit";
 import type { Awareness } from "y-protocols/awareness";
@@ -27,5 +28,6 @@ export function createExtensions(opts: {
       provider: { awareness: opts.awareness } as never,
       user: opts.user,
     }),
+    Image.configure({ inline: false, allowBase64: false }),
   ];
 }
