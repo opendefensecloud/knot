@@ -71,6 +71,13 @@ serviceMonitor:
   metricRelabelings: []
   relabelings: []
 
+alerting:
+  enabled: false
+  pageSeverity: critical
+  ticketSeverity: warning
+  errorBudgetTarget: 0.995
+  latencyP95Target: 0.25
+
 tracing:
   enabled: false
   otlpEndpoint: ""     # e.g. http://otel-collector.observability.svc.cluster.local:4317

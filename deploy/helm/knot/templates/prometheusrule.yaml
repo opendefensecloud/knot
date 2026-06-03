@@ -1,0 +1,54 @@
+{{- if and .Values.metrics.enabled .Values.serviceMonitor.enabled .Values.alerting.enabled -}}
+{{- $budget := sub 1.0 .Values.alerting.errorBudgetTarget -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "knot.fullname" . }}
+  labels:
+    {{- include "knot.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: knot.availability
+      rules:
+        - alert: KnotErrorBudgetFastBurn
+          expr: |
+            (
+              sum(rate(knot_http_requests_total{status_class="5xx",route!~"/api/health.*"}[1h]))
+              /
+              clamp_min(sum(rate(knot_http_requests_total{route!~"/api/health.*"}[1h])), 1)
+            ) > (14.4 * {{ $budget }})
+          for: 5m
+          labels:
+            severity: {{ .Values.alerting.pageSeverity | quote }}
+          annotations:
+            summary: "knot fast burn — 2% of 30d budget in 1h"
+            description: "5xx rate is burning the error budget 14.4× faster than allowed."
+        - alert: KnotErrorBudgetSlowBurn
+          expr: |
+            (
+              sum(rate(knot_http_requests_total{status_class="5xx",route!~"/api/health.*"}[6h]))
+              /
+              clamp_min(sum(rate(knot_http_requests_total{route!~"/api/health.*"}[6h])), 1)
+            ) > (6 * {{ $budget }})
+          for: 30m
+          labels:
+            severity: {{ .Values.alerting.ticketSeverity | quote }}
+          annotations:
+            summary: "knot slow burn — 5% of 30d budget in 6h"
+            description: "Sustained 5xx rate is burning the error budget 6× faster than allowed."
+    - name: knot.latency
+      rules:
+        - alert: KnotLatencyP95High
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (
+                rate(knot_http_request_duration_seconds_bucket{route!~"/api/health.*"}[5m])
+              )
+            ) > {{ .Values.alerting.latencyP95Target }}
+          for: 30m
+          labels:
+            severity: {{ .Values.alerting.ticketSeverity | quote }}
+          annotations:
+            summary: "knot p95 latency above target"
+            description: "P95 request latency has been above {{ .Values.alerting.latencyP95Target }}s for 30 minutes."
+{{- end -}}
