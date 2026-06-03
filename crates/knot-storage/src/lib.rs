@@ -15,6 +15,8 @@ pub mod user_store;
 pub mod workspace_store;
 
 pub use blobs::{BlobMeta, BlobMetadata, BlobStore, BlobStoreError, PgBytesStore};
+#[cfg(feature = "s3")]
+pub use blobs::S3Store;
 pub use doc_store::{DocStore, DocStoreError, Document, PgDocStore};
 pub use grant_store::{Grant, GrantStore, GrantStoreError, PgGrantStore};
 pub use lexorank::between as sort_key_between;

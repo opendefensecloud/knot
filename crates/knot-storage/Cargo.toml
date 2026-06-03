@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+
 [dependencies]
 sqlx.workspace = true
 tokio.workspace = true
@@ -16,6 +20,18 @@ async-trait.workspace = true
 sha2.workspace = true
 ipnetwork.workspace = true
 metrics.workspace = true
+
+[dependencies.aws-sdk-s3]
+version = "1"
+optional = true
+default-features = false
+features = ["behavior-version-latest", "rt-tokio", "rustls"]
+
+[dependencies.aws-config]
+version = "1"
+optional = true
+default-features = false
+features = ["behavior-version-latest", "rt-tokio", "rustls"]
 
 [dev-dependencies]
 knot-test-support = { path = "../knot-test-support" }
