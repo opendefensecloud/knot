@@ -30,6 +30,11 @@ pub trait MarkdownCacheStore: Send + Sync + 'static {
         current_seq: i64,
     ) -> Result<Option<MarkdownCacheEntry>, MarkdownCacheError>;
 
+    /// Return the most recent cached entry for a doc regardless of seq.
+    /// Used by the public share-render endpoint where any cached version is
+    /// better than nothing.
+    async fn get(&self, doc_id: Uuid) -> Result<Option<MarkdownCacheEntry>, MarkdownCacheError>;
+
     async fn put(
         &self,
         doc_id: Uuid,
@@ -66,6 +71,26 @@ impl MarkdownCacheStore for PgMarkdownCache {
         )
         .bind(doc_id)
         .bind(current_seq)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| MarkdownCacheEntry {
+            doc_id: r.0,
+            rendered_at_seq: r.1,
+            markdown_text: r.2,
+            updated_at: r.3,
+        }))
+    }
+
+    async fn get(
+        &self,
+        doc_id: Uuid,
+    ) -> Result<Option<MarkdownCacheEntry>, MarkdownCacheError> {
+        let row = sqlx::query_as::<_, (Uuid, i64, String, DateTime<Utc>)>(
+            "SELECT doc_id, rendered_at_seq, markdown_text, updated_at
+             FROM doc_markdown_cache
+             WHERE doc_id = $1",
+        )
+        .bind(doc_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| MarkdownCacheEntry {

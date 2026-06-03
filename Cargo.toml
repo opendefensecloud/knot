@@ -49,7 +49,7 @@ anyhow = "1"
 yrs = "0.21"
 
 # Markdown parsing
-pulldown-cmark = { version = "0.12", default-features = false }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 
 # Config
 figment = { version = "0.10", features = ["env", "toml", "yaml"] }

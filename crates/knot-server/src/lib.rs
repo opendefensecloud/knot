@@ -148,6 +148,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/collab/:doc_id", get(collab_upgrade))
         .merge(routes::health::router())
         .merge(routes::auth::router())
+        .merge(routes::public::router())
         .merge(routes::api::router(state.clone()))
         .fallback_service(spa);
 
