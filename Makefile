@@ -12,13 +12,22 @@ schema.gen: ## regenerate Rust + TS schema from tools/schema.json
 	$(CARGO) run --quiet -p schemagen -- --lang rust --out crates/knot-markdown/src/schema.rs
 	$(CARGO) run --quiet -p schemagen -- --lang ts   --out web/src/features/editor/schema.ts
 
-.PHONY: spike.server
-spike.server: ## run the spike WebSocket server on :3000
-	$(CARGO) run --bin knot-server
+.PHONY: dev.server
+dev.server: ## run knot-server with cargo-watch (auto-restart on edit)
+	@command -v cargo-watch >/dev/null 2>&1 || $(CARGO) install cargo-watch
+	$(CARGO) watch -q -x "run --bin knot-server"
 
-.PHONY: spike.web
-spike.web: ## run the spike SPA via Vite on :5173 (proxies /collab to :3000)
+.PHONY: dev.web
+dev.web: ## run the SPA via Vite on :5173 (proxies /api,/auth,/collab to :3000)
 	cd web && $(PNPM) dev
+
+.PHONY: spike.server spike.web
+spike.server: ## (deprecated) alias for dev.server
+	@echo "spike.server is deprecated; use 'make dev.server'"
+	@$(MAKE) dev.server
+spike.web: ## (deprecated) alias for dev.web
+	@echo "spike.web is deprecated; use 'make dev.web'"
+	@$(MAKE) dev.web
 
 .PHONY: test
 test: test.rust test.web ## run all unit/integration tests
