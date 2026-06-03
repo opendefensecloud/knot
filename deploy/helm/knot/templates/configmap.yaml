@@ -21,3 +21,7 @@ data:
   KNOT_OIDC_ROLE_FROM_GROUPS: {{ . | quote }}
   {{- end }}
   {{- end }}
+  {{- if .Values.tracing.enabled }}
+  KNOT_TRACING_ENABLED: "true"
+  KNOT_OTLP_ENDPOINT: {{ required "tracing.otlpEndpoint is required when tracing.enabled=true" .Values.tracing.otlpEndpoint | quote }}
+  {{- end }}

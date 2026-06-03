@@ -57,6 +57,10 @@ serviceMonitor:
   metricRelabelings: []
   relabelings: []
 
+tracing:
+  enabled: false
+  otlpEndpoint: ""     # e.g. http://otel-collector.observability.svc.cluster.local:4317
+
 ingress:
   enabled: false
   className: ""
