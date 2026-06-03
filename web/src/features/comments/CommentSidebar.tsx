@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { X } from "lucide-react";
 import { useState } from "react";
 
+import { IconButton } from "../../components/ui/IconButton";
 import { commentsApi, type Comment } from "../../lib/comments.api";
 import { useUi } from "../../stores/ui";
 import { CommentComposer } from "./CommentComposer";
@@ -81,41 +83,33 @@ export function CommentSidebar({ docId }: { docId: string }) {
     <div
       role="dialog"
       data-testid="comment-sidebar"
-      style={{
-        position: "fixed", top: 0, right: 0, bottom: 0,
-        width: 400, maxWidth: "100vw",
-        background: "white",
-        borderLeft: "1px solid #e5e5e5",
-        boxShadow: "-4px 0 12px rgba(0,0,0,0.1)",
-        zIndex: 40,
-        display: "flex", flexDirection: "column",
-      }}
+      className="fixed right-0 top-0 h-dvh w-[400px] max-w-full z-40 bg-surface border-l border-border shadow-xl flex flex-col"
     >
-      <header style={{ display: "flex", alignItems: "center", padding: 12, borderBottom: "1px solid #e5e5e5" }}>
-        <h2 style={{ margin: 0, flex: 1, fontSize: 16 }}>Comments</h2>
-        <label style={{ fontSize: 13, marginRight: 12, display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+      <header className="flex items-center gap-2 px-4 py-3 border-b border-border">
+        <h2 className="m-0 flex-1 text-base font-semibold text-fg">Comments</h2>
+        <label className="text-[13px] text-fg-muted flex items-center gap-1.5 cursor-pointer select-none">
           <input
             type="checkbox"
             data-testid="comment-show-resolved"
             checked={showResolved}
             onChange={(e) => setShowResolved(e.target.checked)}
+            className="accent-accent"
           />
           Show resolved
         </label>
-        <button
-          type="button"
+        <IconButton
           data-testid="comment-sidebar-close"
+          label="Close"
+          size="sm"
           onClick={closeCommentSidebar}
-          style={{ background: "none", border: "none", cursor: "pointer", fontSize: 16 }}
         >
-          ✕
-        </button>
+          <X size={14} aria-hidden />
+        </IconButton>
       </header>
 
-      {/* New thread composer — shown when a selection triggered the sidebar */}
       {pendingAnchor && (
-        <div style={{ borderBottom: "1px solid #e5e5e5", background: "#f5f8ff" }}>
-          <div style={{ padding: "8px 16px 0", fontSize: 12, color: "#555" }}>
+        <div className="border-b border-border bg-accent/5">
+          <div className="px-4 pt-2 text-[12px] text-fg-muted">
             New comment on: <em>&ldquo;{pendingAnchor.anchorText}&rdquo;</em>
           </div>
           <CommentComposer
@@ -129,13 +123,12 @@ export function CommentSidebar({ docId }: { docId: string }) {
         </div>
       )}
 
-      {/* Thread list */}
-      <div style={{ flex: 1, overflowY: "auto" }}>
+      <div className="flex-1 overflow-y-auto">
         {list.isLoading && (
-          <p style={{ padding: 16, color: "#888" }}>Loading…</p>
+          <p className="px-4 py-3 text-fg-muted text-sm">Loading…</p>
         )}
         {!list.isLoading && groups.length === 0 && !pendingAnchor && (
-          <p style={{ padding: 16, color: "#888" }}>No comments yet.</p>
+          <p className="px-4 py-3 text-fg-muted text-sm">No comments yet.</p>
         )}
         {groups.map((g) => (
           <CommentThread

@@ -90,42 +90,21 @@ export function useMentionPicker(value: string, onChange: (v: string) => void) {
 
   const picker = isOpen ? (
     <ul
-      style={{
-        position: "absolute",
-        top: "100%",
-        left: 0,
-        right: 0,
-        zIndex: 50,
-        background: "white",
-        border: "1px solid #ddd",
-        borderRadius: 4,
-        margin: 0,
-        padding: 0,
-        listStyle: "none",
-        boxShadow: "0 4px 12px rgba(0,0,0,0.1)",
-        maxHeight: 200,
-        overflowY: "auto",
-      }}
       role="listbox"
+      className="absolute top-full left-0 right-0 z-50 m-0 p-0 list-none bg-surface border border-border rounded-md shadow-lg max-h-[200px] overflow-y-auto"
     >
       {filtered.map((m, i) => (
         <li
           key={m.user_id}
           role="option"
           aria-selected={i === highlightIndex}
-          onMouseDown={(e) => {
-            e.preventDefault();
-            pick(m.display_name);
-          }}
-          style={{
-            padding: "8px 12px",
-            cursor: "pointer",
-            background: i === highlightIndex ? "#e5e5ff" : "transparent",
-            fontSize: 14,
-          }}
+          onMouseDown={(e) => { e.preventDefault(); pick(m.display_name); }}
+          className={`px-3 py-2 cursor-pointer text-sm ${
+            i === highlightIndex ? "bg-muted text-fg" : "text-fg hover:bg-muted/60"
+          }`}
         >
-          <strong>{m.display_name}</strong>{" "}
-          <span style={{ color: "#888", fontSize: 12 }}>{m.email}</span>
+          <strong className="font-semibold">{m.display_name}</strong>{" "}
+          <span className="text-fg-muted text-[12px]">{m.email}</span>
         </li>
       ))}
     </ul>

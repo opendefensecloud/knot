@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { SmilePlus } from "lucide-react";
 import { useState } from "react";
 
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
@@ -53,7 +54,7 @@ function ReactionRow({
   const existing = Object.entries(comment.reactions);
 
   return (
-    <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 4 }}>
+    <div className="flex flex-wrap gap-1 mt-1">
       {existing.map(([emoji, userIds]) => {
         const reacted = userIds.includes(currentUserId);
         return (
@@ -62,74 +63,38 @@ function ReactionRow({
             type="button"
             data-testid={`comment-react-emoji-${comment.id}-${emoji}`}
             onClick={() => {
-              if (reacted) {
-                removeReaction.mutate(emoji);
-              } else {
-                addReaction.mutate(emoji);
-              }
+              if (reacted) removeReaction.mutate(emoji);
+              else addReaction.mutate(emoji);
             }}
-            style={{
-              padding: "2px 8px",
-              borderRadius: 12,
-              border: reacted ? "1px solid #0050ff" : "1px solid #ddd",
-              background: reacted ? "#e0e8ff" : "white",
-              cursor: "pointer",
-              fontSize: 13,
-            }}
+            className={`px-2 py-0.5 rounded-full text-[13px] border transition-colors ${
+              reacted
+                ? "border-accent bg-accent/10 text-fg"
+                : "border-border bg-surface text-fg-muted hover:text-fg hover:bg-muted"
+            }`}
           >
             {emoji} {userIds.length}
           </button>
         );
       })}
 
-      {/* Add reaction button */}
-      <div style={{ position: "relative" }}>
+      <div className="relative">
         <button
           type="button"
           data-testid={`comment-react-add-${comment.id}`}
           onClick={() => setEmojiPickerOpen((o) => !o)}
-          style={{
-            padding: "2px 8px",
-            borderRadius: 12,
-            border: "1px solid #ddd",
-            background: "white",
-            cursor: "pointer",
-            fontSize: 13,
-          }}
+          aria-label="Add reaction"
+          className="inline-flex items-center justify-center px-2 h-6 rounded-full text-[13px] border border-border bg-surface text-fg-muted hover:text-fg hover:bg-muted transition-colors"
         >
-          +
+          <SmilePlus size={13} aria-hidden />
         </button>
         {emojiPickerOpen && (
-          <div
-            style={{
-              position: "absolute",
-              top: "100%",
-              left: 0,
-              zIndex: 10,
-              background: "white",
-              border: "1px solid #ddd",
-              borderRadius: 4,
-              boxShadow: "0 4px 12px rgba(0,0,0,0.1)",
-              display: "flex",
-              gap: 4,
-              padding: 4,
-            }}
-          >
+          <div className="absolute top-full left-0 z-10 mt-1 flex gap-1 p-1 rounded-md bg-surface border border-border shadow-lg">
             {ALLOWED_EMOJIS.map((emoji) => (
               <button
                 key={emoji}
                 type="button"
-                onClick={() => {
-                  setEmojiPickerOpen(false);
-                  addReaction.mutate(emoji);
-                }}
-                style={{
-                  fontSize: 18,
-                  padding: 4,
-                  background: "none",
-                  border: "none",
-                  cursor: "pointer",
-                }}
+                onClick={() => { setEmojiPickerOpen(false); addReaction.mutate(emoji); }}
+                className="text-lg p-1 rounded hover:bg-muted transition-colors"
               >
                 {emoji}
               </button>
@@ -157,15 +122,12 @@ function CommentRow({
   authorName: string;
 }) {
   return (
-    <div
-      data-testid={`comment-body-${comment.id}`}
-      style={{ marginBottom: 12 }}
-    >
-      <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
-        <span style={{ fontWeight: 600, fontSize: 13 }}>{authorName}</span>
-        <span style={{ color: "#888", fontSize: 12 }}>{relTime(comment.created_at)}</span>
+    <div data-testid={`comment-body-${comment.id}`} className="mb-3">
+      <div className="flex gap-2 items-baseline mb-1">
+        <span className="font-semibold text-[13px] text-fg">{authorName}</span>
+        <span className="text-fg-muted text-[12px]">{relTime(comment.created_at)}</span>
       </div>
-      <p style={{ margin: 0, fontSize: 14, whiteSpace: "pre-wrap" }}>{comment.body}</p>
+      <p className="m-0 text-sm text-fg whitespace-pre-wrap">{comment.body}</p>
       <ReactionRow docId={docId} comment={comment} currentUserId={currentUserId} />
     </div>
   );
@@ -235,29 +197,14 @@ export function CommentThread({ docId, threadId, root, replies }: Props) {
   return (
     <div
       data-testid={`comment-thread-${threadId}`}
-      style={{
-        borderBottom: "1px solid #f0f0f0",
-        padding: "12px 16px",
-        background: isResolved ? "#fafafa" : "white",
-        opacity: isResolved ? 0.8 : 1,
-      }}
+      className={`border-b border-border px-4 py-3 ${isResolved ? "bg-muted/40 opacity-80" : "bg-surface"}`}
     >
-      {/* Thread header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
-        {root.anchor_text && (
-          <blockquote
-            style={{
-              margin: "0 0 8px",
-              padding: "4px 8px",
-              borderLeft: "3px solid #0050ff",
-              background: "#f0f4ff",
-              fontSize: 12,
-              color: "#444",
-            }}
-          >
+      <div className="flex justify-between items-start mb-2 gap-2">
+        {root.anchor_text ? (
+          <blockquote className="m-0 mb-2 px-2 py-1 border-l-[3px] border-accent bg-accent/5 text-[12px] text-fg-muted rounded-sm">
             {root.anchor_text}
           </blockquote>
-        )}
+        ) : <span />}
         {canManage && (
           isResolved ? (
             <button
@@ -265,7 +212,7 @@ export function CommentThread({ docId, threadId, root, replies }: Props) {
               data-testid={`comment-unresolve-${threadId}`}
               onClick={() => unresolve.mutate()}
               disabled={unresolve.isPending}
-              style={{ fontSize: 12, padding: "2px 8px", cursor: "pointer" }}
+              className="text-[12px] px-2 h-6 rounded text-fg-muted hover:text-fg hover:bg-muted transition-colors disabled:opacity-40"
             >
               Unresolve
             </button>
@@ -275,7 +222,7 @@ export function CommentThread({ docId, threadId, root, replies }: Props) {
               data-testid={`comment-resolve-${threadId}`}
               onClick={() => resolve.mutate()}
               disabled={resolve.isPending}
-              style={{ fontSize: 12, padding: "2px 8px", cursor: "pointer" }}
+              className="text-[12px] px-2 h-6 rounded text-fg-muted hover:text-fg hover:bg-muted transition-colors disabled:opacity-40"
             >
               Resolve
             </button>
@@ -293,7 +240,7 @@ export function CommentThread({ docId, threadId, root, replies }: Props) {
 
       {/* Replies */}
       {replies.length > 0 && (
-        <div style={{ borderLeft: "2px solid #eee", paddingLeft: 12, marginTop: 8 }}>
+        <div className="border-l-2 border-border pl-3 mt-2">
           {replies.map((r) => (
             <CommentRow
               key={r.id}

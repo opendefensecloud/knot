@@ -31,15 +31,15 @@ export function CommentComposer({
   }
 
   return (
-    <form onSubmit={handleSubmit} style={{ padding: 12 }}>
-      <div style={{ position: "relative" }}>
+    <form onSubmit={handleSubmit} className="p-3">
+      <div className="relative">
         <textarea
           data-testid={testidInput}
           value={body}
           onChange={(e) => setBody(e.target.value)}
           placeholder={placeholder}
           rows={3}
-          style={{ width: "100%", boxSizing: "border-box", resize: "vertical", padding: 8, fontSize: 14 }}
+          className="w-full resize-y px-2 py-1.5 text-sm rounded border border-border bg-bg text-fg placeholder:text-fg-muted focus:outline-none focus:ring-2 focus:ring-accent"
           {...textareaProps}
         />
         {picker}
@@ -48,7 +48,7 @@ export function CommentComposer({
         type="submit"
         data-testid={testidSubmit}
         disabled={isPending || body.trim().length === 0}
-        style={{ marginTop: 8, padding: "6px 14px", cursor: isPending ? "not-allowed" : "pointer" }}
+        className="mt-2 inline-flex items-center h-8 px-3 rounded bg-accent text-accent-fg text-[13px] font-medium hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
       >
         {isPending ? "Submitting…" : submitLabel}
       </button>
