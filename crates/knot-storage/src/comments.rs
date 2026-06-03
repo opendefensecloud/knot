@@ -28,9 +28,12 @@ pub struct Comment {
     pub parent_id: Option<Uuid>,
     pub author_id: Uuid,
     pub body: String,
-    /// Raw bytes of the Yjs RelativePosition (client-provided, stored as-is).
+    /// Raw bytes of the Yjs RelativePosition for the START of the anchored range.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_y: Option<Vec<u8>>,
+    /// Raw bytes of the Yjs RelativePosition for the END of the anchored range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_y_end: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor_text: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -76,6 +79,7 @@ pub trait CommentStore: Send + Sync + 'static {
         author_id: Uuid,
         body: &str,
         position_y: Option<Vec<u8>>,
+        position_y_end: Option<Vec<u8>>,
         anchor_text: Option<String>,
     ) -> Result<Comment>;
 
@@ -158,6 +162,7 @@ struct CommentRow {
     author_id: Uuid,
     body: String,
     position_y: Option<Vec<u8>>,
+    position_y_end: Option<Vec<u8>>,
     anchor_text: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -209,6 +214,7 @@ fn row_to_comment(r: CommentRow, reactions: HashMap<String, Vec<Uuid>>) -> Comme
         author_id: r.author_id,
         body: r.body,
         position_y: r.position_y,
+        position_y_end: r.position_y_end,
         anchor_text: r.anchor_text,
         created_at: r.created_at,
         updated_at: r.updated_at,
@@ -235,6 +241,7 @@ impl CommentStore for PgCommentStore {
         author_id: Uuid,
         body: &str,
         position_y: Option<Vec<u8>>,
+        position_y_end: Option<Vec<u8>>,
         anchor_text: Option<String>,
     ) -> Result<Comment> {
         if body.len() > 4096 {
@@ -244,10 +251,10 @@ impl CommentStore for PgCommentStore {
         let thread_id = id; // root: thread_id = id
         let row: CommentRow = sqlx::query_as(
             "INSERT INTO comments
-               (id, doc_id, thread_id, parent_id, author_id, body, position_y, anchor_text)
-             VALUES ($1, $2, $3, NULL, $4, $5, $6, $7)
+               (id, doc_id, thread_id, parent_id, author_id, body, position_y, position_y_end, anchor_text)
+             VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8)
              RETURNING id, doc_id, thread_id, parent_id, author_id, body,
-                       position_y, anchor_text, created_at, updated_at, resolved_at",
+                       position_y, position_y_end, anchor_text, created_at, updated_at, resolved_at",
         )
         .bind(id)
         .bind(doc_id)
@@ -255,6 +262,7 @@ impl CommentStore for PgCommentStore {
         .bind(author_id)
         .bind(body)
         .bind(position_y)
+        .bind(position_y_end)
         .bind(anchor_text)
         .fetch_one(&self.pool)
         .await?;
@@ -278,7 +286,7 @@ impl CommentStore for PgCommentStore {
                (id, doc_id, thread_id, parent_id, author_id, body)
              VALUES ($1, $2, $3, $3, $4, $5)
              RETURNING id, doc_id, thread_id, parent_id, author_id, body,
-                       position_y, anchor_text, created_at, updated_at, resolved_at",
+                       position_y, position_y_end, anchor_text, created_at, updated_at, resolved_at",
         )
         .bind(id)
         .bind(doc_id)
@@ -299,7 +307,7 @@ impl CommentStore for PgCommentStore {
         let rows: Vec<CommentRow> = if include_resolved {
             sqlx::query_as(
                 "SELECT id, doc_id, thread_id, parent_id, author_id, body,
-                        position_y, anchor_text, created_at, updated_at, resolved_at
+                        position_y, position_y_end, anchor_text, created_at, updated_at, resolved_at
                  FROM comments
                  WHERE doc_id = $1 AND deleted_at IS NULL
                  ORDER BY created_at",
@@ -311,7 +319,7 @@ impl CommentStore for PgCommentStore {
             // Exclude threads that are resolved and their replies.
             sqlx::query_as(
                 "SELECT c.id, c.doc_id, c.thread_id, c.parent_id, c.author_id, c.body,
-                        c.position_y, c.anchor_text, c.created_at, c.updated_at, c.resolved_at
+                        c.position_y, c.position_y_end, c.anchor_text, c.created_at, c.updated_at, c.resolved_at
                  FROM comments c
                  JOIN comments root ON root.id = c.thread_id
                  WHERE c.doc_id = $1
@@ -391,7 +399,7 @@ impl CommentStore for PgCommentStore {
              SET body = $2, updated_at = NOW()
              WHERE id = $1 AND deleted_at IS NULL
              RETURNING id, doc_id, thread_id, parent_id, author_id, body,
-                       position_y, anchor_text, created_at, updated_at, resolved_at",
+                       position_y, position_y_end, anchor_text, created_at, updated_at, resolved_at",
         )
         .bind(comment_id)
         .bind(body)
@@ -454,7 +462,7 @@ impl CommentStore for PgCommentStore {
     async fn get(&self, comment_id: Uuid) -> Result<Comment> {
         let row: Option<CommentRow> = sqlx::query_as(
             "SELECT id, doc_id, thread_id, parent_id, author_id, body,
-                    position_y, anchor_text, created_at, updated_at, resolved_at
+                    position_y, position_y_end, anchor_text, created_at, updated_at, resolved_at
              FROM comments
              WHERE id = $1 AND deleted_at IS NULL",
         )

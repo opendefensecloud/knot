@@ -47,9 +47,12 @@ fn emoji_allowed(e: &str) -> bool {
 #[derive(Deserialize)]
 struct CreateThreadBody {
     body: String,
-    /// Base64-encoded Yjs RelativePosition bytes (client-provided).
+    /// Base64-encoded Yjs RelativePosition bytes for the START of the range.
     #[serde(default)]
     position_y: Option<String>,
+    /// Base64-encoded Yjs RelativePosition bytes for the END of the range.
+    #[serde(default)]
+    position_y_end: Option<String>,
     #[serde(default)]
     anchor_text: Option<String>,
 }
@@ -212,7 +215,7 @@ async fn create_thread(
         return json_err(StatusCode::PAYLOAD_TOO_LARGE, "comment.body_too_large", "body must be ≤ 4096 chars");
     }
 
-    // Decode position_y from base64 if present.
+    // Decode position_y / position_y_end from base64 if present.
     let position_y: Option<Vec<u8>> = match body_req.position_y {
         None => None,
         Some(ref s) => match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s) {
@@ -220,12 +223,19 @@ async fn create_thread(
             Err(_) => return json_err(StatusCode::BAD_REQUEST, "comment.invalid_position_y", ""),
         },
     };
+    let position_y_end: Option<Vec<u8>> = match body_req.position_y_end {
+        None => None,
+        Some(ref s) => match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s) {
+            Ok(b) => Some(b),
+            Err(_) => return json_err(StatusCode::BAD_REQUEST, "comment.invalid_position_y_end", ""),
+        },
+    };
 
     let Some(comments) = state.comments.clone() else {
         return internal();
     };
     match comments
-        .create_thread(doc_id, ctx.user_id, &body_req.body, position_y, body_req.anchor_text)
+        .create_thread(doc_id, ctx.user_id, &body_req.body, position_y, position_y_end, body_req.anchor_text)
         .await
     {
         Ok(c) => {
