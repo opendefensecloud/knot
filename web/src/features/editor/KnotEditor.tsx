@@ -1,8 +1,11 @@
+import { type Editor } from "@tiptap/core";
 import { EditorContent, useEditor } from "@tiptap/react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Y from "yjs";
 
 import { useSession } from "../../auth/SessionContext";
+import { blobsApi } from "../../lib/blobs.api";
+import { useUi } from "../../stores/ui";
 
 import { createExtensions } from "./extensions";
 import { EditorToolbar } from "./EditorToolbar";
@@ -49,13 +52,18 @@ export function KnotEditor({
       </div>
     );
   }
-  return <EditorBody pair={pair} role={role} />;
+  return <EditorBody pair={pair} role={role} docId={docId} />;
 }
 
-function EditorBody({ pair, role }: { pair: Pair; role: "owner" | "editor" | "viewer" }) {
+const IMAGE_RE = /^image\/(png|jpe?g|gif|webp)$/;
+function isImageType(t: string): boolean { return IMAGE_RE.test(t); }
+
+function EditorBody({ pair, role, docId }: { pair: Pair; role: "owner" | "editor" | "viewer"; docId: string }) {
   const session = useSession();
   const sessionUser = session.data && "ok" in session.data ? session.data.ok : null;
   const userColor = useMemo(() => colorFor(sessionUser?.user_id ?? "anon"), [sessionUser]);
+  const notify = useUi((s) => s.notify);
+  const editorRef = useRef<Editor | null>(null);
 
   const [presence, setPresence] = useState<Array<{ name: string; color: string }>>([]);
 
@@ -76,6 +84,36 @@ function EditorBody({ pair, role }: { pair: Pair; role: "owner" | "editor" | "vi
     return () => { provider.awareness.off("change", update); };
   }, [pair]);
 
+  const uploadAndInsert = useCallback(async (files: File[]) => {
+    for (const f of files) {
+      const r = await blobsApi.upload(docId, f);
+      if ("error" in r) {
+        notify(
+          "error",
+          r.error.code === "blob.too_large" ? "File too large (10 MB cap)."
+            : r.error.code === "blob.blocked_type" ? "File type not allowed."
+            : r.error.code === "acl.no_grant" ? "You don't have permission to upload here."
+            : "Upload failed.",
+        );
+        continue;
+      }
+      const blob = r.ok;
+      if (isImageType(blob.content_type)) {
+        editorRef.current?.chain().focus().setImage({ src: blob.url }).run();
+      } else {
+        editorRef.current?.chain().focus().insertContent({
+          type: "attachment",
+          attrs: {
+            url: blob.url,
+            name: blob.original_name ?? f.name,
+            size: blob.byte_size,
+            contentType: blob.content_type,
+          },
+        }).run();
+      }
+    }
+  }, [docId, notify]);
+
   const editor = useEditor(
     {
       extensions: createExtensions({
@@ -84,9 +122,28 @@ function EditorBody({ pair, role }: { pair: Pair; role: "owner" | "editor" | "vi
         user: { name: sessionUser?.display_name ?? "Anonymous", color: userColor },
       }),
       editable: role !== "viewer",
+      editorProps: {
+        handleDrop(_view, event, _slice, _moved) {
+          const files = Array.from((event as DragEvent).dataTransfer?.files ?? []);
+          if (files.length === 0) return false;
+          event.preventDefault();
+          void uploadAndInsert(files);
+          return true;
+        },
+        handlePaste(_view, event) {
+          const files = Array.from((event as ClipboardEvent).clipboardData?.files ?? []);
+          if (files.length === 0) return false;
+          event.preventDefault();
+          void uploadAndInsert(files);
+          return true;
+        },
+      },
     },
-    [pair, sessionUser?.user_id, role, userColor],
+    [pair, sessionUser?.user_id, role, userColor, uploadAndInsert],
   );
+
+  // Keep ref in sync so uploadAndInsert (stable callback) can reach the latest editor instance.
+  editorRef.current = editor ?? null;
 
   return (
     <>
