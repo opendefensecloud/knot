@@ -7,6 +7,7 @@ import type { Awareness } from "y-protocols/awareness";
 import type * as Y from "yjs";
 
 import { Attachment } from "./nodes/AttachmentNode";
+import { MermaidCodeBlock } from "./nodes/MermaidCodeBlock";
 
 /** Canonical Tiptap extension set that matches the server schema generated
  *  from `tools/schema.json`. History is disabled because Yjs UndoManager
@@ -19,7 +20,9 @@ export function createExtensions(opts: {
   return [
     StarterKit.configure({
       history: false,
+      codeBlock: false,
     }),
+    MermaidCodeBlock,
     Link.configure({
       openOnClick: false,
       autolink: true,

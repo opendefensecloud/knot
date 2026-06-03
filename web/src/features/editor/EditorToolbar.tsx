@@ -12,6 +12,7 @@ import {
   Link as LinkIcon,
   List,
   ListOrdered,
+  Network,
   Quote,
   Strikethrough,
 } from "lucide-react";
@@ -103,6 +104,26 @@ export function EditorToolbar({ editor }: { editor: Editor | null }) {
       <Btn testId="toolbar-code-block" label="Code block" active={editor.isActive("codeBlock")}
         onClick={() => c().toggleCodeBlock().run()}>
         <Code2 size={15} aria-hidden />
+      </Btn>
+      <Btn
+        testId="toolbar-mermaid"
+        label="Insert diagram"
+        onClick={() =>
+          c()
+            .insertContent({
+              type: "codeBlock",
+              attrs: { language: "mermaid" },
+              content: [
+                {
+                  type: "text",
+                  text: "graph TD\n  A[Start] --> B{Decision}\n  B -->|Yes| C[OK]\n  B -->|No| D[End]",
+                },
+              ],
+            })
+            .run()
+        }
+      >
+        <Network size={15} aria-hidden />
       </Btn>
       <Sep />
       <Btn
