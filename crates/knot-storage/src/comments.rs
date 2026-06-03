@@ -16,6 +16,33 @@ use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
 
+/// serde helper: serialize Option<Vec<u8>> as a base64 string (so JS clients
+/// see `position_y: "AbCd..."` instead of `[1,2,3,...]`). Deserialize accepts
+/// either a string (base64) or a missing field (None).
+mod base64_opt {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(bytes) => s.serialize_str(&STANDARD.encode(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt: Option<String> = Option::deserialize(d)?;
+        match opt {
+            Some(s) => STANDARD
+                .decode(s.as_bytes())
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -28,11 +55,12 @@ pub struct Comment {
     pub parent_id: Option<Uuid>,
     pub author_id: Uuid,
     pub body: String,
-    /// Raw bytes of the Yjs RelativePosition for the START of the anchored range.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Yjs RelativePosition for the START of the anchored range. Serialized as
+    /// base64 string on the wire so JS clients can call atob() directly.
+    #[serde(default, with = "base64_opt")]
     pub position_y: Option<Vec<u8>>,
-    /// Raw bytes of the Yjs RelativePosition for the END of the anchored range.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Yjs RelativePosition for the END of the anchored range.
+    #[serde(default, with = "base64_opt")]
     pub position_y_end: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor_text: Option<String>,
