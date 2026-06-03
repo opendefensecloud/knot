@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
-import { useSession } from "../../auth/SessionContext";
+import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { useUi } from "../../stores/ui";
 
 import { workspaceApi } from "./workspace.api";
@@ -9,9 +9,8 @@ import { workspaceApi } from "./workspace.api";
 export default function MembersPage() {
   const qc = useQueryClient();
   const notify = useUi((s) => s.notify);
-  const session = useSession();
-  const myRole = session.data && "ok" in session.data ? session.data.ok.role : "viewer";
-  const isOwner = myRole === "owner";
+  const { workspace } = useEffectiveRole();
+  const isOwner = workspace === "owner";
 
   const members = useQuery({
     queryKey: ["members"],

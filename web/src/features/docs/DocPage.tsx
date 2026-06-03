@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
 
+import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { StatusDot, type ConnStatus } from "../../components/StatusDot";
 import { useUi } from "../../stores/ui";
 
@@ -15,6 +16,7 @@ export default function DocPage() {
   const { id } = useParams<{ id: string }>();
   const nav = useNavigate();
   const qc = useQueryClient();
+  const { doc: effRole } = useEffectiveRole(id);
   const notify = useUi((s) => s.notify);
   const [status, setStatus] = useState<ConnStatus>("connecting");
   const [title, setTitle] = useState("");
@@ -72,13 +74,15 @@ export default function DocPage() {
             background: "transparent",
           }}
         />
-        <Link
-          to="permissions"
-          data-testid="open-permissions"
-          style={{ marginLeft: 12 }}
-        >
-          Permissions
-        </Link>
+        {effRole === "owner" && (
+          <Link
+            to="permissions"
+            data-testid="open-permissions"
+            style={{ marginLeft: 12 }}
+          >
+            Permissions
+          </Link>
+        )}
       </header>
       <Suspense fallback={<p>Loading editor…</p>}>
         <KnotEditor docId={id} onStatus={setStatus} role={meta.effective_role} />
