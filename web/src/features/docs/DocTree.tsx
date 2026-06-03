@@ -1,6 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useState, useMemo } from "react";
+import { useMemo, useState } from "react";
+
+import {
+  ChevronRight,
+  FileText,
+  MoreHorizontal,
+  Plus,
+} from "lucide-react";
 
 import {
   DndContext,
@@ -22,9 +29,11 @@ import { CSS } from "@dnd-kit/utilities";
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { useUi } from "../../stores/ui";
 import { ContextMenu, type ContextMenuItem } from "../../components/ContextMenu";
+import { IconButton } from "../../components/ui/IconButton";
 import { type Doc } from "../../lib/validators";
 import { type ApiError } from "../../lib/api";
 
+import { WorkspaceHeader } from "../workspace/WorkspaceHeader";
 import { docsApi } from "./docs.api";
 import { buildTree, reorderInto, type TreeNode } from "./tree";
 
@@ -76,10 +85,6 @@ export function DocTree() {
     onSettled: () => { void qc.invalidateQueries({ queryKey: ["docs"] }); },
   });
 
-  function doMove(id: string, body: { parent_id?: string | null; before_id?: string; after_id?: string }) {
-    move.mutate({ id, body });
-  }
-
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -96,48 +101,56 @@ export function DocTree() {
     const targetId = String(e.over.id);
     if (movedId === targetId) return;
     // v0.1 UX: drop-onto-row = nest as child of target.
-    doMove(movedId, { parent_id: targetId });
+    move.mutate({ id: movedId, body: { parent_id: targetId } });
   }
 
-  if (list.isLoading) return <div style={{ padding: 12 }}>Loading…</div>;
-  if (!list.data || "error" in list.data) return <div style={{ padding: 12 }}>Failed.</div>;
+  const tree = list.data && "ok" in list.data ? buildTree(list.data.ok) : [];
 
-  const tree = buildTree(list.data.ok);
   return (
-    <div data-testid="doc-tree" style={{ padding: 12 }}>
-      <header
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 8,
-        }}
-      >
-        <strong>Docs</strong>
+    <div data-testid="doc-tree" className="flex flex-col h-full">
+      <WorkspaceHeader />
+      <div className="px-3 pt-3 pb-1 flex items-center justify-between">
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-fg-muted">
+          Documents
+        </span>
         {canEdit && (
-          <button
+          <IconButton
             data-testid="new-doc"
+            label="New document"
+            size="sm"
             onClick={() => create.mutate(undefined)}
-            style={{ padding: "2px 8px" }}
           >
-            + New
-          </button>
+            <Plus size={14} aria-hidden />
+          </IconButton>
         )}
-      </header>
-      {tree.length === 0 && <p style={{ color: "#888" }}>No documents yet.</p>}
-      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
-        <SortableContext items={flatIds} strategy={verticalListSortingStrategy}>
-          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-            {tree.map((n) => (
-              <TreeRow key={n.id} node={n} depth={0} activeId={activeId} canEdit={canEdit} />
-            ))}
-          </ul>
-        </SortableContext>
-      </DndContext>
-      <nav style={{ marginTop: 24, borderTop: "1px solid #e5e5e5", paddingTop: 12 }}>
-        <Link to="/members" style={{ display: "block", padding: 4 }}>Members</Link>
-        <Link to="/settings" style={{ display: "block", padding: 4 }}>Settings</Link>
-      </nav>
+      </div>
+      {list.isLoading && (
+        <div className="px-3 py-2 text-sm text-fg-muted">Loading…</div>
+      )}
+      {list.data && "error" in list.data && (
+        <div className="px-3 py-2 text-sm text-destructive">Failed.</div>
+      )}
+      {list.data && "ok" in list.data && tree.length === 0 && (
+        <p className="px-3 py-2 text-sm text-fg-muted">No documents yet.</p>
+      )}
+      {list.data && "ok" in list.data && (
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
+          <SortableContext items={flatIds} strategy={verticalListSortingStrategy}>
+            <ul className="px-2 pb-3 list-none m-0 flex-1">
+              {tree.map((n) => (
+                <TreeRow
+                  key={n.id}
+                  node={n}
+                  depth={0}
+                  activeId={activeId}
+                  canEdit={canEdit}
+                  onNewChild={(pid) => create.mutate(pid)}
+                />
+              ))}
+            </ul>
+          </SortableContext>
+        </DndContext>
+      )}
     </div>
   );
 }
@@ -147,16 +160,19 @@ function TreeRow({
   depth,
   activeId,
   canEdit,
+  onNewChild,
 }: {
   node: TreeNode;
   depth: number;
   activeId?: string;
   canEdit: boolean;
+  onNewChild: (parentId: string) => void;
 }) {
   const qc = useQueryClient();
   const notify = useUi((s) => s.notify);
   const isActive = activeId === node.id;
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [expanded, setExpanded] = useState(true);
 
   const { attributes, listeners, setNodeRef, transform, isDragging } = useSortable({
     id: node.id,
@@ -191,32 +207,82 @@ function TreeRow({
 
   return (
     <li ref={setNodeRef} style={sortableStyle} {...attributes} {...listeners}>
-      <Link
-        data-testid={`doc-row-${node.id}`}
-        to={`/doc/${node.id}`}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          if (items.length === 0) return;
-          setMenu({ x: e.clientX, y: e.clientY });
-        }}
-        style={{
-          display: "block",
-          padding: "4px 0",
-          paddingLeft: depth * 12,
-          background: isActive ? "#e5e5ff" : "transparent",
-          textDecoration: "none",
-          color: "inherit",
-        }}
+      <div
+        className={`group flex items-center gap-1 rounded h-7 pr-1 transition-colors ease-swift duration-150 ${
+          isActive
+            ? "bg-muted text-fg"
+            : "text-fg-muted hover:text-fg hover:bg-muted/60"
+        }`}
+        style={{ paddingLeft: 4 + depth * 12 }}
       >
-        {node.icon ?? "📄"} {node.title}
-      </Link>
+        {node.children.length > 0 ? (
+          <button
+            type="button"
+            aria-label={expanded ? "Collapse" : "Expand"}
+            onClick={(e) => { e.preventDefault(); setExpanded((v) => !v); }}
+            className="h-5 w-5 inline-flex items-center justify-center text-fg-muted hover:text-fg rounded shrink-0"
+          >
+            <ChevronRight
+              size={12}
+              aria-hidden
+              className={`transition-transform duration-150 ${expanded ? "rotate-90" : ""}`}
+            />
+          </button>
+        ) : (
+          <span className="h-5 w-5 shrink-0" aria-hidden />
+        )}
+        <FileText size={14} aria-hidden className="text-fg-muted shrink-0" />
+        <Link
+          data-testid={`doc-row-${node.id}`}
+          to={`/doc/${node.id}`}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            if (items.length === 0) return;
+            setMenu({ x: e.clientX, y: e.clientY });
+          }}
+          className="flex-1 min-w-0 truncate text-[13px] no-underline text-inherit py-1"
+        >
+          {node.title}
+        </Link>
+        {canEdit && (
+          <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5">
+            <IconButton
+              label="More"
+              size="sm"
+              onClick={(e) => {
+                e.preventDefault();
+                setMenu({ x: e.clientX, y: e.clientY });
+              }}
+            >
+              <MoreHorizontal size={14} aria-hidden />
+            </IconButton>
+            <IconButton
+              label="Add subpage"
+              size="sm"
+              onClick={(e) => {
+                e.preventDefault();
+                onNewChild(node.id);
+              }}
+            >
+              <Plus size={14} aria-hidden />
+            </IconButton>
+          </div>
+        )}
+      </div>
       {menu && (
         <ContextMenu x={menu.x} y={menu.y} items={items} onClose={() => setMenu(null)} />
       )}
-      {node.children.length > 0 && (
-        <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+      {expanded && node.children.length > 0 && (
+        <ul className="list-none p-0 m-0">
           {node.children.map((c) => (
-            <TreeRow key={c.id} node={c} depth={depth + 1} activeId={activeId} canEdit={canEdit} />
+            <TreeRow
+              key={c.id}
+              node={c}
+              depth={depth + 1}
+              activeId={activeId}
+              canEdit={canEdit}
+              onNewChild={onNewChild}
+            />
           ))}
         </ul>
       )}
