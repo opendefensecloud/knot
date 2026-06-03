@@ -1,0 +1,19 @@
+apiVersion: v2
+name: knot
+description: |
+  knot — self-hosted Confluence/Notion alternative.
+  Multi-user collaborative knowledge base with CRDT-backed
+  real-time editing.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/voss/knot
+sources:
+  - https://github.com/voss/knot
+maintainers:
+  - name: Niklas Voss
+icon: ""
+keywords:
+  - knot
+  - wiki
+  - collaboration

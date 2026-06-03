@@ -1,0 +1,94 @@
+# Default values for knot.
+# Assumes EXTERNAL Postgres + OIDC. The dev-compose stack in deploy/compose
+# is for local development only.
+
+image:
+  repository: ghcr.io/voss/knot
+  tag: ""              # defaults to .Chart.AppVersion at template-render time
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+replicaCount: 1
+
+# Required: Postgres connection URL.
+database:
+  url: ""
+  existingSecretName: ""
+  existingSecretKey: "url"
+
+# Required: session signing key (32 bytes).
+session:
+  key: ""
+  existingSecretName: ""
+  existingSecretKey: "key"
+
+# Optional OIDC configuration.
+oidc:
+  enabled: false
+  issuer: ""
+  clientId: ""
+  clientSecret: ""
+  redirectUrl: ""              # https://<host>/auth/oidc/callback
+  existingSecretName: ""
+  autoProvision: "off"          # off | always | domain | group
+  allowedDomains: ""
+  roleFromGroups: ""
+
+baseUrl: ""
+
+logLevel: info
+logFormat: json
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: knot.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+migrations:
+  enabled: true
+  backoffLimit: 3
+
+probes:
+  enabled: true
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
