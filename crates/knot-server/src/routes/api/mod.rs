@@ -8,6 +8,7 @@ use crate::auth::{csrf_mw, require_session_mw};
 pub mod blobs;
 pub mod docs;
 pub mod grants;
+pub mod history;
 pub mod markdown;
 pub mod search;
 pub mod shares;
@@ -20,6 +21,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(blobs::router())
         .merge(search::router())
         .merge(shares::router())
+        .merge(history::router())
         .layer(middleware::from_fn(csrf_mw))
         .layer(middleware::from_fn(require_session_mw))
 }

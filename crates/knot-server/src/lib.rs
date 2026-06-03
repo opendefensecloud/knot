@@ -42,6 +42,7 @@ pub struct AppState {
     pub shares: Option<Arc<dyn ShareTokenStore>>,
     pub blob_store: Option<Arc<dyn BlobStore>>,
     pub blob_meta: Option<Arc<BlobMeta>>,
+    pub snapshots: Option<Arc<dyn knot_storage::SnapshotStore>>,
     pub rooms_v2: Option<Arc<knot_crdt::Rooms>>,
     pub bus: Option<Arc<dyn knot_crdt::Bus>>,
     pub hasher: Arc<Hasher>,
@@ -68,6 +69,7 @@ impl AppState {
             shares: None,
             blob_store: None,
             blob_meta: None,
+            snapshots: None,
             rooms_v2: None,
             bus: None,
             hasher: Arc::new(Hasher::new()),
@@ -98,6 +100,8 @@ impl AppState {
         let shares: Arc<dyn ShareTokenStore> = Arc::new(PgShareTokenStore::new(pool.clone()));
         let blob_store: Arc<dyn BlobStore> = Arc::new(PgBytesStore::new(pool.clone()));
         let blob_meta = Arc::new(BlobMeta::new(pool.clone()));
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> =
+            Arc::new(knot_storage::PgSnapshotStore::new(pool.clone()));
         Self {
             pool: Some(pool),
             users: Some(users),
@@ -111,6 +115,7 @@ impl AppState {
             shares: Some(shares),
             blob_store: Some(blob_store),
             blob_meta: Some(blob_meta),
+            snapshots: Some(snapshots),
             rooms_v2: None,
             bus: None,
             hasher: Arc::new(Hasher::new()),
