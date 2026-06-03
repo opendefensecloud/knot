@@ -13,8 +13,9 @@ use knot_auth::{Hasher, Throttle};
 use knot_config::Config;
 use knot_docs::AclCache;
 use knot_storage::{
-    DocStore, GrantStore, MarkdownCacheStore, PgDocStore, PgGrantStore, PgMarkdownCache,
-    PgSessionStore, PgUserStore, PgWorkspaceStore, Pool, SessionStore, UserStore, WorkspaceStore,
+    BlobMeta, BlobStore, DocStore, GrantStore, MarkdownCacheStore, PgBytesStore, PgDocStore,
+    PgGrantStore, PgMarkdownCache, PgSessionStore, PgUserStore, PgWorkspaceStore, Pool,
+    SessionStore, UserStore, WorkspaceStore,
 };
 use uuid::Uuid;
 
@@ -37,6 +38,8 @@ pub struct AppState {
     pub grants: Option<Arc<dyn GrantStore>>,
     pub acl: Option<Arc<AclCache>>,
     pub markdown_cache: Option<Arc<dyn MarkdownCacheStore>>,
+    pub blob_store: Option<Arc<dyn BlobStore>>,
+    pub blob_meta: Option<Arc<BlobMeta>>,
     pub rooms_v2: Option<Arc<knot_crdt::Rooms>>,
     pub bus: Option<Arc<dyn knot_crdt::Bus>>,
     pub hasher: Arc<Hasher>,
@@ -59,6 +62,8 @@ impl AppState {
             grants: None,
             acl: None,
             markdown_cache: None,
+            blob_store: None,
+            blob_meta: None,
             rooms_v2: None,
             bus: None,
             hasher: Arc::new(Hasher::new()),
@@ -85,6 +90,8 @@ impl AppState {
         let acl = Arc::new(AclCache::new(workspaces.clone(), grants.clone()));
         let markdown_cache: Arc<dyn MarkdownCacheStore> =
             Arc::new(PgMarkdownCache::new(pool.clone()));
+        let blob_store: Arc<dyn BlobStore> = Arc::new(PgBytesStore::new(pool.clone()));
+        let blob_meta = Arc::new(BlobMeta::new(pool.clone()));
         Self {
             pool: Some(pool),
             users: Some(users),
@@ -94,6 +101,8 @@ impl AppState {
             grants: Some(grants),
             acl: Some(acl),
             markdown_cache: Some(markdown_cache),
+            blob_store: Some(blob_store),
+            blob_meta: Some(blob_meta),
             rooms_v2: None,
             bus: None,
             hasher: Arc::new(Hasher::new()),
