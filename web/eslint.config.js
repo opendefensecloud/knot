@@ -35,6 +35,10 @@ export default [
         navigator: "readonly",
         prompt: "readonly",
         confirm: "readonly",
+        btoa: "readonly",
+        atob: "readonly",
+        TextDecoder: "readonly",
+        TextEncoder: "readonly",
       },
     },
     plugins: {
