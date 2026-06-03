@@ -18,7 +18,14 @@ import { useEffect, useId, useRef, useState } from "react";
  * Storage-wise this is still a fenced code block, so markdown round-trip
  * is unchanged.
  */
+/**
+ * Note on the node name: the canonical schema (`crates/knot-markdown`) uses
+ * snake_case "code_block". Tiptap's CodeBlock defaults to "codeBlock". We
+ * override the name so the y-prosemirror sync writes `code_block` into the
+ * Yjs XML element, which is what the markdown serializer expects.
+ */
 export const MermaidCodeBlock = CodeBlock.extend({
+  name: "code_block",
   addNodeView() {
     return ReactNodeViewRenderer(MermaidNodeView);
   },

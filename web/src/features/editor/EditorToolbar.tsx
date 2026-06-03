@@ -101,7 +101,7 @@ export function EditorToolbar({ editor }: { editor: Editor | null }) {
         onClick={() => c().toggleBlockquote().run()}>
         <Quote size={15} aria-hidden />
       </Btn>
-      <Btn testId="toolbar-code-block" label="Code block" active={editor.isActive("codeBlock")}
+      <Btn testId="toolbar-code-block" label="Code block" active={editor.isActive("code_block")}
         onClick={() => c().toggleCodeBlock().run()}>
         <Code2 size={15} aria-hidden />
       </Btn>
@@ -111,7 +111,7 @@ export function EditorToolbar({ editor }: { editor: Editor | null }) {
         onClick={() =>
           c()
             .insertContent({
-              type: "codeBlock",
+              type: "code_block",
               attrs: { language: "mermaid" },
               content: [
                 {
