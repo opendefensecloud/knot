@@ -1,12 +1,31 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useState } from "react";
+import { useState, useMemo } from "react";
+
+import {
+  DndContext,
+  PointerSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+  closestCenter,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  useSortable,
+  verticalListSortingStrategy,
+  sortableKeyboardCoordinates,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 
 import { useUi } from "../../stores/ui";
 import { ContextMenu, type ContextMenuItem } from "../../components/ContextMenu";
+import { type Doc } from "../../lib/validators";
+import { type ApiError } from "../../lib/api";
 
 import { docsApi } from "./docs.api";
-import { buildTree, type TreeNode } from "./tree";
+import { buildTree, reorderInto, type TreeNode } from "./tree";
 
 export function DocTree() {
   const qc = useQueryClient();
@@ -33,6 +52,49 @@ export function DocTree() {
     },
   });
 
+  const move = useMutation({
+    mutationFn: async (a: { id: string; body: { parent_id?: string | null; before_id?: string; after_id?: string } }) =>
+      docsApi.move(a.id, a.body),
+    onMutate: async (a) => {
+      await qc.cancelQueries({ queryKey: ["docs"] });
+      const prev = qc.getQueryData<{ ok: Doc[] } | { error: ApiError }>(["docs"]);
+      if (prev && "ok" in prev) {
+        qc.setQueryData(["docs"], {
+          ok: reorderInto(prev.ok, a.id, a.body.parent_id ?? null),
+        });
+      }
+      return { prev };
+    },
+    onError: (_e, _a, ctx) => {
+      if (ctx?.prev) qc.setQueryData(["docs"], ctx.prev);
+      notify("error", "Couldn't move");
+    },
+    onSettled: () => { void qc.invalidateQueries({ queryKey: ["docs"] }); },
+  });
+
+  function doMove(id: string, body: { parent_id?: string | null; before_id?: string; after_id?: string }) {
+    move.mutate({ id, body });
+  }
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+
+  const flatIds = useMemo(
+    () => (list.data && "ok" in list.data ? list.data.ok.map((d) => d.id) : []),
+    [list.data],
+  );
+
+  function onDragEnd(e: DragEndEvent) {
+    const movedId = String(e.active.id);
+    if (!e.over) return;
+    const targetId = String(e.over.id);
+    if (movedId === targetId) return;
+    // v0.1 UX: drop-onto-row = nest as child of target.
+    doMove(movedId, { parent_id: targetId });
+  }
+
   if (list.isLoading) return <div style={{ padding: 12 }}>Loading…</div>;
   if (!list.data || "error" in list.data) return <div style={{ padding: 12 }}>Failed.</div>;
 
@@ -57,11 +119,15 @@ export function DocTree() {
         </button>
       </header>
       {tree.length === 0 && <p style={{ color: "#888" }}>No documents yet.</p>}
-      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-        {tree.map((n) => (
-          <TreeRow key={n.id} node={n} depth={0} activeId={activeId} />
-        ))}
-      </ul>
+      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
+        <SortableContext items={flatIds} strategy={verticalListSortingStrategy}>
+          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+            {tree.map((n) => (
+              <TreeRow key={n.id} node={n} depth={0} activeId={activeId} />
+            ))}
+          </ul>
+        </SortableContext>
+      </DndContext>
       <nav style={{ marginTop: 24, borderTop: "1px solid #e5e5e5", paddingTop: 12 }}>
         <Link to="/members" style={{ display: "block", padding: 4 }}>Members</Link>
         <Link to="/settings" style={{ display: "block", padding: 4 }}>Settings</Link>
@@ -84,6 +150,12 @@ function TreeRow({
   const isActive = activeId === node.id;
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useSortable({ id: node.id });
+  const sortableStyle = {
+    transform: CSS.Transform.toString(transform),
+    opacity: isDragging ? 0.5 : 1,
+  };
+
   async function onRename() {
     const next = window.prompt("Rename to:", node.title);
     if (!next || next === node.title) return;
@@ -105,7 +177,7 @@ function TreeRow({
   ];
 
   return (
-    <li>
+    <li ref={setNodeRef} style={sortableStyle} {...attributes} {...listeners}>
       <Link
         data-testid={`doc-row-${node.id}`}
         to={`/doc/${node.id}`}
