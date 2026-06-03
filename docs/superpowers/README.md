@@ -22,6 +22,7 @@ This directory is knot's planning log. Every non-trivial change lands as a **pla
 | 13.5 | 2026-06-03 | Runtime-Selected S3 Backend | [plans/2026-06-03-blob-runtime-s3.md](plans/2026-06-03-blob-runtime-s3.md) | [2026-06-03-plan13.5-outcome.md](research/2026-06-03-plan13.5-outcome.md) |
 | 14 | 2026-06-03 | Full-Text Search | [plans/2026-06-03-search.md](plans/2026-06-03-search.md) | [2026-06-03-plan14-outcome.md](research/2026-06-03-plan14-outcome.md) |
 | 14.5 | 2026-06-03 | DocPage Stale-State Fix | [plans/2026-06-03-docpage-fix.md](plans/2026-06-03-docpage-fix.md) | [2026-06-03-plan14.5-outcome.md](research/2026-06-03-plan14.5-outcome.md) |
+| 12.5 | 2026-06-03 | Chaos: WS Reconnect via toxiproxy | [plans/2026-06-03-chaos-ws-reconnect.md](plans/2026-06-03-chaos-ws-reconnect.md) | [2026-06-03-plan12.5-outcome.md](research/2026-06-03-plan12.5-outcome.md) |
 
 > Plan numbers reflect execution order, not always file date. Plans 1–4 predate the plan-driven workflow and don't have outcome docs.
 
