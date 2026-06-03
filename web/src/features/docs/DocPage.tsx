@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { History, MessageSquare, Share2 } from "lucide-react";
+import { FileCode, History, MessageSquare, Share2 } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
 
@@ -9,6 +9,7 @@ import { IconButton } from "../../components/ui/IconButton";
 import { useUi } from "../../stores/ui";
 
 import { CommentSidebar } from "../comments/CommentSidebar";
+import { MarkdownView } from "../editor/MarkdownView";
 import { Breadcrumb } from "./Breadcrumb";
 import { docsApi } from "./docs.api";
 import { HistoryDrawer } from "./HistoryDrawer";
@@ -53,6 +54,7 @@ export default function DocPage() {
   const notify = useUi((s) => s.notify);
   const [status, setStatus] = useState<ConnStatus>("connecting");
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [mdView, setMdView] = useState(false);
   const commentSidebarOpen = useUi((s) => s.commentSidebarOpen);
   const openCommentSidebar = useUi((s) => s.openCommentSidebar);
 
@@ -109,6 +111,14 @@ export default function DocPage() {
             </IconButton>
           )}
           <IconButton
+            data-testid="toggle-markdown"
+            label={mdView ? "Show editor" : "Show markdown"}
+            active={mdView}
+            onClick={() => setMdView((v) => !v)}
+          >
+            <FileCode size={16} aria-hidden />
+          </IconButton>
+          <IconButton
             data-testid="open-comments"
             label="Comments"
             onClick={openCommentSidebar}
@@ -117,11 +127,15 @@ export default function DocPage() {
           </IconButton>
         </div>
       </div>
-      <Suspense fallback={<p className="text-fg-muted mt-6">Loading editor…</p>}>
-        <div className="mt-6">
-          <KnotEditor docId={id} onStatus={setStatus} role={meta.effective_role} />
-        </div>
-      </Suspense>
+      <div className="mt-6">
+        {mdView ? (
+          <MarkdownView docId={id} />
+        ) : (
+          <Suspense fallback={<p className="text-fg-muted">Loading editor…</p>}>
+            <KnotEditor docId={id} onStatus={setStatus} role={meta.effective_role} />
+          </Suspense>
+        )}
+      </div>
       <Outlet />
       {historyOpen && id && (
         <HistoryDrawer docId={id} onClose={() => setHistoryOpen(false)} />
