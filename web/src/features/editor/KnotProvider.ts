@@ -3,6 +3,11 @@
  *
  * Wire format mirrors the server's `crates/knot-server/src/protocol.rs`:
  *   <msg_type:u8> [<sync_subtype:u8>] <varuint length> <payload bytes>
+ *
+ * MSG_MENTION (type=4) is reserved for server-pushed mention notifications.
+ * NOTE: as of 2026-06-03 the server does not yet forward pg_notify('comment_mentions')
+ * payloads to the collab WS room actors. The frontend handler is implemented
+ * here but will never fire until the server-side pipeline is wired.
  */
 
 import * as Y from "yjs";
@@ -10,6 +15,7 @@ import { Awareness, encodeAwarenessUpdate, applyAwarenessUpdate } from "y-protoc
 
 const MSG_SYNC = 0;
 const MSG_AWARENESS = 1;
+const MSG_MENTION = 4;
 const SYNC_STEP_1 = 0;
 const SYNC_STEP_2 = 1;
 const SYNC_UPDATE = 2;
@@ -21,8 +27,16 @@ export type ProviderStatus =
   | "unauthorised"
   | "conflict";
 
+export type MentionMsg = {
+  type: string;
+  doc_id: string;
+  comment_id: string;
+  user_ids: string[];
+};
+
 export type ProviderEvents = {
   status: (s: ProviderStatus) => void;
+  mention: (msg: MentionMsg) => void;
 };
 
 type Listeners = { [K in keyof ProviderEvents]: Array<ProviderEvents[K]> };
@@ -34,7 +48,7 @@ export class KnotProvider {
   status: ProviderStatus = "connecting";
   private ws: WebSocket | null = null;
   private destroyed = false;
-  private listeners: Listeners = { status: [] };
+  private listeners: Listeners = { status: [], mention: [] };
   private reconnectAttempt = 0;
   private reconnectTimer: number | null = null;
 
@@ -139,6 +153,20 @@ export class KnotProvider {
     } else if (type === MSG_AWARENESS) {
       const [payload] = readVarBytes(buf, 1);
       if (payload) applyAwarenessUpdate(this.awareness, payload, this);
+    } else if (type === MSG_MENTION) {
+      const [payload] = readVarBytes(buf, 1);
+      if (payload) {
+        try {
+          const text = new TextDecoder().decode(payload);
+          const msg = JSON.parse(text) as MentionMsg;
+          if (msg.type === "mention") {
+            this.listeners.mention.forEach((fn) => fn(msg));
+          }
+        } catch {
+          // malformed — ignore
+        }
+      }
+      return;
     }
   }
 
