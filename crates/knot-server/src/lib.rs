@@ -21,6 +21,7 @@ use knot_storage::{
 use uuid::Uuid;
 
 pub mod auth;
+pub mod board_room_shim;
 pub mod http_error;
 pub mod metrics;
 pub mod protocol;
@@ -47,6 +48,8 @@ pub struct AppState {
     pub snapshots: Option<Arc<dyn knot_storage::SnapshotStore>>,
     pub rooms_v2: Option<Arc<knot_crdt::Rooms>>,
     pub bus: Option<Arc<dyn knot_crdt::Bus>>,
+    pub boards: Option<Arc<dyn knot_storage::BoardStore>>,
+    pub board_rooms: Option<Arc<knot_crdt::BoardRooms>>,
     pub hasher: Arc<Hasher>,
     pub throttle: Arc<Throttle>,
     pub session_key: Vec<u8>,
@@ -75,6 +78,8 @@ impl AppState {
             snapshots: None,
             rooms_v2: None,
             bus: None,
+            boards: None,
+            board_rooms: None,
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
@@ -106,6 +111,8 @@ impl AppState {
         let blob_meta = Arc::new(BlobMeta::new(pool.clone()));
         let snapshots: Arc<dyn knot_storage::SnapshotStore> =
             Arc::new(knot_storage::PgSnapshotStore::new(pool.clone()));
+        let boards: Arc<dyn knot_storage::BoardStore> =
+            Arc::new(knot_storage::PgBoardStore::new(pool.clone()));
         Self {
             pool: Some(pool),
             users: Some(users),
@@ -123,6 +130,8 @@ impl AppState {
             snapshots: Some(snapshots),
             rooms_v2: None,
             bus: None,
+            boards: Some(boards),
+            board_rooms: None,
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
@@ -155,7 +164,12 @@ pub fn router_with_state(state: AppState) -> Router {
         .not_found_service(ServeFile::new(&index_path));
 
     let mut r = Router::new()
+        // /collab/:doc_id is the v0.1 path; /collab/doc/:id is the v0.2
+        // canonical name. Both route to the doc upgrade handler so a
+        // client mid-deploy doesn't break.
         .route("/collab/:doc_id", get(collab_upgrade))
+        .route("/collab/doc/:doc_id", get(collab_upgrade))
+        .route("/collab/board/:board_id", get(collab_board_upgrade))
         .merge(routes::health::router())
         .merge(routes::auth::router())
         .merge(routes::public::router())
@@ -212,6 +226,49 @@ async fn collab_upgrade(
     };
     ws.on_upgrade(move |socket| async move {
         crate::room::serve(rooms, doc_id, socket).await;
+    })
+    .into_response()
+}
+
+#[tracing::instrument(skip_all, name = "collab.board.upgrade", fields(board_id = %board_id))]
+async fn collab_board_upgrade(
+    Path(board_id): Path<Uuid>,
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let Some(ctx) = req.extensions().get::<crate::auth::AuthContext>().cloned() else {
+        return (axum::http::StatusCode::UNAUTHORIZED, "auth.session_required").into_response();
+    };
+    let Some(boards) = state.boards.as_ref().cloned() else {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+    };
+    let Some(acl) = state.acl.as_ref().cloned() else {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+    };
+    // Resolve the parent doc and gate on its ACL (editor+ for v1).
+    let board = match boards.get(board_id).await {
+        Ok(b) => b,
+        Err(_) => return (axum::http::StatusCode::NOT_FOUND, "board.not_found").into_response(),
+    };
+    match acl
+        .effective_role(ctx.workspace_id, board.doc_id, ctx.user_id)
+        .await
+    {
+        Ok(Some(role)) => {
+            use knot_storage::WorkspaceRole;
+            if !matches!(role, WorkspaceRole::Owner | WorkspaceRole::Editor) {
+                return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response();
+            }
+        }
+        Ok(None) => return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response(),
+        Err(_) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response(),
+    }
+    let Some(board_rooms) = state.board_rooms.as_ref().cloned() else {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+    };
+    ws.on_upgrade(move |socket| async move {
+        crate::board_room_shim::serve(board_rooms, board_id, socket).await;
     })
     .into_response()
 }

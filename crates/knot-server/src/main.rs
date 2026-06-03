@@ -170,6 +170,18 @@ async fn run_server(cfg: Config) {
         (None, None)
     };
 
+    // 3c. BoardRooms registry (single-node v0.1; no bus integration).
+    let board_rooms = if let Some(pool) = pool.clone() {
+        let store: std::sync::Arc<dyn knot_storage::BoardStore> =
+            std::sync::Arc::new(knot_storage::PgBoardStore::new(pool.clone()));
+        Some(std::sync::Arc::new(knot_crdt::BoardRooms::new(
+            std::sync::Arc::new(knot_crdt::YrsEngine),
+            store,
+        )))
+    } else {
+        None
+    };
+
     // 4. Build router.
     let state = match pool {
         Some(p) => {
@@ -181,6 +193,7 @@ async fn run_server(cfg: Config) {
             s.config = cfg.clone();
             s.bus = bus;
             s.rooms_v2 = rooms_v2;
+            s.board_rooms = board_rooms;
 
             // Optional S3 blob backend (default: Postgres bytea, already wired
             // by AppState::with_pool).
