@@ -14,6 +14,7 @@ export const NODE_KINDS = [
   "list_item",
   "text",
   "hard_break",
+  "excalidraw_board",
 ] as const;
 export type NodeKind = (typeof NODE_KINDS)[number];
 
