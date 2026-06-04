@@ -29,6 +29,7 @@ This directory is knot's planning log. Every non-trivial change lands as a **pla
 | 20 | 2026-06-03 | Doc History & Restore | [plans/2026-06-03-doc-history.md](plans/2026-06-03-doc-history.md) | [2026-06-03-plan20-outcome.md](research/2026-06-03-plan20-outcome.md) |
 | 19 | 2026-06-03 | Comments & Mentions | [plans/2026-06-03-comments.md](plans/2026-06-03-comments.md) | [2026-06-03-plan19-outcome.md](research/2026-06-03-plan19-outcome.md) |
 | 22 | 2026-06-03 | UI Modernization | [plans/2026-06-03-ui-modernization.md](plans/2026-06-03-ui-modernization.md) | [2026-06-03-plan22-outcome.md](research/2026-06-03-plan22-outcome.md) |
+| 25 | 2026-06-03 | Excalidraw Boards | [plans/2026-06-03-excalidraw-boards.md](plans/2026-06-03-excalidraw-boards.md) | [2026-06-03-plan25-outcome.md](research/2026-06-03-plan25-outcome.md) |
 
 > Plan numbers reflect execution order, not always file date. Plans 1–4 predate the plan-driven workflow and don't have outcome docs.
 
