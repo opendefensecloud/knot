@@ -2,9 +2,10 @@
  * /tasks — open checklist items across the workspace, scoped to the current
  * user (assignee via @-mention).
  *
- * The index is server-side eager and refreshes on markdown export; a
- * "Refresh" button on this page triggers a markdown export for each doc the
- * user can edit, which is what populates the index.
+ * The index updates automatically: the server-side reindex worker watches
+ * the room actors and re-extracts tasks within a couple seconds of any
+ * doc persist. This page just refetches on visit + offers a manual
+ * Refresh that re-runs the query.
  */
 
 import { useState } from "react";
@@ -13,19 +14,6 @@ import { Link } from "react-router-dom";
 import { CheckSquare, RefreshCw, Square } from "lucide-react";
 
 import { tasksApi, type Task } from "../../lib/tasks.api";
-import { docsApi } from "../docs/docs.api";
-
-async function refreshIndex(docs: { id: string }[]) {
-  // Tickle each doc's markdown export which triggers the server-side
-  // re-extract. Best-effort: ignore failures (likely ACL).
-  await Promise.allSettled(
-    docs.map((d) =>
-      fetch(`/api/docs/${encodeURIComponent(d.id)}/markdown`, {
-        credentials: "include",
-      }),
-    ),
-  );
-}
 
 export default function TasksPage() {
   const qc = useQueryClient();
@@ -42,12 +30,6 @@ export default function TasksPage() {
     // the existing react-query interval.
     refetchOnMount: "always",
     staleTime: 0,
-  });
-
-  const allDocs = useQuery({
-    queryKey: ["docs"],
-    queryFn: () => docsApi.list(),
-    staleTime: 60_000,
   });
 
   // Optimistic check/uncheck: flip locally on click, then PATCH the source
@@ -80,9 +62,6 @@ export default function TasksPage() {
   async function onRefresh() {
     setRefreshing(true);
     try {
-      if (allDocs.data && "ok" in allDocs.data) {
-        await refreshIndex(allDocs.data.ok.map((d) => ({ id: d.id })));
-      }
       await qc.invalidateQueries({ queryKey: ["tasks"] });
     } finally {
       setRefreshing(false);

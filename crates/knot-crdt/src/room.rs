@@ -98,6 +98,10 @@ pub struct Room {
     updates_store: Arc<dyn knot_storage::UpdatesStore>,
     policy: crate::snapshot::SnapshotPolicy,
     snap_state: crate::snapshot::SnapshotState,
+    /// Server-side reindex notifier (see [`crate::Rooms::with_dirty_tx`]).
+    /// Fires after the writer confirms a successful persist; consumers
+    /// debounce + reindex tasks for the doc.
+    dirty_tx: Option<mpsc::Sender<Uuid>>,
 }
 
 pub struct RoomHandle {
@@ -117,6 +121,7 @@ impl Room {
         updates_store: Arc<dyn knot_storage::UpdatesStore>,
         snapshots: Arc<dyn knot_storage::SnapshotStore>,
         policy: crate::snapshot::SnapshotPolicy,
+        dirty_tx: Option<mpsc::Sender<Uuid>>,
     ) -> Result<RoomHandle, EngineError> {
         // Hydrate the doc.
         let doc = engine.new_doc();
@@ -171,6 +176,7 @@ impl Room {
             updates_store,
             policy,
             snap_state,
+            dirty_tx,
         };
         tokio::spawn(room.run());
         Ok(RoomHandle { tx, shutdown })
@@ -409,6 +415,12 @@ impl Room {
                     }
                     self.snap_state.updates_since_snapshot += 1;
                     self.snap_state.last_apply_at = std::time::Instant::now();
+                    // Notify the server-side reindex worker that this
+                    // doc has new content. `try_send` so a full channel
+                    // is dropped — the next applied update will refire.
+                    if let Some(tx) = &self.dirty_tx {
+                        let _ = tx.try_send(self.doc_id);
+                    }
                     if self.snap_state.updates_since_snapshot >= self.policy.every_n {
                         if let Err(e) = crate::snapshot::write_snapshot(
                             self.doc_id, self.last_applied_seq,
@@ -754,6 +766,7 @@ mod tests {
             updates,
             snapshots,
             policy,
+            None,
         )
         .await
         .unwrap();
@@ -821,6 +834,7 @@ mod tests {
             updates,
             snapshots,
             policy,
+            None,
         )
         .await
         .unwrap();
@@ -873,6 +887,7 @@ mod tests {
             updates_store.clone(),
             snapshots,
             policy,
+            None,
         )
         .await
         .unwrap();
@@ -963,6 +978,7 @@ mod tests {
             updates_arc,
             snapshots,
             policy,
+            None,
         )
         .await
         .unwrap();

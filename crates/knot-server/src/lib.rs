@@ -25,6 +25,7 @@ pub mod board_room_shim;
 pub mod http_error;
 pub mod metrics;
 pub mod protocol;
+pub mod reindex;
 pub mod room;
 pub mod routes;
 

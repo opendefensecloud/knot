@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use crate::bus::Bus;
@@ -25,6 +25,13 @@ pub struct Rooms {
     snapshots: Arc<dyn SnapshotStore>,
     policy: SnapshotPolicy,
     idle_evict: Duration,
+    /// Optional notifier fired with the room's `doc_id` after each
+    /// successful persist. Consumers (the reindex worker in
+    /// knot-server) debounce + reindex tasks. `try_send` is used so
+    /// a full channel never stalls the room actor; a dropped
+    /// notification is fine because the next applied update will
+    /// re-fire it.
+    dirty_tx: Option<mpsc::Sender<Uuid>>,
 }
 
 impl Rooms {
@@ -45,7 +52,16 @@ impl Rooms {
             snapshots,
             policy,
             idle_evict,
+            dirty_tx: None,
         }
+    }
+
+    /// Builder: attach a notifier that receives this room's `doc_id`
+    /// every time the writer reports a successful persist. The server
+    /// owns the receiver and runs the reindex worker.
+    pub fn with_dirty_tx(mut self, tx: mpsc::Sender<Uuid>) -> Self {
+        self.dirty_tx = Some(tx);
+        self
     }
 
     /// Acquire (or boot) the room for `doc_id`. Concurrent calls cooperate
@@ -72,6 +88,7 @@ impl Rooms {
             self.updates.clone(),
             self.snapshots.clone(),
             self.policy,
+            self.dirty_tx.clone(),
         )
         .await
         .expect("hydrate");

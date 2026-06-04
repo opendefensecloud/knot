@@ -138,7 +138,7 @@ async fn run_server(cfg: Config) {
     };
 
     // 3b. CRDT bus + Rooms registry (only when a real pool exists).
-    let (bus, rooms_v2) = if let Some(pool) = pool.clone() {
+    let (bus, rooms_v2, reindex_rx) = if let Some(pool) = pool.clone() {
         match knot_crdt::PgBus::connect(&cfg.database_url).await {
             Ok(b) => {
                 let bus: std::sync::Arc<dyn knot_crdt::Bus> = std::sync::Arc::new(b);
@@ -150,16 +150,24 @@ async fn run_server(cfg: Config) {
                     every_n: cfg.snapshot_every_n,
                     idle: std::time::Duration::from_secs(cfg.snapshot_idle_sec as u64),
                 };
-                let rooms = std::sync::Arc::new(knot_crdt::Rooms::new(
-                    std::sync::Arc::new(knot_crdt::YrsEngine),
-                    bus.clone(),
-                    updates.clone(),
-                    snapshots.clone(),
-                    policy,
-                    std::time::Duration::from_secs(cfg.room_idle_evict_sec as u64),
-                ));
+                // Channel feeding the reindex worker. Bounded so a
+                // pathological burst can't pile up unbounded; if it
+                // fills, the room actor's try_send drops the
+                // notification (next applied update will refire).
+                let (dirty_tx, dirty_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(4096);
+                let rooms = std::sync::Arc::new(
+                    knot_crdt::Rooms::new(
+                        std::sync::Arc::new(knot_crdt::YrsEngine),
+                        bus.clone(),
+                        updates.clone(),
+                        snapshots.clone(),
+                        policy,
+                        std::time::Duration::from_secs(cfg.room_idle_evict_sec as u64),
+                    )
+                    .with_dirty_tx(dirty_tx),
+                );
                 knot_crdt::spawn_gc(pool.clone(), snapshots, updates, cfg.snapshot_every_n);
-                (Some(bus), Some(rooms))
+                (Some(bus), Some(rooms), Some(dirty_rx))
             }
             Err(e) => {
                 tracing::error!(error=?e, "PgBus connect failed");
@@ -167,7 +175,12 @@ async fn run_server(cfg: Config) {
             }
         }
     } else {
-        (None, None)
+        let none: (
+            Option<std::sync::Arc<dyn knot_crdt::Bus>>,
+            Option<std::sync::Arc<knot_crdt::Rooms>>,
+            Option<tokio::sync::mpsc::Receiver<uuid::Uuid>>,
+        ) = (None, None, None);
+        none
     };
 
     // 3c. BoardRooms registry (single-node v0.1; no bus integration).
@@ -233,6 +246,10 @@ async fn run_server(cfg: Config) {
             s
         }
     };
+    if let Some(rx) = reindex_rx {
+        knot_server::reindex::spawn(state.clone(), rx);
+        tracing::info!("reindex worker spawned");
+    }
     if let (Some(pool), Some(acl), Some(docs)) =
         (state.pool.clone(), state.acl.clone(), state.docs.clone())
     {
