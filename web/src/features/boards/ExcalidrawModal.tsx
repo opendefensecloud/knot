@@ -36,6 +36,41 @@ import { bindExcalidraw, type ExcalidrawBinding } from "./yBinding";
 import { boardsApi } from "../../lib/boards.api";
 import { useSession } from "../../auth/SessionContext";
 import { colorFor } from "../../components/ui/Avatar";
+import { PENDING_LIBRARY_KEY } from "./LibraryReturn";
+
+const LIBRARY_RETURN_URL = `${window.location.origin}/library-return`;
+
+type LibraryMessage = { type: "knot:add-library"; libraryUrl: string; token: string | null };
+
+async function importLibrary(
+  api: ExcalidrawImperativeAPI,
+  libraryUrl: string,
+  token: string | null,
+): Promise<void> {
+  try {
+    const target = new URL(libraryUrl);
+    // libraries.excalidraw.com expects the token forwarded when fetching
+    // private/in-review libraries; harmless for public ones.
+    if (token) target.searchParams.set("token", token);
+    const res = await fetch(target.toString(), { credentials: "omit" });
+    if (!res.ok) throw new Error(`fetch ${res.status}`);
+    const json = (await res.json()) as {
+      libraryItems?: unknown[];
+      library?: unknown[];
+    };
+    const items = (json.libraryItems ?? json.library ?? []) as Parameters<
+      ExcalidrawImperativeAPI["updateLibrary"]
+    >[0]["libraryItems"];
+    void api.updateLibrary({
+      libraryItems: items,
+      merge: true,
+      openLibraryMenu: true,
+      defaultStatus: "published",
+    });
+  } catch (err) {
+    console.warn("library import failed", err);
+  }
+}
 
 // Lazy-load Excalidraw (and its CSS) so it ships as its own chunk.
 const Excalidraw = lazy(async () => {
@@ -250,6 +285,40 @@ export function ExcalidrawModal({
     }
   }
 
+  // Listen for library imports posted back from /library-return (opener path)
+  // and drain any sessionStorage stash from the fallback path on every API
+  // ready. Excalidraw library state lives in localStorage per-origin, so a
+  // successful updateLibrary persists across modal lifetimes.
+  useEffect(() => {
+    if (!apiReady) return;
+    function onMessage(e: MessageEvent) {
+      if (e.origin !== window.location.origin) return;
+      const data = e.data as Partial<LibraryMessage>;
+      if (data?.type !== "knot:add-library" || !data.libraryUrl) return;
+      const api = apiRef.current;
+      if (!api) return;
+      void importLibrary(api, data.libraryUrl, data.token ?? null);
+    }
+    window.addEventListener("message", onMessage);
+
+    try {
+      const stash = window.sessionStorage.getItem(PENDING_LIBRARY_KEY);
+      if (stash) {
+        const { libraryUrl, token } = JSON.parse(stash) as {
+          libraryUrl: string;
+          token: string | null;
+        };
+        window.sessionStorage.removeItem(PENDING_LIBRARY_KEY);
+        const api = apiRef.current;
+        if (api && libraryUrl) void importLibrary(api, libraryUrl, token ?? null);
+      }
+    } catch (err) {
+      console.warn("library stash drain failed", err);
+    }
+
+    return () => window.removeEventListener("message", onMessage);
+  }, [apiReady]);
+
   // Bind only once BOTH the Excalidraw API is mounted AND the provider has
   // received its first SYNC_STEP_2. Binding earlier risks the mount-time
   // `onChange([])` running the delete-missing branch against remote state,
@@ -351,6 +420,7 @@ export function ExcalidrawModal({
               onChange={handleChange}
               onPointerUpdate={handlePointerUpdate}
               isCollaborating={false}
+              libraryReturnUrl={LIBRARY_RETURN_URL}
               UIOptions={{
                 canvasActions: {
                   toggleTheme: false,
