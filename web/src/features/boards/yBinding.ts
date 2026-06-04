@@ -32,6 +32,7 @@ export function bindExcalidraw(
     const arr = Array.from(elements.values());
     // Excalidraw orders by fractional index (`el.index`); passing as-is is
     // fine — the renderer sorts internally. Avoid pre-sorting here.
+    // Excalidraw treats input as immutable; do not mutate.
     api.updateScene({ elements: arr });
   }
   elements.observeDeep(pushToExcalidraw);

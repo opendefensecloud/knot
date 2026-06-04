@@ -15,7 +15,8 @@
  * and CanvasActions trimmed) since we own the lifecycle.
  */
 
-import { Suspense, lazy, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import * as Y from "yjs";
 import type {
   Collaborator,
@@ -63,8 +64,9 @@ async function saveSvgSnapshot(
     });
     const text = new XMLSerializer().serializeToString(svg);
     await boardsApi.putSvg(boardId, text);
-  } catch {
+  } catch (err) {
     // best-effort — the SVG cache is recoverable on next render
+    console.warn("board svg snapshot failed", err);
   }
 }
 
@@ -80,11 +82,34 @@ export function ExcalidrawModal({
   boardId: string;
   onClose: () => void;
 }) {
+  const qc = useQueryClient();
   const [ready, setReady] = useState(false);
   const docRef = useRef<Y.Doc | null>(null);
   const providerRef = useRef<BoardProvider | null>(null);
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const bindingRef = useRef<ExcalidrawBinding | null>(null);
+  const saveTimerRef = useRef<number | null>(null);
+
+  // Debounced periodic SVG snapshot during editing. The save-on-close in the
+  // mount effect remains the final commitment; this just keeps the cached
+  // SVG fresh for other open NodeViews while the modal is open.
+  const scheduleSave = useCallback(() => {
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+    }
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      const api = apiRef.current;
+      if (!api) return;
+      void saveSvgSnapshot(api, boardId)
+        .then(() => {
+          void qc.invalidateQueries({ queryKey: ["board-svg", boardId] });
+        })
+        .catch((err: unknown) => {
+          console.warn("board svg snapshot failed", err);
+        });
+    }, 300);
+  }, [boardId, qc]);
 
   // Build Y.Doc + provider once. Save SVG on unmount.
   useEffect(() => {
@@ -102,6 +127,12 @@ export function ExcalidrawModal({
     setReady(true);
 
     return () => {
+      // Cancel any pending debounced save; the close-save below is the final
+      // commitment so we don't need to flush the timer.
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
       // Fire-and-forget SVG snapshot. Don't block close.
       const api = apiRef.current;
       if (api) {
@@ -168,9 +199,13 @@ export function ExcalidrawModal({
     }
   }
 
-  function handleChange(next: readonly ExcalidrawElement[]) {
-    bindingRef.current?.onChange(next);
-  }
+  const handleChange = useCallback(
+    (next: readonly ExcalidrawElement[]) => {
+      bindingRef.current?.onChange(next);
+      scheduleSave();
+    },
+    [scheduleSave],
+  );
 
   function handlePointerUpdate(payload: {
     pointer: { x: number; y: number; tool: "pointer" | "laser" };
