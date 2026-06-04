@@ -261,7 +261,21 @@ function EditorBody({ pair, role, docId }: { pair: Pair; role: "owner" | "editor
   function handleAddComment() {
     if (!editor || !selectionRange) return;
     const { from, to } = selectionRange;
-    const anchorText = editor.state.doc.textBetween(from, to, " ").slice(0, 120);
+    let anchorText = editor.state.doc.textBetween(from, to, " ").slice(0, 120);
+    // Atom blocks (excalidraw_board, etc.) have no text content. Fall back
+    // to a node-specific label so the comment doesn't display an empty
+    // quote.
+    if (!anchorText.trim()) {
+      editor.state.doc.nodesBetween(from, to, (node) => {
+        if (anchorText.trim()) return false;
+        if (node.type.name === "excalidraw_board") {
+          const label = (node.attrs.label as string | null)?.trim();
+          anchorText = label && label.length > 0 ? `Diagram: ${label}` : "Diagram";
+          return false;
+        }
+        return true;
+      });
+    }
     const { start, end } = encodeAnchorRange(editor, pair.doc, from, to);
     setPendingAnchor({
       positionY: start ?? "",
