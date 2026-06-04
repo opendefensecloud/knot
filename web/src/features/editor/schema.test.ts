@@ -43,6 +43,84 @@ describe("editor schema alignment", () => {
     editor.destroy();
   });
 
+  it("can build a representative tree without violating any content expression", () => {
+    // The presence checks above only catch missing nodes — they don't
+    // catch a content-expression like `content: 'tableRow+'` that
+    // references a node by the wrong name. This test instantiates a
+    // canonical sample of each container node via `editor.schema.nodeFromJSON`
+    // and asserts the result `check()`s clean.
+    const doc = new Y.Doc();
+    const awareness = new Awareness(doc);
+    const editor = new Editor({
+      extensions: createExtensions({
+        doc,
+        awareness,
+        user: { name: "test", color: "#000" },
+      }),
+    });
+    const sample = {
+      type: "doc",
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: "hi" }] },
+        { type: "heading", attrs: { level: 1 }, content: [{ type: "text", text: "h" }] },
+        { type: "blockquote", content: [{ type: "paragraph", content: [{ type: "text", text: "q" }] }] },
+        { type: "code_block", content: [{ type: "text", text: "x" }] },
+        { type: "horizontal_rule" },
+        {
+          type: "bullet_list",
+          content: [
+            {
+              type: "list_item",
+              content: [{ type: "paragraph", content: [{ type: "text", text: "b" }] }],
+            },
+            {
+              type: "list_item",
+              attrs: { checked: false },
+              content: [{ type: "paragraph", content: [{ type: "text", text: "task" }] }],
+            },
+          ],
+        },
+        {
+          type: "ordered_list",
+          attrs: { start: 1 },
+          content: [
+            {
+              type: "list_item",
+              content: [{ type: "paragraph", content: [{ type: "text", text: "n" }] }],
+            },
+          ],
+        },
+        {
+          type: "table",
+          content: [
+            {
+              type: "table_row",
+              content: [
+                {
+                  type: "table_header",
+                  content: [{ type: "paragraph", content: [{ type: "text", text: "h" }] }],
+                },
+              ],
+            },
+            {
+              type: "table_row",
+              content: [
+                {
+                  type: "table_cell",
+                  content: [{ type: "paragraph", content: [{ type: "text", text: "v" }] }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    // `nodeFromJSON(...).check()` throws on schema violations such as a
+    // table whose content expression doesn't accept table_row.
+    expect(() => editor.schema.nodeFromJSON(sample).check()).not.toThrow();
+    editor.destroy();
+  });
+
   it("every Tiptap mark maps to a snake_case kind from tools/schema.json", () => {
     const doc = new Y.Doc();
     const awareness = new Awareness(doc);

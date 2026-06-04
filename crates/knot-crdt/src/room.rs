@@ -658,6 +658,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn patch_task_checked_flips_attr_at_index() {
+        use yrs::{Doc, Transact, Xml, XmlElementPrelim, XmlFragment};
+        let doc = Doc::new();
+        let frag = doc.get_or_insert_xml_fragment("default");
+        // Build a doc with a bullet_list containing three list_items —
+        // first and third carry a `checked` attr (so the index over
+        // task-items is 0, 1; the second is a plain bullet, skipped).
+        {
+            let mut txn = doc.transact_mut();
+            let list = frag.push_back(&mut txn, XmlElementPrelim::empty("bullet_list"));
+            let li0 = list.push_back(&mut txn, XmlElementPrelim::empty("list_item"));
+            li0.insert_attribute(&mut txn, "checked", "false");
+            let _plain = list.push_back(&mut txn, XmlElementPrelim::empty("list_item"));
+            let li2 = list.push_back(&mut txn, XmlElementPrelim::empty("list_item"));
+            li2.insert_attribute(&mut txn, "checked", "false");
+        }
+        {
+            let mut txn = doc.transact_mut();
+            super::patch_task_checked(&frag, &mut txn, 1, true).unwrap();
+        }
+        // Inspect: only the SECOND task-item (third overall) should be
+        // checked=true.
+        let txn = doc.transact();
+        let len = frag.len(&txn);
+        let yrs::XmlOut::Element(list) = frag.get(&txn, 0).unwrap() else {
+            panic!("expected list at top of frag");
+        };
+        let _ = len;
+        let mut snapshot: Vec<Option<String>> = Vec::new();
+        for i in 0..list.len(&txn) {
+            if let Some(yrs::XmlOut::Element(li)) = list.get(&txn, i) {
+                snapshot.push(li.get_attribute(&txn, "checked"));
+            }
+        }
+        assert_eq!(snapshot, vec![Some("false".into()), None, Some("true".into())]);
+    }
+
+    #[test]
+    fn patch_task_checked_returns_err_for_out_of_range() {
+        use yrs::{Doc, Transact};
+        let doc = Doc::new();
+        let frag = doc.get_or_insert_xml_fragment("default");
+        let mut txn = doc.transact_mut();
+        let err = super::patch_task_checked(&frag, &mut txn, 5, true).unwrap_err();
+        assert!(err.starts_with("no task at index"));
+    }
+
+    #[test]
+    fn patch_task_checked_rejects_negative_index() {
+        use yrs::{Doc, Transact};
+        let doc = Doc::new();
+        let frag = doc.get_or_insert_xml_fragment("default");
+        let mut txn = doc.transact_mut();
+        assert!(super::patch_task_checked(&frag, &mut txn, -1, true).is_err());
+    }
+
     /// Build update bytes that populate the "default" XmlFragment with a
     /// single paragraph containing the given text. Uses raw yrs APIs to
     /// avoid a circular dependency on knot-markdown.

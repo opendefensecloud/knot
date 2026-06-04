@@ -803,6 +803,62 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_link_urls_handles_link_inside_table_cell() {
+        let doc = Uuid::new_v4();
+        let md = format!(
+            "| col |\n| --- |\n| [other](knot://doc/{doc}) |\n"
+        );
+        let out = rewrite_for_export(&md);
+        assert!(out.contains(&format!("docs/{doc}.md")));
+        assert!(!out.contains("knot://"));
+    }
+
+    #[test]
+    fn rewrite_link_urls_handles_link_inside_nested_list() {
+        let doc = Uuid::new_v4();
+        let md = format!(
+            "- outer\n  - inner [link](knot://doc/{doc})\n    - deeper\n"
+        );
+        let out = rewrite_for_export(&md);
+        assert!(out.contains(&format!("docs/{doc}.md")));
+    }
+
+    #[test]
+    fn rewrite_link_urls_handles_link_inside_blockquote() {
+        let doc = Uuid::new_v4();
+        let md = format!("> see [other](knot://doc/{doc})\n");
+        let out = rewrite_for_export(&md);
+        assert!(out.contains(&format!("docs/{doc}.md")));
+    }
+
+    #[test]
+    fn rewrite_leaves_user_mentions_alone() {
+        // `knot://user/<uuid>` is the mention sentinel — not a doc/board/
+        // blob ref. The export's rewrite must pass it through unchanged so
+        // the import can re-link assignees by user_id.
+        let uid = Uuid::new_v4();
+        let md = format!("- [ ] [@Alice](knot://user/{uid}) Buy milk\n");
+        let out = rewrite_for_export(&md);
+        assert_eq!(out, md);
+    }
+
+    #[test]
+    fn rewrite_skips_reference_style_links_silently() {
+        // Reference-style links have the URL defined elsewhere — pulldown
+        // reports the resolved dest_url to our mapper, but the byte range
+        // for the EVENT itself doesn't contain the URL text, so the
+        // `find()` in rewrite_link_urls misses and the link is left
+        // unchanged. Pin this behaviour so future readers know.
+        let doc = Uuid::new_v4();
+        let md = format!("[link][ref]\n\n[ref]: knot://doc/{doc}\n");
+        let out = rewrite_for_export(&md);
+        // The URL is NOT rewritten — would need a parser-level approach
+        // that walks ref definitions too. Document the limitation here.
+        assert!(out.contains(&format!("knot://doc/{doc}")));
+        assert!(!out.contains(&format!("docs/{doc}.md")));
+    }
+
+    #[test]
     fn rewrite_ignores_uuid_lookalikes_in_prose() {
         // A literal sentinel string outside a link/image context (e.g. in
         // prose or code) must NOT be rewritten — only URLs pulldown

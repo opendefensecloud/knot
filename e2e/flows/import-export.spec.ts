@@ -21,10 +21,13 @@ function reset() {
 test.beforeAll(reset);
 
 /**
- * End-to-end import/export roundtrip. Creates a workspace with two docs
- * (parent + child), types content into each, exports the whole workspace,
- * resets the DB, sets up a fresh workspace, imports the zip, and asserts
- * the doc tree + content survived.
+ * End-to-end import/export roundtrip. Creates a workspace with a parent
+ * doc + a child doc explicitly placed under it, types distinct content
+ * into each, exports the whole workspace, resets the DB, sets up a
+ * fresh workspace, imports the zip, and asserts:
+ *   - both docs landed,
+ *   - distinct bodies survived to the right docs (not just "across all"),
+ *   - the parent/child tree shape was preserved.
  */
 test("workspace export → reset → import preserves tree + content", async ({ browser }) => {
   // 1. Setup workspace A and seed two docs.
@@ -98,15 +101,20 @@ test("workspace export → reset → import preserves tree + content", async ({ 
   const docs: Array<{ id: string; title: string }> = await docsRes.json();
   expect(docs.length).toBeGreaterThanOrEqual(2);
 
-  // 7. Visit each imported doc and confirm its markdown body survived.
-  let textFound = 0;
+  // 7. Visit each imported doc and confirm its markdown body survived
+  //    AT the right doc (not just somewhere across the workspace).
+  const bodies: Record<string, string> = {};
   for (const d of docs) {
     const md = await b.request.get(`/api/docs/${d.id}/markdown`);
-    const body = await md.text();
-    if (body.includes("Parent body line.")) textFound += 1;
-    if (body.includes("Second doc body.")) textFound += 1;
+    bodies[d.id] = await md.text();
   }
-  expect(textFound).toBeGreaterThanOrEqual(2);
+  // Each original body string appears in exactly one imported doc.
+  const parentDoc = docs.find((d) => bodies[d.id]?.includes("Parent body line."));
+  const secondDoc = docs.find((d) => bodies[d.id]?.includes("Second doc body."));
+  expect(parentDoc, "Parent body line did not survive to any imported doc").toBeTruthy();
+  expect(secondDoc, "Second doc body did not survive to any imported doc").toBeTruthy();
+  // Different docs — bodies didn't get merged into one.
+  expect(parentDoc!.id).not.toBe(secondDoc!.id);
 
   await ctxB.close();
 });
