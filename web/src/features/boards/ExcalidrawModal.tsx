@@ -48,7 +48,17 @@ function loadStoredLibraryItems(): LibraryItems | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) return null;
-    return parsed as LibraryItems;
+    // Filter to entries that at least carry an `elements` array — anything
+    // else is from a foreign Excalidraw version or a hand-edited
+    // localStorage and would crash the canvas at mount.
+    const items = parsed.filter(
+      (it): it is { elements: unknown[] } =>
+        typeof it === "object" && it !== null
+        && "elements" in (it as Record<string, unknown>)
+        && Array.isArray((it as { elements: unknown }).elements),
+    );
+    if (items.length === 0) return null;
+    return items as unknown as LibraryItems;
   } catch {
     return null;
   }
@@ -217,13 +227,15 @@ export function ExcalidrawModal({
     setReady(true);
     // If the provider already has remote state by the time we attach (e.g.
     // reopening a modal in the same session), treat as synced immediately.
+    const onSynced = () => setSynced(true);
     if (provider.synced) {
       setSynced(true);
     } else {
-      provider.on("synced", () => setSynced(true));
+      provider.on("synced", onSynced);
     }
 
     return () => {
+      provider.off("synced", onSynced);
       // Cancel any pending debounced save; the close-save below is the final
       // commitment so we don't need to flush the timer.
       if (saveTimerRef.current !== null) {
@@ -263,14 +275,25 @@ export function ExcalidrawModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  // Push remote awareness → Excalidraw collaborators map.
+  // Push remote awareness → Excalidraw collaborators map. We skip rebuilds
+  // triggered by purely-local changes (our own pointer move would otherwise
+  // call `api.updateScene` on every mouse event); rebuild only when remote
+  // clients appear/leave/move.
   useEffect(() => {
     const provider = providerRef.current;
     if (!provider || !ready) return;
     const awareness = provider.awareness;
     const localId = awareness.clientID;
 
-    function syncCollaborators() {
+    function syncCollaborators(changed?: { added: number[]; updated: number[]; removed: number[] }) {
+      if (changed
+        && changed.added.length === 0
+        && changed.removed.length === 0
+        && changed.updated.every((id) => id === localId)
+      ) {
+        // Only our own state changed — no remote collaborator to refresh.
+        return;
+      }
       const api = apiRef.current;
       if (!api) return;
       const collaborators = new Map<SocketId, Collaborator>();

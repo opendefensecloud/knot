@@ -63,8 +63,10 @@ export default function TasksPage() {
     },
     onError: (_e, _t, ctx) => {
       if (ctx?.prev) qc.setQueryData(["tasks", { includeCompleted }], ctx.prev);
-    },
-    onSettled: () => {
+      // Refetch only when the optimistic write fails, so the server can
+      // reconcile. On success we trust our local flip — the server-side
+      // reindex (which runs after the room actor flushes) eventually
+      // catches up via the next manual Refresh or page reload.
       void qc.invalidateQueries({ queryKey: ["tasks"] });
     },
   });

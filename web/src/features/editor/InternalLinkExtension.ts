@@ -45,8 +45,18 @@ export const InternalLinkExtension = Extension.create<{
           },
           handleClickOn(_view, _pos, _node, _nodePos, event, _direct) {
             if (!navigate) return false;
+            // Let the browser handle modifier-clicks (open-in-new-tab etc.).
+            // Also bail on middle/right clicks so context menus still work.
+            if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)
+              return false;
+            if (event.button !== 0) return false;
             const target = event.target as HTMLElement | null;
-            const a = target?.closest<HTMLAnchorElement>("a[data-knot-doc]");
+            // Match either the decoration class OR the raw href, so a
+            // freshly-arrived remote link is navigated correctly even if a
+            // transaction lands before the decoration plugin re-runs.
+            const a = target?.closest<HTMLAnchorElement>(
+              "a[data-knot-doc], a[href^='knot://doc/']",
+            );
             if (!a) return false;
             const href = a.getAttribute("href") ?? "";
             const docId = href.startsWith(DOC_HREF_PREFIX)

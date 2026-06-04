@@ -20,6 +20,7 @@ export function ExcalidrawBoardView({ node, updateAttributes }: ReactNodeViewPro
     <NodeViewWrapper
       as="div"
       data-testid="excalidraw-board"
+      data-excalidraw-board="true"
       className="my-3 rounded-md border border-border bg-surface overflow-hidden"
     >
       <div className="px-3 py-1.5 border-b border-border bg-muted/40 flex items-center">

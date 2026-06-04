@@ -66,13 +66,17 @@ export const TaskListExtension = Extension.create({
             // Only handle clicks on list_item nodes that have the checked attr.
             if (node.type.name !== "list_item") return false;
             if (node.attrs.checked === null || node.attrs.checked === undefined) return false;
-            // The checkbox is rendered as a pseudo-element to the LEFT of the
-            // li's content (negative left offset). Treat clicks within ~24px
-            // of the li's left edge as checkbox clicks.
+            // The checkbox renders as a pseudo-element at negative left
+            // offset from the li. A click at-or-before the li's own left
+            // edge is targeting the pseudo-checkbox; clicks strictly past
+            // the text content (clientX > rect.left + 4) are content
+            // clicks. Using `clientX <= rect.left + 4` (4px slop)
+            // correctly captures nested items where the pseudo-element
+            // sits further from the viewport edge.
             const li = (event.target as HTMLElement | null)?.closest("li[data-checked]");
             if (!li) return false;
             const rect = li.getBoundingClientRect();
-            if (event.clientX - rect.left > 24) return false;
+            if (event.clientX > rect.left + 4) return false;
             const tr = view.state.tr.setNodeAttribute(
               nodePos,
               "checked",
@@ -89,7 +93,7 @@ export const TaskListExtension = Extension.create({
 
   addKeyboardShortcuts() {
     return {
-      // ⌘⇧7 / Ctrl+Shift+7 toggles the current line into a task list (the
+      // Mod+Shift+9 toggles the current line into a task list (the
       // first item gets `checked: false`). Mirrors Tiptap's default
       // bullet-list shortcut feel.
       "Mod-Shift-9": () => {

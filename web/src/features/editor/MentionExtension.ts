@@ -83,6 +83,9 @@ class MentionPopup {
 
   onKey(e: KeyboardEvent): boolean {
     if (this.el.style.display === "none") return false;
+    // Empty popup: stay invisible, don't capture keystrokes (especially
+    // Enter, which the user expects to produce a newline).
+    if (this.items.length === 0) return false;
     if (e.key === "ArrowDown") {
       this.selected = (this.selected + 1) % this.items.length;
       this.render();
@@ -95,7 +98,8 @@ class MentionPopup {
     }
     if (e.key === "Enter" || e.key === "Tab") {
       const m = this.items[this.selected];
-      if (m) this.onPick(m);
+      if (!m) return false;
+      this.onPick(m);
       return true;
     }
     if (e.key === "Escape") {
