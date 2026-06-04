@@ -126,12 +126,33 @@ function buildDecorations(
     const to = Math.max(0, Math.min(range.to, docSize));
     if (from >= to) continue;
     const isActive = storage.activeCommentId === c.thread_id || storage.activeCommentId === c.id;
-    decos.push(
-      Decoration.inline(from, to, {
-        class: `comment-highlight${isActive ? " comment-highlight--active" : ""}`,
-        "data-comment-id": c.thread_id,
-      }),
-    );
+    const cls = `comment-highlight${isActive ? " comment-highlight--active" : ""}`;
+
+    // Atom blocks (excalidraw_board, etc.) have no text content, so an
+    // inline decoration paints nothing visible. Emit a node decoration
+    // instead, which lands a class on the NodeView's outer DOM element.
+    let atomMatched = false;
+    pmDoc.nodesBetween(from, to, (node, pos) => {
+      if (node.isAtom && node.type.isBlock) {
+        decos.push(
+          Decoration.node(pos, pos + node.nodeSize, {
+            class: cls,
+            "data-comment-id": c.thread_id,
+          }),
+        );
+        atomMatched = true;
+      }
+      return true;
+    });
+
+    if (!atomMatched) {
+      decos.push(
+        Decoration.inline(from, to, {
+          class: cls,
+          "data-comment-id": c.thread_id,
+        }),
+      );
+    }
   }
   return DecorationSet.create(pmDoc, decos);
 }

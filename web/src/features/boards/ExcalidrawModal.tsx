@@ -71,6 +71,11 @@ async function saveSvgSnapshot(
       exportToSvg: ExportToSvg;
     };
     const elements = api.getSceneElements();
+    // Skip the PUT if there's nothing meaningful to render. `getSceneElements`
+    // already filters out elements with `isDeleted: true`, so empty here
+    // means the canvas is genuinely blank — saving would overwrite a real
+    // cached preview with a 256-byte white placeholder.
+    if (elements.length === 0) return;
     const appState = api.getAppState();
     const files = api.getFiles();
     const svg = await mod.exportToSvg({

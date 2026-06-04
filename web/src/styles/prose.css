@@ -189,3 +189,28 @@
   background: rgb(245 158 11 / 0.45);
   border-bottom-color: rgb(245 158 11 / 0.95);
 }
+
+/* Block-level (atom node) comment indicator: ring + corner badge.
+   Applies to e.g. excalidraw_board node-view wrappers when a comment
+   anchors to the atom itself rather than to a text range. */
+.ProseMirror [data-excalidraw-board].comment-highlight,
+.ProseMirror div.comment-highlight[data-excalidraw-board] {
+  background: transparent;
+  border-bottom: none;
+  box-shadow: 0 0 0 2px rgb(245 158 11 / 0.55);
+  position: relative;
+}
+.ProseMirror [data-excalidraw-board].comment-highlight::after {
+  content: "";
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  background: rgb(245 158 11);
+  box-shadow: 0 0 0 2px var(--color-bg, #fff);
+}
+.ProseMirror [data-excalidraw-board].comment-highlight--active {
+  box-shadow: 0 0 0 2px rgb(245 158 11 / 0.95);
+}
