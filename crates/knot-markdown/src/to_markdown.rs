@@ -158,7 +158,8 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
             // Header row: first row if any of its cells is a table_header,
             // otherwise synthesise an empty header (GFM requires one).
             let first_is_header = rows.first().is_some_and(|r| r.iter().any(|(_, _, h)| *h));
-            let (header_row, body_rows): (Vec<(String, Option<String>, bool)>, &[Vec<(String, Option<String>, bool)>]) =
+            type CellTuple = (String, Option<String>, bool);
+            let (header_row, body_rows): (Vec<CellTuple>, &[Vec<CellTuple>]) =
                 if first_is_header {
                     (rows[0].clone(), &rows[1..])
                 } else {

@@ -50,6 +50,7 @@ metrics = "0.24"
 regex = "1"
 multer = "3"
 pulldown-cmark.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Allocator: mimalloc on all platforms knot actually runs on.
 # musl's default mallocng has known throughput cliffs under multi-threaded

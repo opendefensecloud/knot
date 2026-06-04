@@ -86,6 +86,19 @@ impl BlobMeta {
             .await?;
         Ok(())
     }
+
+    /// All blob metadata records owned by `workspace_id`. Used by the
+    /// workspace export to bundle attachment bytes alongside the docs.
+    pub async fn list_for_workspace(&self, workspace_id: Uuid) -> Result<Vec<BlobMetadata>> {
+        let rows: Vec<BlobRow> = sqlx::query_as(
+            "SELECT id, workspace_id, doc_id, content_type, byte_size, sha256, original_name, created_by, created_at \
+             FROM blobs WHERE workspace_id = $1",
+        )
+        .bind(workspace_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
 }
 
 #[derive(sqlx::FromRow)]

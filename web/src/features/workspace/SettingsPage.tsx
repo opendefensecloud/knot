@@ -64,6 +64,60 @@ export default function SettingsPage() {
             <p className="text-[13px] text-fg-muted mt-1">Role: <span className="text-fg">{session.data.ok.role}</span></p>
           </section>
         )}
+        {session.data && "ok" in session.data && session.data.ok.role === "owner" && (
+          <section data-testid="workspace-export-import" className="bg-surface border border-border rounded-lg px-5 py-4">
+            <h2 className="text-[13px] font-semibold uppercase tracking-wider text-fg-muted mb-3">Backup</h2>
+            <p className="text-[13px] text-fg-muted m-0 mb-3">
+              Export the whole workspace as a zip — markdown bodies, attachments, board previews. Import a previously-exported zip to seed a new instance. Reach out to support if you need to migrate boards' edit history (v1 imports recreate boards with their preview only).
+            </p>
+            <div className="flex gap-2">
+              <a
+                data-testid="workspace-export"
+                href="/api/workspace/export"
+                download="knot-workspace-export.zip"
+                className="inline-flex items-center h-9 px-3 rounded border border-border bg-surface text-fg text-sm font-medium hover:bg-muted transition-colors"
+              >
+                Export workspace
+              </a>
+              <label
+                data-testid="workspace-import"
+                className="inline-flex items-center h-9 px-3 rounded bg-accent text-accent-fg text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer"
+              >
+                Import zip…
+                <input
+                  type="file"
+                  accept=".zip,application/zip"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    e.target.value = "";
+                    void (async () => {
+                      const csrf = document.cookie.split("; ").find((c) => c.startsWith("csrf="))?.split("=")[1] ?? "";
+                      try {
+                        const res = await fetch("/api/workspace/import", {
+                          method: "POST",
+                          credentials: "include",
+                          headers: { "X-CSRF-Token": decodeURIComponent(csrf), "Content-Type": "application/zip" },
+                          body: file,
+                        });
+                        if (!res.ok) {
+                          notify("error", `Import failed (${res.status}).`);
+                          return;
+                        }
+                        const body = (await res.json()) as { imported_docs?: number };
+                        notify("info", `Imported ${body.imported_docs ?? 0} documents.`);
+                        await qc.invalidateQueries({ queryKey: ["docs"] });
+                      } catch (err) {
+                        notify("error", `Import failed: ${String(err)}`);
+                      }
+                    })();
+                  }}
+                />
+              </label>
+            </div>
+          </section>
+        )}
         <section data-testid="change-password" className="bg-surface border border-border rounded-lg px-5 py-4">
           <h2 className="text-[13px] font-semibold uppercase tracking-wider text-fg-muted mb-3">Change password</h2>
           <form

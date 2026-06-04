@@ -18,6 +18,12 @@ pub enum NodeKind {
     Text,
     HardBreak,
     ExcalidrawBoard,
+    Image,
+    Attachment,
+    Table,
+    TableRow,
+    TableCell,
+    TableHeader,
 }
 
 impl NodeKind {
@@ -35,6 +41,12 @@ impl NodeKind {
             Self::Text => "text",
             Self::HardBreak => "hard_break",
             Self::ExcalidrawBoard => "excalidraw_board",
+            Self::Image => "image",
+            Self::Attachment => "attachment",
+            Self::Table => "table",
+            Self::TableRow => "table_row",
+            Self::TableCell => "table_cell",
+            Self::TableHeader => "table_header",
         }
     }
 }

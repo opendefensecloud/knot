@@ -9,6 +9,7 @@ pub mod blobs;
 pub mod boards;
 pub mod comments;
 pub mod docs;
+pub mod export_import;
 pub mod grants;
 pub mod history;
 pub mod markdown;
@@ -26,6 +27,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(shares::router())
         .merge(boards::router())
         .merge(tasks::router())
+        .merge(export_import::router())
         .layer(middleware::from_fn(csrf_mw))
         .layer(middleware::from_fn(require_session_mw))
 }
