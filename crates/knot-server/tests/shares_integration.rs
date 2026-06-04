@@ -358,3 +358,147 @@ async fn no_markdown_cache_503() {
     let (status, _) = anon_get_token(&app, &token).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
+
+// ---------------------------------------------------------------------------
+// Public board SVG endpoint (Plan 25 T13)
+// ---------------------------------------------------------------------------
+
+async fn anon_get_board_svg(
+    app: &axum::Router,
+    token: &str,
+    board_id: Uuid,
+) -> (StatusCode, Vec<u8>, Option<String>) {
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/p/{token}/boards/{board_id}/svg"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = r.status();
+    let ctype = r
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let bytes = r.into_body().collect().await.unwrap().to_bytes().to_vec();
+    (status, bytes, ctype)
+}
+
+/// 10. Public board SVG endpoint returns 200 with image/svg+xml for a valid
+/// token + a board that belongs to the shared doc.
+#[tokio::test(flavor = "multi_thread")]
+async fn public_board_svg_200_for_valid_token_and_board() {
+    let (state, _ws, doc_id, user_id) = state_with_seeded(WorkspaceRole::Owner).await;
+    // Seed markdown cache so the doc resolves (not strictly needed for the SVG
+    // endpoint, but keeps the test scaffolding consistent).
+    state
+        .markdown_cache
+        .as_ref()
+        .unwrap()
+        .put(doc_id, 1, "# Hi")
+        .await
+        .unwrap();
+    let boards = state.boards.as_ref().unwrap().clone();
+    let board = boards
+        .create(doc_id, user_id, Some("d".into()))
+        .await
+        .unwrap();
+    boards
+        .set_svg(board.id, b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>")
+        .await
+        .unwrap();
+
+    let app = router_with_state(state);
+    let (sid, csrf) = login_alice(&app).await;
+    let (status, json) = create_share(&app, &sid, &csrf, doc_id, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = json["token"].as_str().unwrap().to_string();
+
+    let (status, body, ctype) = anon_get_board_svg(&app, &token, board.id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        ctype.as_deref().unwrap_or("").starts_with("image/svg+xml"),
+        "expected svg content-type, got {ctype:?}"
+    );
+    assert!(body.starts_with(b"<svg"), "expected svg body");
+}
+
+/// 11. Board belonging to a *different* doc — returns 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn public_board_svg_404_for_cross_doc_board() {
+    let (state, ws_id, shared_doc_id, user_id) = state_with_seeded(WorkspaceRole::Owner).await;
+    state
+        .markdown_cache
+        .as_ref()
+        .unwrap()
+        .put(shared_doc_id, 1, "# Hi")
+        .await
+        .unwrap();
+    // A second, unrelated doc in the same workspace.
+    let other_doc = state
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(ws_id, None, "Other", "m", user_id)
+        .await
+        .unwrap();
+    let boards = state.boards.as_ref().unwrap().clone();
+    let other_board = boards
+        .create(other_doc.id, user_id, None)
+        .await
+        .unwrap();
+    boards.set_svg(other_board.id, b"<svg/>").await.unwrap();
+
+    let app = router_with_state(state);
+    let (sid, csrf) = login_alice(&app).await;
+    let (status, json) =
+        create_share(&app, &sid, &csrf, shared_doc_id, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = json["token"].as_str().unwrap().to_string();
+
+    let (status, _, _) = anon_get_board_svg(&app, &token, other_board.id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// 12. Invalid token — returns 404 (no token, no board access).
+#[tokio::test(flavor = "multi_thread")]
+async fn public_board_svg_404_for_invalid_token() {
+    let (state, _ws, doc_id, user_id) = state_with_seeded(WorkspaceRole::Owner).await;
+    let boards = state.boards.as_ref().unwrap().clone();
+    let board = boards.create(doc_id, user_id, None).await.unwrap();
+    boards.set_svg(board.id, b"<svg/>").await.unwrap();
+    let app = router_with_state(state);
+
+    let (status, _, _) = anon_get_board_svg(&app, "not-a-real-token", board.id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// 13. Board with no cached SVG returns 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn public_board_svg_404_when_no_preview() {
+    let (state, _ws, doc_id, user_id) = state_with_seeded(WorkspaceRole::Owner).await;
+    state
+        .markdown_cache
+        .as_ref()
+        .unwrap()
+        .put(doc_id, 1, "# Hi")
+        .await
+        .unwrap();
+    let boards = state.boards.as_ref().unwrap().clone();
+    let board = boards.create(doc_id, user_id, None).await.unwrap();
+    // Deliberately do NOT set_svg.
+
+    let app = router_with_state(state);
+    let (sid, csrf) = login_alice(&app).await;
+    let (status, json) = create_share(&app, &sid, &csrf, doc_id, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = json["token"].as_str().unwrap().to_string();
+
+    let (status, _, _) = anon_get_board_svg(&app, &token, board.id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
