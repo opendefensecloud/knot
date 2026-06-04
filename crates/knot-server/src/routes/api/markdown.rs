@@ -24,32 +24,54 @@ use crate::AppState;
 use crate::auth::{AuthContext, EffectiveDocRole};
 use crate::http_error::json_err;
 
+/// Errors `refresh_markdown_and_index` can return. Distinguishing the
+/// kinds lets callers decide whether to surface them: the export
+/// endpoint maps every variant to 500, while the patch endpoint logs
+/// and ignores because the index refresh is bookkeeping rather than the
+/// critical path.
+#[derive(Debug, thiserror::Error)]
+pub enum RefreshError {
+    #[error("server state missing rooms registry")]
+    NoRooms,
+    #[error("room actor unreachable for {0}")]
+    RoomUnreachable(Uuid),
+    #[error("room actor returned an error: {0}")]
+    Actor(String),
+    #[error("yrs apply: {0}")]
+    Apply(String),
+    #[error("markdown serialise: {0}")]
+    Serialise(String),
+}
+
 /// Re-render markdown from the live doc state, write to the cache, and
 /// re-run the task indexer. Used after any mutation that should be
 /// reflected on `/tasks` (markdown export, full-doc import via
 /// ApplyUpdate/ReplaceWithMarkdown, individual task patch).
 ///
-/// Best-effort: each step's failure is logged but never propagated; this
-/// is bookkeeping, not part of the critical write path.
-pub async fn refresh_markdown_and_index(state: &AppState, doc_id: Uuid) -> Result<String, ()> {
-    let rooms = state.rooms_v2.clone().ok_or(())?;
+/// Best-effort: cache-put + indexer failures are logged but never
+/// propagated. The Result reports only the steps before the cache write
+/// (state export + markdown serialise), because failures there mean
+/// callers got no usable text to return.
+pub async fn refresh_markdown_and_index(state: &AppState, doc_id: Uuid) -> Result<String, RefreshError> {
+    let rooms = state.rooms_v2.clone().ok_or(RefreshError::NoRooms)?;
     let room = rooms.acquire(doc_id).await;
     let (tx, rx) = tokio::sync::oneshot::channel();
     if room.tx.send(knot_crdt::Event::ExportState(tx)).await.is_err() {
-        return Err(());
+        return Err(RefreshError::RoomUnreachable(doc_id));
     }
     let (state_bytes, seq) = match rx.await {
         Ok(Ok(v)) => v,
-        _ => return Err(()),
+        Ok(Err(e)) => return Err(RefreshError::Actor(format!("{e:?}"))),
+        Err(_) => return Err(RefreshError::RoomUnreachable(doc_id)),
     };
     let engine = YrsEngine;
     let transient = engine.new_doc();
-    if engine.apply_update(&transient, &state_bytes).is_err() {
-        return Err(());
+    if let Err(e) = engine.apply_update(&transient, &state_bytes) {
+        return Err(RefreshError::Apply(format!("{e:?}")));
     }
     let text = match knot_markdown::to_markdown::serialise(&engine, &transient) {
         Ok(md) => md,
-        Err(_) => return Err(()),
+        Err(e) => return Err(RefreshError::Serialise(format!("{e:?}"))),
     };
     if let Some(cache) = state.markdown_cache.clone()
         && let Err(e) = cache.put(doc_id, seq, &text).await
@@ -90,8 +112,12 @@ pub(super) async fn export_inline(
     if req.extensions().get::<EffectiveDocRole>().is_none() {
         return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
     }
-    let Ok(text) = refresh_markdown_and_index(&state, doc_id).await else {
-        return internal();
+    let text = match refresh_markdown_and_index(&state, doc_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(error=?e, %doc_id, "md export refresh");
+            return internal();
+        }
     };
     Response::builder()
         .status(StatusCode::OK)

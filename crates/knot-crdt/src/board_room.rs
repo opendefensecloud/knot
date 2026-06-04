@@ -17,25 +17,7 @@ use uuid::Uuid;
 
 use crate::engine::{DocHandle, Engine, EngineError};
 
-/// Wrap raw yrs bytes in a y-sync SYNC_UPDATE frame for the WS broadcast.
-///
-///   [MSG_SYNC=0] [SYNC_UPDATE=2] [varuint len] [yrs bytes]
-fn wrap_sync_update(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(payload.len() + 4);
-    out.push(0u8); // MSG_SYNC
-    out.push(2u8); // SYNC_UPDATE
-    let mut v = payload.len() as u64;
-    loop {
-        if v < 0x80 {
-            out.push(v as u8);
-            break;
-        }
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.extend_from_slice(payload);
-    out
-}
+use crate::protocol::wrap_sync_update;
 
 pub type ConnId = Uuid;
 

@@ -6,6 +6,7 @@ pub mod bus_pg;
 pub mod engine;
 pub mod gc;
 pub mod presence;
+pub mod protocol;
 pub mod registry;
 pub mod room;
 pub mod snapshot;

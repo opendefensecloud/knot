@@ -336,11 +336,13 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         }
                         continue;
                     }
-                    let parent_tag = stack
-                        .last()
-                        .expect("text outside container")
-                        .tag()
-                        .to_string();
+                    // Defensive: pulldown can emit Text events outside any
+                    // open block in pathological inputs (malformed user
+                    // imports). Drop the text rather than panic.
+                    let Some(parent) = stack.last() else {
+                        continue;
+                    };
+                    let parent_tag = parent.tag().to_string();
 
                     // Code block bodies have no marks; append as plain text.
                     if parent_tag == "code_block" {
@@ -348,14 +350,13 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         // the to_markdown serializer adds its own newline before ```.
                         // Strip the trailing newline to avoid double-newline.
                         let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
-                        let parent = stack.last().unwrap();
                         let text_ref = ensure_text_child(parent, &mut txn);
                         let pos = text_ref.len(&txn);
                         text_ref.insert(&mut txn, pos, &text);
                     } else if parent_tag == "list_item" {
                         // Tight list: pulldown-cmark emits Text directly inside Item
                         // (no paragraph wrapper). Our schema requires list_item → paragraph.
-                        let para = ensure_para_child(stack.last().unwrap(), &mut txn);
+                        let para = ensure_para_child(parent, &mut txn);
                         let attrs = attrs_from_marks(&active_marks);
                         let text_ref = ensure_text_child(&para, &mut txn);
                         let pos = text_ref.len(&txn);
@@ -364,15 +365,15 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         // Inline text in a paragraph/heading.
                         // Attach current active marks as Attrs.
                         let attrs = attrs_from_marks(&active_marks);
-                        let parent = stack.last().unwrap();
                         let text_ref = ensure_text_child(parent, &mut txn);
                         let pos = text_ref.len(&txn);
                         text_ref.insert_with_attributes(&mut txn, pos, &text, attrs);
                     }
                 }
                 Event::Code(s) => {
-                    // Inline code becomes a "code" mark.
-                    let parent = stack.last().expect("code outside container");
+                    let Some(parent) = stack.last() else {
+                        continue;
+                    };
                     let mut marks_with_code = active_marks.clone();
                     marks_with_code.push(("code".into(), HashMap::new()));
                     let attrs = attrs_from_marks(&marks_with_code);
@@ -387,7 +388,9 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     text_ref.insert_with_attributes(&mut txn, pos, &s, attrs);
                 }
                 Event::HardBreak => {
-                    let parent = stack.last().expect("hard_break outside container");
+                    let Some(parent) = stack.last() else {
+                        continue;
+                    };
                     parent.push_back(&mut txn, XmlElementPrelim::empty("hard_break"));
                 }
                 Event::Rule => {
@@ -426,7 +429,7 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     if in_bq_para {
                         // End current paragraph, start new one inside the blockquote.
                         stack.pop();
-                        let bq = stack.last().expect("blockquote on stack");
+                        let Some(bq) = stack.last() else { continue };
                         let new_para = bq.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
                         stack.push(new_para);
                     } else if let Some(parent) = stack.last() {
@@ -567,3 +570,40 @@ fn attrs_from_marks(marks: &[(String, HashMap<String, Any>)]) -> Attrs {
     }
     attrs
 }
+
+
+#[cfg(test)]
+mod panic_resistance {
+    use super::parse;
+
+    /// Hand-picked pathological markdown inputs that historically (or
+    /// plausibly) emit text/code/hardbreak events with an empty stack.
+    /// These used to panic via `stack.last().unwrap()`; the dropping
+    /// guards keep them well-formed (parse returns Ok, body may be empty).
+    #[test]
+    fn does_not_panic_on_pathological_inputs() {
+        let inputs: &[&str] = &[
+            "",
+            "
+",
+            "   ",
+            "[](knot://board/00000000-0000-0000-0000-000000000000.svg)",
+            "![](knot://board/00000000-0000-0000-0000-000000000000.svg)",
+            // Empty link text + unusual nesting
+            "[]()",
+            "**
+
+_",
+            // Bare backslashes / control chars
+            "\\ {0} {1} {2}",
+            // Just a hard break / soft break
+            "  
+",
+        ];
+        for md in inputs {
+            // Each call must return — panic is the failure mode under test.
+            let _ = parse(md);
+        }
+    }
+}
+

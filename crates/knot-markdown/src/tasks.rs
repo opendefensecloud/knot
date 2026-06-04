@@ -74,17 +74,16 @@ pub fn extract_tasks(md: &str) -> Vec<Task> {
             }
             Event::Text(t) | Event::Code(t) => {
                 if let Some(s) = current.as_mut() {
-                    // Strip a leading "@DisplayName " that came from a
-                    // mention link — the user_id is the truth, the display
-                    // text is human-readable noise for the index.
-                    let mut piece: &str = &t;
-                    if s.assignee_user_id.is_some() && link_depth > 0 {
-                        piece = piece.trim_start_matches('@');
+                    // Suppress text events that are the display content of a
+                    // pending mention link — once promoted to an assignee
+                    // the `@DisplayName` chip is metadata, not task body.
+                    if pending_assignee.is_some() && link_depth > 0 {
+                        continue;
                     }
                     if !s.text.is_empty() && !s.text.ends_with(' ') {
                         s.text.push(' ');
                     }
-                    s.text.push_str(piece);
+                    s.text.push_str(&t);
                 }
             }
             Event::End(TagEnd::Item) => {
@@ -155,9 +154,9 @@ mod tests {
         let got = extract_tasks(&md);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].assignee_user_id, Some(uid));
-        // The text should be the trimmed remainder; the @-prefix from the
-        // mention's link text is stripped.
-        assert!(got[0].text.contains("Buy milk"));
+        // The mention's display text is metadata, not task body — only the
+        // remainder lands in `text`.
+        assert_eq!(got[0].text, "Buy milk");
     }
 
     #[test]

@@ -102,12 +102,20 @@ async fn export_workspace(State(state): State<AppState>, req: Request) -> Respon
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
+    // Owner-only — exports contain everyone's content; treating it as a
+    // member-readable endpoint would leak across grants.
+    use knot_storage::WorkspaceRole;
+    let Some(workspaces) = state.workspaces.clone() else { return internal(); };
+    match workspaces.get_member_role(ctx.workspace_id, ctx.user_id).await {
+        Ok(Some(WorkspaceRole::Owner)) => {}
+        _ => return json_err(StatusCode::FORBIDDEN, "acl.owner_required", ""),
+    }
     let Some(docs) = state.docs.clone() else { return internal(); };
     let all_docs = match docs.list_alive(ctx.workspace_id).await {
         Ok(d) => d,
         Err(_) => return internal(),
     };
-    write_export_zip(&state, all_docs, /*reparent_roots=*/ false).await
+    write_export_zip(&state, ctx.workspace_id, all_docs, /*reparent_roots=*/ false).await
 }
 
 /// Single-doc export. With `descendants=true`, includes every descendant
@@ -138,35 +146,60 @@ async fn export_doc(
     };
     let subset: Vec<_> = if q.descendants {
         let ids = collect_subtree_ids(doc_id, &all_docs);
-        all_docs.into_iter().filter(|d| ids.contains(&d.id)).collect()
+        // Per-descendant ACL re-check. Parent-readable + child-private is a
+        // legal grant in knot today, and we don't want subtree export to
+        // leak the child. Skip descendants the caller can't read; the
+        // tree shape gets pruned at the lowest readable ancestor.
+        let mut keep: Vec<knot_storage::Document> = Vec::new();
+        for d in all_docs.into_iter().filter(|d| ids.contains(&d.id)) {
+            if d.id == doc_id {
+                keep.push(d);
+                continue;
+            }
+            match acl.effective_role(ctx.workspace_id, d.id, ctx.user_id).await {
+                Ok(Some(_)) => keep.push(d),
+                _ => continue,
+            }
+        }
+        keep
     } else {
         all_docs.into_iter().filter(|d| d.id == doc_id).collect()
     };
     if subset.is_empty() {
         return json_err(StatusCode::NOT_FOUND, "doc.not_found", "");
     }
-    write_export_zip(&state, subset, /*reparent_roots=*/ true).await
+    write_export_zip(&state, ctx.workspace_id, subset, /*reparent_roots=*/ true).await
 }
 
-/// DFS collect of `root` + descendants from the flat doc list.
+/// BFS collect of `root` + descendants from the flat doc list. Single O(N)
+/// pass via a parent → children index, then a queue starting from `root`.
 fn collect_subtree_ids(root: Uuid, all: &[knot_storage::Document]) -> std::collections::HashSet<Uuid> {
-    let mut out = std::collections::HashSet::<Uuid>::new();
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut children: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for d in all {
+        if let Some(p) = d.parent_id {
+            children.entry(p).or_default().push(d.id);
+        }
+    }
+    let mut out = HashSet::<Uuid>::new();
+    let mut q = VecDeque::<Uuid>::new();
     out.insert(root);
-    loop {
-        let added = all
-            .iter()
-            .filter(|d| out.contains(&d.parent_id.unwrap_or_default()) || (d.parent_id.is_some_and(|p| out.contains(&p))))
-            .map(|d| d.id)
-            .filter(|id| !out.contains(id))
-            .collect::<Vec<_>>();
-        if added.is_empty() { break; }
-        out.extend(added);
+    q.push_back(root);
+    while let Some(id) = q.pop_front() {
+        if let Some(kids) = children.get(&id) {
+            for k in kids {
+                if out.insert(*k) {
+                    q.push_back(*k);
+                }
+            }
+        }
     }
     out
 }
 
 async fn write_export_zip(
     state: &AppState,
+    workspace_id: Uuid,
     all_docs: Vec<knot_storage::Document>,
     reparent_roots: bool,
 ) -> Response {
@@ -251,11 +284,9 @@ async fn write_export_zip(
         }
 
         // Attachments — list every blob in the workspace and filter to
-        // those that belong to docs included in the export.
-        let workspace_id = match all_docs.first() {
-            Some(d) => d.workspace_id,
-            None => return internal(),
-        };
+        // those that belong to docs included in the export. Empty workspace
+        // is fine: the loop just produces an empty list and we end up with
+        // a zip containing only `index.json`.
         if let Ok(metas) = blob_meta.list_for_workspace(workspace_id).await {
             for m in metas.into_iter().filter(|m| included_ids.contains(&m.doc_id)) {
                 manifest.attachments.push(AttachmentEntry {
@@ -371,6 +402,11 @@ async fn import(
     //    Topological sort by parent_id chain.
     let docs_sorted = sort_docs_by_depth(&manifest.docs);
     for d in &docs_sorted {
+        // Reject malformed doc ids before letting them flow through the
+        // remap. They'd be harmless (the doc_remap key is never used as a
+        // filesystem path on import — only as an interned manifest key),
+        // but defense in depth.
+        if Uuid::parse_str(&d.id).is_err() { continue; }
         // Roots of the import (no parent_id, or parent_id not in the
         // manifest) get grafted under the caller's target parent, if any.
         let new_parent = d
@@ -401,18 +437,27 @@ async fn import(
     for a in &manifest.attachments {
         let new_id = Uuid::new_v4();
         let Some(new_doc_id) = doc_remap.get(&a.doc_id).copied() else { continue };
+        // The manifest id must be a real UUID — anything else means
+        // either a malformed zip or a path-confusion attempt. Skip rather
+        // than feed unvalidated text into a zip lookup.
+        if Uuid::parse_str(&a.id).is_err() { continue; }
         let Some(bytes_vec) = read_zip_entry(&mut zip, &format!("attachments/{}", a.id)) else {
             continue;
         };
-        // sha256 of bytes for the metadata row.
+        // Trust the BYTES, not the manifest. Recompute sha + size from the
+        // unzipped payload, and pick a content-type that respects an
+        // allowlist (defaults to application/octet-stream for anything
+        // unfamiliar — prevents the manifest from declaring text/html for
+        // a JS file, etc.).
         use sha2::{Digest, Sha256};
         let sha = Sha256::digest(&bytes_vec).to_vec();
+        let content_type = sanitize_content_type(&a.content_type);
         let meta = knot_storage::BlobMetadata {
             id: new_id,
             workspace_id: ctx.workspace_id,
             doc_id: new_doc_id,
-            content_type: a.content_type.clone(),
-            byte_size: a.byte_size,
+            content_type: content_type.clone(),
+            byte_size: bytes_vec.len() as i64,
             sha256: sha,
             original_name: a.original_name.clone(),
             created_by: ctx.user_id,
@@ -420,7 +465,7 @@ async fn import(
         };
         if blob_meta.insert(&meta).await.is_err() { continue; }
         if blob_store
-            .put(new_id, &bytes_vec, &a.content_type)
+            .put(new_id, &bytes_vec, &content_type)
             .await
             .is_err()
         {
@@ -434,6 +479,7 @@ async fn import(
     //    NOT seeded in v1, so the board's content history is fresh.
     for b in &manifest.boards {
         let Some(new_doc_id) = doc_remap.get(&b.doc_id).copied() else { continue };
+        if Uuid::parse_str(&b.id).is_err() { continue; }
         let created = match boards
             .create(new_doc_id, ctx.user_id, b.label.clone())
             .await
@@ -487,7 +533,14 @@ async fn import(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({ "imported_docs": manifest.docs.len() }))
+            serde_json::to_vec(&serde_json::json!({
+                // Actual count of docs that landed, not what the manifest
+                // claimed — partial failures are surfaced rather than
+                // hidden behind a cheerful number.
+                "imported_docs": doc_remap.len(),
+                "imported_attachments": blob_remap.len(),
+                "imported_boards": board_remap.len(),
+            }))
                 .unwrap_or_default(),
         ))
         .unwrap()
@@ -497,13 +550,26 @@ async fn import(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Hard per-entry decompression cap to defend against zip-bombs. The
+/// compressed body is already capped at 50 MiB (see import handler), so
+/// any individual entry above this limit is almost certainly malicious.
+const MAX_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
+
 fn read_zip_entry<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     name: &str,
 ) -> Option<Vec<u8>> {
-    let mut entry = zip.by_name(name).ok()?;
-    let mut out = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut out).ok()?;
+    let entry = zip.by_name(name).ok()?;
+    // Reject entries that DECLARE absurd decompressed sizes outright —
+    // their `size()` is attacker-controlled but lets us short-circuit
+    // before allocating anything. The take() limit below catches lies.
+    if entry.size() > MAX_ENTRY_BYTES {
+        return None;
+    }
+    let cap = (entry.size() as usize).min(MAX_ENTRY_BYTES as usize);
+    let mut out = Vec::with_capacity(cap);
+    let mut limited = entry.take(MAX_ENTRY_BYTES);
+    limited.read_to_end(&mut out).ok()?;
     Some(out)
 }
 
@@ -664,6 +730,30 @@ fn remap_sentinels(
     board_remap: &HashMap<String, Uuid>,
 ) -> String {
     rewrite_link_urls(md, |u| local_path_to_url(u, doc_remap, blob_remap, board_remap))
+}
+
+/// Conservative content-type allowlist for imported attachments. Any
+/// type not on this list collapses to `application/octet-stream` so a
+/// manifest can't trick the server into serving `text/html` (XSS) or
+/// `image/svg+xml` (script-in-SVG) for arbitrary uploaded bytes. The
+/// real defense for SVG is the public-share path (which is fine — it's
+/// just bytes through CORS-friendly headers); this clamp protects the
+/// authenticated `/api/blobs/:id` path.
+fn sanitize_content_type(declared: &str) -> String {
+    // Strip parameters (`text/plain; charset=utf-8` → `text/plain`).
+    let base = declared.split(';').next().unwrap_or("").trim().to_lowercase();
+    const ALLOWED: &[&str] = &[
+        "image/png", "image/jpeg", "image/gif", "image/webp",
+        "application/pdf",
+        "text/plain", "text/markdown", "text/csv",
+        "application/json",
+        "application/zip",
+    ];
+    if ALLOWED.contains(&base.as_str()) {
+        base
+    } else {
+        "application/octet-stream".to_string()
+    }
 }
 
 fn internal() -> Response {
