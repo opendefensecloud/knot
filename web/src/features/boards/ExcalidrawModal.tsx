@@ -485,15 +485,17 @@ export function ExcalidrawModal({
           data-testid="excalidraw-modal-label"
           aria-label="Diagram title"
         />
-        <SyncStatus sync={{ status: boardStatus, pendingBytes: boardPending }} />
-        <button
-          type="button"
-          className="text-sm text-fg-muted hover:text-fg shrink-0"
-          onClick={onClose}
-          data-testid="excalidraw-modal-close"
-        >
-          Close
-        </button>
+        <div className="flex items-center gap-3 shrink-0">
+          <SyncStatus sync={{ status: boardStatus, pendingBytes: boardPending }} />
+          <button
+            type="button"
+            className="text-sm text-fg-muted hover:text-fg"
+            onClick={onClose}
+            data-testid="excalidraw-modal-close"
+          >
+            Close
+          </button>
+        </div>
       </div>
       <div className="flex-1 bg-white">
         {ready && synced && initialData ? (
