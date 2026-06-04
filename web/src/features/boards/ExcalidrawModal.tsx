@@ -27,6 +27,7 @@ import * as Y from "yjs";
 import type {
   Collaborator,
   ExcalidrawImperativeAPI,
+  LibraryItems,
   SocketId,
 } from "@excalidraw/excalidraw/types";
 import type { ExcalidrawElement } from "@excalidraw/excalidraw/element/types";
@@ -39,6 +40,27 @@ import { colorFor } from "../../components/ui/Avatar";
 import { PENDING_LIBRARY_KEY } from "./LibraryReturn";
 
 const LIBRARY_RETURN_URL = `${window.location.origin}/library-return`;
+const LIBRARY_ITEMS_KEY = "knot.boardLibraryItems";
+
+function loadStoredLibraryItems(): LibraryItems | null {
+  try {
+    const raw = window.localStorage.getItem(LIBRARY_ITEMS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    return parsed as LibraryItems;
+  } catch {
+    return null;
+  }
+}
+
+function persistLibraryItems(items: readonly unknown[]): void {
+  try {
+    window.localStorage.setItem(LIBRARY_ITEMS_KEY, JSON.stringify(items));
+  } catch (err) {
+    console.warn("library persist failed", err);
+  }
+}
 
 type LibraryMessage = { type: "knot:add-library"; libraryUrl: string; token: string | null };
 
@@ -367,6 +389,7 @@ export function ExcalidrawModal({
   // pushToExcalidraw inside yBinding; initialData is read-once at mount.
   const [initialData, setInitialData] = useState<{
     elements: ExcalidrawElement[];
+    libraryItems: LibraryItems;
     scrollToContent: boolean;
   } | null>(null);
   useEffect(() => {
@@ -376,9 +399,18 @@ export function ExcalidrawModal({
     const elementsMap = doc.getMap<ExcalidrawElement>("elements");
     setInitialData({
       elements: Array.from(elementsMap.values()),
+      libraryItems: loadStoredLibraryItems() ?? [],
       scrollToContent: true,
     });
   }, [synced]);
+
+  // Persist library mutations. Excalidraw doesn't auto-save the library
+  // when embedded — the host owns persistence. Saving on every change
+  // means imports survive refresh and propagate to new boards on the
+  // next mount (via initialData.libraryItems above).
+  const handleLibraryChange = useCallback((items: readonly unknown[]) => {
+    persistLibraryItems(items);
+  }, []);
 
   function handlePointerUpdate(payload: {
     pointer: { x: number; y: number; tool: "pointer" | "laser" };
@@ -435,6 +467,7 @@ export function ExcalidrawModal({
               excalidrawAPI={handleApi}
               initialData={initialData}
               onChange={handleChange}
+              onLibraryChange={handleLibraryChange}
               onPointerUpdate={handlePointerUpdate}
               isCollaborating={false}
               libraryReturnUrl={LIBRARY_RETURN_URL}
