@@ -123,11 +123,11 @@ export function EditorToolbar({
         <Heading3 size={15} aria-hidden />
       </Btn>
       <Sep />
-      <Btn testId="toolbar-bullet-list" label="Bullet list" active={editor.isActive("bulletList")}
+      <Btn testId="toolbar-bullet-list" label="Bullet list" active={editor.isActive("bullet_list")}
         onClick={() => c().toggleBulletList().run()}>
         <List size={15} aria-hidden />
       </Btn>
-      <Btn testId="toolbar-ordered-list" label="Ordered list" active={editor.isActive("orderedList")}
+      <Btn testId="toolbar-ordered-list" label="Ordered list" active={editor.isActive("ordered_list")}
         onClick={() => c().toggleOrderedList().run()}>
         <ListOrdered size={15} aria-hidden />
       </Btn>
@@ -166,9 +166,9 @@ export function EditorToolbar({
       <Btn
         testId="toolbar-task-list"
         label="Task list"
-        active={editor.isActive("listItem", { checked: false }) || editor.isActive("listItem", { checked: true })}
+        active={editor.isActive("list_item", { checked: false }) || editor.isActive("list_item", { checked: true })}
         onClick={() =>
-          c().toggleList("bulletList", "listItem").updateAttributes("listItem", { checked: false }).run()
+          c().toggleList("bullet_list", "list_item").updateAttributes("list_item", { checked: false }).run()
         }
       >
         <ListChecks size={15} aria-hidden />

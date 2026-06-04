@@ -17,7 +17,7 @@ export const TaskListExtension = Extension.create({
   addGlobalAttributes() {
     return [
       {
-        types: ["listItem"],
+        types: ["list_item"],
         attributes: {
           checked: {
             default: null,
@@ -41,7 +41,7 @@ export const TaskListExtension = Extension.create({
   addInputRules() {
     // Match "[ ] " or "[x] " at the very start of a list item. Sets the
     // `checked` attribute and removes the typed marker.
-    const itemType = this.editor?.schema.nodes.listItem;
+    const itemType = this.editor?.schema.nodes.list_item;
     if (!itemType) return [];
     return [
       wrappingInputRule({
@@ -64,7 +64,7 @@ export const TaskListExtension = Extension.create({
         props: {
           handleClickOn(view, _pos, node, nodePos, event) {
             // Only handle clicks on list_item nodes that have the checked attr.
-            if (node.type.name !== "listItem") return false;
+            if (node.type.name !== "list_item") return false;
             if (node.attrs.checked === null || node.attrs.checked === undefined) return false;
             // The checkbox is rendered as a pseudo-element to the LEFT of the
             // li's content (negative left offset). Treat clicks within ~24px
@@ -98,8 +98,8 @@ export const TaskListExtension = Extension.create({
         return ed
           .chain()
           .focus()
-          .toggleList("bulletList", "listItem")
-          .updateAttributes("listItem", { checked: false })
+          .toggleList("bullet_list", "list_item")
+          .updateAttributes("list_item", { checked: false })
           .run();
       },
     };

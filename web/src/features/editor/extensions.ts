@@ -11,6 +11,13 @@ import { Attachment } from "./nodes/AttachmentNode";
 import { ExcalidrawBoard } from "./nodes/ExcalidrawBoard";
 import { MermaidCodeBlock } from "./nodes/MermaidCodeBlock";
 import { CommentsHighlightExtension } from "./CommentsHighlightExtension";
+import {
+  KnotBulletList,
+  KnotHardBreak,
+  KnotHorizontalRule,
+  KnotListItem,
+  KnotOrderedList,
+} from "./SchemaNameOverrides";
 import { TaskListExtension } from "./TaskListExtension";
 import { InternalLinkExtension } from "./InternalLinkExtension";
 import { MentionExtension, type MentionMember } from "./MentionExtension";
@@ -36,7 +43,19 @@ export function createExtensions(opts: {
     StarterKit.configure({
       history: false,
       codeBlock: false,
+      // Disable the camelCase node defaults; we re-add snake_case versions
+      // below so the Y.XmlFragment matches our canonical schema.
+      bulletList: false,
+      orderedList: false,
+      listItem: false,
+      hardBreak: false,
+      horizontalRule: false,
     }),
+    KnotBulletList,
+    KnotOrderedList,
+    KnotListItem,
+    KnotHardBreak,
+    KnotHorizontalRule,
     MermaidCodeBlock,
     Link.configure({
       openOnClick: false,
