@@ -303,7 +303,13 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
     <>
       <PresenceBar presence={presence} />
 
-      {canEdit && <EditorToolbar editor={editor} docId={docId} />}
+      {canEdit && (
+        <EditorToolbar
+          editor={editor}
+          docId={docId}
+          onUploadFiles={(files) => { void uploadAndInsert(files); }}
+        />
+      )}
       <div
         data-testid="editor-host"
         className="relative"

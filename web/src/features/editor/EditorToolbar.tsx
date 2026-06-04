@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 
 import type { Editor } from "@tiptap/react";
 import { useQuery } from "@tanstack/react-query";
@@ -16,6 +16,7 @@ import {
   List,
   ListChecks,
   ListOrdered,
+  Paperclip,
   Table as TableIcon,
   Network,
   PenSquare,
@@ -56,7 +57,16 @@ function Sep() {
   return <span className="mx-1 h-5 w-px bg-border" aria-hidden />;
 }
 
-export function EditorToolbar({ editor, docId }: { editor: Editor | null; docId: string }) {
+export function EditorToolbar({
+  editor,
+  docId,
+  onUploadFiles,
+}: {
+  editor: Editor | null;
+  docId: string;
+  onUploadFiles?: (files: File[]) => void;
+}) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [linkOpen, setLinkOpen] = useState(false);
   const [linkUrl, setLinkUrl] = useState("");
   const [linkMode, setLinkMode] = useState<"url" | "doc">("url");
@@ -121,6 +131,27 @@ export function EditorToolbar({ editor, docId }: { editor: Editor | null; docId:
         onClick={() => c().toggleOrderedList().run()}>
         <ListOrdered size={15} aria-hidden />
       </Btn>
+      <Btn
+        testId="toolbar-attachment"
+        label="Attach file"
+        disabled={!onUploadFiles}
+        onClick={() => fileInputRef.current?.click()}
+      >
+        <Paperclip size={15} aria-hidden />
+      </Btn>
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        data-testid="toolbar-attachment-input"
+        onChange={(e) => {
+          const files = Array.from(e.target.files ?? []);
+          if (files.length > 0) onUploadFiles?.(files);
+          // Reset so the same file can be re-uploaded.
+          e.target.value = "";
+        }}
+      />
       <Btn
         testId="toolbar-table"
         label="Insert table"
