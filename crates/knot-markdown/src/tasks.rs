@@ -74,18 +74,18 @@ pub fn extract_tasks(md: &str) -> Vec<Task> {
                 {
                     pending_assignee = Some(id);
                 }
-                // Promote a knot://time link to the task's due_at when it
-                // follows an explicit "by"/"due" cue in the preceding text.
-                // Whether or not we capture (only the first cued chip
-                // wins), suppress *every* knot://time chip's display
-                // text — the chip is presentation, not body content.
+                // Promote the FIRST knot://time link in a task to its
+                // due_at. The explicit "by"/"due" cue was too strict
+                // in practice — users add a datetime chip and expect
+                // it to surface on the /tasks page without ceremony.
+                // Subsequent chips are still suppressed from the body
+                // (the chip is presentation, not text).
                 if let Some(s) = current.as_mut()
                     && s.is_task
                     && let Some(rest) = dest_url.strip_prefix(TIME_HREF_PREFIX)
                 {
                     inside_due_link = true;
                     if s.due_at.is_none()
-                        && trailing_due_cue(&s.text)
                         && let Ok(ts) = DateTime::parse_from_rfc3339(rest.trim_end_matches('/'))
                     {
                         s.due_at = Some(ts.with_timezone(&Utc));
@@ -154,41 +154,6 @@ struct TaskState {
     text: String,
 }
 
-/// Returns true when `s` (trimmed of trailing whitespace) ends with a
-/// word that signals an upcoming due-date — "by" or "due", case
-/// insensitive. Bytewise compare so we don't pull in a regex crate.
-fn trailing_due_cue(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    let mut end = bytes.len();
-    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    let tail = &bytes[..end];
-    // The cue word must be preceded by start-of-string or whitespace so
-    // we don't trip on "ruby" / "subdue".
-    let starts_word = |start: usize| start == 0 || tail[start - 1].is_ascii_whitespace();
-    let lower = |b: u8| b.to_ascii_lowercase();
-    if tail.len() >= 2 {
-        let start = tail.len() - 2;
-        if starts_word(start)
-            && lower(tail[start]) == b'b'
-            && lower(tail[start + 1]) == b'y'
-        {
-            return true;
-        }
-    }
-    if tail.len() >= 3 {
-        let start = tail.len() - 3;
-        if starts_word(start)
-            && lower(tail[start]) == b'd'
-            && lower(tail[start + 1]) == b'u'
-            && lower(tail[start + 2]) == b'e'
-        {
-            return true;
-        }
-    }
-    false
-}
 
 #[cfg(test)]
 mod tests {
@@ -245,57 +210,38 @@ mod tests {
     }
 
     #[test]
-    fn extract_due_at_with_by_cue() {
+    fn extract_due_at_from_any_inline_time_chip() {
+        // Any inline knot://time chip in a task is the due_at — the
+        // explicit "by"/"due" cue used to be required but was too
+        // strict in practice; users just add a chip and expect it to
+        // show up on /tasks.
         let md = "- [ ] Ship the report by [Jun 4](knot://time/2026-06-04T17:00:00Z)\n";
         let got = extract_tasks(md);
         assert_eq!(got.len(), 1);
         let ts = got[0].due_at.expect("due_at should be Some");
         assert_eq!(ts.to_rfc3339(), "2026-06-04T17:00:00+00:00");
-        // The chip's display text is metadata, not body.
-        assert_eq!(got[0].text, "Ship the report by");
+        // Chip's display text is suppressed; body keeps the cue word.
+        assert!(!got[0].text.contains("Jun 4"));
+        assert!(got[0].text.contains("Ship the report"));
     }
 
     #[test]
-    fn extract_due_at_with_due_cue_case_insensitive() {
-        let md = "- [ ] Review pr DUE [tomorrow](knot://time/2026-06-05T09:00:00Z)\n";
-        let got = extract_tasks(md);
-        assert_eq!(got.len(), 1);
-        assert!(got[0].due_at.is_some());
-    }
-
-    #[test]
-    fn extract_ignores_bare_datetime_without_cue() {
+    fn extract_due_at_without_a_cue_word() {
         let md = "- [ ] Meeting at [3pm](knot://time/2026-06-04T15:00:00Z)\n";
         let got = extract_tasks(md);
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].due_at, None);
+        assert!(got[0].due_at.is_some());
     }
 
     #[test]
-    fn extract_suppresses_second_time_chip_even_without_cue() {
-        // First chip with cue → captured as due_at. Second chip without
-        // a cue → its display text is still suppressed so it doesn't
-        // leak into the task body.
+    fn extract_first_chip_wins_and_later_chips_are_suppressed() {
         let md = "- [ ] Ship by [Jun 4](knot://time/2026-06-04T17:00:00Z) and review at [3pm](knot://time/2026-06-04T15:00:00Z)\n";
         let got = extract_tasks(md);
         assert_eq!(got.len(), 1);
-        assert!(got[0].due_at.is_some());
-        // Neither chip's display text leaks; pulldown's surrounding-space
-        // events still concatenate to a double space, which is fine for
-        // the body's purposes (the extractor doesn't normalise further).
+        let ts = got[0].due_at.expect("due_at should be Some");
+        assert_eq!(ts.to_rfc3339(), "2026-06-04T17:00:00+00:00");
         assert!(!got[0].text.contains("Jun 4"));
         assert!(!got[0].text.contains("3pm"));
-        assert!(got[0].text.contains("Ship by"));
-        assert!(got[0].text.contains("review at"));
-    }
-
-    #[test]
-    fn extract_ignores_due_in_middle_of_word() {
-        // "subdue" ends in "due" but the cue must be a standalone word.
-        let md = "- [ ] subdue [link](knot://time/2026-06-04T15:00:00Z)\n";
-        let got = extract_tasks(md);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].due_at, None);
     }
 
     #[test]

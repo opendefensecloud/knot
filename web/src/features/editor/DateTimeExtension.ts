@@ -287,21 +287,28 @@ export const DateTimeExtension = Extension.create({
         editor: this.editor,
         pluginKey: new PluginKey("knotDateTimeSuggestion"),
         char: "/",
-        // Tiptap's Suggestion matches the trigger char + everything
-        // typed after it, so for `//` the matched range covers BOTH
-        // slashes and `range.from` sits at the *first* `/`. Single
-        // `/` is left free for a future slash-command system: we
-        // only allow when the second char in the matched range is
-        // also `/`.
+        // Tiptap's Suggestion only triggers when the char before the
+        // trigger matches one of `allowedPrefixes`. The default is
+        // [' '], which means single `/` after a space fires but a
+        // second `/` (preceded by the first one) never matches. We
+        // want the *opposite* — fire only when preceded by another
+        // `/`, leaving single `/` free for a future slash-command
+        // system. Set allowedPrefixes to ['/'] to invert.
+        allowedPrefixes: ["/"],
+        // Belt-and-braces: confirm the previous char really is `/`
+        // (Suggestion's prefix check uses regex character classes
+        // and we want to be explicit here).
         allow: ({ state, range }) => {
-          const matched = state.doc.textBetween(range.from, range.to, "\n", "\0");
-          return matched.startsWith("//");
+          if (range.from < 1) return false;
+          const before = state.doc.textBetween(range.from - 1, range.from, "\n", "\0");
+          return before === "/";
         },
         items: () => [{ iso: "" }],
         command: ({ editor, range }) => {
-          // `range` already covers both `/` chars plus any extra
-          // typed query — replace the whole match with the chip.
-          const triggerRange = { from: range.from, to: range.to };
+          // Suggestion fired on the SECOND `/` (allowedPrefixes='/' means
+          // the first `/` is the prefix, not part of the range). Extend
+          // by 1 backward to swallow the first `/` too when we replace.
+          const triggerRange = { from: range.from - 1, to: range.to };
           // Position popup near the cursor.
           const coords = editor.view.coordsAtPos(range.from);
           const rect = {

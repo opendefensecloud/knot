@@ -21,7 +21,12 @@ export const TaskListExtension = Extension.create({
         attributes: {
           checked: {
             default: null,
-            keepOnSplit: false,
+            // Carry the `checked` attr to the new item on Enter so the
+            // user gets another task checkbox instead of a plain bullet.
+            // (Checked → checked is mildly odd but matches Tiptap's stock
+            // TaskItem behaviour; we'd need a custom keymap to reset to
+            // false on split.)
+            keepOnSplit: true,
             parseHTML: (el) => {
               if (el.getAttribute("data-checked") === "true") return true;
               if (el.getAttribute("data-checked") === "false") return false;
@@ -105,6 +110,27 @@ export const TaskListExtension = Extension.create({
           .toggleList("bullet_list", "list_item")
           .updateAttributes("list_item", { checked: false })
           .run();
+      },
+      // Pressing Enter inside a task list item splits to a new task
+      // item. keepOnSplit: true preserves the attribute presence; we
+      // then reset checked → false so the new row always starts as an
+      // open task (regardless of whether the previous was done).
+      Enter: () => {
+        const ed = this.editor;
+        if (!ed) return false;
+        const { $from } = ed.state.selection;
+        // Find the enclosing list_item, if any.
+        for (let depth = $from.depth; depth > 0; depth -= 1) {
+          const node = $from.node(depth);
+          if (node.type.name !== "list_item") continue;
+          if (node.attrs.checked !== true && node.attrs.checked !== false) return false;
+          return ed
+            .chain()
+            .splitListItem("list_item")
+            .updateAttributes("list_item", { checked: false })
+            .run();
+        }
+        return false;
       },
     };
   },
