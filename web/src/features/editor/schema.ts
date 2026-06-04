@@ -16,6 +16,10 @@ export const NODE_KINDS = [
   "hard_break",
   "excalidraw_board",
   "image",
+  "table",
+  "table_row",
+  "table_cell",
+  "table_header",
 ] as const;
 export type NodeKind = (typeof NODE_KINDS)[number];
 

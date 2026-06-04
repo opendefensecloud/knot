@@ -112,6 +112,91 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
         "horizontal_rule" => {
             buf.push_str("---\n");
         }
+        "table" => {
+            // Collect rows.  Within each row, collect cells with (text, align).
+            let len = el.len(txn);
+            let mut rows: Vec<Vec<(String, Option<String>, bool)>> = Vec::new();
+            for ri in 0..len {
+                let row = el.get(txn, ri).ok_or_else(|| SerError::Yrs("row missing".into()))?;
+                let XmlOut::Element(row_el) = row else { continue };
+                if row_el.tag().as_ref() != "table_row" {
+                    continue;
+                }
+                let mut cells: Vec<(String, Option<String>, bool)> = Vec::new();
+                let rlen = row_el.len(txn);
+                for ci in 0..rlen {
+                    let cell = row_el.get(txn, ci).ok_or_else(|| SerError::Yrs("cell missing".into()))?;
+                    let XmlOut::Element(cell_el) = cell else { continue };
+                    let is_header = cell_el.tag().as_ref() == "table_header";
+                    let align = cell_el.get_attribute(txn, "align");
+                    // Serialise cell content. Cells contain `block+` but for GFM
+                    // we collapse to a single inline line: write each block then
+                    // strip newlines and join with a space.
+                    let clen = cell_el.len(txn);
+                    let mut text = String::new();
+                    for k in 0..clen {
+                        let child = cell_el.get(txn, k).ok_or_else(|| SerError::Yrs("cell child".into()))?;
+                        let mut inner = String::new();
+                        write_block(&mut inner, txn, &child)?;
+                        let inline = inner.replace('|', "\\|").replace('\n', " ");
+                        let inline = inline.trim();
+                        if !text.is_empty() && !inline.is_empty() {
+                            text.push(' ');
+                        }
+                        text.push_str(inline);
+                    }
+                    cells.push((text, align, is_header));
+                }
+                rows.push(cells);
+            }
+            // Derive column count from the first row.
+            let col_count = rows.first().map(|r| r.len()).unwrap_or(0);
+            if col_count == 0 {
+                // Empty table — emit nothing.
+                return Ok(());
+            }
+            // Header row: first row if any of its cells is a table_header,
+            // otherwise synthesise an empty header (GFM requires one).
+            let first_is_header = rows.first().is_some_and(|r| r.iter().any(|(_, _, h)| *h));
+            let (header_row, body_rows): (Vec<(String, Option<String>, bool)>, &[Vec<(String, Option<String>, bool)>]) =
+                if first_is_header {
+                    (rows[0].clone(), &rows[1..])
+                } else {
+                    (vec![(String::new(), None, true); col_count], &rows[..])
+                };
+            // Per-column alignment: take from the header row's align attrs.
+            let aligns: Vec<Option<String>> =
+                header_row.iter().map(|(_, a, _)| a.clone()).collect();
+            // Emit header row.
+            buf.push('|');
+            for (t, _, _) in &header_row {
+                buf.push(' ');
+                buf.push_str(t);
+                buf.push_str(" |");
+            }
+            buf.push('\n');
+            // Emit alignment row.
+            buf.push('|');
+            for a in &aligns {
+                match a.as_deref() {
+                    Some("left") => buf.push_str(" :--- |"),
+                    Some("center") => buf.push_str(" :---: |"),
+                    Some("right") => buf.push_str(" ---: |"),
+                    _ => buf.push_str(" --- |"),
+                }
+            }
+            buf.push('\n');
+            // Emit body rows.
+            for r in body_rows {
+                buf.push('|');
+                for (t, _, _) in r {
+                    buf.push(' ');
+                    buf.push_str(t);
+                    buf.push_str(" |");
+                }
+                buf.push('\n');
+            }
+        }
         "image" => {
             let src = el.get_attribute(txn, "src").unwrap_or_default();
             let alt = el.get_attribute(txn, "alt").unwrap_or_default();

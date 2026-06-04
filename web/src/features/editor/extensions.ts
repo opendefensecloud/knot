@@ -13,6 +13,12 @@ import { MermaidCodeBlock } from "./nodes/MermaidCodeBlock";
 import { CommentsHighlightExtension } from "./CommentsHighlightExtension";
 import { TaskListExtension } from "./TaskListExtension";
 import { InternalLinkExtension } from "./InternalLinkExtension";
+import {
+  KnotTable,
+  KnotTableRow,
+  KnotTableCell,
+  KnotTableHeader,
+} from "./TableExtensions";
 
 /** Canonical Tiptap extension set that matches the server schema generated
  *  from `tools/schema.json`. History is disabled because Yjs UndoManager
@@ -45,6 +51,10 @@ export function createExtensions(opts: {
     ExcalidrawBoard,
     TaskListExtension,
     InternalLinkExtension.configure({ navigate: opts.navigate ?? null }),
+    KnotTable,
+    KnotTableRow,
+    KnotTableCell,
+    KnotTableHeader,
     CommentsHighlightExtension.configure({
       doc: opts.doc,
       comments: [],

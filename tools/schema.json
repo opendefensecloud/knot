@@ -14,7 +14,11 @@
     { "kind": "text",            "group": "inline" },
     { "kind": "hard_break",      "group": "inline", "isInline": true, "markdown": { "kind": "hard_break" } },
     { "kind": "excalidraw_board", "group": "block", "content": "", "isBlock": true, "attrs": [{ "name": "board_id", "type": "string" }, { "name": "label", "type": "string", "optional": true }], "markdown": { "kind": "excalidraw_board" } },
-    { "kind": "image", "group": "block", "content": "", "isBlock": true, "attrs": [{ "name": "src", "type": "string" }, { "name": "alt", "type": "string", "optional": true }, { "name": "title", "type": "string", "optional": true }], "markdown": { "kind": "image" } }
+    { "kind": "image", "group": "block", "content": "", "isBlock": true, "attrs": [{ "name": "src", "type": "string" }, { "name": "alt", "type": "string", "optional": true }, { "name": "title", "type": "string", "optional": true }], "markdown": { "kind": "image" } },
+    { "kind": "table",        "group": "block", "content": "table_row+", "isBlock": true, "markdown": { "kind": "table" } },
+    { "kind": "table_row",                       "content": "(table_cell | table_header)+", "isBlock": true, "markdown": { "kind": "table_row" } },
+    { "kind": "table_cell",                      "content": "block+", "isBlock": true, "attrs": [{ "name": "colspan", "type": "int", "default": 1 }, { "name": "rowspan", "type": "int", "default": 1 }, { "name": "align", "type": "string", "optional": true }], "markdown": { "kind": "table_cell" } },
+    { "kind": "table_header",                    "content": "block+", "isBlock": true, "attrs": [{ "name": "colspan", "type": "int", "default": 1 }, { "name": "rowspan", "type": "int", "default": 1 }, { "name": "align", "type": "string", "optional": true }], "markdown": { "kind": "table_header" } }
   ],
   "marks": [
     { "kind": "bold",       "markdown": { "delimiter": "**" } },

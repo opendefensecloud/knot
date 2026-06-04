@@ -16,6 +16,7 @@ import {
   List,
   ListChecks,
   ListOrdered,
+  Table as TableIcon,
   Network,
   PenSquare,
   Quote,
@@ -119,6 +120,17 @@ export function EditorToolbar({ editor, docId }: { editor: Editor | null; docId:
       <Btn testId="toolbar-ordered-list" label="Ordered list" active={editor.isActive("orderedList")}
         onClick={() => c().toggleOrderedList().run()}>
         <ListOrdered size={15} aria-hidden />
+      </Btn>
+      <Btn
+        testId="toolbar-table"
+        label="Insert table"
+        onClick={() =>
+          c()
+            .insertTable({ rows: 3, cols: 3, withHeaderRow: true })
+            .run()
+        }
+      >
+        <TableIcon size={15} aria-hidden />
       </Btn>
       <Btn
         testId="toolbar-task-list"

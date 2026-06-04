@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use knot_crdt::{DocHandle, Engine, YrsEngine};
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use thiserror::Error;
 use uuid::Uuid;
 use yrs::types::Attrs;
@@ -67,7 +67,14 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
         let mut opts = Options::empty();
         opts.insert(Options::ENABLE_STRIKETHROUGH);
         opts.insert(Options::ENABLE_TASKLISTS);
+        opts.insert(Options::ENABLE_TABLES);
         let parser = Parser::new_ext(src, opts);
+
+        // Per-table alignment carried by `Tag::Table(Vec<Alignment>)`. We
+        // stash it on table entry and consume per-cell via a column index.
+        let mut table_align: Vec<Alignment> = Vec::new();
+        let mut in_table_header = false;
+        let mut table_col_idx: usize = 0;
 
         for event in parser {
             match event {
@@ -164,6 +171,47 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                             pending_image = Some((dest_url.to_string(), String::new(), title_opt));
                         }
                     }
+                    Tag::Table(aligns) => {
+                        table_align = aligns;
+                        in_table_header = false;
+                        table_col_idx = 0;
+                        let el = push_block(&frag, &stack, &mut txn, "table", &[]);
+                        stack.push(el);
+                    }
+                    Tag::TableHead => {
+                        in_table_header = true;
+                        table_col_idx = 0;
+                        let el = push_block(&frag, &stack, &mut txn, "table_row", &[]);
+                        stack.push(el);
+                    }
+                    Tag::TableRow => {
+                        in_table_header = false;
+                        table_col_idx = 0;
+                        let el = push_block(&frag, &stack, &mut txn, "table_row", &[]);
+                        stack.push(el);
+                    }
+                    Tag::TableCell => {
+                        let kind = if in_table_header { "table_header" } else { "table_cell" };
+                        let mut attrs: Vec<(&str, String)> = Vec::new();
+                        let align = table_align
+                            .get(table_col_idx)
+                            .copied()
+                            .unwrap_or(Alignment::None);
+                        match align {
+                            Alignment::Left => attrs.push(("align", "left".to_string())),
+                            Alignment::Center => attrs.push(("align", "center".to_string())),
+                            Alignment::Right => attrs.push(("align", "right".to_string())),
+                            Alignment::None => {}
+                        }
+                        table_col_idx += 1;
+                        let el = push_block(&frag, &stack, &mut txn, kind, &attrs);
+                        stack.push(el);
+                        // Tiptap/PM expects block content in a cell; pulldown sends
+                        // inline Text events directly. Open an implicit paragraph
+                        // so Text events land in a valid container.
+                        let p = push_block(&frag, &stack, &mut txn, "paragraph", &[]);
+                        stack.push(p);
+                    }
                     Tag::Link {
                         dest_url, title, ..
                     } => {
@@ -233,6 +281,18 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     | TagEnd::CodeBlock
                     | TagEnd::List(_)
                     | TagEnd::Item => {
+                        stack.pop();
+                    }
+                    TagEnd::Table => {
+                        stack.pop();
+                        table_align.clear();
+                    }
+                    TagEnd::TableHead | TagEnd::TableRow => {
+                        stack.pop();
+                    }
+                    TagEnd::TableCell => {
+                        // Pop the implicit paragraph then the cell.
+                        stack.pop();
                         stack.pop();
                     }
                     TagEnd::Image => {

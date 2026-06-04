@@ -63,6 +63,50 @@
   margin: 0.6em 0;
 }
 
+/* Tables */
+.ProseMirror table {
+  border-collapse: collapse;
+  table-layout: fixed;
+  width: 100%;
+  margin: 0.8em 0;
+  overflow: hidden;
+}
+.ProseMirror th,
+.ProseMirror td {
+  border: 1px solid var(--color-border);
+  padding: 6px 8px;
+  vertical-align: top;
+  position: relative;
+}
+.ProseMirror th {
+  background: var(--color-muted, rgb(0 0 0 / 0.03));
+  font-weight: 600;
+  text-align: left;
+}
+.ProseMirror th p,
+.ProseMirror td p {
+  margin: 0;
+}
+.ProseMirror .selectedCell::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgb(99 102 241 / 0.10);
+  pointer-events: none;
+}
+.ProseMirror .column-resize-handle {
+  position: absolute;
+  right: -2px;
+  top: 0;
+  bottom: -2px;
+  width: 4px;
+  background: var(--color-accent);
+  pointer-events: none;
+}
+.ProseMirror.resize-cursor {
+  cursor: col-resize;
+}
+
 /* Task list items: a list_item with a `data-checked` attribute renders
    as a checkbox + text. The bullet marker is hidden for these. */
 .ProseMirror li[data-checked] {
