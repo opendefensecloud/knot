@@ -32,6 +32,10 @@ const alignAttr = {
 
 export const KnotTable = Table.extend({
   name: "table",
+  // The base extension's content expression is "tableRow+", which refers to
+  // the camelCase name. Renaming the node alone doesn't update that string —
+  // it has to be overridden to match our snake_case schema.
+  content: "table_row+",
 }).configure({
   resizable: true,
   HTMLAttributes: { class: "knot-table" },
@@ -39,6 +43,8 @@ export const KnotTable = Table.extend({
 
 export const KnotTableRow = TableRow.extend({
   name: "table_row",
+  // Same fix here: original is "(tableCell | tableHeader)*".
+  content: "(table_cell | table_header)*",
   // The prosemirror-tables plugin uses tableRole to find related node types.
   // Re-declare it here because the parent extension hardcodes the camelCase
   // type names in its `parseHTML`/spec.
