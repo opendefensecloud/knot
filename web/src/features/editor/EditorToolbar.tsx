@@ -11,6 +11,7 @@ import {
   Italic,
   Link as LinkIcon,
   List,
+  ListChecks,
   ListOrdered,
   Network,
   PenSquare,
@@ -101,6 +102,16 @@ export function EditorToolbar({ editor, docId }: { editor: Editor | null; docId:
       <Btn testId="toolbar-ordered-list" label="Ordered list" active={editor.isActive("orderedList")}
         onClick={() => c().toggleOrderedList().run()}>
         <ListOrdered size={15} aria-hidden />
+      </Btn>
+      <Btn
+        testId="toolbar-task-list"
+        label="Task list"
+        active={editor.isActive("listItem", { checked: false }) || editor.isActive("listItem", { checked: true })}
+        onClick={() =>
+          c().toggleList("bulletList", "listItem").updateAttributes("listItem", { checked: false }).run()
+        }
+      >
+        <ListChecks size={15} aria-hidden />
       </Btn>
       <Btn testId="toolbar-blockquote" label="Quote" active={editor.isActive("blockquote")}
         onClick={() => c().toggleBlockquote().run()}>

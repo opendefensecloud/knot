@@ -131,7 +131,14 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
                 let XmlOut::Element(item_el) = item else {
                     continue;
                 };
-                write_list_item(buf, txn, &item_el, "- ")?;
+                // GFM task-list items carry a `checked` attr. Bullets without
+                // the attr emit a plain `- ` prefix.
+                let prefix = match item_el.get_attribute(txn, "checked").as_deref() {
+                    Some("true") => "- [x] ",
+                    Some(_) => "- [ ] ",
+                    None => "- ",
+                };
+                write_list_item(buf, txn, &item_el, prefix)?;
             }
         }
         "ordered_list" => {

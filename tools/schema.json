@@ -10,7 +10,7 @@
     { "kind": "horizontal_rule", "group": "block", "content": "",        "isBlock": true, "markdown": { "kind": "horizontal_rule" } },
     { "kind": "bullet_list",     "group": "block", "content": "list_item+", "isBlock": true, "markdown": { "kind": "bullet_list" } },
     { "kind": "ordered_list",    "group": "block", "content": "list_item+", "isBlock": true, "attrs": [{ "name": "start", "type": "int", "default": 1, "min": 1 }], "markdown": { "kind": "ordered_list" } },
-    { "kind": "list_item",                          "content": "paragraph block*", "isBlock": true, "markdown": { "kind": "list_item" } },
+    { "kind": "list_item",                          "content": "paragraph block*", "isBlock": true, "attrs": [{ "name": "checked", "type": "bool", "optional": true }], "markdown": { "kind": "list_item" } },
     { "kind": "text",            "group": "inline" },
     { "kind": "hard_break",      "group": "inline", "isInline": true, "markdown": { "kind": "hard_break" } },
     { "kind": "excalidraw_board", "group": "block", "content": "", "isBlock": true, "attrs": [{ "name": "board_id", "type": "string" }, { "name": "label", "type": "string", "optional": true }], "markdown": { "kind": "excalidraw_board" } }

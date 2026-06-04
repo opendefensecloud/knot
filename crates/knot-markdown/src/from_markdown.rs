@@ -60,6 +60,7 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
 
         let mut opts = Options::empty();
         opts.insert(Options::ENABLE_STRIKETHROUGH);
+        opts.insert(Options::ENABLE_TASKLISTS);
         let parser = Parser::new_ext(src, opts);
 
         for event in parser {
@@ -288,6 +289,23 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                 Event::Rule => {
                     // CommonMark horizontal rule. Always lives at the top level.
                     frag.push_back(&mut txn, XmlElementPrelim::empty("horizontal_rule"));
+                }
+                Event::TaskListMarker(checked) => {
+                    // GFM task list. pulldown-cmark emits this just after
+                    // opening the surrounding `list_item`. Tag the item with
+                    // `checked` so to_markdown can emit the right prefix and
+                    // the editor can render the checkbox.
+                    if let Some(item) = stack
+                        .iter()
+                        .rev()
+                        .find(|el| el.tag().as_ref() == "list_item")
+                    {
+                        item.insert_attribute(
+                            &mut txn,
+                            "checked",
+                            if checked { "true" } else { "false" },
+                        );
+                    }
                 }
                 Event::SoftBreak => {
                     // Special case: inside a blockquote paragraph, pulldown-cmark

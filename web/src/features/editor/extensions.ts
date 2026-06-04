@@ -10,6 +10,7 @@ import { Attachment } from "./nodes/AttachmentNode";
 import { ExcalidrawBoard } from "./nodes/ExcalidrawBoard";
 import { MermaidCodeBlock } from "./nodes/MermaidCodeBlock";
 import { CommentsHighlightExtension } from "./CommentsHighlightExtension";
+import { TaskListExtension } from "./TaskListExtension";
 
 /** Canonical Tiptap extension set that matches the server schema generated
  *  from `tools/schema.json`. History is disabled because Yjs UndoManager
@@ -39,6 +40,7 @@ export function createExtensions(opts: {
     Image.configure({ inline: false, allowBase64: false }),
     Attachment,
     ExcalidrawBoard,
+    TaskListExtension,
     CommentsHighlightExtension.configure({
       doc: opts.doc,
       comments: [],

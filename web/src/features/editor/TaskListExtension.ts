@@ -1,0 +1,107 @@
+/**
+ * TaskListExtension — adds GFM task-list affordances on top of the
+ * existing `bullet_list` / `list_item` nodes (no new node types).
+ *
+ * A list item with a `checked` attribute renders with a checkbox; without
+ * the attribute, it's a plain bullet. Items with `checked` round-trip
+ * through markdown as `- [ ]` / `- [x]`.
+ */
+
+import { Extension } from "@tiptap/core";
+import { wrappingInputRule } from "@tiptap/core";
+import { Plugin, PluginKey } from "@tiptap/pm/state";
+
+export const TaskListExtension = Extension.create({
+  name: "knotTaskList",
+
+  addGlobalAttributes() {
+    return [
+      {
+        types: ["listItem"],
+        attributes: {
+          checked: {
+            default: null,
+            keepOnSplit: false,
+            parseHTML: (el) => {
+              if (el.getAttribute("data-checked") === "true") return true;
+              if (el.getAttribute("data-checked") === "false") return false;
+              return null;
+            },
+            renderHTML: (attrs) => {
+              if (attrs.checked === true) return { "data-checked": "true" };
+              if (attrs.checked === false) return { "data-checked": "false" };
+              return {};
+            },
+          },
+        },
+      },
+    ];
+  },
+
+  addInputRules() {
+    // Match "[ ] " or "[x] " at the very start of a list item. Sets the
+    // `checked` attribute and removes the typed marker.
+    const itemType = this.editor?.schema.nodes.listItem;
+    if (!itemType) return [];
+    return [
+      wrappingInputRule({
+        find: /^\[ \] $/,
+        type: itemType,
+        getAttributes: () => ({ checked: false }),
+      }),
+      wrappingInputRule({
+        find: /^\[x\] $/i,
+        type: itemType,
+        getAttributes: () => ({ checked: true }),
+      }),
+    ];
+  },
+
+  addProseMirrorPlugins() {
+    return [
+      new Plugin({
+        key: new PluginKey("knotTaskListClick"),
+        props: {
+          handleClickOn(view, _pos, node, nodePos, event) {
+            // Only handle clicks on list_item nodes that have the checked attr.
+            if (node.type.name !== "listItem") return false;
+            if (node.attrs.checked === null || node.attrs.checked === undefined) return false;
+            // The checkbox is rendered as a pseudo-element to the LEFT of the
+            // li's content (negative left offset). Treat clicks within ~24px
+            // of the li's left edge as checkbox clicks.
+            const li = (event.target as HTMLElement | null)?.closest("li[data-checked]");
+            if (!li) return false;
+            const rect = li.getBoundingClientRect();
+            if (event.clientX - rect.left > 24) return false;
+            const tr = view.state.tr.setNodeAttribute(
+              nodePos,
+              "checked",
+              !node.attrs.checked,
+            );
+            view.dispatch(tr);
+            event.preventDefault();
+            return true;
+          },
+        },
+      }),
+    ];
+  },
+
+  addKeyboardShortcuts() {
+    return {
+      // ⌘⇧7 / Ctrl+Shift+7 toggles the current line into a task list (the
+      // first item gets `checked: false`). Mirrors Tiptap's default
+      // bullet-list shortcut feel.
+      "Mod-Shift-9": () => {
+        const ed = this.editor;
+        if (!ed) return false;
+        return ed
+          .chain()
+          .focus()
+          .toggleList("bulletList", "listItem")
+          .updateAttributes("listItem", { checked: false })
+          .run();
+      },
+    };
+  },
+});

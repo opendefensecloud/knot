@@ -63,6 +63,47 @@
   margin: 0.6em 0;
 }
 
+/* Task list items: a list_item with a `data-checked` attribute renders
+   as a checkbox + text. The bullet marker is hidden for these. */
+.ProseMirror li[data-checked] {
+  list-style: none;
+  position: relative;
+  padding-left: 0.25em;
+}
+.ProseMirror li[data-checked]::before {
+  content: "";
+  position: absolute;
+  left: -1.35em;
+  top: 0.35em;
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid var(--color-border);
+  border-radius: 3px;
+  background: var(--color-bg);
+  cursor: pointer;
+  transition: background-color 100ms ease;
+}
+.ProseMirror li[data-checked="true"]::before {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+}
+.ProseMirror li[data-checked="true"]::after {
+  content: "";
+  position: absolute;
+  left: -1.16em;
+  top: 0.55em;
+  width: 4px;
+  height: 8px;
+  border: solid var(--color-accent-fg, white);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+.ProseMirror li[data-checked="true"] > p {
+  color: var(--color-fg-muted);
+  text-decoration: line-through;
+}
+
 .ProseMirror a {
   color: var(--color-accent);
   text-underline-offset: 2px;
