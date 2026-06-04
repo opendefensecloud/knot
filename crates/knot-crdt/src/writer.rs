@@ -23,6 +23,12 @@ pub const BATCH_INTERVAL: Duration = Duration::from_millis(250);
 pub struct PersistJob {
     pub bytes: Vec<u8>,
     pub by_user_id: Option<Uuid>,
+    /// Optional confirmation channel. Fired with the assigned seq after
+    /// the row is durably inserted (or with Err if the batch failed). Lets
+    /// the room actor's handler await persistence before replying to its
+    /// HTTP caller — needed for endpoints like PATCH /tasks where a 204
+    /// can't be returned until we know the write survived a crash.
+    pub persisted: Option<tokio::sync::oneshot::Sender<Result<i64, String>>>,
 }
 
 /// Output the writer sends back so the room can fan-out + track watermark.
@@ -94,11 +100,18 @@ async fn flush(
                     seq,
                     bytes: job.bytes,
                 });
+                if let Some(reply) = job.persisted {
+                    let _ = reply.send(Ok(seq));
+                }
             }
         }
         Err(e) => {
             tracing::error!(error=?e, %doc_id, "writer flush failed; dropping batch (will reapply on next read)");
-            buf.clear();
+            for job in buf.drain(..) {
+                if let Some(reply) = job.persisted {
+                    let _ = reply.send(Err(format!("{e:?}")));
+                }
+            }
         }
     }
 }

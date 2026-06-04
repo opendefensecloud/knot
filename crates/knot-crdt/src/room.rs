@@ -236,10 +236,15 @@ impl Room {
                             continue;
                         }
                         metrics::counter!("knot_room_updates_total", "source" => "local").increment(1);
-                        // Persist via the writer (backpressured).
+                        // Persist via the writer (backpressured). Wait for
+                        // the durable-insert confirmation before replying so
+                        // a crash between reply and persist doesn't lose the
+                        // update.
+                        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
                         let _ = self.persist_tx.send(crate::writer::PersistJob {
                             bytes: update_bytes.clone(),
                             by_user_id: by_user,
+                            persisted: Some(persisted_tx),
                         }).await;
                         // Local fan-out (slow-consumer eviction).
                         let framed = wrap_sync_update(&update_bytes);
@@ -251,7 +256,18 @@ impl Room {
                             }
                         }
                         for cid in to_close { self.conns.remove(&cid); }
-                        let _ = reply.send(Ok(self.last_applied_seq));
+                        let final_seq = match persisted_rx.await {
+                            Ok(Ok(seq)) => seq,
+                            Ok(Err(e)) => {
+                                let _ = reply.send(Err(EngineError::Apply(format!("persist: {e}"))));
+                                continue;
+                            }
+                            Err(_) => {
+                                let _ = reply.send(Err(EngineError::Apply("persist channel closed".into())));
+                                continue;
+                            }
+                        };
+                        let _ = reply.send(Ok(final_seq));
                     }
                     Some(Event::ExportState(reply)) => {
                         let r = self.engine
@@ -289,9 +305,11 @@ impl Room {
                         }
                         metrics::counter!("knot_room_updates_total", "source" => "restore").increment(1);
                         // Persist via the writer (mirrors ApplyUpdate path).
+                        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
                         let _ = self.persist_tx.send(crate::writer::PersistJob {
                             bytes: update_bytes.clone(),
                             by_user_id: None,
+                            persisted: Some(persisted_tx),
                         }).await;
                         // Fan out the replace to local connections.
                         let framed = wrap_sync_update(&update_bytes);
@@ -303,7 +321,18 @@ impl Room {
                             }
                         }
                         for cid in to_close { self.conns.remove(&cid); }
-                        let _ = reply.send(Ok(self.last_applied_seq));
+                        let final_seq = match persisted_rx.await {
+                            Ok(Ok(seq)) => seq,
+                            Ok(Err(e)) => {
+                                let _ = reply.send(Err(format!("persist: {e}")));
+                                continue;
+                            }
+                            Err(_) => {
+                                let _ = reply.send(Err("persist channel closed".into()));
+                                continue;
+                            }
+                        };
+                        let _ = reply.send(Ok(final_seq));
                     }
                     Some(Event::PatchTaskChecked { item_index, checked, by_user, reply }) => {
                         use std::sync::{Arc, Mutex};
@@ -339,9 +368,11 @@ impl Room {
                             continue;
                         };
                         metrics::counter!("knot_room_updates_total", "source" => "patch").increment(1);
+                        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
                         let _ = self.persist_tx.send(crate::writer::PersistJob {
                             bytes: update_bytes.clone(),
                             by_user_id: by_user,
+                            persisted: Some(persisted_tx),
                         }).await;
                         let framed = wrap_sync_update(&update_bytes);
                         let mut to_close: Vec<ConnId> = Vec::new();
@@ -352,7 +383,18 @@ impl Room {
                             }
                         }
                         for cid in to_close { self.conns.remove(&cid); }
-                        let _ = reply.send(Ok(self.last_applied_seq));
+                        let final_seq = match persisted_rx.await {
+                            Ok(Ok(seq)) => seq,
+                            Ok(Err(e)) => {
+                                let _ = reply.send(Err(format!("persist: {e}")));
+                                continue;
+                            }
+                            Err(_) => {
+                                let _ = reply.send(Err("persist channel closed".into()));
+                                continue;
+                            }
+                        };
+                        let _ = reply.send(Ok(final_seq));
                     }
                     Some(Event::Revoke) => {
                         // Drop all conns. WS shim's writer task sees the
@@ -479,6 +521,10 @@ impl Room {
             .send(crate::writer::PersistJob {
                 bytes: m.bytes,
                 by_user_id: None,
+                // Inbound WS updates are fire-and-forget — the client
+                // already has the update locally, so we don't need to
+                // hold up acknowledgement on the durable insert.
+                persisted: None,
             })
             .await
         {
