@@ -544,77 +544,122 @@ fn sort_docs_by_depth(entries: &[DocEntry]) -> Vec<DocEntry> {
     out
 }
 
+/// Map a URL classified by pulldown as a link/image destination to a
+/// zip-relative path. Returns `None` for URLs that aren't one of our three
+/// sentinel shapes (external links pass through unchanged).
+fn url_to_local_path(url: &str) -> Option<String> {
+    if let Some(rest) = url.strip_prefix("knot://doc/") {
+        let id = rest.split(['?', '#', '/']).next().unwrap_or(rest);
+        if Uuid::parse_str(id).is_ok() {
+            return Some(format!("docs/{id}.md"));
+        }
+    }
+    if let Some(rest) = url.strip_prefix("knot://board/")
+        && let Some(id) = rest.strip_suffix(".svg")
+        && Uuid::parse_str(id).is_ok()
+    {
+        return Some(format!("boards/{id}.svg"));
+    }
+    if let Some(rest) = url.strip_prefix("/api/blobs/") {
+        let id = rest.split(['?', '#', '/']).next().unwrap_or(rest);
+        if Uuid::parse_str(id).is_ok() {
+            return Some(format!("attachments/{id}"));
+        }
+    }
+    None
+}
+
+/// Inverse mapping used by import. Takes a path the export wrote and the
+/// id-remap tables; returns the live URL using the freshly-assigned id, or
+/// `None` when the path isn't a known shape or the old id isn't in the
+/// remap (meaning the referenced resource wasn't in this zip).
+fn local_path_to_url(
+    url: &str,
+    doc_remap: &HashMap<String, Uuid>,
+    blob_remap: &HashMap<String, Uuid>,
+    board_remap: &HashMap<String, Uuid>,
+) -> Option<String> {
+    if let Some(rest) = url.strip_prefix("docs/")
+        && let Some(old) = rest.strip_suffix(".md")
+        && let Some(new) = doc_remap.get(old)
+    {
+        return Some(format!("knot://doc/{new}"));
+    }
+    if let Some(rest) = url.strip_prefix("boards/")
+        && let Some(old) = rest.strip_suffix(".svg")
+        && let Some(new) = board_remap.get(old)
+    {
+        return Some(format!("knot://board/{new}.svg"));
+    }
+    if let Some(rest) = url.strip_prefix("attachments/")
+        && let Some(new) = blob_remap.get(rest)
+    {
+        return Some(format!("/api/blobs/{new}"));
+    }
+    None
+}
+
+/// Walk `md` via pulldown's offset iterator and produce a copy with every
+/// Link/Image destination URL rewritten via `map_url`. URLs that `map_url`
+/// returns `None` for are left untouched. Other markdown text is preserved
+/// byte-for-byte — we only edit the byte ranges pulldown attributed to
+/// link/image destinations.
+fn rewrite_link_urls<F: FnMut(&str) -> Option<String>>(md: &str, mut map_url: F) -> String {
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_TASKLISTS);
+
+    // Collect (byte_start, byte_end, replacement) for each URL we touch.
+    // Apply in reverse so earlier indices stay valid.
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for (event, range) in Parser::new_ext(md, opts).into_offset_iter() {
+        let url: Option<&str> = match &event {
+            Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url.as_ref()),
+            Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.as_ref()),
+            _ => None,
+        };
+        let Some(url) = url else { continue };
+        let Some(replacement) = map_url(url) else { continue };
+        // Locate the URL substring inside the event's source range. Search
+        // from the range's start to anchor; pulldown's reported URL is the
+        // exact string we expect to find inside this span.
+        let span = &md[range.clone()];
+        if let Some(off) = span.find(url) {
+            let start = range.start + off;
+            let end = start + url.len();
+            edits.push((start, end, replacement));
+        }
+    }
+    if edits.is_empty() { return md.to_string(); }
+    edits.sort_by_key(|e| std::cmp::Reverse(e.0));
+    let mut out = md.to_string();
+    for (start, end, repl) in edits {
+        out.replace_range(start..end, &repl);
+    }
+    out
+}
+
 /// Rewrite live sentinel + blob URLs to zip-relative paths so the exported
-/// markdown renders cleanly in any plain markdown viewer:
+/// markdown renders cleanly in any plain markdown viewer.
 ///
 ///   knot://doc/<uuid>          → docs/<uuid>.md
 ///   knot://board/<uuid>.svg    → boards/<uuid>.svg
 ///   /api/blobs/<uuid>          → attachments/<uuid>
 fn rewrite_for_export(md: &str) -> String {
-    use regex::Regex;
-    let mut out = md.to_string();
-    // Doc links: keep the .md suffix so anchor-style links render in viewers.
-    let doc_re = Regex::new(r"knot://doc/([0-9a-fA-F-]{36})").unwrap();
-    out = doc_re.replace_all(&out, "docs/$1.md").into_owned();
-    // Boards already carry a .svg extension; the rewrite is positional.
-    let board_re = Regex::new(r"knot://board/([0-9a-fA-F-]{36})\.svg").unwrap();
-    out = board_re.replace_all(&out, "boards/$1.svg").into_owned();
-    // Blob URLs.
-    let blob_re = Regex::new(r"/api/blobs/([0-9a-fA-F-]{36})").unwrap();
-    out = blob_re.replace_all(&out, "attachments/$1").into_owned();
-    out
+    rewrite_link_urls(md, url_to_local_path)
 }
 
-/// Inverse of `rewrite_for_export`, additionally applying the id remap so
-/// imported references point at the freshly-created records. Also handles
-/// legacy exports that still contain raw sentinels (pre-rewrite zips).
+/// Inverse of `rewrite_for_export`, applying the id remap so imported
+/// references point at the freshly-created records.
 fn remap_sentinels(
     md: &str,
     doc_remap: &HashMap<String, Uuid>,
     blob_remap: &HashMap<String, Uuid>,
     board_remap: &HashMap<String, Uuid>,
 ) -> String {
-    let mut out = md.to_string();
-    // Newer exports: local paths → live sentinels keyed by the old id.
-    for (old, new) in doc_remap {
-        out = out.replace(
-            &format!("docs/{old}.md"),
-            &format!("knot://doc/{new}"),
-        );
-    }
-    for (old, new) in board_remap {
-        out = out.replace(
-            &format!("boards/{old}.svg"),
-            &format!("knot://board/{new}.svg"),
-        );
-    }
-    for (old, new) in blob_remap {
-        out = out.replace(
-            &format!("attachments/{old}"),
-            &format!("/api/blobs/{new}"),
-        );
-    }
-    // Legacy exports (sentinels still in place): also do the direct remap so
-    // older zips round-trip.
-    for (old, new) in doc_remap {
-        out = out.replace(
-            &format!("knot://doc/{old}"),
-            &format!("knot://doc/{new}"),
-        );
-    }
-    for (old, new) in board_remap {
-        out = out.replace(
-            &format!("knot://board/{old}.svg"),
-            &format!("knot://board/{new}.svg"),
-        );
-    }
-    for (old, new) in blob_remap {
-        out = out.replace(
-            &format!("/api/blobs/{old}"),
-            &format!("/api/blobs/{new}"),
-        );
-    }
-    out
+    rewrite_link_urls(md, |u| local_path_to_url(u, doc_remap, blob_remap, board_remap))
 }
 
 fn internal() -> Response {
@@ -654,14 +699,26 @@ mod tests {
     }
 
     #[test]
-    fn import_remap_handles_legacy_sentinels_too() {
-        let old = Uuid::new_v4();
-        let new = Uuid::new_v4();
-        let mut blob_remap = HashMap::new();
-        blob_remap.insert(old.to_string(), new);
-        let md = format!("![pic](/api/blobs/{old})\n");
-        let out = remap_sentinels(&md, &HashMap::new(), &blob_remap, &HashMap::new());
-        assert!(out.contains(&format!("/api/blobs/{new}")));
+    fn import_leaves_unknown_local_paths_untouched() {
+        // A local-path URL for an id that isn't in the remap means the
+        // referenced resource wasn't bundled with this zip. The walker
+        // should leave it as-is rather than producing a broken sentinel.
+        let md = "[ghost](docs/00000000-0000-0000-0000-000000000000.md)\n";
+        let out = remap_sentinels(md, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert_eq!(out, md);
+    }
+
+    #[test]
+    fn rewrite_ignores_uuid_lookalikes_in_prose() {
+        // A literal sentinel string outside a link/image context (e.g. in
+        // prose or code) must NOT be rewritten — only URLs pulldown
+        // classifies as link/image destinations are touched.
+        let id = Uuid::new_v4();
+        let md = format!(
+            "Discussing the value `knot://doc/{id}` inline.\n\n```\nknot://doc/{id}\n```\n"
+        );
+        let out = rewrite_for_export(&md);
+        assert_eq!(out, md);
     }
 
     #[test]
