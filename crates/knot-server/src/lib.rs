@@ -59,6 +59,10 @@ pub struct AppState {
     pub oidc_enabled: bool,
     pub oidc: Option<Arc<knot_auth::oidc::OidcClient>>,
     pub config: Arc<Config>,
+    /// Cancelled on SIGTERM/SIGINT so in-flight collab sockets send a clean
+    /// 1001 Close and the process can drain within the grace period instead
+    /// of being SIGKILLed mid-rollout.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl AppState {
@@ -90,6 +94,7 @@ impl AppState {
             oidc_enabled: false,
             oidc: None,
             config: Arc::new(Config::default()),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -149,6 +154,7 @@ impl AppState {
             oidc_enabled: false,
             oidc: None,
             config: Arc::new(Config::default()),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -234,8 +240,9 @@ async fn collab_upgrade(
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
     };
+    let shutdown = state.shutdown.clone();
     ws.on_upgrade(move |socket| async move {
-        crate::room::serve(rooms, doc_id, socket, can_write).await;
+        crate::room::serve(rooms, doc_id, socket, can_write, shutdown).await;
     })
     .into_response()
 }
@@ -277,8 +284,9 @@ async fn collab_board_upgrade(
     let Some(board_rooms) = state.board_rooms.as_ref().cloned() else {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
     };
+    let shutdown = state.shutdown.clone();
     ws.on_upgrade(move |socket| async move {
-        crate::board_room_shim::serve(board_rooms, board_id, socket).await;
+        crate::board_room_shim::serve(board_rooms, board_id, socket, shutdown).await;
     })
     .into_response()
 }

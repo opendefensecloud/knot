@@ -24,6 +24,7 @@ knot-obs = { path = "../knot-obs" }
 knot-storage = { path = "../knot-storage" }
 axum.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 sqlx.workspace = true
 tower.workspace = true
