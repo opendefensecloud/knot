@@ -83,6 +83,8 @@
         "enabled": { "type": "boolean" }
       }
     },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+    "preStopSleepSeconds": { "type": "integer", "minimum": 0 },
     "metrics": {
       "type": "object",
       "properties": {

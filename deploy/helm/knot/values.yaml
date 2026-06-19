@@ -143,6 +143,14 @@ migrations:
 probes:
   enabled: true
 
+# Graceful shutdown. On SIGTERM the server stops accepting connections, sends
+# a 1001 Close to live collab WebSockets, and drains in-flight HTTP. preStop
+# sleeps first so the pod leaves Service endpoints before draining begins
+# (kube-proxy stops routing new traffic). Uses the native `sleep` lifecycle
+# handler — no shell, so it works on the scratch image.
+terminationGracePeriodSeconds: 30
+preStopSleepSeconds: 5
+
 nodeSelector: {}
 tolerations: []
 affinity: {}
