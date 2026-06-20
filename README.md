@@ -4,7 +4,7 @@ A self-hosted, collaborative knowledge base. Like Notion or Confluence — but y
 
 - **Backend:** Rust (axum + yrs + sqlx + tokio + mimalloc). Static musl binary, ~20 MB scratch image.
 - **Frontend:** React 18 + Tiptap + TanStack Query + Zustand.
-- **Storage:** PostgreSQL 16. Single database, no Redis.
+- **Storage:** PostgreSQL 18. Single database, no Redis.
 - **Auth:** Local credentials (Argon2id) + OIDC (tested against Dex).
 - **Deploy:** Helm chart at `deploy/helm/knot/`. Multi-arch image (amd64 + arm64).
 

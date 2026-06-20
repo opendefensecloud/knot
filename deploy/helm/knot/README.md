@@ -6,7 +6,7 @@ Production install of [knot](https://github.com/trevex/knot) — a self-hosted, 
 
 - Kubernetes 1.27+
 - Helm 3.13+
-- External Postgres 16 (the chart does **not** bundle one). The connection user needs `CREATE TABLE` rights in its database.
+- External Postgres 18 (the chart does **not** bundle one). The connection user needs `CREATE TABLE` rights in its database.
 - An ingress controller (e.g. ingress-nginx, traefik) if you want external access.
 - Optional: cert-manager for TLS, an OIDC provider (Dex, Keycloak, Okta, ...) if you want SSO.
 

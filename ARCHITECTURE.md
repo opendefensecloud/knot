@@ -17,7 +17,7 @@ knot-server (axum, Rust, single binary)
   └─ :9090/metrics           Prometheus exposition
             │
             ▼
-       PostgreSQL 16
+       PostgreSQL 18
        ├─ users, workspaces, sessions, workspace_members
        ├─ documents, document_grants
        ├─ doc_updates, doc_snapshots          (CRDT persistence)
