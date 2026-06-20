@@ -1,0 +1,7 @@
+# Values used by chart-testing (`ct lint`/`ct install`) so the chart renders
+# against its values.schema.json (which fails closed on an empty DB URL /
+# session key). NOT a production example — see deploy/helm/knot/README.md.
+database:
+  url: "postgres://knot:knot@localhost:5432/knot"
+session:
+  key: "0123456789abcdef0123456789abcdef"
