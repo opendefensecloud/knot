@@ -52,14 +52,12 @@ pub struct Config {
     pub log_level: String,
     /// Log format: "json" or "text".
     pub log_format: String,
-    /// Listen address for the metrics + pprof endpoints.
+    /// Listen address for the metrics endpoint.
     pub metrics_addr: String,
     /// Enable OpenTelemetry OTLP exporter.
     pub tracing_enabled: bool,
     /// OTLP endpoint when tracing is enabled.
     pub otlp_endpoint: String,
-    /// Enable pprof endpoints on the metrics port.
-    pub pprof_enabled: bool,
 
     /// CRDT snapshot trigger: N updates between snapshots.
     pub snapshot_every_n: u32,
@@ -114,7 +112,6 @@ impl Default for Config {
             metrics_addr: ":9090".into(),
             tracing_enabled: false,
             otlp_endpoint: String::new(),
-            pprof_enabled: false,
             snapshot_every_n: 200,
             snapshot_idle_sec: 30,
             room_idle_evict_sec: 300,

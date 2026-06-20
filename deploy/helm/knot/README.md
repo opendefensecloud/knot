@@ -1,6 +1,6 @@
 # knot Helm chart
 
-Production install of [knot](https://github.com/voss/knot) — a self-hosted, CRDT-backed collaborative knowledge base.
+Production install of [knot](https://github.com/trevex/knot) — a self-hosted, CRDT-backed collaborative knowledge base.
 
 ## Prerequisites
 
@@ -15,7 +15,7 @@ Production install of [knot](https://github.com/voss/knot) — a self-hosted, CR
 ```bash
 helm install knot ./deploy/helm/knot \
   --create-namespace --namespace knot \
-  --set image.repository=ghcr.io/voss/knot \
+  --set image.repository=ghcr.io/trevex/knot \
   --set image.tag=v0.1.0 \
   --set database.url='postgres://knot:knot@db.svc.cluster.local:5432/knot' \
   --set session.key="$(openssl rand -base64 32)" \
