@@ -12,11 +12,13 @@ Production install of [knot](https://github.com/trevex/knot) — a self-hosted, 
 
 ## Quick install
 
+The release workflow publishes the chart as an OCI artifact to GitHub Container Registry, so
+you can install a released version directly — no `helm repo add` needed (Helm 3.8+):
+
 ```bash
-helm install knot ./deploy/helm/knot \
+helm install knot oci://ghcr.io/christianhuening/charts/knot \
+  --version 0.3.0 \
   --create-namespace --namespace knot \
-  --set image.repository=ghcr.io/trevex/knot \
-  --set image.tag=v0.1.0 \
   --set database.url='postgres://knot:knot@db.svc.cluster.local:5432/knot' \
   --set session.key="$(openssl rand -base64 32)" \
   --set baseUrl=https://knot.example.com \
@@ -25,6 +27,13 @@ helm install knot ./deploy/helm/knot \
   --set ingress.hosts[0].paths[0].path=/ \
   --set ingress.hosts[0].paths[0].pathType=Prefix
 ```
+
+`image.repository`/`image.tag` no longer need to be set — they default to
+`ghcr.io/christianhuening/knot` at the chart's appVersion. To install from a local checkout
+instead, point Helm at the directory: `helm install knot ./deploy/helm/knot ...`.
+
+If the ghcr packages are private, run `helm registry login ghcr.io` before pulling the chart,
+and set `--set image.pullSecrets[0].name=<secret>` so the cluster can pull the image.
 
 The chart will:
 

@@ -3,9 +3,9 @@
 # is for local development only.
 
 image:
-  # Canonical upstream image. CI (release.yaml) publishes here on a v* tag,
-  # stripping the leading "v" so the pushed tag matches .Chart.AppVersion.
-  repository: ghcr.io/trevex/knot
+  # Image published by this repo's release workflow (release.yaml) on a v* tag, with the
+  # leading "v" stripped so the pushed tag matches .Chart.AppVersion.
+  repository: ghcr.io/christianhuening/knot
   tag: ""              # defaults to .Chart.AppVersion at template-render time
   pullPolicy: IfNotPresent
   pullSecrets: []
