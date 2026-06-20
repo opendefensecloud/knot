@@ -1,11 +1,12 @@
 //! WebSocket → BoardRoom shim. Mirrors `room::serve` but against the
 //! `BoardRooms` registry, since boards have their own y-protocol session.
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use knot_crdt::board_room::{ConnHandle, ConnId, Event, InMsg};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::protocol::{YSyncMessage, decode, encode_sync_step2};
@@ -14,6 +15,7 @@ pub async fn serve(
     rooms: Arc<knot_crdt::BoardRooms>,
     board_id: Uuid,
     socket: WebSocket,
+    shutdown: CancellationToken,
 ) {
     let handle = rooms.acquire(board_id).await;
     let conn_id: ConnId = Uuid::new_v4();
@@ -39,21 +41,48 @@ pub async fn serve(
     let _ = out_tx.send(initial).await;
 
     let (mut sink, mut stream) = socket.split();
+    let writer_shutdown = shutdown.clone();
     let writer = tokio::spawn(async move {
-        while let Some(bytes) = out_rx.recv().await {
-            if sink.send(Message::Binary(bytes)).await.is_err() {
-                return;
+        loop {
+            tokio::select! {
+                biased;
+                _ = writer_shutdown.cancelled() => {
+                    let _ = sink
+                        .send(Message::Close(Some(CloseFrame {
+                            code: 1001,
+                            reason: "server.shutdown".into(),
+                        })))
+                        .await;
+                    return;
+                }
+                maybe = out_rx.recv() => match maybe {
+                    Some(bytes) => {
+                        if sink.send(Message::Binary(bytes)).await.is_err() {
+                            return;
+                        }
+                    }
+                    None => {
+                        let _ = sink
+                            .send(Message::Close(Some(CloseFrame {
+                                code: 4403,
+                                reason: "acl.revoked".into(),
+                            })))
+                            .await;
+                        return;
+                    }
+                },
             }
         }
-        let _ = sink
-            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                code: 4403,
-                reason: "acl.revoked".into(),
-            })))
-            .await;
     });
 
-    while let Some(Ok(msg)) = stream.next().await {
+    loop {
+        let msg = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            m = stream.next() => match m {
+                Some(Ok(m)) => m,
+                _ => break,
+            },
+        };
         match msg {
             Message::Binary(bytes) => match decode(&bytes) {
                 Ok(YSyncMessage::SyncStep1(_sv)) => {

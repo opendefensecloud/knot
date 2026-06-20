@@ -93,7 +93,11 @@ async fn login(app: &axum::Router, email: &str) -> (String, String) {
         )
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::NO_CONTENT, "login failed for {email}");
+    assert_eq!(
+        r.status(),
+        StatusCode::NO_CONTENT,
+        "login failed for {email}"
+    );
     let cookies: Vec<String> = r
         .headers()
         .get_all("set-cookie")
@@ -205,12 +209,7 @@ async fn patch_json(
     (status, json)
 }
 
-async fn delete_req(
-    app: &axum::Router,
-    uri: &str,
-    sid: &str,
-    csrf: &str,
-) -> StatusCode {
+async fn delete_req(app: &axum::Router, uri: &str, sid: &str, csrf: &str) -> StatusCode {
     let r = app
         .clone()
         .oneshot(
@@ -255,7 +254,11 @@ async fn owner_creates_thread_201() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::CREATED, "expected 201, got {status}: {json}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "expected 201, got {status}: {json}"
+    );
     assert_eq!(json["body"], "Hello thread");
     assert!(json["id"].as_str().is_some(), "expected id");
     assert_eq!(json["thread_id"], json["id"], "root: thread_id == id");
@@ -293,7 +296,11 @@ async fn editor_replies_201_with_parent_id() {
         serde_json::json!({"body": "Bob's reply"}),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "reply: expected 201, got {status}: {json}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "reply: expected 201, got {status}: {json}"
+    );
     assert_eq!(json["body"], "Bob's reply");
     assert_eq!(json["thread_id"].as_str().unwrap(), thread_id);
     assert_eq!(json["parent_id"].as_str().unwrap(), thread_id);
@@ -305,7 +312,8 @@ async fn viewer_cannot_create_or_reply_403() {
     let (state, ws_id, doc_id, _uid) = state_with_seeded(WorkspaceRole::Owner).await;
 
     // Create root as owner first
-    let (sid_alice, csrf_alice) = login(&router_with_state(state.clone()), "alice@example.com").await;
+    let (sid_alice, csrf_alice) =
+        login(&router_with_state(state.clone()), "alice@example.com").await;
     let (_, root_json) = post_json(
         &router_with_state(state.clone()),
         &format!("/api/docs/{doc_id}/comments"),
@@ -358,7 +366,11 @@ async fn anon_gets_401() {
         )
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "anon GET: expected 401");
+    assert_eq!(
+        r.status(),
+        StatusCode::UNAUTHORIZED,
+        "anon GET: expected 401"
+    );
 
     let r = app
         .oneshot(
@@ -371,7 +383,11 @@ async fn anon_gets_401() {
         )
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "anon POST: expected 401");
+    assert_eq!(
+        r.status(),
+        StatusCode::UNAUTHORIZED,
+        "anon POST: expected 401"
+    );
 }
 
 /// 5. GET list returns threads + replies flat. Default excludes resolved.
@@ -424,18 +440,22 @@ async fn get_list_flat_default_excludes_resolved() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     // Default list: should have t1 root + t1 reply = 2 items; t2 excluded
-    let (status, list) = get_json(
-        &app,
-        &format!("/api/docs/{doc_id}/comments"),
-        &sid,
-        &csrf,
-    )
-    .await;
+    let (status, list) = get_json(&app, &format!("/api/docs/{doc_id}/comments"), &sid, &csrf).await;
     assert_eq!(status, StatusCode::OK);
     let arr = list.as_array().unwrap();
-    assert_eq!(arr.len(), 2, "default should return 2 items (t1 root + reply), got {list}");
-    let ids: Vec<&str> = arr.iter().map(|c| c["thread_id"].as_str().unwrap()).collect();
-    assert!(ids.iter().all(|id| *id == t1_id), "all returned items should be in thread 1");
+    assert_eq!(
+        arr.len(),
+        2,
+        "default should return 2 items (t1 root + reply), got {list}"
+    );
+    let ids: Vec<&str> = arr
+        .iter()
+        .map(|c| c["thread_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.iter().all(|id| *id == t1_id),
+        "all returned items should be in thread 1"
+    );
 }
 
 /// 6. `?include_resolved=true` returns resolved threads too.
@@ -448,29 +468,60 @@ async fn include_resolved_returns_all() {
     let (_, t1) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/comments"),
-        &sid, &csrf,
+        &sid,
+        &csrf,
         serde_json::json!({"body": "Active thread"}),
-    ).await;
+    )
+    .await;
     let (_, t2) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/comments"),
-        &sid, &csrf,
+        &sid,
+        &csrf,
         serde_json::json!({"body": "Resolved thread"}),
-    ).await;
+    )
+    .await;
     let t2_id = t2["id"].as_str().unwrap();
 
-    post_json(&app, &format!("/api/docs/{doc_id}/comments/{t2_id}/resolve"), &sid, &csrf, serde_json::json!({})).await;
+    post_json(
+        &app,
+        &format!("/api/docs/{doc_id}/comments/{t2_id}/resolve"),
+        &sid,
+        &csrf,
+        serde_json::json!({}),
+    )
+    .await;
     let _ = t1;
 
     // include_resolved=true → both threads
-    let (status, list) = get_json(&app, &format!("/api/docs/{doc_id}/comments?include_resolved=true"), &sid, &csrf).await;
+    let (status, list) = get_json(
+        &app,
+        &format!("/api/docs/{doc_id}/comments?include_resolved=true"),
+        &sid,
+        &csrf,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(list.as_array().unwrap().len(), 2, "expected 2 comments with include_resolved=true, got {list}");
+    assert_eq!(
+        list.as_array().unwrap().len(),
+        2,
+        "expected 2 comments with include_resolved=true, got {list}"
+    );
 
     // include_resolved=false (default) → only active
-    let (status, list) = get_json(&app, &format!("/api/docs/{doc_id}/comments?include_resolved=false"), &sid, &csrf).await;
+    let (status, list) = get_json(
+        &app,
+        &format!("/api/docs/{doc_id}/comments?include_resolved=false"),
+        &sid,
+        &csrf,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(list.as_array().unwrap().len(), 1, "expected 1 comment without resolved, got {list}");
+    assert_eq!(
+        list.as_array().unwrap().len(),
+        1,
+        "expected 1 comment without resolved, got {list}"
+    );
 }
 
 /// 7. Resolve sets resolved_at; unresolve clears it.
@@ -483,34 +534,66 @@ async fn resolve_and_unresolve_roundtrip() {
     let (_, t) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/comments"),
-        &sid, &csrf,
+        &sid,
+        &csrf,
         serde_json::json!({"body": "Resolve me"}),
-    ).await;
+    )
+    .await;
     let tid = t["id"].as_str().unwrap();
 
     // Resolve
-    let (status, _) = post_json(&app, &format!("/api/docs/{doc_id}/comments/{tid}/resolve"), &sid, &csrf, serde_json::json!({})).await;
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/docs/{doc_id}/comments/{tid}/resolve"),
+        &sid,
+        &csrf,
+        serde_json::json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "resolve expected 204");
 
     // Resolved: not in default list
     let (_, list) = get_json(&app, &format!("/api/docs/{doc_id}/comments"), &sid, &csrf).await;
-    assert_eq!(list.as_array().unwrap().len(), 0, "resolved thread should be hidden by default");
+    assert_eq!(
+        list.as_array().unwrap().len(),
+        0,
+        "resolved thread should be hidden by default"
+    );
 
     // include_resolved=true: it's there, resolved_at set
-    let (_, list) = get_json(&app, &format!("/api/docs/{doc_id}/comments?include_resolved=true"), &sid, &csrf).await;
+    let (_, list) = get_json(
+        &app,
+        &format!("/api/docs/{doc_id}/comments?include_resolved=true"),
+        &sid,
+        &csrf,
+    )
+    .await;
     let arr = list.as_array().unwrap();
     assert_eq!(arr.len(), 1);
-    assert!(!arr[0]["resolved_at"].is_null(), "resolved_at should be set after resolve");
+    assert!(
+        !arr[0]["resolved_at"].is_null(),
+        "resolved_at should be set after resolve"
+    );
 
     // Unresolve
-    let (status, _) = post_json(&app, &format!("/api/docs/{doc_id}/comments/{tid}/unresolve"), &sid, &csrf, serde_json::json!({})).await;
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/docs/{doc_id}/comments/{tid}/unresolve"),
+        &sid,
+        &csrf,
+        serde_json::json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "unresolve expected 204");
 
     // Now visible again in default list with resolved_at = null
     let (_, list) = get_json(&app, &format!("/api/docs/{doc_id}/comments"), &sid, &csrf).await;
     let arr = list.as_array().unwrap();
     assert_eq!(arr.len(), 1);
-    assert!(arr[0]["resolved_at"].is_null(), "resolved_at should be null after unresolve");
+    assert!(
+        arr[0]["resolved_at"].is_null(),
+        "resolved_at should be null after unresolve"
+    );
 }
 
 /// 8. Add + remove reaction round-trip.
@@ -523,34 +606,46 @@ async fn reaction_add_remove_roundtrip() {
     let (_, c) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/comments"),
-        &sid, &csrf,
+        &sid,
+        &csrf,
         serde_json::json!({"body": "React to me"}),
-    ).await;
+    )
+    .await;
     let comment_id = c["id"].as_str().unwrap();
 
     // Add 👍
     let (status, _) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/comments/{comment_id}/reactions"),
-        &sid, &csrf,
+        &sid,
+        &csrf,
         serde_json::json!({"emoji": "👍"}),
-    ).await;
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "add reaction: expected 204");
 
     // Verify via list
     let (_, list) = get_json(&app, &format!("/api/docs/{doc_id}/comments"), &sid, &csrf).await;
     let comment = &list.as_array().unwrap()[0];
     let thumbs_up = &comment["reactions"]["👍"];
-    assert!(thumbs_up.is_array() && !thumbs_up.as_array().unwrap().is_empty(),
-        "expected 👍 in reactions, got {comment}");
+    assert!(
+        thumbs_up.is_array() && !thumbs_up.as_array().unwrap().is_empty(),
+        "expected 👍 in reactions, got {comment}"
+    );
 
     // Remove 👍
     let status = delete_req(
         &app,
         &format!("/api/docs/{doc_id}/comments/{comment_id}/reactions/👍"),
-        &sid, &csrf,
-    ).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "remove reaction: expected 204");
+        &sid,
+        &csrf,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "remove reaction: expected 204"
+    );
 
     // Verify removed
     let (_, list) = get_json(&app, &format!("/api/docs/{doc_id}/comments"), &sid, &csrf).await;
@@ -572,19 +667,30 @@ async fn invalid_emoji_returns_415() {
     let (_, c) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/comments"),
-        &sid, &csrf,
+        &sid,
+        &csrf,
         serde_json::json!({"body": "Test comment"}),
-    ).await;
+    )
+    .await;
     let comment_id = c["id"].as_str().unwrap();
 
     let (status, json) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/comments/{comment_id}/reactions"),
-        &sid, &csrf,
+        &sid,
+        &csrf,
         serde_json::json!({"emoji": "💩"}),
-    ).await;
-    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "invalid emoji: expected 415, got {status}: {json}");
-    assert_eq!(json["error"]["code"], "comment.invalid_emoji", "expected code comment.invalid_emoji, got {json}");
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "invalid emoji: expected 415, got {status}: {json}"
+    );
+    assert_eq!(
+        json["error"]["code"], "comment.invalid_emoji",
+        "expected code comment.invalid_emoji, got {json}"
+    );
 }
 
 /// 10. Edit (author) → 200; non-author → 403; delete (author) → 204;
@@ -602,63 +708,172 @@ async fn edit_and_delete_acl() {
     let (_, c) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/comments"),
-        &sid_alice, &csrf_alice,
+        &sid_alice,
+        &csrf_alice,
         serde_json::json!({"body": "Alice's comment"}),
-    ).await;
+    )
+    .await;
     let comment_id = c["id"].as_str().unwrap();
 
     // Bob (editor, not author) tries to edit → 403
     let (status, json) = patch_json(
         &app,
         &format!("/api/docs/{doc_id}/comments/{comment_id}"),
-        &sid_bob, &csrf_bob,
+        &sid_bob,
+        &csrf_bob,
         serde_json::json!({"body": "Bob edits Alice"}),
-    ).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-author edit: expected 403, got {status}: {json}");
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "non-author edit: expected 403, got {status}: {json}"
+    );
 
     // Alice edits her own comment → 200
     let (status, json) = patch_json(
         &app,
         &format!("/api/docs/{doc_id}/comments/{comment_id}"),
-        &sid_alice, &csrf_alice,
+        &sid_alice,
+        &csrf_alice,
         serde_json::json!({"body": "Updated body"}),
-    ).await;
-    assert_eq!(status, StatusCode::OK, "author edit: expected 200, got {status}: {json}");
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "author edit: expected 200, got {status}: {json}"
+    );
     assert_eq!(json["body"], "Updated body");
 
     // Bob creates his own comment
     let (_, bc) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/comments"),
-        &sid_bob, &csrf_bob,
+        &sid_bob,
+        &csrf_bob,
         serde_json::json!({"body": "Bob's comment"}),
-    ).await;
+    )
+    .await;
     let bob_comment_id = bc["id"].as_str().unwrap();
 
     // Alice (workspace owner) deletes Bob's comment → 204
     let status = delete_req(
         &app,
         &format!("/api/docs/{doc_id}/comments/{bob_comment_id}"),
-        &sid_alice, &csrf_alice,
-    ).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "workspace owner delete other's comment: expected 204");
+        &sid_alice,
+        &csrf_alice,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "workspace owner delete other's comment: expected 204"
+    );
 
     // Bob deletes his own second comment after alice-deletes-first
     // (Make a new one so bob can delete his own)
     let (_, bc2) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/comments"),
-        &sid_bob, &csrf_bob,
+        &sid_bob,
+        &csrf_bob,
         serde_json::json!({"body": "Bob's second comment"}),
-    ).await;
+    )
+    .await;
     let bc2_id = bc2["id"].as_str().unwrap();
 
     let status = delete_req(
         &app,
         &format!("/api/docs/{doc_id}/comments/{bc2_id}"),
-        &sid_bob, &csrf_bob,
-    ).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "author self-delete: expected 204");
+        &sid_bob,
+        &csrf_bob,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "author self-delete: expected 204"
+    );
+}
+
+/// 12. Cross-document IDOR: a comment in doc B cannot be resolved/edited/
+///     reacted-to by routing the request through doc A's path, even though the
+///     caller is authorized on doc A. The handler now re-asserts that the
+///     comment belongs to the path's doc.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_doc_comment_mutation_is_rejected() {
+    let (state, ws_id, doc_a, uid) = state_with_seeded(WorkspaceRole::Owner).await;
+    // A second doc in the same workspace.
+    let doc_b = state
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(ws_id, None, "Doc B", "m", uid)
+        .await
+        .unwrap();
+    let app = router_with_state(state);
+    let (sid, csrf) = login(&app, "alice@example.com").await;
+
+    // Create a comment in doc B via its correct path.
+    let (status, c) = post_json(
+        &app,
+        &format!("/api/docs/{}/comments", doc_b.id),
+        &sid,
+        &csrf,
+        serde_json::json!({"body": "lives in doc B"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let comment_b = c["id"].as_str().unwrap().to_string();
+
+    // Resolve via doc A's path → must 404.
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/docs/{doc_a}/comments/{comment_b}/resolve"),
+        &sid,
+        &csrf,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "cross-doc resolve must 404");
+
+    // Edit via doc A's path → must 404.
+    let (status, _) = patch_json(
+        &app,
+        &format!("/api/docs/{doc_a}/comments/{comment_b}"),
+        &sid,
+        &csrf,
+        serde_json::json!({"body": "hijack"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "cross-doc edit must 404");
+
+    // React via doc A's path → must 404.
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/docs/{doc_a}/comments/{comment_b}/reactions"),
+        &sid,
+        &csrf,
+        serde_json::json!({"emoji": "👍"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "cross-doc reaction must 404");
+
+    // Sanity: the same operation via doc B's correct path still works.
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/docs/{}/comments/{comment_b}/resolve", doc_b.id),
+        &sid,
+        &csrf,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "same-doc resolve should succeed"
+    );
 }
 
 /// 11. Body length > 4096 → 413.
@@ -672,8 +887,14 @@ async fn body_over_4096_returns_413() {
     let (status, json) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/comments"),
-        &sid, &csrf,
+        &sid,
+        &csrf,
         serde_json::json!({"body": long_body}),
-    ).await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body >4096: expected 413, got {status}: {json}");
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "body >4096: expected 413, got {status}: {json}"
+    );
 }

@@ -146,9 +146,15 @@ impl OidcClient {
         let raw = id_token.to_string();
         let groups = extract_groups_from_jwt(&raw).unwrap_or_default();
 
+        // Whether the IdP asserts the email is verified. Domain-based
+        // auto-provisioning must not trust an unverified email (an attacker
+        // could claim any address in a trusted domain otherwise).
+        let email_verified = claims.email_verified().unwrap_or(false);
+
         Ok(VerifiedIdentity {
             subject: claims.subject().to_string(),
             email,
+            email_verified,
             display_name,
             groups,
         })
@@ -166,6 +172,8 @@ pub struct FlowStart {
 pub struct VerifiedIdentity {
     pub subject: String,
     pub email: String,
+    /// IdP's `email_verified` claim (false if absent).
+    pub email_verified: bool,
     pub display_name: String,
     pub groups: Vec<String>,
 }

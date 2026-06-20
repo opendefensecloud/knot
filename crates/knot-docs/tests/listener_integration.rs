@@ -25,7 +25,11 @@ async fn grant_change_evicts_cache_entry() {
         .unwrap();
     let d = ds.create(ws.id, None, "X", "m", u.id).await.unwrap();
 
-    let cache = Arc::new(AclCache::new(Arc::new(ws_s.clone()), Arc::new(gs.clone())));
+    let cache = Arc::new(AclCache::new(
+        Arc::new(ws_s.clone()),
+        Arc::new(gs.clone()),
+        Arc::new(ds.clone()),
+    ));
     let _handle = spawn_listener(
         pool.clone(),
         cache.clone(),
@@ -79,7 +83,11 @@ async fn grant_change_on_parent_evicts_descendants() {
         .await
         .unwrap();
 
-    let cache = Arc::new(AclCache::new(Arc::new(ws_s.clone()), Arc::new(gs.clone())));
+    let cache = Arc::new(AclCache::new(
+        Arc::new(ws_s.clone()),
+        Arc::new(gs.clone()),
+        Arc::new(ds.clone()),
+    ));
     let _handle = spawn_listener(
         pool.clone(),
         cache.clone(),

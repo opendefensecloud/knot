@@ -21,7 +21,11 @@ use crate::http_error::json_err;
 /// Expects `EffectiveDocRole` already set by `require_doc_role_mw`.
 fn require_editor(req: &Request) -> Option<Response> {
     if req.extensions().get::<AuthContext>().is_none() {
-        return Some(json_err(StatusCode::UNAUTHORIZED, "auth.session_required", ""));
+        return Some(json_err(
+            StatusCode::UNAUTHORIZED,
+            "auth.session_required",
+            "",
+        ));
     }
     match req.extensions().get::<EffectiveDocRole>().copied() {
         None => Some(json_err(StatusCode::FORBIDDEN, "acl.no_grant", "")),
@@ -66,7 +70,11 @@ pub async fn preview_markdown(
     let snap = match snapshots.by_seq(doc_id, seq).await {
         Ok(Some(s)) => s,
         Ok(None) => {
-            return json_err(StatusCode::NOT_FOUND, "history.not_found", "snapshot not found")
+            return json_err(
+                StatusCode::NOT_FOUND,
+                "history.not_found",
+                "snapshot not found",
+            );
         }
         Err(e) => {
             tracing::error!(error=?e, %doc_id, seq, "history by_seq");
@@ -115,7 +123,11 @@ pub async fn restore(
     let snap = match snapshots.by_seq(doc_id, seq).await {
         Ok(Some(s)) => s,
         Ok(None) => {
-            return json_err(StatusCode::NOT_FOUND, "history.not_found", "snapshot not found")
+            return json_err(
+                StatusCode::NOT_FOUND,
+                "history.not_found",
+                "snapshot not found",
+            );
         }
         Err(e) => {
             tracing::error!(error=?e, %doc_id, seq, "restore by_seq");

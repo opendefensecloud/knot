@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use knot_storage::{GrantStore, WorkspaceRole, WorkspaceStore};
+use knot_storage::{DocStore, GrantStore, WorkspaceRole, WorkspaceStore};
 use moka::future::Cache;
 use uuid::Uuid;
 
@@ -20,10 +20,15 @@ pub struct AclCache {
     inner: Cache<(Uuid, Uuid), Option<WorkspaceRole>>,
     workspaces: Arc<dyn WorkspaceStore>,
     grants: Arc<dyn GrantStore>,
+    docs: Arc<dyn DocStore>,
 }
 
 impl AclCache {
-    pub fn new(workspaces: Arc<dyn WorkspaceStore>, grants: Arc<dyn GrantStore>) -> Self {
+    pub fn new(
+        workspaces: Arc<dyn WorkspaceStore>,
+        grants: Arc<dyn GrantStore>,
+        docs: Arc<dyn DocStore>,
+    ) -> Self {
         let inner = Cache::builder()
             .max_capacity(100_000)
             .time_to_live(Duration::from_secs(60))
@@ -33,6 +38,7 @@ impl AclCache {
             inner,
             workspaces,
             grants,
+            docs,
         }
     }
 
@@ -49,6 +55,7 @@ impl AclCache {
         let v = resolve(
             self.workspaces.as_ref(),
             self.grants.as_ref(),
+            self.docs.as_ref(),
             workspace_id,
             doc_id,
             user_id,

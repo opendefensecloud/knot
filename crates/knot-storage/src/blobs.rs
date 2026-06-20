@@ -48,7 +48,9 @@ pub struct BlobMeta {
 }
 
 impl BlobMeta {
-    pub fn new(pool: PgPool) -> Self { Self { pool } }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
 
     pub async fn insert(&self, m: &BlobMetadata) -> Result<()> {
         sqlx::query(

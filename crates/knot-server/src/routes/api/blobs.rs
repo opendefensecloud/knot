@@ -5,20 +5,20 @@
 //! DELETE /api/blobs/:id                    editor+ on parent doc
 
 use axum::{
+    Json, Router,
     body::Body,
     extract::{Path, Request, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use multer::{Constraints, Multipart, SizeLimit};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::AppState;
 use crate::auth::AuthContext;
 use crate::http_error::json_err;
-use crate::AppState;
 
 const MAX_BLOB_BYTES: u64 = 10 * 1024 * 1024;
 const BLOCKED_PREFIXES: &[&str] = &[
@@ -44,11 +44,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/blobs/:id", get(download).delete(delete_blob))
 }
 
-async fn upload(
-    State(state): State<AppState>,
-    Path(doc_id): Path<Uuid>,
-    req: Request,
-) -> Response {
+async fn upload(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
@@ -57,11 +53,18 @@ async fn upload(
     let Some(acl) = state.acl.clone() else {
         return internal();
     };
-    match acl.effective_role(ctx.workspace_id, doc_id, ctx.user_id).await {
-        Ok(Some(
-            knot_storage::WorkspaceRole::Owner | knot_storage::WorkspaceRole::Editor,
-        )) => {}
-        Ok(_) => return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "editor role required"),
+    match acl
+        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
+        .await
+    {
+        Ok(Some(knot_storage::WorkspaceRole::Owner | knot_storage::WorkspaceRole::Editor)) => {}
+        Ok(_) => {
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "acl.no_grant",
+                "editor role required",
+            );
+        }
         Err(_) => return internal(),
     }
 
@@ -82,7 +85,7 @@ async fn upload(
         Ok(Some(f)) => f,
         Ok(None) => return json_err(StatusCode::BAD_REQUEST, "blob.missing_file", ""),
         Err(e) if is_size_exceeded(&e) => {
-            return json_err(StatusCode::PAYLOAD_TOO_LARGE, "blob.too_large", "10 MB cap")
+            return json_err(StatusCode::PAYLOAD_TOO_LARGE, "blob.too_large", "10 MB cap");
         }
         Err(_) => return json_err(StatusCode::BAD_REQUEST, "blob.bad_multipart", ""),
     };
@@ -103,7 +106,7 @@ async fn upload(
     let bytes = match field.bytes().await {
         Ok(b) => b,
         Err(e) if is_size_exceeded(&e) => {
-            return json_err(StatusCode::PAYLOAD_TOO_LARGE, "blob.too_large", "10 MB cap")
+            return json_err(StatusCode::PAYLOAD_TOO_LARGE, "blob.too_large", "10 MB cap");
         }
         Err(_) => return json_err(StatusCode::BAD_REQUEST, "blob.read_error", ""),
     };
@@ -160,11 +163,7 @@ async fn upload(
         .into_response()
 }
 
-async fn download(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    req: Request,
-) -> Response {
+async fn download(State(state): State<AppState>, Path(id): Path<Uuid>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
@@ -183,7 +182,10 @@ async fn download(
         Ok(None) => return json_err(StatusCode::NOT_FOUND, "blob.not_found", ""),
         Err(_) => return internal(),
     };
-    match acl.effective_role(meta.workspace_id, meta.doc_id, ctx.user_id).await {
+    match acl
+        .effective_role(meta.workspace_id, meta.doc_id, ctx.user_id)
+        .await
+    {
         Ok(Some(_)) => {}
         Ok(None) => return json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""),
         Err(_) => return internal(),
@@ -192,7 +194,7 @@ async fn download(
     let bytes = match store.get(id).await {
         Ok(b) => b,
         Err(knot_storage::BlobStoreError::NotFound) => {
-            return json_err(StatusCode::NOT_FOUND, "blob.not_found", "")
+            return json_err(StatusCode::NOT_FOUND, "blob.not_found", "");
         }
         Err(_) => return internal(),
     };
@@ -229,11 +231,18 @@ async fn delete_blob(
         Ok(None) => return json_err(StatusCode::NOT_FOUND, "blob.not_found", ""),
         Err(_) => return internal(),
     };
-    match acl.effective_role(meta.workspace_id, meta.doc_id, ctx.user_id).await {
-        Ok(Some(
-            knot_storage::WorkspaceRole::Owner | knot_storage::WorkspaceRole::Editor,
-        )) => {}
-        _ => return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "editor role required"),
+    match acl
+        .effective_role(meta.workspace_id, meta.doc_id, ctx.user_id)
+        .await
+    {
+        Ok(Some(knot_storage::WorkspaceRole::Owner | knot_storage::WorkspaceRole::Editor)) => {}
+        _ => {
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "acl.no_grant",
+                "editor role required",
+            );
+        }
     }
 
     let _ = store.delete(id).await;

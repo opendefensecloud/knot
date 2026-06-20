@@ -1,0 +1,8 @@
+# chart-testing (https://github.com/helm/chart-testing) configuration.
+# Auto-discovered from the repo root by `ct lint`/`ct install`.
+target-branch: main
+chart-dirs:
+  - deploy/helm
+# Maintainer `name` fields hold a human name (not a GitHub username), so skip
+# the GitHub-account existence check that `ct` performs by default.
+validate-maintainers: false

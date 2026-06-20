@@ -122,17 +122,30 @@ async fn export_workspace(State(state): State<AppState>, req: Request) -> Respon
     // Owner-only — exports contain everyone's content; treating it as a
     // member-readable endpoint would leak across grants.
     use knot_storage::WorkspaceRole;
-    let Some(workspaces) = state.workspaces.clone() else { return internal(); };
-    match workspaces.get_member_role(ctx.workspace_id, ctx.user_id).await {
+    let Some(workspaces) = state.workspaces.clone() else {
+        return internal();
+    };
+    match workspaces
+        .get_member_role(ctx.workspace_id, ctx.user_id)
+        .await
+    {
         Ok(Some(WorkspaceRole::Owner)) => {}
         _ => return json_err(StatusCode::FORBIDDEN, "acl.owner_required", ""),
     }
-    let Some(docs) = state.docs.clone() else { return internal(); };
+    let Some(docs) = state.docs.clone() else {
+        return internal();
+    };
     let all_docs = match docs.list_alive(ctx.workspace_id).await {
         Ok(d) => d,
         Err(_) => return internal(),
     };
-    write_export_zip(&state, ctx.workspace_id, all_docs, /*reparent_roots=*/ false).await
+    write_export_zip(
+        &state,
+        ctx.workspace_id,
+        all_docs,
+        /*reparent_roots=*/ false,
+    )
+    .await
 }
 
 /// Single-doc export. With `descendants=true`, includes every descendant
@@ -148,15 +161,22 @@ async fn export_doc(
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
-    let Some(acl) = state.acl.clone() else { return internal(); };
+    let Some(acl) = state.acl.clone() else {
+        return internal();
+    };
     // Reader on the root is enough to export it; subtree export inherits the
     // same per-doc ACL via filtering below.
-    match acl.effective_role(ctx.workspace_id, doc_id, ctx.user_id).await {
+    match acl
+        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
+        .await
+    {
         Ok(Some(_)) => {}
         Ok(None) => return json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""),
         Err(_) => return internal(),
     }
-    let Some(docs) = state.docs.clone() else { return internal(); };
+    let Some(docs) = state.docs.clone() else {
+        return internal();
+    };
     let all_docs = match docs.list_alive(ctx.workspace_id).await {
         Ok(d) => d,
         Err(_) => return internal(),
@@ -173,7 +193,10 @@ async fn export_doc(
                 keep.push(d);
                 continue;
             }
-            match acl.effective_role(ctx.workspace_id, d.id, ctx.user_id).await {
+            match acl
+                .effective_role(ctx.workspace_id, d.id, ctx.user_id)
+                .await
+            {
                 Ok(Some(_)) => keep.push(d),
                 _ => continue,
             }
@@ -185,12 +208,21 @@ async fn export_doc(
     if subset.is_empty() {
         return json_err(StatusCode::NOT_FOUND, "doc.not_found", "");
     }
-    write_export_zip(&state, ctx.workspace_id, subset, /*reparent_roots=*/ true).await
+    write_export_zip(
+        &state,
+        ctx.workspace_id,
+        subset,
+        /*reparent_roots=*/ true,
+    )
+    .await
 }
 
 /// BFS collect of `root` + descendants from the flat doc list. Single O(N)
 /// pass via a parent → children index, then a queue starting from `root`.
-fn collect_subtree_ids(root: Uuid, all: &[knot_storage::Document]) -> std::collections::HashSet<Uuid> {
+fn collect_subtree_ids(
+    root: Uuid,
+    all: &[knot_storage::Document],
+) -> std::collections::HashSet<Uuid> {
     use std::collections::{HashMap, HashSet, VecDeque};
     let mut children: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     for d in all {
@@ -220,16 +252,23 @@ async fn write_export_zip(
     all_docs: Vec<knot_storage::Document>,
     reparent_roots: bool,
 ) -> Response {
-    let Some(cache) = state.markdown_cache.clone() else { return internal(); };
-    let Some(blob_meta) = state.blob_meta.clone() else { return internal(); };
-    let Some(blob_store) = state.blob_store.clone() else { return internal(); };
-    let Some(boards) = state.boards.clone() else { return internal(); };
+    let Some(cache) = state.markdown_cache.clone() else {
+        return internal();
+    };
+    let Some(blob_meta) = state.blob_meta.clone() else {
+        return internal();
+    };
+    let Some(blob_store) = state.blob_store.clone() else {
+        return internal();
+    };
+    let Some(boards) = state.boards.clone() else {
+        return internal();
+    };
 
     // For subtree/single exports, manifest parent_ids that don't point at a
     // doc inside the subset become None so import grafts cleanly under the
     // import's target parent.
-    let included_ids: std::collections::HashSet<Uuid> =
-        all_docs.iter().map(|d| d.id).collect();
+    let included_ids: std::collections::HashSet<Uuid> = all_docs.iter().map(|d| d.id).collect();
     let resolve_parent = |d: &knot_storage::Document| -> Option<String> {
         match d.parent_id {
             Some(p) if !reparent_roots || included_ids.contains(&p) => Some(p.to_string()),
@@ -299,8 +338,8 @@ async fn write_export_zip(
     {
         let cursor = Cursor::new(&mut buf);
         let mut zip = ZipWriter::new(cursor);
-        let opts = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
         for d in &all_docs {
             let doc_path = doc_path_for.get(&d.id).cloned().unwrap_or_default();
@@ -329,9 +368,7 @@ async fn write_export_zip(
                 .map(|c| c.markdown_text)
                 .unwrap_or_default();
             let md = rewrite_for_export(&md_raw, &doc_path_for, &board_path_for, &blob_path_for);
-            if zip.start_file(&doc_path, opts).is_err()
-                || zip.write_all(md.as_bytes()).is_err()
-            {
+            if zip.start_file(&doc_path, opts).is_err() || zip.write_all(md.as_bytes()).is_err() {
                 return internal();
             }
             if let Some(board_list) = board_lists.get(&d.id) {
@@ -376,9 +413,7 @@ async fn write_export_zip(
             Ok(v) => v,
             Err(_) => return internal(),
         };
-        if zip.start_file("index.json", opts).is_err()
-            || zip.write_all(&manifest_json).is_err()
-        {
+        if zip.start_file("index.json", opts).is_err() || zip.write_all(&manifest_json).is_err() {
             return internal();
         }
         if zip.finish().is_err() {
@@ -410,8 +445,12 @@ async fn import(
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
     use knot_storage::WorkspaceRole;
-    let Some(workspaces) = state.workspaces.clone() else { return internal(); };
-    let Some(acl) = state.acl.clone() else { return internal(); };
+    let Some(workspaces) = state.workspaces.clone() else {
+        return internal();
+    };
+    let Some(acl) = state.acl.clone() else {
+        return internal();
+    };
     // ACL: with no parent_id, owner on the workspace is required.
     // With a parent_id, editor+ on that parent is sufficient.
     match q.parent_id {
@@ -425,17 +464,30 @@ async fn import(
             }
         }
         Some(parent) => {
-            match acl.effective_role(ctx.workspace_id, parent, ctx.user_id).await {
+            match acl
+                .effective_role(ctx.workspace_id, parent, ctx.user_id)
+                .await
+            {
                 Ok(Some(WorkspaceRole::Owner | WorkspaceRole::Editor)) => {}
                 _ => return json_err(StatusCode::FORBIDDEN, "acl.editor_required", ""),
             }
         }
     }
-    let Some(docs) = state.docs.clone() else { return internal(); };
-    let Some(blob_meta) = state.blob_meta.clone() else { return internal(); };
-    let Some(blob_store) = state.blob_store.clone() else { return internal(); };
-    let Some(boards) = state.boards.clone() else { return internal(); };
-    let Some(rooms) = state.rooms_v2.clone() else { return internal(); };
+    let Some(docs) = state.docs.clone() else {
+        return internal();
+    };
+    let Some(blob_meta) = state.blob_meta.clone() else {
+        return internal();
+    };
+    let Some(blob_store) = state.blob_store.clone() else {
+        return internal();
+    };
+    let Some(boards) = state.boards.clone() else {
+        return internal();
+    };
+    let Some(rooms) = state.rooms_v2.clone() else {
+        return internal();
+    };
 
     // Read body. Hard cap at 50 MB for v1.
     let bytes: Bytes = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
@@ -483,7 +535,9 @@ async fn import(
         // remap. They'd be harmless (the doc_remap key is never used as a
         // filesystem path on import — only as an interned manifest key),
         // but defense in depth.
-        if Uuid::parse_str(&d.id).is_err() { continue; }
+        if Uuid::parse_str(&d.id).is_err() {
+            continue;
+        }
         // Roots of the import (no parent_id, or parent_id not in the
         // manifest) get grafted under the caller's target parent, if any.
         let new_parent = d
@@ -513,11 +567,15 @@ async fn import(
     // 4. Import attachments. New ids, but doc_id remapped to the new doc.
     for a in &manifest.attachments {
         let new_id = Uuid::new_v4();
-        let Some(new_doc_id) = doc_remap.get(&a.doc_id).copied() else { continue };
+        let Some(new_doc_id) = doc_remap.get(&a.doc_id).copied() else {
+            continue;
+        };
         // The manifest id must be a real UUID — anything else means
         // either a malformed zip or a path-confusion attempt. Skip rather
         // than feed unvalidated text into a zip lookup.
-        if Uuid::parse_str(&a.id).is_err() { continue; }
+        if Uuid::parse_str(&a.id).is_err() {
+            continue;
+        }
         let Some(bytes_vec) = read_zip_entry(&mut zip, &a.path) else {
             continue;
         };
@@ -540,7 +598,9 @@ async fn import(
             created_by: ctx.user_id,
             created_at: chrono::Utc::now(),
         };
-        if blob_meta.insert(&meta).await.is_err() { continue; }
+        if blob_meta.insert(&meta).await.is_err() {
+            continue;
+        }
         if blob_store
             .put(new_id, &bytes_vec, &content_type)
             .await
@@ -555,8 +615,12 @@ async fn import(
     // 5. Import boards. New ids; SVG preserved if present; Yjs state is
     //    NOT seeded in v1, so the board's content history is fresh.
     for b in &manifest.boards {
-        let Some(new_doc_id) = doc_remap.get(&b.doc_id).copied() else { continue };
-        if Uuid::parse_str(&b.id).is_err() { continue; }
+        let Some(new_doc_id) = doc_remap.get(&b.doc_id).copied() else {
+            continue;
+        };
+        if Uuid::parse_str(&b.id).is_err() {
+            continue;
+        }
         let created = match boards
             .create(new_doc_id, ctx.user_id, b.label.clone())
             .await
@@ -577,8 +641,12 @@ async fn import(
     // 6. For each doc, read markdown, rewrite knot:// + /api/blobs ids,
     //    parse to a Y-update, push via the room actor.
     for d in &manifest.docs {
-        let Some(new_doc_id) = doc_remap.get(&d.id).copied() else { continue };
-        let Some(md_bytes) = read_zip_entry(&mut zip, &d.path) else { continue };
+        let Some(new_doc_id) = doc_remap.get(&d.id).copied() else {
+            continue;
+        };
+        let Some(md_bytes) = read_zip_entry(&mut zip, &d.path) else {
+            continue;
+        };
         let md = match std::str::from_utf8(&md_bytes) {
             Ok(s) => s.to_string(),
             Err(_) => continue,
@@ -627,7 +695,7 @@ async fn import(
                 "imported_attachments": blob_remap.len(),
                 "imported_boards": board_remap.len(),
             }))
-                .unwrap_or_default(),
+            .unwrap_or_default(),
         ))
         .unwrap()
 }
@@ -745,7 +813,9 @@ fn sort_docs_by_depth(entries: &[DocEntry]) -> Vec<DocEntry> {
         by_id: &HashMap<&'a str, &'a DocEntry>,
         depth: &mut HashMap<String, usize>,
     ) -> usize {
-        if let Some(d) = depth.get(id) { return *d; }
+        if let Some(d) = depth.get(id) {
+            return *d;
+        }
         let d = match by_id
             .get(id)
             .and_then(|e| e.parent_id.as_ref())
@@ -863,7 +933,9 @@ fn rewrite_link_urls<F: FnMut(&str) -> Option<String>>(md: &str, mut map_url: F)
             _ => None,
         };
         let Some(url) = url else { continue };
-        let Some(replacement) = map_url(url) else { continue };
+        let Some(replacement) = map_url(url) else {
+            continue;
+        };
         // Locate the URL substring inside the event's source range. Search
         // from the range's start to anchor; pulldown's reported URL is the
         // exact string we expect to find inside this span.
@@ -874,7 +946,9 @@ fn rewrite_link_urls<F: FnMut(&str) -> Option<String>>(md: &str, mut map_url: F)
             edits.push((start, end, replacement));
         }
     }
-    if edits.is_empty() { return md.to_string(); }
+    if edits.is_empty() {
+        return md.to_string();
+    }
     edits.sort_by_key(|e| std::cmp::Reverse(e.0));
     let mut out = md.to_string();
     for (start, end, repl) in edits {
@@ -895,7 +969,9 @@ fn rewrite_for_export(
     board_paths: &std::collections::HashMap<Uuid, String>,
     blob_paths: &std::collections::HashMap<Uuid, String>,
 ) -> String {
-    rewrite_link_urls(md, |u| url_to_local_path(u, doc_paths, board_paths, blob_paths))
+    rewrite_link_urls(md, |u| {
+        url_to_local_path(u, doc_paths, board_paths, blob_paths)
+    })
 }
 
 /// Inverse of `rewrite_for_export`, applying the id remap so imported
@@ -910,7 +986,15 @@ fn remap_sentinels(
     board_remap: &HashMap<String, Uuid>,
 ) -> String {
     rewrite_link_urls(md, |u| {
-        local_path_to_url(u, path_to_doc, path_to_blob, path_to_board, doc_remap, blob_remap, board_remap)
+        local_path_to_url(
+            u,
+            path_to_doc,
+            path_to_blob,
+            path_to_board,
+            doc_remap,
+            blob_remap,
+            board_remap,
+        )
     })
 }
 
@@ -923,11 +1007,21 @@ fn remap_sentinels(
 /// authenticated `/api/blobs/:id` path.
 fn sanitize_content_type(declared: &str) -> String {
     // Strip parameters (`text/plain; charset=utf-8` → `text/plain`).
-    let base = declared.split(';').next().unwrap_or("").trim().to_lowercase();
+    let base = declared
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
     const ALLOWED: &[&str] = &[
-        "image/png", "image/jpeg", "image/gif", "image/webp",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
         "application/pdf",
-        "text/plain", "text/markdown", "text/csv",
+        "text/plain",
+        "text/markdown",
+        "text/csv",
         "application/json",
         "application/zip",
     ];
@@ -941,9 +1035,7 @@ fn sanitize_content_type(declared: &str) -> String {
 /// Validate the upload body is a recognisable zip archive. Pure for
 /// testing — the error codes here flow through to the import handler's
 /// HTTP responses verbatim.
-fn open_import_zip(
-    bytes: &[u8],
-) -> Result<zip::ZipArchive<Cursor<&[u8]>>, &'static str> {
+fn open_import_zip(bytes: &[u8]) -> Result<zip::ZipArchive<Cursor<&[u8]>>, &'static str> {
     zip::ZipArchive::new(Cursor::new(bytes)).map_err(|_| "import.not_zip")
 }
 
@@ -1069,7 +1161,10 @@ mod tests {
     fn split_stem_ext_handles_dotfiles_and_extensionless() {
         assert_eq!(split_stem_ext("photo.png"), ("photo".into(), ".png".into()));
         assert_eq!(split_stem_ext("Makefile"), ("Makefile".into(), "".into()));
-        assert_eq!(split_stem_ext(".gitignore"), (".gitignore".into(), "".into()));
+        assert_eq!(
+            split_stem_ext(".gitignore"),
+            (".gitignore".into(), "".into())
+        );
         assert_eq!(split_stem_ext("a.b.c"), ("a.b".into(), ".c".into()));
     }
 
@@ -1079,8 +1174,8 @@ mod tests {
         {
             let cursor = Cursor::new(&mut buf);
             let mut z = ZipWriter::new(cursor);
-            let opts = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             for (name, body) in entries {
                 z.start_file(*name, opts).unwrap();
                 z.write_all(body).unwrap();
@@ -1135,19 +1230,29 @@ mod tests {
     #[test]
     fn sanitize_content_type_strips_parameters_and_clamps_unknown_types() {
         assert_eq!(sanitize_content_type("image/png"), "image/png");
-        assert_eq!(sanitize_content_type("text/plain; charset=utf-8"), "text/plain");
-        assert_eq!(sanitize_content_type("image/svg+xml"), "application/octet-stream");
-        assert_eq!(sanitize_content_type("text/html"), "application/octet-stream");
-        assert_eq!(sanitize_content_type("application/javascript"), "application/octet-stream");
+        assert_eq!(
+            sanitize_content_type("text/plain; charset=utf-8"),
+            "text/plain"
+        );
+        assert_eq!(
+            sanitize_content_type("image/svg+xml"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            sanitize_content_type("text/html"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            sanitize_content_type("application/javascript"),
+            "application/octet-stream"
+        );
     }
 
     #[test]
     fn rewrite_link_urls_handles_link_inside_table_cell() {
         let doc = Uuid::new_v4();
         let (d, b, a) = single_path_maps(doc, Uuid::nil(), Uuid::nil());
-        let md = format!(
-            "| col |\n| --- |\n| [other](knot://doc/{doc}) |\n"
-        );
+        let md = format!("| col |\n| --- |\n| [other](knot://doc/{doc}) |\n");
         let out = rewrite_for_export(&md, &d, &b, &a);
         assert!(out.contains("docs/Hello.md"));
         assert!(!out.contains("knot://"));
@@ -1157,9 +1262,7 @@ mod tests {
     fn rewrite_link_urls_handles_link_inside_nested_list() {
         let doc = Uuid::new_v4();
         let (d, b, a) = single_path_maps(doc, Uuid::nil(), Uuid::nil());
-        let md = format!(
-            "- outer\n  - inner [link](knot://doc/{doc})\n    - deeper\n"
-        );
+        let md = format!("- outer\n  - inner [link](knot://doc/{doc})\n    - deeper\n");
         let out = rewrite_for_export(&md, &d, &b, &a);
         assert!(out.contains("docs/Hello.md"));
     }

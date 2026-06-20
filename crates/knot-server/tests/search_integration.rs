@@ -4,7 +4,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
-use knot_server::{router_with_state, AppState};
+use knot_server::{AppState, router_with_state};
 use knot_storage::WorkspaceRole;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -102,11 +102,7 @@ fn encode_q(q: &str) -> String {
     q.replace(' ', "%20")
 }
 
-async fn do_search(
-    app: &axum::Router,
-    sid_kv: &str,
-    q: &str,
-) -> (StatusCode, serde_json::Value) {
+async fn do_search(app: &axum::Router, sid_kv: &str, q: &str) -> (StatusCode, serde_json::Value) {
     let r = app
         .clone()
         .oneshot(
@@ -121,8 +117,7 @@ async fn do_search(
         .unwrap();
     let status = r.status();
     let body = r.into_body().collect().await.unwrap().to_bytes();
-    let json: serde_json::Value =
-        serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
     (status, json)
 }
 

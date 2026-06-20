@@ -117,16 +117,24 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
             let len = el.len(txn);
             let mut rows: Vec<Vec<(String, Option<String>, bool)>> = Vec::new();
             for ri in 0..len {
-                let row = el.get(txn, ri).ok_or_else(|| SerError::Yrs("row missing".into()))?;
-                let XmlOut::Element(row_el) = row else { continue };
+                let row = el
+                    .get(txn, ri)
+                    .ok_or_else(|| SerError::Yrs("row missing".into()))?;
+                let XmlOut::Element(row_el) = row else {
+                    continue;
+                };
                 if row_el.tag().as_ref() != "table_row" {
                     continue;
                 }
                 let mut cells: Vec<(String, Option<String>, bool)> = Vec::new();
                 let rlen = row_el.len(txn);
                 for ci in 0..rlen {
-                    let cell = row_el.get(txn, ci).ok_or_else(|| SerError::Yrs("cell missing".into()))?;
-                    let XmlOut::Element(cell_el) = cell else { continue };
+                    let cell = row_el
+                        .get(txn, ci)
+                        .ok_or_else(|| SerError::Yrs("cell missing".into()))?;
+                    let XmlOut::Element(cell_el) = cell else {
+                        continue;
+                    };
                     let is_header = cell_el.tag().as_ref() == "table_header";
                     let align = cell_el.get_attribute(txn, "align");
                     // Serialise cell content. Cells contain `block+` but for GFM
@@ -135,7 +143,9 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
                     let clen = cell_el.len(txn);
                     let mut text = String::new();
                     for k in 0..clen {
-                        let child = cell_el.get(txn, k).ok_or_else(|| SerError::Yrs("cell child".into()))?;
+                        let child = cell_el
+                            .get(txn, k)
+                            .ok_or_else(|| SerError::Yrs("cell child".into()))?;
                         let mut inner = String::new();
                         write_block(&mut inner, txn, &child)?;
                         let inline = inner.replace('|', "\\|").replace('\n', " ");
@@ -159,12 +169,11 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
             // otherwise synthesise an empty header (GFM requires one).
             let first_is_header = rows.first().is_some_and(|r| r.iter().any(|(_, _, h)| *h));
             type CellTuple = (String, Option<String>, bool);
-            let (header_row, body_rows): (Vec<CellTuple>, &[Vec<CellTuple>]) =
-                if first_is_header {
-                    (rows[0].clone(), &rows[1..])
-                } else {
-                    (vec![(String::new(), None, true); col_count], &rows[..])
-                };
+            let (header_row, body_rows): (Vec<CellTuple>, &[Vec<CellTuple>]) = if first_is_header {
+                (rows[0].clone(), &rows[1..])
+            } else {
+                (vec![(String::new(), None, true); col_count], &rows[..])
+            };
             // Per-column alignment: take from the header row's align attrs.
             let aligns: Vec<Option<String>> =
                 header_row.iter().map(|(_, a, _)| a.clone()).collect();

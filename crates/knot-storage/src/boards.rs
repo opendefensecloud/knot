@@ -46,12 +46,7 @@ pub type Result<T> = std::result::Result<T, BoardStoreError>;
 #[async_trait]
 pub trait BoardStore: Send + Sync + 'static {
     /// Create a new board attached to a parent doc.
-    async fn create(
-        &self,
-        doc_id: Uuid,
-        created_by: Uuid,
-        label: Option<String>,
-    ) -> Result<Board>;
+    async fn create(&self, doc_id: Uuid, created_by: Uuid, label: Option<String>) -> Result<Board>;
 
     async fn get(&self, id: Uuid) -> Result<Board>;
 
@@ -120,12 +115,7 @@ fn row_to_board(r: BoardRow) -> Board {
 
 #[async_trait]
 impl BoardStore for PgBoardStore {
-    async fn create(
-        &self,
-        doc_id: Uuid,
-        created_by: Uuid,
-        label: Option<String>,
-    ) -> Result<Board> {
+    async fn create(&self, doc_id: Uuid, created_by: Uuid, label: Option<String>) -> Result<Board> {
         let id = Uuid::new_v4();
         let row: BoardRow = sqlx::query_as(
             "INSERT INTO boards (id, doc_id, created_by, label)
@@ -190,22 +180,20 @@ impl BoardStore for PgBoardStore {
     }
 
     async fn load_updates(&self, id: Uuid) -> Result<Vec<Vec<u8>>> {
-        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
-            "SELECT bytes FROM board_updates WHERE board_id = $1 ORDER BY seq",
-        )
-        .bind(id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT bytes FROM board_updates WHERE board_id = $1 ORDER BY seq")
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows.into_iter().map(|(b,)| b).collect())
     }
 
     async fn max_update_seq(&self, id: Uuid) -> Result<i64> {
-        let max: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(seq) FROM board_updates WHERE board_id = $1",
-        )
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await?;
+        let max: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(seq) FROM board_updates WHERE board_id = $1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(max.unwrap_or(0))
     }
 
@@ -251,12 +239,11 @@ impl BoardStore for PgBoardStore {
     }
 
     async fn get_svg(&self, id: Uuid) -> Result<Option<Vec<u8>>> {
-        let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
-            "SELECT svg_cached FROM boards WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(Option<Vec<u8>>,)> =
+            sqlx::query_as("SELECT svg_cached FROM boards WHERE id = $1 AND deleted_at IS NULL")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.and_then(|(b,)| b))
     }
 }

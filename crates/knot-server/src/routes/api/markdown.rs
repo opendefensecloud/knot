@@ -52,7 +52,10 @@ pub enum RefreshError {
 /// propagated. The Result reports only the steps before the cache write
 /// (state export + markdown serialise), because failures there mean
 /// callers got no usable text to return.
-pub async fn refresh_markdown_and_index(state: &AppState, doc_id: Uuid) -> Result<String, RefreshError> {
+pub async fn refresh_markdown_and_index(
+    state: &AppState,
+    doc_id: Uuid,
+) -> Result<String, RefreshError> {
     refresh_markdown_inner(state, doc_id, true).await
 }
 
@@ -71,7 +74,12 @@ async fn refresh_markdown_inner(
     let rooms = state.rooms_v2.clone().ok_or(RefreshError::NoRooms)?;
     let room = rooms.acquire(doc_id).await;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    if room.tx.send(knot_crdt::Event::ExportState(tx)).await.is_err() {
+    if room
+        .tx
+        .send(knot_crdt::Event::ExportState(tx))
+        .await
+        .is_err()
+    {
         return Err(RefreshError::RoomUnreachable(doc_id));
     }
     let (state_bytes, seq) = match rx.await {
@@ -93,8 +101,7 @@ async fn refresh_markdown_inner(
     {
         tracing::warn!(error=?e, "md cache put failed");
     }
-    if reindex_tasks
-        && let (Some(tasks), Some(docs)) = (state.tasks.clone(), state.docs.clone()) {
+    if reindex_tasks && let (Some(tasks), Some(docs)) = (state.tasks.clone(), state.docs.clone()) {
         let extracted = knot_markdown::tasks::extract_tasks(&text);
         let inputs: Vec<knot_storage::DocTaskInput> = extracted
             .into_iter()
@@ -108,7 +115,10 @@ async fn refresh_markdown_inner(
             .collect();
         match docs.get(doc_id).await {
             Ok(Some(doc)) => {
-                if let Err(e) = tasks.upsert_for_doc(doc.workspace_id, doc_id, &inputs).await {
+                if let Err(e) = tasks
+                    .upsert_for_doc(doc.workspace_id, doc_id, &inputs)
+                    .await
+                {
                     tracing::warn!(error=?e, "task reindex failed");
                 }
             }

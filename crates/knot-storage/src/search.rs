@@ -139,7 +139,10 @@ mod tests {
     #[test]
     fn sanitizes_special_chars() {
         assert_eq!(to_prefix_tsquery("foo & bar"), Some("foo:* & bar:*".into()));
-        assert_eq!(to_prefix_tsquery("'; DROP TABLE"), Some("DROP:* & TABLE:*".into()));
+        assert_eq!(
+            to_prefix_tsquery("'; DROP TABLE"),
+            Some("DROP:* & TABLE:*".into())
+        );
     }
 
     #[test]
@@ -156,7 +159,10 @@ mod tests {
 
     #[test]
     fn caps_token_count() {
-        let q = (0..20).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ");
+        let q = (0..20)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let out = to_prefix_tsquery(&q).unwrap();
         assert_eq!(out.matches(":*").count(), 8);
     }

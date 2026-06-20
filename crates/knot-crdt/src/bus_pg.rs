@@ -12,13 +12,15 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dashmap::DashMap;
 use futures_util::{StreamExt, stream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::bus::{Bus, BusError, Subscription};
 
 const PRESENCE_PAYLOAD_CAP_B64: usize = 6 * 1024;
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct DocChannels {
@@ -28,46 +30,103 @@ struct DocChannels {
 
 #[derive(Clone)]
 pub struct PgBus {
-    client: Arc<tokio_postgres::Client>,
+    // Swappable so the supervisor can replace the client after a reconnect.
+    // The lock is only ever held to clone the Arc out — never across an await.
+    client: Arc<Mutex<Arc<tokio_postgres::Client>>>,
     subscriptions: Arc<DashMap<Uuid, DocChannels>>,
 }
 
 impl PgBus {
-    /// Connect a dedicated tokio_postgres client and spawn the demux task.
+    /// Connect a dedicated tokio_postgres client and spawn a supervised demux
+    /// task. The initial connect is fail-fast; thereafter the supervisor
+    /// reconnects with backoff and re-issues LISTEN for every active
+    /// subscription, so a transient DB blip no longer permanently kills
+    /// cross-pod fan-out.
     pub async fn connect(database_url: &str) -> Result<Self, BusError> {
         let config = database_url
             .parse::<tokio_postgres::Config>()
             .map_err(|e| BusError::Io(e.to_string()))?;
-        let (client, mut connection) = config
+        let (client, connection) = config
             .connect(tokio_postgres::NoTls)
             .await
             .map_err(|e| BusError::Io(e.to_string()))?;
 
+        let client_slot = Arc::new(Mutex::new(Arc::new(client)));
         let subscriptions: Arc<DashMap<Uuid, DocChannels>> = Arc::new(DashMap::new());
-        let demux_subs = subscriptions.clone();
 
-        // Drive the connection AND surface notifications via a stream.
+        let slot = client_slot.clone();
+        let subs = subscriptions.clone();
         tokio::spawn(async move {
-            let stream = stream::poll_fn(move |cx| connection.poll_message(cx));
-            tokio::pin!(stream);
-            while let Some(msg) = stream.next().await {
-                match msg {
-                    Ok(tokio_postgres::AsyncMessage::Notification(n)) => {
-                        Self::route(&demux_subs, n.channel(), n.payload());
+            let mut next_conn = Some(connection);
+            loop {
+                let mut connection = next_conn.take().expect("connection present each iteration");
+
+                // Drive THIS connection in a dedicated task so the client can
+                // make progress (tokio_postgres requires the connection to be
+                // polled). It returns when the connection errors or closes.
+                let driver_subs = subs.clone();
+                let driver = tokio::spawn(async move {
+                    let stream = stream::poll_fn(|cx| connection.poll_message(cx));
+                    tokio::pin!(stream);
+                    while let Some(msg) = stream.next().await {
+                        match msg {
+                            Ok(tokio_postgres::AsyncMessage::Notification(n)) => {
+                                Self::route(&driver_subs, n.channel(), n.payload());
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(error=?e, "pg bus connection error");
+                                break;
+                            }
+                        }
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!(error=?e, "pg bus connection error");
-                        break;
-                    }
+                });
+
+                // The driver is now polling, so LISTEN executes resolve. On the
+                // first pass `subs` is empty (no-op); after a reconnect this
+                // re-subscribes every active doc so fan-out resumes.
+                let client = slot.lock().unwrap().clone();
+                for entry in subs.iter() {
+                    let doc_id = *entry.key();
+                    let _ = client
+                        .execute(&format!("LISTEN \"doc:{doc_id}\""), &[])
+                        .await;
+                    let _ = client
+                        .execute(&format!("LISTEN \"presence:{doc_id}\""), &[])
+                        .await;
                 }
+
+                // Block until the connection dies.
+                let _ = driver.await;
+                tracing::warn!("pg bus connection lost; reconnecting");
+
+                // Reconnect: try immediately, back off on repeated failure.
+                let (new_client, new_conn) = loop {
+                    match config.connect(tokio_postgres::NoTls).await {
+                        Ok(cc) => break cc,
+                        Err(e) => {
+                            tracing::warn!(error=?e, "pg bus reconnect failed; retrying");
+                            tokio::time::sleep(RECONNECT_BACKOFF).await;
+                        }
+                    }
+                };
+                *slot.lock().unwrap() = Arc::new(new_client);
+                next_conn = Some(new_conn);
+                tracing::info!("pg bus reconnected");
             }
         });
 
         Ok(Self {
-            client: Arc::new(client),
+            client: client_slot,
             subscriptions,
         })
+    }
+
+    /// Current client handle. The lock is held only long enough to clone the
+    /// Arc — never across the subsequent await — so a reconnect swap never
+    /// blocks publishers.
+    fn current_client(&self) -> Arc<tokio_postgres::Client> {
+        self.client.lock().unwrap().clone()
     }
 
     fn route(subscriptions: &Arc<DashMap<Uuid, DocChannels>>, channel: &str, payload: &str) {
@@ -99,11 +158,13 @@ impl PgBus {
 #[async_trait]
 impl Bus for PgBus {
     async fn publish(&self, doc_id: Uuid, seq: i64) -> Result<(), BusError> {
-        // NOTIFY can't be parameterised; doc_id is internal Uuid, seq is i64
-        // — neither can contain SQL-injection chars.
-        let sql = format!("NOTIFY \"doc:{doc_id}\", '{seq}'");
-        self.client
-            .execute(&sql, &[])
+        // pg_notify() binds the channel + payload as parameters, so no SQL
+        // string is built from values (defence-in-depth; both are internal).
+        self.current_client()
+            .execute(
+                "SELECT pg_notify($1, $2)",
+                &[&format!("doc:{doc_id}"), &seq.to_string()],
+            )
             .await
             .map_err(|e| BusError::Io(e.to_string()))?;
         Ok(())
@@ -115,9 +176,11 @@ impl Bus for PgBus {
             tracing::debug!(len = encoded.len(), "drop oversize presence frame");
             return Ok(());
         }
-        let sql = format!("NOTIFY \"presence:{doc_id}\", '{encoded}'");
-        self.client
-            .execute(&sql, &[])
+        self.current_client()
+            .execute(
+                "SELECT pg_notify($1, $2)",
+                &[&format!("presence:{doc_id}"), &encoded],
+            )
             .await
             .map_err(|e| BusError::Io(e.to_string()))?;
         Ok(())
@@ -132,11 +195,12 @@ impl Bus for PgBus {
         entry.presence_tx.push(pt);
         drop(entry);
         if was_new {
-            self.client
+            let client = self.current_client();
+            client
                 .execute(&format!("LISTEN \"doc:{doc_id}\""), &[])
                 .await
                 .map_err(|e| BusError::Io(e.to_string()))?;
-            self.client
+            client
                 .execute(&format!("LISTEN \"presence:{doc_id}\""), &[])
                 .await
                 .map_err(|e| BusError::Io(e.to_string()))?;
@@ -155,12 +219,11 @@ impl Bus for PgBus {
             .unwrap_or(false);
         if !still_active {
             self.subscriptions.remove(&doc_id);
-            let _ = self
-                .client
+            let client = self.current_client();
+            let _ = client
                 .execute(&format!("UNLISTEN \"doc:{doc_id}\""), &[])
                 .await;
-            let _ = self
-                .client
+            let _ = client
                 .execute(&format!("UNLISTEN \"presence:{doc_id}\""), &[])
                 .await;
         }

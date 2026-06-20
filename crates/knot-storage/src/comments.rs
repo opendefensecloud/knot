@@ -123,11 +123,7 @@ pub trait CommentStore: Send + Sync + 'static {
 
     /// List all non-deleted comments on a doc. When `include_resolved` is false,
     /// threads whose root has resolved_at set are excluded (along with their replies).
-    async fn list(
-        &self,
-        doc_id: Uuid,
-        include_resolved: bool,
-    ) -> Result<Vec<Comment>>;
+    async fn list(&self, doc_id: Uuid, include_resolved: bool) -> Result<Vec<Comment>>;
 
     /// Resolve a thread (only callable on a root; enforces parent_id IS NULL).
     async fn resolve(&self, thread_id: Uuid) -> Result<()>;
@@ -136,30 +132,16 @@ pub trait CommentStore: Send + Sync + 'static {
     async fn unresolve(&self, thread_id: Uuid) -> Result<()>;
 
     /// Update body of a comment. Returns the updated comment.
-    async fn update_body(
-        &self,
-        comment_id: Uuid,
-        body: &str,
-    ) -> Result<Comment>;
+    async fn update_body(&self, comment_id: Uuid, body: &str) -> Result<Comment>;
 
     /// Soft-delete a comment.
     async fn delete(&self, comment_id: Uuid) -> Result<()>;
 
     /// Add a reaction. Idempotent (ON CONFLICT DO NOTHING).
-    async fn add_reaction(
-        &self,
-        comment_id: Uuid,
-        user_id: Uuid,
-        emoji: &str,
-    ) -> Result<()>;
+    async fn add_reaction(&self, comment_id: Uuid, user_id: Uuid, emoji: &str) -> Result<()>;
 
     /// Remove a reaction. Idempotent — no error if absent.
-    async fn remove_reaction(
-        &self,
-        comment_id: Uuid,
-        user_id: Uuid,
-        emoji: &str,
-    ) -> Result<()>;
+    async fn remove_reaction(&self, comment_id: Uuid, user_id: Uuid, emoji: &str) -> Result<()>;
 
     /// Fetch a single comment by id (non-deleted). Used for author checks in the server.
     async fn get(&self, comment_id: Uuid) -> Result<Comment>;
@@ -252,10 +234,7 @@ fn row_to_comment(r: CommentRow, reactions: HashMap<String, Vec<Uuid>>) -> Comme
 }
 
 /// Fetch all reactions for a single comment.
-async fn comment_reactions(
-    pool: &PgPool,
-    comment_id: Uuid,
-) -> Result<HashMap<String, Vec<Uuid>>> {
+async fn comment_reactions(pool: &PgPool, comment_id: Uuid) -> Result<HashMap<String, Vec<Uuid>>> {
     let ids = [comment_id];
     let mut map = load_reactions(pool, &ids).await?;
     Ok(map.remove(&comment_id).unwrap_or_default())
@@ -327,11 +306,7 @@ impl CommentStore for PgCommentStore {
         Ok(row_to_comment(row, HashMap::new()))
     }
 
-    async fn list(
-        &self,
-        doc_id: Uuid,
-        include_resolved: bool,
-    ) -> Result<Vec<Comment>> {
+    async fn list(&self, doc_id: Uuid, include_resolved: bool) -> Result<Vec<Comment>> {
         let rows: Vec<CommentRow> = if include_resolved {
             sqlx::query_as(
                 "SELECT id, doc_id, thread_id, parent_id, author_id, body,
@@ -414,11 +389,7 @@ impl CommentStore for PgCommentStore {
         Ok(())
     }
 
-    async fn update_body(
-        &self,
-        comment_id: Uuid,
-        body: &str,
-    ) -> Result<Comment> {
+    async fn update_body(&self, comment_id: Uuid, body: &str) -> Result<Comment> {
         if body.len() > 4096 {
             return Err(CommentStoreError::BodyTooLong);
         }
@@ -450,12 +421,7 @@ impl CommentStore for PgCommentStore {
         Ok(())
     }
 
-    async fn add_reaction(
-        &self,
-        comment_id: Uuid,
-        user_id: Uuid,
-        emoji: &str,
-    ) -> Result<()> {
+    async fn add_reaction(&self, comment_id: Uuid, user_id: Uuid, emoji: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO comment_reactions (comment_id, user_id, emoji)
              VALUES ($1, $2, $3)
@@ -469,12 +435,7 @@ impl CommentStore for PgCommentStore {
         Ok(())
     }
 
-    async fn remove_reaction(
-        &self,
-        comment_id: Uuid,
-        user_id: Uuid,
-        emoji: &str,
-    ) -> Result<()> {
+    async fn remove_reaction(&self, comment_id: Uuid, user_id: Uuid, emoji: &str) -> Result<()> {
         sqlx::query(
             "DELETE FROM comment_reactions
              WHERE comment_id = $1 AND user_id = $2 AND emoji = $3",

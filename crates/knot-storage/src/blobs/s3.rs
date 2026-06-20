@@ -89,7 +89,10 @@ impl BlobStore for S3Store {
         let key = self.key(id);
         let resp = self.bucket.get_object(&key).await.map_err(|e| {
             let s = format!("{e}");
-            if s.contains("404") || s.to_lowercase().contains("not found") || s.contains("NoSuchKey") {
+            if s.contains("404")
+                || s.to_lowercase().contains("not found")
+                || s.contains("NoSuchKey")
+            {
                 BlobStoreError::NotFound
             } else {
                 BlobStoreError::Backend(format!("s3 get {key}: {e}"))

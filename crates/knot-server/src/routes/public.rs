@@ -6,12 +6,12 @@
 use std::collections::HashMap;
 
 use axum::{
+    Router,
     body::Body,
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::Response,
     routing::get,
-    Router,
 };
 use uuid::Uuid;
 
@@ -77,7 +77,7 @@ fn render_markdown(
     token: &str,
     doc_link_map: &HashMap<Uuid, String>,
 ) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser, Tag};
+    use pulldown_cmark::{Event, Options, Parser, Tag, html};
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
@@ -129,8 +129,16 @@ fn render_markdown(
         }
         other => other,
     });
-    let mut body = String::new();
-    html::push_html(&mut body, parser);
+    let mut raw = String::new();
+    html::push_html(&mut raw, parser);
+    // pulldown-cmark emits raw HTML (`<script>`, `<img onerror=...>`) and
+    // unsafe link schemes (`javascript:`) verbatim. This page is served to
+    // ANONYMOUS visitors, so sanitize before embedding. Relative URLs are the
+    // rewritten board/blob links (`/p/<token>/...`) and must pass through.
+    let body = ammonia::Builder::default()
+        .url_relative(ammonia::UrlRelative::PassThrough)
+        .clean(&raw)
+        .to_string();
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title>\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -272,6 +280,14 @@ async fn public_board_svg(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")
         .header(header::CACHE_CONTROL, "public, max-age=60")
+        // Defense-in-depth: an SVG opened as a top-level document can run
+        // embedded <script>. nosniff + a script-free CSP neutralize that even
+        // if the stored SVG is malicious.
+        .header("X-Content-Type-Options", "nosniff")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox",
+        )
         .body(Body::from(svg))
         .unwrap()
 }
@@ -353,6 +369,43 @@ mod tests {
         let md = "![alt](https://example.com/cat.png)\n";
         let html = render_markdown("Hello", md, "tok123", &HashMap::new());
         assert!(html.contains("https://example.com/cat.png"));
+    }
+
+    #[test]
+    fn render_markdown_strips_raw_html_script() {
+        // Stored XSS regression: raw <script> in the doc markdown must not
+        // survive to the anonymous share page.
+        let md =
+            "hello\n\n<script>alert(document.cookie)</script>\n\n<img src=x onerror=alert(1)>\n";
+        let html = render_markdown("T", md, "tok", &HashMap::new());
+        assert!(!html.contains("<script"), "script tag survived: {html}");
+        assert!(!html.contains("onerror"), "event handler survived: {html}");
+        assert!(
+            !html.contains("alert(1)"),
+            "inline handler survived: {html}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_strips_javascript_link_scheme() {
+        let md = "[click me](javascript:alert(1))\n";
+        let html = render_markdown("T", md, "tok", &HashMap::new());
+        assert!(!html.contains("javascript:"), "js scheme survived: {html}");
+        // Link text is preserved even though the unsafe href is dropped.
+        assert!(html.contains("click me"));
+    }
+
+    #[test]
+    fn render_markdown_keeps_relative_share_links() {
+        // The board/blob rewrites produce relative `/p/<token>/...` URLs that
+        // sanitization must NOT strip.
+        let id = Uuid::new_v4();
+        let md = format!("![diagram](knot://board/{id}.svg)\n");
+        let html = render_markdown("T", &md, "tok", &HashMap::new());
+        assert!(
+            html.contains(&format!("/p/tok/boards/{id}/svg")),
+            "relative board link was stripped by sanitizer: {html}"
+        );
     }
 
     #[test]

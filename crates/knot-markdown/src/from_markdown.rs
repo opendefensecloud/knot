@@ -139,7 +139,9 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     Tag::Emphasis => active_marks.push(("italic".into(), HashMap::new())),
                     Tag::Strong => active_marks.push(("bold".into(), HashMap::new())),
                     Tag::Strikethrough => active_marks.push(("strike".into(), HashMap::new())),
-                    Tag::Image { dest_url, title, .. } => {
+                    Tag::Image {
+                        dest_url, title, ..
+                    } => {
                         // Track every image (sentinel or not) so we can suppress its
                         // alt-text Text events from leaking into the paragraph.
                         image_depth = image_depth.saturating_add(1);
@@ -191,7 +193,11 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         stack.push(el);
                     }
                     Tag::TableCell => {
-                        let kind = if in_table_header { "table_header" } else { "table_cell" };
+                        let kind = if in_table_header {
+                            "table_header"
+                        } else {
+                            "table_cell"
+                        };
                         let mut attrs: Vec<(&str, String)> = Vec::new();
                         let align = table_align
                             .get(table_col_idx)
@@ -571,7 +577,6 @@ fn attrs_from_marks(marks: &[(String, HashMap<String, Any>)]) -> Attrs {
     attrs
 }
 
-
 #[cfg(test)]
 mod panic_resistance {
     use super::parse;
@@ -606,4 +611,3 @@ _",
         }
     }
 }
-

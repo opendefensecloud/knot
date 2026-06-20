@@ -376,7 +376,10 @@ async fn history_restore_replaces_content() {
     // Seed a snapshot with known content.
     let snaps = PgSnapshotStore::new(pool.clone());
     let (snap_bytes, snap_sv) = snapshot_bytes_from_md("# Snapshot Content\n\nOriginal text.");
-    snaps.insert(doc_id, 1, &snap_bytes, &snap_sv).await.unwrap();
+    snaps
+        .insert(doc_id, 1, &snap_bytes, &snap_sv)
+        .await
+        .unwrap();
 
     // Wire rooms so restore can acquire the room and apply the replace.
     wire_rooms(&mut state, &db.url).await;
@@ -407,7 +410,11 @@ async fn history_restore_replaces_content() {
 
     // Now restore to snapshot seq=1.
     let status = post_restore(&app, &sid, &csrf, doc_id, 1).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "restore failed with {status}");
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "restore failed with {status}"
+    );
 
     // Export current markdown; should match the snapshot content.
     // Give the room a brief moment to process (it's async).
@@ -443,7 +450,11 @@ async fn history_viewer_gets_403() {
     let (sid, csrf) = login(&app, "bob@example.com").await;
 
     let (status, _) = get_history(&app, &sid, &csrf, doc_id).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "list: expected 403 for viewer");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "list: expected 403 for viewer"
+    );
 
     let (status, _) = get_history_markdown(&app, &sid, &csrf, doc_id, 1).await;
     assert_eq!(
@@ -478,5 +489,9 @@ async fn history_anon_gets_401() {
         )
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "expected 401 for anon");
+    assert_eq!(
+        r.status(),
+        StatusCode::UNAUTHORIZED,
+        "expected 401 for anon"
+    );
 }

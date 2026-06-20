@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { boardsApi } from "../../../lib/boards.api";
+import { sanitizeSvg } from "../../../lib/sanitize";
 import { ExcalidrawModal } from "../../boards/ExcalidrawModal";
 
 export function ExcalidrawBoardView({ node, updateAttributes }: ReactNodeViewProps) {
@@ -47,7 +48,7 @@ export function ExcalidrawBoardView({ node, updateAttributes }: ReactNodeViewPro
         {svg.data && "ok" in svg.data ? (
           <div
             className="flex justify-center [&_svg]:max-w-full [&_svg]:h-auto"
-            dangerouslySetInnerHTML={{ __html: svg.data.ok }}
+            dangerouslySetInnerHTML={{ __html: sanitizeSvg(svg.data.ok) }}
           />
         ) : (
           <div className="h-40 grid place-items-center text-fg-muted text-sm">

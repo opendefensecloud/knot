@@ -5,7 +5,7 @@ Thanks for considering a contribution. This file covers the setup, the test infr
 ## Setup
 
 ```bash
-git clone https://github.com/voss/knot
+git clone https://github.com/trevex/knot
 cd knot
 cp .env.example .env
 make compose.up                  # boot Postgres + Dex in docker

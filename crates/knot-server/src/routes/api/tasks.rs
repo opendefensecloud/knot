@@ -116,7 +116,10 @@ async fn patch_checked(
         return internal();
     };
     // Editor+ on the parent doc; checking off a task is an edit.
-    match acl.effective_role(ctx.workspace_id, doc_id, ctx.user_id).await {
+    match acl
+        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
+        .await
+    {
         Ok(Some(knot_storage::WorkspaceRole::Owner | knot_storage::WorkspaceRole::Editor)) => {}
         Ok(_) => return json_err(StatusCode::FORBIDDEN, "acl.editor_required", ""),
         Err(_) => return internal(),

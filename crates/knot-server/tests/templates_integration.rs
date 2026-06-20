@@ -12,9 +12,7 @@ use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
 use knot_crdt::{Engine, Event, Rooms, SnapshotPolicy, YrsEngine};
 use knot_server::{AppState, router_with_state};
-use knot_storage::{
-    PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore, WorkspaceRole,
-};
+use knot_storage::{PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore, WorkspaceRole};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -57,8 +55,7 @@ async fn seeded() -> (AppState, Uuid, Uuid, Uuid, String) {
         .unwrap();
 
     // Wire Rooms against the dev DB so ApplyUpdate persists.
-    let bus: Arc<dyn knot_crdt::Bus> =
-        Arc::new(knot_crdt::PgBus::connect(&db.url).await.unwrap());
+    let bus: Arc<dyn knot_crdt::Bus> = Arc::new(knot_crdt::PgBus::connect(&db.url).await.unwrap());
     let updates: Arc<dyn UpdatesStore> = Arc::new(PgUpdatesStore::new(pool.clone()));
     let snaps: Arc<dyn SnapshotStore> = Arc::new(PgSnapshotStore::new(pool.clone()));
     let policy = SnapshotPolicy {
@@ -179,7 +176,7 @@ async fn from_template_clones_markdown_into_new_doc() {
         "Meeting notes copy",
         "default title should be source + ' copy'"
     );
-    assert_eq!(body["is_template"].as_bool().unwrap(), false);
+    assert!(!body["is_template"].as_bool().unwrap());
 
     // Pull the new doc's markdown back out and confirm it matches the
     // template's source. Round-trip is exact for this fixture.

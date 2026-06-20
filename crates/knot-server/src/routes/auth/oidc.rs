@@ -201,6 +201,24 @@ async fn callback(
     resp
 }
 
+/// Whether a `domain`-policy auto-provision is allowed for this identity.
+/// Requires the IdP to have marked the email verified — an unverified address
+/// could otherwise claim any allow-listed domain and self-provision.
+fn domain_policy_allows(email: &str, email_verified: bool, allowed_domains: &str) -> bool {
+    if !email_verified {
+        return false;
+    }
+    let user_domain = email.split('@').nth(1).unwrap_or("");
+    if user_domain.is_empty() {
+        return false;
+    }
+    allowed_domains
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|d| d == user_domain)
+}
+
 async fn auto_provision(
     state: &AppState,
     id: &knot_auth::oidc::VerifiedIdentity,
@@ -210,13 +228,18 @@ async fn auto_provision(
     let allow = match policy {
         "always" => true,
         "domain" => {
-            let domains = &state.config.oidc_allowed_domains;
-            let user_domain = id.email.split('@').nth(1).unwrap_or("");
-            domains
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .any(|d| d == user_domain)
+            let allowed = domain_policy_allows(
+                &id.email,
+                id.email_verified,
+                &state.config.oidc_allowed_domains,
+            );
+            if !allowed && !id.email_verified {
+                tracing::warn!(
+                    email = %id.email,
+                    "oidc domain auto-provision denied: email not verified"
+                );
+            }
+            allowed
         }
         "group" => {
             let mapping = &state.config.oidc_role_from_groups;
@@ -267,4 +290,40 @@ fn read_flow_cookie(req: &Request<Body>) -> Option<FlowState> {
     let raw = find_cookie(req, OIDC_FLOW_COOKIE)?;
     let bytes = URL_SAFE_NO_PAD.decode(raw).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::domain_policy_allows;
+
+    #[test]
+    fn verified_email_in_allowed_domain_is_allowed() {
+        assert!(domain_policy_allows("a@corp.com", true, "corp.com"));
+        assert!(domain_policy_allows(
+            "a@corp.com",
+            true,
+            "other.org, corp.com"
+        ));
+    }
+
+    #[test]
+    fn unverified_email_is_denied_even_in_allowed_domain() {
+        // The security fix: an unverified email must never pass the domain gate.
+        assert!(!domain_policy_allows(
+            "attacker@corp.com",
+            false,
+            "corp.com"
+        ));
+    }
+
+    #[test]
+    fn verified_email_outside_allowed_domains_is_denied() {
+        assert!(!domain_policy_allows("a@evil.com", true, "corp.com"));
+        assert!(!domain_policy_allows("a@corp.com", true, ""));
+    }
+
+    #[test]
+    fn malformed_email_is_denied() {
+        assert!(!domain_policy_allows("no-at-sign", true, "corp.com"));
+    }
 }

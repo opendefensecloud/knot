@@ -81,10 +81,7 @@ impl MarkdownCacheStore for PgMarkdownCache {
         }))
     }
 
-    async fn get(
-        &self,
-        doc_id: Uuid,
-    ) -> Result<Option<MarkdownCacheEntry>, MarkdownCacheError> {
+    async fn get(&self, doc_id: Uuid) -> Result<Option<MarkdownCacheEntry>, MarkdownCacheError> {
         let row = sqlx::query_as::<_, (Uuid, i64, String, DateTime<Utc>)>(
             "SELECT doc_id, rendered_at_seq, markdown_text, updated_at
              FROM doc_markdown_cache

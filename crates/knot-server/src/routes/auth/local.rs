@@ -230,9 +230,7 @@ async fn change_password(State(state): State<AppState>, req: Request<Body>) -> R
     };
     let body: PasswordChange = match serde_json::from_slice(&bytes) {
         Ok(r) => r,
-        Err(_) => {
-            return json_err(StatusCode::BAD_REQUEST, "auth.bad_request", "invalid body")
-        }
+        Err(_) => return json_err(StatusCode::BAD_REQUEST, "auth.bad_request", "invalid body"),
     };
 
     // Validate new password before any crypto work to avoid timing leaks.

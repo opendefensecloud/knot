@@ -3,7 +3,9 @@
 # is for local development only.
 
 image:
-  repository: ghcr.io/voss/knot
+  # Canonical upstream image. CI (release.yaml) publishes here on a v* tag,
+  # stripping the leading "v" so the pushed tag matches .Chart.AppVersion.
+  repository: ghcr.io/trevex/knot
   tag: ""              # defaults to .Chart.AppVersion at template-render time
   pullPolicy: IfNotPresent
   pullSecrets: []
@@ -15,6 +17,9 @@ database:
   url: ""
   existingSecretName: ""
   existingSecretKey: "url"
+  # Pool size per replica. Budget against Postgres max_connections:
+  # roughly replicaCount * (maxConnections + 2).
+  maxConnections: 16
 
 # Required: session signing key (32 bytes).
 session:
@@ -140,6 +145,14 @@ migrations:
 
 probes:
   enabled: true
+
+# Graceful shutdown. On SIGTERM the server stops accepting connections, sends
+# a 1001 Close to live collab WebSockets, and drains in-flight HTTP. preStop
+# sleeps first so the pod leaves Service endpoints before draining begins
+# (kube-proxy stops routing new traffic). Uses the native `sleep` lifecycle
+# handler — no shell, so it works on the scratch image.
+terminationGracePeriodSeconds: 30
+preStopSleepSeconds: 5
 
 nodeSelector: {}
 tolerations: []

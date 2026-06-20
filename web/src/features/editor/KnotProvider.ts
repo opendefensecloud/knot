@@ -141,42 +141,63 @@ export class KnotProvider {
   }
 
   private handleFrame(buf: Uint8Array) {
-    if (buf.length === 0) return;
-    const type = buf[0];
+    // A single WS frame may carry multiple concatenated y-protocol messages.
+    // Consume the whole buffer; processing only the first would silently drop
+    // batched CRDT updates / awareness frames.
+    let offset = 0;
+    while (offset < buf.length) {
+      const next = this.handleMessage(buf, offset);
+      // null = malformed/truncated; no-progress = guard against an infinite
+      // loop on a degenerate message. Either way, stop.
+      if (next === null || next <= offset) return;
+      offset = next;
+    }
+  }
+
+  /** Process one message starting at `start`; return the offset of the next
+   *  message, or null if the frame is malformed/truncated. */
+  private handleMessage(buf: Uint8Array, start: number): number | null {
+    const type = buf[start];
     if (type === MSG_SYNC) {
-      if (buf.length < 2) return;
-      const subtype = buf[1];
-      const [payload] = readVarBytes(buf, 2);
-      if (!payload) return;
+      if (buf.length < start + 2) return null;
+      const subtype = buf[start + 1];
+      const [payload, next] = readVarBytes(buf, start + 2);
+      if (!payload) return null;
       switch (subtype) {
         case SYNC_STEP_1: {
           const update = Y.encodeStateAsUpdate(this.doc, payload);
           this.ws?.send(encodeSync(SYNC_STEP_2, update));
-          return;
+          return next;
         }
         case SYNC_STEP_2:
         case SYNC_UPDATE:
           Y.applyUpdate(this.doc, payload, this);
-          return;
+          return next;
+        default:
+          // Unknown subtype: length is known, so skip and keep going.
+          return next;
       }
     } else if (type === MSG_AWARENESS) {
-      const [payload] = readVarBytes(buf, 1);
-      if (payload) applyAwarenessUpdate(this.awareness, payload, this);
+      const [payload, next] = readVarBytes(buf, start + 1);
+      if (!payload) return null;
+      applyAwarenessUpdate(this.awareness, payload, this);
+      return next;
     } else if (type === MSG_MENTION) {
-      const [payload] = readVarBytes(buf, 1);
-      if (payload) {
-        try {
-          const text = new TextDecoder().decode(payload);
-          const msg = JSON.parse(text) as MentionMsg;
-          if (msg.type === "mention") {
-            this.listeners.mention.forEach((fn) => fn(msg));
-          }
-        } catch {
-          // malformed — ignore
+      const [payload, next] = readVarBytes(buf, start + 1);
+      if (!payload) return null;
+      try {
+        const text = new TextDecoder().decode(payload);
+        const msg = JSON.parse(text) as MentionMsg;
+        if (msg.type === "mention") {
+          this.listeners.mention.forEach((fn) => fn(msg));
         }
+      } catch {
+        // malformed — ignore
       }
-      return;
+      return next;
     }
+    // Unknown message type: we can't know its length, so stop consuming.
+    return null;
   }
 
   private handleDocUpdate = (update: Uint8Array, origin: unknown) => {

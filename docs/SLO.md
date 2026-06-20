@@ -61,7 +61,7 @@ Convergence is not directly measured by a server-side metric — it's bounded by
 
 These aren't SLOs but operating bounds:
 
-- **DB pool busy** — alert if `(pool_size − pool_idle) / pool_size > 0.8` for 5 minutes. Default pool: 8 connections.
+- **DB pool busy** — alert if `(pool_size − pool_idle) / pool_size > 0.8` for 5 minutes. Default pool: 16 connections per replica (`KNOT_DB_MAX_CONNECTIONS` / chart `database.maxConnections`).
 - **Active rooms per pod** — soft cap at 1000. Beyond that, raise `room_idle_evict_sec` lower so cold rooms unload.
 - **Memory** — knot-server with mimalloc keeps RSS proportional to active rooms + connected clients. The `requests: 128Mi / limits: 512Mi` default in the chart fits a few hundred active rooms; right-size for your scale.
 
@@ -78,7 +78,8 @@ When more than **25 %** of the budget is burned in a rolling 7-day window, freez
 
 ## Burn-rate signals
 
-These are descriptions for an on-call to act on, not finalized `PrometheusRule` definitions (those are deferred to a hardening plan):
+These map to the `PrometheusRule` shipped in the chart
+(`deploy/helm/knot/templates/prometheusrule.yaml`, enabled via `alerting.enabled=true`):
 
 - **Fast burn** — error rate × 14.4 (= ~2 % of budget in 1 hour) → page immediately.
 - **Slow burn** — error rate × 6 (= ~5 % of budget in 6 hours) → ticket / Slack within business hours.

@@ -74,11 +74,7 @@ async fn require_doc_role(
     }
 }
 
-async fn create(
-    State(state): State<AppState>,
-    Path(doc_id): Path<Uuid>,
-    req: Request,
-) -> Response {
+async fn create(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
@@ -109,11 +105,7 @@ async fn create(
     }
 }
 
-async fn list(
-    State(state): State<AppState>,
-    Path(doc_id): Path<Uuid>,
-    req: Request,
-) -> Response {
+async fn list(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
@@ -129,11 +121,7 @@ async fn list(
     }
 }
 
-async fn remove(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    req: Request,
-) -> Response {
+async fn remove(State(state): State<AppState>, Path(id): Path<Uuid>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
@@ -154,11 +142,7 @@ async fn remove(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn get_svg(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    req: Request,
-) -> Response {
+async fn get_svg(State(state): State<AppState>, Path(id): Path<Uuid>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
@@ -187,11 +171,7 @@ async fn get_svg(
     }
 }
 
-async fn put_svg(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    req: Request,
-) -> Response {
+async fn put_svg(State(state): State<AppState>, Path(id): Path<Uuid>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };

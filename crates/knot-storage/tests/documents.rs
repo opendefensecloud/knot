@@ -106,12 +106,12 @@ async fn templates_flow_set_and_list() {
     let sk = sort_key_between(None, None);
     let b = store.create(ws, None, "B", &sk, user).await.unwrap();
     let sk = sort_key_between(None, None);
-    let tpl = store.create(ws, None, "Meeting notes", &sk, user).await.unwrap();
-    // Flip the template flag.
-    let after = store
-        .set_template(ws, tpl.id, user, true)
+    let tpl = store
+        .create(ws, None, "Meeting notes", &sk, user)
         .await
         .unwrap();
+    // Flip the template flag.
+    let after = store.set_template(ws, tpl.id, user, true).await.unwrap();
     assert!(after.is_template);
     // list_alive must exclude the template.
     let alive = store.list_alive(ws).await.unwrap();
@@ -130,4 +130,3 @@ async fn templates_flow_set_and_list() {
     let templates2 = store.list_templates(ws).await.unwrap();
     assert!(templates2.is_empty());
 }
-

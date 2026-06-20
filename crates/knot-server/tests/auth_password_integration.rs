@@ -42,11 +42,7 @@ async fn state_with_seeded_user(email: &str, password: &str) -> (AppState, uuid:
 }
 
 /// Log in and return (app clone, sid_kv, csrf_val) for use in subsequent requests.
-async fn login(
-    app: axum::Router,
-    email: &str,
-    password: &str,
-) -> (Vec<String>, String, String) {
+async fn login(app: axum::Router, email: &str, password: &str) -> (Vec<String>, String, String) {
     let r = app
         .oneshot(
             Request::builder()

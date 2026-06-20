@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 
 #[derive(Debug, thiserror::Error)]
@@ -38,23 +38,19 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
 
     // CRDT rooms
     describe_gauge!("knot_room_active", "Currently loaded rooms in this process");
+    describe_gauge!(
+        "knot_board_room_active",
+        "Currently loaded Excalidraw board rooms in this process"
+    );
     describe_counter!(
         "knot_room_updates_total",
         "CRDT updates applied to rooms, by source (local|peer)"
     );
-    describe_counter!(
-        "knot_room_snapshots_total",
-        "Snapshots written to storage"
-    );
+    describe_counter!("knot_room_snapshots_total", "Snapshots written to storage");
 
     // Storage / pool
     describe_gauge!("knot_db_pool_size", "Total connections in the pool");
     describe_gauge!("knot_db_pool_idle", "Idle connections in the pool");
-    describe_histogram!(
-        "knot_db_query_duration_seconds",
-        Unit::Seconds,
-        "Database query duration, by store method"
-    );
 
     Ok(())
 }

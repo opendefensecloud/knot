@@ -4,10 +4,18 @@ metadata:
   name: {{ include "knot.fullname" . }}
   labels:
     {{- include "knot.labels" . | nindent 4 }}
+  annotations:
+    # Pre-install/pre-upgrade hook (weight -10) so the migrate Job (weight -5),
+    # which references this ConfigMap via envFrom, can start. As a plain
+    # resource it would only be applied in the main phase, after the hook.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
 data:
   KNOT_LOG_LEVEL: {{ .Values.logLevel | quote }}
   KNOT_LOG_FORMAT: {{ .Values.logFormat | quote }}
   KNOT_BASE_URL: {{ .Values.baseUrl | quote }}
+  KNOT_DB_MAX_CONNECTIONS: {{ .Values.database.maxConnections | quote }}
   {{- if .Values.oidc.enabled }}
   KNOT_OIDC_ENABLED: "true"
   KNOT_OIDC_ISSUER: {{ .Values.oidc.issuer | quote }}

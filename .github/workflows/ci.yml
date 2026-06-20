@@ -14,19 +14,19 @@ jobs:
     name: fmt + clippy + tsc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0 # keep in sync with rust-toolchain.toml
         with:
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
@@ -37,22 +37,41 @@ jobs:
   unit-rust:
     name: cargo nextest
     runs-on: ubuntu-latest
+    # Integration tests use knot_test_support::fresh_db(), which creates a
+    # t_<uuid> database on a Postgres at 127.0.0.1:5432. Without this service
+    # the ~30 DB-backed tests fail deterministically.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: knot
+          POSTGRES_PASSWORD: knot
+          POSTGRES_DB: knot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U knot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --all-features
+        env:
+          KNOT_TEST_DATABASE_URL: postgres://knot:knot@127.0.0.1:5432/knot
 
   unit-web:
     name: vitest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
@@ -67,16 +86,22 @@ jobs:
     runs-on: ubuntu-latest
     needs: [unit-rust, unit-web]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
+          # This job installs in both web/ and e2e/, so key the cache on both
+          # lockfiles. Without a path, setup-node looks for pnpm-lock.yaml at the
+          # repo root (there is none) and fails.
+          cache-dependency-path: |
+            web/pnpm-lock.yaml
+            e2e/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: web
       - run: pnpm install --frozen-lockfile
@@ -117,8 +142,8 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check

@@ -39,6 +39,23 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
-{{- define "knot.secretName" -}}
-{{- if .Values.database.existingSecretName -}}{{ .Values.database.existingSecretName }}{{- else -}}{{ include "knot.fullname" . }}{{- end -}}
+{{/*
+Secret name/key selectors. Each value (database URL, session key) is resolved
+independently: an external Secret + custom key when existingSecretName is set,
+otherwise the chart-managed Secret with the canonical KNOT_* key. This is what
+makes mixed configs (one external, one inline) work — the old single
+knot.secretName only ever looked at database.existingSecretName and silently
+dropped the chart Secret (incl. the session key) for partial configs.
+*/}}
+{{- define "knot.dbSecretName" -}}
+{{- .Values.database.existingSecretName | default (include "knot.fullname" .) -}}
+{{- end -}}
+{{- define "knot.dbSecretKey" -}}
+{{- if .Values.database.existingSecretName -}}{{ .Values.database.existingSecretKey }}{{- else -}}KNOT_DATABASE_URL{{- end -}}
+{{- end -}}
+{{- define "knot.sessionSecretName" -}}
+{{- .Values.session.existingSecretName | default (include "knot.fullname" .) -}}
+{{- end -}}
+{{- define "knot.sessionSecretKey" -}}
+{{- if .Values.session.existingSecretName -}}{{ .Values.session.existingSecretKey }}{{- else -}}KNOT_SESSION_KEY{{- end -}}
 {{- end -}}

@@ -39,6 +39,10 @@ pub struct Config {
     pub base_url: String,
     /// Postgres connection string.
     pub database_url: String,
+    /// Max Postgres connections in the pool, per replica. Budget against the
+    /// server's `max_connections`: roughly `replicas * (this + 2)` (the pool
+    /// plus one LISTEN/NOTIFY bus connection and one ACL-listener connection).
+    pub db_max_connections: u32,
     /// HMAC key for CSRF token signing. Required in production.
     pub session_key: String,
     /// Filesystem path for blob storage (fs BlobStore impl).
@@ -48,14 +52,12 @@ pub struct Config {
     pub log_level: String,
     /// Log format: "json" or "text".
     pub log_format: String,
-    /// Listen address for the metrics + pprof endpoints.
+    /// Listen address for the metrics endpoint.
     pub metrics_addr: String,
     /// Enable OpenTelemetry OTLP exporter.
     pub tracing_enabled: bool,
     /// OTLP endpoint when tracing is enabled.
     pub otlp_endpoint: String,
-    /// Enable pprof endpoints on the metrics port.
-    pub pprof_enabled: bool,
 
     /// CRDT snapshot trigger: N updates between snapshots.
     pub snapshot_every_n: u32,
@@ -102,6 +104,7 @@ impl Default for Config {
             env: "development".into(),
             base_url: "http://localhost:3000".into(),
             database_url: String::new(),
+            db_max_connections: 16,
             session_key: String::new(),
             data_dir: "./data".into(),
             log_level: "info".into(),
@@ -109,7 +112,6 @@ impl Default for Config {
             metrics_addr: ":9090".into(),
             tracing_enabled: false,
             otlp_endpoint: String::new(),
-            pprof_enabled: false,
             snapshot_every_n: 200,
             snapshot_idle_sec: 30,
             room_idle_evict_sec: 300,
@@ -149,6 +151,20 @@ impl Config {
         if self.env == "production" && self.session_key.is_empty() {
             return Err(ConfigError::Invalid(
                 "KNOT_SESSION_KEY is required when KNOT_ENV=production".into(),
+            ));
+        }
+        // A short signing key trivially weakens CSRF/session HMACs. Enforce a
+        // 32-byte floor whenever a key is set (empty is allowed only outside
+        // production, handled above).
+        if !self.session_key.is_empty() && self.session_key.len() < 32 {
+            return Err(ConfigError::Invalid(format!(
+                "KNOT_SESSION_KEY must be at least 32 bytes (got {})",
+                self.session_key.len()
+            )));
+        }
+        if self.db_max_connections == 0 {
+            return Err(ConfigError::Invalid(
+                "KNOT_DB_MAX_CONNECTIONS must be >= 1".into(),
             ));
         }
         if !matches!(
@@ -199,5 +215,43 @@ impl Config {
             })?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_valid() {
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn short_session_key_is_rejected() {
+        let cfg = Config {
+            session_key: "too-short".into(),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn thirty_two_byte_session_key_is_accepted() {
+        let cfg = Config {
+            session_key: "0123456789abcdef0123456789abcdef".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.session_key.len(), 32);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_pool_size_is_rejected() {
+        let cfg = Config {
+            db_max_connections: 0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 }

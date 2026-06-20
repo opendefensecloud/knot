@@ -8,7 +8,6 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use tower_http::services::{ServeDir, ServeFile};
 use knot_auth::{Hasher, Throttle};
 use knot_config::Config;
 use knot_docs::AclCache;
@@ -18,6 +17,7 @@ use knot_storage::{
     PgShareTokenStore, PgUserStore, PgWorkspaceStore, Pool, SearchStore, SessionStore,
     ShareTokenStore, UserStore, WorkspaceStore,
 };
+use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 pub mod auth;
@@ -59,6 +59,10 @@ pub struct AppState {
     pub oidc_enabled: bool,
     pub oidc: Option<Arc<knot_auth::oidc::OidcClient>>,
     pub config: Arc<Config>,
+    /// Cancelled on SIGTERM/SIGINT so in-flight collab sockets send a clean
+    /// 1001 Close and the process can drain within the grace period instead
+    /// of being SIGKILLed mid-rollout.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl AppState {
@@ -90,6 +94,7 @@ impl AppState {
             oidc_enabled: false,
             oidc: None,
             config: Arc::new(Config::default()),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -104,7 +109,11 @@ impl AppState {
         let sessions: Arc<dyn SessionStore> = Arc::new(PgSessionStore::new(pool.clone()));
         let docs: Arc<dyn DocStore> = Arc::new(PgDocStore::new(pool.clone()));
         let grants: Arc<dyn GrantStore> = Arc::new(PgGrantStore::new(pool.clone()));
-        let acl = Arc::new(AclCache::new(workspaces.clone(), grants.clone()));
+        let acl = Arc::new(AclCache::new(
+            workspaces.clone(),
+            grants.clone(),
+            docs.clone(),
+        ));
         let markdown_cache: Arc<dyn MarkdownCacheStore> =
             Arc::new(PgMarkdownCache::new(pool.clone()));
         let search: Arc<dyn SearchStore> = Arc::new(PgSearchStore::new(pool.clone()));
@@ -145,6 +154,7 @@ impl AppState {
             oidc_enabled: false,
             oidc: None,
             config: Arc::new(Config::default()),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -162,8 +172,7 @@ pub fn router() -> Router {
 }
 
 pub fn router_with_state(state: AppState) -> Router {
-    let web_dist =
-        std::env::var("KNOT_WEB_DIST").unwrap_or_else(|_| "/web/dist".into());
+    let web_dist = std::env::var("KNOT_WEB_DIST").unwrap_or_else(|_| "/web/dist".into());
     let index_path = format!("{web_dist}/index.html");
     let spa = ServeDir::new(&web_dist)
         .append_index_html_on_directories(true)
@@ -210,24 +219,29 @@ async fn collab_upgrade(
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
     };
-    match acl
+    let can_write = match acl
         .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
         .await
     {
-        Ok(Some(_role)) => {}
+        // Viewers may connect (read/hydrate) but cannot write; Owner/Editor can.
+        Ok(Some(role)) => {
+            use knot_storage::WorkspaceRole;
+            matches!(role, WorkspaceRole::Owner | WorkspaceRole::Editor)
+        }
         Ok(None) => return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response(),
         Err(_) => {
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
-    }
+    };
     let rooms = match state.rooms_v2.as_ref() {
         Some(r) => r.clone(),
         None => {
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
     };
+    let shutdown = state.shutdown.clone();
     ws.on_upgrade(move |socket| async move {
-        crate::room::serve(rooms, doc_id, socket).await;
+        crate::room::serve(rooms, doc_id, socket, can_write, shutdown).await;
     })
     .into_response()
 }
@@ -240,7 +254,11 @@ async fn collab_board_upgrade(
     req: axum::extract::Request,
 ) -> axum::response::Response {
     let Some(ctx) = req.extensions().get::<crate::auth::AuthContext>().cloned() else {
-        return (axum::http::StatusCode::UNAUTHORIZED, "auth.session_required").into_response();
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "auth.session_required",
+        )
+            .into_response();
     };
     let Some(boards) = state.boards.as_ref().cloned() else {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
@@ -264,13 +282,16 @@ async fn collab_board_upgrade(
             }
         }
         Ok(None) => return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response(),
-        Err(_) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response(),
+        Err(_) => {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+        }
     }
     let Some(board_rooms) = state.board_rooms.as_ref().cloned() else {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
     };
+    let shutdown = state.shutdown.clone();
     ws.on_upgrade(move |socket| async move {
-        crate::board_room_shim::serve(board_rooms, board_id, socket).await;
+        crate::board_room_shim::serve(board_rooms, board_id, socket, shutdown).await;
     })
     .into_response()
 }

@@ -88,10 +88,7 @@ pub trait DocStore: Send + Sync + 'static {
     async fn descendant_ids(&self, doc_id: Uuid) -> Result<Vec<Uuid>, DocStoreError>;
     /// Documents in the workspace flagged as templates. Returned in
     /// title order. Used to populate the "New document" gallery.
-    async fn list_templates(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<Vec<Document>, DocStoreError>;
+    async fn list_templates(&self, workspace_id: Uuid) -> Result<Vec<Document>, DocStoreError>;
     /// Flip the `is_template` flag on a doc. Auditable; owners only at
     /// the route layer.
     async fn set_template(
@@ -160,10 +157,7 @@ impl DocStore for PgDocStore {
         Ok(rows.into_iter().map(doc_from_row).collect())
     }
 
-    async fn list_templates(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<Vec<Document>, DocStoreError> {
+    async fn list_templates(&self, workspace_id: Uuid) -> Result<Vec<Document>, DocStoreError> {
         let rows = sqlx::query_as::<_, DocRow>(&format!(
             "SELECT {COLS} FROM documents
              WHERE workspace_id = $1 AND archived_at IS NULL AND is_template
@@ -199,7 +193,11 @@ impl DocStore for PgDocStore {
             &mut tx,
             workspace_id,
             Some(actor),
-            if is_template { "doc.template.mark" } else { "doc.template.unmark" },
+            if is_template {
+                "doc.template.mark"
+            } else {
+                "doc.template.unmark"
+            },
             "doc",
             doc.id,
         )

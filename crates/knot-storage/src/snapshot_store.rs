@@ -51,11 +51,8 @@ pub trait SnapshotStore: Send + Sync + 'static {
     ) -> Result<u64, SnapshotStoreError>;
 
     /// Most recent `limit` snapshots for a doc, newest-first, metadata only.
-    async fn list(
-        &self,
-        doc_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<SnapshotMeta>, SnapshotStoreError>;
+    async fn list(&self, doc_id: Uuid, limit: i64)
+    -> Result<Vec<SnapshotMeta>, SnapshotStoreError>;
 
     /// Full snapshot row by seq.
     async fn by_seq(

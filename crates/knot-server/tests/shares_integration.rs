@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
-use knot_server::{router_with_state, AppState};
+use knot_server::{AppState, router_with_state};
 use knot_storage::WorkspaceRole;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -188,10 +188,7 @@ async fn owner_creates_token_201() {
         json["token"].as_str().is_some(),
         "expected token field: {json}"
     );
-    assert!(
-        json["url"].as_str().is_some(),
-        "expected url field: {json}"
-    );
+    assert!(json["url"].as_str().is_some(), "expected url field: {json}");
     assert!(json["expires_at"].is_null(), "expected null expires_at");
     assert!(
         json["created_at"].as_str().is_some(),
@@ -448,10 +445,7 @@ async fn public_board_svg_404_for_cross_doc_board() {
         .await
         .unwrap();
     let boards = state.boards.as_ref().unwrap().clone();
-    let other_board = boards
-        .create(other_doc.id, user_id, None)
-        .await
-        .unwrap();
+    let other_board = boards.create(other_doc.id, user_id, None).await.unwrap();
     boards.set_svg(other_board.id, b"<svg/>").await.unwrap();
 
     let app = router_with_state(state);

@@ -76,7 +76,7 @@ async fn main() {
 async fn run_server(cfg: Config) {
     let cfg = std::sync::Arc::new(cfg);
     // 2. Init observability (logging + optional OTLP; metrics).
-    let _otlp_provider = if cfg.tracing_enabled && !cfg.otlp_endpoint.is_empty() {
+    let otlp_provider = if cfg.tracing_enabled && !cfg.otlp_endpoint.is_empty() {
         match knot_obs::tracing::init_with_otlp(
             &cfg.log_level,
             &cfg.log_format,
@@ -125,7 +125,7 @@ async fn run_server(cfg: Config) {
 
     // 3. Connect to Postgres if configured.
     let pool = if !cfg.database_url.is_empty() {
-        match knot_storage::connect(&cfg.database_url, 16).await {
+        match knot_storage::connect(&cfg.database_url, cfg.db_max_connections).await {
             Ok(p) => Some(p),
             Err(e) => {
                 tracing::error!(error=?e, "database connect failed");
@@ -175,6 +175,7 @@ async fn run_server(cfg: Config) {
             }
         }
     } else {
+        #[allow(clippy::type_complexity)]
         let none: (
             Option<std::sync::Arc<dyn knot_crdt::Bus>>,
             Option<std::sync::Arc<knot_crdt::Rooms>>,
@@ -266,6 +267,9 @@ async fn run_server(cfg: Config) {
         tracing::info!("acl listener spawned");
     }
 
+    // Token shared with every collab socket; cancelled on SIGTERM so they
+    // send a clean 1001 Close and drain instead of being severed mid-rollout.
+    let shutdown = state.shutdown.clone();
     let app = knot_server::router_with_state(state);
 
     // 5. Bind + serve.
@@ -277,15 +281,50 @@ async fn run_server(cfg: Config) {
         }
     };
     tracing::info!(addr=%listener.local_addr().unwrap(), "listening");
-    if let Err(e) = axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await
-    {
+    .with_graceful_shutdown(shutdown_signal(shutdown))
+    .await;
+    if let Err(e) = serve_result {
         tracing::error!(error=?e, "serve failed");
         process::exit(5);
     }
+
+    // Normal (drained) exit: flush traces.
+    tracing::info!("server stopped; flushing telemetry");
+    if let Some(p) = otlp_provider {
+        knot_obs::tracing::shutdown(p);
+    }
+}
+
+/// Resolves when a shutdown signal (SIGTERM in k8s, Ctrl-C locally) arrives.
+/// Cancels the collab token first so in-flight WebSocket sessions close
+/// cleanly, then returns to let axum stop accepting and drain HTTP.
+async fn shutdown_signal(shutdown: tokio_util::sync::CancellationToken) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received; draining collab sockets");
+    shutdown.cancel();
 }
 
 fn normalize_addr(addr: &str) -> String {

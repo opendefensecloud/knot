@@ -11,7 +11,8 @@
 //!    grant on the doc or its ancestors).
 
 use knot_storage::{
-    GrantStore, GrantStoreError, WorkspaceRole, WorkspaceStore, WorkspaceStoreError,
+    DocStore, DocStoreError, GrantStore, GrantStoreError, WorkspaceRole, WorkspaceStore,
+    WorkspaceStoreError,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -24,6 +25,8 @@ pub enum ResolveError {
     Workspace(#[from] WorkspaceStoreError),
     #[error("grants: {0}")]
     Grants(#[from] GrantStoreError),
+    #[error("docs: {0}")]
+    Docs(#[from] DocStoreError),
 }
 
 fn rank(r: WorkspaceRole) -> u8 {
@@ -41,10 +44,22 @@ fn max(a: WorkspaceRole, b: WorkspaceRole) -> WorkspaceRole {
 pub async fn resolve(
     workspaces: &dyn WorkspaceStore,
     grants: &dyn GrantStore,
+    docs: &dyn DocStore,
     workspace_id: Uuid,
     doc_id: Uuid,
     user_id: Uuid,
 ) -> Result<Option<EffectiveRole>, ResolveError> {
+    // Tenancy guard: the document must belong to the caller's workspace.
+    // Without this, `get_member_role(workspace_id, user_id)` returns the
+    // caller's role in their OWN workspace for ANY doc_id — granting a member
+    // of one workspace read/write access to documents in every other workspace
+    // by UUID. We re-assert the doc's workspace here (the cache key is
+    // (doc_id, user_id), and a doc maps to exactly one workspace, so this does
+    // not poison other users' entries).
+    match docs.get(doc_id).await? {
+        Some(doc) if doc.workspace_id == workspace_id => {}
+        _ => return Ok(None),
+    }
     let workspace_role = workspaces.get_member_role(workspace_id, user_id).await?;
     let principal = format!("user:{user_id}");
     let inherited = grants.list_inherited(workspace_id, doc_id).await?;
@@ -87,7 +102,7 @@ mod tests {
     async fn workspace_role_used_when_no_grant() {
         let (ws_s, gs, ds, ws, user) = ctx().await;
         let d = ds.create(ws, None, "X", "m", user).await.unwrap();
-        let r = resolve(&ws_s, &gs, ws, d.id, user).await.unwrap();
+        let r = resolve(&ws_s, &gs, &ds, ws, d.id, user).await.unwrap();
         assert_eq!(r, Some(WorkspaceRole::Viewer));
     }
 
@@ -105,7 +120,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = resolve(&ws_s, &gs, ws, d.id, user).await.unwrap();
+        let r = resolve(&ws_s, &gs, &ds, ws, d.id, user).await.unwrap();
         assert_eq!(r, Some(WorkspaceRole::Owner));
     }
 
@@ -124,7 +139,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = resolve(&ws_s, &gs, ws, child.id, user).await.unwrap();
+        let r = resolve(&ws_s, &gs, &ds, ws, child.id, user).await.unwrap();
         assert_eq!(r, Some(WorkspaceRole::Editor));
     }
 
@@ -133,7 +148,51 @@ mod tests {
         let (ws_s, gs, ds, ws, owner) = ctx().await;
         let d = ds.create(ws, None, "X", "m", owner).await.unwrap();
         let other = Uuid::new_v4();
-        let r = resolve(&ws_s, &gs, ws, d.id, other).await.unwrap();
+        let r = resolve(&ws_s, &gs, &ds, ws, d.id, other).await.unwrap();
         assert_eq!(r, None);
+    }
+
+    /// Regression: a member of workspace A must NOT inherit access to a
+    /// document that lives in workspace B, even though `get_member_role`
+    /// returns their (valid) role within workspace A. The doc-tenancy guard
+    /// in `resolve` closes this cross-tenant read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cross_workspace_doc_is_denied() {
+        let pool = knot_test_support::fresh_db().await.pool;
+        let ws_s = PgWorkspaceStore::new(pool.clone());
+        let us = PgUserStore::new(pool.clone());
+        let ds = PgDocStore::new(pool.clone());
+        let gs = PgGrantStore::new(pool);
+
+        // Workspace A with an Owner member.
+        let a = ws_s.create("wsa", "A").await.unwrap();
+        let user_a = us.create_local("a@x.test", "A", "$h$").await.unwrap();
+        ws_s.add_member(a.id, user_a.id, WorkspaceRole::Owner)
+            .await
+            .unwrap();
+
+        // Workspace B with its own owner and a private document.
+        let b = ws_s.create("wsb", "B").await.unwrap();
+        let owner_b = us.create_local("b@x.test", "B", "$h$").await.unwrap();
+        ws_s.add_member(b.id, owner_b.id, WorkspaceRole::Owner)
+            .await
+            .unwrap();
+        let doc_b = ds
+            .create(b.id, None, "Secret", "m", owner_b.id)
+            .await
+            .unwrap();
+
+        // user_a (Owner of A, NOT a member of B) asks for doc_b using their
+        // own workspace A — must be denied by the tenancy guard.
+        let r = resolve(&ws_s, &gs, &ds, a.id, doc_b.id, user_a.id)
+            .await
+            .unwrap();
+        assert_eq!(r, None, "cross-workspace read must be denied");
+
+        // Sanity: even scoped to B, a non-member of B has no access.
+        let r2 = resolve(&ws_s, &gs, &ds, b.id, doc_b.id, user_a.id)
+            .await
+            .unwrap();
+        assert_eq!(r2, None, "non-member of B has no access even in B's scope");
     }
 }

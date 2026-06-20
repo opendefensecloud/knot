@@ -113,6 +113,7 @@ impl Room {
     /// Spawn a room, hydrating its `DocHandle` from the latest snapshot and
     /// replaying any updates persisted after that snapshot. The actor starts
     /// with `last_applied_seq` set to the highest seq applied during hydration.
+    #[allow(clippy::too_many_arguments)] // cohesive set of room dependencies
     pub async fn spawn(
         doc_id: Uuid,
         engine: Arc<dyn Engine>,
@@ -475,7 +476,8 @@ impl Room {
                         continue;
                     }
                     if self.engine.apply_update(&self.doc, &u.update_bytes).is_ok() {
-                        metrics::counter!("knot_room_updates_total", "source" => "peer").increment(1);
+                        metrics::counter!("knot_room_updates_total", "source" => "peer")
+                            .increment(1);
                         let framed = wrap_sync_update(&u.update_bytes);
                         let mut to_close: Vec<ConnId> = Vec::new();
                         for (cid, conn) in &self.conns {
@@ -713,7 +715,10 @@ mod tests {
                 snapshot.push(li.get_attribute(&txn, "checked"));
             }
         }
-        assert_eq!(snapshot, vec![Some("false".into()), None, Some("true".into())]);
+        assert_eq!(
+            snapshot,
+            vec![Some("false".into()), None, Some("true".into())]
+        );
     }
 
     #[test]

@@ -92,6 +92,17 @@ pub(super) async fn put_inline(
             "",
         );
     }
+    // `group:` principals pass the format check but ACL resolution only honors
+    // `user:` grants — a group grant would silently grant nothing. Reject at
+    // creation rather than store a no-op. (delete still accepts them so any
+    // legacy group grant can be removed.)
+    if principal.starts_with("group:") {
+        return json_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "grant.group_unsupported",
+            "group grants are not supported; grant individual users",
+        );
+    }
     let Some(grants) = state.grants.clone() else {
         return internal();
     };

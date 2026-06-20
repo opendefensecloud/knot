@@ -41,7 +41,10 @@ async fn require_owner(state: &AppState, ctx: &AuthContext, doc_id: Uuid) -> Opt
     let Some(acl) = state.acl.clone() else {
         return Some(json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", ""));
     };
-    match acl.effective_role(ctx.workspace_id, doc_id, ctx.user_id).await {
+    match acl
+        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
+        .await
+    {
         Ok(Some(knot_storage::WorkspaceRole::Owner)) => None,
         Ok(_) => Some(json_err(
             StatusCode::FORBIDDEN,
@@ -56,11 +59,7 @@ fn url_for(state: &AppState, token: &str) -> String {
     format!("{}/p/{}", state.base_url.trim_end_matches('/'), token)
 }
 
-async fn create(
-    State(state): State<AppState>,
-    Path(doc_id): Path<Uuid>,
-    req: Request,
-) -> Response {
+async fn create(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
@@ -104,11 +103,7 @@ async fn create(
     }
 }
 
-async fn list(
-    State(state): State<AppState>,
-    Path(doc_id): Path<Uuid>,
-    req: Request,
-) -> Response {
+async fn list(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };

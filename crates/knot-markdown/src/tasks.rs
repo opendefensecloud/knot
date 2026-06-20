@@ -154,7 +154,6 @@ struct TaskState {
     text: String,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

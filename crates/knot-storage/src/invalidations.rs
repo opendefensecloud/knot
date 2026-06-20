@@ -20,9 +20,10 @@ pub async fn record_in_tx(
     .execute(&mut *tx)
     .await?;
     // Notify listeners. Payload = doc_id text so listener can target evictions.
-    // NOTE: NOTIFY can't be parameterised; doc_id comes from internal call
-    // sites only (never user input), so format!() is safe here.
-    sqlx::query(&format!("NOTIFY acl_invalidate, '{}'", doc_id))
+    // pg_notify() takes the payload as a bound parameter, so no SQL string is
+    // built from a value (defence-in-depth; doc_id is an internal Uuid).
+    sqlx::query("SELECT pg_notify('acl_invalidate', $1)")
+        .bind(doc_id.to_string())
         .execute(&mut *tx)
         .await?;
     Ok(())

@@ -8,9 +8,7 @@ use std::time::Duration;
 use knot_auth::{Hasher, Throttle};
 use knot_crdt::{Event, Rooms, SnapshotPolicy, YrsEngine};
 use knot_server::AppState;
-use knot_storage::{
-    PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore, WorkspaceRole,
-};
+use knot_storage::{PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore, WorkspaceRole};
 
 #[tokio::test]
 async fn doc_edit_with_mention_lands_in_task_index_without_http() {
@@ -54,9 +52,7 @@ async fn doc_edit_with_mention_lands_in_task_index_without_http() {
         .unwrap();
 
     // Rooms registry with dirty-notify wired to the reindex worker.
-    let bus: Arc<dyn knot_crdt::Bus> = Arc::new(
-        knot_crdt::PgBus::connect(&db.url).await.unwrap(),
-    );
+    let bus: Arc<dyn knot_crdt::Bus> = Arc::new(knot_crdt::PgBus::connect(&db.url).await.unwrap());
     let updates: Arc<dyn UpdatesStore> = Arc::new(PgUpdatesStore::new(pool.clone()));
     let snaps: Arc<dyn SnapshotStore> = Arc::new(PgSnapshotStore::new(pool.clone()));
     let policy = SnapshotPolicy {
@@ -86,10 +82,7 @@ async fn doc_edit_with_mention_lands_in_task_index_without_http() {
     // as `[Alice](knot://user/<uuid>)` in markdown — round-tripping
     // through from_markdown produces the same nodes the extractor
     // expects.
-    let md = format!(
-        "- [ ] [Alice](knot://user/{}) ship it\n",
-        user.id
-    );
+    let md = format!("- [ ] [Alice](knot://user/{}) ship it\n", user.id);
     let (_handle, update_bytes) = knot_markdown::from_markdown::parse(&md).unwrap();
 
     // Acquire the room and apply the update.

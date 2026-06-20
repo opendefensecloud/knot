@@ -94,7 +94,10 @@ impl TaskStore for PgTaskStore {
         let mut tx = self.pool.begin().await?;
 
         // Build the new ID set so we can prune rows that fell out.
-        let new_ids: Vec<String> = items.iter().map(|i| task_id(doc_id, i.item_index)).collect();
+        let new_ids: Vec<String> = items
+            .iter()
+            .map(|i| task_id(doc_id, i.item_index))
+            .collect();
 
         // Delete rows for this doc that aren't in the new set. NOT IN with
         // an empty array would be a no-op, so handle that case explicitly.
