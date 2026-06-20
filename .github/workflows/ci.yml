@@ -71,7 +71,7 @@ jobs:
       - uses: pnpm/action-setup@v6
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
@@ -96,6 +96,12 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+          # This job installs in both web/ and e2e/, so key the cache on both
+          # lockfiles. Without a path, setup-node looks for pnpm-lock.yaml at the
+          # repo root (there is none) and fails.
+          cache-dependency-path: |
+            web/pnpm-lock.yaml
+            e2e/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: web
       - run: pnpm install --frozen-lockfile
