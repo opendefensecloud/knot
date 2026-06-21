@@ -28,6 +28,30 @@ impl From<figment::Error> for ConfigError {
     }
 }
 
+/// Deserialize a `String` field that may arrive as a string OR an integer.
+///
+/// figment's `Env` provider parses bare-digit env values as integers, so a
+/// numeric OIDC client id (e.g. the all-digit IDs Zitadel issues) would
+/// otherwise fail with "invalid type: found unsigned int ..., expected a
+/// string". Accept both and normalise to the canonical decimal string.
+fn de_string_or_number<'de, D>(de: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Unsigned(u64),
+        Signed(i64),
+    }
+    Ok(match StringOrNumber::deserialize(de)? {
+        StringOrNumber::String(s) => s,
+        StringOrNumber::Unsigned(n) => n.to_string(),
+        StringOrNumber::Signed(n) => n.to_string(),
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -71,8 +95,10 @@ pub struct Config {
     /// OIDC issuer URL (e.g. `http://dex:5556/dex`).
     pub oidc_issuer: String,
     /// OIDC client id.
+    #[serde(deserialize_with = "de_string_or_number")]
     pub oidc_client_id: String,
     /// OIDC client secret.
+    #[serde(deserialize_with = "de_string_or_number")]
     pub oidc_client_secret: String,
     /// Redirect URL registered with the IdP.
     pub oidc_redirect_url: String,
