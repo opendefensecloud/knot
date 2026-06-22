@@ -28,6 +28,9 @@ data:
   {{- with .Values.oidc.roleFromGroups }}
   KNOT_OIDC_ROLE_FROM_GROUPS: {{ . | quote }}
   {{- end }}
+  {{- with .Values.oidc.extraAudiences }}
+  KNOT_OIDC_EXTRA_AUDIENCES: {{ . | quote }}
+  {{- end }}
   {{- end }}
   {{- if .Values.tracing.enabled }}
   KNOT_TRACING_ENABLED: "true"

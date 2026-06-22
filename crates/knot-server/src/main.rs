@@ -107,6 +107,7 @@ async fn run_server(cfg: Config) {
             &cfg.oidc_client_id,
             &cfg.oidc_client_secret,
             &cfg.oidc_redirect_url,
+            cfg.oidc_extra_audiences_list(),
         )
         .await
         {

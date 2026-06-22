@@ -41,6 +41,9 @@ type ConfiguredCoreClient = CoreClient<
 pub struct OidcClient {
     client: ConfiguredCoreClient,
     issuer: String,
+    /// Extra `aud` values to trust in the ID token beyond the client id (see
+    /// `audience_is_trusted`). Empty for IdPs that only ever set the client id.
+    extra_audiences: Vec<String>,
 }
 
 impl OidcClient {
@@ -49,6 +52,7 @@ impl OidcClient {
         client_id: &str,
         client_secret: &str,
         redirect_url: &str,
+        extra_audiences: Vec<String>,
     ) -> Result<Self, OidcError> {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -71,6 +75,7 @@ impl OidcClient {
         Ok(Self {
             client,
             issuer: issuer.to_string(),
+            extra_audiences,
         })
     }
 
@@ -125,7 +130,17 @@ impl OidcClient {
             .id_token()
             .ok_or_else(|| OidcError::Verification("missing id_token".into()))?;
         let nonce = Nonce::new(expected_nonce.to_string());
-        let id_verifier = self.client.id_token_verifier();
+        // Some IdPs put extra `aud` values in the ID token alongside our client
+        // id — Zitadel, for example, adds the project id. openidconnect rejects
+        // any audience other than the client id by default ("not a trusted
+        // audience"), so explicitly trust the configured extras. The client id
+        // is still required to be present, and the crate still enforces that
+        // `azp` equals the client id whenever multiple audiences are present.
+        let trusted = self.extra_audiences.clone();
+        let id_verifier = self
+            .client
+            .id_token_verifier()
+            .set_other_audience_verifier_fn(move |aud| audience_is_trusted(&trusted, aud.as_str()));
         let claims = id_token
             .claims(&id_verifier, &nonce)
             .map_err(|e| OidcError::Verification(e.to_string()))?;
@@ -192,6 +207,13 @@ fn extract_groups_from_jwt(jwt: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Whether `aud` is an audience we explicitly trust beyond the client id.
+/// Exact string match against the configured extra-audience list; an empty
+/// list trusts nothing extra (the openidconnect default).
+fn audience_is_trusted(trusted: &[String], aud: &str) -> bool {
+    trusted.iter().any(|a| a == aud)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +226,24 @@ mod tests {
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
         assert!(challenge.as_str().len() >= 43);
         assert!(verifier.secret().len() >= 43);
+    }
+
+    #[test]
+    fn audience_trust_requires_explicit_match() {
+        // With no configured extra audiences nothing beyond the client_id is
+        // trusted — mirrors openidconnect's default-deny for other audiences.
+        assert!(!audience_is_trusted(&[], "366700366412350659"));
+        // An exact configured match is trusted (e.g. the Zitadel project id).
+        let trusted = vec!["366700366412350659".to_string()];
+        assert!(audience_is_trusted(&trusted, "366700366412350659"));
+        // A non-listed audience is not trusted.
+        assert!(!audience_is_trusted(&trusted, "999999999999999999"));
+        // Matching is exact: neither prefixes nor truncations count.
+        assert!(!audience_is_trusted(&["3667".to_string()], "366700366412350659"));
+        assert!(!audience_is_trusted(&trusted, "36670036641235065"));
+        // Any entry in the list matches.
+        let many = vec!["a".to_string(), "366700366412350659".to_string()];
+        assert!(audience_is_trusted(&many, "366700366412350659"));
     }
 
     #[test]

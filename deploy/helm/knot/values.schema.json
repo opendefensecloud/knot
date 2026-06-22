@@ -50,6 +50,7 @@
         "autoProvision": { "enum": ["off", "always", "domain", "group"] },
         "allowedDomains": { "type": "string" },
         "roleFromGroups": { "type": "string" },
+        "extraAudiences": { "type": "string" },
         "existingSecretName": { "type": "string" }
       }
     },
