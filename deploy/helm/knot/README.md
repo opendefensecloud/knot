@@ -98,16 +98,20 @@ Tested IdPs:
 
 Per [OIDC Core §3.1.3.7](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation),
 an ID token is rejected if it lists an audience the client does not trust. Some
-IdPs add audiences beyond the client id: **Zitadel**, for example, includes the
-**project id** in `aud` next to the client id, which makes login fail with
-`auth.oidc.exchange_failed` (the server log shows `Invalid audiences: \`<id>\` is
-not a trusted audience`). List those extra ids in `oidc.extraAudiences`
-(comma-separated) so the verifier trusts them; the client id must still be
-present and Zitadel's `azp` still has to equal it.
+IdPs add audiences beyond the client id: **Zitadel**, for example, puts the
+**project id** — and sometimes several other numeric ids — in `aud` next to the
+client id, which makes login fail with `auth.oidc.exchange_failed` (the server
+log shows `Invalid audiences: \`<id>\` is not a trusted audience`).
+
+`oidc.extraAudiences` is a comma-separated list of **regex patterns**, each
+matched against the whole audience. A bare id matches only itself; `\d{18}`
+matches any 18-digit id. Trusting these is safe — the client id must still be
+present in `aud` and Zitadel's `azp` must still equal it. For Zitadel, match any
+snowflake id rather than chasing them one by one:
 
 ```yaml
 oidc:
-  extraAudiences: "366700366412350659"   # the Zitadel project id
+  extraAudiences: '^\d{18}$'   # trust any 18-digit Zitadel id (project, grants, …)
 ```
 
 ## S3 blob backend

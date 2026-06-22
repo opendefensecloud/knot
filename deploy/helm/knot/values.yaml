@@ -38,9 +38,11 @@ oidc:
   autoProvision: "off"          # off | always | domain | group
   allowedDomains: ""
   roleFromGroups: ""
-  # Extra `aud` values to trust in the ID token besides clientId, comma-separated.
-  # Needed for IdPs that add audiences — e.g. Zitadel includes the project id
-  # alongside the client id, which the verifier rejects by default.
+  # Comma-separated regex patterns for extra `aud` values to trust besides
+  # clientId, each matched against the whole audience (a bare id matches only
+  # itself; `\d{18}` matches any 18-digit id). Needed for IdPs that add
+  # audiences — e.g. Zitadel adds the project id (and sometimes more). For
+  # Zitadel use '^\d{18}$' rather than listing each id.
   extraAudiences: ""
 
 baseUrl: ""

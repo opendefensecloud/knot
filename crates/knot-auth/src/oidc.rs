@@ -10,6 +10,7 @@ use openidconnect::{
     core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
     reqwest,
 };
+use regex::Regex;
 use thiserror::Error;
 use url::Url;
 
@@ -41,9 +42,10 @@ type ConfiguredCoreClient = CoreClient<
 pub struct OidcClient {
     client: ConfiguredCoreClient,
     issuer: String,
-    /// Extra `aud` values to trust in the ID token beyond the client id (see
-    /// `audience_is_trusted`). Empty for IdPs that only ever set the client id.
-    extra_audiences: Vec<String>,
+    /// Compiled patterns for extra `aud` values to trust in the ID token beyond
+    /// the client id (see `audience_is_trusted`). Each is anchored to match the
+    /// whole audience. Empty for IdPs that only ever set the client id.
+    extra_audiences: Vec<Regex>,
 }
 
 impl OidcClient {
@@ -72,6 +74,8 @@ impl OidcClient {
             RedirectUrl::new(redirect_url.to_string())
                 .map_err(|e| OidcError::Config(e.to_string()))?,
         );
+        let extra_audiences = compile_audience_patterns(&extra_audiences)
+            .map_err(|e| OidcError::Config(format!("invalid oidc extra audience pattern: {e}")))?;
         Ok(Self {
             client,
             issuer: issuer.to_string(),
@@ -207,11 +211,25 @@ fn extract_groups_from_jwt(jwt: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Whether `aud` is an audience we explicitly trust beyond the client id.
-/// Exact string match against the configured extra-audience list; an empty
-/// list trusts nothing extra (the openidconnect default).
-fn audience_is_trusted(trusted: &[String], aud: &str) -> bool {
-    trusted.iter().any(|a| a == aud)
+/// Compile each raw extra-audience pattern into a regex anchored to match the
+/// ENTIRE audience. A bare id like `366700366412350659` therefore matches only
+/// itself, while `\d{18}` (or `^\d{18}$`) matches any 18-digit id — useful
+/// because some IdPs (Zitadel) put several numeric audiences in the token.
+/// Returns an error for an invalid pattern so a misconfig fails fast at startup.
+fn compile_audience_patterns(patterns: &[String]) -> Result<Vec<Regex>, regex::Error> {
+    patterns
+        .iter()
+        .map(|p| Regex::new(&format!("^(?:{p})$")))
+        .collect()
+}
+
+/// Whether `aud` is an audience we explicitly trust beyond the client id: it
+/// must fully match one of the configured patterns. An empty list trusts
+/// nothing extra (the openidconnect default). Accepting extra audiences is safe
+/// because the verifier still requires the client id to be in `aud` and `azp`
+/// to equal the client id for multi-audience tokens.
+fn audience_is_trusted(patterns: &[Regex], aud: &str) -> bool {
+    patterns.iter().any(|re| re.is_match(aud))
 }
 
 #[cfg(test)]
@@ -228,22 +246,45 @@ mod tests {
         assert!(verifier.secret().len() >= 43);
     }
 
+    fn pats(raw: &[&str]) -> Vec<Regex> {
+        compile_audience_patterns(&raw.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .expect("valid patterns")
+    }
+
     #[test]
-    fn audience_trust_requires_explicit_match() {
-        // With no configured extra audiences nothing beyond the client_id is
-        // trusted — mirrors openidconnect's default-deny for other audiences.
-        assert!(!audience_is_trusted(&[], "366700366412350659"));
-        // An exact configured match is trusted (e.g. the Zitadel project id).
-        let trusted = vec!["366700366412350659".to_string()];
-        assert!(audience_is_trusted(&trusted, "366700366412350659"));
-        // A non-listed audience is not trusted.
-        assert!(!audience_is_trusted(&trusted, "999999999999999999"));
-        // Matching is exact: neither prefixes nor truncations count.
-        assert!(!audience_is_trusted(&["3667".to_string()], "366700366412350659"));
-        assert!(!audience_is_trusted(&trusted, "36670036641235065"));
-        // Any entry in the list matches.
-        let many = vec!["a".to_string(), "366700366412350659".to_string()];
-        assert!(audience_is_trusted(&many, "366700366412350659"));
+    fn audience_patterns_full_match_literal_ids() {
+        // A bare id matches only itself — not a prefix, suffix, or substring.
+        let p = pats(&["366700366412350659"]);
+        assert!(audience_is_trusted(&p, "366700366412350659"));
+        assert!(!audience_is_trusted(&p, "366700366412350659X"));
+        assert!(!audience_is_trusted(&p, "X366700366412350659"));
+        assert!(!audience_is_trusted(&p, "36670036641235065")); // 17 digits
+        // Empty list trusts nothing extra.
+        assert!(!audience_is_trusted(&pats(&[]), "366700366412350659"));
+    }
+
+    #[test]
+    fn audience_pattern_regex_matches_any_zitadel_snowflake() {
+        // vaultwarden-style: trust any 18-digit audience; Zitadel emits several.
+        // Anchors are optional since patterns match against the whole audience.
+        for raw in [r"^\d{18}$", r"\d{18}"] {
+            let p = pats(&[raw]);
+            assert!(audience_is_trusted(&p, "366700366412350659"), "{raw}");
+            assert!(audience_is_trusted(&p, "366700366395770051"), "{raw}");
+            assert!(
+                !audience_is_trusted(&p, "36670036641235065"),
+                "17-digit / {raw}"
+            );
+            assert!(
+                !audience_is_trusted(&p, "3667003664123506590"),
+                "19-digit / {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_audience_pattern_is_rejected() {
+        assert!(compile_audience_patterns(&["[".to_string()]).is_err());
     }
 
     #[test]

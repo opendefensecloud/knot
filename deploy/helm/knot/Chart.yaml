@@ -5,13 +5,13 @@ description: |
   Multi-user collaborative knowledge base with CRDT-backed
   real-time editing.
 type: application
-version: 0.3.1
-appVersion: "0.1.5"
+version: 0.3.3
+appVersion: "0.1.6"
 home: https://github.com/trevex/knot
 sources:
   - https://github.com/trevex/knot
 maintainers:
-  - name: Niklas Voss
+  - name: christianhuening
 icon: ""
 keywords:
   - knot

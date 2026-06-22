@@ -1926,6 +1926,7 @@ dependencies = [
  "hmac 0.12.1",
  "openidconnect",
  "rand 0.8.6",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -108,11 +108,13 @@ pub struct Config {
     pub oidc_allowed_domains: String,
     /// JSON map of OIDC group → workspace role (used by `group` policy).
     pub oidc_role_from_groups: String,
-    /// Comma-separated list of additional `aud` values to trust in the ID
-    /// token, beyond the client id. Some IdPs add extra audiences — Zitadel,
-    /// for one, includes the project id alongside the client id — which the
-    /// OIDC verifier rejects by default ("not a trusted audience"). List those
-    /// ids here. A single all-digit id arrives from the env as an integer,
+    /// Comma-separated list of regex patterns for additional `aud` values to
+    /// trust in the ID token, beyond the client id. Each pattern is matched
+    /// against the whole audience (a bare id matches only itself; `\d{18}`
+    /// matches any 18-digit id). Some IdPs add extra audiences — Zitadel, for
+    /// one, includes the project id (and sometimes more) alongside the client
+    /// id — which the OIDC verifier rejects by default ("not a trusted
+    /// audience"). A single all-digit value arrives from the env as an integer,
     /// hence `de_string_or_number` (same as the client id/secret).
     #[serde(deserialize_with = "de_string_or_number")]
     pub oidc_extra_audiences: String,

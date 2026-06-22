@@ -96,5 +96,7 @@ hmac = "0.12"
 sha2 = "0.10"
 cookie = "0.18"
 openidconnect = { version = "4", features = ["reqwest"] }
+# Regex for matching extra OIDC token audiences (IdPs like Zitadel add several).
+regex = "1"
 clap = { version = "4", features = ["derive", "env"] }
 url = "2"
