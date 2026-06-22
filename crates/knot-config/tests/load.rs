@@ -170,3 +170,47 @@ fn oidc_client_secret_accepts_numeric_value() {
         Ok(())
     });
 }
+
+#[test]
+fn oidc_extra_audiences_default_empty_and_env_parsed() {
+    // Zitadel issues ID tokens whose `aud` contains the client_id AND the
+    // project id; operators list the extra (project) audiences here so the
+    // verifier trusts them. Comma-separated, surrounding whitespace ignored,
+    // empties dropped.
+    figment::Jail::expect_with(|jail| {
+        let cfg = Config::load::<&str>(None).expect("load");
+        assert!(cfg.oidc_extra_audiences.is_empty());
+        assert!(cfg.oidc_extra_audiences_list().is_empty());
+
+        jail.set_env(
+            "KNOT_OIDC_EXTRA_AUDIENCES",
+            "366700366412350659, 378364338165023482 ,",
+        );
+        let cfg = Config::load::<&str>(None).expect("load");
+        assert_eq!(
+            cfg.oidc_extra_audiences_list(),
+            vec![
+                "366700366412350659".to_string(),
+                "378364338165023482".to_string(),
+            ]
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn oidc_extra_audiences_accepts_single_numeric_value() {
+    // A single all-digit audience (e.g. a Zitadel project id) arrives from
+    // figment's Env provider as an integer and must still load as a String,
+    // exactly like the numeric client id/secret above.
+    figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_OIDC_EXTRA_AUDIENCES", "366700366412350659");
+        let cfg = Config::load::<&str>(None).expect("numeric extra audience must load");
+        assert_eq!(cfg.oidc_extra_audiences, "366700366412350659");
+        assert_eq!(
+            cfg.oidc_extra_audiences_list(),
+            vec!["366700366412350659".to_string()]
+        );
+        Ok(())
+    });
+}

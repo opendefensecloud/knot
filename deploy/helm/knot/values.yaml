@@ -38,6 +38,10 @@ oidc:
   autoProvision: "off"          # off | always | domain | group
   allowedDomains: ""
   roleFromGroups: ""
+  # Extra `aud` values to trust in the ID token besides clientId, comma-separated.
+  # Needed for IdPs that add audiences — e.g. Zitadel includes the project id
+  # alongside the client id, which the verifier rejects by default.
+  extraAudiences: ""
 
 baseUrl: ""
 

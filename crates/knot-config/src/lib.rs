@@ -108,6 +108,14 @@ pub struct Config {
     pub oidc_allowed_domains: String,
     /// JSON map of OIDC group → workspace role (used by `group` policy).
     pub oidc_role_from_groups: String,
+    /// Comma-separated list of additional `aud` values to trust in the ID
+    /// token, beyond the client id. Some IdPs add extra audiences — Zitadel,
+    /// for one, includes the project id alongside the client id — which the
+    /// OIDC verifier rejects by default ("not a trusted audience"). List those
+    /// ids here. A single all-digit id arrives from the env as an integer,
+    /// hence `de_string_or_number` (same as the client id/secret).
+    #[serde(deserialize_with = "de_string_or_number")]
+    pub oidc_extra_audiences: String,
 
     /// Blob storage backend: "postgres" (default) or "s3".
     pub blob_backend: String,
@@ -149,6 +157,7 @@ impl Default for Config {
             oidc_auto_provision: "off".into(),
             oidc_allowed_domains: String::new(),
             oidc_role_from_groups: String::new(),
+            oidc_extra_audiences: String::new(),
             blob_backend: "postgres".into(),
             s3_bucket: String::new(),
             s3_endpoint: String::new(),
@@ -171,6 +180,17 @@ impl Config {
 
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Parse `oidc_extra_audiences` (comma-separated) into trimmed, non-empty
+    /// audience strings. Empty when unset.
+    pub fn oidc_extra_audiences_list(&self) -> Vec<String> {
+        self.oidc_extra_audiences
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
