@@ -239,7 +239,10 @@ mod tests {
         // A non-listed audience is not trusted.
         assert!(!audience_is_trusted(&trusted, "999999999999999999"));
         // Matching is exact: neither prefixes nor truncations count.
-        assert!(!audience_is_trusted(&["3667".to_string()], "366700366412350659"));
+        assert!(!audience_is_trusted(
+            &["3667".to_string()],
+            "366700366412350659"
+        ));
         assert!(!audience_is_trusted(&trusted, "36670036641235065"));
         // Any entry in the list matches.
         let many = vec!["a".to_string(), "366700366412350659".to_string()];
