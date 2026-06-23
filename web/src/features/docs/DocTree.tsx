@@ -20,6 +20,7 @@ import {
   useSensors,
   closestCenter,
   type DragEndEvent,
+  type DragOverEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
@@ -39,7 +40,7 @@ import { type ApiError } from "../../lib/api";
 import { WorkspaceHeader } from "../workspace/WorkspaceHeader";
 import { docsApi } from "./docs.api";
 import { markDocEditMode } from "./editMode";
-import { buildTree, applyOptimisticMove, type TreeNode } from "./tree";
+import { buildTree, applyOptimisticMove, descendantIds, dropIntent, moveArgs, type TreeNode } from "./tree";
 
 export function DocTree() {
   const qc = useQueryClient();
@@ -102,13 +103,33 @@ export function DocTree() {
     [list.data],
   );
 
+  const [drop, setDrop] = useState<{ overId: string; intent: "before" | "after" | "into" } | null>(null);
+
+  function onDragOver(e: DragOverEvent) {
+    const over = e.over;
+    const activeRect = e.active.rect.current.translated;
+    if (!over || over.id === e.active.id || !activeRect) { setDrop(null); return; }
+    const centerY = activeRect.top + activeRect.height / 2;
+    const intent = dropIntent(centerY, { top: over.rect.top, height: over.rect.height });
+    setDrop({ overId: String(over.id), intent });
+  }
+
   function onDragEnd(e: DragEndEvent) {
+    const d = drop;
+    setDrop(null);
+    if (!e.over || !d) return;
     const movedId = String(e.active.id);
-    if (!e.over) return;
     const targetId = String(e.over.id);
     if (movedId === targetId) return;
-    // v0.1 UX: drop-onto-row = nest as child of target.
-    move.mutate({ id: movedId, body: { parent_id: targetId } });
+    const docs = list.data && "ok" in list.data ? list.data.ok : [];
+    const target = docs.find((x) => x.id === targetId) ?? null;
+    if (!target) return;
+    const destParent = d.intent === "into" ? target.id : (target.parent_id ?? null);
+    if (destParent === movedId || (destParent && descendantIds(docs, movedId).has(destParent))) {
+      notify("error", "Can't move a document inside itself");
+      return;
+    }
+    move.mutate({ id: movedId, body: moveArgs(target, d.intent) });
   }
 
   const tree = list.data && "ok" in list.data ? buildTree(list.data.ok) : [];
@@ -141,7 +162,7 @@ export function DocTree() {
         <p className="px-3 py-2 text-sm text-fg-muted">No documents yet.</p>
       )}
       {list.data && "ok" in list.data && (
-        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragOver={onDragOver} onDragEnd={onDragEnd} onDragCancel={() => setDrop(null)}>
           <SortableContext items={flatIds} strategy={verticalListSortingStrategy}>
             <ul className="px-2 pb-3 list-none m-0 flex-1">
               {tree.map((n) => (
@@ -153,6 +174,8 @@ export function DocTree() {
                   canEdit={canEdit}
                   isOwner={isOwner}
                   onNewChild={(pid) => create.mutate(pid)}
+                  dropHint={drop && drop.overId === n.id ? drop.intent : null}
+                  drop={drop}
                 />
               ))}
             </ul>
@@ -282,6 +305,8 @@ function TreeRow({
   canEdit,
   isOwner,
   onNewChild,
+  dropHint,
+  drop,
 }: {
   node: TreeNode;
   depth: number;
@@ -289,6 +314,8 @@ function TreeRow({
   canEdit: boolean;
   isOwner: boolean;
   onNewChild: (parentId: string) => void;
+  dropHint: "before" | "after" | "into" | null;
+  drop: { overId: string; intent: "before" | "after" | "into" } | null;
 }) {
   const qc = useQueryClient();
   const nav = useNavigate();
@@ -356,13 +383,19 @@ function TreeRow({
   return (
     <li ref={setNodeRef} style={sortableStyle} {...attributes} {...listeners}>
       <div
-        className={`group flex items-center gap-1 rounded h-7 pr-1 transition-colors ease-swift duration-150 ${
+        className={`relative group flex items-center gap-1 rounded h-7 pr-1 transition-colors ease-swift duration-150 ${
           isActive
             ? "bg-muted text-fg"
             : "text-fg-muted hover:text-fg hover:bg-muted/60"
-        }`}
+        } ${dropHint === "into" ? "ring-1 ring-accent bg-accent/10" : ""}`}
         style={{ paddingLeft: 4 + depth * 12 }}
       >
+        {dropHint === "before" && (
+          <span className="pointer-events-none absolute left-0 right-1 top-0 h-0.5 bg-accent rounded" />
+        )}
+        {dropHint === "after" && (
+          <span className="pointer-events-none absolute left-0 right-1 bottom-0 h-0.5 bg-accent rounded" />
+        )}
         {node.children.length > 0 ? (
           <button
             type="button"
@@ -431,6 +464,8 @@ function TreeRow({
               canEdit={canEdit}
               isOwner={isOwner}
               onNewChild={onNewChild}
+              dropHint={drop && drop.overId === c.id ? drop.intent : null}
+              drop={drop}
             />
           ))}
         </ul>
