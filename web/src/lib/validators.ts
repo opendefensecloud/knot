@@ -10,6 +10,14 @@ const sessionSchema = v.object({
 export type Session = v.InferOutput<typeof sessionSchema>;
 export const Session = sessionSchema;
 
+const authConfigSchema = v.object({
+  setup_available: v.boolean(),
+  oidc_enabled: v.boolean(),
+  password_login_enabled: v.boolean(),
+});
+export type AuthConfig = v.InferOutput<typeof authConfigSchema>;
+export const AuthConfig = authConfigSchema;
+
 const workspaceSchema = v.object({
   id: v.string(),
   slug: v.string(),

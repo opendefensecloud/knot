@@ -38,6 +38,7 @@ import { type ApiError } from "../../lib/api";
 
 import { WorkspaceHeader } from "../workspace/WorkspaceHeader";
 import { docsApi } from "./docs.api";
+import { markDocEditMode } from "./editMode";
 import { buildTree, reorderInto, type TreeNode } from "./tree";
 
 export function DocTree() {
@@ -48,6 +49,7 @@ export function DocTree() {
 
   const { workspace } = useEffectiveRole();
   const canEdit = workspace === "owner" || workspace === "editor";
+  const isOwner = workspace === "owner";
   const [pickerOpen, setPickerOpen] = useState(false);
 
   const list = useQuery({
@@ -65,6 +67,7 @@ export function DocTree() {
       }
       await qc.invalidateQueries({ queryKey: ["docs"] });
       const created = r.ok as { id: string };
+      markDocEditMode(created.id);
       await nav(`/doc/${created.id}`);
     },
   });
@@ -148,6 +151,7 @@ export function DocTree() {
                   depth={0}
                   activeId={activeId}
                   canEdit={canEdit}
+                  isOwner={isOwner}
                   onNewChild={(pid) => create.mutate(pid)}
                 />
               ))}
@@ -171,6 +175,7 @@ export function DocTree() {
             }
             await qc.invalidateQueries({ queryKey: ["docs"] });
             const created = r.ok as { id: string };
+            markDocEditMode(created.id);
             await nav(`/doc/${created.id}`);
           }}
         />
@@ -275,15 +280,18 @@ function TreeRow({
   depth,
   activeId,
   canEdit,
+  isOwner,
   onNewChild,
 }: {
   node: TreeNode;
   depth: number;
   activeId?: string;
   canEdit: boolean;
+  isOwner: boolean;
   onNewChild: (parentId: string) => void;
 }) {
   const qc = useQueryClient();
+  const nav = useNavigate();
   const notify = useUi((s) => s.notify);
   const isActive = activeId === node.id;
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
@@ -325,17 +333,25 @@ function TreeRow({
     await qc.invalidateQueries({ queryKey: ["templates"] });
   }
 
-  const items: ContextMenuItem[] = canEdit
-    ? [
-        { label: "Rename", testId: "ctx-rename", onSelect: () => void onRename() },
-        {
-          label: node.is_template ? "Remove from templates" : "Save as template",
-          testId: "ctx-template",
-          onSelect: () => void onToggleTemplate(),
-        },
-        { label: "Delete", testId: "ctx-delete", destructive: true, onSelect: () => void onArchive() },
-      ]
-    : [];
+  const items: ContextMenuItem[] = [];
+  if (canEdit) {
+    items.push({ label: "Rename", testId: "ctx-rename", onSelect: () => void onRename() });
+  }
+  if (isOwner) {
+    items.push({
+      label: "Permissions…",
+      testId: "ctx-permissions",
+      onSelect: () => void nav(`/doc/${node.id}/permissions`),
+    });
+    items.push({
+      label: node.is_template ? "Remove from templates" : "Save as template",
+      testId: "ctx-template",
+      onSelect: () => void onToggleTemplate(),
+    });
+  }
+  if (canEdit) {
+    items.push({ label: "Delete", testId: "ctx-delete", destructive: true, onSelect: () => void onArchive() });
+  }
 
   return (
     <li ref={setNodeRef} style={sortableStyle} {...attributes} {...listeners}>
@@ -413,6 +429,7 @@ function TreeRow({
               depth={depth + 1}
               activeId={activeId}
               canEdit={canEdit}
+              isOwner={isOwner}
               onNewChild={onNewChild}
             />
           ))}

@@ -12,13 +12,22 @@ import { CommentSidebar } from "../comments/CommentSidebar";
 import { MarkdownView } from "../editor/MarkdownView";
 import { Breadcrumb } from "./Breadcrumb";
 import { docsApi } from "./docs.api";
+import { editModeKey } from "./editMode";
 import { HistoryDrawer } from "./HistoryDrawer";
 
 const KnotEditor = lazy(() =>
   import("../editor/KnotEditor").then((m) => ({ default: m.KnotEditor })),
 );
 
-function DocTitle({ id, initialTitle }: { id: string; initialTitle: string }) {
+export function DocTitle({
+  id,
+  initialTitle,
+  editable,
+}: {
+  id: string;
+  initialTitle: string;
+  editable: boolean;
+}) {
   const qc = useQueryClient();
   const notify = useUi((s) => s.notify);
   const [title, setTitle] = useState(initialTitle);
@@ -39,10 +48,13 @@ function DocTitle({ id, initialTitle }: { id: string; initialTitle: string }) {
     <input
       data-testid="doc-title"
       value={title}
+      readOnly={!editable}
       onChange={(e) => setTitle(e.target.value)}
-      onBlur={() => { if (title !== initialTitle) rename.mutate(title); }}
+      onBlur={() => { if (editable && title !== initialTitle) rename.mutate(title); }}
       placeholder="Untitled"
-      className="w-full border-none bg-transparent text-[30px] font-bold text-fg placeholder:text-fg-muted/60 focus:outline-none focus:ring-0 px-0"
+      className={`w-full border-none bg-transparent text-[30px] font-bold text-fg placeholder:text-fg-muted/60 focus:outline-none focus:ring-0 px-0 ${
+        editable ? "" : "cursor-default"
+      }`}
     />
   );
 }
@@ -60,7 +72,7 @@ export default function DocPage() {
   // View mode by default — viewers are always read-only anyway; editors and
   // owners get a per-tab toggle (persisted in window.sessionStorage by doc id) so a
   // page refresh keeps the chosen mode but a fresh tab starts safe.
-  const editModeKey = id ? `knot.editMode.${id}` : null;
+  const editModeKeyOrNull = id ? editModeKey(id) : null;
   const [editMode, setEditMode] = useState<boolean>(() => {
     // localStorage override for automation: any non-empty value defaults
     // every doc to edit mode. Used by the e2e suite to avoid threading a
@@ -69,13 +81,13 @@ export default function DocPage() {
     try {
       if (window.localStorage.getItem("knot.editMode.defaultOn") === "1") return true;
     } catch { /* localStorage unavailable */ }
-    if (!editModeKey) return false;
-    return window.sessionStorage.getItem(editModeKey) === "1";
+    if (!editModeKeyOrNull) return false;
+    return window.sessionStorage.getItem(editModeKeyOrNull) === "1";
   });
   useEffect(() => {
-    if (!editModeKey) return;
-    window.sessionStorage.setItem(editModeKey, editMode ? "1" : "0");
-  }, [editMode, editModeKey]);
+    if (!editModeKeyOrNull) return;
+    window.sessionStorage.setItem(editModeKeyOrNull, editMode ? "1" : "0");
+  }, [editMode, editModeKeyOrNull]);
   // ⌘E / Ctrl+E toggles edit mode for editor+. Viewers stay read-only.
   useEffect(() => {
     if (effRole !== "owner" && effRole !== "editor") return;
@@ -119,7 +131,8 @@ export default function DocPage() {
       <Breadcrumb items={[{ title: "Documents" }, { title: meta.title }]} />
       <div className="mt-3 flex items-start gap-3">
         <div className="flex-1 min-w-0">
-          <DocTitle key={id} id={id} initialTitle={meta.title} />
+          <DocTitle key={id} id={id} initialTitle={meta.title}
+                    editable={effRole !== "viewer" && editMode} />
         </div>
         <div className="flex items-center gap-1 pt-2 shrink-0">
           <SyncStatus sync={{ status, pendingBytes }} />
@@ -131,11 +144,12 @@ export default function DocPage() {
             <Link
               to="permissions"
               data-testid="open-permissions"
-              aria-label="Permissions"
-              title="Permissions"
-              className="inline-flex items-center justify-center h-9 w-9 rounded text-fg-muted hover:text-fg hover:bg-muted transition-colors ease-swift duration-150"
+              aria-label="Share"
+              title="Share & permissions"
+              className="inline-flex items-center gap-1.5 h-9 px-3 rounded text-[13px] font-medium text-fg-muted hover:text-fg hover:bg-muted transition-colors ease-swift duration-150"
             >
               <Share2 size={16} aria-hidden />
+              <span>Share</span>
             </Link>
           )}
           {(effRole === "owner" || effRole === "editor") && (

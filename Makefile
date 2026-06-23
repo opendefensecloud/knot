@@ -25,8 +25,20 @@ dev.preflight: ## sanity-check .env against the config validator
 		}; \
 		echo ".env validated"
 
+.PHONY: install
+install: web/node_modules e2e/node_modules ## install frontend + e2e npm deps
+
+# Incremental: only re-install when a lockfile or manifest changes.
+web/node_modules: web/pnpm-lock.yaml web/package.json
+	cd web && $(PNPM) install
+	@touch $@
+
+e2e/node_modules: e2e/pnpm-lock.yaml e2e/package.json
+	cd e2e && $(PNPM) install
+	@touch $@
+
 .PHONY: dev
-dev: compose.up ## boot Postgres + backend (cargo-watch) + frontend (Vite) — Ctrl+C tears down both
+dev: compose.up web/node_modules ## boot Postgres + backend (cargo-watch) + frontend (Vite) — Ctrl+C tears down both
 	@command -v cargo-watch >/dev/null 2>&1 || $(CARGO) install cargo-watch
 	@echo ""
 	@echo "  knot dev"
@@ -45,7 +57,7 @@ dev.server: ## run knot-server with cargo-watch (auto-restart on edit)
 	$(CARGO) watch -q -x "run --bin knot-server"
 
 .PHONY: dev.web
-dev.web: ## run the SPA via Vite on :5173 (proxies /api,/auth,/collab to :3000)
+dev.web: web/node_modules ## run the SPA via Vite on :5173 (proxies /api,/auth,/collab to :3000)
 	cd web && $(PNPM) dev
 
 .PHONY: spike.server spike.web
@@ -64,11 +76,11 @@ test.rust: ## run Rust tests
 	$(CARGO) nextest run --workspace --all-features
 
 .PHONY: test.web
-test.web: ## run TS unit tests
+test.web: web/node_modules ## run TS unit tests
 	cd web && $(PNPM) test
 
 .PHONY: e2e
-e2e: ## run the playwright convergence test
+e2e: e2e/node_modules ## run the playwright convergence test
 	cd e2e && $(PNPM) playwright test
 
 .PHONY: lint

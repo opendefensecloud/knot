@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 
 import { authApi } from "../auth/session.api";
 import { docsApi } from "../features/docs/docs.api";
+import { markDocEditMode } from "../features/docs/editMode";
 import { useViewport } from "../hooks/useViewport";
 import { searchApi, type SearchHit } from "../lib/search.api";
 import { useUi } from "../stores/ui";
@@ -123,6 +124,7 @@ export function CommandPalette() {
           if ("error" in r) return;
           const created = r.ok as { id: string };
           await qc.invalidateQueries({ queryKey: ["docs"] });
+          markDocEditMode(created.id);
           void nav(`/doc/${created.id}`);
         },
       },

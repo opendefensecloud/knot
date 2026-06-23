@@ -1,11 +1,22 @@
 import { apiFetch } from "../lib/api";
-import { type Session, parse, Session as SessionSchema } from "../lib/validators";
+import {
+  type AuthConfig,
+  AuthConfig as AuthConfigSchema,
+  type Session,
+  parse,
+  Session as SessionSchema,
+} from "../lib/validators";
 
 export const authApi = {
   async session() {
     const r = await apiFetch<unknown>("/auth/session");
     if ("error" in r) return r;
     return { ok: parse(SessionSchema, r.ok) satisfies Session };
+  },
+  async config() {
+    const r = await apiFetch<unknown>("/auth/config");
+    if ("error" in r) return r;
+    return { ok: parse(AuthConfigSchema, r.ok) satisfies AuthConfig };
   },
   async login(email: string, password: string) {
     return apiFetch<void>("/auth/login", {
