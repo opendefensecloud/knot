@@ -8,6 +8,9 @@
 
 pub const MSG_SYNC: u8 = 0;
 pub const MSG_AWARENESS: u8 = 1;
+/// Server→client push: comments on this doc changed; client should refetch.
+/// Payload: <varuint len><JSON bytes> where JSON is `{ "doc_id": "<uuid>" }`.
+pub const MSG_COMMENTS: u8 = 5;
 pub const SYNC_STEP_1: u8 = 0;
 pub const SYNC_STEP_2: u8 = 1;
 pub const SYNC_UPDATE: u8 = 2;

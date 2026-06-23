@@ -50,6 +50,9 @@ pub enum Event {
     BusUpdate(i64),
     BusPresence(Vec<u8>),
     Revoke,
+    /// Broadcast a pre-framed server message to every connection in the room.
+    /// Opaque bytes — the room does not interpret them.
+    ServerFrame(Vec<u8>),
     ExportState(oneshot::Sender<Result<(Vec<u8>, i64), EngineError>>),
     ApplyUpdate {
         update_bytes: Vec<u8>,
@@ -234,6 +237,16 @@ impl Room {
                         for cid in to_close { self.conns.remove(&cid); }
                         // Bus fan-out to other replicas.
                         let _ = self.bus.publish_presence(self.doc_id, payload).await;
+                    }
+                    Some(Event::ServerFrame(frame)) => {
+                        let mut to_close: Vec<ConnId> = Vec::new();
+                        for (cid, conn) in &self.conns {
+                            match conn.tx.try_send(frame.clone()) {
+                                Ok(_) => {}
+                                Err(_) => to_close.push(*cid),
+                            }
+                        }
+                        for cid in to_close { self.conns.remove(&cid); }
                     }
                     Some(Event::BusUpdate(_)) | Some(Event::BusPresence(_)) => {}
                     Some(Event::ApplyUpdate { update_bytes, by_user, reply }) => {

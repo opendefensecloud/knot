@@ -107,6 +107,15 @@ impl Rooms {
         }
     }
 
+    /// Push a pre-framed server message to all clients in the doc's room, IF a
+    /// room is currently active. Never boots a room — a comment on an unviewed
+    /// document is simply dropped.
+    pub async fn notify_doc_comments(&self, doc_id: Uuid, frame: Vec<u8>) {
+        if let Some(h) = self.map.get(&doc_id) {
+            let _ = h.tx.send(crate::room::Event::ServerFrame(frame)).await;
+        }
+    }
+
     /// Cancel the room's actor and unsubscribe from the bus. The caller
     /// is responsible for ordering this with any in-flight WS connections.
     pub async fn evict(&self, doc_id: Uuid) {
