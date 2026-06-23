@@ -78,3 +78,31 @@ async fn svg_set_and_get() {
     let got = store.get_svg(b.id).await.unwrap().unwrap();
     assert_eq!(&got, b"<svg/>");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn since_returns_updates_after_seq_in_order() {
+    let (store, doc_id, user) = setup().await;
+    let board_id = store.create(doc_id, user, None).await.unwrap().id;
+
+    let s1 = store.append_update(board_id, b"u1").await.unwrap();
+    let s2 = store.append_update(board_id, b"u2").await.unwrap();
+    let s3 = store.append_update(board_id, b"u3").await.unwrap();
+
+    let all = store.since(board_id, 0).await.unwrap();
+    assert_eq!(
+        all.iter().map(|(_, b)| b.clone()).collect::<Vec<_>>(),
+        vec![b"u1".to_vec(), b"u2".to_vec(), b"u3".to_vec()]
+    );
+    assert_eq!(
+        all.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![s1, s2, s3]
+    );
+
+    let rest = store.since(board_id, s1).await.unwrap();
+    assert_eq!(
+        rest.iter().map(|(_, b)| b.clone()).collect::<Vec<_>>(),
+        vec![b"u2".to_vec(), b"u3".to_vec()]
+    );
+
+    assert!(store.since(board_id, s3).await.unwrap().is_empty());
+}
