@@ -19,6 +19,7 @@ git clone https://github.com/trevex/knot
 cd knot
 cp .env.example .env             # local KNOT_* defaults
 make compose.up                  # boot Postgres + Dex
+make install                     # fetch node dependencies
 make dev                         # backend + frontend with live reload
 ```
 
