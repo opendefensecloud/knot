@@ -39,7 +39,7 @@ import { type ApiError } from "../../lib/api";
 import { WorkspaceHeader } from "../workspace/WorkspaceHeader";
 import { docsApi } from "./docs.api";
 import { markDocEditMode } from "./editMode";
-import { buildTree, reorderInto, type TreeNode } from "./tree";
+import { buildTree, applyOptimisticMove, type TreeNode } from "./tree";
 
 export function DocTree() {
   const qc = useQueryClient();
@@ -80,7 +80,7 @@ export function DocTree() {
       const prev = qc.getQueryData<{ ok: Doc[] } | { error: ApiError }>(["docs"]);
       if (prev && "ok" in prev) {
         qc.setQueryData(["docs"], {
-          ok: reorderInto(prev.ok, a.id, a.body.parent_id ?? null),
+          ok: applyOptimisticMove(prev.ok, a.id, a.body),
         });
       }
       return { prev };
