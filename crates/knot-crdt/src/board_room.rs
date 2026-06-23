@@ -128,6 +128,11 @@ impl BoardRoom {
 
     #[tracing::instrument(skip_all, fields(board_id = %self.board_id))]
     async fn run(mut self) {
+        // Periodic catch-up: Postgres NOTIFY is best-effort and the PgBus
+        // channel drops on overflow/reconnect, so a missed seq would otherwise
+        // leave this pod diverged until the next local edit. Re-sweep the log
+        // from the watermark on a timer, mirroring `Room`.
+        let mut catchup_tick = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             tokio::select! {
                 biased;
@@ -141,7 +146,10 @@ impl BoardRoom {
                         self.conns.remove(&c);
                     }
                     Some(Event::AwarenessIn { from, payload }) => {
-                        if payload.len() > 64 * 1024 { continue; }
+                        // Match the document Room's cap (4KB) so a frame that fans
+                        // out locally also fits under PgBus's cross-pod size limit;
+                        // otherwise large presence would silently fail across pods.
+                        if crate::presence::is_oversize(&payload) { continue; }
                         let mut to_close: Vec<ConnId> = Vec::new();
                         for (cid, conn) in &self.conns {
                             if *cid == from { continue; }
@@ -156,26 +164,12 @@ impl BoardRoom {
                     }
                     Some(Event::Shutdown) | None => break,
                 },
+                // A peer signalled a new seq; pull whatever we're missing.
                 Some(_seq) = self.bus_updates_rx.recv() => {
-                    // Remote edit on another pod: fetch new updates from the shared
-                    // log and apply locally. Already persisted — do NOT re-append.
-                    if let Ok(updates) = self.store.since(self.board_id, self.last_applied_seq).await {
-                        for (seq, bytes) in updates {
-                            if seq <= self.last_applied_seq { continue; }
-                            if self.engine.apply_update(&self.doc, &bytes).is_ok() {
-                                let framed = wrap_sync_update(&bytes);
-                                let mut to_close: Vec<ConnId> = Vec::new();
-                                for (cid, conn) in &self.conns {
-                                    if conn.tx.try_send(framed.clone()).is_err() { to_close.push(*cid); }
-                                }
-                                for cid in to_close { self.conns.remove(&cid); }
-                                // Advance the watermark only on success, mirroring Room:
-                                // a transient apply failure is retried on the next notify
-                                // rather than silently skipped.
-                                self.last_applied_seq = seq;
-                            }
-                        }
-                    }
+                    self.replay_since_watermark().await;
+                }
+                _ = catchup_tick.tick() => {
+                    self.replay_since_watermark().await;
                 }
                 Some(payload) = self.bus_presence_rx.recv() => {
                     let mut to_close: Vec<ConnId> = Vec::new();
@@ -184,6 +178,39 @@ impl BoardRoom {
                     }
                     for cid in to_close { self.conns.remove(&cid); }
                 }
+            }
+        }
+    }
+
+    /// Apply any board updates persisted after our watermark — from a peer's
+    /// bus notification or the periodic catch-up tick — and fan them out to
+    /// local connections. Remote updates are already persisted, so they are
+    /// NOT re-appended. The watermark advances only on a successful apply, so a
+    /// transient failure is retried rather than silently skipped.
+    async fn replay_since_watermark(&mut self) {
+        let updates = match self.store.since(self.board_id, self.last_applied_seq).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::debug!(error=?e, "board catch-up replay failed");
+                return;
+            }
+        };
+        for (seq, bytes) in updates {
+            if seq <= self.last_applied_seq {
+                continue;
+            }
+            if self.engine.apply_update(&self.doc, &bytes).is_ok() {
+                let framed = wrap_sync_update(&bytes);
+                let mut to_close: Vec<ConnId> = Vec::new();
+                for (cid, conn) in &self.conns {
+                    if conn.tx.try_send(framed.clone()).is_err() {
+                        to_close.push(*cid);
+                    }
+                }
+                for cid in to_close {
+                    self.conns.remove(&cid);
+                }
+                self.last_applied_seq = seq;
             }
         }
     }
