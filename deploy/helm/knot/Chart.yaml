@@ -5,8 +5,8 @@ description: |
   Multi-user collaborative knowledge base with CRDT-backed
   real-time editing.
 type: application
-version: 0.3.3
-appVersion: "0.1.6"
+version: 0.3.4
+appVersion: "0.1.7"
 home: https://github.com/trevex/knot
 sources:
   - https://github.com/trevex/knot

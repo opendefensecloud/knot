@@ -11,7 +11,10 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - knot-dev-postgres:/var/lib/postgresql/data
+      # postgres:18+ stores data in a major-version subdir and refuses a volume
+      # mounted at the legacy /var/lib/postgresql/data; mount the parent instead
+      # (see docker-library/postgres#1259).
+      - knot-dev-postgres:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U knot -d knot"]
       interval: 2s
