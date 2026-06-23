@@ -20,6 +20,7 @@ use knot_storage::{
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
+pub mod admin;
 pub mod auth;
 pub mod board_room_shim;
 pub mod comments_listener;

@@ -125,6 +125,26 @@ async fn callback(
         }
     };
 
+    // A workspace must already exist before we provision or sign anyone in.
+    // Check it up front — BEFORE auto-provisioning — so an uninitialised knot
+    // returns a clear error instead of a bare 500, and without creating a stray
+    // user (which would otherwise wedge `/auth/setup` and `admin create`, both
+    // first-run-only, and block bootstrapping the workspace at all).
+    let ws = match workspaces.get_singleton().await {
+        Ok(Some(w)) => w,
+        Ok(None) => {
+            return json_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "auth.not_initialized",
+                "knot has no workspace yet; bootstrap with `knot-server admin create` or /auth/setup",
+            );
+        }
+        Err(e) => {
+            tracing::error!(error=?e, "oidc get_singleton");
+            return internal();
+        }
+    };
+
     // Resolve existing user by (issuer, subject), then by email, else
     // auto-provision per policy.
     let user = match users.find_by_oidc(oidc.issuer(), &id.subject).await {
@@ -153,10 +173,6 @@ async fn callback(
         }
     };
 
-    let ws = match workspaces.get_singleton().await {
-        Ok(Some(w)) => w,
-        _ => return internal(),
-    };
     if workspaces
         .get_member_role(ws.id, user.id)
         .await

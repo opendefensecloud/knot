@@ -74,6 +74,12 @@ oidc:
 
 ## OIDC
 
+> **First run:** knot needs a workspace before anyone can log in. Bootstrap one
+> owner **before the first OIDC login** with `knot-server admin create`
+> (or `POST /auth/setup`). If you OIDC-login first, knot returns
+> `auth.not_initialized` until you bootstrap. `admin create` also works later as
+> a break-glass local admin.
+
 `knot-server` discovers the provider via OIDC issuer URL and uses Authorization Code + PKCE.
 
 ```yaml

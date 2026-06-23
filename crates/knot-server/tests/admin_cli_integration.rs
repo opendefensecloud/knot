@@ -28,3 +28,65 @@ async fn admin_create_seeds_first_user_and_workspace() {
     let role = ws.get_member_role(workspace.id, user.id).await.unwrap();
     assert_eq!(role, Some(WorkspaceRole::Owner));
 }
+
+/// `admin create` (via the extracted `create_owner` core) must work as a
+/// break-glass tool AFTER the system is already bootstrapped: it bootstraps the
+/// workspace on the first call, then still creates additional local owners even
+/// though users already exist — refusing only a duplicate email.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_create_owner_is_break_glass_after_bootstrap() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let users = PgUserStore::new(pool.clone());
+    let ws = PgWorkspaceStore::new(pool.clone());
+    let hasher = Hasher::fast_for_tests();
+
+    // First call bootstraps the singleton workspace + first owner.
+    knot_server::admin::create_owner(
+        &users,
+        &ws,
+        &hasher,
+        "first@example.com",
+        "First",
+        "hunter22",
+        "default",
+        "Workspace",
+    )
+    .await
+    .expect("bootstrap owner");
+
+    // Break-glass: a second local owner is allowed even though a user exists.
+    let bg = knot_server::admin::create_owner(
+        &users,
+        &ws,
+        &hasher,
+        "break-glass@example.com",
+        "BreakGlass",
+        "hunter22",
+        "default",
+        "Workspace",
+    )
+    .await
+    .expect("break-glass owner after bootstrap");
+
+    assert_eq!(users.count().await.unwrap(), 2);
+    let wsrow = ws.get_singleton().await.unwrap().expect("workspace exists");
+    assert_eq!(
+        ws.get_member_role(wsrow.id, bg.id).await.unwrap(),
+        Some(WorkspaceRole::Owner),
+        "break-glass user is an owner"
+    );
+
+    // A duplicate email is refused (would violate the unique constraint).
+    let dup = knot_server::admin::create_owner(
+        &users,
+        &ws,
+        &hasher,
+        "first@example.com",
+        "Dup",
+        "hunter22",
+        "default",
+        "Workspace",
+    )
+    .await;
+    assert!(dup.is_err(), "duplicate email must be rejected");
+}

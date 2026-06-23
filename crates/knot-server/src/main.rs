@@ -7,9 +7,9 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod admin;
-
 use std::process;
+
+use knot_server::admin;
 
 use clap::{Parser, Subcommand};
 use knot_config::Config;
