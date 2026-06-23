@@ -166,3 +166,36 @@ async fn presence_on_one_room_reaches_a_conn_on_another_room() {
     room_a.shutdown.cancel();
     room_b.shutdown.cancel();
 }
+
+/// A peer's update whose bus NOTIFY was dropped must still converge: the
+/// periodic catch-up tick re-sweeps the shared log from the watermark. We
+/// simulate the dropped notify by writing directly to the store and never
+/// publishing on the bus, then assert the connection still receives the update.
+#[tokio::test(flavor = "multi_thread")]
+async fn catch_up_tick_recovers_a_missed_update() {
+    let (pg_store, board_id) = setup_board().await;
+    let store: Arc<dyn BoardStore> = pg_store.clone();
+
+    let bus = Arc::new(MemBus::new());
+    let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
+    let sub: Subscription = bus.subscribe(board_id).await.unwrap();
+
+    let room = BoardRoom::spawn(board_id, engine, store, bus, sub)
+        .await
+        .unwrap();
+    let mut rx = join_conn(&room).await;
+
+    // Append directly to the shared log WITHOUT publishing on the bus — exactly
+    // what a dropped NOTIFY (or a write during a bus reconnect) looks like to
+    // this pod. Only the catch-up tick can recover it.
+    let update = make_elements_update();
+    pg_store.append_update(board_id, &update).await.unwrap();
+
+    // The tick runs every 5s; allow generous slack.
+    let got = tokio::time::timeout(std::time::Duration::from_secs(9), rx.recv())
+        .await
+        .expect("timed out: catch-up tick did not recover the missed update");
+    assert!(got.is_some(), "conn did not receive the recovered update");
+
+    room.shutdown.cancel();
+}
