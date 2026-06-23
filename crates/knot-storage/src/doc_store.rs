@@ -35,6 +35,8 @@ pub enum DocStoreError {
     NotFound,
     #[error("conflict")]
     Conflict,
+    #[error("cycle")]
+    Cycle,
 }
 
 #[async_trait]
@@ -296,6 +298,26 @@ impl DocStore for PgDocStore {
         sort_key: &str,
     ) -> Result<Document, DocStoreError> {
         let mut tx = self.pool.begin().await?;
+        // Reject moves that would create a parent cycle: the destination
+        // parent must not be the doc itself or one of its descendants. Done
+        // inside the tx so it's correct under concurrency.
+        if let Some(p) = parent_id {
+            let creates_cycle: bool = sqlx::query_scalar(
+                "WITH RECURSIVE sub AS (
+                     SELECT id FROM documents WHERE id = $1
+                     UNION ALL
+                     SELECT d.id FROM documents d JOIN sub s ON d.parent_id = s.id
+                 )
+                 SELECT EXISTS(SELECT 1 FROM sub WHERE id = $2)",
+            )
+            .bind(doc_id)
+            .bind(p)
+            .fetch_one(&mut *tx)
+            .await?;
+            if creates_cycle {
+                return Err(DocStoreError::Cycle);
+            }
+        }
         let row = sqlx::query_as::<_, DocRow>(&format!(
             "UPDATE documents SET parent_id = $3, sort_key = $4, updated_at = now()
              WHERE workspace_id = $1 AND id = $2

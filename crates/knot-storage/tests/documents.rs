@@ -1,6 +1,6 @@
 use knot_storage::{
-    DocStore, PgDocStore, PgUserStore, PgWorkspaceStore, UserStore, WorkspaceRole, WorkspaceStore,
-    sort_key_between,
+    DocStore, DocStoreError, PgDocStore, PgUserStore, PgWorkspaceStore, UserStore, WorkspaceRole,
+    WorkspaceStore, sort_key_between,
 };
 use uuid::Uuid;
 
@@ -129,4 +129,41 @@ async fn templates_flow_set_and_list() {
     assert!(alive2.iter().any(|d| d.id == tpl.id));
     let templates2 = store.list_templates(ws).await.unwrap();
     assert!(templates2.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn move_to_descendant_is_rejected_as_cycle() {
+    let (store, ws, u) = setup().await;
+    let a = store.create(ws, None, "A", "m", u).await.unwrap();
+    let b = store.create(ws, Some(a.id), "B", "m", u).await.unwrap();
+    let err = store
+        .move_to(ws, a.id, u, Some(b.id), "n")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DocStoreError::Cycle),
+        "expected Cycle, got {err:?}"
+    );
+    let err = store
+        .move_to(ws, a.id, u, Some(a.id), "n")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DocStoreError::Cycle));
+    assert_eq!(store.list_alive(ws).await.unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn move_reorder_and_nest_preserve_all_docs() {
+    let (store, ws, u) = setup().await;
+    let a = store.create(ws, None, "A", "a", u).await.unwrap();
+    let b = store.create(ws, None, "B", "b", u).await.unwrap();
+    let c = store.create(ws, None, "C", "c", u).await.unwrap();
+    store.move_to(ws, c.id, u, Some(a.id), "m").await.unwrap();
+    store.move_to(ws, b.id, u, None, "z").await.unwrap();
+    let all = store.list_alive(ws).await.unwrap();
+    assert_eq!(all.len(), 3, "no doc lost");
+    assert_eq!(
+        all.iter().find(|d| d.id == c.id).unwrap().parent_id,
+        Some(a.id)
+    );
 }
