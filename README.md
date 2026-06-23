@@ -10,7 +10,7 @@ A self-hosted, collaborative knowledge base. Like Notion or Confluence — but y
 
 ## Status
 
-**v0.1** — feature-complete for single-workspace teams; production-ready enough to dogfood. Tagged releases publish a cosign-signed multi-arch image (amd64/arm64) with SBOM + SLSA provenance, plus the Helm chart (PrometheusRule + ServiceMonitor templates). Ships single-replica by default (`replicaCount: 1`); see `docs/superpowers/research/` for landed work and scale-out notes.
+**v0.1** — feature-complete for single-workspace teams; production-ready enough to dogfood. Tagged releases publish a cosign-signed multi-arch image (amd64/arm64) with SBOM + SLSA provenance, plus the Helm chart (PrometheusRule + ServiceMonitor templates). Real-time collaboration — documents and Excalidraw boards — fans out across pods over Postgres `LISTEN/NOTIFY`, so it scales horizontally; the chart defaults to a single replica. See `docs/superpowers/research/` for landed work and scale-out notes.
 
 ## Quickstart
 
