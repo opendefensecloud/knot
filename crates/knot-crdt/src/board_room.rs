@@ -169,8 +169,11 @@ impl BoardRoom {
                                     if conn.tx.try_send(framed.clone()).is_err() { to_close.push(*cid); }
                                 }
                                 for cid in to_close { self.conns.remove(&cid); }
+                                // Advance the watermark only on success, mirroring Room:
+                                // a transient apply failure is retried on the next notify
+                                // rather than silently skipped.
+                                self.last_applied_seq = seq;
                             }
-                            self.last_applied_seq = seq;
                         }
                     }
                 }
@@ -295,17 +298,10 @@ mod tests {
         async fn max_update_seq(&self, _id: Uuid) -> knot_storage::boards::Result<i64> {
             Ok(0)
         }
-        async fn set_svg(
-            &self,
-            _id: Uuid,
-            _bytes: &[u8],
-        ) -> knot_storage::boards::Result<()> {
+        async fn set_svg(&self, _id: Uuid, _bytes: &[u8]) -> knot_storage::boards::Result<()> {
             Ok(())
         }
-        async fn get_svg(
-            &self,
-            _id: Uuid,
-        ) -> knot_storage::boards::Result<Option<Vec<u8>>> {
+        async fn get_svg(&self, _id: Uuid) -> knot_storage::boards::Result<Option<Vec<u8>>> {
             Ok(None)
         }
     }
