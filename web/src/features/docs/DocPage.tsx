@@ -19,7 +19,15 @@ const KnotEditor = lazy(() =>
   import("../editor/KnotEditor").then((m) => ({ default: m.KnotEditor })),
 );
 
-function DocTitle({ id, initialTitle }: { id: string; initialTitle: string }) {
+export function DocTitle({
+  id,
+  initialTitle,
+  editable,
+}: {
+  id: string;
+  initialTitle: string;
+  editable: boolean;
+}) {
   const qc = useQueryClient();
   const notify = useUi((s) => s.notify);
   const [title, setTitle] = useState(initialTitle);
@@ -40,10 +48,13 @@ function DocTitle({ id, initialTitle }: { id: string; initialTitle: string }) {
     <input
       data-testid="doc-title"
       value={title}
+      readOnly={!editable}
       onChange={(e) => setTitle(e.target.value)}
-      onBlur={() => { if (title !== initialTitle) rename.mutate(title); }}
+      onBlur={() => { if (editable && title !== initialTitle) rename.mutate(title); }}
       placeholder="Untitled"
-      className="w-full border-none bg-transparent text-[30px] font-bold text-fg placeholder:text-fg-muted/60 focus:outline-none focus:ring-0 px-0"
+      className={`w-full border-none bg-transparent text-[30px] font-bold text-fg placeholder:text-fg-muted/60 focus:outline-none focus:ring-0 px-0 ${
+        editable ? "" : "cursor-default"
+      }`}
     />
   );
 }
@@ -120,7 +131,8 @@ export default function DocPage() {
       <Breadcrumb items={[{ title: "Documents" }, { title: meta.title }]} />
       <div className="mt-3 flex items-start gap-3">
         <div className="flex-1 min-w-0">
-          <DocTitle key={id} id={id} initialTitle={meta.title} />
+          <DocTitle key={id} id={id} initialTitle={meta.title}
+                    editable={effRole !== "viewer" && editMode} />
         </div>
         <div className="flex items-center gap-1 pt-2 shrink-0">
           <SyncStatus sync={{ status, pendingBytes }} />
