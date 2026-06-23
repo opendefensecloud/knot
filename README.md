@@ -10,7 +10,7 @@ A self-hosted, collaborative knowledge base. Like Notion or Confluence — but y
 
 ## Status
 
-**v0.1.** Feature-complete for single-workspace teams; production-ready enough to dogfood. The release pipeline publishes a multi-arch image on tag, and the chart ships PrometheusRule + ServiceMonitor templates. Remaining hardening before scale-out: auth throttling is per-process (not shared across replicas), Excalidraw boards have no cross-pod fan-out (HA is documents-only — keep `replicaCount: 1`), and there's no image signing/SBOM yet. See `docs/superpowers/plans/` for the roadmap.
+**v0.1** — feature-complete for single-workspace teams; production-ready enough to dogfood. Tagged releases publish a cosign-signed multi-arch image (amd64/arm64) with SBOM + SLSA provenance, plus the Helm chart (PrometheusRule + ServiceMonitor templates). Ships single-replica by default (`replicaCount: 1`); see `docs/superpowers/research/` for landed work and scale-out notes.
 
 ## Quickstart
 
@@ -18,7 +18,7 @@ A self-hosted, collaborative knowledge base. Like Notion or Confluence — but y
 git clone https://github.com/trevex/knot
 cd knot
 cp .env.example .env             # local KNOT_* defaults
-make compose.up                  # boot Postgres + Dex
+make compose.up                  # boot Postgres + Dex (+ toxiproxy for e2e)
 make install                     # fetch node dependencies
 make dev                         # backend + frontend with live reload
 ```
@@ -39,12 +39,12 @@ The Nix flake at `flake.nix` pins all of the above; `direnv allow` is the zero-f
 ```bash
 make test                # cargo + vitest
 make e2e                 # Playwright (needs compose.up)
-make lint                # clippy + fmt --check + tsc + eslint
+make lint                # clippy + fmt --check + tsc
 ```
 
 ## Architecture
 
-See `ARCHITECTURE.md` for the one-page system overview. The long-form design spec is at `docs/superpowers/specs/2026-06-01-knot-foundation-design.md`. Every plan landed since (Plans 3–11) has an outcome doc at `docs/superpowers/research/`.
+See `ARCHITECTURE.md` for the one-page system overview. The long-form design spec is at `docs/superpowers/specs/2026-06-01-knot-foundation-design.md`. Plan outcome docs for everything landed since live in `docs/superpowers/research/`.
 
 ## Deploy
 
