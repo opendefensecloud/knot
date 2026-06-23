@@ -1,12 +1,13 @@
 //! Per-board actor. Mirrors `Room` for Excalidraw-style sub-documents but
-//! without markdown-cache concerns, snapshot scheduler, or bus integration
-//! (single-node for v0.1 — multi-node bus can be added later by wiring the
-//! existing `Bus` trait into this loop).
+//! without markdown-cache concerns or snapshot scheduler.
 //!
 //! v0.1 persistence: the actor calls `BoardStore::append_update` inline
 //! when a y-update is applied. Hydration replays the latest snapshot then
 //! the update tail. No automatic snapshotting yet — boards are typically
 //! small enough that replay is cheap.
+//!
+//! Cross-pod convergence: the actor holds a `Bus` subscription and replays
+//! updates from the shared log whenever a peer signals a new seq via the bus.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::bus::Bus;
 use crate::engine::{DocHandle, Engine, EngineError};
 
 use crate::protocol::wrap_sync_update;
@@ -53,6 +55,10 @@ pub struct BoardRoom {
     shutdown: CancellationToken,
     rx: mpsc::Receiver<Event>,
     store: Arc<dyn knot_storage::BoardStore>,
+    bus: Arc<dyn Bus>,
+    bus_updates_rx: mpsc::Receiver<i64>,
+    bus_presence_rx: mpsc::Receiver<Vec<u8>>,
+    last_applied_seq: i64,
 }
 
 pub struct BoardRoomHandle {
@@ -65,6 +71,8 @@ impl BoardRoom {
         board_id: Uuid,
         engine: Arc<dyn Engine>,
         store: Arc<dyn knot_storage::BoardStore>,
+        bus: Arc<dyn Bus>,
+        subscription: crate::bus::Subscription,
     ) -> Result<BoardRoomHandle, EngineError> {
         let doc = engine.new_doc();
 
@@ -97,6 +105,8 @@ impl BoardRoom {
             "board room hydrated"
         );
 
+        let last_applied_seq = store.max_update_seq(board_id).await.unwrap_or(0);
+
         let (tx, rx) = mpsc::channel::<Event>(256);
         let shutdown = CancellationToken::new();
         let room = Self {
@@ -107,6 +117,10 @@ impl BoardRoom {
             shutdown: shutdown.clone(),
             rx,
             store,
+            bus,
+            bus_updates_rx: subscription.updates,
+            bus_presence_rx: subscription.presence,
+            last_applied_seq,
         };
         tokio::spawn(room.run());
         Ok(BoardRoomHandle { tx, shutdown })
@@ -136,9 +150,37 @@ impl BoardRoom {
                             }
                         }
                         for cid in to_close { self.conns.remove(&cid); }
+                        // Bus fan-out to other pods — payload is still owned
+                        // (the loop above clones per conn, not a move).
+                        let _ = self.bus.publish_presence(self.board_id, payload).await;
                     }
                     Some(Event::Shutdown) | None => break,
                 },
+                Some(_seq) = self.bus_updates_rx.recv() => {
+                    // Remote edit on another pod: fetch new updates from the shared
+                    // log and apply locally. Already persisted — do NOT re-append.
+                    if let Ok(updates) = self.store.since(self.board_id, self.last_applied_seq).await {
+                        for (seq, bytes) in updates {
+                            if seq <= self.last_applied_seq { continue; }
+                            if self.engine.apply_update(&self.doc, &bytes).is_ok() {
+                                let framed = wrap_sync_update(&bytes);
+                                let mut to_close: Vec<ConnId> = Vec::new();
+                                for (cid, conn) in &self.conns {
+                                    if conn.tx.try_send(framed.clone()).is_err() { to_close.push(*cid); }
+                                }
+                                for cid in to_close { self.conns.remove(&cid); }
+                            }
+                            self.last_applied_seq = seq;
+                        }
+                    }
+                }
+                Some(payload) = self.bus_presence_rx.recv() => {
+                    let mut to_close: Vec<ConnId> = Vec::new();
+                    for (cid, conn) in &self.conns {
+                        if conn.tx.try_send(payload.clone()).is_err() { to_close.push(*cid); }
+                    }
+                    for cid in to_close { self.conns.remove(&cid); }
+                }
             }
         }
     }
@@ -160,10 +202,17 @@ impl BoardRoom {
             tracing::debug!(error=?e, "apply_update failed");
             return;
         }
-        // Persist inline — boards are typically small, so the write doesn't
-        // need a separate writer task for v0.1.
-        if let Err(e) = self.store.append_update(self.board_id, &m.bytes).await {
-            tracing::warn!(error=?e, "board append_update failed");
+        // Persist inline and capture the seq so we can advance the watermark
+        // before publishing — ensures the self-NOTIFY from our own publish
+        // is a no-op when the bus_updates_rx arm fires.
+        match self.store.append_update(self.board_id, &m.bytes).await {
+            Ok(seq) => {
+                self.last_applied_seq = seq;
+                if let Err(e) = self.bus.publish(self.board_id, seq).await {
+                    tracing::warn!(error=?e, "board bus publish failed");
+                }
+            }
+            Err(e) => tracing::warn!(error=?e, "board append_update failed"),
         }
         let framed = wrap_sync_update(&m.bytes);
         let mut to_close: Vec<ConnId> = Vec::new();
@@ -178,5 +227,99 @@ impl BoardRoom {
         for cid in to_close {
             self.conns.remove(&cid);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MemBus, YrsEngine};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    struct NoopBoardStore;
+
+    #[async_trait::async_trait]
+    impl knot_storage::BoardStore for NoopBoardStore {
+        async fn create(
+            &self,
+            _doc_id: Uuid,
+            _created_by: Uuid,
+            _label: Option<String>,
+        ) -> knot_storage::boards::Result<knot_storage::Board> {
+            unimplemented!()
+        }
+        async fn get(&self, _id: Uuid) -> knot_storage::boards::Result<knot_storage::Board> {
+            Err(knot_storage::boards::BoardStoreError::NotFound)
+        }
+        async fn list_for_doc(
+            &self,
+            _doc_id: Uuid,
+        ) -> knot_storage::boards::Result<Vec<knot_storage::Board>> {
+            Ok(vec![])
+        }
+        async fn delete(&self, _id: Uuid) -> knot_storage::boards::Result<()> {
+            Ok(())
+        }
+        async fn latest_snapshot(
+            &self,
+            _id: Uuid,
+        ) -> knot_storage::boards::Result<Option<(i64, Vec<u8>)>> {
+            Ok(None)
+        }
+        async fn put_snapshot(
+            &self,
+            _id: Uuid,
+            _seq: i64,
+            _state: &[u8],
+        ) -> knot_storage::boards::Result<()> {
+            Ok(())
+        }
+        async fn load_updates(&self, _id: Uuid) -> knot_storage::boards::Result<Vec<Vec<u8>>> {
+            Ok(vec![])
+        }
+        async fn append_update(
+            &self,
+            _id: Uuid,
+            _bytes: &[u8],
+        ) -> knot_storage::boards::Result<i64> {
+            Ok(1)
+        }
+        async fn since(
+            &self,
+            _id: Uuid,
+            _after_seq: i64,
+        ) -> knot_storage::boards::Result<Vec<(i64, Vec<u8>)>> {
+            Ok(vec![])
+        }
+        async fn max_update_seq(&self, _id: Uuid) -> knot_storage::boards::Result<i64> {
+            Ok(0)
+        }
+        async fn set_svg(
+            &self,
+            _id: Uuid,
+            _bytes: &[u8],
+        ) -> knot_storage::boards::Result<()> {
+            Ok(())
+        }
+        async fn get_svg(
+            &self,
+            _id: Uuid,
+        ) -> knot_storage::boards::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn board_room_spawns_and_shuts_down() {
+        let board_id = Uuid::new_v4();
+        let bus = Arc::new(MemBus::new());
+        let sub = bus.subscribe(board_id).await.unwrap();
+        let store: Arc<dyn knot_storage::BoardStore> = Arc::new(NoopBoardStore);
+        let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
+        let h = BoardRoom::spawn(board_id, engine, store, bus, sub)
+            .await
+            .unwrap();
+        h.shutdown.cancel();
     }
 }
