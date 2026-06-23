@@ -105,6 +105,7 @@ struct InviteRequest {
     email: String,
     role: String,
     password: Option<String>,
+    display_name: Option<String>,
 }
 
 async fn invite_member(State(state): State<AppState>, req: Request) -> Response {
@@ -142,7 +143,12 @@ async fn invite_member(State(state): State<AppState>, req: Request) -> Response 
                         return internal();
                     }
                 };
-                let display = body.email.split('@').next().unwrap_or(&body.email);
+                let display = body
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| body.email.split('@').next().unwrap_or(&body.email));
                 match users.create_local(&body.email, display, &hash).await {
                     Ok(u) => u,
                     Err(e) => {

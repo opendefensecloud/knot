@@ -20,10 +20,11 @@ export default function MembersPage() {
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<"owner" | "editor" | "viewer">("editor");
   const [invitePassword, setInvitePassword] = useState("");
+  const [inviteName, setInviteName] = useState("");
 
   const invite = useMutation({
     mutationFn: async () =>
-      workspaceApi.invite(inviteEmail, inviteRole, invitePassword || undefined),
+      workspaceApi.invite(inviteEmail, inviteRole, invitePassword || undefined, inviteName || undefined),
     onSuccess: async (r) => {
       if ("error" in r) {
         const msg =
@@ -37,6 +38,7 @@ export default function MembersPage() {
       }
       setInviteEmail("");
       setInvitePassword("");
+      setInviteName("");
       await qc.invalidateQueries({ queryKey: ["members"] });
     },
   });
@@ -85,6 +87,14 @@ export default function MembersPage() {
               placeholder="Email"
               required
               className={`${inputCls} flex-1 min-w-[180px]`}
+            />
+            <input
+              data-testid="invite-display-name"
+              type="text"
+              value={inviteName}
+              onChange={(e) => setInviteName(e.target.value)}
+              placeholder="Display name (optional)"
+              className={`${inputCls} flex-1 min-w-[160px]`}
             />
             <select
               data-testid="invite-role"

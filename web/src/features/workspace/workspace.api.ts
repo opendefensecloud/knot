@@ -14,11 +14,17 @@ export const workspaceApi = {
     if ("error" in r) return r;
     return { ok: parse(v.array(Member), r.ok) };
   },
-  invite(email: string, role: "owner" | "editor" | "viewer", password?: string) {
-    return apiFetch<void>("/api/workspace/members", {
-      method: "POST",
-      body: password ? { email, role, password } : { email, role },
-    });
+  invite(
+    email: string,
+    role: "owner" | "editor" | "viewer",
+    password?: string,
+    displayName?: string,
+  ) {
+    const body: Record<string, unknown> = { email, role };
+    if (password) body.password = password;
+    const name = displayName?.trim();
+    if (name) body.display_name = name;
+    return apiFetch<void>("/api/workspace/members", { method: "POST", body });
   },
   setRole(userId: string, role: "owner" | "editor" | "viewer") {
     return apiFetch<void>(`/api/workspace/members/${encodeURIComponent(userId)}`, {
