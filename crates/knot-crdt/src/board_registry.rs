@@ -46,10 +46,20 @@ impl BoardRooms {
         if let Some(h) = self.map.get(&board_id) {
             return h.clone();
         }
-        let sub = self.bus.subscribe(board_id).await.expect("board bus subscribe");
-        let h = BoardRoom::spawn(board_id, self.engine.clone(), self.store.clone(), self.bus.clone(), sub)
+        let sub = self
+            .bus
+            .subscribe(board_id)
             .await
-            .expect("hydrate board room");
+            .expect("board bus subscribe");
+        let h = BoardRoom::spawn(
+            board_id,
+            self.engine.clone(),
+            self.store.clone(),
+            self.bus.clone(),
+            sub,
+        )
+        .await
+        .expect("hydrate board room");
         let arc = Arc::new(h);
         self.map.insert(board_id, arc.clone());
         metrics::gauge!("knot_board_room_active").increment(1.0);
