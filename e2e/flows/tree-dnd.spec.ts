@@ -36,14 +36,25 @@ test("dragging Child onto Parent doesn't crash; no error toast", async ({
   await page.getByTestId("setup-password").fill("owner-hunter22");
   await page.getByTestId("setup-submit").click();
 
+  // The "new-doc" button now opens a NewDocPicker modal; click through to
+  // "new-doc-blank" to create a blank document.
   await page.getByTestId("new-doc").click();
+  await page.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await page.getByTestId("new-doc-blank").click();
   await page.waitForURL(/\/doc\/.+/);
   const firstDocUrl = page.url();
   await page.locator("[data-testid='doc-title']").fill("Parent");
   await page.locator("[data-testid='doc-title']").blur();
 
   await page.getByTestId("new-doc").click();
-  await page.waitForURL(/\/doc\/.+/);
+  await page.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await page.getByTestId("new-doc-blank").click();
+  // Wait for URL to change to the SECOND doc's URL (not the first).
+  await page.waitForFunction(
+    (prev: string) => window.location.href !== prev,
+    firstDocUrl,
+    { timeout: 10_000 },
+  );
   // Must not still be on the first doc URL.
   await expect(page).not.toHaveURL(firstDocUrl);
   await page.locator("[data-testid='doc-title']").fill("Child");
