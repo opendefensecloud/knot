@@ -60,6 +60,10 @@ pub trait BoardStore: Send + Sync + 'static {
     /// Load updates for replay on room boot, in seq order.
     async fn load_updates(&self, id: Uuid) -> Result<Vec<Vec<u8>>>;
 
+    /// Board updates with seq > after_seq, in seq order. Used for incremental
+    /// cross-pod catch-up: the bus delivers a seq, the room fetches the bytes.
+    async fn since(&self, id: Uuid, after_seq: i64) -> Result<Vec<(i64, Vec<u8>)>>;
+
     /// Highest update seq, or 0 if none.
     async fn max_update_seq(&self, id: Uuid) -> Result<i64>;
 
@@ -186,6 +190,18 @@ impl BoardStore for PgBoardStore {
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows.into_iter().map(|(b,)| b).collect())
+    }
+
+    async fn since(&self, id: Uuid, after_seq: i64) -> Result<Vec<(i64, Vec<u8>)>> {
+        let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT seq, bytes FROM board_updates
+             WHERE board_id = $1 AND seq > $2 ORDER BY seq",
+        )
+        .bind(id)
+        .bind(after_seq)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     async fn max_update_seq(&self, id: Uuid) -> Result<i64> {

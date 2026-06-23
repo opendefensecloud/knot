@@ -10,6 +10,9 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets: []
 
+# Horizontally scalable: document and board collaboration fans out across pods
+# via Postgres LISTEN/NOTIFY, so replicaCount can be raised. (Login throttling is
+# still per-process, so brute-force protection weakens as replicas increase.)
 replicaCount: 1
 
 # Required: Postgres connection URL.

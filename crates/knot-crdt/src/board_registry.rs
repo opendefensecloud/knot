@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::board_room::{BoardRoom, BoardRoomHandle};
+use crate::bus::Bus;
 use crate::engine::Engine;
 use knot_storage::BoardStore;
 
@@ -18,15 +19,17 @@ pub struct BoardRooms {
     inflight: DashMap<Uuid, Arc<Mutex<()>>>,
     engine: Arc<dyn Engine>,
     store: Arc<dyn BoardStore>,
+    bus: Arc<dyn Bus>,
 }
 
 impl BoardRooms {
-    pub fn new(engine: Arc<dyn Engine>, store: Arc<dyn BoardStore>) -> Self {
+    pub fn new(engine: Arc<dyn Engine>, store: Arc<dyn BoardStore>, bus: Arc<dyn Bus>) -> Self {
         Self {
             map: DashMap::new(),
             inflight: DashMap::new(),
             engine,
             store,
+            bus,
         }
     }
 
@@ -43,9 +46,20 @@ impl BoardRooms {
         if let Some(h) = self.map.get(&board_id) {
             return h.clone();
         }
-        let h = BoardRoom::spawn(board_id, self.engine.clone(), self.store.clone())
+        let sub = self
+            .bus
+            .subscribe(board_id)
             .await
-            .expect("hydrate board room");
+            .expect("board bus subscribe");
+        let h = BoardRoom::spawn(
+            board_id,
+            self.engine.clone(),
+            self.store.clone(),
+            self.bus.clone(),
+            sub,
+        )
+        .await
+        .expect("hydrate board room");
         let arc = Arc::new(h);
         self.map.insert(board_id, arc.clone());
         metrics::gauge!("knot_board_room_active").increment(1.0);
@@ -55,6 +69,7 @@ impl BoardRooms {
     pub async fn evict(&self, board_id: Uuid) {
         if let Some((_, h)) = self.map.remove(&board_id) {
             h.shutdown.cancel();
+            let _ = self.bus.unsubscribe(board_id).await;
             metrics::gauge!("knot_board_room_active").decrement(1.0);
         }
     }

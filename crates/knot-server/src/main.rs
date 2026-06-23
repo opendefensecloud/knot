@@ -185,13 +185,15 @@ async fn run_server(cfg: Config) {
         none
     };
 
-    // 3c. BoardRooms registry (single-node v0.1; no bus integration).
-    let board_rooms = if let Some(pool) = pool.clone() {
+    // 3c. BoardRooms registry — wired to the same Bus as the document Rooms
+    //     so board edits converge across pods via Postgres LISTEN/NOTIFY.
+    let board_rooms = if let (Some(pool), Some(b)) = (pool.clone(), bus.clone()) {
         let store: std::sync::Arc<dyn knot_storage::BoardStore> =
             std::sync::Arc::new(knot_storage::PgBoardStore::new(pool.clone()));
         Some(std::sync::Arc::new(knot_crdt::BoardRooms::new(
             std::sync::Arc::new(knot_crdt::YrsEngine),
             store,
+            b,
         )))
     } else {
         None
