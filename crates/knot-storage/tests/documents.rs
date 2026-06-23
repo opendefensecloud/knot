@@ -167,3 +167,50 @@ async fn move_reorder_and_nest_preserve_all_docs() {
         Some(a.id)
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heal_query_promotes_cycle_members_to_root() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let w = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
+        .await
+        .unwrap();
+    let u = PgUserStore::new(pool.clone())
+        .create_local("a@x.test", "U", "$h$")
+        .await
+        .unwrap();
+    let store = PgDocStore::new(pool.clone());
+    let a = store.create(w.id, None, "A", "a", u.id).await.unwrap();
+    let b = store
+        .create(w.id, Some(a.id), "B", "b", u.id)
+        .await
+        .unwrap();
+
+    // Inject a cycle directly (bypassing the move guard): A.parent = B.
+    sqlx::query("UPDATE documents SET parent_id = $1 WHERE id = $2")
+        .bind(b.id)
+        .bind(a.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Run the heal statement (identical SQL to the migration).
+    sqlx::query(
+        "WITH RECURSIVE anc(start, cur, depth) AS (
+             SELECT id, parent_id, 1 FROM documents WHERE parent_id IS NOT NULL
+             UNION ALL
+             SELECT a.start, d.parent_id, a.depth + 1
+             FROM anc a JOIN documents d ON d.id = a.cur
+             WHERE a.cur IS NOT NULL AND a.depth < 1000
+         )
+         UPDATE documents SET parent_id = NULL, updated_at = now()
+         WHERE id IN (SELECT start FROM anc WHERE cur = start)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let all = store.list_alive(w.id).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().all(|d| d.parent_id.is_none()));
+}
