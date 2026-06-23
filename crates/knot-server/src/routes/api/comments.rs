@@ -187,6 +187,21 @@ async fn broadcast_mentions(state: &AppState, doc_id: Uuid, comment_id: Uuid, bo
     });
 }
 
+/// Fire-and-forget: tell any active room for `doc_id` that its comments changed,
+/// so connected clients refetch. Mirrors `broadcast_mentions`' pool access.
+fn notify_comment_change(state: &AppState, doc_id: Uuid) {
+    let Some(pool) = state.pool.as_ref().cloned() else {
+        return;
+    };
+    let payload = serde_json::json!({ "doc_id": doc_id.to_string() }).to_string();
+    tokio::spawn(async move {
+        let _ = sqlx::query("SELECT pg_notify('doc_comments', $1)")
+            .bind(&payload)
+            .execute(&pool)
+            .await;
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
@@ -269,6 +284,7 @@ async fn create_thread(
             let body_text = c.body.clone();
             let response = (StatusCode::CREATED, Json(c)).into_response();
             broadcast_mentions(&state, doc_id, comment_id, &body_text).await;
+            notify_comment_change(&state, doc_id);
             response
         }
         Err(CommentStoreError::BodyTooLong) => {
@@ -320,6 +336,7 @@ async fn create_reply(
             let body_text = c.body.clone();
             let response = (StatusCode::CREATED, Json(c)).into_response();
             broadcast_mentions(&state, doc_id, comment_id, &body_text).await;
+            notify_comment_change(&state, doc_id);
             response
         }
         Err(CommentStoreError::BodyTooLong) => {
@@ -392,7 +409,10 @@ async fn resolve_thread(
         return r;
     }
     match comments.resolve(thread_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            notify_comment_change(&state, doc_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(CommentStoreError::NotFound) => json_err(
             StatusCode::NOT_FOUND,
             "comment.not_found",
@@ -421,7 +441,10 @@ async fn unresolve_thread(
         return r;
     }
     match comments.unresolve(thread_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            notify_comment_change(&state, doc_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(CommentStoreError::NotFound) => json_err(
             StatusCode::NOT_FOUND,
             "comment.not_found",
@@ -475,7 +498,10 @@ async fn add_reaction(
         .add_reaction(comment_id, ctx.user_id, &body_req.emoji)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            notify_comment_change(&state, doc_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => {
             tracing::error!(error=?e, "add_reaction");
             internal()
@@ -507,7 +533,10 @@ async fn remove_reaction(
         .remove_reaction(comment_id, ctx.user_id, &emoji)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            notify_comment_change(&state, doc_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => {
             tracing::error!(error=?e, "remove_reaction");
             internal()
@@ -575,6 +604,7 @@ async fn edit_comment(
             let body_text = c.body.clone();
             let response = Json(c).into_response();
             broadcast_mentions(&state, doc_id_val, comment_id_val, &body_text).await;
+            notify_comment_change(&state, doc_id);
             response
         }
         Err(CommentStoreError::NotFound) => {
@@ -634,7 +664,10 @@ async fn delete_comment(
     }
 
     match comments.delete(comment_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            notify_comment_change(&state, doc_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => {
             tracing::error!(error=?e, "delete_comment");
             internal()
