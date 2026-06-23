@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Doc } from "../../lib/validators";
-import { buildTree, reorderInto, moveArgs } from "./tree";
+import { buildTree, descendantIds, dropIntent, applyOptimisticMove, moveArgs } from "./tree";
 
 function doc(id: string, parent: string | null, sort_key: string): Doc {
   return {
@@ -50,11 +50,58 @@ describe("buildTree", () => {
   });
 });
 
-describe("reorderInto", () => {
-  it("reparents a doc", () => {
-    const docs = [doc("a", null, "m"), doc("b", null, "n")];
-    const next = reorderInto(docs, "b", "a");
-    expect(next.find((d) => d.id === "b")?.parent_id).toBe("a");
+function countNodes(nodes: ReturnType<typeof buildTree>): number {
+  return nodes.reduce((acc, n) => acc + 1 + countNodes(n.children), 0);
+}
+
+describe("buildTree totality (no doc ever vanishes)", () => {
+  it("keeps every doc for a self-loop", () => {
+    expect(countNodes(buildTree([doc("a", "a", "m"), doc("b", null, "n")]))).toBe(2);
+  });
+  it("keeps every doc for a 2-cycle", () => {
+    expect(countNodes(buildTree([doc("a", "b", "m"), doc("b", "a", "n")]))).toBe(2);
+  });
+  it("keeps every doc for a 3-cycle with a child", () => {
+    const t = buildTree([doc("a", "b", "m"), doc("b", "c", "n"), doc("c", "a", "o"), doc("d", "a", "p")]);
+    expect(countNodes(t)).toBe(4);
+    const ids = new Set<string>();
+    (function walk(ns: typeof t) { ns.forEach((n) => { ids.add(n.id); walk(n.children); }); })(t);
+    expect(ids.size).toBe(4);
+  });
+  it("keeps a doc whose parent is missing", () => {
+    expect(countNodes(buildTree([doc("a", "ghost", "m")]))).toBe(1);
+  });
+});
+
+describe("dropIntent", () => {
+  const rect = { top: 100, height: 40 };
+  it("top quarter → before", () => { expect(dropIntent(105, rect)).toBe("before"); });
+  it("middle → into", () => { expect(dropIntent(120, rect)).toBe("into"); });
+  it("bottom quarter → after", () => { expect(dropIntent(135, rect)).toBe("after"); });
+});
+
+describe("descendantIds", () => {
+  it("collects descendants and is cycle-safe", () => {
+    const docs = [doc("a", null, "m"), doc("b", "a", "m"), doc("c", "b", "m")];
+    expect([...descendantIds(docs, "a")].sort()).toEqual(["b", "c"]);
+    expect(() => descendantIds([doc("a", "b", "m"), doc("b", "a", "m")], "a")).not.toThrow();
+  });
+});
+
+describe("applyOptimisticMove", () => {
+  it("nests a doc under a new parent (into)", () => {
+    const next = applyOptimisticMove([doc("a", null, "a"), doc("b", null, "b")], "b", { parent_id: "a" });
+    const t = buildTree(next);
+    expect(t).toHaveLength(1);
+    expect(t[0]!.children.map((n) => n.id)).toEqual(["b"]);
+  });
+  it("reorders a sibling before another", () => {
+    const docs = [doc("a", null, "a"), doc("b", null, "b"), doc("c", null, "c")];
+    expect(buildTree(applyOptimisticMove(docs, "c", { parent_id: null, before_id: "a" })).map((n) => n.id)).toEqual(["c", "a", "b"]);
+  });
+  it("reorders a sibling after another", () => {
+    const docs = [doc("a", null, "a"), doc("b", null, "b"), doc("c", null, "c")];
+    expect(buildTree(applyOptimisticMove(docs, "a", { parent_id: null, after_id: "b" })).map((n) => n.id)).toEqual(["b", "a", "c"]);
   });
 });
 

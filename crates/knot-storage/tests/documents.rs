@@ -1,6 +1,6 @@
 use knot_storage::{
-    DocStore, PgDocStore, PgUserStore, PgWorkspaceStore, UserStore, WorkspaceRole, WorkspaceStore,
-    sort_key_between,
+    DocStore, DocStoreError, PgDocStore, PgUserStore, PgWorkspaceStore, UserStore, WorkspaceRole,
+    WorkspaceStore, sort_key_between,
 };
 use uuid::Uuid;
 
@@ -129,4 +129,88 @@ async fn templates_flow_set_and_list() {
     assert!(alive2.iter().any(|d| d.id == tpl.id));
     let templates2 = store.list_templates(ws).await.unwrap();
     assert!(templates2.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn move_to_descendant_is_rejected_as_cycle() {
+    let (store, ws, u) = setup().await;
+    let a = store.create(ws, None, "A", "m", u).await.unwrap();
+    let b = store.create(ws, Some(a.id), "B", "m", u).await.unwrap();
+    let err = store
+        .move_to(ws, a.id, u, Some(b.id), "n")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DocStoreError::Cycle),
+        "expected Cycle, got {err:?}"
+    );
+    let err = store
+        .move_to(ws, a.id, u, Some(a.id), "n")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DocStoreError::Cycle));
+    assert_eq!(store.list_alive(ws).await.unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn move_reorder_and_nest_preserve_all_docs() {
+    let (store, ws, u) = setup().await;
+    let a = store.create(ws, None, "A", "a", u).await.unwrap();
+    let b = store.create(ws, None, "B", "b", u).await.unwrap();
+    let c = store.create(ws, None, "C", "c", u).await.unwrap();
+    store.move_to(ws, c.id, u, Some(a.id), "m").await.unwrap();
+    store.move_to(ws, b.id, u, None, "z").await.unwrap();
+    let all = store.list_alive(ws).await.unwrap();
+    assert_eq!(all.len(), 3, "no doc lost");
+    assert_eq!(
+        all.iter().find(|d| d.id == c.id).unwrap().parent_id,
+        Some(a.id)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heal_query_promotes_cycle_members_to_root() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let w = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
+        .await
+        .unwrap();
+    let u = PgUserStore::new(pool.clone())
+        .create_local("a@x.test", "U", "$h$")
+        .await
+        .unwrap();
+    let store = PgDocStore::new(pool.clone());
+    let a = store.create(w.id, None, "A", "a", u.id).await.unwrap();
+    let b = store
+        .create(w.id, Some(a.id), "B", "b", u.id)
+        .await
+        .unwrap();
+
+    // Inject a cycle directly (bypassing the move guard): A.parent = B.
+    sqlx::query("UPDATE documents SET parent_id = $1 WHERE id = $2")
+        .bind(b.id)
+        .bind(a.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Run the heal statement (identical SQL to the migration).
+    sqlx::query(
+        "WITH RECURSIVE anc(start, cur, depth) AS (
+             SELECT id, parent_id, 1 FROM documents WHERE parent_id IS NOT NULL
+             UNION ALL
+             SELECT a.start, d.parent_id, a.depth + 1
+             FROM anc a JOIN documents d ON d.id = a.cur
+             WHERE a.cur IS NOT NULL AND a.depth < 1000
+         )
+         UPDATE documents SET parent_id = NULL, updated_at = now()
+         WHERE id IN (SELECT start FROM anc WHERE cur = start)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let all = store.list_alive(w.id).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().all(|d| d.parent_id.is_none()));
 }

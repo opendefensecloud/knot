@@ -330,6 +330,9 @@ async fn move_doc(
         Err(knot_storage::DocStoreError::Conflict) => {
             json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "")
         }
+        Err(knot_storage::DocStoreError::Cycle) => {
+            json_err(StatusCode::CONFLICT, "doc.move_cycle", "")
+        }
         Err(e) => {
             tracing::error!(error=?e, "move");
             internal()
