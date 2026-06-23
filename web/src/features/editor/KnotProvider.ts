@@ -16,6 +16,7 @@ import { Awareness, encodeAwarenessUpdate, applyAwarenessUpdate } from "y-protoc
 const MSG_SYNC = 0;
 const MSG_AWARENESS = 1;
 const MSG_MENTION = 4;
+const MSG_COMMENTS = 5;
 const SYNC_STEP_1 = 0;
 const SYNC_STEP_2 = 1;
 const SYNC_UPDATE = 2;
@@ -34,9 +35,12 @@ export type MentionMsg = {
   user_ids: string[];
 };
 
+export type CommentChangeMsg = { doc_id: string };
+
 export type ProviderEvents = {
   status: (s: ProviderStatus) => void;
   mention: (msg: MentionMsg) => void;
+  comments: (msg: CommentChangeMsg) => void;
 };
 
 type Listeners = { [K in keyof ProviderEvents]: Array<ProviderEvents[K]> };
@@ -48,7 +52,7 @@ export class KnotProvider {
   status: ProviderStatus = "connecting";
   private ws: WebSocket | null = null;
   private destroyed = false;
-  private listeners: Listeners = { status: [], mention: [] };
+  private listeners: Listeners = { status: [], mention: [], comments: [] };
   private reconnectAttempt = 0;
   private reconnectTimer: number | null = null;
 
@@ -193,6 +197,16 @@ export class KnotProvider {
         }
       } catch {
         // malformed — ignore
+      }
+      return next;
+    } else if (type === MSG_COMMENTS) {
+      const [payload, next] = readVarBytes(buf, start + 1);
+      if (!payload) return null;
+      try {
+        const msg = JSON.parse(new TextDecoder().decode(payload)) as CommentChangeMsg;
+        if (msg.doc_id) this.listeners.comments.forEach((fn) => fn(msg));
+      } catch {
+        /* malformed — ignore */
       }
       return next;
     }

@@ -28,6 +28,24 @@ describe("KnotProvider", () => {
     expect(p.status).toBe("connecting");
   });
 
+  it("dispatches a MSG_COMMENTS frame to 'comments' listeners", () => {
+    const p = new KnotProvider({ url: "ws://127.0.0.1:1/never", doc: new Y.Doc() });
+    const seen: string[] = [];
+    p.on("comments", (m) => seen.push(m.doc_id));
+
+    const json = new TextEncoder().encode(JSON.stringify({ doc_id: "doc-123" }));
+    const head = [5]; // MSG_COMMENTS
+    let len = json.length;
+    while (len >= 0x80) { head.push((len & 0x7f) | 0x80); len >>= 7; }
+    head.push(len);
+    const frame = new Uint8Array([...head, ...json]);
+
+    (p as unknown as { handleFrame(b: Uint8Array): void }).handleFrame(frame);
+
+    expect(seen).toEqual(["doc-123"]);
+    p.destroy();
+  });
+
   it("applies every y-sync message batched in a single frame", () => {
     const doc = new Y.Doc();
     const p = new KnotProvider({ url: "ws://127.0.0.1:1/never", doc });
