@@ -267,6 +267,10 @@ async fn run_server(cfg: Config) {
         let _handle = knot_docs::spawn_listener(pool, acl, docs, on_invalidate);
         tracing::info!("acl listener spawned");
     }
+    if let (Some(pool), Some(rooms)) = (state.pool.clone(), state.rooms_v2.clone()) {
+        let _handle = knot_server::comments_listener::spawn(pool, rooms);
+        tracing::info!("comments listener spawned");
+    }
 
     // Token shared with every collab socket; cancelled on SIGTERM so they
     // send a clean 1001 Close and drain instead of being severed mid-rollout.

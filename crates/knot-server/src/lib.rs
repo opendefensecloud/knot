@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 pub mod auth;
 pub mod board_room_shim;
+pub mod comments_listener;
 pub mod http_error;
 pub mod metrics;
 pub mod protocol;

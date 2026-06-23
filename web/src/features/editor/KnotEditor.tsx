@@ -4,7 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import * as Y from "yjs";
 import { useNavigate } from "react-router-dom";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { useSession } from "../../auth/SessionContext";
 import { colorFor } from "../../components/ui/Avatar";
@@ -21,7 +21,7 @@ import {
   setEditorRef,
 } from "./CommentsHighlightExtension";
 import { EditorToolbar } from "./EditorToolbar";
-import { KnotProvider, type MentionMsg, type ProviderStatus } from "./KnotProvider";
+import { KnotProvider, type CommentChangeMsg, type MentionMsg, type ProviderStatus } from "./KnotProvider";
 
 type Pair = { doc: Y.Doc; provider: KnotProvider };
 
@@ -92,6 +92,7 @@ function isImageType(t: string): boolean { return IMAGE_RE.test(t); }
 function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner" | "editor" | "viewer"; docId: string; editMode: boolean }) {
   const canEdit = role !== "viewer" && editMode;
   const navigate = useNavigate();
+  const qc = useQueryClient();
   const session = useSession();
   const sessionUser = session.data && "ok" in session.data ? session.data.ok : null;
   const userColor = useMemo(() => colorFor(sessionUser?.user_id ?? "anon"), [sessionUser]);
@@ -159,6 +160,17 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
     provider.on("mention", onMention);
     return () => { provider.off("mention", onMention); };
   }, [pair, sessionUser?.user_id, notify, openCommentSidebar]);
+
+  // Invalidate the comments query when a peer pushes a MSG_COMMENTS frame,
+  // causing the comment sidebar to refetch automatically.
+  useEffect(() => {
+    const { provider } = pair;
+    const onComments = (_msg: CommentChangeMsg) => {
+      void qc.invalidateQueries({ queryKey: ["comments", docId] });
+    };
+    provider.on("comments", onComments);
+    return () => { provider.off("comments", onComments); };
+  }, [pair, docId, qc]);
 
   const uploadAndInsert = useCallback(async (files: File[]) => {
     for (const f of files) {
