@@ -260,3 +260,98 @@ async fn invite_unknown_email_without_password_returns_404() {
         "error code should be workspace.user_not_found"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 4. invite_sets_display_name_when_provided
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_sets_display_name_when_provided() {
+    let state = state_with_seeded_user("owner@x.test", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+
+    let (sid_kv, csrf_val) = login(app.clone(), "owner@x.test", "ownerpass1").await;
+
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workspace/members")
+                .header("content-type", "application/json")
+                .header("cookie", format!("{sid_kv}; csrf={csrf_val}"))
+                .header("x-csrf-token", &csrf_val)
+                .body(Body::from(
+                    serde_json::json!({
+                        "email": "newbie@x.test",
+                        "role": "editor",
+                        "password": "newbie-pass-1",
+                        "display_name": "Ada Lovelace"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED, "invite should return 201");
+
+    let user = state
+        .users
+        .as_ref()
+        .unwrap()
+        .find_by_email("newbie@x.test")
+        .await
+        .unwrap()
+        .expect("new user should exist in DB");
+    assert_eq!(
+        user.display_name, "Ada Lovelace",
+        "display_name should be set from the invite request"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. invite_falls_back_to_email_prefix_without_display_name
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_falls_back_to_email_prefix_without_display_name() {
+    let state = state_with_seeded_user("owner2@x.test", "ownerpass2").await;
+    let app = router_with_state(state.clone());
+
+    let (sid_kv, csrf_val) = login(app.clone(), "owner2@x.test", "ownerpass2").await;
+
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workspace/members")
+                .header("content-type", "application/json")
+                .header("cookie", format!("{sid_kv}; csrf={csrf_val}"))
+                .header("x-csrf-token", &csrf_val)
+                .body(Body::from(
+                    serde_json::json!({
+                        "email": "plain@x.test",
+                        "role": "viewer",
+                        "password": "plain-pass-1"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED, "invite should return 201");
+
+    let user = state
+        .users
+        .as_ref()
+        .unwrap()
+        .find_by_email("plain@x.test")
+        .await
+        .unwrap()
+        .expect("new user should exist in DB");
+    assert_eq!(
+        user.display_name, "plain",
+        "display_name should fall back to email prefix when not provided"
+    );
+}
