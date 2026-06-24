@@ -84,7 +84,8 @@ pub fn append_var_uint(out: &mut Vec<u8>, mut v: u64) {
 
 fn read_var_bytes(buf: &[u8]) -> Result<(&[u8], usize), DecodeError> {
     let (len, consumed) = read_var_uint(buf)?;
-    let total = consumed + len as usize;
+    let len = usize::try_from(len).map_err(|_| DecodeError::Truncated)?;
+    let total = consumed.checked_add(len).ok_or(DecodeError::Truncated)?;
     if buf.len() < total {
         return Err(DecodeError::Truncated);
     }
@@ -110,6 +111,23 @@ fn read_var_uint(buf: &[u8]) -> Result<(u64, usize), DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_var_bytes_rejects_oversize_length_without_panicking() {
+        let mut buf = Vec::new();
+        append_var_uint(&mut buf, u64::MAX);
+        assert!(matches!(read_var_bytes(&buf), Err(DecodeError::Truncated)));
+    }
+
+    #[test]
+    fn read_var_bytes_reads_a_valid_payload() {
+        let mut buf = Vec::new();
+        append_var_uint(&mut buf, 3);
+        buf.extend_from_slice(b"abc");
+        let (payload, total) = read_var_bytes(&buf).unwrap();
+        assert_eq!(payload, b"abc");
+        assert_eq!(total, buf.len());
+    }
 
     #[test]
     fn roundtrip_varuint() {

@@ -20,6 +20,10 @@ use knot_storage::{
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
+/// Max inbound collab/board WS message. CRDT updates and board ops are far
+/// smaller; this bounds memory amplification from a malicious frame.
+const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
 pub mod admin;
 pub mod auth;
 pub mod board_room_shim;
@@ -30,6 +34,7 @@ pub mod protocol;
 pub mod reindex;
 pub mod room;
 pub mod routes;
+pub mod security_headers;
 
 use auth::SessionDeps;
 
@@ -58,6 +63,7 @@ pub struct AppState {
     pub throttle: Arc<Throttle>,
     pub session_key: Vec<u8>,
     pub base_url: String,
+    pub cookie_secure: bool,
     pub oidc_enabled: bool,
     pub oidc: Option<Arc<knot_auth::oidc::OidcClient>>,
     pub config: Arc<Config>,
@@ -93,6 +99,7 @@ impl AppState {
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
             base_url: "http://localhost:3000".into(),
+            cookie_secure: true,
             oidc_enabled: false,
             oidc: None,
             config: Arc::new(Config::default()),
@@ -153,6 +160,7 @@ impl AppState {
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
             base_url: "http://localhost:3000".into(),
+            cookie_secure: true,
             oidc_enabled: false,
             oidc: None,
             config: Arc::new(Config::default()),
@@ -180,14 +188,25 @@ pub fn router_with_state(state: AppState) -> Router {
         .append_index_html_on_directories(true)
         .not_found_service(ServeFile::new(&index_path));
 
-    let mut r = Router::new()
+    // WS routes: NO timeout / body-limit (long-lived, streamed).
+    let collab = Router::new()
         .route("/collab/doc/:doc_id", get(collab_upgrade))
-        .route("/collab/board/:board_id", get(collab_board_upgrade))
+        .route("/collab/board/:board_id", get(collab_board_upgrade));
+
+    // Everything else: request timeout + body-size limit.
+    let api_and_pages = Router::new()
         .merge(routes::health::router())
         .merge(routes::auth::router())
         .merge(routes::public::router())
         .merge(routes::api::router(state.clone()))
-        .fallback_service(spa);
+        .fallback_service(spa)
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(30),
+        ));
+
+    let mut r = collab.merge(api_and_pages);
 
     if let Some(deps) = state.session_deps() {
         r = r.layer(axum::middleware::from_fn_with_state(
@@ -196,9 +215,13 @@ pub fn router_with_state(state: AppState) -> Router {
         ));
     }
 
-    r.layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(axum::middleware::from_fn(crate::metrics::record))
-        .with_state(state)
+    r.layer(axum::middleware::from_fn_with_state(
+        state.cookie_secure,
+        crate::security_headers::set_security_headers,
+    ))
+    .layer(tower_http::trace::TraceLayer::new_for_http())
+    .layer(axum::middleware::from_fn(crate::metrics::record))
+    .with_state(state)
 }
 
 #[tracing::instrument(skip_all, name = "collab.upgrade", fields(doc_id = %doc_id))]
@@ -242,6 +265,9 @@ async fn collab_upgrade(
         }
     };
     let shutdown = state.shutdown.clone();
+    let ws = ws
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
         crate::room::serve(rooms, doc_id, socket, can_write, shutdown).await;
     })
@@ -292,6 +318,9 @@ async fn collab_board_upgrade(
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
     };
     let shutdown = state.shutdown.clone();
+    let ws = ws
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
         crate::board_room_shim::serve(board_rooms, board_id, socket, shutdown).await;
     })
