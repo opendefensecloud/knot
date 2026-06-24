@@ -20,6 +20,10 @@ use knot_storage::{
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
+/// Max inbound collab/board WS message. CRDT updates and board ops are far
+/// smaller; this bounds memory amplification from a malicious frame.
+const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
 pub mod admin;
 pub mod auth;
 pub mod board_room_shim;
@@ -242,6 +246,9 @@ async fn collab_upgrade(
         }
     };
     let shutdown = state.shutdown.clone();
+    let ws = ws
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
         crate::room::serve(rooms, doc_id, socket, can_write, shutdown).await;
     })
@@ -292,6 +299,9 @@ async fn collab_board_upgrade(
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
     };
     let shutdown = state.shutdown.clone();
+    let ws = ws
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
         crate::board_room_shim::serve(board_rooms, board_id, socket, shutdown).await;
     })
