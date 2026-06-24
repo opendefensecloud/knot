@@ -96,3 +96,23 @@ async fn ipv6_round_trips() {
     let found = s.find_active(&id).await.unwrap().expect("found");
     assert_eq!(found.ip, Some(ip));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_for_user_removes_all_their_sessions() {
+    let (store, user_id, ws_id) = setup().await;
+    let exp = chrono::Utc::now() + chrono::Duration::hours(1);
+    store
+        .create(b"tok-a", user_id, ws_id, exp, None, None)
+        .await
+        .unwrap();
+    store
+        .create(b"tok-b", user_id, ws_id, exp, None, None)
+        .await
+        .unwrap();
+    assert!(store.find_active(b"tok-a").await.unwrap().is_some());
+
+    store.delete_for_user(user_id).await.unwrap();
+
+    assert!(store.find_active(b"tok-a").await.unwrap().is_none());
+    assert!(store.find_active(b"tok-b").await.unwrap().is_none());
+}
