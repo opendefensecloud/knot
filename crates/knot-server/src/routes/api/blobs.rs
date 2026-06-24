@@ -28,6 +28,20 @@ const BLOCKED_PREFIXES: &[&str] = &[
     "application/x-mach-binary",
 ];
 
+/// Content types we are willing to serve INLINE. Everything else is sent as a
+/// download with a neutral type so a browser never renders attacker-controlled
+/// markup (e.g. an uploaded SVG/HTML) in our origin.
+pub(crate) fn safe_inline_content_type(ct: &str) -> Option<&'static str> {
+    match ct {
+        "image/png" => Some("image/png"),
+        "image/jpeg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        "application/pdf" => Some("application/pdf"),
+        _ => None,
+    }
+}
+
 #[derive(serde::Serialize)]
 struct BlobResponse {
     id: String,
@@ -199,9 +213,15 @@ async fn download(State(state): State<AppState>, Path(id): Path<Uuid>, req: Requ
         Err(_) => return internal(),
     };
 
+    let (ct, disposition) = match safe_inline_content_type(&meta.content_type) {
+        Some(ct) => (ct, "inline"),
+        None => ("application/octet-stream", "attachment"),
+    };
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, meta.content_type)
+        .header(header::CONTENT_TYPE, ct)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CONTENT_DISPOSITION, disposition)
         .header(header::CACHE_CONTROL, "private, max-age=60")
         .header(header::CONTENT_LENGTH, meta.byte_size)
         .body(Body::from(bytes))
