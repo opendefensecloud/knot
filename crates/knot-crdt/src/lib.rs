@@ -12,7 +12,7 @@ pub mod room;
 pub mod snapshot;
 pub mod writer;
 
-pub use board_registry::BoardRooms;
+pub use board_registry::{BoardAcquireError, BoardRooms};
 pub use board_room::{BoardRoom, BoardRoomHandle};
 pub use bus::{Bus, BusError, Subscription};
 pub use bus_mem::MemBus;
@@ -20,7 +20,7 @@ pub use bus_pg::PgBus;
 pub use engine::{DocHandle, Engine, EngineError, TextMark, TextMarkAttr, YrsEngine};
 pub use gc::spawn as spawn_gc;
 pub use presence::PRESENCE_MAX_BYTES;
-pub use registry::Rooms;
+pub use registry::{AcquireError, Rooms};
 pub use room::{ConnHandle, ConnId, Event, InMsg, Room, RoomHandle};
 pub use snapshot::{SnapshotPolicy, SnapshotState};
 pub use writer::{Applied, PersistJob};

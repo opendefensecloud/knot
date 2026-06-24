@@ -33,6 +33,8 @@ use crate::http_error::json_err;
 pub enum RefreshError {
     #[error("server state missing rooms registry")]
     NoRooms,
+    #[error("room acquire failed for {0}")]
+    Acquire(Uuid),
     #[error("room actor unreachable for {0}")]
     RoomUnreachable(Uuid),
     #[error("room actor returned an error: {0}")]
@@ -72,7 +74,10 @@ async fn refresh_markdown_inner(
     reindex_tasks: bool,
 ) -> Result<String, RefreshError> {
     let rooms = state.rooms_v2.clone().ok_or(RefreshError::NoRooms)?;
-    let room = rooms.acquire(doc_id).await;
+    let room = rooms
+        .acquire(doc_id)
+        .await
+        .map_err(|_| RefreshError::Acquire(doc_id))?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     if room
         .tx
@@ -191,7 +196,13 @@ pub(super) async fn import_inline(
         }
     };
 
-    let room = rooms.acquire(doc_id).await;
+    let room = match rooms.acquire(doc_id).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error=?e, %doc_id, "room acquire failed");
+            return internal();
+        }
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     if room
         .tx

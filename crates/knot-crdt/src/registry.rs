@@ -7,14 +7,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
+use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
-use crate::bus::Bus;
-use crate::engine::Engine;
+use crate::bus::{Bus, BusError};
+use crate::engine::{Engine, EngineError};
 use crate::room::{Room, RoomHandle};
 use crate::snapshot::SnapshotPolicy;
 use knot_storage::{SnapshotStore, UpdatesStore};
+
+/// Error returned by [`Rooms::acquire`] when a room cannot be booted.
+#[derive(Debug, Error)]
+pub enum AcquireError {
+    #[error("bus subscribe: {0}")]
+    Bus(#[from] BusError),
+    #[error("hydrate: {0}")]
+    Hydrate(#[from] EngineError),
+}
 
 pub struct Rooms {
     map: DashMap<Uuid, Arc<RoomHandle>>,
@@ -65,10 +75,14 @@ impl Rooms {
     }
 
     /// Acquire (or boot) the room for `doc_id`. Concurrent calls cooperate
-    /// via a per-doc Mutex so only one room is booted.
-    pub async fn acquire(&self, doc_id: Uuid) -> Arc<RoomHandle> {
+    /// via a per-doc Mutex so only one room boots.
+    ///
+    /// Returns `Err` when the bus subscription or initial hydration fails
+    /// (transient DB/bus blip). The inflight entry is removed after a
+    /// successful insert so it does not accumulate indefinitely.
+    pub async fn acquire(&self, doc_id: Uuid) -> Result<Arc<RoomHandle>, AcquireError> {
         if let Some(h) = self.map.get(&doc_id) {
-            return h.clone();
+            return Ok(h.clone());
         }
         let guard = self
             .inflight
@@ -77,9 +91,9 @@ impl Rooms {
             .clone();
         let _lock = guard.lock().await;
         if let Some(h) = self.map.get(&doc_id) {
-            return h.clone();
+            return Ok(h.clone());
         }
-        let sub = self.bus.subscribe(doc_id).await.expect("bus subscribe");
+        let sub = self.bus.subscribe(doc_id).await?;
         let h = Room::spawn(
             doc_id,
             self.engine.clone(),
@@ -90,12 +104,14 @@ impl Rooms {
             self.policy,
             self.dirty_tx.clone(),
         )
-        .await
-        .expect("hydrate");
+        .await?;
         let arc = Arc::new(h);
         self.map.insert(doc_id, arc.clone());
+        // Prune the inflight entry now that the room is live; leaving it in
+        // would cause the DashMap to grow without bound over time.
+        self.inflight.remove(&doc_id);
         metrics::gauge!("knot_room_active").increment(1.0);
-        arc
+        Ok(arc)
     }
 
     /// Send a revoke event to the room (if active). The room drops all

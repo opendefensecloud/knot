@@ -86,7 +86,7 @@ async fn doc_edit_with_mention_lands_in_task_index_without_http() {
     let (_handle, update_bytes) = knot_markdown::from_markdown::parse(&md).unwrap();
 
     // Acquire the room and apply the update.
-    let room = rooms.acquire(doc.id).await;
+    let room = rooms.acquire(doc.id).await.unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     room.tx
         .send(Event::ApplyUpdate {

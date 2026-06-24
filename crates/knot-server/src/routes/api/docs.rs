@@ -542,7 +542,13 @@ async fn create_from_template_inline(
     let Some(rooms) = state.rooms_v2.clone() else {
         return internal();
     };
-    let room = rooms.acquire(new_doc.id).await;
+    let room = match rooms.acquire(new_doc.id).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error=?e, doc_id=%new_doc.id, "room acquire failed");
+            return internal();
+        }
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     if room
         .tx

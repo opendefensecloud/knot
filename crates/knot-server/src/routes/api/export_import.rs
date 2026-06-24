@@ -667,7 +667,13 @@ async fn import(
             Ok((_doc, bytes)) => bytes,
             Err(_) => continue,
         };
-        let room = rooms.acquire(new_doc_id).await;
+        let room = match rooms.acquire(new_doc_id).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(error=?e, %new_doc_id, "room acquire failed during import");
+                continue;
+            }
+        };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = room
             .tx

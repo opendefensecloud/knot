@@ -76,7 +76,7 @@ async fn seeded() -> (AppState, Uuid, Uuid, Uuid, String) {
     // Seed the template's content via ApplyUpdate.
     let md = "# Agenda\n\n- topic one\n- topic two\n";
     let (_doc, update_bytes) = knot_markdown::from_markdown::parse(md).unwrap();
-    let room = rooms.acquire(tpl_doc.id).await;
+    let room = rooms.acquire(tpl_doc.id).await.unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     room.tx
         .send(Event::ApplyUpdate {
@@ -181,7 +181,7 @@ async fn from_template_clones_markdown_into_new_doc() {
     // Pull the new doc's markdown back out and confirm it matches the
     // template's source. Round-trip is exact for this fixture.
     let rooms = state.rooms_v2.as_ref().unwrap();
-    let room = rooms.acquire(new_id).await;
+    let room = rooms.acquire(new_id).await.unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     room.tx.send(Event::ExportState(tx)).await.unwrap();
     let (state_bytes, _seq) = rx.await.unwrap().unwrap();
@@ -206,7 +206,7 @@ async fn from_template_clones_markdown_into_new_doc() {
     rx.await.unwrap().expect("replace");
 
     // Template content still matches its original markdown.
-    let tpl_room = rooms.acquire(tpl_id).await;
+    let tpl_room = rooms.acquire(tpl_id).await.unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     tpl_room.tx.send(Event::ExportState(tx)).await.unwrap();
     let (state_bytes, _seq) = rx.await.unwrap().unwrap();

@@ -23,7 +23,13 @@ pub async fn serve(
     can_write: bool,
     shutdown: CancellationToken,
 ) {
-    let handle = rooms.acquire(doc_id).await;
+    let handle = match rooms.acquire(doc_id).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error=?e, %doc_id, "room acquire failed; closing socket");
+            return;
+        }
+    };
     let conn_id: ConnId = Uuid::new_v4();
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
 
