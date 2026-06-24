@@ -37,6 +37,13 @@ struct SessionResponse {
     role: String,
 }
 
+/// A fixed Argon2 hash so login runs the (expensive) verify even when the user
+/// is absent or has no password, removing the existing-user timing oracle.
+fn timing_dummy_hash(hasher: &knot_auth::Hasher) -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| hasher.hash("knot-timing-dummy").unwrap_or_default())
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/auth/login", post(login))
@@ -92,6 +99,9 @@ async fn login(State(state): State<AppState>, req: Request<Body>) -> Response {
         Ok(None) => {
             state.throttle.record_failure(&ip_key);
             state.throttle.record_failure(&email_key);
+            let _ = state
+                .hasher
+                .verify(timing_dummy_hash(&state.hasher), &body.password);
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             return invalid_credentials();
         }
@@ -102,6 +112,9 @@ async fn login(State(state): State<AppState>, req: Request<Body>) -> Response {
     };
     let Some(hash) = user.password_hash.as_deref() else {
         state.throttle.record_failure(&email_key);
+        let _ = state
+            .hasher
+            .verify(timing_dummy_hash(&state.hasher), &body.password);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         return invalid_credentials();
     };
