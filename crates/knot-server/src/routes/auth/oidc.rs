@@ -245,7 +245,16 @@ async fn auto_provision(
 ) -> Result<Option<knot_storage::User>, Response> {
     let policy = state.config.oidc_auto_provision.as_str();
     let allow = match policy {
-        "always" => true,
+        "always" => {
+            let allowed = always_policy_allows(id.email_verified);
+            if !allowed {
+                tracing::warn!(
+                    email = %id.email,
+                    "oidc always auto-provision denied: email not verified"
+                );
+            }
+            allowed
+        }
         "domain" => {
             let allowed = domain_policy_allows(
                 &id.email,
@@ -311,9 +320,37 @@ fn read_flow_cookie(req: &Request<Body>) -> Option<FlowState> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Whether an `always`-policy auto-provision is allowed for this identity.
+/// Requires the IdP to have marked the email verified — an unverified email
+/// could otherwise self-provision without a real identity assertion.
+fn always_policy_allows(email_verified: bool) -> bool {
+    email_verified
+}
+
 #[cfg(test)]
 mod tests {
-    use super::domain_policy_allows;
+    use super::{always_policy_allows, domain_policy_allows};
+
+    // ---- always policy ----
+
+    #[test]
+    fn always_policy_requires_verified_email() {
+        // Unverified email must NOT be auto-provisioned.
+        assert!(
+            !always_policy_allows(false),
+            "always policy must deny unverified email"
+        );
+    }
+
+    #[test]
+    fn always_policy_allows_verified_email() {
+        assert!(
+            always_policy_allows(true),
+            "always policy must allow verified email"
+        );
+    }
+
+    // ---- domain policy ----
 
     #[test]
     fn verified_email_in_allowed_domain_is_allowed() {
