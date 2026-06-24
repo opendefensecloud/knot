@@ -472,6 +472,85 @@ async fn public_board_svg_404_for_invalid_token() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// 14. Cross-doc IDOR: owner of doc B cannot revoke a token that belongs to
+/// doc A. The revoke must return 404 (not 204), and the token must remain
+/// valid afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_doc_revoke_returns_404_and_token_stays_valid() {
+    // Seed workspace + alice as Owner with doc A.
+    let pool = knot_test_support::fresh_db().await.pool;
+    let mut s = AppState::with_pool(pool.clone());
+    s.hasher = Arc::new(knot_auth::Hasher::fast_for_tests());
+    s.throttle = Arc::new(knot_auth::Throttle::new());
+    s.session_key = b"test-key-32-bytes-aaaaaaaaaaaaaa".to_vec();
+
+    let hash = s.hasher.hash("hunter22").unwrap();
+    let ws = s
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .create("default", "Workspace")
+        .await
+        .unwrap();
+    let alice = s
+        .users
+        .as_ref()
+        .unwrap()
+        .create_local("alice@example.com", "Alice", &hash)
+        .await
+        .unwrap();
+    s.workspaces
+        .as_ref()
+        .unwrap()
+        .add_member(ws.id, alice.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+
+    // Doc A — alice creates a share token on it.
+    let doc_a = s
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(ws.id, None, "DocA", "m", alice.id)
+        .await
+        .unwrap();
+    // Doc B — also owned by alice (same workspace owner).
+    let doc_b = s
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(ws.id, None, "DocB", "m", alice.id)
+        .await
+        .unwrap();
+
+    let app = router_with_state(s);
+    let (sid, csrf) = login_alice(&app).await;
+
+    // Create a share token on doc A.
+    let (status, json) = create_share(&app, &sid, &csrf, doc_a.id, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token_a = json["token"].as_str().unwrap().to_string();
+    let share_a_id = json["id"].as_str().unwrap().to_string();
+
+    // Attempt to revoke doc A's token using doc B as the path parameter.
+    // This is the IDOR: alice is owner of B but the token belongs to A.
+    let del_status = revoke_share(&app, &sid, &csrf, doc_b.id, &share_a_id).await;
+    assert_eq!(
+        del_status,
+        StatusCode::NOT_FOUND,
+        "cross-doc revoke must be rejected with 404"
+    );
+
+    // The token must still be alive — anon access returns something other than 410.
+    // (We don't have a markdown cache entry so 503 is expected, but not 410/gone.)
+    let (anon_status, _) = anon_get_token(&app, &token_a).await;
+    assert_ne!(
+        anon_status,
+        StatusCode::GONE,
+        "token must still be valid after rejected cross-doc revoke"
+    );
+}
+
 /// 13. Board with no cached SVG returns 404.
 #[tokio::test(flavor = "multi_thread")]
 async fn public_board_svg_404_when_no_preview() {
