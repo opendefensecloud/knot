@@ -17,7 +17,13 @@ pub async fn serve(
     socket: WebSocket,
     shutdown: CancellationToken,
 ) {
-    let handle = rooms.acquire(board_id).await;
+    let handle = match rooms.acquire(board_id).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error=?e, %board_id, "board room acquire failed; closing socket");
+            return;
+        }
+    };
     let conn_id: ConnId = Uuid::new_v4();
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
 

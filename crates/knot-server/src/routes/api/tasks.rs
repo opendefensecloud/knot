@@ -133,7 +133,13 @@ async fn patch_checked(
         Err(_) => return json_err(StatusCode::BAD_REQUEST, "bad_request", ""),
     };
 
-    let room = rooms.acquire(doc_id).await;
+    let room = match rooms.acquire(doc_id).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error=?e, %doc_id, "room acquire failed");
+            return internal();
+        }
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     if room
         .tx

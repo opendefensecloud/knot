@@ -144,8 +144,9 @@ async fn revoke(
     let Some(shares) = state.shares.clone() else {
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "");
     };
-    match shares.revoke(share_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    match shares.revoke(share_id, doc_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => json_err(StatusCode::NOT_FOUND, "shares.not_found", "token not found for this doc"),
         Err(_) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", ""),
     }
 }

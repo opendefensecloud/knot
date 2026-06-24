@@ -17,7 +17,7 @@ use crate::acl::{ResolveError, resolve};
 
 #[derive(Clone)]
 pub struct AclCache {
-    inner: Cache<(Uuid, Uuid), Option<WorkspaceRole>>,
+    inner: Cache<(Uuid, Uuid, Uuid), Option<WorkspaceRole>>,
     workspaces: Arc<dyn WorkspaceStore>,
     grants: Arc<dyn GrantStore>,
     docs: Arc<dyn DocStore>,
@@ -48,7 +48,7 @@ impl AclCache {
         doc_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<WorkspaceRole>, ResolveError> {
-        let key = (doc_id, user_id);
+        let key = (workspace_id, doc_id, user_id);
         if let Some(v) = self.inner.get(&key).await {
             return Ok(v);
         }
@@ -70,7 +70,7 @@ impl AclCache {
         // invalidation runs lazily on the next read of each matching key,
         // OR via the background drain task.
         self.inner
-            .invalidate_entries_if(move |k, _| k.0 == doc_id)
+            .invalidate_entries_if(move |k, _| k.1 == doc_id)
             .ok();
     }
 
@@ -84,5 +84,65 @@ impl AclCache {
     /// background drain task.
     pub async fn run_pending_tasks(&self) {
         self.inner.run_pending_tasks().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use knot_storage::{DocStore, PgDocStore, PgGrantStore, PgUserStore, PgWorkspaceStore, UserStore};
+
+    /// Regression: the cache must be keyed by (workspace_id, doc_id, user_id).
+    /// If the key were only (doc_id, user_id), a cached role for workspace A
+    /// would be returned when the same (doc_id, user_id) pair is looked up
+    /// under workspace B — cross-tenant poisoning.
+    ///
+    /// This test creates two workspaces with the same user and the same
+    /// doc_id (impossible in real data, but we directly insert the cache
+    /// entries to isolate the key logic), then verifies that inserting under
+    /// ws A does not serve the cached value under ws B.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_workspace_isolation() {
+        let pool = knot_test_support::fresh_db().await.pool;
+
+        let ws_s = PgWorkspaceStore::new(pool.clone());
+        let us = PgUserStore::new(pool.clone());
+        let ds = PgDocStore::new(pool.clone());
+        let gs = PgGrantStore::new(pool.clone());
+
+        // Workspace A: user is an Owner.
+        let ws_a = ws_s.create("wsa", "A").await.unwrap();
+        let user = us.create_local("u@x.test", "U", "$h$").await.unwrap();
+        ws_s.add_member(ws_a.id, user.id, WorkspaceRole::Owner)
+            .await
+            .unwrap();
+        let doc = ds
+            .create(ws_a.id, None, "Doc", "m", user.id)
+            .await
+            .unwrap();
+
+        // Workspace B: same user, NOT a member.
+        let ws_b = ws_s.create("wsb", "B").await.unwrap();
+
+        let cache = AclCache::new(
+            Arc::new(ws_s),
+            Arc::new(gs),
+            Arc::new(ds),
+        );
+
+        // Prime the cache for workspace A — resolves to Owner.
+        let r_a = cache.effective_role(ws_a.id, doc.id, user.id).await.unwrap();
+        assert_eq!(r_a, Some(WorkspaceRole::Owner));
+
+        // Look up the same (doc_id, user_id) under workspace B.
+        // With the old (doc_id, user_id) key this would return the poisoned
+        // Owner value; with the correct (workspace_id, doc_id, user_id) key
+        // it must resolve independently and return None (user not a member of B).
+        let r_b = cache.effective_role(ws_b.id, doc.id, user.id).await.unwrap();
+        assert_eq!(
+            r_b,
+            None,
+            "cached Owner role from ws_a must not bleed into ws_b lookup"
+        );
     }
 }

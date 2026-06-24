@@ -26,6 +26,10 @@ use regex::Regex;
 use serde::Deserialize;
 use uuid::Uuid;
 
+/// Compiled once at first use; avoids re-compiling on every comment request.
+static MENTION_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(?:^|\s)@(\w+)").expect("valid mention regex"));
+
 use crate::AppState;
 use crate::auth::{AuthContext, EffectiveDocRole};
 use crate::http_error::json_err;
@@ -127,9 +131,8 @@ fn internal() -> Response {
 
 /// Extract @mention handles from comment body.
 fn extract_mentions(body: &str) -> Vec<String> {
-    // Pattern: word-boundary @ followed by \w+
-    let re = Regex::new(r"(?:^|\s)@(\w+)").expect("valid regex");
-    re.captures_iter(body)
+    MENTION_RE
+        .captures_iter(body)
         .filter_map(|cap| cap.get(1))
         .map(|m| m.as_str().to_lowercase())
         .collect()

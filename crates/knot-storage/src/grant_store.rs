@@ -103,6 +103,10 @@ impl GrantStore for PgGrantStore {
     ) -> Result<Vec<Grant>, GrantStoreError> {
         // Recursive CTE walks from doc_id up to root; selects grants on each.
         // For non-self levels, only inherit=true grants are returned.
+        // The depth cap (< 10000) is a defense-in-depth guard: a reintroduced
+        // cycle in the document tree would otherwise loop indefinitely in
+        // Postgres (ACL-resolution DoS). The heal migration already prevents
+        // cycles; this cap is belt-and-suspenders.
         let rows = sqlx::query_as::<_, GrantRow>(
             "WITH RECURSIVE chain AS (
                  SELECT id, parent_id, 0 AS depth
@@ -110,7 +114,7 @@ impl GrantStore for PgGrantStore {
                  UNION ALL
                  SELECT d.id, d.parent_id, c.depth + 1
                  FROM documents d JOIN chain c ON d.id = c.parent_id
-                 WHERE d.workspace_id = $1
+                 WHERE d.workspace_id = $1 AND c.depth < 10000
              )
              SELECT g.doc_id, g.principal, g.role, g.inherit, g.granted_at, g.granted_by
              FROM document_grants g

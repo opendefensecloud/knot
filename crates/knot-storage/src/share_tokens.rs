@@ -47,8 +47,11 @@ pub trait ShareTokenStore: Send + Sync {
     /// token is alive: not revoked AND (no expiry OR expiry in the future).
     async fn find_alive(&self, token: &str) -> Result<Option<ShareToken>>;
 
-    /// Mark a token revoked. Idempotent — no error on already-revoked.
-    async fn revoke(&self, id: Uuid) -> Result<()>;
+    /// Mark a token revoked. Returns true if a row was updated (the token
+    /// existed AND belonged to `doc_id`). Returns false when the token does
+    /// not belong to the given doc (cross-doc IDOR guard). Idempotent on
+    /// already-revoked tokens (returns false).
+    async fn revoke(&self, id: Uuid, doc_id: Uuid) -> Result<bool>;
 }
 
 pub struct PgShareTokenStore {
@@ -135,14 +138,16 @@ impl ShareTokenStore for PgShareTokenStore {
         Ok(row.map(Into::into))
     }
 
-    async fn revoke(&self, id: Uuid) -> Result<()> {
-        sqlx::query(
-            "UPDATE share_tokens SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL",
+    async fn revoke(&self, id: Uuid, doc_id: Uuid) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE share_tokens SET revoked_at = NOW() \
+             WHERE id = $1 AND doc_id = $2 AND revoked_at IS NULL",
         )
         .bind(id)
+        .bind(doc_id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 }
 
