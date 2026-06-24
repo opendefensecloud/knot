@@ -172,6 +172,7 @@ impl AppState {
         Some(SessionDeps {
             sessions: self.sessions.clone()?,
             workspaces: self.workspaces.clone()?,
+            session_key: self.session_key.clone(),
         })
     }
 }

@@ -147,6 +147,77 @@ async fn login_wrong_password_returns_401() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn session_hmac_round_trip_and_store_does_not_hold_raw_token() {
+    // After login the session cookie holds the raw token, but the store
+    // persists HMAC(session_key, token). A raw-token lookup must return None
+    // while the cookie still authenticates (the loader hashes before lookup).
+    let (state, _) = state_with_seeded_user("hmac@example.com", "hmacpass1").await;
+    let app = router_with_state(state.clone());
+
+    // Login → get sid cookie.
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"email": "hmac@example.com", "password": "hmacpass1"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+
+    let cookies: Vec<String> = r
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    let sid_kv = cookies
+        .iter()
+        .find(|c| c.starts_with("sid="))
+        .expect("sid cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Cookie still authenticates (create and find_active both hash the token).
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/session")
+                .header("cookie", &sid_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "cookie must authenticate");
+
+    // The raw token (without HMAC) must NOT be in the store.
+    let raw_val = sid_kv.trim_start_matches("sid=");
+    let raw_decoded = knot_auth::SessionToken::decode(raw_val).expect("decode");
+    let found_raw = state
+        .sessions
+        .as_ref()
+        .unwrap()
+        .find_active(raw_decoded.as_bytes())
+        .await
+        .unwrap();
+    assert!(
+        found_raw.is_none(),
+        "raw token must not be stored; only the HMAC is"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unauth_session_returns_401() {
     let (state, _) = state_with_seeded_user("alice@example.com", "hunter22").await;
     let app = router_with_state(state);

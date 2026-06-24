@@ -127,9 +127,10 @@ async fn login(State(state): State<AppState>, req: Request<Body>) -> Response {
 
     let token = SessionToken::generate();
     let exp = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
+    let sid_hash = knot_auth::csrf::hash_session_id(&state.session_key, token.as_bytes());
     if let Err(e) = sessions
         .create(
-            token.as_bytes(),
+            &sid_hash,
             user.id,
             ws.id,
             exp,
@@ -153,7 +154,8 @@ async fn logout(State(state): State<AppState>, req: Request<Body>) -> Response {
         && let Ok(token) = SessionToken::decode(&sid)
         && let Some(sessions) = state.sessions.clone()
     {
-        let _ = sessions.delete(token.as_bytes()).await;
+        let hash = knot_auth::csrf::hash_session_id(&state.session_key, token.as_bytes());
+        let _ = sessions.delete(&hash).await;
     }
     let (sid_clear, csrf_clear) = build_clear_cookies();
     let mut resp = StatusCode::NO_CONTENT.into_response();
