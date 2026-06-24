@@ -1,4 +1,4 @@
-//! Integration tests for HTTP hardening: blob nosniff/attachment headers.
+//! Integration tests for HTTP hardening: blob nosniff/attachment headers + security headers.
 
 use std::sync::Arc;
 
@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
-use knot_server::{AppState, router_with_state};
+use knot_server::{AppState, router_with_state, security_headers::CSP};
 use knot_storage::WorkspaceRole;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -198,6 +198,38 @@ async fn svg_blob_is_served_as_attachment_with_nosniff() {
     assert_eq!(
         r.headers()[header::CONTENT_DISPOSITION].to_str().unwrap(),
         "attachment"
+    );
+}
+
+/// GET /api/healthz (no auth) must carry the full suite of security headers.
+#[tokio::test(flavor = "multi_thread")]
+async fn security_headers_are_present_on_healthz() {
+    let (state, _ws, _doc, _u) = state_with_seeded(WorkspaceRole::Owner).await;
+    let app = router_with_state(state);
+
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        r.headers()["content-security-policy"].to_str().unwrap(),
+        CSP,
+    );
+    assert_eq!(
+        r.headers()[header::X_CONTENT_TYPE_OPTIONS].to_str().unwrap(),
+        "nosniff",
+    );
+    assert_eq!(
+        r.headers()[header::X_FRAME_OPTIONS].to_str().unwrap(),
+        "DENY",
     );
 }
 

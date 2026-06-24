@@ -34,6 +34,7 @@ pub mod protocol;
 pub mod reindex;
 pub mod room;
 pub mod routes;
+pub mod security_headers;
 
 use auth::SessionDeps;
 
@@ -187,14 +188,25 @@ pub fn router_with_state(state: AppState) -> Router {
         .append_index_html_on_directories(true)
         .not_found_service(ServeFile::new(&index_path));
 
-    let mut r = Router::new()
+    // WS routes: NO timeout / body-limit (long-lived, streamed).
+    let collab = Router::new()
         .route("/collab/doc/:doc_id", get(collab_upgrade))
-        .route("/collab/board/:board_id", get(collab_board_upgrade))
+        .route("/collab/board/:board_id", get(collab_board_upgrade));
+
+    // Everything else: request timeout + body-size limit.
+    let api_and_pages = Router::new()
         .merge(routes::health::router())
         .merge(routes::auth::router())
         .merge(routes::public::router())
         .merge(routes::api::router(state.clone()))
-        .fallback_service(spa);
+        .fallback_service(spa)
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(30),
+        ));
+
+    let mut r = collab.merge(api_and_pages);
 
     if let Some(deps) = state.session_deps() {
         r = r.layer(axum::middleware::from_fn_with_state(
@@ -203,9 +215,13 @@ pub fn router_with_state(state: AppState) -> Router {
         ));
     }
 
-    r.layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(axum::middleware::from_fn(crate::metrics::record))
-        .with_state(state)
+    r.layer(axum::middleware::from_fn_with_state(
+        state.cookie_secure,
+        crate::security_headers::set_security_headers,
+    ))
+    .layer(tower_http::trace::TraceLayer::new_for_http())
+    .layer(axum::middleware::from_fn(crate::metrics::record))
+    .with_state(state)
 }
 
 #[tracing::instrument(skip_all, name = "collab.upgrade", fields(doc_id = %doc_id))]
