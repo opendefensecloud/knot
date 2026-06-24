@@ -214,8 +214,7 @@ impl Config {
             ));
         }
         // A short signing key trivially weakens CSRF/session HMACs. Enforce a
-        // 32-byte floor whenever a key is set (empty is allowed only outside
-        // production, handled above).
+        // 32-byte floor (the empty case is already rejected above, in all envs).
         if !self.session_key.is_empty() && self.session_key.len() < 32 {
             return Err(ConfigError::Invalid(format!(
                 "KNOT_SESSION_KEY must be at least 32 bytes (got {})",

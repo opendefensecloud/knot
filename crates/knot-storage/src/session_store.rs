@@ -27,7 +27,8 @@ pub enum SessionStoreError {
 
 #[async_trait]
 pub trait SessionStore: Send + Sync + 'static {
-    /// Create a new session. `id` is the raw 32-byte token bytes.
+    /// Create a new session. `id` is the at-rest session key — the auth layer
+    /// passes the keyed HMAC of the cookie token, not the raw token.
     async fn create(
         &self,
         id: &[u8],
