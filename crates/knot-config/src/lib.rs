@@ -61,6 +61,9 @@ pub struct Config {
     pub env: String,
     /// External base URL (used for OIDC redirect URLs, links, etc.).
     pub base_url: String,
+    /// Set the `Secure` flag on auth cookies and emit HSTS. Default true;
+    /// dev sets KNOT_COOKIE_SECURE=false to allow plain-HTTP localhost.
+    pub cookie_secure: bool,
     /// Postgres connection string.
     pub database_url: String,
     /// Max Postgres connections in the pool, per replica. Budget against the
@@ -139,6 +142,7 @@ impl Default for Config {
             addr: ":3000".into(),
             env: "development".into(),
             base_url: "http://localhost:3000".into(),
+            cookie_secure: true,
             database_url: String::new(),
             db_max_connections: 16,
             session_key: String::new(),
@@ -301,5 +305,25 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cookie_secure_defaults_true() {
+        let cfg = Config::default();
+        assert!(cfg.cookie_secure);
+    }
+
+    #[test]
+    fn cookie_secure_env_false_parses_to_false() {
+        // SAFETY: single-threaded test; no concurrent env reads.
+        unsafe {
+            std::env::set_var("KNOT_COOKIE_SECURE", "false");
+        }
+        let cfg = Config::load(None::<&str>).expect("load");
+        assert!(!cfg.cookie_secure);
+        // SAFETY: same as above.
+        unsafe {
+            std::env::remove_var("KNOT_COOKIE_SECURE");
+        }
     }
 }

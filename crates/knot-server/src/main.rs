@@ -205,6 +205,7 @@ async fn run_server(cfg: Config) {
             let mut s = knot_server::AppState::with_pool(p);
             s.session_key = cfg.session_key.clone().into_bytes();
             s.base_url = cfg.base_url.clone();
+            s.cookie_secure = cfg.cookie_secure;
             s.oidc_enabled = cfg.oidc_enabled;
             s.oidc = oidc;
             s.config = cfg.clone();
