@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 
 import { authApi } from "../auth/session.api";
 import { docsApi } from "../features/docs/docs.api";
@@ -34,6 +34,8 @@ export function CommandPalette() {
   const close = useUi((s) => s.closePalette);
   const togglePalette = useUi((s) => s.togglePalette);
   const nav = useNavigate();
+  const loc = useLocation();
+  const activeDocId = loc.pathname.match(/^\/doc\/([^/]+)/)?.[1];
   const qc = useQueryClient();
   const [q, setQ] = useState("");
   const [cursor, setCursor] = useState(0);
@@ -119,7 +121,9 @@ export function CommandPalette() {
         label: "Create new document",
         kind: "action",
         run: async () => {
-          const r = await docsApi.create({ title: "Untitled" });
+          const r = await docsApi.create(
+            activeDocId ? { title: "Untitled", parent_id: activeDocId } : { title: "Untitled" },
+          );
           close();
           if ("error" in r) return;
           const created = r.ok as { id: string };
@@ -152,7 +156,7 @@ export function CommandPalette() {
       },
     ];
     return [...docActions, ...navActions];
-  }, [visibleHits, close, nav, qc]);
+  }, [visibleHits, close, nav, qc, activeDocId]);
 
   // Filter static nav/action items by query substring; doc hits come from the server.
   const filtered = useMemo(() => {
