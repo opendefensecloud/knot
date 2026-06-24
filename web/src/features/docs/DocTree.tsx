@@ -40,6 +40,7 @@ import { type ApiError } from "../../lib/api";
 import { WorkspaceHeader } from "../workspace/WorkspaceHeader";
 import { docsApi } from "./docs.api";
 import { markDocEditMode } from "./editMode";
+import { placementParent, type Placement } from "./placement";
 import { buildTree, applyOptimisticMove, descendantIds, dropIntent, moveArgs, type TreeNode } from "./tree";
 
 export function DocTree() {
@@ -185,13 +186,21 @@ export function DocTree() {
       {pickerOpen && (
         <NewDocPicker
           onClose={() => setPickerOpen(false)}
-          onPickBlank={() => {
+          current={(() => {
+            const docs = list.data && "ok" in list.data ? list.data.ok : [];
+            const c = activeId ? docs.find((d) => d.id === activeId) : undefined;
+            return c ? { id: c.id, parent_id: c.parent_id, title: c.title } : null;
+          })()}
+          onPickBlank={(parentId) => {
             setPickerOpen(false);
-            create.mutate(undefined);
+            create.mutate(parentId ?? undefined);
           }}
-          onPickTemplate={async (templateId, title) => {
+          onPickTemplate={async (templateId, title, parentId) => {
             setPickerOpen(false);
-            const r = await docsApi.createFromTemplate(templateId, { title });
+            const r = await docsApi.createFromTemplate(templateId, {
+              title,
+              ...(parentId ? { parent_id: parentId } : {}),
+            });
             if ("error" in r) {
               notify("error", "Couldn't create from template");
               return;
@@ -208,15 +217,19 @@ export function DocTree() {
 }
 
 /** Modal for "New document": choose Blank or one of the workspace templates. */
-function NewDocPicker({
+export function NewDocPicker({
   onClose,
   onPickBlank,
   onPickTemplate,
+  current,
 }: {
   onClose: () => void;
-  onPickBlank: () => void;
-  onPickTemplate: (templateId: string, title: string) => void;
+  onPickBlank: (parentId: string | null) => void;
+  onPickTemplate: (templateId: string, title: string, parentId: string | null) => void;
+  current: { id: string; parent_id: string | null; title: string } | null;
 }) {
+  const [placement, setPlacement] = useState<Placement>("nested");
+  const parentId = placementParent(placement, current);
   const templates = useQuery({
     queryKey: ["templates"],
     queryFn: () => docsApi.listTemplates(),
@@ -246,10 +259,37 @@ function NewDocPicker({
           </button>
         </div>
         <div className="p-3 max-h-[60vh] overflow-auto">
+          {current && (
+            <fieldset className="mb-3 rounded border border-border p-2">
+              <legend className="px-1 text-[11px] font-semibold uppercase tracking-wider text-fg-muted">
+                Location
+              </legend>
+              <label className="flex items-center gap-2 py-1 text-sm text-fg cursor-pointer">
+                <input
+                  type="radio"
+                  name="new-doc-location"
+                  data-testid="new-doc-loc-nested"
+                  checked={placement === "nested"}
+                  onChange={() => setPlacement("nested")}
+                />
+                <span className="truncate">Nested under &quot;{current.title}&quot;</span>
+              </label>
+              <label className="flex items-center gap-2 py-1 text-sm text-fg cursor-pointer">
+                <input
+                  type="radio"
+                  name="new-doc-location"
+                  data-testid="new-doc-loc-sibling"
+                  checked={placement === "sibling"}
+                  onChange={() => setPlacement("sibling")}
+                />
+                <span className="truncate">Same level as &quot;{current.title}&quot;</span>
+              </label>
+            </fieldset>
+          )}
           <button
             type="button"
             data-testid="new-doc-blank"
-            onClick={onPickBlank}
+            onClick={() => onPickBlank(parentId)}
             className="w-full flex items-center gap-3 rounded border border-border bg-bg p-3 text-left hover:bg-muted transition-colors"
           >
             <FilePlus size={20} className="text-fg-muted shrink-0" aria-hidden />
@@ -274,7 +314,7 @@ function NewDocPicker({
                     <button
                       type="button"
                       data-testid={`template-card-${t.id}`}
-                      onClick={() => onPickTemplate(t.id, t.title)}
+                      onClick={() => onPickTemplate(t.id, t.title, parentId)}
                       className="w-full h-full flex flex-col items-start gap-1 rounded border border-border bg-bg p-3 text-left hover:bg-muted transition-colors"
                     >
                       <LayoutTemplate size={16} className="text-fg-muted" aria-hidden />
