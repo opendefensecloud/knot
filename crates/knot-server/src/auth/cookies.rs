@@ -29,11 +29,11 @@ pub fn find_cookie(req: &Request<Body>, name: &str) -> Option<String> {
     None
 }
 
-/// Build the two Set-Cookie strings: (sid, csrf). `secure` derived from
-/// AppState::base_url (https → Secure flag).
+/// Build the two Set-Cookie strings: (sid, csrf). The `Secure` flag comes from
+/// `AppState::cookie_secure` (config `KNOT_COOKIE_SECURE`, default true; dev
+/// sets false for plain-HTTP localhost).
 pub fn build_session_cookies(state: &AppState, token: &SessionToken) -> (String, String) {
-    let secure = state.base_url.starts_with("https://");
-    let sec = if secure { "; Secure" } else { "" };
+    let sec = if state.cookie_secure { "; Secure" } else { "" };
     let sid = format!(
         "{SID_COOKIE}={}; HttpOnly; SameSite=Lax; Path=/{sec}",
         token.encode()
@@ -65,8 +65,7 @@ pub const OIDC_FLOW_TTL_SEC: i64 = 300;
 /// containing state/nonce/pkce). Short-lived (5 min) cookie scoped to the
 /// callback path.
 pub fn build_flow_cookie(state: &AppState, encoded_payload: &str) -> String {
-    let secure = state.base_url.starts_with("https://");
-    let sec = if secure { "; Secure" } else { "" };
+    let sec = if state.cookie_secure { "; Secure" } else { "" };
     format!(
         "{OIDC_FLOW_COOKIE}={encoded_payload}; HttpOnly; SameSite=Lax; Path=/; Max-Age={OIDC_FLOW_TTL_SEC}{sec}"
     )

@@ -205,6 +205,14 @@ impl Config {
                 "KNOT_SESSION_KEY is required when KNOT_ENV=production".into(),
             ));
         }
+        // Cookies must carry the Secure flag in production (the .env.example
+        // ships KNOT_COOKIE_SECURE=false for plain-HTTP dev; copying it to prod
+        // would silently downgrade session cookies).
+        if self.env == "production" && !self.cookie_secure {
+            return Err(ConfigError::Invalid(
+                "KNOT_COOKIE_SECURE must be true when KNOT_ENV=production".into(),
+            ));
+        }
         // A short signing key trivially weakens CSRF/session HMACs. Enforce a
         // 32-byte floor whenever a key is set (empty is allowed only outside
         // production, handled above).
@@ -305,6 +313,28 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn insecure_cookies_rejected_in_production() {
+        let cfg = Config {
+            env: "production".into(),
+            session_key: "0123456789abcdef0123456789abcdef".into(),
+            cookie_secure: false,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn secure_cookies_accepted_in_production() {
+        let cfg = Config {
+            env: "production".into(),
+            session_key: "0123456789abcdef0123456789abcdef".into(),
+            cookie_secure: true,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
