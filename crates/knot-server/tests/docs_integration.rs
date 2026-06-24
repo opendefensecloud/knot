@@ -218,3 +218,80 @@ async fn move_with_unknown_anchor_falls_to_end() {
         "with unknown after_id, doc A should land at the end (key {moved_key} > C's key {c_key})",
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn move_cycle_returns_409() {
+    // Create doc A (top-level), then doc B as a child of A.
+    // Attempting to move A under B (its own descendant) must return
+    // 409 with error code `doc.move_cycle`.
+    let (state, joined) = login_state("cycle@x.test", "hunter22").await;
+    let (cookie, csrf) = split_cookie_csrf(&joined);
+    let app = router_with_state(state);
+
+    // Helper: create a doc and return its full JSON value.
+    async fn create_doc_json(
+        app: &axum::Router,
+        cookie: &str,
+        csrf: &str,
+        title: &str,
+        parent_id: Option<&str>,
+    ) -> serde_json::Value {
+        let body = match parent_id {
+            Some(pid) => serde_json::json!({ "title": title, "parent_id": pid }),
+            None => serde_json::json!({ "title": title }),
+        };
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/docs")
+                    .header("cookie", cookie)
+                    .header("x-csrf-token", csrf)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED, "create {title}");
+        let b = r.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&b).unwrap()
+    }
+
+    let a = create_doc_json(&app, cookie, csrf, "A", None).await;
+    let a_id = a["id"].as_str().unwrap();
+
+    let b = create_doc_json(&app, cookie, csrf, "B", Some(a_id)).await;
+    let b_id = b["id"].as_str().unwrap();
+
+    // Try to move A under B — this would create a cycle (A → B → A).
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/docs/{a_id}/move"))
+                .header("cookie", cookie)
+                .header("x-csrf-token", csrf)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "parent_id": b_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        r.status(),
+        StatusCode::CONFLICT,
+        "moving a doc under its own descendant must return 409"
+    );
+    let body = r.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["error"]["code"], "doc.move_cycle",
+        "error code must be doc.move_cycle, got: {v}"
+    );
+}

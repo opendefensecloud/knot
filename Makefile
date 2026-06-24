@@ -164,6 +164,18 @@ migrate.info: ## show migration status
 	DATABASE_URL=$${DATABASE_URL:-postgres://knot:knot@localhost:5432/knot} \
 		sqlx migrate info --source migrations
 
+.PHONY: coverage.rust
+coverage.rust: ## Rust line coverage summary (needs: cargo install cargo-llvm-cov)
+	$(CARGO) llvm-cov --workspace --all-features --summary-only
+
+.PHONY: coverage.web
+coverage.web: web/node_modules ## frontend line coverage (needs: @vitest/coverage-v8 in web devDeps)
+	cd web && $(PNPM) test -- --coverage
+
+.PHONY: audit.web
+audit.web: ## frontend dependency audit (production deps only)
+	cd web && $(PNPM) audit --prod
+
 .PHONY: migrate.create
 migrate.create: ## scaffold migrations/<ts>_<NAME>.sql; usage: make migrate.create NAME=add_foo
 	@if [ -z "$(NAME)" ]; then \
