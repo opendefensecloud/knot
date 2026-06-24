@@ -297,6 +297,30 @@ async fn change_password(State(state): State<AppState>, req: Request<Body>) -> R
         return internal();
     }
 
+    // Kill every existing session for this user (logs out other devices and
+    // any stolen cookie), then mint a fresh session for the current request.
+    if let Some(sessions) = state.sessions.clone() {
+        if let Err(e) = sessions.delete_for_user(ctx.user_id).await {
+            tracing::error!(error=?e, "change_password: delete_for_user");
+            return internal();
+        }
+        let token = SessionToken::generate();
+        let exp = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
+        let sid_hash = knot_auth::csrf::hash_session_id(&state.session_key, token.as_bytes());
+        if let Err(e) = sessions
+            .create(&sid_hash, ctx.user_id, ctx.workspace_id, exp, None, None)
+            .await
+        {
+            tracing::error!(error=?e, "change_password: re-create session");
+            return internal();
+        }
+        state.throttle.reset(&ip_key);
+        state.throttle.reset(&user_key);
+        let (sid, csrf) = build_session_cookies(&state, &token);
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        append_session_cookies(&mut resp, &sid, &csrf);
+        return resp;
+    }
     state.throttle.reset(&ip_key);
     state.throttle.reset(&user_key);
     StatusCode::NO_CONTENT.into_response()

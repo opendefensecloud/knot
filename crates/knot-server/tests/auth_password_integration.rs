@@ -282,6 +282,81 @@ async fn unauthenticated_returns_401_session_required() {
 }
 
 // ---------------------------------------------------------------------------
+// 7. Password change invalidates old session; new sid cookie authenticates
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread")]
+async fn password_change_invalidates_old_session_and_mints_new_one() {
+    let (state, _) = state_with_seeded_user("heidi@example.com", "heidipass1").await;
+    let app = router_with_state(state);
+
+    // 1. Login → sid_a.
+    let (_, sid_a, csrf_val) = login(app.clone(), "heidi@example.com", "heidipass1").await;
+
+    // 2. Change password; capture the new Set-Cookie headers.
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/password")
+                .header("content-type", "application/json")
+                .header("cookie", format!("{sid_a}; csrf={csrf_val}"))
+                .header("x-csrf-token", &csrf_val)
+                .body(Body::from(
+                    serde_json::json!({"current": "heidipass1", "new": "heidipass99"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT, "change_password should succeed");
+
+    let new_cookies: Vec<String> = r
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+
+    let sid_b = new_cookies
+        .iter()
+        .find(|c| c.starts_with("sid="))
+        .expect("new sid cookie must be set after password change")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // 3. Old session (sid_a) must be rejected.
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/session")
+                .header("cookie", &sid_a)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "old session must be invalid");
+
+    // 4. New session (sid_b) must be accepted.
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/session")
+                .header("cookie", &sid_b)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "new session must be valid");
+}
+
+// ---------------------------------------------------------------------------
 // 6. Throttle — 5 wrong-current attempts fill the bucket, 6th returns 429
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread")]
