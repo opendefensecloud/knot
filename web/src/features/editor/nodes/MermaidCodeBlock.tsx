@@ -8,6 +8,8 @@ import {
 import { Eye, Pencil } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 
+import { sanitizeSvg } from "../../../lib/sanitize";
+
 /**
  * MermaidCodeBlock — replaces StarterKit's `codeBlock` with one that adds
  * a React NodeView. When the block's language is "mermaid" the NodeView
@@ -193,7 +195,7 @@ function MermaidPreview(props: ReactNodeViewProps) {
             <div
               data-testid="mermaid-svg"
               className="flex justify-center [&_svg]:max-w-full [&_svg]:h-auto"
-              dangerouslySetInnerHTML={{ __html: svg }}
+              dangerouslySetInnerHTML={{ __html: sanitizeSvg(svg) }}
             />
           ) : (
             <div className="text-fg-muted text-[12px] italic">Empty diagram.</div>

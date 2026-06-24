@@ -82,6 +82,16 @@ async function importLibrary(
 ): Promise<void> {
   try {
     const target = new URL(libraryUrl);
+    // Only fetch from the official Excalidraw library host to prevent
+    // SSRF-style abuse where a crafted postMessage redirects the fetch
+    // to an attacker-controlled endpoint.
+    if (target.host !== "libraries.excalidraw.com") {
+      console.warn(
+        "importLibrary: rejected URL from untrusted host:",
+        target.host,
+      );
+      return;
+    }
     // libraries.excalidraw.com expects the token forwarded when fetching
     // private/in-review libraries; harmless for public ones.
     if (token) target.searchParams.set("token", token);
