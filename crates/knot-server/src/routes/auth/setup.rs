@@ -118,11 +118,13 @@ async fn setup(State(state): State<AppState>, Json(req): Json<SetupRequest>) -> 
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "");
     }
 
-    // Mint session.
+    // Mint session. The cookie carries the raw token; the store keeps only the
+    // keyed HMAC (see session_loader), so create must hash exactly like login.
     let token = SessionToken::generate();
     let exp = Utc::now() + chrono::Duration::from_std(crate::auth::cookies::SESSION_TTL).unwrap();
+    let sid_hash = knot_auth::csrf::hash_session_id(&state.session_key, token.as_bytes());
     if let Err(e) = sessions
-        .create(token.as_bytes(), user.id, ws.id, exp, None, None)
+        .create(&sid_hash, user.id, ws.id, exp, None, None)
         .await
     {
         tracing::error!(error=?e, "create session");

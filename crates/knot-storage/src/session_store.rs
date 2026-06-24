@@ -27,7 +27,8 @@ pub enum SessionStoreError {
 
 #[async_trait]
 pub trait SessionStore: Send + Sync + 'static {
-    /// Create a new session. `id` is the raw 32-byte token bytes.
+    /// Create a new session. `id` is the at-rest session key — the auth layer
+    /// passes the keyed HMAC of the cookie token, not the raw token.
     async fn create(
         &self,
         id: &[u8],
@@ -46,6 +47,9 @@ pub trait SessionStore: Send + Sync + 'static {
 
     /// Delete a session row.
     async fn delete(&self, id: &[u8]) -> Result<(), SessionStoreError>;
+
+    /// Delete every session belonging to a user (e.g. on password change).
+    async fn delete_for_user(&self, user_id: Uuid) -> Result<(), SessionStoreError>;
 }
 
 #[derive(Clone)]
@@ -135,6 +139,14 @@ impl SessionStore for PgSessionStore {
     async fn delete(&self, id: &[u8]) -> Result<(), SessionStoreError> {
         sqlx::query("DELETE FROM sessions WHERE id = $1")
             .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_for_user(&self, user_id: Uuid) -> Result<(), SessionStoreError> {
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(user_id)
             .execute(&self.pool)
             .await?;
         Ok(())

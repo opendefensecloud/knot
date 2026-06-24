@@ -75,6 +75,59 @@ async fn setup_first_user_then_closes() {
     assert_eq!(v["error"]["code"], "auth.setup_closed");
 }
 
+/// Regression: the session cookie minted by /auth/setup must actually
+/// authenticate. (The at-rest session id is a keyed HMAC of the token; setup
+/// must hash on create exactly like login, or the first admin session is dead
+/// on arrival.)
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_session_cookie_authenticates() {
+    let state = fresh_state().await;
+    let app = router_with_state(state);
+
+    let body = serde_json::json!({
+        "email": "admin@example.com",
+        "password": "hunter2!hunter2",
+        "display_name": "Admin",
+    })
+    .to_string();
+
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/setup")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let sid = r
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .find(|c| c.starts_with("sid="))
+        .and_then(|c| c.split(';').next().map(str::to_string))
+        .expect("sid cookie");
+
+    // Replay the cookie against an authenticated endpoint.
+    let r2 = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/auth/session")
+                .header("cookie", sid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK, "setup session cookie must authenticate");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn setup_rejects_short_password() {
     let state = fresh_state().await;

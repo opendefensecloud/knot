@@ -200,9 +200,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.env == "production" && self.session_key.is_empty() {
+        if self.session_key.is_empty() {
             return Err(ConfigError::Invalid(
-                "KNOT_SESSION_KEY is required when KNOT_ENV=production".into(),
+                "KNOT_SESSION_KEY is required (set it in every environment)".into(),
             ));
         }
         // Cookies must carry the Secure flag in production (the .env.example
@@ -214,8 +214,7 @@ impl Config {
             ));
         }
         // A short signing key trivially weakens CSRF/session HMACs. Enforce a
-        // 32-byte floor whenever a key is set (empty is allowed only outside
-        // production, handled above).
+        // 32-byte floor (the empty case is already rejected above, in all envs).
         if !self.session_key.is_empty() && self.session_key.len() < 32 {
             return Err(ConfigError::Invalid(format!(
                 "KNOT_SESSION_KEY must be at least 32 bytes (got {})",
@@ -283,8 +282,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_is_valid() {
-        assert!(Config::default().validate().is_ok());
+    fn default_config_without_session_key_is_invalid() {
+        // Config::default() has an empty session_key — must be rejected in all envs.
+        assert!(Config::default().validate().is_err());
+    }
+
+    #[test]
+    fn empty_session_key_is_rejected_in_development() {
+        let cfg = Config {
+            env: "development".into(),
+            session_key: String::new(),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn valid_session_key_is_accepted_in_development() {
+        let cfg = Config {
+            env: "development".into(),
+            session_key: "0123456789abcdef0123456789abcdef".into(),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -348,12 +368,17 @@ mod tests {
         // SAFETY: single-threaded test; no concurrent env reads.
         unsafe {
             std::env::set_var("KNOT_COOKIE_SECURE", "false");
+            std::env::set_var(
+                "KNOT_SESSION_KEY",
+                "0123456789abcdef0123456789abcdef",
+            );
         }
         let cfg = Config::load(None::<&str>).expect("load");
         assert!(!cfg.cookie_secure);
         // SAFETY: same as above.
         unsafe {
             std::env::remove_var("KNOT_COOKIE_SECURE");
+            std::env::remove_var("KNOT_SESSION_KEY");
         }
     }
 }

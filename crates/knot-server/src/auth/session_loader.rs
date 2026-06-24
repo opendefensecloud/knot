@@ -16,6 +16,7 @@ pub use crate::auth::cookies::SID_COOKIE;
 pub struct SessionDeps {
     pub sessions: Arc<dyn SessionStore>,
     pub workspaces: Arc<dyn WorkspaceStore>,
+    pub session_key: Vec<u8>,
 }
 
 pub async fn session_loader_mw(
@@ -25,25 +26,27 @@ pub async fn session_loader_mw(
 ) -> Response {
     if let Some(token) = crate::auth::cookies::find_cookie(&req, SID_COOKIE)
         && let Ok(decoded) = SessionToken::decode(&token)
-        && let Ok(Some(s)) = deps.sessions.find_active(decoded.as_bytes()).await
-        && let Ok(Some(role)) = deps
-            .workspaces
-            .get_member_role(s.workspace_id, s.user_id)
-            .await
     {
-        req.extensions_mut().insert(AuthContext {
-            user_id: s.user_id,
-            workspace_id: s.workspace_id,
-            role,
-        });
-        // Fire-and-forget touch.
-        let sessions = deps.sessions.clone();
-        let id = s.id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = sessions.touch(&id).await {
-                tracing::warn!(error=?e, "session touch failed");
-            }
-        });
+        let id = knot_auth::csrf::hash_session_id(&deps.session_key, decoded.as_bytes());
+        if let Ok(Some(s)) = deps.sessions.find_active(&id).await
+            && let Ok(Some(role)) = deps
+                .workspaces
+                .get_member_role(s.workspace_id, s.user_id)
+                .await
+        {
+            req.extensions_mut().insert(AuthContext {
+                user_id: s.user_id,
+                workspace_id: s.workspace_id,
+                role,
+            });
+            // Fire-and-forget touch (using the hashed id).
+            let sessions = deps.sessions.clone();
+            tokio::spawn(async move {
+                if let Err(e) = sessions.touch(&id).await {
+                    tracing::warn!(error=?e, "session touch failed");
+                }
+            });
+        }
     }
     next.run(req).await
 }

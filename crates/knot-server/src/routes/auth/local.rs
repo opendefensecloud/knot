@@ -37,6 +37,13 @@ struct SessionResponse {
     role: String,
 }
 
+/// A fixed Argon2 hash so login runs the (expensive) verify even when the user
+/// is absent or has no password, removing the existing-user timing oracle.
+fn timing_dummy_hash(hasher: &knot_auth::Hasher) -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| hasher.hash("knot-timing-dummy").unwrap_or_default())
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/auth/login", post(login))
@@ -92,6 +99,9 @@ async fn login(State(state): State<AppState>, req: Request<Body>) -> Response {
         Ok(None) => {
             state.throttle.record_failure(&ip_key);
             state.throttle.record_failure(&email_key);
+            let _ = state
+                .hasher
+                .verify(timing_dummy_hash(&state.hasher), &body.password);
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             return invalid_credentials();
         }
@@ -102,6 +112,9 @@ async fn login(State(state): State<AppState>, req: Request<Body>) -> Response {
     };
     let Some(hash) = user.password_hash.as_deref() else {
         state.throttle.record_failure(&email_key);
+        let _ = state
+            .hasher
+            .verify(timing_dummy_hash(&state.hasher), &body.password);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         return invalid_credentials();
     };
@@ -127,9 +140,10 @@ async fn login(State(state): State<AppState>, req: Request<Body>) -> Response {
 
     let token = SessionToken::generate();
     let exp = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
+    let sid_hash = knot_auth::csrf::hash_session_id(&state.session_key, token.as_bytes());
     if let Err(e) = sessions
         .create(
-            token.as_bytes(),
+            &sid_hash,
             user.id,
             ws.id,
             exp,
@@ -153,7 +167,8 @@ async fn logout(State(state): State<AppState>, req: Request<Body>) -> Response {
         && let Ok(token) = SessionToken::decode(&sid)
         && let Some(sessions) = state.sessions.clone()
     {
-        let _ = sessions.delete(token.as_bytes()).await;
+        let hash = knot_auth::csrf::hash_session_id(&state.session_key, token.as_bytes());
+        let _ = sessions.delete(&hash).await;
     }
     let (sid_clear, csrf_clear) = build_clear_cookies();
     let mut resp = StatusCode::NO_CONTENT.into_response();
@@ -295,6 +310,30 @@ async fn change_password(State(state): State<AppState>, req: Request<Body>) -> R
         return internal();
     }
 
+    // Kill every existing session for this user (logs out other devices and
+    // any stolen cookie), then mint a fresh session for the current request.
+    if let Some(sessions) = state.sessions.clone() {
+        if let Err(e) = sessions.delete_for_user(ctx.user_id).await {
+            tracing::error!(error=?e, "change_password: delete_for_user");
+            return internal();
+        }
+        let token = SessionToken::generate();
+        let exp = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
+        let sid_hash = knot_auth::csrf::hash_session_id(&state.session_key, token.as_bytes());
+        if let Err(e) = sessions
+            .create(&sid_hash, ctx.user_id, ctx.workspace_id, exp, None, None)
+            .await
+        {
+            tracing::error!(error=?e, "change_password: re-create session");
+            return internal();
+        }
+        state.throttle.reset(&ip_key);
+        state.throttle.reset(&user_key);
+        let (sid, csrf) = build_session_cookies(&state, &token);
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        append_session_cookies(&mut resp, &sid, &csrf);
+        return resp;
+    }
     state.throttle.reset(&ip_key);
     state.throttle.reset(&user_key);
     StatusCode::NO_CONTENT.into_response()

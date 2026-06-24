@@ -9,7 +9,8 @@ use knot_config::Config;
 
 #[test]
 fn defaults_when_no_env_no_file() {
-    figment::Jail::expect_with(|_jail| {
+    figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
         let cfg = Config::load::<&str>(None).expect("load");
         assert_eq!(cfg.addr, ":3000");
         assert_eq!(cfg.env, "development");
@@ -23,6 +24,7 @@ fn defaults_when_no_env_no_file() {
 #[test]
 fn env_overrides_defaults() {
     figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
         jail.set_env("KNOT_ADDR", ":9999");
         jail.set_env("KNOT_DATABASE_URL", "postgres://x:y@h/d");
         jail.set_env("KNOT_LOG_LEVEL", "debug");
@@ -37,6 +39,7 @@ fn env_overrides_defaults() {
 #[test]
 fn file_overrides_defaults_env_overrides_file() {
     figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
         jail.create_file(
             "config.yaml",
             r#"
@@ -75,6 +78,7 @@ fn refuses_empty_session_key_in_production() {
 #[test]
 fn oidc_fields_have_defaults_and_env_overrides() {
     figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
         let cfg = Config::load::<&str>(None).expect("load");
         assert!(!cfg.oidc_enabled);
         assert_eq!(cfg.oidc_auto_provision, "off");
@@ -113,6 +117,7 @@ fn oidc_fields_have_defaults_and_env_overrides() {
 #[test]
 fn oidc_enabled_requires_issuer_client_redirect() {
     figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
         jail.set_env("KNOT_OIDC_ENABLED", "true");
         // No issuer, client_id, redirect.
         let err = Config::load::<&str>(None).expect_err("must fail validation");
@@ -124,6 +129,7 @@ fn oidc_enabled_requires_issuer_client_redirect() {
 #[test]
 fn oidc_auto_provision_must_be_known_policy() {
     figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
         jail.set_env("KNOT_OIDC_AUTO_PROVISION", "bogus");
         let err = Config::load::<&str>(None).expect_err("must fail");
         assert!(err.to_string().contains("auto_provision"), "got: {err}");
@@ -138,6 +144,7 @@ fn oidc_client_id_accepts_numeric_value() {
     // still accept them rather than failing with "invalid type: found unsigned
     // int ..., expected a string".
     figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
         jail.set_env("KNOT_OIDC_ENABLED", "true");
         jail.set_env("KNOT_OIDC_ISSUER", "https://zitadel.example.com");
         jail.set_env("KNOT_OIDC_CLIENT_ID", "378364338165023482");
@@ -157,6 +164,7 @@ fn oidc_client_secret_accepts_numeric_value() {
     // Same class of bug as the client id: an all-digit client secret arrives
     // from figment's Env provider as an integer and must still load as a String.
     figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
         jail.set_env("KNOT_OIDC_ENABLED", "true");
         jail.set_env("KNOT_OIDC_ISSUER", "https://zitadel.example.com");
         jail.set_env("KNOT_OIDC_CLIENT_ID", "client-abc");
@@ -178,6 +186,7 @@ fn oidc_extra_audiences_default_empty_and_env_parsed() {
     // verifier trusts them. Comma-separated, surrounding whitespace ignored,
     // empties dropped.
     figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
         let cfg = Config::load::<&str>(None).expect("load");
         assert!(cfg.oidc_extra_audiences.is_empty());
         assert!(cfg.oidc_extra_audiences_list().is_empty());
@@ -204,6 +213,7 @@ fn oidc_extra_audiences_accepts_single_numeric_value() {
     // figment's Env provider as an integer and must still load as a String,
     // exactly like the numeric client id/secret above.
     figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
         jail.set_env("KNOT_OIDC_EXTRA_AUDIENCES", "366700366412350659");
         let cfg = Config::load::<&str>(None).expect("numeric extra audience must load");
         assert_eq!(cfg.oidc_extra_audiences, "366700366412350659");

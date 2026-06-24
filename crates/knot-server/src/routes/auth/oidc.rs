@@ -198,8 +198,11 @@ async fn callback(
 
     let token = SessionToken::generate();
     let exp = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
+    // Store the keyed HMAC, not the raw token (matches login/setup; the loader
+    // hashes the cookie token before lookup).
+    let sid_hash = knot_auth::csrf::hash_session_id(&state.session_key, token.as_bytes());
     if let Err(e) = sessions
-        .create(token.as_bytes(), user.id, ws.id, exp, None, None)
+        .create(&sid_hash, user.id, ws.id, exp, None, None)
         .await
     {
         tracing::error!(error=?e, "oidc create session");
