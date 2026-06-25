@@ -145,9 +145,11 @@ async function saveSvgSnapshot(
       appState: Record<string, unknown>;
       files: ReturnType<ExcalidrawImperativeAPI["getFiles"]>;
     }) => Promise<SVGSVGElement>;
-    const mod = (await import("@excalidraw/excalidraw")) as unknown as {
-      exportToSvg: ExportToSvg;
-    };
+    // Capture the scene SYNCHRONOUSLY before any await. On a draw →
+    // immediate-close, this runs inside the unmount cleanup; if we read the
+    // scene only after `await import(...)`, Excalidraw has already torn down
+    // and `getSceneElements()` returns [], so the snapshot PUT would be
+    // silently skipped and the inline preview would never refresh.
     const elements = api.getSceneElements();
     // Skip the PUT if there's nothing meaningful to render. `getSceneElements`
     // already filters out elements with `isDeleted: true`, so empty here
@@ -156,6 +158,9 @@ async function saveSvgSnapshot(
     if (elements.length === 0) return;
     const appState = api.getAppState();
     const files = api.getFiles();
+    const mod = (await import("@excalidraw/excalidraw")) as unknown as {
+      exportToSvg: ExportToSvg;
+    };
     const svg = await mod.exportToSvg({
       elements,
       appState: { ...appState, exportBackground: true },
@@ -222,6 +227,22 @@ export function ExcalidrawModal({
     }, 300);
   }, [boardId, qc]);
 
+  // Save the SVG snapshot while Excalidraw is STILL MOUNTED, then close.
+  // Reading the scene from the unmount cleanup is too late: React tears down
+  // the child <Excalidraw> before the parent's cleanup runs, so
+  // getSceneElements() returns [] and the snapshot is skipped. saveSvgSnapshot
+  // captures the scene synchronously, so the async SVG export can finish even
+  // as the modal unmounts. Invalidate the preview query once it lands.
+  const handleClose = useCallback(() => {
+    const api = apiRef.current;
+    if (api) {
+      void saveSvgSnapshot(api, boardId).then(() => {
+        void qc.invalidateQueries({ queryKey: ["board-svg", boardId] });
+      });
+    }
+    onClose();
+  }, [boardId, qc, onClose]);
+
   // Build Y.Doc + provider once. Save SVG on unmount.
   useEffect(() => {
     const doc = new Y.Doc();
@@ -269,10 +290,16 @@ export function ExcalidrawModal({
         window.clearTimeout(saveTimerRef.current);
         saveTimerRef.current = null;
       }
-      // Fire-and-forget SVG snapshot. Don't block close.
+      // Fire-and-forget SVG snapshot. Don't block close. Invalidate the
+      // inline preview query once it lands so a draw → immediate-close leaves
+      // the NodeView showing the fresh drawing rather than a stale (or empty)
+      // cached preview — the debounced scheduleSave that normally invalidates
+      // is cancelled above on unmount.
       const api = apiRef.current;
       if (api) {
-        void saveSvgSnapshot(api, boardId);
+        void saveSvgSnapshot(api, boardId).then(() => {
+          void qc.invalidateQueries({ queryKey: ["board-svg", boardId] });
+        });
       }
 
       bindingRef.current?.destroy();
@@ -283,7 +310,7 @@ export function ExcalidrawModal({
       providerRef.current = null;
       apiRef.current = null;
     };
-  }, [boardId]);
+  }, [boardId, qc]);
 
   // Identify ourselves in awareness so peers see a real name + color instead
   // of "anon". Re-runs if the session user updates while the modal is open.
@@ -296,11 +323,11 @@ export function ExcalidrawModal({
   // ESC closes.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") handleClose();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [handleClose]);
 
   // Push remote awareness → Excalidraw collaborators map. We skip rebuilds
   // triggered by purely-local changes (our own pointer move would otherwise
@@ -479,7 +506,7 @@ export function ExcalidrawModal({
       className="fixed inset-0 z-50 bg-black/70 flex flex-col"
       onClick={(e) => {
         // Backdrop click closes only when clicking the overlay itself.
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) handleClose();
       }}
     >
       <div className="flex items-center justify-between gap-3 px-4 py-2 bg-surface border-b border-border">
@@ -500,7 +527,7 @@ export function ExcalidrawModal({
           <button
             type="button"
             className="text-sm text-fg-muted hover:text-fg"
-            onClick={onClose}
+            onClick={handleClose}
             data-testid="excalidraw-modal-close"
           >
             Close
