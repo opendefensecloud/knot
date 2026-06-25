@@ -46,7 +46,10 @@ async fn full_state_with_rooms(email: &str, password: &str) -> (AppState, String
         bus,
         updates,
         snapshots,
-        knot_crdt::SnapshotPolicy { every_n: 100, idle: Duration::from_secs(60) },
+        knot_crdt::SnapshotPolicy {
+            every_n: 100,
+            idle: Duration::from_secs(60),
+        },
         Duration::from_secs(300),
     ));
     s.rooms_v2 = Some(rooms);
@@ -127,9 +130,7 @@ async fn open_authed_ws(
     addr: std::net::SocketAddr,
     doc_id: uuid::Uuid,
     sid_cookie: &str,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let url = format!("ws://{addr}/collab/doc/{doc_id}");
     let mut req = url.into_client_request().expect("valid ws url");
     req.headers_mut().insert(
@@ -195,8 +196,7 @@ async fn drain_initial(
 #[tokio::test(flavor = "multi_thread")]
 async fn viewer_cannot_write_owner_can() {
     // --- Setup: owner + viewer on the same workspace + doc -----------------
-    let (state, owner_joined) =
-        full_state_with_rooms("collab-owner@ws.test", "ownerpass").await;
+    let (state, owner_joined) = full_state_with_rooms("collab-owner@ws.test", "ownerpass").await;
     let (owner_cookie, owner_csrf) = split_cookie_csrf(&owner_joined);
 
     // We need to keep a reference to the inner SID cookie for the WS handshake.
@@ -329,11 +329,8 @@ async fn viewer_cannot_write_owner_can() {
         .unwrap();
 
     // Wait briefly; owner must NOT receive anything.
-    let owner_got_viewer_update = tokio::time::timeout(
-        Duration::from_millis(400),
-        owner_ws.next(),
-    )
-    .await;
+    let owner_got_viewer_update =
+        tokio::time::timeout(Duration::from_millis(400), owner_ws.next()).await;
 
     // timeout = the server correctly dropped the update (expected path).
     // non-timeout = the server forwarded it (bug).
@@ -349,11 +346,8 @@ async fn viewer_cannot_write_owner_can() {
         .await
         .unwrap();
 
-    let viewer_got_owner_update = tokio::time::timeout(
-        Duration::from_secs(3),
-        viewer_ws.next(),
-    )
-    .await;
+    let viewer_got_owner_update =
+        tokio::time::timeout(Duration::from_secs(3), viewer_ws.next()).await;
     match viewer_got_owner_update {
         Err(_elapsed) => panic!("viewer timed out waiting for owner's update — propagation broken"),
         Ok(None) => panic!("viewer stream ended before receiving owner's update"),

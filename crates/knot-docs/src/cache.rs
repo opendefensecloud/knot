@@ -90,7 +90,9 @@ impl AclCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use knot_storage::{DocStore, PgDocStore, PgGrantStore, PgUserStore, PgWorkspaceStore, UserStore};
+    use knot_storage::{
+        DocStore, PgDocStore, PgGrantStore, PgUserStore, PgWorkspaceStore, UserStore,
+    };
 
     /// Regression: the cache must be keyed by (workspace_id, doc_id, user_id).
     /// If the key were only (doc_id, user_id), a cached role for workspace A
@@ -116,32 +118,30 @@ mod tests {
         ws_s.add_member(ws_a.id, user.id, WorkspaceRole::Owner)
             .await
             .unwrap();
-        let doc = ds
-            .create(ws_a.id, None, "Doc", "m", user.id)
-            .await
-            .unwrap();
+        let doc = ds.create(ws_a.id, None, "Doc", "m", user.id).await.unwrap();
 
         // Workspace B: same user, NOT a member.
         let ws_b = ws_s.create("wsb", "B").await.unwrap();
 
-        let cache = AclCache::new(
-            Arc::new(ws_s),
-            Arc::new(gs),
-            Arc::new(ds),
-        );
+        let cache = AclCache::new(Arc::new(ws_s), Arc::new(gs), Arc::new(ds));
 
         // Prime the cache for workspace A — resolves to Owner.
-        let r_a = cache.effective_role(ws_a.id, doc.id, user.id).await.unwrap();
+        let r_a = cache
+            .effective_role(ws_a.id, doc.id, user.id)
+            .await
+            .unwrap();
         assert_eq!(r_a, Some(WorkspaceRole::Owner));
 
         // Look up the same (doc_id, user_id) under workspace B.
         // With the old (doc_id, user_id) key this would return the poisoned
         // Owner value; with the correct (workspace_id, doc_id, user_id) key
         // it must resolve independently and return None (user not a member of B).
-        let r_b = cache.effective_role(ws_b.id, doc.id, user.id).await.unwrap();
+        let r_b = cache
+            .effective_role(ws_b.id, doc.id, user.id)
+            .await
+            .unwrap();
         assert_eq!(
-            r_b,
-            None,
+            r_b, None,
             "cached Owner role from ws_a must not bleed into ws_b lookup"
         );
     }

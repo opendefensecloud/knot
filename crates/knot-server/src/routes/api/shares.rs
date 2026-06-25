@@ -146,7 +146,11 @@ async fn revoke(
     };
     match shares.revoke(share_id, doc_id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => json_err(StatusCode::NOT_FOUND, "shares.not_found", "token not found for this doc"),
+        Ok(false) => json_err(
+            StatusCode::NOT_FOUND,
+            "shares.not_found",
+            "token not found for this doc",
+        ),
         Err(_) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", ""),
     }
 }

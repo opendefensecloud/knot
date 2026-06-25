@@ -368,10 +368,7 @@ mod tests {
         // SAFETY: single-threaded test; no concurrent env reads.
         unsafe {
             std::env::set_var("KNOT_COOKIE_SECURE", "false");
-            std::env::set_var(
-                "KNOT_SESSION_KEY",
-                "0123456789abcdef0123456789abcdef",
-            );
+            std::env::set_var("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
         }
         let cfg = Config::load(None::<&str>).expect("load");
         assert!(!cfg.cookie_secure);

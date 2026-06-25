@@ -196,9 +196,7 @@ async fn create_doc(app: axum::Router, cookie: &str, csrf: &str, title: &str) ->
                 .header("cookie", cookie)
                 .header("x-csrf-token", csrf)
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({"title": title}).to_string(),
-                ))
+                .body(Body::from(serde_json::json!({"title": title}).to_string()))
                 .unwrap(),
         )
         .await
@@ -270,7 +268,9 @@ async fn owner_can_put_and_delete_grant() {
     let arr: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let grants = arr.as_array().unwrap();
     assert!(
-        grants.iter().any(|g| g["principal"] == principal && g["role"] == "editor"),
+        grants
+            .iter()
+            .any(|g| g["principal"] == principal && g["role"] == "editor"),
         "grant should appear in list: {arr}",
     );
 
@@ -288,7 +288,11 @@ async fn owner_can_put_and_delete_grant() {
         )
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::NO_CONTENT, "owner DELETE grant → 204");
+    assert_eq!(
+        r.status(),
+        StatusCode::NO_CONTENT,
+        "owner DELETE grant → 204"
+    );
 
     // GET grants: the grant should be gone.
     let r = app

@@ -125,7 +125,11 @@ async fn setup_session_cookie_authenticates() {
         )
         .await
         .unwrap();
-    assert_eq!(r2.status(), StatusCode::OK, "setup session cookie must authenticate");
+    assert_eq!(
+        r2.status(),
+        StatusCode::OK,
+        "setup session cookie must authenticate"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

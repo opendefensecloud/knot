@@ -309,7 +309,11 @@ async fn password_change_invalidates_old_session_and_mints_new_one() {
         )
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::NO_CONTENT, "change_password should succeed");
+    assert_eq!(
+        r.status(),
+        StatusCode::NO_CONTENT,
+        "change_password should succeed"
+    );
 
     let new_cookies: Vec<String> = r
         .headers()
@@ -339,7 +343,11 @@ async fn password_change_invalidates_old_session_and_mints_new_one() {
         )
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "old session must be invalid");
+    assert_eq!(
+        r.status(),
+        StatusCode::UNAUTHORIZED,
+        "old session must be invalid"
+    );
 
     // 4. New session (sid_b) must be accepted.
     let r = app
