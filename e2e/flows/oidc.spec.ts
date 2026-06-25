@@ -32,7 +32,7 @@ test("Dex round-trip lands a session", async ({ page }) => {
   await page.getByTestId("logout").click();
   await page.waitForURL(/\/login/);
 
-  await page.click("text=Sign in with SSO");
+  await page.click("text=Continue with SSO");
 
   // Dex login page (URL contains :5556).
   await page.waitForURL(/:5556\/dex/);

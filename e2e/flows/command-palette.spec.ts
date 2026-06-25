@@ -33,6 +33,8 @@ test("Ctrl+K opens palette, search filters, Enter navigates", async ({
   await page.waitForURL(/\/(?:doc\/.+)?$/);
 
   await page.getByTestId("new-doc").click();
+  await page.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await page.getByTestId("new-doc-blank").click();
   await page.waitForURL(/\/doc\/.+/);
   const input = page.locator("[data-testid='doc-title']");
   await expect(input).toHaveValue("Untitled");

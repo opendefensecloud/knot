@@ -53,6 +53,13 @@ async function createDoc(page: Page, title: string): Promise<string> {
     state: "visible",
     timeout: 5_000,
   });
+  // The picker defaults to "nested under the current doc" whenever a doc is
+  // open. These reorder tests need A/B/C as root siblings, so when the
+  // same-level option is offered (i.e. a doc is already open) select it.
+  const sibling = page.getByTestId("new-doc-loc-sibling");
+  if (await sibling.count()) {
+    await sibling.click();
+  }
   await page.getByTestId("new-doc-blank").click();
   // Wait until the URL has changed to a NEW /doc/:id (not the previous one)
   await page.waitForURL(/\/doc\/.+/, { timeout: 10_000 });

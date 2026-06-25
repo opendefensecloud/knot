@@ -27,6 +27,8 @@ test("comments: create thread, reply, react, resolve, show resolved", async ({ p
   await page.waitForURL(/\/(?:doc\/.+)?$/);
 
   await page.getByTestId("new-doc").click();
+  await page.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await page.getByTestId("new-doc-blank").click();
   await page.waitForURL(/\/doc\/.+/);
   const docId = page.url().match(/\/doc\/([^/?#]+)/)?.[1] ?? "";
   expect(docId).toBeTruthy();

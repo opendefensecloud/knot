@@ -50,6 +50,8 @@ test("two users editing concurrently converge on both screens", async ({ browser
   await alice.getByTestId("setup-password").fill("alice-hunter22");
   await alice.getByTestId("setup-submit").click();
   await alice.getByTestId("new-doc").click();
+  await alice.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await alice.getByTestId("new-doc-blank").click();
   await alice.waitForURL(/\/doc\/.+/);
   const docUrl = alice.url();
 

@@ -26,6 +26,8 @@ test("drop a PNG → renders as <img>, reload preserves", async ({ page }) => {
   await page.getByTestId("setup-password").fill("owner-hunter22");
   await page.getByTestId("setup-submit").click();
   await page.getByTestId("new-doc").click();
+  await page.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await page.getByTestId("new-doc-blank").click();
   await page.waitForURL(/\/doc\/.+/);
   const url = page.url();
   await expect(page.getByTestId("status-dot")).toHaveAttribute("data-status", "connected", {

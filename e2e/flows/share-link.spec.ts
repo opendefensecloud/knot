@@ -26,6 +26,8 @@ test("owner enables share link; anon reads; owner revokes; anon sees 410", async
   await owner.waitForURL(/\/(?:doc\/.+)?$/);
 
   await owner.getByTestId("new-doc").click();
+  await owner.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await owner.getByTestId("new-doc-blank").click();
   await owner.waitForURL(/\/doc\/.+/);
   const docUrl = owner.url();
   const titleInput = owner.locator("[data-testid='doc-title']");

@@ -75,6 +75,8 @@ test("excalidraw: insert board, draw rectangle, inline preview renders", async (
   await page.waitForURL(/\/(?:doc\/.+)?$/);
 
   await page.getByTestId("new-doc").click();
+  await page.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await page.getByTestId("new-doc-blank").click();
   await page.waitForURL(/\/doc\/.+/);
 
   await expect(page.getByTestId("status-dot")).toHaveAttribute("data-status", "connected", {
@@ -118,6 +120,8 @@ test("excalidraw: two contexts converge on a shared board", async ({ browser }) 
   await alice.getByTestId("setup-password").fill("alice-hunter22");
   await alice.getByTestId("setup-submit").click();
   await alice.getByTestId("new-doc").click();
+  await alice.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await alice.getByTestId("new-doc-blank").click();
   await alice.waitForURL(/\/doc\/.+/);
   const docUrl = alice.url();
 
@@ -194,6 +198,8 @@ test("excalidraw: markdown export references board sentinel", async ({ page, req
   await page.waitForURL(/\/(?:doc\/.+)?$/);
 
   await page.getByTestId("new-doc").click();
+  await page.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await page.getByTestId("new-doc-blank").click();
   await page.waitForURL(/\/doc\/.+/);
   const url = new URL(page.url());
   const docId = url.pathname.replace(/^\/doc\//, "");

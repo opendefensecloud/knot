@@ -24,6 +24,8 @@ test("setup → land on landing → create doc", async ({ page }) => {
   await page.getByTestId("setup-submit").click();
   await page.waitForURL(/\/$/);
   await page.getByTestId("new-doc").click();
+  await page.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await page.getByTestId("new-doc-blank").click();
   await page.waitForURL(/\/doc\/.+/);
   await expect(page.getByTestId("doc-title")).toBeVisible();
 });

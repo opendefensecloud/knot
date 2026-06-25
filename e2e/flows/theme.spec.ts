@@ -28,6 +28,11 @@ test("theme toggle persists across reload", async ({ page }) => {
 
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
 
+  // The theme toggle now lives on the Settings page (moved out of the
+  // sidebar in 0988b51). data-theme is applied to <html> globally, so the
+  // assertions below hold regardless of which page we're on.
+  await page.goto("/settings");
+
   const toggle = page.getByTestId("theme-toggle");
   await expect(toggle).toBeVisible();
   await toggle.click();

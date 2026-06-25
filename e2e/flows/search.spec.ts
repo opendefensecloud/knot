@@ -24,6 +24,8 @@ test("Cmd+K search finds a doc by title and navigates to it", async ({ page }) =
 
   for (const t of ["Findable Alpha", "Other Beta", "Some Gamma"]) {
     await page.getByTestId("new-doc").click();
+    await page.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+    await page.getByTestId("new-doc-blank").click();
     await page.waitForURL(/\/doc\/.+/);
     const input = page.locator("[data-testid='doc-title']");
     await expect(input).toHaveValue("Untitled");
