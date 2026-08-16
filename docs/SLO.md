@@ -11,7 +11,7 @@ Targets apply to a single knot deployment serving a single workspace. Multi-regi
 | Service area | Target | Window |
 |---|---|---|
 | `/api/*` (excluding `/api/healthz`, `/api/readyz`) | **99.5 %** successful (2xx or 3xx) | 30-day rolling |
-| `/collab/:doc_id` WebSocket upgrades | **99.5 %** accepted (101 Switching Protocols) | 30-day rolling |
+| `/collab/{doc_id}` WebSocket upgrades | **99.5 %** accepted (101 Switching Protocols) | 30-day rolling |
 | `/auth/login`, `/auth/setup`, `/auth/password` | **99 %** successful | 30-day rolling |
 | `/auth/oidc/*` | follows the IdP's own SLO, never tighter than 99 % | 30-day rolling |
 
@@ -33,7 +33,7 @@ clamp_min(sum(rate(knot_http_requests_total{route!~"/api/health.*"}[5m])), 1)
 | `POST/PATCH/DELETE /api/docs/*`, `POST /api/workspace/members*` | **P95 < 250 ms**, **P99 < 500 ms** | Single-row mutation + audit insert |
 | `POST /auth/login`, `POST /auth/password` | **P95 < 500 ms**, **P99 < 1 s** | Argon2id verify dominates |
 | `POST /auth/setup` | **P95 < 2 s**, **P99 < 5 s** | One-time first-run; Argon2id hash + workspace bootstrap |
-| `GET/POST /api/docs/:id/markdown` | **P95 < 1 s**, **P99 < 3 s** | Markdown round-trip via room actor |
+| `GET/POST /api/docs/{id}/markdown` | **P95 < 1 s**, **P99 < 3 s** | Markdown round-trip via room actor |
 
 PromQL — overall P95:
 

@@ -1,10 +1,10 @@
 //! Excalidraw boards:
 //!
-//!   POST   /api/docs/:doc_id/boards          → 201 { id, doc_id, label, … }       (editor+)
-//!   GET    /api/docs/:doc_id/boards          → 200 [Board, …]                     (viewer+)
-//!   DELETE /api/boards/:id                   → 204                                (editor+ on parent)
-//!   GET    /api/boards/:id/svg               → image/svg+xml (cached preview)      (viewer+)
-//!   PUT    /api/boards/:id/svg               → 204                                (editor+)
+//!   POST   /api/docs/{doc_id}/boards          → 201 { id, doc_id, label, … }       (editor+)
+//!   GET    /api/docs/{doc_id}/boards          → 200 [Board, …]                     (viewer+)
+//!   DELETE /api/boards/{id}                   → 204                                (editor+ on parent)
+//!   GET    /api/boards/{id}/svg               → image/svg+xml (cached preview)      (viewer+)
+//!   PUT    /api/boards/{id}/svg               → 204                                (editor+)
 //!
 //! ACL is inherited from the parent document; there's no per-board grant table.
 //! Viewers see the cached SVG preview but cannot upload a new one or join the
@@ -34,9 +34,9 @@ struct CreateBody {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/docs/:doc_id/boards", post(create).get(list))
-        .route("/api/boards/:id", delete(remove))
-        .route("/api/boards/:id/svg", get(get_svg).put(put_svg))
+        .route("/api/docs/{doc_id}/boards", post(create).get(list))
+        .route("/api/boards/{id}", delete(remove))
+        .route("/api/boards/{id}/svg", get(get_svg).put(put_svg))
 }
 
 fn internal() -> Response {

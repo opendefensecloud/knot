@@ -1,8 +1,8 @@
 //! Blob upload / download / delete.
 //!
-//! POST   /api/docs/:doc_id/blobs           multipart, returns BlobMetadata
-//! GET    /api/blobs/:id                    streams bytes, ACL-checked
-//! DELETE /api/blobs/:id                    editor+ on parent doc
+//! POST   /api/docs/{doc_id}/blobs           multipart, returns BlobMetadata
+//! GET    /api/blobs/{id}                    streams bytes, ACL-checked
+//! DELETE /api/blobs/{id}                    editor+ on parent doc
 
 use axum::{
     Json, Router,
@@ -54,8 +54,8 @@ struct BlobResponse {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/docs/:doc_id/blobs", post(upload))
-        .route("/api/blobs/:id", get(download).delete(delete_blob))
+        .route("/api/docs/{doc_id}/blobs", post(upload))
+        .route("/api/blobs/{id}", get(download).delete(delete_blob))
 }
 
 async fn upload(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Request) -> Response {

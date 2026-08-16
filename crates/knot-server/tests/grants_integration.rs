@@ -1,7 +1,7 @@
 //! HTTP-layer tests for the document grants API:
-//! - GET  /api/docs/:id/grants
-//! - PUT  /api/docs/:id/grants/:principal
-//! - DELETE /api/docs/:id/grants/:principal
+//! - GET  /api/docs/{id}/grants
+//! - PUT  /api/docs/{id}/grants/{principal}
+//! - DELETE /api/docs/{id}/grants/{principal}
 //!
 //! Verifies owner-gating (403 for non-owners), group-principal rejection
 //! (422 `grant.group_unsupported`), and cross-workspace/unknown doc handling.

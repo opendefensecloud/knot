@@ -50,21 +50,21 @@ Keep the password in an env var, never in argv/history. Failed logins are thrott
 |---|---|
 | List docs | `GET /api/docs` |
 | Create doc | `POST /api/docs` body `{"title":?, "parent_id":?, "after_id":?}` |
-| Doc meta | `GET /api/docs/:id` · rename/icon: `PATCH` `{"title":?, "icon":?}` |
-| Archive / restore | `DELETE /api/docs/:id` · `POST /api/docs/:id/restore` — **Owner role only** (403 `acl.owner_required` for Editors) |
-| Move | `POST /api/docs/:id/move` `{"parent_id":?, "after_id":?, "before_id":?}` |
-| **Read doc as markdown** | `GET /api/docs/:id/markdown` → `text/markdown` |
-| **Write markdown into doc** | `POST /api/docs/:id/markdown`, raw UTF-8 body ≤ 1 MB → 204 |
+| Doc meta | `GET /api/docs/{id}` · rename/icon: `PATCH` `{"title":?, "icon":?}` |
+| Archive / restore | `DELETE /api/docs/{id}` · `POST /api/docs/{id}/restore` — **Owner role only** (403 `acl.owner_required` for Editors) |
+| Move | `POST /api/docs/{id}/move` `{"parent_id":?, "after_id":?, "before_id":?}` |
+| **Read doc as markdown** | `GET /api/docs/{id}/markdown` → `text/markdown` |
+| **Write markdown into doc** | `POST /api/docs/{id}/markdown`, raw UTF-8 body ≤ 1 MB → 204 |
 | Search | `GET /api/search?q=…&limit=…` (min 2 chars, limit clamped 1–20) |
 | My assigned tasks | `GET /api/workspace/tasks?include_completed=true` — only tasks **assigned to the current user**; unassigned checklist items never appear here |
-| Check/uncheck task | `PATCH /api/docs/:doc_id/tasks/:item_index` `{"checked":true}` — `item_index` is 0-based in doc order |
-| Doc history | `GET /api/docs/:id/history` · preview `…/:seq/markdown` · `POST …/:seq/restore` |
-| Grants (ACL) | `GET /api/docs/:id/grants` · `PUT/DELETE /api/docs/:id/grants/:principal` |
-| Share links | `POST /api/docs/:id/shares` · `DELETE …/shares/:share_id` |
+| Check/uncheck task | `PATCH /api/docs/{doc_id}/tasks/{item_index}` `{"checked":true}` — `item_index` is 0-based in doc order |
+| Doc history | `GET /api/docs/{id}/history` · preview `…/{seq}/markdown` · `POST …/{seq}/restore` |
+| Grants (ACL) | `GET /api/docs/{id}/grants` · `PUT/DELETE /api/docs/{id}/grants/{principal}` |
+| Share links | `POST /api/docs/{id}/shares` · `DELETE …/shares/{share_id}` |
 | Workspace export | `GET /api/workspace/export` → zip (markdown + manifest) |
 | Workspace import | `POST /api/workspace/import` (multipart zip upload) |
-| Single-doc export | `GET /api/docs/:id/export` |
-| Upload attachment | `POST /api/docs/:id/blobs` · fetch: `GET /api/blobs/:id` |
+| Single-doc export | `GET /api/docs/{id}/export` |
+| Upload attachment | `POST /api/docs/{id}/blobs` · fetch: `GET /api/blobs/{id}` |
 | Workspace info | `GET /api/workspace` · templates: `GET /api/workspace/templates` |
 
 ## Core recipes

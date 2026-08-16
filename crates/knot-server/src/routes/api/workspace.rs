@@ -1,8 +1,8 @@
 //! GET    /api/workspace
 //! GET    /api/workspace/members
 //! POST   /api/workspace/members        body: {email, role}
-//! PATCH  /api/workspace/members/:id    body: {role}
-//! DELETE /api/workspace/members/:id
+//! PATCH  /api/workspace/members/{id}    body: {role}
+//! DELETE /api/workspace/members/{id}
 
 use axum::{
     Json, Router,
@@ -28,7 +28,7 @@ pub fn router() -> Router<AppState> {
             get(list_members).post(invite_member),
         )
         .route(
-            "/api/workspace/members/:id",
+            "/api/workspace/members/{id}",
             patch(change_role).delete(remove_member),
         )
 }

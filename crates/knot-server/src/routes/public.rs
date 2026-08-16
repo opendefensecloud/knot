@@ -1,4 +1,4 @@
-//! GET /p/:token — anonymous read of a doc via a public share link.
+//! GET /p/{token} — anonymous read of a doc via a public share link.
 //!
 //! Also serves the cached board SVG previews referenced by sentinel image
 //! tags in the rendered markdown, gated by the same share token.
@@ -20,9 +20,9 @@ use crate::routes::api::blobs::safe_inline_content_type;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/p/:token", get(public_doc))
-        .route("/p/:token/boards/:id/svg", get(public_board_svg))
-        .route("/p/:token/blobs/:id", get(public_blob))
+        .route("/p/{token}", get(public_doc))
+        .route("/p/{token}/boards/{id}/svg", get(public_board_svg))
+        .route("/p/{token}/blobs/{id}", get(public_blob))
 }
 
 async fn public_doc(State(state): State<AppState>, Path(token): Path<String>) -> Response {

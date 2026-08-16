@@ -1,7 +1,7 @@
 //! Documents API:
 //! - GET    /api/docs            flat list (alive only)
 //! - POST   /api/docs            body: {title?, parent_id?, after_id?}
-//! - GET    /api/docs/:id        metadata + effective_role
+//! - GET    /api/docs/{id}        metadata + effective_role
 //!
 //! PATCH/DELETE/move/restore land in T13/T14 (handlers stubbed below for
 //! router shape; replaced in later tasks).
@@ -51,40 +51,40 @@ fn to_response(d: &Document) -> DocResponse {
 
 pub fn router(state: AppState) -> Router<AppState> {
     let doc_id_routes: Router<AppState> = Router::new()
-        .route("/api/docs/:id", get(get_one).patch(rename).delete(archive))
-        .route("/api/docs/:id/move", post(move_doc))
-        .route("/api/docs/:id/restore", post(restore))
+        .route("/api/docs/{id}", get(get_one).patch(rename).delete(archive))
+        .route("/api/docs/{id}/move", post(move_doc))
+        .route("/api/docs/{id}/restore", post(restore))
         .route(
-            "/api/docs/:id/markdown",
+            "/api/docs/{id}/markdown",
             get(crate::routes::api::markdown::export_inline)
                 .post(crate::routes::api::markdown::import_inline),
         )
         .route(
-            "/api/docs/:id/grants",
+            "/api/docs/{id}/grants",
             get(crate::routes::api::grants::list_inline),
         )
         .route(
-            "/api/docs/:id/grants/:principal",
+            "/api/docs/{id}/grants/{principal}",
             put(crate::routes::api::grants::put_inline)
                 .delete(crate::routes::api::grants::delete_inline),
         )
         // History endpoints share the same :id param and ACL layer.
         .route(
-            "/api/docs/:id/history",
+            "/api/docs/{id}/history",
             get(crate::routes::api::history::list),
         )
         .route(
-            "/api/docs/:id/history/:seq/markdown",
+            "/api/docs/{id}/history/{seq}/markdown",
             get(crate::routes::api::history::preview_markdown),
         )
         .route(
-            "/api/docs/:id/history/:seq/restore",
+            "/api/docs/{id}/history/{seq}/restore",
             post(crate::routes::api::history::restore),
         )
         .merge(crate::routes::api::comments::routes())
-        .route("/api/docs/:id/template", post(set_template_inline))
+        .route("/api/docs/{id}/template", post(set_template_inline))
         .route(
-            "/api/docs/from-template/:id",
+            "/api/docs/from-template/{id}",
             post(create_from_template_inline),
         )
         .layer(middleware::from_fn_with_state(state, require_doc_role_mw));
@@ -531,7 +531,7 @@ async fn create_from_template_inline(
     };
 
     // Import the template's markdown into the new doc via the room
-    // actor (mirrors POST /api/docs/:id/markdown).
+    // actor (mirrors POST /api/docs/{id}/markdown).
     let update_bytes = match knot_markdown::from_markdown::parse(&md) {
         Ok((_doc, bytes)) => bytes,
         Err(e) => {

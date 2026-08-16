@@ -27,7 +27,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 
 # Web
-axum = { version = "0.7", features = ["ws", "macros"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "compression-br", "fs", "timeout"] }
 

@@ -72,7 +72,7 @@ pub async fn serve(
                 }
                 maybe = out_rx.recv() => match maybe {
                     Some(bytes) => {
-                        if sink.send(Message::Binary(bytes)).await.is_err() {
+                        if sink.send(Message::Binary(bytes.into())).await.is_err() {
                             return;
                         }
                     }
@@ -135,7 +135,7 @@ pub async fn serve(
                             .tx
                             .send(Event::AwarenessIn {
                                 from: conn_id,
-                                payload: bytes,
+                                payload: bytes.to_vec(),
                             })
                             .await;
                     }

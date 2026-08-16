@@ -1,17 +1,17 @@
 //! Comment threads on documents.
 //!
-//! POST   /api/docs/:doc_id/comments                  { body, position_y?, anchor_text? } → 201
-//! POST   /api/docs/:doc_id/comments/:thread_id/replies { body } → 201
-//! GET    /api/docs/:doc_id/comments?include_resolved  → 200 [Comment]
+//! POST   /api/docs/{doc_id}/comments                  { body, position_y?, anchor_text? } → 201
+//! POST   /api/docs/{doc_id}/comments/{thread_id}/replies { body } → 201
+//! GET    /api/docs/{doc_id}/comments?include_resolved  → 200 [Comment]
 //!
-//! POST   /api/docs/:doc_id/comments/:thread_id/resolve   → 204
-//! POST   /api/docs/:doc_id/comments/:thread_id/unresolve → 204
+//! POST   /api/docs/{doc_id}/comments/{thread_id}/resolve   → 204
+//! POST   /api/docs/{doc_id}/comments/{thread_id}/unresolve → 204
 //!
-//! POST   /api/docs/:doc_id/comments/:comment_id/reactions        { emoji } → 204
-//! DELETE /api/docs/:doc_id/comments/:comment_id/reactions/:emoji  → 204
+//! POST   /api/docs/{doc_id}/comments/{comment_id}/reactions        { emoji } → 204
+//! DELETE /api/docs/{doc_id}/comments/{comment_id}/reactions/{emoji}  → 204
 //!
-//! PATCH  /api/docs/:doc_id/comments/:comment_id { body } → 200 (author only)
-//! DELETE /api/docs/:doc_id/comments/:comment_id          → 204 (author or workspace owner)
+//! PATCH  /api/docs/{doc_id}/comments/{comment_id} { body } → 200 (author only)
+//! DELETE /api/docs/{doc_id}/comments/{comment_id}          → 204 (author or workspace owner)
 
 use axum::{
     Json, Router,
@@ -209,7 +209,7 @@ fn notify_comment_change(state: &AppState, doc_id: Uuid) {
 // Route handlers
 // ---------------------------------------------------------------------------
 
-/// POST /api/docs/:doc_id/comments
+/// POST /api/docs/{doc_id}/comments
 async fn create_thread(
     State(state): State<AppState>,
     Path(doc_id): Path<Uuid>,
@@ -300,7 +300,7 @@ async fn create_thread(
     }
 }
 
-/// POST /api/docs/:doc_id/comments/:thread_id/replies
+/// POST /api/docs/{doc_id}/comments/{thread_id}/replies
 async fn create_reply(
     State(state): State<AppState>,
     Path((doc_id, thread_id)): Path<(Uuid, Uuid)>,
@@ -352,7 +352,7 @@ async fn create_reply(
     }
 }
 
-/// GET /api/docs/:doc_id/comments
+/// GET /api/docs/{doc_id}/comments
 async fn list_comments(
     State(state): State<AppState>,
     Path(doc_id): Path<Uuid>,
@@ -396,7 +396,7 @@ async fn ensure_comment_in_doc(
     }
 }
 
-/// POST /api/docs/:doc_id/comments/:thread_id/resolve
+/// POST /api/docs/{doc_id}/comments/{thread_id}/resolve
 async fn resolve_thread(
     State(state): State<AppState>,
     Path((doc_id, thread_id)): Path<(Uuid, Uuid)>,
@@ -428,7 +428,7 @@ async fn resolve_thread(
     }
 }
 
-/// POST /api/docs/:doc_id/comments/:thread_id/unresolve
+/// POST /api/docs/{doc_id}/comments/{thread_id}/unresolve
 async fn unresolve_thread(
     State(state): State<AppState>,
     Path((doc_id, thread_id)): Path<(Uuid, Uuid)>,
@@ -460,7 +460,7 @@ async fn unresolve_thread(
     }
 }
 
-/// POST /api/docs/:doc_id/comments/:comment_id/reactions
+/// POST /api/docs/{doc_id}/comments/{comment_id}/reactions
 async fn add_reaction(
     State(state): State<AppState>,
     Path((doc_id, comment_id)): Path<(Uuid, Uuid)>,
@@ -512,7 +512,7 @@ async fn add_reaction(
     }
 }
 
-/// DELETE /api/docs/:doc_id/comments/:comment_id/reactions/:emoji
+/// DELETE /api/docs/{doc_id}/comments/{comment_id}/reactions/{emoji}
 async fn remove_reaction(
     State(state): State<AppState>,
     Path((doc_id, comment_id, emoji)): Path<(Uuid, Uuid, String)>,
@@ -547,7 +547,7 @@ async fn remove_reaction(
     }
 }
 
-/// PATCH /api/docs/:doc_id/comments/:comment_id — author only
+/// PATCH /api/docs/{doc_id}/comments/{comment_id} — author only
 async fn edit_comment(
     State(state): State<AppState>,
     Path((doc_id, comment_id)): Path<(Uuid, Uuid)>,
@@ -623,7 +623,7 @@ async fn edit_comment(
     }
 }
 
-/// DELETE /api/docs/:doc_id/comments/:comment_id — author or workspace owner
+/// DELETE /api/docs/{doc_id}/comments/{comment_id} — author or workspace owner
 async fn delete_comment(
     State(state): State<AppState>,
     Path((doc_id, comment_id)): Path<(Uuid, Uuid)>,
@@ -685,31 +685,31 @@ async fn delete_comment(
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
-            "/api/docs/:id/comments",
+            "/api/docs/{id}/comments",
             post(create_thread).get(list_comments),
         )
         .route(
-            "/api/docs/:id/comments/:thread_id/replies",
+            "/api/docs/{id}/comments/{thread_id}/replies",
             post(create_reply),
         )
         .route(
-            "/api/docs/:id/comments/:thread_id/resolve",
+            "/api/docs/{id}/comments/{thread_id}/resolve",
             post(resolve_thread),
         )
         .route(
-            "/api/docs/:id/comments/:thread_id/unresolve",
+            "/api/docs/{id}/comments/{thread_id}/unresolve",
             post(unresolve_thread),
         )
         .route(
-            "/api/docs/:id/comments/:comment_id/reactions",
+            "/api/docs/{id}/comments/{comment_id}/reactions",
             post(add_reaction),
         )
         .route(
-            "/api/docs/:id/comments/:comment_id/reactions/:emoji",
+            "/api/docs/{id}/comments/{comment_id}/reactions/{emoji}",
             delete(remove_reaction),
         )
         .route(
-            "/api/docs/:id/comments/:comment_id",
+            "/api/docs/{id}/comments/{comment_id}",
             patch(edit_comment).delete(delete_comment),
         )
 }

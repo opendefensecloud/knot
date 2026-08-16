@@ -4,7 +4,7 @@
 //!   knot_http_requests_total{method,route,status_class}
 //!   knot_http_request_duration_seconds{method,route,status_class}
 //!
-//! `route` is the MatchedPath template (e.g. "/api/docs/:id"), NOT the
+//! `route` is the MatchedPath template (e.g. "/api/docs/{id}"), NOT the
 //! raw URI — keeps cardinality bounded.
 
 use std::time::Instant;

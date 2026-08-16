@@ -191,8 +191,8 @@ pub fn router_with_state(state: AppState) -> Router {
 
     // WS routes: NO timeout / body-limit (long-lived, streamed).
     let collab = Router::new()
-        .route("/collab/doc/:doc_id", get(collab_upgrade))
-        .route("/collab/board/:board_id", get(collab_board_upgrade));
+        .route("/collab/doc/{doc_id}", get(collab_upgrade))
+        .route("/collab/board/{board_id}", get(collab_board_upgrade));
 
     // Everything else: request timeout + body-size limit.
     let api_and_pages = Router::new()

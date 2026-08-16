@@ -1,4 +1,4 @@
-//! Integration: POST /api/docs/from-template/:id clones the template's
+//! Integration: POST /api/docs/from-template/{id} clones the template's
 //! markdown into a brand-new doc. The clone must be a fresh CRDT
 //! lineage — comments/history don't carry over — but the content
 //! must match the template's exported markdown.
@@ -150,7 +150,7 @@ async fn from_template_clones_markdown_into_new_doc() {
     let app = router_with_state(state.clone());
     let (sid, csrf) = login(&app).await;
 
-    // POST /api/docs/from-template/:id with no title — server should
+    // POST /api/docs/from-template/{id} with no title — server should
     // fall back to "<template title> copy".
     let r = app
         .clone()

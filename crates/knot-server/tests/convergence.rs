@@ -324,7 +324,7 @@ async fn viewer_cannot_write_owner_can() {
     // (The server drops inbound updates from can_write=false connections.)
     let update_frame = make_yrs_update_frame();
     viewer_ws
-        .send(tungstenite::Message::Binary(update_frame))
+        .send(tungstenite::Message::Binary(update_frame.into()))
         .await
         .unwrap();
 
@@ -342,7 +342,7 @@ async fn viewer_cannot_write_owner_can() {
     // --- T2: Owner sends an update; viewer SHOULD receive it ---------------
     let owner_update_frame = make_yrs_update_frame();
     owner_ws
-        .send(tungstenite::Message::Binary(owner_update_frame))
+        .send(tungstenite::Message::Binary(owner_update_frame.into()))
         .await
         .unwrap();
 
