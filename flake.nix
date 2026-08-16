@@ -36,7 +36,7 @@
             mold
 
             # Frontend
-            nodejs_22
+            nodejs_24
             pnpm
 
             # Browser / e2e

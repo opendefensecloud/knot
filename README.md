@@ -15,7 +15,7 @@ A self-hosted, collaborative knowledge base. Like Notion or Confluence — but y
 ## Quickstart
 
 ```bash
-git clone https://github.com/trevex/knot
+git clone https://github.com/opendefensecloud/knot
 cd knot
 cp .env.example .env             # local KNOT_* defaults
 make compose.up                  # boot Postgres + Dex (+ toxiproxy for e2e)

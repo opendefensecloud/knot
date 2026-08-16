@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@1.97.1 # keep in sync with rust-toolchain.toml
         with:
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
@@ -23,8 +23,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - uses: pnpm/action-setup@v6
         with:
-          version: 9
-      - uses: actions/setup-node@v6
+          version: 11
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -56,7 +56,7 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@1.97.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --all-features
@@ -70,10 +70,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
         with:
-          version: 9
-      - uses: actions/setup-node@v6
+          version: 11
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
@@ -87,14 +87,14 @@ jobs:
     needs: [unit-rust, unit-web]
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@1.97.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - uses: pnpm/action-setup@v6
         with:
-          version: 9
-      - uses: actions/setup-node@v6
+          version: 11
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           # This job installs in both web/ and e2e/, so key the cache on both
           # lockfiles. Without a path, setup-node looks for pnpm-lock.yaml at the
@@ -114,7 +114,9 @@ jobs:
         run: make compose.up
 
       - name: install sqlx-cli
-        run: cargo install sqlx-cli --no-default-features --features postgres,rustls --version ^0.8
+        # Keep in sync with the sqlx version in Cargo.toml — the CLI applies the
+        # migrations the server then reads.
+        run: cargo install sqlx-cli --no-default-features --features postgres,rustls --version ^0.9
 
       - name: apply migrations
         env:
@@ -143,7 +145,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@1.97.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check

@@ -1,24 +1,28 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1
 #
 # knot-server multi-arch container.
-#   builder #1 (web): node:22 builds the SPA -> /app/web/dist
+#   builder #1 (web): node:24 builds the SPA -> /app/web/dist
 #   builder #2 (rust): chef base installs the toolchain -> planner derives recipe.json ->
 #     builder cooks deps (gha-cacheable layer) then cargo-zigbuild cross-compiles to
 #     ${TARGETARCH}-unknown-linux-musl on the BUILDPLATFORM toolchain (no per-arch QEMU).
 #   runtime: scratch + static binary + web/dist (TLS roots are compiled into the binary).
 
 # ----- SPA build -----
-FROM --platform=$BUILDPLATFORM node:22-alpine AS web-builder
+FROM --platform=$BUILDPLATFORM node:24-alpine AS web-builder
 WORKDIR /app/web
 RUN corepack enable
-COPY web/package.json web/pnpm-lock.yaml ./
+# pnpm-workspace.yaml carries the overrides and allowBuilds settings (pnpm >= 11
+# no longer reads them from package.json). It MUST be copied with the manifests:
+# without it the frozen install fails ERR_PNPM_LOCKFILE_CONFIG_MISMATCH, because
+# the lockfile records overrides this stage would otherwise not know about.
+COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY web/ .
 RUN pnpm build
 # /app/web/dist now contains the built SPA
 
 # ----- Rust build (cargo-chef: dependency compile lands in a cache-exportable layer) -----
-# Base tag MUST stay in sync with rust-toolchain.toml (channel = "1.96.0"). We deliberately do
+# Base tag MUST stay in sync with rust-toolchain.toml (channel = "1.97.1"). We deliberately do
 # NOT copy rust-toolchain.toml into the build (it would pull dev-only components such as
 # rust-analyzer/rust-src); instead the base image supplies the pinned compiler so the release
 # binary is built with the same toolchain as CI rather than the base image's default.
@@ -28,24 +32,30 @@ RUN pnpm build
 # release recompiled all dependencies from zero on a fresh runner. `cargo chef cook` compiles
 # only third-party deps into a normal filesystem layer keyed on recipe.json, and type=gha
 # (mode=max) DOES persist that layer, so unchanged deps are a cache hit on later releases.
-FROM --platform=$BUILDPLATFORM rust:1.96.0-alpine AS chef
+FROM --platform=$BUILDPLATFORM rust:1.97.1-alpine AS chef
 RUN apk add --no-cache musl-dev openssl-dev pkgconf clang lld build-base curl xz tar
 # Pinned exactly (=) for reproducible release builds; bump deliberately.
-RUN cargo install cargo-chef --locked --version =0.1.77 \
+RUN cargo install cargo-chef --locked --version =0.1.78 \
  && cargo install cargo-zigbuild --locked --version =0.23.0
 # Fetch zig (the cross-linker cargo-zigbuild drives) and verify its SHA256 before extracting —
 # the tarball ends up in every released binary, so an unverified download is a build-time
-# supply-chain hole. Digests are for zig 0.13.0, keyed by BUILDPLATFORM arch (uname -m).
+# supply-chain hole. Digests are for zig 0.16.0, keyed by BUILDPLATFORM arch (uname -m), and
+# come from https://ziglang.org/download/index.json.
+#
+# NOTE: zig flipped its tarball/archive naming at 0.14.0, from zig-{os}-{arch}-{ver} to
+# zig-{arch}-{os}-{ver}. Both the download URL and the symlink path below follow the new
+# order; reverting the version without reverting the naming 404s.
+ARG ZIG_VERSION=0.16.0
 RUN ARCH=$(uname -m) \
  && case "$ARCH" in \
-      x86_64)  ZIG_SHA=d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea ;; \
-      aarch64) ZIG_SHA=041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556 ;; \
+      x86_64)  ZIG_SHA=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;; \
+      aarch64) ZIG_SHA=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;; \
       *) echo "unsupported build arch: $ARCH" >&2; exit 1 ;; \
     esac \
- && curl -sSLo /tmp/zig.tar.xz "https://ziglang.org/download/0.13.0/zig-linux-${ARCH}-0.13.0.tar.xz" \
+ && curl -sSLo /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" \
  && echo "${ZIG_SHA}  /tmp/zig.tar.xz" | sha256sum -c - \
  && tar -xJf /tmp/zig.tar.xz -C /usr/local \
- && ln -s /usr/local/zig-linux-${ARCH}-0.13.0/zig /usr/local/bin/zig \
+ && ln -s /usr/local/zig-${ARCH}-linux-${ZIG_VERSION}/zig /usr/local/bin/zig \
  && rm /tmp/zig.tar.xz
 WORKDIR /src
 
