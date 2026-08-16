@@ -1,7 +1,7 @@
 //! Doc snapshot history endpoints:
-//! GET  /api/docs/:doc_id/history              → metadata list (newest-first)
-//! GET  /api/docs/:doc_id/history/:seq/markdown → markdown preview of snapshot
-//! POST /api/docs/:doc_id/history/:seq/restore  → replace live doc with snapshot
+//! GET  /api/docs/{doc_id}/history              → metadata list (newest-first)
+//! GET  /api/docs/{doc_id}/history/{seq}/markdown → markdown preview of snapshot
+//! POST /api/docs/{doc_id}/history/{seq}/restore  → replace live doc with snapshot
 
 use axum::{
     Json,

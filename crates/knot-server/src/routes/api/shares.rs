@@ -1,7 +1,7 @@
 //! Share token management (owner-only):
-//! POST   /api/docs/:doc_id/shares           { expires_at? } → 201
-//! GET    /api/docs/:doc_id/shares           → 200 [ShareResponse, ...]
-//! DELETE /api/docs/:doc_id/shares/:share_id → 204
+//! POST   /api/docs/{doc_id}/shares           { expires_at? } → 201
+//! GET    /api/docs/{doc_id}/shares           → 200 [ShareResponse, ...]
+//! DELETE /api/docs/{doc_id}/shares/{share_id} → 204
 
 use axum::{
     Json, Router,
@@ -33,8 +33,8 @@ struct ShareResponse {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/docs/:doc_id/shares", post(create).get(list))
-        .route("/api/docs/:doc_id/shares/:share_id", delete(revoke))
+        .route("/api/docs/{doc_id}/shares", post(create).get(list))
+        .route("/api/docs/{doc_id}/shares/{share_id}", delete(revoke))
 }
 
 async fn require_owner(state: &AppState, ctx: &AuthContext, doc_id: Uuid) -> Option<Response> {

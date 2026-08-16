@@ -21,7 +21,10 @@ use crate::http_error::json_err;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/workspace/tasks", get(list_mine))
-        .route("/api/docs/:doc_id/tasks/:item_index", patch(patch_checked))
+        .route(
+            "/api/docs/{doc_id}/tasks/{item_index}",
+            patch(patch_checked),
+        )
 }
 
 #[derive(Debug, Deserialize)]

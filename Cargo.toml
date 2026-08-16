@@ -15,7 +15,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.80"
+rust-version = "1.94"
 license = "Apache-2.0"
 authors = ["Niklas Voss <niklas.voss@gmail.com>"]
 repository = "https://github.com/trevex/knot"
@@ -27,29 +27,29 @@ tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 
 # Web
-axum = { version = "0.7", features = ["ws", "macros"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "compression-br", "fs", "timeout"] }
+tower-http = { version = "0.7", features = ["trace", "compression-br", "fs", "timeout"] }
 
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
-tracing-opentelemetry = "0.28"
+metrics-exporter-prometheus = "0.18"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.33"
 
 # Error handling
 thiserror = "2"
 anyhow = "1"
 
 # CRDT
-yrs = "0.21"
+yrs = "0.27"
 
 # Markdown parsing
-pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 # Config
 figment = { version = "0.10", features = ["env", "toml", "yaml"] }
@@ -58,28 +58,25 @@ figment = { version = "0.10", features = ["env", "toml", "yaml"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Testing
-proptest = "1"
-
 # IDs
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Storage
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros", "ipnetwork"] }
+# 0.9 removed the combined `runtime-tokio-rustls` feature; the runtime and the
+# TLS backend are now selected separately. `tls-rustls-ring` keeps the ring
+# provider, matching the explicit choice made for the PgBus connection below.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "json", "migrate", "macros", "ipnetwork"] }
 tokio-postgres = "0.7"
 # mTLS for the PgBus tokio-postgres connection (rustls; ring provider chosen
-# explicitly since aws-lc-rs is also in the graph).
-tokio-postgres-rustls = "0.13"
+# explicitly since aws-lc-rs is also in the graph). 0.14 ships `default = []`,
+# so the provider feature is required here — without it the crate builds but
+# links no crypto backend.
+tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
 futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
-ipnetwork = "0.20"
-
-# Testing — containers
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres"] }
+ipnetwork = "0.21"
 
 # Caching
 moka = { version = "0.12", features = ["future"] }
@@ -90,7 +87,7 @@ bytes = "1"
 
 # Auth primitives
 argon2 = "0.5"
-rand = "0.8"
+rand = "0.10"
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"

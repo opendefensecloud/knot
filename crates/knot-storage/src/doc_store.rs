@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -141,6 +141,13 @@ fn doc_from_row(r: DocRow) -> Document {
         is_template: r.10,
     }
 }
+/// Shared SELECT column list, spliced into query strings with `format!`.
+///
+/// sqlx 0.9 only accepts `&'static str` directly, so every query below wraps
+/// its `format!` in `AssertSqlSafe`. That assertion holds because this is the
+/// ONLY value interpolated into those strings — it is a compile-time constant,
+/// never caller-supplied — and every runtime value remains a `$N` bind.
+/// Keep it that way: interpolating anything else here would defeat the check.
 const COLS: &str = "id, workspace_id, parent_id, title, sort_key, icon, created_by, created_at, updated_at, archived_at, is_template";
 
 #[async_trait]
@@ -148,11 +155,11 @@ impl DocStore for PgDocStore {
     async fn list_alive(&self, workspace_id: Uuid) -> Result<Vec<Document>, DocStoreError> {
         // Templates live in their own gallery (see list_templates) and
         // are intentionally excluded from the main doc-tree listing.
-        let rows = sqlx::query_as::<_, DocRow>(&format!(
+        let rows = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "SELECT {COLS} FROM documents
              WHERE workspace_id = $1 AND archived_at IS NULL AND NOT is_template
              ORDER BY parent_id NULLS FIRST, sort_key"
-        ))
+        )))
         .bind(workspace_id)
         .fetch_all(&self.pool)
         .await?;
@@ -160,11 +167,11 @@ impl DocStore for PgDocStore {
     }
 
     async fn list_templates(&self, workspace_id: Uuid) -> Result<Vec<Document>, DocStoreError> {
-        let rows = sqlx::query_as::<_, DocRow>(&format!(
+        let rows = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "SELECT {COLS} FROM documents
              WHERE workspace_id = $1 AND archived_at IS NULL AND is_template
              ORDER BY title"
-        ))
+        )))
         .bind(workspace_id)
         .fetch_all(&self.pool)
         .await?;
@@ -179,11 +186,11 @@ impl DocStore for PgDocStore {
         is_template: bool,
     ) -> Result<Document, DocStoreError> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query_as::<_, DocRow>(&format!(
+        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "UPDATE documents SET is_template = $3, updated_at = now()
              WHERE workspace_id = $1 AND id = $2
              RETURNING {COLS}"
-        ))
+        )))
         .bind(workspace_id)
         .bind(doc_id)
         .bind(is_template)
@@ -209,11 +216,12 @@ impl DocStore for PgDocStore {
     }
 
     async fn get(&self, doc_id: Uuid) -> Result<Option<Document>, DocStoreError> {
-        let row =
-            sqlx::query_as::<_, DocRow>(&format!("SELECT {COLS} FROM documents WHERE id = $1"))
-                .bind(doc_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
+            "SELECT {COLS} FROM documents WHERE id = $1"
+        )))
+        .bind(doc_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(doc_from_row))
     }
 
@@ -226,11 +234,11 @@ impl DocStore for PgDocStore {
         created_by: Uuid,
     ) -> Result<Document, DocStoreError> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query_as::<_, DocRow>(&format!(
+        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
              VALUES ($1, $2, $3, $4, $5)
              RETURNING {COLS}"
-        ))
+        )))
         .bind(workspace_id)
         .bind(parent_id)
         .bind(title)
@@ -263,11 +271,11 @@ impl DocStore for PgDocStore {
         icon: Option<&str>,
     ) -> Result<Document, DocStoreError> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query_as::<_, DocRow>(&format!(
+        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "UPDATE documents SET title = $3, icon = COALESCE($4, icon), updated_at = now()
              WHERE workspace_id = $1 AND id = $2
              RETURNING {COLS}"
-        ))
+        )))
         .bind(workspace_id)
         .bind(doc_id)
         .bind(title)
@@ -318,11 +326,11 @@ impl DocStore for PgDocStore {
                 return Err(DocStoreError::Cycle);
             }
         }
-        let row = sqlx::query_as::<_, DocRow>(&format!(
+        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "UPDATE documents SET parent_id = $3, sort_key = $4, updated_at = now()
              WHERE workspace_id = $1 AND id = $2
              RETURNING {COLS}"
-        ))
+        )))
         .bind(workspace_id)
         .bind(doc_id)
         .bind(parent_id)
@@ -417,12 +425,12 @@ impl DocStore for PgDocStore {
         workspace_id: Uuid,
         parent_id: Option<Uuid>,
     ) -> Result<Vec<Document>, DocStoreError> {
-        let rows = sqlx::query_as::<_, DocRow>(&format!(
+        let rows = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "SELECT {COLS} FROM documents
              WHERE workspace_id = $1 AND parent_id IS NOT DISTINCT FROM $2
                    AND archived_at IS NULL
              ORDER BY sort_key"
-        ))
+        )))
         .bind(workspace_id)
         .bind(parent_id)
         .fetch_all(&self.pool)

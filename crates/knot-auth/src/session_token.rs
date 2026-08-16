@@ -5,7 +5,7 @@
 //! base64url-encoded form (43 chars, no padding).
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngCore;
+use rand::TryRng;
 use thiserror::Error;
 
 pub const TOKEN_BYTES: usize = 32;
@@ -22,7 +22,13 @@ pub struct SessionToken([u8; TOKEN_BYTES]);
 impl SessionToken {
     pub fn generate() -> Self {
         let mut buf = [0u8; TOKEN_BYTES];
-        rand::rngs::OsRng.fill_bytes(&mut buf);
+        // rand 0.10 renamed OsRng -> SysRng and made it fallible; 0.8's
+        // fill_bytes panicked internally on OS CSPRNG failure, so panicking
+        // here preserves the previous behaviour rather than minting a
+        // predictable token.
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut buf)
+            .expect("OS CSPRNG unavailable");
         Self(buf)
     }
 

@@ -1,5 +1,5 @@
 //! Integration tests for share-token creation, revocation, ACL, expiry, and
-//! anonymous public access via /p/:token.
+//! anonymous public access via /p/{token}.
 
 use std::sync::Arc;
 

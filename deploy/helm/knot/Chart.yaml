@@ -5,11 +5,17 @@ description: |
   Multi-user collaborative knowledge base with CRDT-backed
   real-time editing.
 type: application
-version: 0.3.4
-appVersion: "0.1.7"
-home: https://github.com/trevex/knot
+# version/appVersion are INERT PLACEHOLDERS. release.yaml packages the chart with
+# `helm package --version "$VERSION" --app-version "$VERSION"`, forcing both from
+# the git tag, so these values never reach a published chart — they are only seen
+# by local `helm template`/`helm install` from a checkout and by `ct lint`.
+# 0.0.0 is deliberate: the previous 0.3.4/0.1.7 were inherited from an unrelated
+# lineage and were mistaken for real chart versions.
+version: 0.0.0
+appVersion: "0.0.0"
+home: https://github.com/opendefensecloud/knot
 sources:
-  - https://github.com/trevex/knot
+  - https://github.com/opendefensecloud/knot
 maintainers:
   - name: christianhuening
 icon: ""

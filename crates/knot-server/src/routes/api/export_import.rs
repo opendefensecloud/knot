@@ -34,7 +34,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/workspace/export", get(export_workspace))
         .route("/api/workspace/import", post(import))
-        .route("/api/docs/:doc_id/export", get(export_doc))
+        .route("/api/docs/{doc_id}/export", get(export_doc))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1010,7 +1010,7 @@ fn remap_sentinels(
 /// `image/svg+xml` (script-in-SVG) for arbitrary uploaded bytes. The
 /// real defense for SVG is the public-share path (which is fine — it's
 /// just bytes through CORS-friendly headers); this clamp protects the
-/// authenticated `/api/blobs/:id` path.
+/// authenticated `/api/blobs/{id}` path.
 fn sanitize_content_type(declared: &str) -> String {
     // Strip parameters (`text/plain; charset=utf-8` → `text/plain`).
     let base = declared

@@ -1,5 +1,5 @@
-//! GET  /api/docs/:id/markdown    → text/markdown export
-//! POST /api/docs/:id/markdown    → cold-import markdown as a y-update
+//! GET  /api/docs/{id}/markdown    → text/markdown export
+//! POST /api/docs/{id}/markdown    → cold-import markdown as a y-update
 //!
 //! The room actor is the exclusive owner of the live `DocHandle`, so we only
 //! ask it for an encoded state snapshot (`Event::ExportState`) and perform

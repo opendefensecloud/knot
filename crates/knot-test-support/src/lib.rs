@@ -20,7 +20,7 @@
 //! instance these are cheap; thousands of empty databases use kilobytes
 //! of storage and no idle resources.
 
-use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
+use sqlx::{AssertSqlSafe, Executor, PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
 
 /// Connection string for the dev-compose Postgres. Override with the
@@ -61,7 +61,7 @@ pub async fn fresh_db_url() -> String {
         .expect("admin connect (is `make compose.up` running?)");
     let name = format!("t_{}", Uuid::new_v4().simple());
     admin
-        .execute(format!(r#"CREATE DATABASE "{name}""#).as_str())
+        .execute(AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
         .await
         .expect("create database");
     drop(admin);

@@ -55,7 +55,7 @@ pulldown-cmark.workspace = true
 # raw HTML and unsafe link schemes through verbatim, which is stored XSS on
 # /p/:token. ammonia is pure-Rust (musl/scratch friendly).
 ammonia = "4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Allocator: mimalloc on all platforms knot actually runs on.
 # musl's default mallocng has known throughput cliffs under multi-threaded
@@ -72,7 +72,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 mimalloc = "0.1"
 
 [dev-dependencies]
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 yrs.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

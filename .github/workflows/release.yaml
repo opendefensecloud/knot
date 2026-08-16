@@ -17,12 +17,12 @@ jobs:
       packages: write # push to ghcr
       id-token: write # keyless cosign signing via GitHub OIDC
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -30,7 +30,7 @@ jobs:
 
       - name: Docker metadata (tags + OCI labels/annotations)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
           # {{version}} strips the leading "v" (v0.1.0 -> 0.1.0) to match Chart.AppVersion;
@@ -45,7 +45,7 @@ jobs:
 
       - name: Build + push multi-arch
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -64,6 +64,12 @@ jobs:
           sbom: true
 
       - name: Install cosign
+        # Deliberately held at v3 (cosign 2.x) while every other action here
+        # moved to its current major. v4 installs cosign 3.x, which writes a
+        # different signature bundle format — that is a change consumers feel,
+        # not just CI, and anyone verifying knot images with a cosign 2.x
+        # verifier would start failing. Bump once downstream verifiers are
+        # known to handle cosign 3 bundles.
         uses: sigstore/cosign-installer@v3
 
       - name: Sign image (keyless)
@@ -79,11 +85,11 @@ jobs:
       contents: read
       packages: write # push the OCI chart to ghcr
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
-          version: v3.16.0
+          version: v3.21.4
       - name: Package + push chart to ghcr (OCI)
         # Both the chart version and appVersion are forced to the stripped git tag so a release
         # publishes exactly the chart+image this tag built (the version baked into Chart.yaml is
@@ -103,7 +109,7 @@ jobs:
     permissions:
       contents: write # create the GitHub Release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Derive versions
         id: v
         run: |
@@ -111,7 +117,7 @@ jobs:
           echo "image=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           echo "chart=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           body: |

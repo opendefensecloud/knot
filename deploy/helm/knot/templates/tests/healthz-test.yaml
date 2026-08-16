@@ -10,7 +10,7 @@ spec:
   restartPolicy: Never
   containers:
     - name: curl
-      image: curlimages/curl:8.10.1
+      image: curlimages/curl:8.21.0
       command:
         - sh
         - -c

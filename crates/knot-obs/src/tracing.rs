@@ -1,18 +1,22 @@
 //! OpenTelemetry OTLP exporter setup.
 //!
-//! API notes for opentelemetry-otlp 0.27.0 / opentelemetry_sdk 0.27.1:
+//! API notes for opentelemetry-otlp 0.32.0 / opentelemetry_sdk 0.32.1:
 //!
 //! - `SpanExporter::builder().with_tonic().with_endpoint(…).build()` — unchanged.
-//! - The SDK struct is `TracerProvider` (NOT `SdkTracerProvider`; that name is unreleased).
-//! - `TracerProviderBuilder::with_batch_exporter` no longer takes a runtime argument.
-//! - `Resource::new(kvs)` is the current constructor (builder_empty is unreleased).
+//! - The SDK struct is `SdkTracerProvider` (renamed from `TracerProvider` in 0.28,
+//!   which is why it no longer collides with the `trace::TracerProvider` trait).
+//! - `TracerProviderBuilder::with_batch_exporter` takes only the exporter; the
+//!   runtime argument was dropped, so the `rt-tokio` feature is only needed for
+//!   the batch processor's own scheduling.
+//! - `Resource::new(kvs)` is gone; build via `Resource::builder().with_attribute(…)`.
 //! - `global::shutdown_tracer_provider()` is gone; call `provider.shutdown()` directly.
-//! - The caller must hold the returned `TracerProvider` and call `shutdown()` on drop/exit.
+//! - The caller must hold the returned provider and call `shutdown()` on drop/exit.
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, thiserror::Error)]
@@ -33,18 +37,19 @@ pub fn init_with_otlp(
     format: &str,
     endpoint: &str,
     service_name: &str,
-) -> Result<opentelemetry_sdk::trace::TracerProvider, TracingError> {
+) -> Result<SdkTracerProvider, TracingError> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
         .build()
         .map_err(|e| TracingError::Otlp(e.to_string()))?;
 
-    let resource = Resource::new([KeyValue::new("service.name", service_name.to_string())]);
+    let resource = Resource::builder()
+        .with_attribute(KeyValue::new("service.name", service_name.to_string()))
+        .build();
 
-    // In 0.27.1, with_batch_exporter still takes a runtime argument.
-    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_resource(resource)
         .build();
 
@@ -74,9 +79,9 @@ pub fn init_with_otlp(
 
 /// Flush and shut down the OTLP exporter.
 ///
-/// Pass the `TracerProvider` returned by `init_with_otlp`.
+/// Pass the `SdkTracerProvider` returned by `init_with_otlp`.
 /// Any error is logged but not propagated (best-effort at shutdown time).
-pub fn shutdown(provider: opentelemetry_sdk::trace::TracerProvider) {
+pub fn shutdown(provider: SdkTracerProvider) {
     if let Err(e) = provider.shutdown() {
         eprintln!("knot-obs: OTLP shutdown error: {e}");
     }

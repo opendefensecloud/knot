@@ -5,7 +5,11 @@
 image:
   # Image published by this repo's release workflow (release.yaml) on a v* tag, with the
   # leading "v" stripped so the pushed tag matches .Chart.AppVersion.
-  repository: ghcr.io/christianhuening/knot
+  # MUST match `ghcr.io/${{ github.repository }}` in release.yaml. This previously
+  # pointed at ghcr.io/christianhuening/knot — a real, populated registry from a
+  # different lineage — so a default install silently ran an unrelated image
+  # instead of failing.
+  repository: ghcr.io/opendefensecloud/knot
   tag: ""              # defaults to .Chart.AppVersion at template-render time
   pullPolicy: IfNotPresent
   pullSecrets: []

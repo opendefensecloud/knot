@@ -19,7 +19,7 @@ ipnetwork.workspace = true
 base64.workspace = true
 rand.workspace = true
 metrics.workspace = true
-rust-s3 = { version = "0.36", default-features = false, features = ["tokio-rustls-tls"] }
+rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"] }
 
 [dev-dependencies]
 knot-test-support = { path = "../knot-test-support" }

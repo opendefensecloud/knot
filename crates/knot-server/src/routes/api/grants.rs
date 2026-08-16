@@ -1,7 +1,7 @@
 //! Document grants API:
-//! - GET    /api/docs/:id/grants
-//! - PUT    /api/docs/:id/grants/:principal   body: {role, inherit}
-//! - DELETE /api/docs/:id/grants/:principal
+//! - GET    /api/docs/{id}/grants
+//! - PUT    /api/docs/{id}/grants/{principal}   body: {role, inherit}
+//! - DELETE /api/docs/{id}/grants/{principal}
 //!
 //! Mounted into the docs router so the shared `require_doc_role_mw` layer
 //! covers these routes too.

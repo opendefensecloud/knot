@@ -6,3 +6,9 @@ chart-dirs:
 # Maintainer `name` fields hold a human name (not a GitHub username), so skip
 # the GitHub-account existence check that `ct` performs by default.
 validate-maintainers: false
+# Chart.yaml's version/appVersion are inert placeholders — release.yaml forces
+# BOTH from the git tag when packaging (`helm package --version --app-version`),
+# so the committed values never reach a published chart. With the placeholder
+# parked at 0.0.0 there is no in-repo version to increment, and ct's default
+# increment check would fail every chart PR.
+check-version-increment: false
