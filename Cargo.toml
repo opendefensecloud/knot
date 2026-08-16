@@ -36,10 +36,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
-tracing-opentelemetry = "0.28"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.33"
 
 # Error handling
 thiserror = "2"
@@ -65,10 +65,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros", "ipnetwork"] }
 tokio-postgres = "0.7"
 # mTLS for the PgBus tokio-postgres connection (rustls; ring provider chosen
-# explicitly since aws-lc-rs is also in the graph).
-tokio-postgres-rustls = "0.13"
+# explicitly since aws-lc-rs is also in the graph). 0.14 ships `default = []`,
+# so the provider feature is required here — without it the crate builds but
+# links no crypto backend.
+tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
 futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
@@ -83,7 +84,7 @@ bytes = "1"
 
 # Auth primitives
 argon2 = "0.5"
-rand = "0.8"
+rand = "0.10"
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"

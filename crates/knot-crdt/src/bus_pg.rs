@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_postgres::config::SslMode;
+use rustls::pki_types::pem::PemObject;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
@@ -140,7 +141,7 @@ fn build_tls_connector(tls: &PgTls) -> Result<MakeRustlsConnect, BusError> {
 fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, BusError> {
     let data =
         std::fs::read(path).map_err(|e| BusError::Io(format!("read {}: {e}", path.display())))?;
-    rustls_pemfile::certs(&mut &data[..])
+    rustls::pki_types::CertificateDer::pem_slice_iter(&data)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| BusError::Io(format!("parse certs {}: {e}", path.display())))
 }
@@ -148,9 +149,8 @@ fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'stat
 fn load_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>, BusError> {
     let data =
         std::fs::read(path).map_err(|e| BusError::Io(format!("read {}: {e}", path.display())))?;
-    rustls_pemfile::private_key(&mut &data[..])
-        .map_err(|e| BusError::Io(format!("parse key {}: {e}", path.display())))?
-        .ok_or_else(|| BusError::Io(format!("no private key in {}", path.display())))
+    rustls::pki_types::PrivateKeyDer::from_pem_slice(&data)
+        .map_err(|e| BusError::Io(format!("parse key {}: {e}", path.display())))
 }
 
 impl PgBus {

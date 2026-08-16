@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use base64::Engine;
-use rand::RngCore;
+use rand::TryRng;
 use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
@@ -66,7 +66,11 @@ impl PgShareTokenStore {
 
 fn fresh_token() -> String {
     let mut bytes = [0u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    // See session_token.rs: rand 0.10's SysRng is fallible, and a failure to
+    // reach the OS CSPRNG must not degrade into a guessable share token.
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS CSPRNG unavailable");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
