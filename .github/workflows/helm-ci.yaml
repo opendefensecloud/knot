@@ -27,7 +27,10 @@ jobs:
         uses: helm/chart-testing-action@v2.8.0
 
       - name: ct lint
-        run: ct lint --target-branch main --chart-dirs deploy/helm
+        # --config is required: chart-testing-action sets CT_CONFIG_DIR to the
+        # tool's own install dir, so ct never discovers the repo-root ct.yaml
+        # and silently ignores check-version-increment.
+        run: ct lint --config ct.yaml --target-branch main --chart-dirs deploy/helm
 
       # NOTE: `ct install` (deploy-to-kind smoke test) is intentionally omitted:
       # the chart's default image is not published yet, so an install hits

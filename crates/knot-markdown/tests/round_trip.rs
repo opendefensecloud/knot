@@ -299,10 +299,8 @@ fn boards_sentinel_parses_to_excalidraw_board() {
     for i in 0..frag.len(&txn) {
         if let Some(XmlOut::Element(el)) = frag.get(&txn, i) {
             let tag = el.tag().to_string();
-            let board_id = el
-                .get_attribute(&txn, "board_id")
-                .map(|v| v.to_string(&txn));
-            let label = el.get_attribute(&txn, "label").map(|v| v.to_string(&txn));
+            let board_id = el.get_attribute(&txn, "board_id");
+            let label = el.get_attribute(&txn, "label");
             found.push((tag, board_id, label));
         }
     }

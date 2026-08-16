@@ -13,17 +13,6 @@ use yrs::{
 /// Per-run formatting attributes: `mark_name → Any value`.
 type RunAttrs = HashMap<Arc<str>, Any>;
 
-/// Read an XML attribute as a plain `String`.
-///
-/// yrs 0.27 changed [`Xml::get_attribute`] to return `Option<Out>` instead of
-/// the `Option<String>` it returned through 0.21. Attributes written by the
-/// editor round-trip as `Any::String`, whose `Display` emits the raw value
-/// (no JSON quoting), so stringifying restores the pre-0.27 behaviour for
-/// every attribute this serialiser reads.
-fn attr<X: Xml, T: ReadTxn>(el: &X, txn: &T, name: &str) -> Option<String> {
-    el.get_attribute(txn, name).map(|v| v.to_string(txn))
-}
-
 #[derive(Debug, Error)]
 pub enum SerError {
     #[error("yrs read: {0}")]
@@ -75,7 +64,8 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
             buf.push('\n');
         }
         "heading" => {
-            let level: u8 = attr(el, txn, "level")
+            let level: u8 = el
+                .get_attribute(txn, "level")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1)
                 .clamp(1, 6);
@@ -106,7 +96,7 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
             }
         }
         "code_block" => {
-            let lang = attr(el, txn, "language").unwrap_or_default();
+            let lang = el.get_attribute(txn, "language").unwrap_or_default();
             buf.push_str("```");
             buf.push_str(&lang);
             buf.push('\n');
@@ -146,7 +136,7 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
                         continue;
                     };
                     let is_header = cell_el.tag().as_ref() == "table_header";
-                    let align = attr(&cell_el, txn, "align");
+                    let align = cell_el.get_attribute(txn, "align");
                     // Serialise cell content. Cells contain `block+` but for GFM
                     // we collapse to a single inline line: write each block then
                     // strip newlines and join with a space.
@@ -223,15 +213,15 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
             // attachment node by matching the link's href shape; for now
             // the export is lossy w.r.t. content-type/size (recoverable
             // from the blob metadata).
-            let url = attr(el, txn, "url").unwrap_or_default();
-            let name = attr(el, txn, "name").unwrap_or_default();
+            let url = el.get_attribute(txn, "url").unwrap_or_default();
+            let name = el.get_attribute(txn, "name").unwrap_or_default();
             let label = if name.is_empty() { "attachment" } else { &name };
             buf.push_str(&format!("[{label}]({url})\n"));
         }
         "image" => {
-            let src = attr(el, txn, "src").unwrap_or_default();
-            let alt = attr(el, txn, "alt").unwrap_or_default();
-            let title = attr(el, txn, "title");
+            let src = el.get_attribute(txn, "src").unwrap_or_default();
+            let alt = el.get_attribute(txn, "alt").unwrap_or_default();
+            let title = el.get_attribute(txn, "title");
             match title.as_deref() {
                 Some(t) if !t.is_empty() => {
                     let escaped = t.replace('"', "\\\"");
@@ -241,8 +231,8 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
             }
         }
         "excalidraw_board" => {
-            let board_id = attr(el, txn, "board_id").unwrap_or_default();
-            let label = attr(el, txn, "label");
+            let board_id = el.get_attribute(txn, "board_id").unwrap_or_default();
+            let label = el.get_attribute(txn, "label");
             let display = match label.as_deref() {
                 Some(s) if !s.is_empty() => s,
                 _ => crate::DEFAULT_BOARD_LABEL,
@@ -261,7 +251,7 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
                 };
                 // GFM task-list items carry a `checked` attr. Bullets without
                 // the attr emit a plain `- ` prefix.
-                let prefix = match attr(&item_el, txn, "checked").as_deref() {
+                let prefix = match item_el.get_attribute(txn, "checked").as_deref() {
                     Some("true") => "- [x] ",
                     Some(_) => "- [ ] ",
                     None => "- ",
@@ -270,7 +260,8 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
             }
         }
         "ordered_list" => {
-            let mut idx: u64 = attr(el, txn, "start")
+            let mut idx: u64 = el
+                .get_attribute(txn, "start")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1);
             let len = el.len(txn);

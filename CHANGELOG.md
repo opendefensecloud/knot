@@ -54,7 +54,7 @@ notes below need reading before rollout.
 ### Changed
 - Rust toolchain 1.96.0 → 1.97.1; declared MSRV corrected 1.80 → 1.94 (the real
   floor, set by sqlx 0.9).
-- axum 0.7 → 0.8, sqlx 0.8 → 0.9, yrs 0.21 → 0.27, OpenTelemetry 0.27 → 0.32,
+- axum 0.7 → 0.8, sqlx 0.8 → 0.9, OpenTelemetry 0.27 → 0.32,
   rand 0.8 → 0.10, zip 2 → 8, rust-s3 0.36 → 0.37, tower-http 0.6 → 0.7,
   pulldown-cmark 0.12 → 0.13, ipnetwork 0.20 → 0.21,
   metrics-exporter-prometheus 0.16 → 0.18, tokio-postgres-rustls 0.13 → 0.14.
@@ -81,6 +81,11 @@ notes below need reading before rollout.
   `0.3.4` package version.
 
 ### Deferred
+yrs 0.27 (CI showed it breaks document-history restore: the restored
+snapshot merges into the live doc instead of replacing it, so clients see the
+old and new text concatenated; pinned at 0.21 pending a fix to the room
+fan-out, and it carries no security benefit either way).
+
 Tailwind 4, TypeScript 7 (blocked: `@typescript-eslint` peers `<6.1.0` and this
 repo relies on type-aware linting), Tiptap 3, jsdom 30 (needs Node ≥ 22.22.2),
 Vite 8 (Rolldown/Oxc), and `reqwest` 0.13 (pinned by `openidconnect`).
