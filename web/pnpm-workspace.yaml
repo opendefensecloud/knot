@@ -31,11 +31,16 @@ overrides:
   # `^1.x` ranges on the ProseMirror core, and pnpm is free to resolve them to
   # different patches. When it does, the editor is handed two structurally
   # identical but nominally distinct `Node` types and tsc fails with a wall of
-  # "not assignable" errors. Collapsing each to one copy keeps the whole
-  # ProseMirror stack on a single set of types.
-  prosemirror-model: "^1.25.11"
-  prosemirror-state: "^1.4.4"
-  prosemirror-view: "^1.42.2"
+  # "not assignable" errors.
+  #
+  # Pinned EXACTLY to the versions main resolved, not to the newest release.
+  # These are the editor's document/transaction core: taking prosemirror-view
+  # 1.42 here changed how a remote replace-the-document update applies, and
+  # broke history restore in a way only CI reproduced. Dedupe is the goal;
+  # upgrading this stack is a separate, deliberate change.
+  prosemirror-model: "1.25.7"
+  prosemirror-state: "1.4.4"
+  prosemirror-view: "1.41.8"
 
 # pnpm >= 10 blocks dependency lifecycle scripts unless they are approved here.
 # esbuild is the only package in this tree whose install script is required.

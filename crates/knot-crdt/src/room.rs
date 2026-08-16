@@ -725,7 +725,7 @@ mod tests {
         let mut snapshot: Vec<Option<String>> = Vec::new();
         for i in 0..list.len(&txn) {
             if let Some(yrs::XmlOut::Element(li)) = list.get(&txn, i) {
-                snapshot.push(li.get_attribute(&txn, "checked"));
+                snapshot.push(li.get_attribute(&txn, "checked").map(|v| v.to_string(&txn)));
             }
         }
         assert_eq!(
