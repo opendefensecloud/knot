@@ -1,0 +1,44 @@
+# pnpm >= 11 no longer reads the "pnpm" field in package.json; everything that
+# lived there belongs here. See https://pnpm.io/settings.
+#
+# NOTE: this file and the "packageManager" bump in package.json are one atomic
+# change. pnpm 9 hard-fails on a pnpm-workspace.yaml that has no `packages:`
+# key, so landing this file while packageManager still says pnpm@9 breaks every
+# install. The pnpm/action-setup version in .github/workflows/ci.yml moves with
+# it for the same reason.
+
+overrides:
+  # Transitive pins that no parent bump can reach, because each parent declares
+  # an EXACT version rather than a range. Re-check when @excalidraw/excalidraw
+  # or mermaid publish — that is the only path to retiring these.
+  #
+  # @excalidraw/excalidraw hard-pins nanoid "3.3.3"; GHSA-28wg-ghj8-5hjv needs
+  # >=3.3.16 and GHSA-2v37-7h3g-55p8 needs >=3.3.18.
+  nanoid@<3.3.18: "^3.3.18"
+  # @excalidraw/mermaid-to-excalidraw hard-pins nanoid "4.0.2". The 4.x line has
+  # no patched release; 5.x is the first fixed major and exports the same named
+  # symbol, which is all the consumer uses.
+  nanoid@4: "^5.1.16"
+  # chevrotain and @chevrotain/{gast,cst-dts-gen} hard-pin lodash-es "4.17.21",
+  # which carries the _.template code-injection and prototype-pollution
+  # advisories. 4.18.1 patches all three.
+  lodash-es@<4.18.1: "^4.18.1"
+  # knot's HTML/SVG sanitiser (src/lib/sanitize.ts). Keep it floored at the
+  # patched release regardless of what mermaid or excalidraw ask for.
+  dompurify@<3.4.13: "^3.4.13"
+
+  # Deduplication, not security. @tiptap/pm and y-prosemirror both declare wide
+  # `^1.x` ranges on the ProseMirror core, and pnpm is free to resolve them to
+  # different patches. When it does, the editor is handed two structurally
+  # identical but nominally distinct `Node` types and tsc fails with a wall of
+  # "not assignable" errors. Collapsing each to one copy keeps the whole
+  # ProseMirror stack on a single set of types.
+  prosemirror-model: "^1.25.11"
+  prosemirror-state: "^1.4.4"
+  prosemirror-view: "^1.42.2"
+
+# pnpm >= 10 blocks dependency lifecycle scripts unless they are approved here.
+# esbuild is the only package in this tree whose install script is required.
+allowBuilds:
+  # postinstall links the platform-specific binary; `pnpm build` fails without it.
+  esbuild: true
