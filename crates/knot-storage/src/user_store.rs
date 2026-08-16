@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -106,6 +106,9 @@ fn map_user_violation(e: sqlx::Error) -> UserStoreError {
     UserStoreError::Sqlx(e)
 }
 
+/// Shared SELECT column list. As with `doc_store::COLS`, this constant is the
+/// only value interpolated into the query strings that `AssertSqlSafe` wraps;
+/// all caller-supplied values stay `$N` binds.
 const SELECT_USER_COLS: &str =
     "id, email::text, display_name, password_hash, oidc_subject, oidc_issuer, created_at";
 
@@ -117,11 +120,11 @@ impl UserStore for PgUserStore {
         display_name: &str,
         password_hash: &str,
     ) -> Result<User, UserStoreError> {
-        let row = sqlx::query_as::<_, UserRow>(&format!(
+        let row = sqlx::query_as::<_, UserRow>(AssertSqlSafe(format!(
             "INSERT INTO users (email, display_name, password_hash)
              VALUES ($1, $2, $3)
              RETURNING {SELECT_USER_COLS}"
-        ))
+        )))
         .bind(email)
         .bind(display_name)
         .bind(password_hash)
@@ -138,11 +141,11 @@ impl UserStore for PgUserStore {
         issuer: &str,
         subject: &str,
     ) -> Result<User, UserStoreError> {
-        let row = sqlx::query_as::<_, UserRow>(&format!(
+        let row = sqlx::query_as::<_, UserRow>(AssertSqlSafe(format!(
             "INSERT INTO users (email, display_name, oidc_issuer, oidc_subject)
              VALUES ($1, $2, $3, $4)
              RETURNING {SELECT_USER_COLS}"
-        ))
+        )))
         .bind(email)
         .bind(display_name)
         .bind(issuer)
@@ -157,9 +160,9 @@ impl UserStore for PgUserStore {
         // Cast the bound parameter to citext so the comparison uses
         // citext (case-insensitive) semantics; binding a Rust &str produces
         // a plain `text` parameter which would do a case-sensitive compare.
-        let row = sqlx::query_as::<_, UserRow>(&format!(
+        let row = sqlx::query_as::<_, UserRow>(AssertSqlSafe(format!(
             "SELECT {SELECT_USER_COLS} FROM users WHERE email = $1::citext"
-        ))
+        )))
         .bind(email)
         .fetch_optional(&self.pool)
         .await?;
@@ -171,10 +174,10 @@ impl UserStore for PgUserStore {
         issuer: &str,
         subject: &str,
     ) -> Result<Option<User>, UserStoreError> {
-        let row = sqlx::query_as::<_, UserRow>(&format!(
+        let row = sqlx::query_as::<_, UserRow>(AssertSqlSafe(format!(
             "SELECT {SELECT_USER_COLS} FROM users
              WHERE oidc_issuer = $1 AND oidc_subject = $2"
-        ))
+        )))
         .bind(issuer)
         .bind(subject)
         .fetch_optional(&self.pool)
@@ -183,9 +186,9 @@ impl UserStore for PgUserStore {
     }
 
     async fn find_by_id(&self, id: Uuid) -> Result<Option<User>, UserStoreError> {
-        let row = sqlx::query_as::<_, UserRow>(&format!(
+        let row = sqlx::query_as::<_, UserRow>(AssertSqlSafe(format!(
             "SELECT {SELECT_USER_COLS} FROM users WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;

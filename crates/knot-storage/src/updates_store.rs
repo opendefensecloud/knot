@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -75,6 +75,10 @@ impl UpdatesStore for PgUpdatesStore {
         }
         // Build "($1, $2, $3), ($1, $2, $4), ..." with shared doc_id +
         // by_user_id binds and one per-update bytea bind.
+        //
+        // The generated string contains only a fixed prefix and `$N` placeholder
+        // tuples whose N is a loop counter, so the `AssertSqlSafe` below is
+        // sound: no caller data reaches the SQL text, only the binds.
         let mut sql =
             String::from("INSERT INTO doc_updates (doc_id, by_user_id, update_bytes) VALUES ");
         for i in 0..updates.len() {
@@ -84,7 +88,7 @@ impl UpdatesStore for PgUpdatesStore {
             sql.push_str(&format!("($1, $2, ${})", i + 3));
         }
         sql.push_str(" RETURNING seq");
-        let mut q = sqlx::query_scalar::<_, i64>(&sql)
+        let mut q = sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql))
             .bind(doc_id)
             .bind(by_user_id);
         for u in updates {
