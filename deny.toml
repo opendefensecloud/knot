@@ -7,17 +7,38 @@ all-features = true
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
+# Every entry below is a finding with NO reachable fix at the pinned versions.
+# Each records the real dependency path (verified with `cargo tree -i <crate>`)
+# and the single upstream event that would let us drop the ignore. Re-check on
+# each dependency refresh; delete an entry the moment its fix lands.
 ignore = [
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive via testcontainers/bollard; superseded by rustls-pki-types in newer chains" },
-    # rsa v0.9 has a known timing sidechannel (Marvin Attack). Reachable via
-    # openidconnect -> oauth2 -> rsa for RS256 JWT signature verification (we
-    # never decrypt, only verify). No safe upgrade is available upstream; the
-    # RustCrypto/RSA team has not released a constant-time implementation as
-    # of this writing. Tracked: https://github.com/RustCrypto/RSA/issues/626
-    # Mitigation: Dex (our OIDC issuer) is deployed inside the same trust
-    # boundary as the server, so network-observable timing is bounded.
-    # Re-evaluate on every openidconnect/rsa release.
-    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack via openidconnect; verification-only path; no upstream fix yet" },
+    # rsa 0.9 has a timing sidechannel (Marvin Attack). rsa is a DIRECT
+    # dependency of openidconnect — NOT via oauth2, which declares no rsa at
+    # all — and openidconnect 4.0.1 (the current latest) requires `rsa ^0.9.2`
+    # non-optionally. The constant-time rewrite exists only in the 0.10.0-rc
+    # line, which no caret range can reach.
+    # Reachability: RS256 JWT signature VERIFICATION only; knot never decrypts.
+    # Mitigation: the OIDC issuer is deployed inside the same trust boundary as
+    # the server, bounding network-observable timing.
+    # Tracked: https://github.com/RustCrypto/RSA/issues/626
+    # Drop when: rsa 0.10.0 final ships AND openidconnect widens to ^0.10.
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack; direct dep of openidconnect 4.0.1; verification-only path; no stable fix published" },
+
+    # quick-xml < 0.41 parses S3 API responses (two DoS advisories: quadratic
+    # duplicate-attribute scanning and unbounded namespace allocation).
+    # Path: rust-s3 0.37.2 -> quick-xml ^0.38, and aws-creds 0.39.1 -> ^0.38.
+    # Both are already at their latest release, so 0.41 is unreachable without
+    # an upstream bump. Reachability: only parses responses from the configured
+    # S3 endpoint, which is operator-supplied infrastructure, not user input.
+    # Drop when: rust-s3 and aws-creds widen to quick-xml >= 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic attribute scan; capped at ^0.38 by rust-s3/aws-creds; parses only operator-configured S3 endpoint responses" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml namespace-allocation DoS; capped at ^0.38 by rust-s3/aws-creds; parses only operator-configured S3 endpoint responses" },
+
+    # smallstr is unmaintained with no successor. Path: yrs -> smallstr ^0.3,
+    # unchanged from yrs 0.21 through the current 0.27.3, so bumping yrs does
+    # not help. Unmaintained-only: no known vulnerability.
+    # Drop when: yrs replaces or vendors smallstr.
+    { id = "RUSTSEC-2026-0215", reason = "smallstr unmaintained; pinned at ^0.3 by yrs through 0.27.3; no vulnerability, no successor crate" },
 ]
 
 [licenses]
