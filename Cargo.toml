@@ -29,13 +29,13 @@ futures = "0.3"
 # Web
 axum = { version = "0.7", features = ["ws", "macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "compression-br", "fs", "timeout"] }
+tower-http = { version = "0.7", features = ["trace", "compression-br", "fs", "timeout"] }
 
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
@@ -46,10 +46,10 @@ thiserror = "2"
 anyhow = "1"
 
 # CRDT
-yrs = "0.21"
+yrs = "0.27"
 
 # Markdown parsing
-pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 # Config
 figment = { version = "0.10", features = ["env", "toml", "yaml"] }
@@ -57,9 +57,6 @@ figment = { version = "0.10", features = ["env", "toml", "yaml"] }
 # Codegen
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# Testing
-proptest = "1"
 
 # IDs
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -76,10 +73,6 @@ futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 ipnetwork = "0.20"
-
-# Testing — containers
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres"] }
 
 # Caching
 moka = { version = "0.12", features = ["future"] }
