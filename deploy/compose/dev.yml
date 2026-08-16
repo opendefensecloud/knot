@@ -10,6 +10,13 @@ services:
       POSTGRES_PASSWORD: knot
     ports:
       - "5432:5432"
+    # Docker defaults /dev/shm to 64 MB, which Postgres uses for parallel-query
+    # segments (32 MB each). knot_test_support::fresh_db() creates a database
+    # per integration test, and after a few full `cargo nextest` runs the
+    # accumulated backends exhaust it — queries then fail with
+    # "could not resize shared memory segment ... No space left on device",
+    # which looks like a code failure but is purely environmental.
+    shm_size: 1gb
     volumes:
       # postgres:18+ stores data in a major-version subdir and refuses a volume
       # mounted at the legacy /var/lib/postgresql/data; mount the parent instead
