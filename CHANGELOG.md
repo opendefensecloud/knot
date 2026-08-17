@@ -10,6 +10,102 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 _Changes on `main` that have not yet been tagged._
 
+## [0.2.1] - 2026-08-17
+
+Two bugs that CI could not see, and the two tests that now see them.
+
+**The Helm chart could never be installed** — charts `0.1.0` and `0.2.0` both
+fail at the very first step of `helm install`. And **restoring a document
+snapshot corrupted the document for every connected client**, appending the
+restored text to the existing content instead of replacing it.
+
+### Fixed
+- **Restoring a snapshot merged instead of replacing.** `ReplaceWithMarkdown`
+  clears the document fragment and applies the restored content in a single
+  transaction, but it broadcast and persisted the caller's `update_bytes` —
+  which encodes only the insertion. Peers therefore received the insert without
+  the delete and kept what they already had:
+
+  ```text
+  expected: "First version of the doc."
+  actual:   "Completely different content.First version of the doc"
+  ```
+
+  Because the _persisted_ update was also missing the deletion, this was a
+  data-integrity bug and not merely a display glitch: replaying the update log
+  reproduced the merged content. The room now captures what the transaction
+  actually produced via `observe_update_v1` — the same pattern
+  `PatchTaskChecked` already used — and persists and fans that out.
+
+  The existing `replace_with_markdown_swaps_content` test could not catch this:
+  it asserted on the room's own document, which was always correct. The new
+  `replace_broadcast_replaces_peer_content` asserts on the frame a peer
+  receives, applied to a peer holding the pre-restore state.
+
+  Affects every release with document history: `0.1.0` and `0.2.0`.
+- **The chart could never be installed.** The `pre-install`/`pre-upgrade`
+  migrate Job injected `KNOT_DATABASE_URL` but not `KNOT_SESSION_KEY`. The binary
+  loads and validates its entire config _before_ dispatching the subcommand, and
+  validation rejects an empty session key — so the hook exited 2 with
+  `KNOT_SESSION_KEY is required` and **every** `helm install` and `helm upgrade`
+  failed before reaching the Deployment:
+
+  ```text
+  Error: INSTALLATION FAILED: failed pre-install: resource Job/knot-migrate
+         not ready. status: Failed, message: Job Failed. failed: 1/1
+  config: invalid: KNOT_SESSION_KEY is required (set it in every environment)
+  ```
+
+  `migrate` never reads the session key; it only has to survive validation. The
+  Job now receives it from the same Secret the Deployment uses, honouring
+  `session.existingSecretName`/`existingSecretKey`.
+
+  The bug survived two releases because `ct install` is disabled in chart CI, so
+  nothing had ever deployed the chart — `helm lint` cannot see a hook that fails
+  at runtime.
+
+### Added
+- **Helm upgrade test** (`.github/workflows/helm-upgrade.yaml`). Installs the
+  previous _published_ release — chart pulled from ghcr and the real image, not
+  the working tree — seeds a document through that release's own API, runs
+  `helm upgrade` to the working tree, and then asserts:
+
+  1. `/api/version` changed — the binary actually swapped
+  2. the session cookie minted by the **old** version still authorises — the
+     session format and signing key survived
+  3. the seeded document still reads back — schema and migrations survived
+
+  Runs on chart, migration and `Dockerfile` changes, weekly against `main`, and
+  on demand. This is what caught the migrate Job bug.
+- `replace_broadcast_replaces_peer_content`, a room-level test asserting on the
+  bytes a peer actually receives from a restore rather than on the room's own
+  document. Reverting the fix turns it red with the exact production symptom
+  (`<paragraph>Replaced Content</paragraph><paragraph>Hello World</paragraph>`),
+  while the pre-existing test stays green.
+
+### Changed
+- `history.spec` no longer restores an arbitrary snapshot. It selected
+  `snapButtons.last()` — the oldest — which with `KNOT_SNAPSHOT_EVERY_N=1` is
+  the complete V1 only when every keystroke lands in one persisted batch: true
+  on a fast machine, false on a loaded runner, so the spec restored a prefix and
+  asserted on the full string. Its preview check only required `"First version"`,
+  which any prefix satisfies, so the failure surfaced later and read as a restore
+  bug. It now pins the newest snapshot that contains all of V1 and asserts the
+  full string in both places.
+
+### Operators
+- **Upgrading from chart `0.2.0`.** If you worked around the broken hook with
+  `--set migrations.enabled=false`, drop that override — `0.2.1` runs migrations
+  itself again. Nothing else about your values file changes.
+- **Installing fresh.** `helm install` now works with defaults; no manual
+  `/knot-server migrate` step is needed.
+- The stray `0.3.4` chart package has been deleted from ghcr, so
+  `helm install oci://ghcr.io/opendefensecloud/charts/knot` without `--version`
+  resolves to the newest real release instead of the mis-versioned `v0.1.0`
+  chart. The `--version` advice in the 0.2.0 notes below is no longer required.
+- The Prometheus `route` label change noted under 0.2.0 still applies if you are
+  coming from `0.1.0`.
+
 ## [0.2.0] - 2026-08-16
 
 Maintenance release: a full dependency refresh across every surface, clearing

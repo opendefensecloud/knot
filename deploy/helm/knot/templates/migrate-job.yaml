@@ -33,6 +33,16 @@ spec:
                 secretKeyRef:
                   name: {{ include "knot.dbSecretName" . }}
                   key: {{ include "knot.dbSecretKey" . }}
+            # `migrate` never reads the session key, but the binary loads and
+            # validates the WHOLE config before dispatching the subcommand, and
+            # validation rejects an empty KNOT_SESSION_KEY. Without this the hook
+            # exits 2 with "KNOT_SESSION_KEY is required" and every install and
+            # upgrade fails at pre-install/pre-upgrade.
+            - name: KNOT_SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "knot.sessionSecretName" . }}
+                  key: {{ include "knot.sessionSecretKey" . }}
           envFrom:
             - configMapRef:
                 name: {{ include "knot.fullname" . }}

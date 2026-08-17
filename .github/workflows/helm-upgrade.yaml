@@ -1,0 +1,348 @@
+name: Helm upgrade test
+
+# Proves the in-place upgrade path that `ct lint` cannot see: install the
+# previous tagged release, write data through ITS api, `helm upgrade` to the
+# working tree, then read that data back using the SAME session cookie.
+#
+# The three assertions are the point:
+#   1. /api/version changes            -> the binary actually swapped
+#   2. the old cookie still authorises  -> session format + signing key survived
+#   3. the seeded doc reads back        -> schema + migrations survived
+#
+# Deliberately a separate workflow from helm-ci.yaml: this builds an image and
+# runs a kind cluster (~10 min) where `ct lint` takes ~10 s, and the two want
+# different trigger paths.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/helm/**"
+      - "migrations/**"
+      - "Dockerfile"
+      - ".github/workflows/helm-upgrade.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "deploy/helm/**"
+      - "migrations/**"
+      - "Dockerfile"
+  # Server-side changes (session cookies, the CRDT bus, API shapes) can break an
+  # upgrade without touching any path above, but gating every Rust PR on a kind
+  # cluster is too expensive. The weekly run against main covers that drift, and
+  # workflow_dispatch is there for when you know a change is risky.
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: helm-upgrade-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read # pull the previous release's image from ghcr
+
+env:
+  NAMESPACE: knot-upgrade
+  RELEASE: knot
+  CLUSTER: knot-upgrade
+  CANDIDATE_IMAGE: knot:candidate
+
+jobs:
+  upgrade:
+    name: previous release -> working tree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the full tag list is how the upgrade base is resolved
+
+      # Pinned rather than taking the runner's preinstalled helm, and kept in
+      # sync with helm-ci.yaml and release.yaml so the chart is packaged,
+      # linted and upgrade-tested by one version.
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.21.4
+
+      - name: Resolve the upgrade base
+        id: prev
+        run: |
+          set -euo pipefail
+          # Newest v* tag reachable from HEAD. On a PR that is the last shipped
+          # release, i.e. exactly the upgrade an operator is about to perform.
+          TAG=$(git tag -l 'v*' --sort=-v:refname --merged HEAD | head -1)
+          if [ -z "$TAG" ]; then
+            echo "::error::no v* tag reachable from HEAD; nothing to upgrade from"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "Upgrading from $TAG"
+
+      - name: Pull the base release's published chart
+        run: |
+          set -euo pipefail
+          # The PUBLISHED chart, not `git archive` of the tag: Chart.yaml carries
+          # 0.0.0 placeholders in-tree and release.yaml injects the real version
+          # at package time, so the tagged tree is not what operators install.
+          # Pulling the artifact also means a broken chart push fails this test.
+          rm -rf /tmp/base && mkdir -p /tmp/base
+          helm pull "oci://ghcr.io/${{ github.repository_owner }}/charts/knot" \
+            --version "${{ steps.prev.outputs.version }}" \
+            --untar --untardir /tmp/base
+          helm show chart /tmp/base/knot | grep -E '^(name|version|appVersion):'
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the candidate image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          # Single-arch on purpose: the runner and the kind node are both amd64,
+          # so the arm64 leg would be ~10 min of QEMU for an image nothing loads.
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.CANDIDATE_IMAGE }}
+          # A version string that cannot collide with the base release, so
+          # assertion 1 below is unambiguous.
+          build-args: |
+            KNOT_VERSION=candidate-${{ github.sha }}
+            KNOT_COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # node_image is deliberately NOT pinned. The kind CLI and the node image
+      # are a matched pair: this action ships kind v0.31.0, and pointing it at a
+      # newer kindest/node fails with
+      #   ERROR: unknown containerd config version: 4 (supported versions: 2 and 3)
+      # Letting the action pick its own default keeps them in step, and the exact
+      # Kubernetes version is irrelevant to what this test asserts.
+      - uses: helm/kind-action@v1.14.0
+        with:
+          cluster_name: knot-upgrade
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load both images into kind
+        run: |
+          set -euo pipefail
+          BASE_IMAGE="ghcr.io/${{ github.repository }}:${{ steps.prev.outputs.version }}"
+          docker pull --platform linux/amd64 "$BASE_IMAGE"
+
+          # Via a single-platform archive, not `kind load docker-image`: the
+          # released image is a multi-arch index, and kind imports with
+          # --all-platforms, which fails on the manifests that were never pulled
+          # ("content digest ...: not found"). `docker save --platform` flattens
+          # it to the one platform the kind node can actually run.
+          docker save --platform linux/amd64 "$BASE_IMAGE" -o /tmp/base-image.tar
+          docker save --platform linux/amd64 "$CANDIDATE_IMAGE" -o /tmp/candidate-image.tar
+          kind load image-archive /tmp/base-image.tar --name "$CLUSTER"
+          kind load image-archive /tmp/candidate-image.tar --name "$CLUSTER"
+
+          echo "BASE_IMAGE=$BASE_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy Postgres
+        run: |
+          set -euo pipefail
+          kubectl create namespace "$NAMESPACE"
+          kubectl -n "$NAMESPACE" apply -f - <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: postgres
+          spec:
+            replicas: 1
+            selector:
+              matchLabels: { app: postgres }
+            template:
+              metadata:
+                labels: { app: postgres }
+              spec:
+                containers:
+                  - name: postgres
+                    # Matches the version used by ci.yml and deploy/compose/dev.yml.
+                    image: postgres:18-alpine
+                    env:
+                      - { name: POSTGRES_USER, value: knot }
+                      - { name: POSTGRES_PASSWORD, value: knot }
+                      - { name: POSTGRES_DB, value: knot }
+                      # The cluster is thrown away with the job; durability is
+                      # irrelevant and fsync off makes migrations noticeably faster.
+                      - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+                    args: ["postgres", "-c", "fsync=off", "-c", "full_page_writes=off"]
+                    ports:
+                      - containerPort: 5432
+                    readinessProbe:
+                      exec:
+                        command: ["pg_isready", "-U", "knot"]
+                      initialDelaySeconds: 3
+                      periodSeconds: 3
+                    volumeMounts:
+                      - { name: data, mountPath: /var/lib/postgresql/data }
+                volumes:
+                  - name: data
+                    emptyDir: {}
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgres
+          spec:
+            selector: { app: postgres }
+            ports:
+              - port: 5432
+                targetPort: 5432
+          EOF
+          kubectl -n "$NAMESPACE" rollout status deploy/postgres --timeout=180s
+
+      - name: Write the shared values file
+        run: |
+          set -euo pipefail
+          # ONE values file for both installs. The session key in particular must
+          # not change between them: assertion 2 only means something if the old
+          # cookie is being checked against the same signing key.
+          openssl rand -base64 32 > /tmp/session.key
+          cat > /tmp/values.yaml <<EOF
+          database:
+            url: "postgres://knot:knot@postgres:5432/knot"
+          session:
+            key: "$(cat /tmp/session.key)"
+          baseUrl: "http://127.0.0.1:8080"
+          EOF
+
+      - name: Migrate the database with the base image
+        run: |
+          set -euo pipefail
+          # Run migrations out-of-band and install the base with its hook off.
+          #
+          # Charts <= 0.2.0 ship a migrate Job that omits KNOT_SESSION_KEY. The
+          # binary validates the whole config before dispatching the subcommand,
+          # so that hook always exits 2 and `helm install` of those charts always
+          # fails. Doing it by hand is the only way to stand a base release up.
+          # The working tree's hook is fixed and IS exercised by the upgrade half
+          # below; once the resolved base is >= 0.2.1 this step can be deleted
+          # and `migrations.enabled=false` dropped from the install.
+          kubectl -n "$NAMESPACE" run base-migrate \
+            --image="$BASE_IMAGE" --image-pull-policy=IfNotPresent --restart=Never \
+            --env="KNOT_DATABASE_URL=postgres://knot:knot@postgres:5432/knot" \
+            --env="KNOT_SESSION_KEY=$(cat /tmp/session.key)" \
+            --command -- /knot-server migrate
+          if ! kubectl -n "$NAMESPACE" wait --for=jsonpath='{.status.phase}'=Succeeded \
+               pod/base-migrate --timeout=180s; then
+            echo "::error::base migration failed"
+            kubectl -n "$NAMESPACE" logs pod/base-migrate || true
+            exit 1
+          fi
+          kubectl -n "$NAMESPACE" logs pod/base-migrate
+
+      - name: Install the base release
+        run: |
+          set -euo pipefail
+          helm install "$RELEASE" /tmp/base/knot \
+            -n "$NAMESPACE" \
+            -f /tmp/values.yaml \
+            --set image.repository="ghcr.io/${{ github.repository }}" \
+            --set image.tag="${{ steps.prev.outputs.version }}" \
+            --set migrations.enabled=false \
+            --wait --timeout 5m
+
+      - name: Seed data through the base release
+        run: |
+          set -euo pipefail
+          source .github/scripts/knot-upgrade-lib.sh
+          port_forward
+
+          # Assertion 1, first half: record what the base release reports.
+          BASE_VER=$(api GET /api/version | jq -r .version)
+          echo "base /api/version -> $BASE_VER"
+          if [ "$BASE_VER" != "${{ steps.prev.outputs.version }}" ]; then
+            echo "::error::base image reports '$BASE_VER', expected '${{ steps.prev.outputs.version }}'"
+            exit 1
+          fi
+          echo "$BASE_VER" > /tmp/base.version
+
+          # /auth/* sits outside the CSRF layer, so first-run bootstrap needs no
+          # token. It returns the sid + csrf cookies that everything below uses.
+          curl -sSf -D /tmp/setup.headers -o /dev/null \
+            -X POST "$BASE_URL/auth/setup" \
+            -H 'content-type: application/json' \
+            -d '{"email":"ci@example.invalid","password":"upgrade-test-pw","display_name":"CI"}'
+
+          cookie sid  < /tmp/setup.headers > /tmp/sid
+          cookie csrf < /tmp/setup.headers > /tmp/csrf
+          echo "::add-mask::$(cat /tmp/sid)"
+          echo "::add-mask::$(cat /tmp/csrf)"
+
+          # An unsafe method with a live session DOES need the CSRF header.
+          api POST /api/docs '{"title":"upgrade-canary"}' | jq -r .id > /tmp/doc.id
+          echo "seeded doc $(cat /tmp/doc.id)"
+
+          stop_port_forward
+
+      - name: Upgrade to the working tree
+        run: |
+          set -euo pipefail
+          helm upgrade "$RELEASE" deploy/helm/knot \
+            -n "$NAMESPACE" \
+            -f /tmp/values.yaml \
+            --set image.repository=knot \
+            --set image.tag=candidate \
+            --wait --timeout 5m
+          helm history "$RELEASE" -n "$NAMESPACE"
+
+      - name: Verify the upgraded release
+        run: |
+          set -euo pipefail
+          source .github/scripts/knot-upgrade-lib.sh
+          port_forward
+
+          BASE_VER=$(cat /tmp/base.version)
+          DOC=$(cat /tmp/doc.id)
+
+          # 1. the binary actually swapped
+          NEW_VER=$(api GET /api/version | jq -r .version)
+          echo "upgraded /api/version -> $NEW_VER"
+          if [ "$NEW_VER" = "$BASE_VER" ]; then
+            echo "::error::still reporting '$BASE_VER' after upgrade; the rollout did not take"
+            exit 1
+          fi
+
+          # 2 + 3. the cookie minted by the OLD version still authorises, and the
+          # document it wrote is still readable. A 401 here means the session
+          # format or signing changed; a 404 means the data or schema did.
+          CODE=$(curl -s -o /tmp/doc.json -w '%{http_code}' \
+            "$BASE_URL/api/docs/$DOC" -H "cookie: sid=$(cat /tmp/sid)")
+          if [ "$CODE" != "200" ]; then
+            echo "::error::GET /api/docs/$DOC returned $CODE with the pre-upgrade cookie"
+            cat /tmp/doc.json || true
+            exit 1
+          fi
+          TITLE=$(jq -r .title /tmp/doc.json)
+          if [ "$TITLE" != "upgrade-canary" ]; then
+            echo "::error::doc survived but title is '$TITLE', expected 'upgrade-canary'"
+            exit 1
+          fi
+
+          echo "upgrade $BASE_VER -> $NEW_VER verified: session and data intact"
+          stop_port_forward
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          set +e
+          kubectl -n "$NAMESPACE" get all
+          echo "=== pods ==="
+          kubectl -n "$NAMESPACE" describe pods
+          echo "=== migrate job ==="
+          kubectl -n "$NAMESPACE" logs -l job-name --tail=200 --prefix
+          echo "=== knot ==="
+          kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/name=knot --tail=200 --prefix
+          echo "=== helm ==="
+          helm history "$RELEASE" -n "$NAMESPACE"
+          echo "=== port-forward ==="
+          cat /tmp/pf.log
