@@ -8,7 +8,33 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
-_Changes on `main` that have not yet been tagged._
+### Fixed
+- **The chart could never be installed.** The `pre-install`/`pre-upgrade`
+  migrate Job injected `KNOT_DATABASE_URL` but not `KNOT_SESSION_KEY`. The
+  binary loads and validates the entire config before dispatching the
+  subcommand, and validation rejects an empty session key — so the hook exited 2
+  with `KNOT_SESSION_KEY is required` and *every* `helm install` and
+  `helm upgrade` failed before reaching the Deployment. Present in the published
+  `0.1.0` and `0.2.0` charts alike; it survived because `ct install` is disabled
+  in chart CI, so nothing had ever deployed the chart. **Anyone installing chart
+  `0.2.0` must either wait for the next release or pass
+  `--set migrations.enabled=false` and run `/knot-server migrate` by hand with
+  both env vars set.**
+
+### Added
+- `helm-upgrade.yaml` workflow: installs the previous published release
+  (real chart from ghcr, real image), seeds a document through its API, runs
+  `helm upgrade` to the working tree, then asserts that (1) `/api/version`
+  changed, (2) the session cookie minted by the *old* version still authorises,
+  and (3) the seeded document still reads back. This is what caught the migrate
+  Job bug above. Runs on chart/migration/Dockerfile changes, weekly against
+  `main`, and on demand.
+
+### Operators
+- The stray `0.3.4` chart package has been deleted from ghcr, so
+  `helm install oci://ghcr.io/opendefensecloud/charts/knot` without `--version`
+  now resolves to the newest real release instead of the mis-versioned `v0.1.0`
+  chart. The `--version` advice in the 0.2.0 notes below is no longer required.
 
 ## [0.2.0] - 2026-08-16
 
