@@ -299,40 +299,64 @@ impl Room {
                         // In a single transaction on the live doc:
                         //   1. Clear the existing "default" XmlFragment content.
                         //   2. Apply the pre-parsed update bytes.
-                        {
-                            use yrs::{Transact, Update, XmlFragment, updates::decoder::Decode};
-                            // Get (or create) the fragment reference BEFORE opening the
-                            // mutable transaction, because get_or_insert_xml_fragment
-                            // internally acquires its own write lock. Calling it while
-                            // a TransactionMut is active would deadlock (write_blocking).
-                            let frag = self.doc.inner().get_or_insert_xml_fragment("default");
+                        use std::sync::{Arc, Mutex};
+                        use yrs::{Transact, Update, XmlFragment, updates::decoder::Decode};
+
+                        // Get (or create) the fragment reference BEFORE opening the
+                        // mutable transaction, because get_or_insert_xml_fragment
+                        // internally acquires its own write lock. Calling it while
+                        // a TransactionMut is active would deadlock (write_blocking).
+                        let frag = self.doc.inner().get_or_insert_xml_fragment("default");
+
+                        // Capture what the transaction ACTUALLY produces rather than
+                        // reusing `update_bytes`. The clear and the apply happen
+                        // together, but `update_bytes` encodes only the insertion —
+                        // persisting and fanning that out ships the insert without the
+                        // delete, so every peer MERGES the restored content into what
+                        // it already had instead of replacing it, yielding
+                        // "<old text><restored text>". Same capture pattern as
+                        // PatchTaskChecked below.
+                        let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+                        let captured_clone = captured.clone();
+                        let sub = self.doc.inner().observe_update_v1(move |_txn, e| {
+                            *captured_clone.lock().unwrap() = Some(e.update.clone());
+                        });
+                        let replace_result = {
                             let mut txn = self.doc.inner().transact_mut();
                             let len = frag.len(&txn);
                             if len > 0 {
                                 frag.remove_range(&mut txn, 0, len);
                             }
-                            let upd = match Update::decode_v1(&update_bytes) {
-                                Ok(u) => u,
-                                Err(e) => {
-                                    let _ = reply.send(Err(format!("decode: {e}")));
-                                    continue;
-                                }
-                            };
-                            if let Err(e) = txn.apply_update(upd) {
-                                let _ = reply.send(Err(format!("apply: {e}")));
-                                continue;
-                            }
+                            Update::decode_v1(&update_bytes)
+                                .map_err(|e| format!("decode: {e}"))
+                                .and_then(|upd| {
+                                    txn.apply_update(upd).map_err(|e| format!("apply: {e}"))
+                                })
+                        };
+                        // Dropping the subscription must happen AFTER the txn closes
+                        // (Drop on TransactionMut flushes the update notification).
+                        drop(sub);
+
+                        if let Err(e) = replace_result {
+                            let _ = reply.send(Err(e));
+                            continue;
                         }
+                        // A restore always clears and re-inserts, so the transaction
+                        // cannot be a no-op the way a task-checkbox patch can be.
+                        let Some(effective_bytes) = captured.lock().unwrap().take() else {
+                            let _ = reply.send(Err("replace produced no update".into()));
+                            continue;
+                        };
                         metrics::counter!("knot_room_updates_total", "source" => "restore").increment(1);
                         // Persist via the writer (mirrors ApplyUpdate path).
                         let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
                         let _ = self.persist_tx.send(crate::writer::PersistJob {
-                            bytes: update_bytes.clone(),
+                            bytes: effective_bytes.clone(),
                             by_user_id: None,
                             persisted: Some(persisted_tx),
                         }).await;
                         // Fan out the replace to local connections.
-                        let framed = wrap_sync_update(&update_bytes);
+                        let framed = wrap_sync_update(&effective_bytes);
                         let mut to_close: Vec<ConnId> = Vec::new();
                         for (cid, conn) in &self.conns {
                             match conn.tx.try_send(framed.clone()) {
@@ -836,6 +860,130 @@ mod tests {
         assert!(
             !content.contains("Hello World"),
             "expected 'Hello World' to be gone: {content:?}"
+        );
+
+        h.shutdown.cancel();
+    }
+
+    /// A restore must REPLACE the content a connected peer already holds, not
+    /// merge into it.
+    ///
+    /// The room's own doc was always correct (the test above covers that); the
+    /// bug was in what got fanned out. `ReplaceWithMarkdown` clears the fragment
+    /// and applies the new content in one transaction, but used to broadcast the
+    /// caller's `update_bytes` — which encodes only the insertion. A peer
+    /// applying that kept its old content and appended the restored text,
+    /// producing "Hello WorldReplaced Content" in the editor.
+    ///
+    /// So this asserts on the frame the room actually sends, applied to a peer
+    /// holding the pre-restore state. Checking the room's own doc cannot catch
+    /// the regression.
+    #[tokio::test]
+    async fn replace_broadcast_replaces_peer_content() {
+        use yrs::{GetString, Transact};
+
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let updates: Arc<dyn knot_storage::UpdatesStore> = Arc::new(NoopUpdates);
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            engine.clone(),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Seed the room, then join a peer so it starts from that state.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        h.tx.send(Event::ReplaceWithMarkdown {
+            update_bytes: make_replace_bytes_raw("Hello World"),
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        rx.await.unwrap().unwrap();
+
+        let (conn_tx, mut conn_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (join_tx, join_rx) = tokio::sync::oneshot::channel();
+        h.tx.send(Event::Join {
+            conn_id: Uuid::new_v4(),
+            handle: ConnHandle { tx: conn_tx },
+            reply: join_tx,
+        })
+        .await
+        .unwrap();
+        let peer_state = join_rx.await.unwrap().unwrap();
+
+        let peer = engine.new_doc();
+        engine.apply_update(&peer, &peer_state).unwrap();
+        {
+            let inner = peer.inner();
+            let frag = inner.get_or_insert_xml_fragment("default");
+            let txn = inner.transact();
+            assert!(
+                frag.get_string(&txn).contains("Hello World"),
+                "peer should start from the seeded content"
+            );
+        }
+
+        // Restore over the top of what the peer is holding.
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        h.tx.send(Event::ReplaceWithMarkdown {
+            update_bytes: make_replace_bytes_raw("Replaced Content"),
+            reply: tx2,
+        })
+        .await
+        .unwrap();
+        rx2.await.unwrap().unwrap();
+
+        // Apply every SYNC_UPDATE frame the room pushed, exactly as a client would.
+        let mut frames = 0;
+        while let Ok(frame) = conn_rx.try_recv() {
+            // [MSG_SYNC=0, SYNC_UPDATE=2, varuint(len), payload]
+            assert_eq!(&frame[..2], &[0u8, 2u8], "expected a SYNC_UPDATE frame");
+            let mut i = 2;
+            let mut len = 0u64;
+            let mut shift = 0;
+            loop {
+                let b = frame[i];
+                i += 1;
+                len |= u64::from(b & 0x7f) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            engine
+                .apply_update(&peer, &frame[i..i + len as usize])
+                .unwrap();
+            frames += 1;
+        }
+        assert!(frames > 0, "room fanned out nothing for the replace");
+
+        let inner = peer.inner();
+        let frag = inner.get_or_insert_xml_fragment("default");
+        let txn = inner.transact();
+        let content = frag.get_string(&txn);
+        assert!(
+            content.contains("Replaced Content"),
+            "peer missing the restored text: {content:?}"
+        );
+        assert!(
+            !content.contains("Hello World"),
+            "peer MERGED instead of replacing — the broadcast is missing the \
+             deletion half of the transaction: {content:?}"
         );
 
         h.shutdown.cancel();

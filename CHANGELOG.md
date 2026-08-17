@@ -12,15 +12,37 @@ _Changes on `main` that have not yet been tagged._
 
 ## [0.2.1] - 2026-08-17
 
-**The first release whose Helm chart can actually be installed.** Charts `0.1.0`
-and `0.2.0` both fail at the very first step of `helm install`; this release
-fixes that and adds the CI test that found it.
+Two bugs that CI could not see, and the two tests that now see them.
 
-No application code changed — the diff is the chart and CI only. The `0.2.1`
-image is behaviourally identical to `0.2.0`, so upgrading from `0.2.0` carries
-no runtime risk beyond the rollout itself.
+**The Helm chart could never be installed** — charts `0.1.0` and `0.2.0` both
+fail at the very first step of `helm install`. And **restoring a document
+snapshot corrupted the document for every connected client**, appending the
+restored text to the existing content instead of replacing it.
 
 ### Fixed
+- **Restoring a snapshot merged instead of replacing.** `ReplaceWithMarkdown`
+  clears the document fragment and applies the restored content in a single
+  transaction, but it broadcast and persisted the caller's `update_bytes` —
+  which encodes only the insertion. Peers therefore received the insert without
+  the delete and kept what they already had:
+
+  ```text
+  expected: "First version of the doc."
+  actual:   "Completely different content.First version of the doc"
+  ```
+
+  Because the _persisted_ update was also missing the deletion, this was a
+  data-integrity bug and not merely a display glitch: replaying the update log
+  reproduced the merged content. The room now captures what the transaction
+  actually produced via `observe_update_v1` — the same pattern
+  `PatchTaskChecked` already used — and persists and fans that out.
+
+  The existing `replace_with_markdown_swaps_content` test could not catch this:
+  it asserted on the room's own document, which was always correct. The new
+  `replace_broadcast_replaces_peer_content` asserts on the frame a peer
+  receives, applied to a peer holding the pre-restore state.
+
+  Affects every release with document history: `0.1.0` and `0.2.0`.
 - **The chart could never be installed.** The `pre-install`/`pre-upgrade`
   migrate Job injected `KNOT_DATABASE_URL` but not `KNOT_SESSION_KEY`. The binary
   loads and validates its entire config _before_ dispatching the subcommand, and
@@ -54,7 +76,12 @@ no runtime risk beyond the rollout itself.
   3. the seeded document still reads back — schema and migrations survived
 
   Runs on chart, migration and `Dockerfile` changes, weekly against `main`, and
-  on demand. This is what caught the bug above.
+  on demand. This is what caught the migrate Job bug.
+- `replace_broadcast_replaces_peer_content`, a room-level test asserting on the
+  bytes a peer actually receives from a restore rather than on the room's own
+  document. Reverting the fix turns it red with the exact production symptom
+  (`<paragraph>Replaced Content</paragraph><paragraph>Hello World</paragraph>`),
+  while the pre-existing test stays green.
 
 ### Operators
 - **Upgrading from chart `0.2.0`.** If you worked around the broken hook with
