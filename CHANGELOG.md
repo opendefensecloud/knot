@@ -8,33 +8,66 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+_Changes on `main` that have not yet been tagged._
+
+## [0.2.1] - 2026-08-17
+
+**The first release whose Helm chart can actually be installed.** Charts `0.1.0`
+and `0.2.0` both fail at the very first step of `helm install`; this release
+fixes that and adds the CI test that found it.
+
+No application code changed — the diff is the chart and CI only. The `0.2.1`
+image is behaviourally identical to `0.2.0`, so upgrading from `0.2.0` carries
+no runtime risk beyond the rollout itself.
+
 ### Fixed
 - **The chart could never be installed.** The `pre-install`/`pre-upgrade`
-  migrate Job injected `KNOT_DATABASE_URL` but not `KNOT_SESSION_KEY`. The
-  binary loads and validates the entire config before dispatching the
-  subcommand, and validation rejects an empty session key — so the hook exited 2
-  with `KNOT_SESSION_KEY is required` and *every* `helm install` and
-  `helm upgrade` failed before reaching the Deployment. Present in the published
-  `0.1.0` and `0.2.0` charts alike; it survived because `ct install` is disabled
-  in chart CI, so nothing had ever deployed the chart. **Anyone installing chart
-  `0.2.0` must either wait for the next release or pass
-  `--set migrations.enabled=false` and run `/knot-server migrate` by hand with
-  both env vars set.**
+  migrate Job injected `KNOT_DATABASE_URL` but not `KNOT_SESSION_KEY`. The binary
+  loads and validates its entire config _before_ dispatching the subcommand, and
+  validation rejects an empty session key — so the hook exited 2 with
+  `KNOT_SESSION_KEY is required` and **every** `helm install` and `helm upgrade`
+  failed before reaching the Deployment:
+
+  ```text
+  Error: INSTALLATION FAILED: failed pre-install: resource Job/knot-migrate
+         not ready. status: Failed, message: Job Failed. failed: 1/1
+  config: invalid: KNOT_SESSION_KEY is required (set it in every environment)
+  ```
+
+  `migrate` never reads the session key; it only has to survive validation. The
+  Job now receives it from the same Secret the Deployment uses, honouring
+  `session.existingSecretName`/`existingSecretKey`.
+
+  The bug survived two releases because `ct install` is disabled in chart CI, so
+  nothing had ever deployed the chart — `helm lint` cannot see a hook that fails
+  at runtime.
 
 ### Added
-- `helm-upgrade.yaml` workflow: installs the previous published release
-  (real chart from ghcr, real image), seeds a document through its API, runs
-  `helm upgrade` to the working tree, then asserts that (1) `/api/version`
-  changed, (2) the session cookie minted by the *old* version still authorises,
-  and (3) the seeded document still reads back. This is what caught the migrate
-  Job bug above. Runs on chart/migration/Dockerfile changes, weekly against
-  `main`, and on demand.
+- **Helm upgrade test** (`.github/workflows/helm-upgrade.yaml`). Installs the
+  previous _published_ release — chart pulled from ghcr and the real image, not
+  the working tree — seeds a document through that release's own API, runs
+  `helm upgrade` to the working tree, and then asserts:
+
+  1. `/api/version` changed — the binary actually swapped
+  2. the session cookie minted by the **old** version still authorises — the
+     session format and signing key survived
+  3. the seeded document still reads back — schema and migrations survived
+
+  Runs on chart, migration and `Dockerfile` changes, weekly against `main`, and
+  on demand. This is what caught the bug above.
 
 ### Operators
+- **Upgrading from chart `0.2.0`.** If you worked around the broken hook with
+  `--set migrations.enabled=false`, drop that override — `0.2.1` runs migrations
+  itself again. Nothing else about your values file changes.
+- **Installing fresh.** `helm install` now works with defaults; no manual
+  `/knot-server migrate` step is needed.
 - The stray `0.3.4` chart package has been deleted from ghcr, so
   `helm install oci://ghcr.io/opendefensecloud/charts/knot` without `--version`
-  now resolves to the newest real release instead of the mis-versioned `v0.1.0`
+  resolves to the newest real release instead of the mis-versioned `v0.1.0`
   chart. The `--version` advice in the 0.2.0 notes below is no longer required.
+- The Prometheus `route` label change noted under 0.2.0 still applies if you are
+  coming from `0.1.0`.
 
 ## [0.2.0] - 2026-08-16
 

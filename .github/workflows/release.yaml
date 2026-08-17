@@ -116,21 +116,60 @@ jobs:
           # Image and chart are both published under the stripped git tag (see the chart job).
           echo "image=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           echo "chart=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Build the release body
+        env:
+          VERSION: ${{ steps.v.outputs.image }}
+          CHART: ${{ steps.v.outputs.chart }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Lift this tag's section out of CHANGELOG.md so the release page shows
+          # the hand-written notes rather than only the generated commit list.
+          # Written as one file because action-gh-release takes `body` OR
+          # `body_path`, not both.
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && /^## \[/      { exit }
+            found                  { print }
+          ' CHANGELOG.md | sed '/./,$!d' > /tmp/notes.md
+
+          if [ ! -s /tmp/notes.md ]; then
+            # Not fatal — the artifacts still matter — but it means the tag was
+            # cut without a changelog entry, which is worth surfacing.
+            echo "::warning::no CHANGELOG.md section for $VERSION"
+            printf 'See [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n' \
+              "$REPO" "$REF" > /tmp/notes.md
+          fi
+
+          {
+            cat /tmp/notes.md
+            cat <<EOF
+
+          ---
+
+          ### Container image
+          \`ghcr.io/$REPO:$VERSION\` — multi-arch (amd64/arm64), cosign-signed, with SBOM + SLSA provenance.
+
+          ### Helm chart
+          \`\`\`sh
+          helm install knot oci://ghcr.io/$OWNER/charts/knot \\
+            --version $CHART \\
+            -n knot --create-namespace \\
+            --set database.url='postgres://…' \\
+            --set session.key="\$(openssl rand -base64 32)" \\
+            --set baseUrl=https://knot.example.com
+          \`\`\`
+          Full values: [chart README](https://github.com/$REPO/tree/$REF/deploy/helm/knot).
+          EOF
+          } > /tmp/release-body.md
+
+          echo "--- release body ---"
+          cat /tmp/release-body.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
-          body: |
-            ### Container image
-            `ghcr.io/${{ github.repository }}:${{ steps.v.outputs.image }}` — multi-arch (amd64/arm64), cosign-signed, with SBOM + SLSA provenance.
-
-            ### Helm chart
-            ```sh
-            helm install knot oci://ghcr.io/${{ github.repository_owner }}/charts/knot \
-              --version ${{ steps.v.outputs.chart }} \
-              -n knot --create-namespace \
-              --set database.url='postgres://…' \
-              --set session.key="$(openssl rand -base64 32)" \
-              --set baseUrl=https://knot.example.com
-            ```
-            Full values: [chart README](https://github.com/${{ github.repository }}/tree/${{ github.ref_name }}/deploy/helm/knot).
+          body_path: /tmp/release-body.md
