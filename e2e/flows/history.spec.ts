@@ -35,11 +35,32 @@ test("type → snapshot → edit → restore brings back the snapshot text", asy
   await page.keyboard.type("First version of the doc.");
   await page.waitForTimeout(500);
 
-  // Open history; wait for the snapshot list to be non-empty.
+  // Open history and pin down the snapshot that actually holds ALL of V1.
+  //
+  // KNOT_SNAPSHOT_EVERY_N=1 snapshots after every persisted batch, so typing V1
+  // leaves a trail of prefix snapshots ("F", "First version of the", …). The
+  // list is ORDER BY snapshot_seq DESC, so the OLDEST entry is complete only if
+  // every keystroke happened to land in a single batch — true on a fast machine,
+  // false on a loaded CI runner. That is what made this spec flaky: it restored
+  // a prefix and then asserted on the full string.
+  //
+  // Poll the newest snapshot until it contains the whole of V1, then remember it
+  // by seq so the same one can be re-selected after V2.
   await page.getByTestId("open-history").click();
   await expect(page.getByTestId("history-drawer")).toBeVisible();
   const snapButtons = page.locator("[data-testid^='history-snap-']");
   await expect.poll(() => snapButtons.count(), { timeout: 10_000 }).toBeGreaterThan(0);
+  await expect
+    .poll(
+      async () => {
+        await snapButtons.first().click();
+        return (await page.getByTestId("history-preview").textContent()) ?? "";
+      },
+      { timeout: 15_000 },
+    )
+    .toContain("First version of the doc.");
+  const v1TestId = (await snapButtons.first().getAttribute("data-testid")) ?? "";
+  expect(v1TestId).not.toBe("");
   // Close history; we'll come back after editing.
   await page.getByTestId("history-close").click();
 
@@ -53,13 +74,13 @@ test("type → snapshot → edit → restore brings back the snapshot text", asy
   // Sanity: editor reflects V2 now.
   await expect(editor).toContainText("Completely different content.");
 
-  // Re-open history; pick the OLDEST snapshot (lowest seq) which should be V1.
+  // Re-open history and select the exact V1 snapshot identified above.
   await page.getByTestId("open-history").click();
   await expect(page.getByTestId("history-drawer")).toBeVisible();
-  const lastSnap = snapButtons.last();
-  await lastSnap.click();
-  // Preview should contain "First version".
-  await expect(page.getByTestId("history-preview")).toContainText("First version", {
+  await page.getByTestId(v1TestId).click();
+  // Assert the FULL text, not just "First version" — a prefix snapshot would
+  // satisfy the looser check and only fail later, at the restore assertion.
+  await expect(page.getByTestId("history-preview")).toContainText("First version of the doc.", {
     timeout: 5_000,
   });
   // Confirm prompt → accept; then click Restore.
