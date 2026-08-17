@@ -83,6 +83,16 @@ restored text to the existing content instead of replacing it.
   (`<paragraph>Replaced Content</paragraph><paragraph>Hello World</paragraph>`),
   while the pre-existing test stays green.
 
+### Changed
+- `history.spec` no longer restores an arbitrary snapshot. It selected
+  `snapButtons.last()` — the oldest — which with `KNOT_SNAPSHOT_EVERY_N=1` is
+  the complete V1 only when every keystroke lands in one persisted batch: true
+  on a fast machine, false on a loaded runner, so the spec restored a prefix and
+  asserted on the full string. Its preview check only required `"First version"`,
+  which any prefix satisfies, so the failure surfaced later and read as a restore
+  bug. It now pins the newest snapshot that contains all of V1 and asserts the
+  full string in both places.
+
 ### Operators
 - **Upgrading from chart `0.2.0`.** If you worked around the broken hook with
   `--set migrations.enabled=false`, drop that override — `0.2.1` runs migrations
