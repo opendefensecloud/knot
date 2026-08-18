@@ -16,7 +16,14 @@ function reset() {
   );
 }
 
-test.beforeAll(reset);
+// beforeEACH, not beforeAll. All three tests below bootstrap through
+// /setup, and POST /auth/setup returns 410 (auth.setup_closed) once any user
+// exists — SetupPage then renders an error and does NOT navigate, so every
+// test after the first hung until the 30s timeout and only passed on retry
+// (a retry restarts the worker, which re-runs a beforeAll). That read as
+// flakiness for a long time; it was deterministic. Same reason
+// create-placement, new-doc-edit-mode and tree-reorder reset per test.
+test.beforeEach(reset);
 
 /**
  * Drive a rectangle into the open Excalidraw modal via the dev-only
