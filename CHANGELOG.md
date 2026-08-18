@@ -8,7 +8,16 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
-_Changes on `main` that have not yet been tagged._
+### Changed
+- `excalidraw.spec` resets per test. Its two long-standing "flaky" specs were
+  deterministic failures: all three tests bootstrap through `/setup`, but the
+  file reset once per file with `beforeAll`, and `POST /auth/setup` returns 410
+  once a user exists — `SetupPage` renders that error without navigating, so
+  tests 2 and 3 sat on `/setup` for the full 30s timeout. They passed on retry
+  only because a retry restarts the worker and re-runs `beforeAll`. That is why
+  it was always exactly two flaky specs: the number of tests after the first.
+  The suite now reports `42 passed` with no flakes, and the playwright job
+  dropped from ~10m to ~5m.
 
 ## [0.2.1] - 2026-08-17
 
