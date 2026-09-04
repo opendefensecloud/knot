@@ -199,6 +199,7 @@ async fn from_template_clones_markdown_into_new_doc() {
     room.tx
         .send(Event::ReplaceWithMarkdown {
             update_bytes: mutate_bytes,
+            by_user: None,
             reply: tx,
         })
         .await

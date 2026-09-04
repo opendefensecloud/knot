@@ -172,6 +172,7 @@ pub async fn restore(
         .tx
         .send(knot_crdt::Event::ReplaceWithMarkdown {
             update_bytes,
+            by_user: None,
             reply: tx,
         })
         .await
