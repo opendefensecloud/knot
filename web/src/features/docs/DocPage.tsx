@@ -14,6 +14,7 @@ import { Breadcrumb } from "./Breadcrumb";
 import { docsApi } from "./docs.api";
 import { editModeKey } from "./editMode";
 import { HistoryDrawer } from "./HistoryDrawer";
+import { ImportMarkdownButton } from "./ImportMarkdownButton";
 
 const KnotEditor = lazy(() =>
   import("../editor/KnotEditor").then((m) => ({ default: m.KnotEditor })),
@@ -179,6 +180,9 @@ export default function DocPage() {
           >
             <FileCode size={16} aria-hidden />
           </IconButton>
+          {(effRole === "owner" || effRole === "editor") && (
+            <ImportMarkdownButton docId={id} docTitle={meta.title} />
+          )}
           <IconButton
             data-testid="doc-export"
             label="Export doc (shift-click for subtree)"
