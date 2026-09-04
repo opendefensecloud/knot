@@ -45,6 +45,8 @@ test("import a .md file into an empty page, then replace it", async ({ page }) =
 
   await expect(editor.locator("h1")).toHaveText("Imported Heading", { timeout: 10_000 });
   await expect(editor.locator("li")).toHaveCount(2);
+  // Plain bullets must not pick up a checkbox.
+  await expect(editor.locator("li[data-checked]")).toHaveCount(0);
 
   // Second import into the now-non-empty page: accept the confirm and check
   // the old body is gone rather than appended to.
@@ -76,4 +78,28 @@ test("paste Markdown source into the editor", async ({ page }) => {
 
   await expect(editor.locator("h2")).toHaveText("Pasted Heading", { timeout: 10_000 });
   await expect(editor.locator("li")).toHaveCount(2);
+});
+
+// Checklists and tables are first-class in knot, and both arrive through the
+// server's Markdown parser, which stores `checked` as a Yjs string rather than
+// the boolean the editor's own input rules produce. Importing used to render
+// those items as plain bullets.
+test("an imported checklist keeps its checkboxes", async ({ page }) => {
+  await newDoc(page);
+  const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
+
+  await page.getByTestId("doc-import-md-input").setInputFiles({
+    name: "plan.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from(
+      "# Release Plan\n\n" +
+        "| env | owner |\n| --- | --- |\n| prod | ops |\n\n" +
+        "- [ ] cut the tag\n- [x] write the notes\n",
+    ),
+  });
+
+  await expect(editor.locator("h1")).toHaveText("Release Plan", { timeout: 10_000 });
+  await expect(editor.locator("td").first()).toHaveText("prod");
+  await expect(editor.locator("li[data-checked='false']")).toHaveText("cut the tag");
+  await expect(editor.locator("li[data-checked='true']")).toHaveText("write the notes");
 });

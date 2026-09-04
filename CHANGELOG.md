@@ -23,6 +23,16 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   fixes, and what the import control uses. A replace is now also attributed to
   the user who made it, instead of landing in `doc_updates` with a null author.
 
+### Fixed
+- **Checklists arriving from the server rendered as plain bullets.** A
+  `list_item`'s `checked` attribute reaches the editor as a boolean when you
+  type `[ ] `, but as the string `"true"`/`"false"` when the document was
+  parsed by `knot_markdown::from_markdown` — the editor only understood the
+  boolean form. Anything built from Markdown server-side therefore lost its
+  checkboxes: imported files, and pages created from a template. The task
+  index and the Markdown round-trip were always correct; only the rendering
+  was wrong.
+
 ### Changed
 - `excalidraw.spec` resets per test. Its two long-standing "flaky" specs were
   deterministic failures: all three tests bootstrap through `/setup`, but the
