@@ -127,6 +127,23 @@ export default function DocPage() {
 
   const meta = doc.data.ok;
 
+  // Named rather than an inline `async` handler: `onClick` is typed to
+  // return void, so handing it a promise leaves rejections unhandled.
+  // Callers below fire it with `void`, the same idiom the editor uses for
+  // its own async work.
+  async function toggleTemplate() {
+    const next = !meta.is_template;
+    const r = await docsApi.setTemplate(id!, next);
+    if ("error" in r) {
+      notify("error", next ? "Couldn't save as template" : "Couldn't unmark");
+      return;
+    }
+    notify("info", next ? "Saved as template" : "Removed from templates");
+    await qc.invalidateQueries({ queryKey: ["docs"] });
+    await qc.invalidateQueries({ queryKey: ["templates"] });
+    await doc.refetch();
+  }
+
   return (
     <section data-testid="doc-page" className="mx-auto max-w-[760px] px-6 py-8">
       <Breadcrumb items={[{ title: "Documents" }, { title: meta.title }]} />
@@ -204,18 +221,7 @@ export default function DocPage() {
               data-testid="toggle-template"
               label={meta.is_template ? "Remove from templates" : "Save as template"}
               active={meta.is_template}
-              onClick={async () => {
-                const next = !meta.is_template;
-                const r = await docsApi.setTemplate(id, next);
-                if ("error" in r) {
-                  notify("error", next ? "Couldn't save as template" : "Couldn't unmark");
-                  return;
-                }
-                notify("info", next ? "Saved as template" : "Removed from templates");
-                await qc.invalidateQueries({ queryKey: ["docs"] });
-                await qc.invalidateQueries({ queryKey: ["templates"] });
-                await doc.refetch();
-              }}
+              onClick={() => { void toggleTemplate(); }}
             >
               <LayoutTemplate size={16} aria-hidden />
             </IconButton>

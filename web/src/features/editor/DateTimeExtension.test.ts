@@ -112,7 +112,7 @@ describe("DateTimeExtension", () => {
       const content = node.content as Array<Record<string, unknown>> | undefined;
       content?.forEach(walk);
     }
-    walk(json as unknown as Record<string, unknown>);
+    walk(json);
     expect(hrefs).toContain(href);
     editor.destroy();
   });

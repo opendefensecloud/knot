@@ -14,7 +14,6 @@
  */
 
 import { Extension } from "@tiptap/core";
-import type { RawCommands } from "@tiptap/core";
 import Suggestion from "@tiptap/suggestion";
 import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { type Editor } from "@tiptap/core";
@@ -249,7 +248,7 @@ export const DateTimeExtension = Extension.create({
           });
           return true;
         },
-    } as Partial<RawCommands>;
+    };
   },
 
   addProseMirrorPlugins() {

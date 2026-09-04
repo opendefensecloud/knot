@@ -133,6 +133,29 @@ export function DocTree() {
     move.mutate({ id: movedId, body: moveArgs(target, d.intent) });
   }
 
+  // Named rather than an inline `async` handler: `onPickTemplate` is typed
+  // to return void, so handing it a promise leaves rejections unhandled.
+  // The caller below fires it with `void`.
+  async function createFromTemplate(
+    templateId: string,
+    title: string,
+    parentId: string | null,
+  ) {
+    setPickerOpen(false);
+    const r = await docsApi.createFromTemplate(templateId, {
+      title,
+      ...(parentId ? { parent_id: parentId } : {}),
+    });
+    if ("error" in r) {
+      notify("error", "Couldn't create from template");
+      return;
+    }
+    await qc.invalidateQueries({ queryKey: ["docs"] });
+    const created = r.ok as { id: string };
+    markDocEditMode(created.id);
+    await nav(`/doc/${created.id}`);
+  }
+
   const tree = list.data && "ok" in list.data ? buildTree(list.data.ok) : [];
 
   return (
@@ -195,20 +218,8 @@ export function DocTree() {
             setPickerOpen(false);
             create.mutate(parentId ?? undefined);
           }}
-          onPickTemplate={async (templateId, title, parentId) => {
-            setPickerOpen(false);
-            const r = await docsApi.createFromTemplate(templateId, {
-              title,
-              ...(parentId ? { parent_id: parentId } : {}),
-            });
-            if ("error" in r) {
-              notify("error", "Couldn't create from template");
-              return;
-            }
-            await qc.invalidateQueries({ queryKey: ["docs"] });
-            const created = r.ok as { id: string };
-            markDocEditMode(created.id);
-            await nav(`/doc/${created.id}`);
+          onPickTemplate={(templateId, title, parentId) => {
+            void createFromTemplate(templateId, title, parentId);
           }}
         />
       )}
