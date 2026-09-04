@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { sanitizeSvg } from "./sanitize";
+import { sanitizeEditorFragment, sanitizeSvg } from "./sanitize";
 
 describe("sanitizeSvg", () => {
   it("strips <script> from board SVG", () => {
@@ -31,5 +31,50 @@ describe("sanitizeSvg", () => {
     const clean = sanitizeSvg(ok);
     expect(clean).toContain("path");
     expect(clean).toContain("stroke");
+  });
+});
+
+describe("sanitizeEditorFragment", () => {
+  function html(fragment: DocumentFragment): string {
+    const host = document.createElement("div");
+    host.appendChild(fragment);
+    return host.innerHTML;
+  }
+
+  it("keeps the structure knot's schema can represent", () => {
+    const out = html(
+      sanitizeEditorFragment(
+        '<h2>Title</h2><ul><li>one</li></ul><p><a href="https://x.test">link</a></p>',
+      ),
+    );
+    expect(out).toContain("<h2>Title</h2>");
+    expect(out).toContain("<li>one</li>");
+    expect(out).toContain('href="https://x.test"');
+  });
+
+  it("keeps checkbox inputs so task items can be promoted", () => {
+    const out = html(
+      sanitizeEditorFragment('<ul><li><input type="checkbox" checked>done</li></ul>'),
+    );
+    expect(out).toContain("<input");
+    expect(out).toContain('type="checkbox"');
+  });
+
+  it("keeps data-checked", () => {
+    const out = html(sanitizeEditorFragment('<ul><li data-checked="true">done</li></ul>'));
+    expect(out).toContain('data-checked="true"');
+  });
+
+  it("strips scripts and event handlers", () => {
+    const out = html(
+      sanitizeEditorFragment('<p>hi</p><script>alert(1)</script><img src=x onerror="alert(1)">'),
+    );
+    expect(out).not.toContain("script");
+    expect(out).not.toContain("onerror");
+  });
+
+  it("strips javascript: URLs", () => {
+    const out = html(sanitizeEditorFragment('<a href="javascript:alert(1)">x</a>'));
+    expect(out).not.toContain("javascript:");
   });
 });

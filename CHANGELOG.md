@@ -8,6 +8,31 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Added
+- **Import a Markdown file as a page.** The doc page has an "Import Markdown…"
+  control next to Export: pick a `.md` file and it becomes the page body. The
+  editor also understands Markdown on paste, so pasting a document's source
+  now produces real headings, lists, tables and task items instead of literal
+  `## Heading` text. Pasting is left alone when the clipboard carries rich
+  text, when the cursor is in a code block, and on ⌘⇧V.
+- `POST /api/docs/{id}/markdown` takes `?mode=replace`, which clears the page
+  before applying instead of merging into it. The default is unchanged
+  (`append`), so existing callers — including create-from-template — behave
+  exactly as before. Importing over a page that already had content used to
+  duplicate it (`"# Original\n\n# Imported\n"`); that is what the new mode
+  fixes, and what the import control uses. A replace is now also attributed to
+  the user who made it, instead of landing in `doc_updates` with a null author.
+
+### Fixed
+- **Checklists arriving from the server rendered as plain bullets.** A
+  `list_item`'s `checked` attribute reaches the editor as a boolean when you
+  type `[ ] `, but as the string `"true"`/`"false"` when the document was
+  parsed by `knot_markdown::from_markdown` — the editor only understood the
+  boolean form. Anything built from Markdown server-side therefore lost its
+  checkboxes: imported files, and pages created from a template. The task
+  index and the Markdown round-trip were always correct; only the rendering
+  was wrong.
+
 ### Changed
 - `excalidraw.spec` resets per test. Its two long-standing "flaky" specs were
   deterministic failures: all three tests bootstrap through `/setup`, but the

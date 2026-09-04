@@ -67,6 +67,10 @@ pub enum Event {
     ReplaceWithMarkdown {
         /// Full-state update bytes encoding the replacement content.
         update_bytes: Vec<u8>,
+        /// Attribution for the persisted update, mirroring `ApplyUpdate`.
+        /// `None` where there is no meaningful actor (workspace import), or
+        /// where the caller has not been threaded through yet.
+        by_user: Option<Uuid>,
         reply: oneshot::Sender<Result<i64, String>>,
     },
     /// Flip the `checked` attribute on the Nth task `list_item` in the doc.
@@ -295,7 +299,7 @@ impl Room {
                             .map(|bytes| (bytes, self.last_applied_seq));
                         let _ = reply.send(r);
                     }
-                    Some(Event::ReplaceWithMarkdown { update_bytes, reply }) => {
+                    Some(Event::ReplaceWithMarkdown { update_bytes, by_user, reply }) => {
                         // In a single transaction on the live doc:
                         //   1. Clear the existing "default" XmlFragment content.
                         //   2. Apply the pre-parsed update bytes.
@@ -352,7 +356,7 @@ impl Room {
                         let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
                         let _ = self.persist_tx.send(crate::writer::PersistJob {
                             bytes: effective_bytes.clone(),
-                            by_user_id: None,
+                            by_user_id: by_user,
                             persisted: Some(persisted_tx),
                         }).await;
                         // Fan out the replace to local connections.
@@ -675,6 +679,41 @@ mod tests {
         }
     }
 
+    /// Records the `by_user` argument each persist passes through, so
+    /// tests can assert attribution reaches the store.
+    struct RecordingUpdates {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Option<Uuid>>>>,
+    }
+    #[async_trait::async_trait]
+    impl knot_storage::UpdatesStore for RecordingUpdates {
+        async fn insert_batch(
+            &self,
+            _: Uuid,
+            by_user: Option<Uuid>,
+            updates: &[Vec<u8>],
+        ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+            self.seen.lock().unwrap().push(by_user);
+            Ok((1..=updates.len() as i64).collect())
+        }
+        async fn since(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+            Ok(vec![])
+        }
+        async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
+            Ok(0)
+        }
+        async fn delete_up_to(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<u64, knot_storage::UpdatesStoreError> {
+            Ok(0)
+        }
+    }
+
     struct NoopSnapshots;
     #[async_trait::async_trait]
     impl knot_storage::SnapshotStore for NoopSnapshots {
@@ -826,6 +865,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         h.tx.send(Event::ReplaceWithMarkdown {
             update_bytes: initial_bytes,
+            by_user: None,
             reply: tx,
         })
         .await
@@ -837,6 +877,7 @@ mod tests {
         let (tx2, rx2) = tokio::sync::oneshot::channel();
         h.tx.send(Event::ReplaceWithMarkdown {
             update_bytes: replacement_bytes,
+            by_user: None,
             reply: tx2,
         })
         .await
@@ -909,6 +950,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         h.tx.send(Event::ReplaceWithMarkdown {
             update_bytes: make_replace_bytes_raw("Hello World"),
+            by_user: None,
             reply: tx,
         })
         .await
@@ -942,6 +984,7 @@ mod tests {
         let (tx2, rx2) = tokio::sync::oneshot::channel();
         h.tx.send(Event::ReplaceWithMarkdown {
             update_bytes: make_replace_bytes_raw("Replaced Content"),
+            by_user: None,
             reply: tx2,
         })
         .await
@@ -1170,6 +1213,55 @@ mod tests {
         assert!(
             !state.is_empty(),
             "hydrated state should include the seed update"
+        );
+    }
+    /// A replace carries its author through to the persisted update.
+    /// Before this, `ReplaceWithMarkdown` hardcoded `by_user_id: None`, so
+    /// a full-document rewrite was the one mutation nobody could be blamed
+    /// for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replace_with_markdown_records_by_user() {
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates: Arc<dyn knot_storage::UpdatesStore> =
+            Arc::new(RecordingUpdates { seen: seen.clone() });
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            engine.clone(),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let alice = Uuid::new_v4();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        h.tx.send(Event::ReplaceWithMarkdown {
+            update_bytes: make_replace_bytes_raw("Imported"),
+            by_user: Some(alice),
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        rx.await.unwrap().expect("replace");
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![Some(alice)],
+            "replace should persist with its author, got {recorded:?}"
         );
     }
 }

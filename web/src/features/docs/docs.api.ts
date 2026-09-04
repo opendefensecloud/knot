@@ -53,4 +53,16 @@ export const docsApi = {
       body,
     });
   },
+  /**
+   * Import Markdown into an existing doc. `replace` swaps the body;
+   * `append` is the server's default and merges into whatever is already
+   * there. Returns 204 with no body, so `ok` is `undefined`.
+   */
+  importMarkdown(id: string, markdown: string, mode: "replace" | "append" = "replace") {
+    return apiFetch<void>(`/api/docs/${encodeURIComponent(id)}/markdown?mode=${mode}`, {
+      method: "POST",
+      body: markdown,
+      contentType: "text/markdown; charset=utf-8",
+    });
+  },
 };

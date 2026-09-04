@@ -34,7 +34,6 @@ export function buildTree(docs: Doc[]): TreeNode[] {
       const i = sib.indexOf(node);
       if (i >= 0) sib.splice(i, 1);
     }
-    // eslint-disable-next-line no-console
     console.warn(`buildTree: promoted unreachable node ${node.id} (parent cycle?)`);
     roots.push(node);
   });
