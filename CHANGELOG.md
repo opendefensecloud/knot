@@ -8,41 +8,46 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-04
+
+Markdown documents can be brought into knot — as a file, or by pasting the source.
+
 ### Added
-- **Import a Markdown file as a page.** The doc page has an "Import Markdown…"
-  control next to Export: pick a `.md` file and it becomes the page body. The
-  editor also understands Markdown on paste, so pasting a document's source
-  now produces real headings, lists, tables and task items instead of literal
-  `## Heading` text. Pasting is left alone when the clipboard carries rich
-  text, when the cursor is in a code block, and on ⌘⇧V.
-- `POST /api/docs/{id}/markdown` takes `?mode=replace`, which clears the page
-  before applying instead of merging into it. The default is unchanged
-  (`append`), so existing callers — including create-from-template — behave
-  exactly as before. Importing over a page that already had content used to
-  duplicate it (`"# Original\n\n# Imported\n"`); that is what the new mode
-  fixes, and what the import control uses. A replace is now also attributed to
-  the user who made it, instead of landing in `doc_updates` with a null author.
+- **Import a Markdown file as a page.** "Import Markdown…" sits next to Export on
+  the doc page, for editors and owners. 1 MB limit. Importing into a page that
+  already has content asks first; the previous version stays in History.
+- **Markdown-aware paste.** Pasting Markdown source now produces real headings,
+  lists, tables and task items instead of literal `## Heading` text. Left alone
+  when the clipboard carries rich text, inside a code block, and on ⌘⇧V.
+- `POST /api/docs/{id}/markdown` accepts `?mode=replace`, which clears the page
+  before applying. The default stays `append`, so existing callers — including
+  create-from-template — are unchanged.
 
 ### Fixed
-- **Checklists arriving from the server rendered as plain bullets.** A
-  `list_item`'s `checked` attribute reaches the editor as a boolean when you
-  type `[ ] `, but as the string `"true"`/`"false"` when the document was
-  parsed by `knot_markdown::from_markdown` — the editor only understood the
-  boolean form. Anything built from Markdown server-side therefore lost its
-  checkboxes: imported files, and pages created from a template. The task
-  index and the Markdown round-trip were always correct; only the rendering
-  was wrong.
+- **Importing over a page that had content duplicated it** instead of replacing.
+  The endpoint only ever merged into the live document; its one caller always
+  targeted an empty page, so the path was never exercised.
+- **Checklists built server-side rendered as plain bullets.** `from_markdown`
+  stores `checked` as the string `"true"`/`"false"`, but the editor matched only
+  the boolean form. Affected imported files and pages created from a template.
+  The Markdown round-trip and the task index were correct throughout; only the
+  rendering was wrong.
+- A full-document replace is attributed to the user who made it, rather than
+  landing in `doc_updates` with a null author.
+- `h2` 0.4.15 → 0.4.19 ([RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258),
+  unbounded empty DATA frames) and `chacha20` 0.10.1 → 0.10.2 (yanked). Both
+  transitive, via hyper and rand.
 
 ### Changed
-- `excalidraw.spec` resets per test. Its two long-standing "flaky" specs were
-  deterministic failures: all three tests bootstrap through `/setup`, but the
-  file reset once per file with `beforeAll`, and `POST /auth/setup` returns 410
-  once a user exists — `SetupPage` renders that error without navigating, so
-  tests 2 and 3 sat on `/setup` for the full 30s timeout. They passed on retry
-  only because a retry restarts the worker and re-runs `beforeAll`. That is why
-  it was always exactly two flaky specs: the number of tests after the first.
-  The suite now reports `42 passed` with no flakes, and the playwright job
-  dropped from ~10m to ~5m.
+- `pnpm lint` runs in CI, and the backlog it had accumulated unseen is cleared.
+  Two of those were real defects: `onClick` and `onPickTemplate` are typed to
+  return void, so their inline `async` handlers left promise rejections
+  unhandled — a failed request surfaced as an unhandled rejection instead of the
+  intended error toast.
+- `excalidraw.spec` resets per test instead of per file. Its two "flaky" specs
+  were deterministic failures: every test bootstraps through `/setup`, and
+  `POST /auth/setup` returns 410 once a user exists, so tests 2 and 3 sat on the
+  setup page until they timed out. The playwright job dropped from ~10m to ~5m.
 
 ## [0.2.1] - 2026-08-17
 
@@ -231,6 +236,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/opendefensecloud/knot/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/opendefensecloud/knot/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/opendefensecloud/knot/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/opendefensecloud/knot/releases/tag/v0.1.0
