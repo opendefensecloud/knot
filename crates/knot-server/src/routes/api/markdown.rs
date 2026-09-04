@@ -8,12 +8,21 @@
 //! traffic and avoids polluting the `Engine` trait with a markdown concern.
 //!
 //! For import we parse the markdown to a y-update in the handler (pure
-//! transform) and hand the bytes to the room via `Event::ApplyUpdate`, which
-//! applies + persists + fans out to local connections.
+//! transform) and hand the bytes to the room, which applies + persists +
+//! fans out to local connections.
+//!
+//! Import takes `?mode=append` (the default) or `?mode=replace`. Append
+//! hands the parsed bytes to `Event::ApplyUpdate`, which Yjs *merges* into
+//! the live fragment — right for `from_template`, which always targets a
+//! fresh doc, wrong for importing over a page that already has content
+//! (you get both, concatenated). Replace goes through
+//! `Event::ReplaceWithMarkdown`, which clears the fragment and applies in a
+//! single transaction. The default stays `append` so existing callers are
+//! unaffected; the doc page's import control asks for `replace`.
 
 use axum::{
     body::Body,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -158,9 +167,21 @@ pub(super) async fn export_inline(
         .unwrap()
 }
 
+/// Query for [`import_inline`].
+///
+/// Deliberately typed as `Option<String>` rather than a serde enum: an enum
+/// would make an unknown value fail deserialization, and axum would answer
+/// with its own plain-text 400 instead of our JSON error envelope.
+#[derive(serde::Deserialize)]
+pub(super) struct ImportQuery {
+    #[serde(default)]
+    mode: Option<String>,
+}
+
 pub(super) async fn import_inline(
     State(state): State<AppState>,
     Path(doc_id): Path<Uuid>,
+    Query(q): Query<ImportQuery>,
     req: Request,
 ) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
@@ -172,6 +193,14 @@ pub(super) async fn import_inline(
     if role.0 == knot_storage::WorkspaceRole::Viewer {
         return json_err(StatusCode::FORBIDDEN, "acl.editor_required", "");
     }
+    // `append` is the default because it is what shipped: `from_template`
+    // and any existing API client rely on the merge. Only the doc page's
+    // import control asks for `replace`.
+    let replace = match q.mode.as_deref() {
+        None | Some("append") => false,
+        Some("replace") => true,
+        Some(_) => return json_err(StatusCode::BAD_REQUEST, "markdown.bad_mode", ""),
+    };
     let Some(rooms) = state.rooms_v2.clone() else {
         return internal();
     };
@@ -203,29 +232,57 @@ pub(super) async fn import_inline(
             return internal();
         }
     };
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if room
-        .tx
-        .send(knot_crdt::Event::ApplyUpdate {
-            update_bytes,
-            by_user: Some(ctx.user_id),
-            reply: tx,
-        })
-        .await
-        .is_err()
-    {
-        return internal();
-    }
-    match rx.await {
-        Ok(Ok(_seq)) => {
+    // The two events reply over differently-typed channels (`EngineError`
+    // vs `String`), so they cannot share one oneshot — normalise to
+    // `Result<i64, String>` here.
+    let applied: Result<i64, String> = if replace {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if room
+            .tx
+            .send(knot_crdt::Event::ReplaceWithMarkdown {
+                update_bytes,
+                by_user: Some(ctx.user_id),
+                reply: tx,
+            })
+            .await
+            .is_err()
+        {
+            return internal();
+        }
+        match rx.await {
+            Ok(r) => r,
+            Err(_) => return internal(),
+        }
+    } else {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if room
+            .tx
+            .send(knot_crdt::Event::ApplyUpdate {
+                update_bytes,
+                by_user: Some(ctx.user_id),
+                reply: tx,
+            })
+            .await
+            .is_err()
+        {
+            return internal();
+        }
+        match rx.await {
+            Ok(Ok(seq)) => Ok(seq),
+            Ok(Err(e)) => Err(format!("{e:?}")),
+            Err(_) => return internal(),
+        }
+    };
+
+    match applied {
+        Ok(_seq) => {
             let _ = refresh_markdown_and_index(&state, doc_id).await;
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(Err(e)) => {
-            tracing::warn!(error=?e, "md import apply");
+        Err(e) => {
+            tracing::warn!(error = %e, %doc_id, replace, "md import apply");
             json_err(StatusCode::UNPROCESSABLE_ENTITY, "markdown.apply", "")
         }
-        Err(_) => internal(),
     }
 }
 
