@@ -22,6 +22,7 @@ import {
 } from "./CommentsHighlightExtension";
 import { EditorToolbar } from "./EditorToolbar";
 import { KnotProvider, type CommentChangeMsg, type MentionMsg, type ProviderStatus } from "./KnotProvider";
+import { looksLikeMarkdown, markdownToHtml } from "./markdownPaste";
 
 type Pair = { doc: Y.Doc; provider: KnotProvider };
 
@@ -102,6 +103,10 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
   const setActiveCommentId = useUi((s) => s.setActiveCommentId);
   const activeCommentId = useUi((s) => s.activeCommentId);
   const editorRef = useRef<Editor | null>(null);
+  // ⌘⇧V / Ctrl+Shift+V is the conventional "paste without formatting". The
+  // paste event carries no modifier state of its own, so latch it from the
+  // keydown that triggers the paste.
+  const plainPasteRef = useRef(false);
 
   // Fetch all comments (including resolved) for the highlight overlay.
   // We deliberately use a different cache key from the sidebar's "active
@@ -227,6 +232,14 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
       }),
       editable: canEdit,
       editorProps: {
+        handleDOMEvents: {
+          keydown: (_view, event) => {
+            if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v") {
+              plainPasteRef.current = event.shiftKey;
+            }
+            return false;
+          },
+        },
         handleDrop(_view, event, _slice, _moved) {
           const files = Array.from((event as DragEvent).dataTransfer?.files ?? []);
           if (files.length === 0) return false;
@@ -235,10 +248,29 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
           return true;
         },
         handlePaste(_view, event) {
-          const files = Array.from((event as ClipboardEvent).clipboardData?.files ?? []);
-          if (files.length === 0) return false;
+          const clipboard = (event as ClipboardEvent).clipboardData;
+          const files = Array.from(clipboard?.files ?? []);
+          if (files.length > 0) {
+            event.preventDefault();
+            void uploadAndInsert(files);
+            return true;
+          }
+          // Consume the latch on every paste, so a plain-text paste never
+          // leaks its opt-out into the next one.
+          const plainOnly = plainPasteRef.current;
+          plainPasteRef.current = false;
+          if (plainOnly) return false;
+          // A rich-text source already carries structure; ProseMirror's own
+          // clipboard parser handles it better than a Markdown round-trip.
+          if (clipboard?.types.includes("text/html")) return false;
+          const ed = editorRef.current;
+          // Inside a code block or a code mark, a paste must stay verbatim.
+          if (!ed || ed.isActive("code_block") || ed.isActive("code")) return false;
+          const text = clipboard?.getData("text/plain") ?? "";
+          if (!looksLikeMarkdown(text)) return false;
           event.preventDefault();
-          void uploadAndInsert(files);
+          ed.chain().focus().insertContent(markdownToHtml(text)).run();
+          notify("info", "Pasted as Markdown");
           return true;
         },
       },
