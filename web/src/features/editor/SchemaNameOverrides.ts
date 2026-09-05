@@ -17,17 +17,34 @@ import ListItem from "@tiptap/extension-list-item";
 import HardBreak from "@tiptap/extension-hard-break";
 import HorizontalRule from "@tiptap/extension-horizontal-rule";
 
+/**
+ * Renaming a node does not rewrite the OPTIONS its own commands read.
+ * BulletList and OrderedList resolve `options.itemTypeName` when building the
+ * wrap, and it defaults to the camelCase `listItem` — a node type this schema
+ * does not have. So `toggleBulletList()` and `toggleOrderedList()` threw
+ * "There is no node type named 'listItem'", taking `Mod-Shift-8` and
+ * `Mod-Shift-7` down with them.
+ *
+ * The toolbar buttons were never affected: they name both types explicitly
+ * (`toggleList("bullet_list", "list_item")`), which is why the keyboard
+ * shortcuts could be broken this long without anyone noticing.
+ *
+ * ListItem also declares `bulletListTypeName` / `orderedListTypeName` options,
+ * but nothing in the v2 extension reads them — its Enter/Tab/Shift-Tab keymaps
+ * all pass `this.name`, which the rename already corrected. They are left
+ * unconfigured rather than set to a plausible-looking value that does nothing.
+ */
 export const KnotBulletList = BulletList.extend({
   name: "bullet_list",
   // Original is "listItem+"; align with renamed item.
   content: "list_item+",
-});
+}).configure({ itemTypeName: "list_item" });
 
 export const KnotOrderedList = OrderedList.extend({
   name: "ordered_list",
   // Original is "listItem+".
   content: "list_item+",
-});
+}).configure({ itemTypeName: "list_item" });
 
 export const KnotListItem = ListItem.extend({
   name: "list_item",

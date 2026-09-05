@@ -275,11 +275,11 @@
   opacity: 1;
 }
 
-/* Optional selection highlight from the remote peer */
-.collaboration-cursor__selection {
-  background-color: currentColor;
-  opacity: 0.18;
-}
+/* No rule for the remote peer's selection highlight. y-prosemirror emits it
+   as `.ProseMirror-yjs-selection` with the peer's colour set inline at ~44%
+   alpha, so it is already styled and an inline background could not be
+   overridden from here anyway. A `.collaboration-cursor__selection` rule
+   stood here and matched nothing — that class does not exist. */
 
 /* ---------------------------------------------------------------- */
 /* Mermaid NodeView — source-mode pre/code overrides                 */
@@ -396,7 +396,19 @@
   overflow-x: auto;
 }
 
-.ProseMirror > pre {
+/* Everything below has to reach THROUGH a wrapper.
+   A React node view's outer element is Tiptap's own `div.react-renderer`
+   (ReactNodeView.dom returns `renderer.element`), and the component's
+   NodeViewWrapper — the element that carries our own attributes — renders
+   inside it. So the direct child of .ProseMirror is always that div, never
+   the card, and the `.ProseMirror > pre` / `> [data-testid=…]` selectors
+   these replace matched nothing at all. The bug was invisible because
+   `.ProseMirror > *` above still applied: diagrams, boards and code blocks
+   were being held at the prose measure in wide mode rather than erroring.
+
+   Tiptap stamps `node-<type>` on that wrapper, which is the stable hook. */
+
+.ProseMirror > .react-renderer.node-code_block {
   max-width: var(--knot-code-measure);
 }
 
@@ -405,9 +417,13 @@
    below the measure, so the page rhythm holds. The min-width floor is
    load-bearing: fit-content alone collapses an SVG sized `width="100%"`
    to below its natural size, because a percentage width contributes
-   nothing to intrinsic sizing. */
-.ProseMirror > [data-testid="mermaid-node"],
-.ProseMirror > [data-excalidraw-board="true"] {
+   nothing to intrinsic sizing.
+
+   A rendered Mermaid diagram is still a code_block, so the node-type class
+   cannot tell it apart from ordinary code — hence :has() for that one alone.
+   It follows the code_block rule above, so it wins on order. */
+.ProseMirror > .react-renderer.node-excalidraw_board,
+.ProseMirror > .react-renderer.node-code_block:has([data-testid="mermaid-node"]) {
   width: fit-content;
   min-width: min(100%, var(--knot-measure));
   max-width: 100%;

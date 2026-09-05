@@ -8,6 +8,15 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Security
+- **`@tiptap/core` 2.27.3** closes [GHSA-cp6q-959q-f8rh](https://github.com/advisories/GHSA-cp6q-959q-f8rh),
+  where `mergeAttributes()` turned an own `__proto__` key into inherited
+  executable DOM attributes. knot was not reachable — ProseMirror builds
+  `node.attrs` into a null-prototype object over schema-declared names only, so
+  no attacker-controlled key ever reached the merge — but the patched code is
+  free. The advisory's range still reads `< 3.30.4` and so keeps flagging
+  2.27.3; the backport is real, on the `v2-latest` tag.
+
 ## [0.4.0] - 2026-09-05
 
 The document column can be widened to use the window, and several things that
