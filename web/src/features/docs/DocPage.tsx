@@ -169,12 +169,19 @@ export default function DocPage() {
       <div className="measure">
         <Breadcrumb items={[{ title: "Documents" }, { title: meta.title }]} />
       </div>
-      <div className="measure mt-3 flex items-start gap-3">
-        <div className="flex-1 min-w-0">
+      {/* Wraps rather than overflows. The action row is 412px intrinsic on a
+          phone (the width toggle is hidden there) against a 327px content box,
+          and `shrink-0` with no wrapping used to force the last two buttons
+          off-screen. The title's min-width now breaks the row instead, and the
+          action row wraps internally into whatever width it is given. On the
+          desktop column it still fits one line — 200 + 452 + 12 <= 712 — so
+          that layout is unchanged. */}
+      <div className="measure mt-3 flex flex-wrap items-start gap-3">
+        <div className="flex-1 min-w-[200px]">
           <DocTitle key={id} id={id} initialTitle={meta.title}
                     editable={effRole !== "viewer" && editMode} />
         </div>
-        <div className="flex items-center gap-1 pt-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-1 pt-2">
           <SyncStatus sync={{ status, pendingBytes }} />
           {/* Keep the bare StatusDot mounted (invisible) so existing tests
               targeting `data-testid="status-dot"` still find it; SyncStatus
