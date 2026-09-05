@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, Eye, FileCode, History, LayoutTemplate, MessageSquare, Pencil, Share2 } from "lucide-react";
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState, type CSSProperties } from "react";
 import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
 
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
@@ -14,6 +14,7 @@ import { Breadcrumb } from "./Breadcrumb";
 import { docsApi } from "./docs.api";
 import { editModeKey } from "./editMode";
 import { HistoryDrawer } from "./HistoryDrawer";
+import { DocWidthToggle } from "./DocWidthToggle";
 import { ImportMarkdownButton } from "./ImportMarkdownButton";
 
 const KnotEditor = lazy(() =>
@@ -101,6 +102,19 @@ export default function DocPage() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [effRole]);
+  // ⌘⇧F / Ctrl+Shift+F toggles the layout width. Collision-free: the ⌘E
+  // handler above bails on e.shiftKey, and no browser binds ⌘⇧F.
+  const toggleDocWidth = useUi((s) => s.toggleDocWidth);
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        toggleDocWidth();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggleDocWidth]);
   const commentSidebarOpen = useUi((s) => s.commentSidebarOpen);
   const openCommentSidebar = useUi((s) => s.openCommentSidebar);
 
@@ -119,10 +133,10 @@ export default function DocPage() {
 
   if (!id) return null;
   if (doc.isLoading) {
-    return <div className="mx-auto max-w-[760px] px-6 py-8 text-fg-muted">Loading…</div>;
+    return <div className="doc-shell text-fg-muted">Loading…</div>;
   }
   if (!doc.data || "error" in doc.data) {
-    return <div className="mx-auto max-w-[760px] px-6 py-8 text-fg-muted">Document not found.</div>;
+    return <div className="doc-shell text-fg-muted">Document not found.</div>;
   }
 
   const meta = doc.data.ok;
@@ -145,9 +159,17 @@ export default function DocPage() {
   }
 
   return (
-    <section data-testid="doc-page" className="mx-auto max-w-[760px] px-6 py-8">
-      <Breadcrumb items={[{ title: "Documents" }, { title: meta.title }]} />
-      <div className="mt-3 flex items-start gap-3">
+    <section
+      data-testid="doc-page"
+      className="doc-shell"
+      // Drives the comment-rail inset in layout.css (>=1280 only), so the
+      // rail reserves space instead of covering live text.
+      style={{ "--knot-rail-w": commentSidebarOpen ? "400px" : "0px" } as CSSProperties}
+    >
+      <div className="measure">
+        <Breadcrumb items={[{ title: "Documents" }, { title: meta.title }]} />
+      </div>
+      <div className="measure mt-3 flex items-start gap-3">
         <div className="flex-1 min-w-0">
           <DocTitle key={id} id={id} initialTitle={meta.title}
                     editable={effRole !== "viewer" && editMode} />
@@ -170,6 +192,7 @@ export default function DocPage() {
               <span>Share</span>
             </Link>
           )}
+          <DocWidthToggle />
           {(effRole === "owner" || effRole === "editor") && (
             <IconButton
               data-testid="toggle-edit-mode"
@@ -239,7 +262,7 @@ export default function DocPage() {
         {mdView ? (
           <MarkdownView docId={id} />
         ) : (
-          <Suspense fallback={<p className="text-fg-muted">Loading editor…</p>}>
+          <Suspense fallback={<p className="measure text-fg-muted">Loading editor…</p>}>
             <KnotEditor
               docId={id}
               onStatus={setStatus}

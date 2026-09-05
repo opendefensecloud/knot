@@ -18,6 +18,8 @@ import Suggestion from "@tiptap/suggestion";
 import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { type Editor } from "@tiptap/core";
 
+import { placeFixedPopup } from "./popupPosition";
+
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
     knotDateTime: {
@@ -189,11 +191,10 @@ class DateTimePopup {
       this.timeInput.value = split.time;
       this.clearBtn.style.display = "none";
     }
-    if (rect) {
-      this.el.style.left = `${Math.round(rect.left)}px`;
-      this.el.style.top = `${Math.round(rect.bottom + 4)}px`;
-    }
+    // Display before positioning: a `display: none` element measures 0x0,
+    // which would defeat the viewport clamp.
     this.el.style.display = "flex";
+    if (rect) placeFixedPopup(this.el, rect);
     // Focus the date input so keyboard users can edit immediately.
     this.dateInput.focus();
   }

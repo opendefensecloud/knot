@@ -38,6 +38,11 @@ export const KnotTable = Table.extend({
   content: "table_row+",
 }).configure({
   resizable: true,
+  // Tiptap defaults this to false, and TableView (which emits its own
+  // wrapper) only mounts when the editor is editable — so view mode, the
+  // default here, had no `.tableWrapper` at all and nothing to scroll a
+  // colwidth-pinned table inside. prose.css gives the wrapper overflow-x.
+  renderWrapper: true,
   HTMLAttributes: { class: "knot-table" },
 });
 

@@ -1,4 +1,5 @@
 import { Menu } from "lucide-react";
+import { useEffect } from "react";
 import { Outlet } from "react-router-dom";
 
 import { DocTree } from "../features/docs/DocTree";
@@ -13,6 +14,20 @@ export function AppShell() {
   const toggleSidebar = useUi((s) => s.toggleSidebar);
   const vp = useViewport();
   const mobile = vp === "mobile";
+
+  // Mirror the width preference across tabs. setState rather than the
+  // persisting setDocWidth: writing back into storage from a storage event
+  // is a needless round trip, and this way there is no echo to reason about.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== "knot.docWidth") return;
+      const next = e.newValue === "wide" ? "wide" : "fixed";
+      document.documentElement.setAttribute("data-doc-width", next);
+      useUi.setState({ docWidth: next });
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   return (
     <div
