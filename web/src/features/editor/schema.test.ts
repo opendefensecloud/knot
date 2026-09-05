@@ -109,17 +109,11 @@ const EDITOR_ONLY_ATTRS: Record<string, string[]> = {
 };
 
 /**
- * Canonical attributes the editor does not implement.
- *
- * `to_markdown` emits a link title and `from_markdown` parses one, but no
- * editor affordance produces one — so a title that arrives through markdown
- * import is dropped the next time the link is edited. Pre-existing, small,
- * and tracked separately; recorded here so the parity check stays honest
- * rather than being weakened to hide it.
+ * Canonical attributes the editor does not implement. Empty, and meant to
+ * stay that way — an entry here is a one-way data-loss path, because
+ * ProseMirror silently drops what its schema does not declare.
  */
-const UNIMPLEMENTED_ATTRS: Record<string, string[]> = {
-  link: ["title"],
-};
+const UNIMPLEMENTED_ATTRS: Record<string, string[]> = {};
 
 const canonicalAttrs = (entries: { kind: string; attrs?: { name: string }[] }[]) =>
   new Map(entries.map((e) => [e.kind, (e.attrs ?? []).map((a) => a.name)]));

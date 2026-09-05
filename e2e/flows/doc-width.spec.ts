@@ -148,3 +148,45 @@ test("the width toggle is absent on mobile, where it would do nothing", async ({
   const shell = (await page.getByTestId("doc-page").boundingBox())!;
   expect(shell.width).toBeLessThanOrEqual(375);
 });
+
+test("code blocks and diagram cards break out of the prose measure in wide mode", async ({ page }) => {
+  // The breakout rules have to reach through Tiptap's own `div.react-renderer`,
+  // which is the real direct child of .ProseMirror for any React node view.
+  // Selectors written against the card itself match nothing, and the failure is
+  // invisible: `.ProseMirror > *` still caps the wrapper at the prose measure,
+  // so the card silently stays narrow instead of erroring.
+  await signIn(page);
+  await newDoc(page);
+  await page.setViewportSize({ width: 1920, height: 1000 });
+
+  const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
+  await editor.click();
+  // A paragraph to compare against, then a code block below it.
+  await page.keyboard.type("prose holds the measure");
+  await page.keyboard.press("Enter");
+  await page.getByTestId("toolbar-code-block").click();
+  await page.keyboard.type("const x = 1;");
+
+  // Wide mode: the shell is far wider than the 712px prose measure.
+  await page.getByTestId("toggle-doc-width").click();
+  await expect(page.locator("html")).toHaveAttribute("data-doc-width", "wide");
+  await expect.poll(() => shellWidth(page)).toBeGreaterThan(1000);
+
+  // Measure the rendered widths rather than asserting on a selector: the
+  // point is that the rule applies, and Playwright's selector engine does not
+  // support every relative form the stylesheet uses.
+  const widths = await editor.evaluate((el) => {
+    const code = el.querySelector(":scope > .react-renderer.node-code_block");
+    const para = el.querySelector(":scope > p");
+    return {
+      code: code ? code.getBoundingClientRect().width : null,
+      paragraph: para ? para.getBoundingClientRect().width : null,
+    };
+  });
+
+  expect(widths.paragraph, "no paragraph to compare against").not.toBeNull();
+  expect(widths.code, "the code block's wrapper is not a direct child of .ProseMirror").not.toBeNull();
+  // Prose holds the 712px measure; the code block gets --knot-code-measure.
+  expect(widths.paragraph!).toBeCloseTo(712, -1);
+  expect(widths.code!).toBeGreaterThan(widths.paragraph! + 100);
+});
