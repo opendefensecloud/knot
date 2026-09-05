@@ -8,6 +8,77 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-05
+
+The document column can be widened to use the window, and several things that
+were quietly broken at the edges of any width are fixed.
+
+### Added
+- **Fixed / wide document width.** A toggle in the doc header, `⌘⇧F`, a command
+  palette action, and Settings → Appearance. One global per-user preference
+  (`knot.docWidth`), stamped before first paint so there is no narrow-to-wide
+  flash. Not role-gated — width is a reading preference, so viewers get it too;
+  hidden below 1024px, where it would buy nothing.
+- Wide mode widens the *container*, not the *measure*. Paragraphs hold the same
+  712px column and do not reflow a line, while tables, code blocks, Mermaid and
+  Excalidraw cards break out into the room. Content box at a 1920px window goes
+  712px → 1472px, capped at a 1600px shell so an ultrawide does not sprawl; prose
+  stays at 95 characters per line in both modes. The practical win is tables: a
+  five-column table goes from 125px cells — six wrapped lines each — to 265px.
+- **The comment sidebar reserves space instead of covering the page** at ≥1280px.
+  It previously sat on top of a constant 352px of every line at every window
+  size, so a wider monitor never helped.
+- **Favicon, app icons and a web manifest.** An SVG mark with PNG fallbacks
+  (32px, apple-touch, 192/512, maskable), regenerable via `tools/gen-favicon.mjs`.
+  Public `/p/{token}` pages link it too — a share link is often someone's first
+  sight of knot.
+
+### Fixed
+- **The mention and datetime popups could open off-screen.** Both are
+  `position: fixed` children of `<body>` placed at the caret's `left` with no
+  right-edge clamp. They only ever fit because the fixed column kept the caret
+  ~450px from the window edge; in wide mode at 2560px the datetime picker's Apply
+  button landed outside the viewport, and being `fixed`, could not be scrolled to.
+- **The floating "Add comment" button could give the app a horizontal scrollbar.**
+  It was clamped only on the low side, so a selection near the right edge pushed
+  it past its host; `<main>` is `overflow-y: auto`, which makes its `overflow-x`
+  compute to `auto`, turning that into an app-wide scrollbar. Its "don't cover the
+  toolbar" guard also measured against the ProseMirror top rather than the sticky
+  toolbar, so it never actually held — the editor scrolls while the toolbar stays
+  pinned.
+- **Tables with dragged column widths overflowed for readers.** Tiptap only mounts
+  its table wrapper when the editor is editable, so view mode — the default — had
+  nothing to scroll a pinned table inside. `colwidth` is stored in the CRDT, so one
+  collaborator's column drag blew out the page for everyone reading it.
+- **The document header overflowed on phones.** At 375px the page scrolled 73px
+  horizontally and the last two controls, Save as template and Comments, sat
+  off-screen and unreachable: the action row is `shrink-0` with no wrapping, so it
+  forced its intrinsic 412px into a 327px content box. Both rows now wrap. This
+  also repairs a quieter tablet case — at 768px the title had been squeezed to
+  36px beside the action row.
+- **Comment highlights hidden behind the sidebar could not be scrolled into view.**
+  `scrollIntoView({ block: "center" })` only corrects the vertical axis; insetting
+  the document means highlights are never underneath the rail to begin with.
+
+### Changed
+- **The e2e suite could wedge the server permanently.** Every spec reset with a
+  bare `TRUNCATE ... CASCADE`, which needs ACCESS EXCLUSIVE on tables the CRDT room
+  actors keep busy for as long as a document is open. Postgres queues lock requests
+  FIFO, so the *pending* TRUNCATE then blocked every query behind it — one reset
+  could park the whole server for the rest of the run, recoverable only with
+  `pg_terminate_backend` and a restart. `SET lock_timeout` plus a retry fixes it:
+  on timeout the statement aborts and stops queueing, so the server is released
+  immediately. A full local run is now 50 passed / 1 failed in 2.6 minutes.
+  (A row-by-row DELETE also avoids the queue and was measured first — it is worse,
+  because without the exclusive lock it races the writers it no longer excludes and
+  leaves connections in aborted transactions.)
+- 31 copies of the e2e `reset()` helper are now one. They had drifted: several
+  omitted `boards`, `share_tokens` and `doc_tasks`, so those tables leaked between
+  specs.
+- `editor-toolbar` and `history` specs select text with `ControlOrMeta+a`. On macOS
+  Chromium binds `Control+A` to "move to start of line", so the selection collapsed
+  and Bold applied to nothing — a failure that could only ever reproduce off CI.
+
 ## [0.3.0] - 2026-09-04
 
 Markdown documents can be brought into knot — as a file, or by pasting the source.
@@ -236,7 +307,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/opendefensecloud/knot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/opendefensecloud/knot/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/opendefensecloud/knot/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/opendefensecloud/knot/compare/v0.1.0...v0.2.0
