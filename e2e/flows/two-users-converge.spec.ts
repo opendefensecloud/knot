@@ -1,32 +1,9 @@
 import { expect, test } from "@playwright/test";
 
+import { docText } from "../support/docText";
 import { reset } from "../support/reset";
 
 test.beforeAll(reset);
-
-/**
- * Walk only bare Text nodes inside a ProseMirror element, skipping any
- * collaboration-cursor label spans so cursor decorations don't pollute the
- * result.
- */
-function docText(el: Element): string {
-  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      let p: Node | null = node.parentElement;
-      while (p && p !== el) {
-        if (p instanceof Element && p.classList.contains("collaboration-cursor__label")) {
-          return NodeFilter.FILTER_REJECT;
-        }
-        p = p.parentNode;
-      }
-      return NodeFilter.FILTER_ACCEPT;
-    },
-  });
-  const parts: string[] = [];
-  let n: Node | null;
-  while ((n = walker.nextNode())) parts.push(n.textContent ?? "");
-  return parts.join("");
-}
 
 test("two users editing concurrently converge on both screens", async ({ browser }) => {
   // Alice sets up the workspace + creates a doc + invites Bob with password.
@@ -91,6 +68,23 @@ test("two users editing concurrently converge on both screens", async ({ browser
   await expect.poll(() => bobEditor.evaluate(docText), { timeout: 5_000 }).toMatch(/And from Bob\./);
   await expect.poll(() => aliceEditor.evaluate(docText), { timeout: 5_000 }).toMatch(/Hello from Alice\./);
   await expect.poll(() => aliceEditor.evaluate(docText), { timeout: 5_000 }).toMatch(/And from Bob\./);
+
+  // Alice can actually SEE Bob. Nothing else in the suite asserts that a
+  // remote caret renders — docText above deliberately strips the label, so a
+  // caret that silently stopped being drawn would leave every assertion in
+  // this file green. The colour matters too: the awareness payload is
+  // validated against /^#[0-9a-fA-F]{6}$/, and a value outside that either
+  // warns and renders (today) or is replaced with `transparent`.
+  const bobCaret = aliceEditor.locator(".collaboration-cursor__caret");
+  await expect(bobCaret).toHaveCount(1, { timeout: 8_000 });
+  // Bob was invited by email with no display name, so the server derives
+  // one from the local part.
+  await expect(bobCaret.locator(".collaboration-cursor__label")).toHaveText("bob");
+
+  const caretColor = await bobCaret.evaluate((el) => getComputedStyle(el).borderLeftColor);
+  expect(caretColor, "the remote caret has no colour — it is invisible").not.toBe("transparent");
+  expect(caretColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(caretColor, `unexpected caret colour ${caretColor}`).toMatch(/^rgba?\(/);
 
   await aliceCtx.close();
   await bobCtx.close();
