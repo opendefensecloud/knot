@@ -104,7 +104,7 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "web/pnpm-workspace.yaml pins these EXACTLY, to deduplicate the ProseMirror core that @tiptap/pm and y-prosemirror both depend on. They are not ordinary patches: taking prosemirror-view 1.42 changed how a remote replace-the-document update applies and broke history restore, which only CI caught. Surfaced on the dashboard so they stay visible, never opened or merged automatically.",
+      "description": "web/pnpm-workspace.yaml pins these EXACTLY, to deduplicate the ProseMirror core that @tiptap/pm and y-prosemirror both depend on: when pnpm resolves them to different patches, tsc fails with a wall of 'not assignable' errors between two structurally identical Node types. That is the whole reason. Surfaced on the dashboard rather than automerged because a bump has to be checked for re-duplication, not because any version is suspect.",
       "matchPackageNames": [
         "prosemirror-model",
         "prosemirror-state",

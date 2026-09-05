@@ -34,10 +34,15 @@ overrides:
   # "not assignable" errors.
   #
   # Pinned EXACTLY to the versions main resolved, not to the newest release.
-  # These are the editor's document/transaction core: taking prosemirror-view
-  # 1.42 here changed how a remote replace-the-document update applies, and
-  # broke history restore in a way only CI reproduced. Dedupe is the goal;
-  # upgrading this stack is a separate, deliberate change.
+  # Dedupe is the goal; upgrading this stack is a separate, deliberate change.
+  #
+  # These pins were introduced in a5c7042, which blamed prosemirror-view 1.42
+  # for a history-restore failure. That diagnosis was wrong and ccf5dbd
+  # retracts it: the actual defect was ReplaceWithMarkdown broadcasting only
+  # its insertion, so peers appended the restored text instead of replacing.
+  # Nothing is known to be wrong with prosemirror-view 1.42 — do not treat
+  # these versions as a quarantine. Lifting them is an ordinary upgrade that
+  # wants a CI run, not a re-investigation.
   prosemirror-model: "1.25.7"
   prosemirror-state: "1.4.4"
   prosemirror-view: "1.41.8"
