@@ -1,0 +1,127 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    "group:monorepos",
+    "group:recommended",
+    ":maintainLockFilesWeekly"
+  ],
+  "timezone": "Europe/Berlin",
+  "schedule": ["before 6am on monday"],
+  "labels": ["dependencies"],
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 4,
+  "dependencyDashboard": true,
+  "configMigration": true,
+
+  "major": {
+    "dependencyDashboardApproval": true
+  },
+
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["dependencies", "security"],
+    "schedule": ["at any time"]
+  },
+  "osvVulnerabilityAlerts": true,
+
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Rust channel in rust-toolchain.toml",
+      "managerFilePatterns": ["/^rust-toolchain\\.toml$/"],
+      "matchStrings": ["channel\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+(\\.\\d+)?)\""],
+      "depNameTemplate": "rust",
+      "packageNameTemplate": "rust-lang/rust",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "description": "node-version input of actions/setup-node",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["node-version:\\s*(?<currentValue>\\d+(\\.\\d+)*)"],
+      "depNameTemplate": "node",
+      "datasourceTemplate": "node-version",
+      "versioningTemplate": "node"
+    },
+    {
+      "customType": "regex",
+      "description": "version input of pnpm/action-setup",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": [
+        "uses:\\s*pnpm/action-setup@[^\\n]*\\n\\s*with:\\n\\s*version:\\s*(?<currentValue>\\d+(\\.\\d+)*)"
+      ],
+      "depNameTemplate": "pnpm",
+      "datasourceTemplate": "npm",
+      "versioningTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "ZIG_VERSION build arg in the Dockerfile",
+      "managerFilePatterns": ["/^Dockerfile$/"],
+      "matchStrings": ["ARG ZIG_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "zig",
+      "packageNameTemplate": "ziglang/zig",
+      "datasourceTemplate": "github-releases"
+    }
+  ],
+
+  "packageRules": [
+    {
+      "description": "CI gates every PR (nextest, vitest, playwright, clippy, cargo-deny), so anything below a major merges itself once green.",
+      "matchUpdateTypes": ["patch", "minor", "pin", "digest"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Refreshing the lockfiles is how transitive advisories reach us — a direct dependency bump cannot pull a patched sub-dependency on its own.",
+      "matchUpdateTypes": ["lockFileMaintenance"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "The Rust version is pinned in three places (rust-toolchain.toml, the dtolnay/rust-toolchain action, and the Dockerfile's rust image) and they must move together. Never automerged: a new toolchain relints and reformats the workspace, which is a deliberate change.",
+      "groupName": "rust toolchain",
+      "matchDepNames": ["rust", "dtolnay/rust-toolchain"],
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "pnpm is pinned in web/package.json, e2e/package.json and the pnpm/action-setup input. web/pnpm-workspace.yaml documents that these are one atomic change — pnpm 9 hard-fails on the workspace file this repo now ships.",
+      "groupName": "pnpm",
+      "matchDepNames": ["pnpm"],
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Node is pinned in the Dockerfile's web-builder stage and in actions/setup-node; keep the build and CI on the same major.",
+      "groupName": "node",
+      "matchDepNames": ["node"],
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "web/pnpm-workspace.yaml pins these EXACTLY, to deduplicate the ProseMirror core that @tiptap/pm and y-prosemirror both depend on. They are not ordinary patches: taking prosemirror-view 1.42 changed how a remote replace-the-document update applies and broke history restore, which only CI caught. Surfaced on the dashboard so they stay visible, never opened or merged automatically.",
+      "matchPackageNames": [
+        "prosemirror-model",
+        "prosemirror-state",
+        "prosemirror-view"
+      ],
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Security floors in web/pnpm-workspace.yaml overrides. Raising them is welcome, but they exist because a parent hard-pins a vulnerable version, so a bump here needs a human to confirm the parent still resolves.",
+      "matchFileNames": ["web/pnpm-workspace.yaml"],
+      "automerge": false
+    },
+    {
+      "description": "Playwright ships its browser binaries per version; a bump changes what the e2e suite actually runs against.",
+      "matchPackageNames": ["@playwright/test"],
+      "automerge": false
+    }
+  ]
+}

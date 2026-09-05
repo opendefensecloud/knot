@@ -81,6 +81,41 @@ This regenerates both `crates/knot-markdown/src/schema.rs` and `web/src/features
 - `build:` — build system (Dockerfile, Makefile, Cargo.toml)
 - `ci:` — GitHub Actions
 
+## Dependencies
+
+[Renovate](https://docs.renovatebot.com/) (`.github/renovate.json`) keeps the
+Cargo workspace, both pnpm projects, the GitHub Actions, and the Dockerfile base
+images current. Patch and minor updates merge themselves once CI is green;
+everything else waits for a human.
+
+Majors do not open a PR on their own — they are listed on the **Dependency
+Dashboard** issue, and ticking a box there tells Renovate to raise that one.
+That keeps a major migration (tiptap 2 → 3, tailwind 3 → 4) a deliberate choice
+rather than eight red PRs.
+
+Weekly `lockFileMaintenance` runs `cargo update` / `pnpm update` against the
+lockfiles. This is the only route by which a patched *transitive* dependency
+reaches us — bumping a direct dependency cannot pull one in on its own — so it
+is how most RUSTSEC and GHSA advisories actually get closed here.
+
+Three versions are pinned in more than one file and must move together.
+Renovate groups each into a single PR; do the same by hand:
+
+| what | pinned in |
+|---|---|
+| Rust | `rust-toolchain.toml`, `dtolnay/rust-toolchain@…` in `ci.yml`, `rust:…-alpine` in `Dockerfile` |
+| pnpm | `packageManager` in `web/` and `e2e/package.json`, `pnpm/action-setup` `version:` |
+| Node | `node:…-alpine` in `Dockerfile`, `node-version:` in `ci.yml` |
+
+Left out of automation on purpose: the exact `prosemirror-*` pins in
+`web/pnpm-workspace.yaml` (they deduplicate the editor core — see the comment
+there for what breaks), the security floors in the same file's `overrides`, and
+`@playwright/test`, which ships the browser the e2e suite runs against.
+
+`cargo deny check` gates every PR. When an advisory has no reachable fix, add it
+to `deny.toml` with the dependency path and the upstream event that would let us
+drop it again.
+
 ## Pull requests
 
 Before opening a PR:
