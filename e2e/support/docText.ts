@@ -14,7 +14,7 @@ export function docText(el: Element): string {
     acceptNode(node) {
       let p: Node | null = node.parentElement;
       while (p && p !== el) {
-        if (p instanceof Element && p.classList.contains("collaboration-cursor__label")) {
+        if (p instanceof Element && p.classList.contains("collaboration-carets__label")) {
           return NodeFilter.FILTER_REJECT;
         }
         p = p.parentNode;

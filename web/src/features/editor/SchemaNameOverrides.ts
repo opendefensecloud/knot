@@ -11,11 +11,10 @@
  * schema, then disable the original in `StarterKit.configure({ … : false })`.
  */
 
-import BulletList from "@tiptap/extension-bullet-list";
-import OrderedList from "@tiptap/extension-ordered-list";
-import ListItem from "@tiptap/extension-list-item";
 import HardBreak from "@tiptap/extension-hard-break";
 import HorizontalRule from "@tiptap/extension-horizontal-rule";
+// The three list nodes now ship from one package, as named exports.
+import { BulletList, ListItem, OrderedList } from "@tiptap/extension-list";
 
 /**
  * Renaming a node does not rewrite the OPTIONS its own commands read.

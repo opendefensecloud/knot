@@ -230,10 +230,10 @@
 }
 
 /* ---------------------------------------------------------------- */
-/* Tiptap CollaborationCursor — remote peer carets + labels         */
+/* Tiptap CollaborationCaret — remote peer carets + labels          */
 /* ---------------------------------------------------------------- */
 
-.collaboration-cursor__caret {
+.collaboration-carets__caret {
   position: relative;
   margin-left: -1px;
   margin-right: -1px;
@@ -243,7 +243,7 @@
   word-break: normal;
 }
 
-.collaboration-cursor__label {
+.collaboration-carets__label {
   position: absolute;
   top: -1.4em;
   left: -2px;
@@ -270,16 +270,15 @@
 /* Reveal the label again when the user is actively typing nearby —
    ProseMirror toggles `data-active` on selection-change in some setups;
    otherwise hovering the caret restores it. */
-.collaboration-cursor__caret:hover .collaboration-cursor__label {
+.collaboration-carets__caret:hover .collaboration-carets__label {
   animation: none;
   opacity: 1;
 }
 
-/* No rule for the remote peer's selection highlight. y-prosemirror emits it
-   as `.ProseMirror-yjs-selection` with the peer's colour set inline at ~44%
+/* No rule for the remote peer's selection highlight. The binding emits it as
+   `.ProseMirror-yjs-selection` with the peer's colour set inline at ~44%
    alpha, so it is already styled and an inline background could not be
-   overridden from here anyway. A `.collaboration-cursor__selection` rule
-   stood here and matched nothing — that class does not exist. */
+   overridden from here anyway. */
 
 /* ---------------------------------------------------------------- */
 /* Mermaid NodeView — source-mode pre/code overrides                 */

@@ -1,5 +1,5 @@
 import Collaboration from "@tiptap/extension-collaboration";
-import CollaborationCursor from "@tiptap/extension-collaboration-cursor";
+import CollaborationCaret from "@tiptap/extension-collaboration-caret";
 import Image from "@tiptap/extension-image";
 import Link from "@tiptap/extension-link";
 import Underline from "@tiptap/extension-underline";
@@ -54,6 +54,27 @@ const KnotLink = Link.extend({
   },
 });
 
+/**
+ * v3's Image adds `width` and `height`. Nothing in knot sets them — the
+ * upload path calls setImage({ src }) and the paste sanitiser's attribute
+ * allowlist drops both — but leaving them declared would put two attributes
+ * in the document schema that `tools/schema.json` does not know and
+ * `to_markdown` cannot emit. Dropping them keeps the stored schema identical
+ * to what every existing document was written against, which is the property
+ * worth protecting in a CRDT.
+ *
+ * Adopting image dimensions instead is a feature: declare them in
+ * tools/schema.json and teach to_markdown to write them.
+ */
+const KnotImage = Image.extend({
+  addAttributes() {
+    const attrs: Record<string, unknown> = { ...(this.parent?.() ?? {}) };
+    delete attrs.width;
+    delete attrs.height;
+    return attrs;
+  },
+});
+
 /** Canonical Tiptap extension set that matches the server schema generated
  *  from `tools/schema.json`. History is disabled because Yjs UndoManager
  *  owns undo. */
@@ -67,7 +88,9 @@ export function createExtensions(opts: {
 }) {
   return [
     StarterKit.configure({
-      history: false,
+      // v2 called this `history`. Still disabled for the same reason: the Yjs
+      // UndoManager owns undo, and a second history plugin fights it.
+      undoRedo: false,
       codeBlock: false,
       // Disable the camelCase node defaults; we re-add snake_case versions
       // below so the Y.XmlFragment matches our canonical schema.
@@ -76,6 +99,19 @@ export function createExtensions(opts: {
       listItem: false,
       hardBreak: false,
       horizontalRule: false,
+      // Bundled by StarterKit from v3 on. Link and Underline are registered
+      // explicitly below, and registering either twice makes the second
+      // configure() lose the argument fight for the click handler.
+      link: false,
+      underline: false,
+      // Appends a paragraph to any document not ending in one. Harmless in a
+      // local editor; here it is a write to a shared CRDT that every peer
+      // receives and that reaches the markdown export, triggered by opening
+      // a document rather than by editing it.
+      trailingNode: false,
+      // Its list types default to camelCase, so it is inert against this
+      // schema. Off rather than registered-and-doing-nothing.
+      listKeymap: false,
     }),
     KnotBulletList,
     KnotOrderedList,
@@ -90,11 +126,15 @@ export function createExtensions(opts: {
       HTMLAttributes: { rel: "noopener noreferrer", target: "_blank" },
     }),
     Collaboration.configure({ document: opts.doc }),
-    CollaborationCursor.configure({
+    // Successor to CollaborationCursor, which has no v3 release. Only ever
+    // reads `provider.awareness`, so the shim stands. `user.color` must be
+    // 6-digit hex: the extension replaces anything else with "transparent",
+    // which renders an invisible caret rather than warning (see colorFor).
+    CollaborationCaret.configure({
       provider: { awareness: opts.awareness } as never,
       user: opts.user,
     }),
-    Image.configure({ inline: false, allowBase64: false }),
+    KnotImage.configure({ inline: false, allowBase64: false }),
     Attachment,
     ExcalidrawBoard,
     TaskListExtension,

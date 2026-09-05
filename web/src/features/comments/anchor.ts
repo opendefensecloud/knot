@@ -6,8 +6,12 @@
  * in the `position_y` column and the client can resolve it back to a
  * pixel offset even after concurrent edits.
  *
- * The y-prosemirror mapping is obtained from the ySyncPlugin state that
- * Tiptap's Collaboration extension installs. If the plugin isn't mounted
+ * The mapping is obtained from the ySyncPlugin state that Tiptap's
+ * Collaboration extension installs. It MUST be imported from the same
+ * package that extension installs its plugin from (@tiptap/y-tiptap), not
+ * from y-prosemirror: both call `new PluginKey("y-sync")`, ProseMirror
+ * uniquifies the second one, and `getState` is a bare property read — so the
+ * wrong import silently returns undefined and every anchor becomes null. If the plugin isn't mounted
  * (e.g. viewer mode before the editor is ready), both functions return null.
  */
 
@@ -18,7 +22,7 @@ import {
   absolutePositionToRelativePosition,
   relativePositionToAbsolutePosition,
   ySyncPluginKey,
-} from "y-prosemirror";
+} from "@tiptap/y-tiptap";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ProsemirrorMapping = Map<Y.AbstractType<any>, PmNode | PmNode[]>;

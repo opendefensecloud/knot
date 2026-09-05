@@ -51,9 +51,14 @@ const REGISTERED_EXTENSIONS = [
   "code",
   "code_block",
   "collaboration",
-  "collaborationCursor",
+  // v3: CollaborationCursor has no v3 release; this is its successor.
+  "collaborationCaret",
   "commands",
   "commentsHighlight",
+  // v3 core: emits an editor "delete" event when nodes are removed. Skips
+  // transactions carrying y-sync meta, so it never reacts to remote updates,
+  // and mutates nothing.
+  "delete",
   "doc",
   "drop",
   "dropCursor",
@@ -73,6 +78,9 @@ const REGISTERED_EXTENSIONS = [
   "knotTaskList",
   "link",
   "list_item",
+  // v3: ListItem registers this keymap itself, named after the node — so it
+  // is active against the renamed list_item rather than inert.
+  "list_itemBranchingDeleteKeymap",
   "ordered_list",
   "paragraph",
   "paste",
@@ -84,6 +92,10 @@ const REGISTERED_EXTENSIONS = [
   "table_header",
   "table_row",
   "text",
+  // v3 core. addGlobalAttributes() returns [] unless `direction` is
+  // configured, and it is not, so this adds no attribute to any node — as
+  // the attribute-parity test below independently confirms.
+  "textDirection",
   "underline",
 ];
 

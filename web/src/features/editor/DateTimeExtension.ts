@@ -21,6 +21,12 @@ import { type Editor } from "@tiptap/core";
 import { placeFixedPopup } from "./popupPosition";
 
 declare module "@tiptap/core" {
+  // v3 retyped Editor.storage from Record<string, any> to an augmentable
+  // interface, so every extension has to declare its own slot.
+  interface Storage {
+    knotDateTime: { popup: DateTimePopup | null };
+  }
+
   interface Commands<ReturnType> {
     knotDateTime: {
       /** Open the date+time picker at the current cursor; on Apply,
@@ -229,7 +235,7 @@ export const DateTimeExtension = Extension.create({
       openDateTimePicker:
         () =>
         ({ editor }) => {
-          const popup = (editor.storage.knotDateTime as { popup: DateTimePopup | null }).popup;
+          const { popup } = editor.storage.knotDateTime;
           if (!popup) return false;
           const { from, to } = editor.state.selection;
           const coords = editor.view.coordsAtPos(from);
@@ -255,7 +261,7 @@ export const DateTimeExtension = Extension.create({
   addProseMirrorPlugins() {
     const editor = this.editor;
     const popup = new DateTimePopup();
-    (editor.storage.knotDateTime as { popup: DateTimePopup | null }).popup = popup;
+    editor.storage.knotDateTime.popup = popup;
     editor.on("destroy", () => popup.destroy());
 
     // Plugin for click-to-edit on existing chips.
