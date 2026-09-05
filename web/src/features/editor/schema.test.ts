@@ -11,8 +11,118 @@ import { Editor } from "@tiptap/core";
 import * as Y from "yjs";
 import { Awareness } from "y-protocols/awareness";
 
+import canonical from "../../../../tools/schema.json";
+
 import { createExtensions } from "./extensions";
 import { NODE_KINDS, MARK_KINDS } from "./schema";
+
+function mount(): Editor {
+  const doc = new Y.Doc();
+  const awareness = new Awareness(doc);
+  return new Editor({
+    extensions: createExtensions({
+      doc,
+      awareness,
+      user: { name: "test", color: "#000" },
+    }),
+  });
+}
+
+/**
+ * Every extension `createExtensions()` registers, including the ones Tiptap
+ * adds implicitly.
+ *
+ * The node/mark checks below cannot see an extension that contributes no node
+ * and no mark — a keymap, an input-rule set, a ProseMirror plugin. Those are
+ * exactly the extensions a StarterKit version bump turns on silently, and some
+ * of them write to the document (a trailing-node extension appends a
+ * paragraph; a duplicate Link registration overrides `openOnClick`). Pinning
+ * the whole list means an addition has to be acknowledged rather than
+ * discovered later from a corrupted Y.Doc.
+ *
+ * Update deliberately, never to make the test pass.
+ */
+const REGISTERED_EXTENSIONS = [
+  "attachment",
+  "blockquote",
+  "bold",
+  "bullet_list",
+  "clipboardTextSerializer",
+  "code",
+  "code_block",
+  "collaboration",
+  "collaborationCursor",
+  "commands",
+  "commentsHighlight",
+  "doc",
+  "drop",
+  "dropCursor",
+  "editable",
+  "excalidraw_board",
+  "focusEvents",
+  "gapCursor",
+  "hard_break",
+  "heading",
+  "horizontal_rule",
+  "image",
+  "italic",
+  "keymap",
+  "knotDateTime",
+  "knotInternalLink",
+  "knotMention",
+  "knotTaskList",
+  "link",
+  "list_item",
+  "ordered_list",
+  "paragraph",
+  "paste",
+  "starterKit",
+  "strike",
+  "tabindex",
+  "table",
+  "table_cell",
+  "table_header",
+  "table_row",
+  "text",
+  "underline",
+];
+
+/**
+ * Attributes the live editor carries that `tools/schema.json` does not
+ * declare. Each is render- or interaction-time only and never reaches
+ * `to_markdown`, so the omission is correct — but it has to be stated,
+ * otherwise the parity check below cannot tell a deliberate extra from a new
+ * one that arrived with a dependency bump.
+ */
+const EDITOR_ONLY_ATTRS: Record<string, string[]> = {
+  // prosemirror-tables records a dragged column width here. It does ride in
+  // the CRDT (one collaborator's drag is visible to everyone), but markdown
+  // has no column-width concept, so the canonical schema omits it.
+  table_cell: ["colwidth"],
+  table_header: ["colwidth"],
+  // Tiptap's OrderedList ships the HTML `type` attribute (1/a/A/i/I). Nothing
+  // in knot sets it and `to_markdown` has no marker-style concept.
+  ordered_list: ["type"],
+  // `rel` and `target` come from Link.configure({ HTMLAttributes }); `class`
+  // is Tiptap's own. All three are rendering concerns.
+  link: ["class", "rel", "target"],
+};
+
+/**
+ * Canonical attributes the editor does not implement.
+ *
+ * `to_markdown` emits a link title and `from_markdown` parses one, but no
+ * editor affordance produces one — so a title that arrives through markdown
+ * import is dropped the next time the link is edited. Pre-existing, small,
+ * and tracked separately; recorded here so the parity check stays honest
+ * rather than being weakened to hide it.
+ */
+const UNIMPLEMENTED_ATTRS: Record<string, string[]> = {
+  link: ["title"],
+};
+
+const canonicalAttrs = (entries: { kind: string; attrs?: { name: string }[] }[]) =>
+  new Map(entries.map((e) => [e.kind, (e.attrs ?? []).map((a) => a.name)]));
 
 describe("editor schema alignment", () => {
   it("every Tiptap node maps to a snake_case kind from tools/schema.json", () => {
@@ -137,6 +247,60 @@ describe("editor schema alignment", () => {
     const expected = new Set<string>(MARK_KINDS);
     for (const name of Object.keys(editor.schema.marks)) {
       expect(expected.has(name), `unexpected PM mark "${name}" — not in tools/schema.json`).toBe(true);
+    }
+    editor.destroy();
+  });
+
+  it("registers exactly the expected extension set", () => {
+    const editor = mount();
+    const names = editor.extensionManager.extensions.map((e) => e.name).sort();
+    expect(
+      names,
+      "the registered extension set changed. If a dependency bump added this, "
+        + "check what it does to the document before accepting it — a plugin-only "
+        + "extension is invisible to every other assertion in this file.",
+    ).toEqual([...REGISTERED_EXTENSIONS].sort());
+    editor.destroy();
+  });
+
+  it("carries the attributes tools/schema.json declares, and no undeclared extras", () => {
+    const editor = mount();
+    const declaredNodes = canonicalAttrs(canonical.nodes);
+    const declaredMarks = canonicalAttrs(canonical.marks);
+
+    const check = (
+      kind: "node" | "mark",
+      name: string,
+      live: string[],
+      declared: string[] | undefined,
+    ) => {
+      if (declared === undefined) return; // name-level checks above own this
+      const allowedExtra = EDITOR_ONLY_ATTRS[name] ?? [];
+      const unimplemented = UNIMPLEMENTED_ATTRS[name] ?? [];
+
+      for (const attr of declared) {
+        if (unimplemented.includes(attr)) continue;
+        expect(
+          live,
+          `${kind} "${name}" is missing the declared attribute "${attr}" — `
+            + "content carrying it will be dropped on the next edit",
+        ).toContain(attr);
+      }
+      for (const attr of live) {
+        if (declared.includes(attr) || allowedExtra.includes(attr)) continue;
+        expect.fail(
+          `${kind} "${name}" grew an undeclared attribute "${attr}". It will be `
+            + "stored in the CRDT and silently lost by to_markdown. Either declare "
+            + "it in tools/schema.json or record it in EDITOR_ONLY_ATTRS.",
+        );
+      }
+    };
+
+    for (const [name, type] of Object.entries(editor.schema.nodes)) {
+      check("node", name, Object.keys(type.spec.attrs ?? {}), declaredNodes.get(name));
+    }
+    for (const [name, type] of Object.entries(editor.schema.marks)) {
+      check("mark", name, Object.keys(type.spec.attrs ?? {}), declaredMarks.get(name));
     }
     editor.destroy();
   });
