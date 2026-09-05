@@ -1,23 +1,9 @@
-import { execSync } from "node:child_process";
-
 import { expect, test, type Page } from "@playwright/test";
 
-function reset() {
-  const tables = [
-    "comment_reactions", "comments",
-    "acl_invalidations", "audit_events", "doc_markdown_cache",
-    "doc_snapshots", "doc_updates", "document_grants", "documents",
-    "sessions", "workspace_members", "users", "workspaces",
-  ].join(", ");
-  execSync(
-    `docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d knot -c "TRUNCATE TABLE ${tables} CASCADE"`,
-    { cwd: "..", stdio: "pipe" },
-  );
-}
+import { reset } from "../support/reset";
 
-// Reset once, not per test: TRUNCATE needs ACCESS EXCLUSIVE on doc_updates,
-// and the server's room actors keep that table busy for every doc a previous
-// test opened — a per-test truncate deadlocks against them.
+// Reset once: the owner is created in the beforeAll below, and a per-test
+// reset would delete it out from under the later tests.
 test.beforeAll(reset);
 
 const EMAIL = "owner@width.test";

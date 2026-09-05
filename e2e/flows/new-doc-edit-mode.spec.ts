@@ -10,28 +10,10 @@
  * real production path (sessionStorage per-doc flag set by DocTree on creation)
  * is exercised.
  */
-import { execSync } from "node:child_process";
 import { expect, test } from "@playwright/test";
 
-function reset() {
-  const tables = [
-    "acl_invalidations",
-    "audit_events",
-    "doc_markdown_cache",
-    "doc_snapshots",
-    "doc_updates",
-    "document_grants",
-    "documents",
-    "sessions",
-    "workspace_members",
-    "users",
-    "workspaces",
-  ].join(", ");
-  execSync(
-    `docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d knot -c "TRUNCATE TABLE ${tables} CASCADE"`,
-    { cwd: "..", stdio: "pipe" },
-  );
-}
+import { reset } from "../support/reset";
+
 // Each test creates a fresh workspace via /setup, so reset before every test.
 test.beforeEach(reset);
 

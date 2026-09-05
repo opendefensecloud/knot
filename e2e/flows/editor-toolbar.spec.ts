@@ -1,25 +1,7 @@
-import { execSync } from "node:child_process";
 import { expect, test } from "@playwright/test";
 
-function reset() {
-  const tables = [
-    "acl_invalidations",
-    "audit_events",
-    "doc_markdown_cache",
-    "doc_snapshots",
-    "doc_updates",
-    "document_grants",
-    "documents",
-    "sessions",
-    "workspace_members",
-    "users",
-    "workspaces",
-  ].join(", ");
-  execSync(
-    `docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d knot -c "TRUNCATE TABLE ${tables} CASCADE"`,
-    { cwd: "..", stdio: "pipe" },
-  );
-}
+import { reset } from "../support/reset";
+
 test.beforeAll(reset);
 
 test("toolbar toggles bold + heading", async ({ page }) => {
@@ -41,7 +23,7 @@ test("toolbar toggles bold + heading", async ({ page }) => {
   const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
   await editor.click();
   await page.keyboard.type("hello world");
-  await page.keyboard.press("Control+a");
+  await page.keyboard.press("ControlOrMeta+a");
 
   await page.getByTestId("toolbar-bold").click();
   await expect(editor.locator("strong")).toContainText("hello world");
