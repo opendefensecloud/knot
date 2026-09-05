@@ -10,8 +10,8 @@
  *      about comment anchoring is silent when that happens — encode returns
  *      null and the caller persists an empty string — so there is no second
  *      chance to notice.
- *   2. The y-prosemirror primitives with a hand-built mapping, which pin the
- *      relative-position semantics we depend on.
+ *   2. The binding's position primitives with a hand-built mapping, which
+ *      pin the relative-position semantics we depend on.
  *   3. The null branches, via a fake editor.
  *
  * An earlier version of this file had only (2) and (3). Both stay green when
@@ -25,7 +25,7 @@ import * as Y from "yjs";
 import {
   absolutePositionToRelativePosition,
   relativePositionToAbsolutePosition,
-} from "y-prosemirror";
+} from "@tiptap/y-tiptap";
 
 import { fragmentShape, mountBoundEditor, type BoundEditor } from "../../test/boundEditor";
 import {
@@ -136,7 +136,7 @@ describe("anchors against a live ySync binding", () => {
 // (2) The primitives, with a hand-built mapping
 // ---------------------------------------------------------------------------
 
-describe("y-prosemirror relative position primitives", () => {
+describe("Yjs relative position primitives", () => {
   it("round-trips position 0 on an empty XmlFragment", () => {
     const ydoc = new Y.Doc();
     const fragment = ydoc.getXmlFragment("default");

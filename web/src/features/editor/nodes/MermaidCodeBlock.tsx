@@ -93,7 +93,7 @@ function MermaidNodeView(props: ReactNodeViewProps) {
     return (
       <NodeViewWrapper as="div" className="my-3">
         <pre className="bg-muted text-fg rounded-md p-3 overflow-x-auto">
-          <NodeViewContent as="code" />
+          <NodeViewContent<"code"> as="code" />
         </pre>
       </NodeViewWrapper>
     );
@@ -203,12 +203,12 @@ function MermaidPreview(props: ReactNodeViewProps) {
           {/* Source still exists in the document; hide it from view but keep it
               editable via the keyboard navigation by toggling to source mode. */}
           <div className="hidden" aria-hidden>
-            <NodeViewContent as="code" />
+            <NodeViewContent<"code"> as="code" />
           </div>
         </div>
       ) : (
         <pre className="overflow-x-auto">
-          <NodeViewContent as="code" spellCheck={false} />
+          <NodeViewContent<"code"> as="code" spellCheck={false} />
         </pre>
       )}
     </NodeViewWrapper>

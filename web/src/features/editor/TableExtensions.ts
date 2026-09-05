@@ -7,10 +7,10 @@
  * GFM column alignment and round-trips through to_markdown.
  */
 
-import Table from "@tiptap/extension-table";
-import TableRow from "@tiptap/extension-table-row";
-import TableCell from "@tiptap/extension-table-cell";
-import TableHeader from "@tiptap/extension-table-header";
+// The four table nodes now ship from one package as named exports; the
+// aggregate has no default export, so `import Table from …` fails to compile.
+// TableKit is deliberately not used: it registers camelCase node names.
+import { Table, TableCell, TableHeader, TableRow } from "@tiptap/extension-table";
 
 const alignAttr = {
   align: {

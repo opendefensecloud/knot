@@ -329,12 +329,18 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
   // Push the latest comments + activeCommentId into the highlight extension's
   // storage, then dispatch a no-op transaction so the plugin re-decorates.
   useEffect(() => {
-    if (!editor) return;
-    const storage = editor.extensionStorage.commentsHighlight as {
-      comments: HighlightedComment[];
-      activeCommentId: string | null;
-      doc: Y.Doc | null;
-    };
+    // Navigating from one document to another runs this effect twice against
+    // the OUTGOING editor before the replacement exists — React commits the
+    // new deps first. Tiptap 3 empties extensionStorage on destroy, so the
+    // lookup below returns undefined and assigning to it throws, taking the
+    // whole route down with an error boundary. In v2 the same write landed on
+    // a dead object and did nothing, which is why this was never guarded.
+    //
+    // e2e/flows/search.spec.ts is the regression test: navigating via the
+    // command palette reproduces it. Clicking a sidebar link does not — the
+    // timing differs — so do not "simplify" that spec into a plain link click.
+    if (!editor || editor.isDestroyed) return;
+    const storage = editor.extensionStorage.commentsHighlight;
     storage.comments = highlightComments;
     storage.activeCommentId = activeCommentId;
     storage.doc = pair.doc;

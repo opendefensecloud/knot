@@ -75,11 +75,11 @@ test("two users editing concurrently converge on both screens", async ({ browser
   // this file green. The colour matters too: the awareness payload is
   // validated against /^#[0-9a-fA-F]{6}$/, and a value outside that either
   // warns and renders (today) or is replaced with `transparent`.
-  const bobCaret = aliceEditor.locator(".collaboration-cursor__caret");
+  const bobCaret = aliceEditor.locator(".collaboration-carets__caret");
   await expect(bobCaret).toHaveCount(1, { timeout: 8_000 });
   // Bob was invited by email with no display name, so the server derives
   // one from the local part.
-  await expect(bobCaret.locator(".collaboration-cursor__label")).toHaveText("bob");
+  await expect(bobCaret.locator(".collaboration-carets__label")).toHaveText("bob");
 
   const caretColor = await bobCaret.evaluate((el) => getComputedStyle(el).borderLeftColor);
   expect(caretColor, "the remote caret has no colour — it is invisible").not.toBe("transparent");

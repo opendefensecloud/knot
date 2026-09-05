@@ -35,17 +35,26 @@ export type CommentsHighlightOptions = {
 
 const PLUGIN_KEY = new PluginKey<DecorationSet>("commentsHighlight");
 
+declare module "@tiptap/core" {
+  // v3 retyped Editor.storage from Record<string, any> to an augmentable
+  // interface. React reaches into this slot directly (see KnotEditor), so it
+  // has to be declared rather than cast at each use.
+  interface Storage {
+    commentsHighlight: CommentsHighlightStorage;
+  }
+}
+
 // Storage shape held on the extension. React updates this object via
 // `editor.extensionStorage.commentsHighlight.X = ...` and then dispatches
 // a no-op transaction with `setMeta` to trigger a re-decoration.
-type Storage = {
+type CommentsHighlightStorage = {
   comments: HighlightedComment[];
   activeCommentId: string | null;
   doc: Y.Doc | null;
   onSelect: ((id: string) => void) | null;
 };
 
-export const CommentsHighlightExtension = Extension.create<CommentsHighlightOptions, Storage>({
+export const CommentsHighlightExtension = Extension.create<CommentsHighlightOptions, CommentsHighlightStorage>({
   name: "commentsHighlight",
 
   addOptions() {
@@ -108,7 +117,7 @@ export const CommentsHighlightExtension = Extension.create<CommentsHighlightOpti
 
 function buildDecorations(
   pmDoc: import("@tiptap/pm/model").Node,
-  storage: Storage,
+  storage: CommentsHighlightStorage,
 ): DecorationSet {
   if (!storage.doc || storage.comments.length === 0) return DecorationSet.empty;
   // We need a Tiptap editor reference to call decodeAnchorRange. The plugin
