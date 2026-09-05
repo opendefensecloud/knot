@@ -44,6 +44,17 @@ export function fragmentShape(bound: BoundEditor): string[] {
   });
 }
 
+/**
+ * The persisted fragment as XML — what actually goes to the server.
+ *
+ * Y.XmlFragment defines `toString()`, but its type declaration does not, so
+ * calling it directly trips `@typescript-eslint/no-base-to-string`. Casting
+ * once here keeps that out of every test that needs to look at durable state.
+ */
+export function fragmentXml(bound: BoundEditor): string {
+  return (bound.fragment as unknown as { toString(): string }).toString();
+}
+
 export function mountBoundEditor(
   opts: { user?: { name: string; color: string } } = {},
 ): BoundEditor {

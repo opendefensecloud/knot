@@ -30,6 +30,30 @@ import {
   KnotTableHeader,
 } from "./TableExtensions";
 
+/**
+ * Tiptap's Link ships href/target/rel/class but no `title`, while
+ * `tools/schema.json` declares one and both `from_markdown` and `to_markdown`
+ * honour it. ProseMirror drops attributes its schema does not declare, so an
+ * imported `[text](url "title")` lost its title the first time anyone edited
+ * the document — in storage, for every reader, with no error.
+ *
+ * `renderHTML` returns nothing when the title is unset so bare links keep
+ * emitting exactly the markup (and markdown) they always have.
+ */
+const KnotLink = Link.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      title: {
+        default: null,
+        parseHTML: (el: HTMLElement) => el.getAttribute("title"),
+        renderHTML: (attrs: { title?: string | null }) =>
+          attrs.title ? { title: attrs.title } : {},
+      },
+    };
+  },
+});
+
 /** Canonical Tiptap extension set that matches the server schema generated
  *  from `tools/schema.json`. History is disabled because Yjs UndoManager
  *  owns undo. */
@@ -60,7 +84,7 @@ export function createExtensions(opts: {
     KnotHorizontalRule,
     MermaidCodeBlock,
     Underline,
-    Link.configure({
+    KnotLink.configure({
       openOnClick: false,
       autolink: true,
       HTMLAttributes: { rel: "noopener noreferrer", target: "_blank" },
