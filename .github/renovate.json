@@ -104,14 +104,9 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "web/pnpm-workspace.yaml pins these EXACTLY, to deduplicate the ProseMirror core that @tiptap/pm and y-prosemirror both depend on: when pnpm resolves them to different patches, tsc fails with a wall of 'not assignable' errors between two structurally identical Node types. That is the whole reason. Surfaced on the dashboard rather than automerged because a bump has to be checked for re-duplication, not because any version is suspect.",
-      "matchPackageNames": [
-        "prosemirror-model",
-        "prosemirror-state",
-        "prosemirror-view"
-      ],
-      "automerge": false,
-      "dependencyDashboardApproval": true
+      "description": "@tiptap/y-tiptap is published from ueberdosis/y-tiptap, a DIFFERENT repo from ueberdosis/tiptap, so Renovate's monorepo preset does not group it with @tiptap/* and it would otherwise get its own PR. It has to move in the same PR: it is the Yjs binding that @tiptap/extension-collaboration and -collaboration-caret peer-depend on, and the module src/features/comments/anchor.ts imports ySyncPluginKey from. Resolve two copies and the key becomes 'y-sync$' in one and 'y-sync$1' in the other, at which point getState() silently returns undefined and comment anchors stop resolving. Nothing throws.",
+      "groupName": "tiptap",
+      "matchPackageNames": ["@tiptap/y-tiptap"]
     },
     {
       "description": "Security floors in web/pnpm-workspace.yaml overrides. Raising them is welcome, but they exist because a parent hard-pins a vulnerable version, so a bump here needs a human to confirm the parent still resolves.",

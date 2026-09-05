@@ -31,6 +31,19 @@ jobs:
           cache-dependency-path: web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: web
+      # The editor breaks quietly when pnpm resolves two copies of the
+      # ProseMirror core: @tiptap/pm and @tiptap/y-tiptap get structurally
+      # identical but distinct Node classes, and @tiptap/y-tiptap gets two
+      # ySyncPluginKey objects — 'y-sync$' and 'y-sync$1' — at which point
+      # getState() returns undefined and every comment anchor resolves to null.
+      # web/pnpm-workspace.yaml used to prevent this by pinning prosemirror-*
+      # exactly, which also held them BELOW the ranges @tiptap/pm declares.
+      # This is the replacement, and it is not redundant with the jobs below:
+      # a duplicated tree passes tsc, eslint and the full vitest suite.
+      # It matters most for lockFileMaintenance, which runs pnpm update and
+      # automerges itself once green.
+      - run: pnpm dedupe --check
+        working-directory: web
       - run: pnpm tsc --noEmit
         working-directory: web
       - run: pnpm lint
