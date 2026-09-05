@@ -14,6 +14,7 @@ import { useUi } from "../../stores/ui";
 
 import { encodeAnchorRange } from "../comments/anchor";
 import { workspaceApi } from "../workspace/workspace.api";
+import { computeAddCommentPos } from "./addCommentPos";
 import { createExtensions } from "./extensions";
 import {
   type HighlightedComment,
@@ -283,16 +284,19 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
           return;
         }
         const coords = ed.view.coordsAtPos(from);
-        const editorDom = ed.view.dom.getBoundingClientRect();
-        // Position above the selection when there's room; otherwise below.
-        // Clamping prevents the button from leaking up into the toolbar's
-        // hit-area, where it would intercept clicks on Bold/H1/etc.
-        const above = coords.top - editorDom.top - 32;
-        const below = coords.bottom - editorDom.top + 4;
-        setAddCommentPos({
-          top: above >= 0 ? above : below,
-          left: Math.max(0, coords.left - editorDom.left),
-        });
+        const host = ed.view.dom.parentElement ?? ed.view.dom;
+        const hostRect = host.getBoundingClientRect();
+        // The toolbar is sticky, so its live rect is the only honest way to
+        // tell whether the button would land under it — a host-relative
+        // offset says nothing once the host has scrolled beneath it.
+        const toolbar = document.querySelector("[data-testid='editor-toolbar']");
+        setAddCommentPos(
+          computeAddCommentPos({
+            caret: { top: coords.top, bottom: coords.bottom, left: coords.left },
+            host: { top: hostRect.top, left: hostRect.left, width: hostRect.width },
+            toolbarBottom: toolbar ? toolbar.getBoundingClientRect().bottom : null,
+          }),
+        );
         setSelectionRange({ from, to });
       },
     },

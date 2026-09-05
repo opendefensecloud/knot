@@ -1,19 +1,7 @@
 import { test, expect, request } from "@playwright/test";
-import { execSync } from "node:child_process";
 
+import { reset } from "../support/reset";
 const SERVER = "http://localhost:3000";
-
-function reset() {
-  const tables = [
-    "acl_invalidations", "audit_events", "doc_markdown_cache",
-    "doc_snapshots", "doc_updates", "document_grants", "documents",
-    "sessions", "workspace_members", "users", "workspaces",
-  ].join(", ");
-  execSync(
-    `docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d knot -c "TRUNCATE TABLE ${tables} CASCADE"`,
-    { cwd: "..", stdio: "pipe" },
-  );
-}
 
 test.beforeAll(reset);
 

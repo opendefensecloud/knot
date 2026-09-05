@@ -1,27 +1,34 @@
-import { execSync } from "node:child_process";
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
-function reset() {
-  const tables = [
-    "acl_invalidations","audit_events","doc_markdown_cache","doc_snapshots","doc_updates",
-    "document_grants","documents","sessions","workspace_members","users","workspaces",
-    "blobs","blob_bytes",
-  ].join(", ");
-  execSync(
-    `docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d knot -c "TRUNCATE TABLE ${tables} CASCADE"`,
-    { cwd: "..", stdio: "pipe" },
-  );
-}
-test.beforeAll(reset);
+import { reset } from "../support/reset";
+
+const EMAIL = "o@e.com";
+const PASSWORD = "owner-hunter22";
+
+// The owner is created against the API rather than through /setup, because
+// /setup renders its form whether or not an owner exists — so a second test
+// in this file cannot tell the two states apart from the page alone.
+test.beforeAll(async () => {
+  reset();
+  const r = await fetch("http://localhost:3000/auth/setup", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, display_name: "O", password: PASSWORD }),
+  });
+  if (!r.ok) throw new Error(`setup failed: ${r.status} ${await r.text()}`);
+});
 test.use({ viewport: { width: 375, height: 667 } });
 
-test("mobile: drawer opens/closes, palette goes full-screen", async ({ page }) => {
-  await page.goto("/setup");
-  await page.getByTestId("setup-email").fill("o@e.com");
-  await page.getByTestId("setup-display-name").fill("O");
-  await page.getByTestId("setup-password").fill("owner-hunter22");
-  await page.getByTestId("setup-submit").click();
+async function signIn(page: Page) {
+  await page.goto("/login");
+  await page.getByTestId("login-email").fill(EMAIL);
+  await page.getByTestId("login-password").fill(PASSWORD);
+  await page.getByTestId("login-submit").click();
   await page.waitForURL(/\/(?:doc\/.+)?$/);
+}
+
+test("mobile: drawer opens/closes, palette goes full-screen", async ({ page }) => {
+  await signIn(page);
 
   // Initial state: sidebarOpen=true (Zustand default), so backdrop is showing.
   const backdrop = page.getByTestId("sidebar-backdrop");
@@ -51,4 +58,27 @@ test("mobile: drawer opens/closes, palette goes full-screen", async ({ page }) =
   const box = await dialog.boundingBox();
   expect(box?.width).toBeGreaterThan(370);
   expect(box?.height).toBeGreaterThan(660);
+});
+
+test("mobile: the document header fits the viewport", async ({ page }) => {
+  await signIn(page);
+  await page.getByTestId("new-doc").click();
+  await page.waitForSelector("[data-testid='new-doc-modal']", { state: "visible", timeout: 5_000 });
+  await page.getByTestId("new-doc-blank").click();
+  await page.waitForURL(/\/doc\/.+/);
+  await expect(page.getByTestId("doc-page")).toBeVisible();
+
+  // The header action row carries nine controls. Without wrapping it forces
+  // an intrinsic 412px into a 327px content box, pushing the last two
+  // buttons off-screen and giving <main> a horizontal scrollbar.
+  const overflow = await page.evaluate(() => {
+    const m = document.querySelector("main")!;
+    return m.scrollWidth - m.clientWidth;
+  });
+  expect(overflow).toBeLessThanOrEqual(1);
+
+  // Every control must be reachable, not merely non-overflowing.
+  for (const id of ["toggle-edit-mode", "toggle-markdown", "doc-export", "toggle-template", "open-comments"]) {
+    await expect(page.getByTestId(id)).toBeInViewport();
+  }
 });

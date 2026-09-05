@@ -14,6 +14,9 @@ export type PendingAnchor = {
 
 export type Theme = "light" | "dark";
 
+/** Document layout mode. "fixed" is the classic narrow column. */
+export type DocWidth = "fixed" | "wide";
+
 type UiState = {
   sidebarOpen: boolean;
   toggleSidebar: () => void;
@@ -39,6 +42,10 @@ type UiState = {
   theme: Theme;
   setTheme: (t: Theme) => void;
   toggleTheme: () => void;
+  // Document width — a global reading preference, not a document property.
+  docWidth: DocWidth;
+  setDocWidth: (w: DocWidth) => void;
+  toggleDocWidth: () => void;
 };
 
 let nextId = 1;
@@ -46,6 +53,27 @@ let nextId = 1;
 function readInitialTheme(): Theme {
   if (typeof localStorage === "undefined") return "light";
   return (localStorage.getItem("knot.theme") as Theme | null) ?? "light";
+}
+
+/** Exported for tests: the storage read has to survive a disabled or
+ *  throwing Storage, which `readInitialTheme` above does not. */
+export function readInitialDocWidth(): DocWidth {
+  try {
+    return localStorage.getItem("knot.docWidth") === "wide" ? "wide" : "fixed";
+  } catch {
+    return "fixed";
+  }
+}
+
+function applyDocWidth(w: DocWidth) {
+  if (typeof document !== "undefined") {
+    document.documentElement.setAttribute("data-doc-width", w);
+  }
+  try {
+    localStorage.setItem("knot.docWidth", w);
+  } catch {
+    /* storage unavailable — the mode still applies for this session */
+  }
 }
 
 function applyTheme(t: Theme) {
@@ -82,5 +110,12 @@ export const useUi = create<UiState>((set, get) => ({
     const next: Theme = get().theme === "light" ? "dark" : "light";
     applyTheme(next);
     set({ theme: next });
+  },
+  docWidth: readInitialDocWidth(),
+  setDocWidth: (w) => { applyDocWidth(w); set({ docWidth: w }); },
+  toggleDocWidth: () => {
+    const next: DocWidth = get().docWidth === "fixed" ? "wide" : "fixed";
+    applyDocWidth(next);
+    set({ docWidth: next });
   },
 }));

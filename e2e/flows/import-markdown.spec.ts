@@ -1,18 +1,6 @@
-import { execSync } from "node:child_process";
-
 import { expect, test, type Page } from "@playwright/test";
 
-function reset() {
-  const tables = [
-    "acl_invalidations", "audit_events", "doc_markdown_cache", "doc_tasks",
-    "doc_snapshots", "doc_updates", "document_grants", "documents",
-    "sessions", "workspace_members", "users", "workspaces",
-  ].join(", ");
-  execSync(
-    `docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d knot -c "TRUNCATE TABLE ${tables} CASCADE"`,
-    { cwd: "..", stdio: "pipe" },
-  );
-}
+import { reset } from "../support/reset";
 
 // Each test bootstraps through /setup, and POST /auth/setup returns 410 once a
 // user exists — so reset per test, not once per file.

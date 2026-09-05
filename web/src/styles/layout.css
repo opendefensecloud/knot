@@ -1,0 +1,83 @@
+/* ------------------------------------------------------------------ */
+/* Document width modes                                                */
+/*                                                                     */
+/* Wide mode widens the *container*, never the *measure*: prose keeps  */
+/* the exact column it has today and does not reflow, while tables,    */
+/* code, diagrams and boards break out into the room. That is what     */
+/* makes the toggle non-destructive, and therefore what makes a single */
+/* global preference the right model instead of a per-document opt-in. */
+/* ------------------------------------------------------------------ */
+
+:root {
+  /* Text measure — identical in both modes. 712px is today's content box
+     (760 - 2×24), which measures 95 characters per line at 16px Inter. */
+  --knot-measure: 712px;
+  /* Code breaks out further: 972px of content / 8.786px monospace advance
+     = 110 columns, up from 78. Enough for the 80- and 100-column
+     conventions without painting a full-window slab behind `npm i`. */
+  --knot-code-measure: 1000px;
+  --knot-page-max: 760px;
+  /* Hard ceiling so an ultrawide monitor doesn't sprawl. */
+  --knot-wide-max: 1600px;
+  --knot-page-pad: 24px;
+  --knot-wide-pad: clamp(32px, 3.5vw, 64px);
+  /* Room reserved on the right for the comment rail. Overridden per
+     element below; declared here so the calc()s always resolve. */
+  --knot-doc-inset-right: 0px;
+}
+
+/* Pins page chrome (breadcrumb, title row, toolbar) to the text column so
+   it doesn't drift away from the prose in wide mode. A no-op in fixed
+   mode, where the measure already equals the content box. */
+.measure {
+  max-width: var(--knot-measure);
+  margin-inline: auto;
+}
+
+/* The document container.
+   NEVER add transform / filter / backdrop-filter / contain / will-change /
+   perspective here or on <main>: CommentSidebar, HistoryDrawer and
+   PermissionsDialog are position:fixed children rendered *inside* this
+   section, and any of those properties would make it their containing
+   block — re-anchoring all three to the column. max-width and padding
+   transitions are safe; transform is not. */
+.doc-shell {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: calc(var(--knot-page-max) + var(--knot-doc-inset-right));
+  margin-inline: auto;
+  padding: 32px var(--knot-page-pad);
+  padding-right: calc(var(--knot-page-pad) + var(--knot-doc-inset-right));
+  transition:
+    max-width 160ms cubic-bezier(0.16, 1, 0.3, 1),
+    padding 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Gated at the same 1024px as useViewport()'s "desktop" bucket, which is
+   where DocWidthToggle stops rendering. Below it wide mode buys almost
+   nothing, so the layout falls back even if the JS gate ever misbehaves. */
+@media (min-width: 1024px) {
+  [data-doc-width="wide"] .doc-shell {
+    max-width: calc(var(--knot-wide-max) + var(--knot-doc-inset-right));
+    padding-left: var(--knot-wide-pad);
+    padding-right: calc(var(--knot-wide-pad) + var(--knot-doc-inset-right));
+  }
+}
+
+/* Comment-rail inset. DocPage sets --knot-rail-w inline. The
+   max-width += inset / padding-right += inset / margin-inline:auto trio
+   re-centres the document in the space the rail does not cover, without
+   moving or re-parenting the rail itself.
+
+   Scoped to .doc-shell, never to <main>: commentSidebarOpen has no
+   route-change reset, so a <main>-level inset would leave phantom padding
+   on Tasks/Templates/Settings/Members.
+
+   Below 1280 the rail keeps overlaying as it does today — at 1280 with a
+   260px sidebar there are only 620px left, and insetting would starve the
+   column rather than help it. */
+@media (min-width: 1280px) {
+  .doc-shell {
+    --knot-doc-inset-right: var(--knot-rail-w, 0px);
+  }
+}

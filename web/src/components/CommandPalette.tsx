@@ -145,6 +145,12 @@ export function CommandPalette() {
         run: () => { close(); void nav("/settings"); },
       },
       {
+        id: "action:doc-width",
+        label: "Toggle wide layout",
+        kind: "action",
+        run: () => { close(); useUi.getState().toggleDocWidth(); },
+      },
+      {
         id: "action:logout",
         label: "Sign out",
         kind: "action",

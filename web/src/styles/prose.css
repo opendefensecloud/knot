@@ -364,3 +364,69 @@
 .ProseMirror [data-excalidraw-board].comment-highlight--active {
   box-shadow: 0 0 0 2px rgb(245 158 11 / 0.95);
 }
+
+/* ---------------------------------------------------------------- */
+/* Width modes — measure cap + per-block breakout                   */
+/*                                                                  */
+/* In fixed mode --knot-measure equals the content box, so every    */
+/* rule below is a no-op and the page renders exactly as before.    */
+/* ---------------------------------------------------------------- */
+
+/* Text-flow blocks keep the measure and centre in the wider shell.
+   Deliberately not a grid: grid would suppress margin collapsing and
+   silently double every paragraph gap. */
+.ProseMirror > * {
+  max-width: var(--knot-measure);
+  margin-inline: auto;
+}
+
+/* Tables take the whole shell — the single biggest win here. At 1920 a
+   5-column table goes from 125px cells (six wrapped lines each) to 265px. */
+.ProseMirror > table,
+.ProseMirror > .tableWrapper {
+  max-width: 100%;
+}
+
+/* The wrapper has never had this rule, and without it a table carrying
+   persisted `colwidth` attributes overflows: the inline width TableView
+   writes beats the `width: 100%` above. `colwidth` rides Yjs, so one
+   collaborator's column drag would otherwise blow out the page for every
+   reader. KnotTable sets renderWrapper so this exists in view mode too. */
+.ProseMirror > .tableWrapper {
+  overflow-x: auto;
+}
+
+.ProseMirror > pre {
+  max-width: var(--knot-code-measure);
+}
+
+/* Diagram and board cards hug their content instead of becoming a
+   full-window bordered void around a 400px drawing — but never shrink
+   below the measure, so the page rhythm holds. The min-width floor is
+   load-bearing: fit-content alone collapses an SVG sized `width="100%"`
+   to below its natural size, because a percentage width contributes
+   nothing to intrinsic sizing. */
+.ProseMirror > [data-testid="mermaid-node"],
+.ProseMirror > [data-excalidraw-board="true"] {
+  width: fit-content;
+  min-width: min(100%, var(--knot-measure));
+  max-width: 100%;
+}
+
+/* Capped at the measure so toggling width mode never resizes an image —
+   a 2x screenshot jumping from 712 to 1472 would reflow every position
+   below it and invalidate scroll and comment-highlight targets. */
+.ProseMirror img {
+  max-width: min(100%, var(--knot-measure));
+}
+
+/* Clip illegitimate horizontal bleed (peer cursor labels are absolutely
+   positioned, white-space:nowrap and unclamped) while keeping the 2px
+   table column-resize handle grabbable. `clip` is not a scroll container
+   and creates no containing block for fixed elements, so the sticky
+   toolbar — a sibling before this host, not a descendant — and the z-40
+   rails are unaffected. */
+[data-testid="editor-host"] {
+  overflow-x: clip;
+  overflow-clip-margin: 4px;
+}

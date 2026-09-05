@@ -3,25 +3,12 @@
 // auth tables so the run is repeatable.
 
 import { test, expect, request } from "@playwright/test";
-import { execSync } from "node:child_process";
 
+import { reset } from "../support/reset";
 const SERVER = "http://localhost:3000";
 
-function resetAuthTables() {
-  // The dev compose stack must be up (`make compose.up`). This truncates
-  // the auth tables so `/auth/setup` can succeed afresh.
-  const cmd = [
-    "docker compose",
-    "-f deploy/compose/dev.yml",
-    "exec -T postgres",
-    `psql -U knot -d knot -c`,
-    `"TRUNCATE TABLE acl_invalidations, audit_events, doc_markdown_cache, doc_snapshots, doc_updates, document_grants, documents, sessions, workspace_members, users, workspaces CASCADE"`,
-  ].join(" ");
-  execSync(cmd, { cwd: "..", stdio: "pipe" });
-}
-
 test.beforeAll(() => {
-  resetAuthTables();
+  reset();
 });
 
 test("local auth round-trip: setup → session → logout", async () => {

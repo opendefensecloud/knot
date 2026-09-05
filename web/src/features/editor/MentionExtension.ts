@@ -8,6 +8,8 @@
 
 import { Extension } from "@tiptap/core";
 import Suggestion from "@tiptap/suggestion";
+
+import { placeFixedPopup } from "./popupPosition";
 import { type Editor } from "@tiptap/core";
 
 export const USER_HREF_PREFIX = "knot://user/";
@@ -68,11 +70,10 @@ class MentionPopup {
       return;
     }
     this.render();
-    if (rect) {
-      this.el.style.left = `${Math.round(rect.left)}px`;
-      this.el.style.top = `${Math.round(rect.bottom + 4)}px`;
-    }
+    // Display before positioning: a `display: none` element measures 0x0,
+    // which would defeat the viewport clamp.
     this.el.style.display = "block";
+    if (rect) placeFixedPopup(this.el, rect);
   }
 
   hide() {

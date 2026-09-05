@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { useState } from "react";
 
-import { Moon, Sun } from "lucide-react";
+import { FoldHorizontal, Moon, Sun, UnfoldHorizontal } from "lucide-react";
 
 import { authApi } from "../../auth/session.api";
 import { useSession } from "../../auth/SessionContext";
@@ -19,6 +19,8 @@ export default function SettingsPage() {
   const notify = useUi((s) => s.notify);
   const theme = useUi((s) => s.theme);
   const toggleTheme = useUi((s) => s.toggleTheme);
+  const docWidth = useUi((s) => s.docWidth);
+  const toggleDocWidth = useUi((s) => s.toggleDocWidth);
 
   const [pwCurrent, setPwCurrent] = useState("");
   const [pwNew, setPwNew] = useState("");
@@ -91,6 +93,30 @@ export default function SettingsPage() {
               ) : (
                 <>
                   <Moon size={14} aria-hidden /> Switch to dark
+                </>
+              )}
+            </button>
+          </div>
+          <div className="flex items-center justify-between gap-3 mt-4 pt-4 border-t border-border">
+            <div>
+              <p className="text-sm text-fg m-0">Document width</p>
+              <p className="text-[13px] text-fg-muted m-0 mt-0.5">
+                Currently: {docWidth === "wide" ? "Wide" : "Fixed"} · applies on screens wider than 1024px
+              </p>
+            </div>
+            <button
+              type="button"
+              data-testid="doc-width-toggle"
+              onClick={toggleDocWidth}
+              className="inline-flex items-center gap-2 h-9 px-3 rounded border border-border bg-surface text-fg text-sm font-medium hover:bg-muted transition-colors"
+            >
+              {docWidth === "wide" ? (
+                <>
+                  <FoldHorizontal size={14} aria-hidden /> Switch to fixed
+                </>
+              ) : (
+                <>
+                  <UnfoldHorizontal size={14} aria-hidden /> Switch to wide
                 </>
               )}
             </button>

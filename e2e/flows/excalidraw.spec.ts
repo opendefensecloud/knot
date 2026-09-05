@@ -1,20 +1,6 @@
-import { execSync } from "node:child_process";
-
 import { expect, test, type Page } from "@playwright/test";
 
-function reset() {
-  const tables = [
-    "board_snapshots", "board_updates", "boards",
-    "comment_reactions", "comments",
-    "acl_invalidations", "audit_events", "doc_markdown_cache",
-    "doc_snapshots", "doc_updates", "document_grants", "documents",
-    "sessions", "workspace_members", "users", "workspaces",
-  ].join(", ");
-  execSync(
-    `docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d knot -c "TRUNCATE TABLE ${tables} CASCADE"`,
-    { cwd: "..", stdio: "pipe" },
-  );
-}
+import { reset } from "../support/reset";
 
 // beforeEACH, not beforeAll. All three tests below bootstrap through
 // /setup, and POST /auth/setup returns 410 (auth.setup_closed) once any user
