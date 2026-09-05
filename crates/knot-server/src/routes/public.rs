@@ -143,6 +143,7 @@ fn render_markdown(
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title>\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\
          <style>body{{max-width:720px;margin:40px auto;padding:0 24px;\
          font-family:system-ui,sans-serif;line-height:1.5;color:#222}}\
          pre,code{{font-family:ui-monospace,monospace;background:#f5f5f5;padding:2px 4px;border-radius:3px}}\
@@ -340,6 +341,17 @@ fn placeholder(title: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_markdown_links_the_favicon() {
+        let html = render_markdown("Shared doc", "hello", "tok", &HashMap::new());
+        // A shared link is often someone's first sight of knot; the tab needs
+        // the same mark the SPA shows rather than a blank placeholder.
+        assert!(
+            html.contains("<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">"),
+            "public doc head should link the favicon, got: {html}"
+        );
+    }
 
     #[test]
     fn rewrite_board_url_matches_sentinel() {
