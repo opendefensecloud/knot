@@ -1,6 +1,6 @@
-import { execSync } from "node:child_process";
-
 import { expect, test, type BrowserContext } from "@playwright/test";
+
+import { reset } from "../support/reset";
 
 // Unsafe API calls go through the server's CSRF middleware, which requires the
 // X-CSRF-Token header to match the `csrf` cookie. The web app sets this header
@@ -9,22 +9,6 @@ async function csrfHeader(ctx: BrowserContext): Promise<Record<string, string>> 
   const cookies = await ctx.cookies();
   const csrf = cookies.find((c) => c.name === "csrf")?.value ?? "";
   return { "X-CSRF-Token": csrf };
-}
-
-function reset() {
-  const tables = [
-    "comment_reactions", "comments",
-    "doc_tasks",
-    "acl_invalidations", "audit_events", "doc_markdown_cache",
-    "doc_snapshots", "doc_updates", "document_grants", "documents",
-    "board_snapshots", "board_updates", "boards",
-    "blob_bytes", "blobs",
-    "sessions", "workspace_members", "users", "workspaces",
-  ].join(", ");
-  execSync(
-    `docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d knot -c "TRUNCATE TABLE ${tables} CASCADE"`,
-    { cwd: "..", stdio: "pipe" },
-  );
 }
 
 test.beforeAll(reset);

@@ -1,17 +1,7 @@
-import { execSync } from "node:child_process";
 import { expect, test, type Page } from "@playwright/test";
 
-function reset() {
-  const tables = [
-    "acl_invalidations","audit_events","doc_markdown_cache","doc_snapshots","doc_updates",
-    "document_grants","documents","sessions","workspace_members","users","workspaces",
-    "blobs","blob_bytes",
-  ].join(", ");
-  execSync(
-    `docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d knot -c "TRUNCATE TABLE ${tables} CASCADE"`,
-    { cwd: "..", stdio: "pipe" },
-  );
-}
+import { reset } from "../support/reset";
+
 const EMAIL = "o@e.com";
 const PASSWORD = "owner-hunter22";
 

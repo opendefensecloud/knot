@@ -1,18 +1,10 @@
-import { test, expect, request } from "@playwright/test";
 import { execSync } from "node:child_process";
 
-const SERVER = "http://localhost:3000";
+import { test, expect, request } from "@playwright/test";
 
-function reset() {
-  const cmd = [
-    "docker compose",
-    "-f deploy/compose/dev.yml",
-    "exec -T postgres",
-    `psql -U knot -d knot -c`,
-    `"TRUNCATE TABLE acl_invalidations, audit_events, document_grants, documents, sessions, workspace_members, users, workspaces CASCADE"`,
-  ].join(" ");
-  execSync(cmd, { cwd: "..", stdio: "pipe" });
-}
+import { reset } from "../support/reset";
+
+const SERVER = "http://localhost:3000";
 
 test.beforeAll(reset);
 
