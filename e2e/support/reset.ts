@@ -23,7 +23,13 @@ import { execSync } from "node:child_process";
  * drain. In practice the first attempt succeeds; the retries exist so a busy
  * moment costs a second rather than the entire run.
  */
-const ATTEMPTS = 5;
+// 8 attempts is a ~46s window (each attempt costs up to LOCK_TIMEOUT plus a
+// growing backoff). That is deliberately longer than the server's 30s
+// idle_in_transaction_session_timeout: if a connection ever is stranded
+// despite the pool's after_release guard, Postgres reclaims it at 30s, and a
+// shorter window here would give up just before that happened — making the
+// backstop useless to this suite.
+const ATTEMPTS = 8;
 const LOCK_TIMEOUT = "4s";
 
 const TABLES = [
