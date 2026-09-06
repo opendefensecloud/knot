@@ -107,10 +107,14 @@ Renovate groups each into a single PR; do the same by hand:
 | pnpm | `packageManager` in `web/` and `e2e/package.json`, `pnpm/action-setup` `version:` |
 | Node | `node:…-alpine` in `Dockerfile`, `node-version:` in `ci.yml` |
 
-Left out of automation on purpose: the exact `prosemirror-*` pins in
-`web/pnpm-workspace.yaml` (they deduplicate the editor core — see the comment
-there for what breaks), the security floors in the same file's `overrides`, and
-`@playwright/test`, which ships the browser the e2e suite runs against.
+Left out of automation on purpose: the security floors in
+`web/pnpm-workspace.yaml`'s `overrides`, and `@playwright/test`, which ships the
+browser the e2e suite runs against.
+
+`@tiptap/y-tiptap` is grouped with the `@tiptap/*` packages in `renovate.json`
+even though it is published from a different upstream repo. It is the Yjs
+binding the collaboration extensions peer-depend on and the one `ySyncPluginKey`
+comes from, so it has to be tested against the tiptap version it will ship with.
 
 `cargo deny check` gates every PR. When an advisory has no reachable fix, add it
 to `deny.toml` with the dependency path and the upstream event that would let us

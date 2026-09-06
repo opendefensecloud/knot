@@ -27,26 +27,6 @@ overrides:
   # patched release regardless of what mermaid or excalidraw ask for.
   dompurify@<3.4.13: "^3.4.13"
 
-  # Deduplication, not security. @tiptap/pm and y-prosemirror both declare wide
-  # `^1.x` ranges on the ProseMirror core, and pnpm is free to resolve them to
-  # different patches. When it does, the editor is handed two structurally
-  # identical but nominally distinct `Node` types and tsc fails with a wall of
-  # "not assignable" errors.
-  #
-  # Pinned EXACTLY to the versions main resolved, not to the newest release.
-  # Dedupe is the goal; upgrading this stack is a separate, deliberate change.
-  #
-  # These pins were introduced in a5c7042, which blamed prosemirror-view 1.42
-  # for a history-restore failure. That diagnosis was wrong and ccf5dbd
-  # retracts it: the actual defect was ReplaceWithMarkdown broadcasting only
-  # its insertion, so peers appended the restored text instead of replacing.
-  # Nothing is known to be wrong with prosemirror-view 1.42 — do not treat
-  # these versions as a quarantine. Lifting them is an ordinary upgrade that
-  # wants a CI run, not a re-investigation.
-  prosemirror-model: "1.25.7"
-  prosemirror-state: "1.4.4"
-  prosemirror-view: "1.41.8"
-
 # pnpm >= 10 blocks dependency lifecycle scripts unless they are approved here.
 # esbuild is the only package in this tree whose install script is required.
 allowBuilds:
