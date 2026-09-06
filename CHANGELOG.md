@@ -8,14 +8,148 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-06
+
+The editor moves from Tiptap 2 to Tiptap 3. The visible result should be nothing
+at all — almost all of the work went into keeping the stored document schema
+identical to what every existing page was written against — but four things that
+were quietly not working are fixed on the way, and a browser that navigates away
+mid-request can no longer strand an open transaction on the server.
+
+### Changed
+- **The editor runs on Tiptap 3** (2.27.2 → 3.31.3, and the whole `@tiptap/*`
+  set with it). The 2.x line is not dead — it still has a `v2-latest` tag and
+  picked up a security backport as recently as 2.27.3 — but it is maintenance
+  only, so every fix and every new extension now lands on 3.x alone. Two things
+  made this more than a version bump. The Yjs binding changed hands:
+  `y-prosemirror` is replaced by `@tiptap/y-tiptap`, Tiptap's own fork, and both
+  create their plugin key by the same name — so importing `ySyncPluginKey` from
+  the wrong one leaves ProseMirror holding `y-sync$` in one place and `y-sync$1`
+  in the other, `getState()` silently returns `undefined`, and every comment
+  anchor resolves to null with nothing thrown. And `CollaborationCursor` is gone
+  in favour of `CollaborationCaret`, which sanitises a colour it cannot parse to
+  `transparent` rather than rendering it anyway.
+- **The stored schema is deliberately unchanged.** Everything StarterKit 3 adds
+  that would have written to a document — `trailingNode`, `listKeymap`, and its
+  now-bundled Link and Underline — is disabled, and the snake_case node names
+  knot's Rust serialiser expects are preserved. A 0.4.0 document opens on this
+  release producing an identical `Y.XmlFragment` and emitting no Y.Doc updates
+  at all. The only schema difference any stored page sees is the link `title`
+  attribute, which is a fix — see below.
+- **The exact `prosemirror-*` pins are gone.** They existed to deduplicate the
+  ProseMirror core that `@tiptap/pm` and `y-prosemirror` both pulled in, and
+  `y-prosemirror` left with the migration. They had also started doing harm:
+  `@tiptap/pm` 3.31.3 asks for `prosemirror-model` ^1.25.11 and
+  `prosemirror-view` ^1.42.3, and the overrides held the tree at 1.25.7 and
+  1.41.8 — *below* both, silently, because pnpm `overrides` bypass range checks.
+
+### Added
+- **Renovate keeps dependencies current** (`.github/renovate.json`). Nothing was
+  watching them between manual refreshes. Patch and minor updates merge
+  themselves once nextest, vitest, Playwright, clippy and cargo-deny are green;
+  majors never open a PR on their own, so a migration like this one stays a
+  deliberate choice rather than eight red PRs landing at once. Weekly
+  `lockFileMaintenance` refreshes the lockfiles, which is the only route by
+  which a patched *transitive* dependency ever arrives. The Rust, pnpm and Node
+  versions that each live in three files are grouped so they move atomically.
+  CONTRIBUTING.md § Dependencies is the reference.
+- **A test baseline for the migration, landed on Tiptap 2 first**, so it is a
+  real before/after rather than a story told afterwards.
+  `web/src/test/boundEditor.ts` mounts a real editor over a real `Y.Doc` in
+  jsdom in about 40ms — the assumption that this needed Playwright is what left
+  the gaps. Comment anchors now resolve through the live ySync binding instead
+  of a hand-built Map; `schema.test.ts` pins the exact registered-extension list
+  and checks attribute parity in both directions against `tools/schema.json`;
+  `ydoc.test.ts` asserts the editor writes nothing but the user's own edits.
+  Two gaps needed the whole stack: `comment-anchors.spec.ts`, because the
+  existing comment spec posted every comment straight to the API with
+  `position_y: null` and never exercised anchoring at all, and
+  `editor-markdown-roundtrip.spec.ts`, because only paragraph, image and
+  `excalidraw_board` had ever travelled editor → Y.Doc → `to_markdown`.
+- **`pnpm dedupe --check` gates CI.** Not belt-and-braces: while removing the
+  pins above, the ProseMirror core was genuinely split for one run —
+  `@tiptap/pm` on `prosemirror-view` 1.41.8 while `@tiptap/y-tiptap` was on
+  1.42.3 — and tsc, eslint and all 153 unit tests passed anyway. TypeScript is
+  structural, so the two `Node` classes match and nothing else in CI looks at
+  resolution.
+
+### Fixed
+- **A browser navigating away mid-request could strand a transaction and stall
+  the server.** `sqlx`'s `pool.begin()` is not cancellation-safe: drop the
+  future after BEGIN has reached Postgres but before `begin()` returns, and sqlx
+  never receives a `Transaction` to roll back and keeps no record that one is
+  open. The connection goes back to the pool looking clean, and every later
+  query handed it silently joins the orphan. One backend was caught holding a
+  dozen unrelated documents' work inside a single transaction open for minutes,
+  with AccessShare on `doc_updates`, `board_updates` and `comments` plus
+  RowExclusive on `sessions`. Nothing ever commits it: it pins a transaction id
+  against vacuum and stalls any TRUNCATE or DDL on those tables until the
+  process exits. axum drops a handler future exactly this way whenever a client
+  disconnects, which is ordinary browser behaviour. `knot_storage::begin` now
+  runs the BEGIN on a detached task, so the caller can be cancelled but the
+  transaction is always constructed and always dropped — and sqlx's own `Drop`
+  rolls it back. Connections also carry `application_name=knot-server` and a 30s
+  `idle_in_transaction_session_timeout` as a backstop.
+- **`⌘⇧8` and `⌘⇧7` did nothing.** knot renames ProseMirror's nodes to
+  snake_case, but renaming a node does not rewrite the options its own commands
+  read: BulletList and OrderedList still resolved `itemTypeName` to the
+  camelCase `listItem`, so `toggleBulletList()` raised "There is no node type
+  named 'listItem'" and the keystroke logged instead of making a list. The
+  toolbar buttons pass both names explicitly, which is why only the shortcuts
+  were affected.
+- **Link titles were dropped from storage.** `tools/schema.json` declares
+  `title` on the link mark and both `from_markdown` and `to_markdown` honour it,
+  but Tiptap's Link has no such attribute and ProseMirror discards what its
+  schema does not declare. `[text](url "title")` survived import and then lost
+  its title the first time anyone edited the page — in the CRDT, for every
+  reader and for the next export. Nothing backfills: titles already lost this
+  way stay lost.
+- **Code blocks, Mermaid diagrams and Excalidraw boards ignored wide mode.**
+  0.4.0's notes said all three break out into the room; only tables actually
+  did. A React node view's outer element is Tiptap's own `div.react-renderer`
+  and the wrapper carrying our attributes renders inside it, so
+  `.ProseMirror > pre` and `.ProseMirror > [data-testid=…]` selected nothing —
+  invisibly, because the generic `.ProseMirror > *` rule still applied and held
+  all three at the 712px prose measure. Retargeted at the `node-<type>` class
+  Tiptap stamps on the wrapper, and `doc-width.spec.ts` now measures rendered
+  widths rather than trusting a selector.
+- **Every collaborative session logged "A user uses an unsupported color
+  format" once per peer.** `colorFor()` emitted `hsl()`; the caret accepts only
+  `#rrggbb`. Noise under Tiptap 2, which rendered the caret anyway — but the v3
+  caret extension replaces a colour it cannot parse with `transparent`, which
+  would have made every remote caret invisible. Same palette, converted rather
+  than re-picked, so nobody's avatar changes colour.
+
 ### Security
-- **`@tiptap/core` 2.27.3** closes [GHSA-cp6q-959q-f8rh](https://github.com/advisories/GHSA-cp6q-959q-f8rh),
-  where `mergeAttributes()` turned an own `__proto__` key into inherited
-  executable DOM attributes. knot was not reachable — ProseMirror builds
-  `node.attrs` into a null-prototype object over schema-declared names only, so
-  no attacker-controlled key ever reached the merge — but the patched code is
-  free. The advisory's range still reads `< 3.30.4` and so keeps flagging
-  2.27.3; the backport is real, on the `v2-latest` tag.
+- **`prosemirror-view` 1.42.3** closes an XSS in clipboard handling: attribute
+  validators were not run on attributes arriving via slice context. No advisory
+  was ever filed, so no scanner would have surfaced it — the old pins were
+  holding knot at 1.41.8. knot was not reachable through it, because Tiptap only
+  sets `spec.validate` when an extension declares a validator and knot declares
+  none, but being on the patched release closes the exposure the moment that
+  stops being true.
+- GHSA-cp6q-959q-f8rh (`mergeAttributes()` prototype pollution) is closed by
+  `@tiptap/core` 3.31.3. knot was never reachable — ProseMirror builds
+  `node.attrs` into a null-prototype object over schema-declared names only —
+  and the advisory range no longer flags the shipped version.
+
+### Operators — read before upgrading
+- **No migrations, and rollback to 0.4.0 is clean.** Nothing in this release
+  changes the database schema.
+- **Tell people to reload.** The JS bundle is content-hashed and code-split, so
+  a tab left open across the upgrade can request a chunk that no longer exists
+  and get `index.html` back instead. A refresh fixes it.
+- **A stale 0.4.0 tab strips link titles.** 0.4.0's schema does not declare the
+  link `title` attribute fixed above, so if an old tab edits a link run it
+  rewrites it without the title, for every peer. The same applies if you roll
+  back. It only affects titles, which are new in this release.
+- **Comments anchored to the very first character of a document lose their
+  inline highlight.** `@tiptap/y-tiptap` rejects an item-based relative position
+  resolving to absolute position ≤ 1, which is how 0.4.0 stored an anchor that
+  started at the first character. Nothing is deleted — the thread, its body and
+  its quoted text all still appear in the sidebar — and it self-heals as soon as
+  any content is inserted above the anchor. Comments created on this release are
+  unaffected.
 
 ## [0.4.0] - 2026-09-05
 
@@ -316,7 +450,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/opendefensecloud/knot/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/opendefensecloud/knot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/opendefensecloud/knot/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/opendefensecloud/knot/compare/v0.2.0...v0.2.1
