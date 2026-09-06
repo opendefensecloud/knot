@@ -227,38 +227,64 @@ async fn a_transaction_dropped_by_cancellation_does_not_poison_the_pool() {
 /// 12 BEGIN, 11 COMMIT and 0 ROLLBACK, and the statements after the unmatched
 /// BEGIN were unrelated work for a dozen different documents.
 ///
-/// axum drops a handler future exactly this way when the client disconnects,
-/// which a Playwright navigation does constantly.
+/// This is the characterisation half. If sqlx ever fixes this upstream, this
+/// test fails and `knot_storage::begin` can be retired.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cancelled_begin_does_not_poison_the_pool() {
+async fn the_raw_pool_begin_is_not_cancellation_safe() {
     let db = knot_test_support::fresh_db().await;
     let name = db_name(&db.url);
-    // The real pool builder — this test exists to prove ITS guard works, so
-    // it must not construct a bare sqlx pool.
     let pool = knot_storage::connect(&db.url, 1).await.unwrap();
     let obs = observer(&db.url).await;
 
-    // Sweep the timeout across the window in which BEGIN is in flight, and
-    // check after EVERY cancellation. Checking only at the end hides the bug:
+    let mut cancelled = 0u32;
+    for i in 0..3_000u64 {
+        let d = Duration::from_micros(20 + (i % 400) * 5);
+        match tokio::time::timeout(d, pool.begin()).await {
+            Ok(tx) => tx.unwrap().rollback().await.unwrap(),
+            Err(_) => {
+                cancelled += 1;
+                if idle_in_transaction(&obs, &name).await > 0 {
+                    return; // reproduced — the wrapper below is still needed
+                }
+            }
+        }
+    }
+    panic!(
+        "cancelled {cancelled} raw begin() calls without stranding a \
+         transaction. Either the window was never hit, or sqlx fixed this \
+         upstream — in which case knot_storage::begin can be retired."
+    );
+}
+
+/// And the guard: cancelling `knot_storage::begin` cannot poison the pool,
+/// because the BEGIN runs on a detached task that always completes and always
+/// drops its `Transaction`.
+#[tokio::test(flavor = "multi_thread")]
+async fn knot_begin_survives_cancellation() {
+    let db = knot_test_support::fresh_db().await;
+    let name = db_name(&db.url);
+    let pool = knot_storage::connect(&db.url, 1).await.unwrap();
+    let obs = observer(&db.url).await;
+
+    // Check after EVERY cancellation. Checking only at the end hides the bug:
     // a later successful begin()/rollback() on the same pooled connection
     // rolls the orphaned transaction back too.
     let mut cancelled = 0u32;
     for i in 0..3_000u64 {
         let d = Duration::from_micros(20 + (i % 400) * 5);
-        match tokio::time::timeout(d, pool.begin()).await {
-            Ok(tx) => {
-                tx.unwrap().rollback().await.unwrap();
-            }
+        match tokio::time::timeout(d, knot_storage::begin(&pool)).await {
+            Ok(tx) => tx.unwrap().rollback().await.unwrap(),
             Err(_) => {
                 cancelled += 1;
-                if idle_in_transaction(&obs, &name).await > 0 {
-                    panic!(
-                        "a cancelled begin() left the pooled connection inside an open \
-                         transaction (after {cancelled} cancellations); every later query \
-                         on it joins that transaction and its locks are held until the \
-                         process exits"
-                    );
-                }
+                // The detached BEGIN may still be in flight; give its
+                // Transaction a moment to drop and roll back.
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                let stranded = idle_in_transaction(&obs, &name).await;
+                assert_eq!(
+                    stranded, 0,
+                    "a cancelled knot_storage::begin left the pooled connection \
+                     inside an open transaction (after {cancelled} cancellations)"
+                );
             }
         }
     }
@@ -267,5 +293,5 @@ async fn a_cancelled_begin_does_not_poison_the_pool() {
         "no begin() was actually cancelled, so this proved nothing — \
          widen the timeout sweep"
     );
-    eprintln!("cancelled {cancelled} begin() calls with no poisoning");
+    eprintln!("cancelled {cancelled} knot_storage::begin calls with no poisoning");
 }
