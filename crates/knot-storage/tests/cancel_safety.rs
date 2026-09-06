@@ -243,9 +243,24 @@ async fn a_transaction_dropped_by_cancellation_does_not_poison_the_pool() {
 /// 12 BEGIN, 11 COMMIT and 0 ROLLBACK, and the statements after the unmatched
 /// BEGIN were unrelated work for a dozen different documents.
 ///
-/// This is the characterisation half. If sqlx ever fixes this upstream, this
-/// test fails and `knot_storage::begin` can be retired.
+/// This is the characterisation half, and it is `#[ignore]`d on purpose.
+///
+/// Reproducing needs the cancellation to land in the gap between BEGIN
+/// reaching Postgres and `begin()` returning, and the width of that gap is
+/// connection latency. Against Postgres in Docker Desktop it is wide enough to
+/// hit on the first cancellation. On CI, where Postgres is a host service over
+/// loopback, 2997 cancelled calls stranded nothing — so as a gate this test
+/// cannot tell "sqlx fixed it upstream" from "the window was never reachable
+/// here", which is the only thing it exists to tell you.
+///
+/// Run it deliberately, on a setup with real connection latency:
+///
+///     cargo test -p knot-storage --test cancel_safety -- --ignored
+///
+/// If it fails there, the window is genuinely gone and `knot_storage::begin`
+/// can be retired. The CI gate is `knot_begin_survives_cancellation` below.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "reproduces only where connection latency makes the window reachable; see doc comment"]
 async fn the_raw_pool_begin_is_not_cancellation_safe() {
     let db = knot_test_support::fresh_db().await;
     let name = db_name(&db.url);
@@ -285,6 +300,13 @@ async fn knot_begin_survives_cancellation() {
     // Check after EVERY cancellation. Checking only at the end hides the bug:
     // a later successful begin()/rollback() on the same pooled connection
     // rolls the orphaned transaction back too.
+    //
+    // Honest about its own sensitivity: like the ignored test above, this can
+    // only catch a regression where connection latency makes the cancellation
+    // window reachable — on a loopback Postgres the sweep may cancel 3000
+    // times without ever landing in it. It is kept as the gate because it is
+    // green everywhere and decisive where the window exists, which is exactly
+    // the setup that found the bug.
     let mut cancelled = 0u32;
     for i in 0..3_000u64 {
         let d = Duration::from_micros(20 + (i % 400) * 5);
