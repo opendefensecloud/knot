@@ -91,7 +91,7 @@ impl TaskStore for PgTaskStore {
         doc_id: Uuid,
         items: &[DocTaskInput],
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin(&self.pool).await?;
 
         // Build the new ID set so we can prune rows that fell out.
         let new_ids: Vec<String> = items

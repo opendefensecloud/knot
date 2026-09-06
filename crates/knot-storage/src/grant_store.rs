@@ -138,7 +138,7 @@ impl GrantStore for PgGrantStore {
         inherit: bool,
         granted_by: Uuid,
     ) -> Result<(), GrantStoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin(&self.pool).await?;
         sqlx::query(
             "INSERT INTO document_grants (doc_id, principal, role, inherit, granted_by)
              VALUES ($1, $2, $3, $4, $5)
@@ -174,7 +174,7 @@ impl GrantStore for PgGrantStore {
         principal: &str,
         actor: Uuid,
     ) -> Result<(), GrantStoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin(&self.pool).await?;
         sqlx::query("DELETE FROM document_grants WHERE doc_id = $1 AND principal = $2")
             .bind(doc_id)
             .bind(principal)

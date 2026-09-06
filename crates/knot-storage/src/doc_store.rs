@@ -185,7 +185,7 @@ impl DocStore for PgDocStore {
         actor: Uuid,
         is_template: bool,
     ) -> Result<Document, DocStoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin(&self.pool).await?;
         let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "UPDATE documents SET is_template = $3, updated_at = now()
              WHERE workspace_id = $1 AND id = $2
@@ -233,7 +233,7 @@ impl DocStore for PgDocStore {
         sort_key: &str,
         created_by: Uuid,
     ) -> Result<Document, DocStoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin(&self.pool).await?;
         let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
              VALUES ($1, $2, $3, $4, $5)
@@ -270,7 +270,7 @@ impl DocStore for PgDocStore {
         title: &str,
         icon: Option<&str>,
     ) -> Result<Document, DocStoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin(&self.pool).await?;
         let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "UPDATE documents SET title = $3, icon = COALESCE($4, icon), updated_at = now()
              WHERE workspace_id = $1 AND id = $2
@@ -305,7 +305,7 @@ impl DocStore for PgDocStore {
         parent_id: Option<Uuid>,
         sort_key: &str,
     ) -> Result<Document, DocStoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin(&self.pool).await?;
         // Reject moves that would create a parent cycle: the destination
         // parent must not be the doc itself or one of its descendants. Done
         // inside the tx so it's correct under concurrency.
@@ -360,7 +360,7 @@ impl DocStore for PgDocStore {
         doc_id: Uuid,
         actor: Uuid,
     ) -> Result<(), DocStoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin(&self.pool).await?;
         let n = sqlx::query(
             "UPDATE documents SET archived_at = now()
              WHERE workspace_id = $1 AND id = $2 AND archived_at IS NULL",
@@ -393,7 +393,7 @@ impl DocStore for PgDocStore {
         doc_id: Uuid,
         actor: Uuid,
     ) -> Result<(), DocStoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin(&self.pool).await?;
         let n = sqlx::query(
             "UPDATE documents SET archived_at = NULL
              WHERE workspace_id = $1 AND id = $2 AND archived_at IS NOT NULL",

@@ -28,7 +28,7 @@ pub use lexorank::between as sort_key_between;
 pub use markdown_cache::{
     MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore, PgMarkdownCache,
 };
-pub use pool::{Pool, PoolError, connect};
+pub use pool::{Pool, PoolError, begin, connect};
 pub use search::{PgSearchStore, SearchHit, SearchStore, SearchStoreError};
 pub use session_store::{PgSessionStore, Session, SessionStore, SessionStoreError};
 pub use share_tokens::{PgShareTokenStore, ShareStoreError, ShareToken, ShareTokenStore};

@@ -70,8 +70,8 @@ async fn a_cancelled_fetch_does_not_strand_its_connection() {
 
     let store = PgUpdatesStore::new(pool.clone());
     let blob = vec![7u8; 4096];
-    for _ in 0..8 {
-        let batch: Vec<Vec<u8>> = (0..250).map(|_| blob.clone()).collect();
+    for _ in 0..2 {
+        let batch: Vec<Vec<u8>> = (0..125).map(|_| blob.clone()).collect();
         store
             .insert_batch(doc.id, Some(u.id), &batch)
             .await
@@ -83,18 +83,34 @@ async fn a_cancelled_fetch_does_not_strand_its_connection() {
 
     // `timeout` drops the query future — the same thing axum does to a
     // handler future when the client disconnects.
-    let r = tokio::time::timeout(Duration::from_millis(3), store.since(doc.id, 0)).await;
+    //
+    // The deadline is SWEPT rather than fixed. A fixed one is a bet on how long
+    // the fetch takes, and that bet is environment-specific: 3ms against this
+    // payload cancels reliably on a Docker Desktop VM and never fires on CI,
+    // where Postgres is a host service and the whole fetch lands first. That
+    // made this test pass in one environment and fail in the other while
+    // proving nothing in either. Sweeping upward from microseconds guarantees
+    // some attempt lands mid-flight on any hardware.
+    let mut cancelled = 0u32;
+    for i in 0..60u64 {
+        let d = Duration::from_micros(10 + (i % 30) * 40);
+        if tokio::time::timeout(d, store.since(doc.id, 0))
+            .await
+            .is_err()
+        {
+            cancelled += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(
+                idle_in_transaction(&obs, &name).await,
+                0,
+                "a cancelled fetch left a backend idle in transaction"
+            );
+        }
+    }
     assert!(
-        r.is_err(),
-        "the query finished inside the timeout, so nothing was cancelled — \
-         raise the payload or lower the timeout"
-    );
-
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(
-        idle_in_transaction(&obs, &name).await,
-        0,
-        "a cancelled fetch left a backend idle in transaction"
+        cancelled > 0,
+        "every fetch completed inside its deadline, so nothing was ever \
+         cancelled and this proved nothing — lower the sweep"
     );
 }
 
@@ -227,38 +243,103 @@ async fn a_transaction_dropped_by_cancellation_does_not_poison_the_pool() {
 /// 12 BEGIN, 11 COMMIT and 0 ROLLBACK, and the statements after the unmatched
 /// BEGIN were unrelated work for a dozen different documents.
 ///
-/// axum drops a handler future exactly this way when the client disconnects,
-/// which a Playwright navigation does constantly.
+/// This is the characterisation half, and it is `#[ignore]`d on purpose.
+///
+/// Reproducing needs the cancellation to land in the gap between BEGIN
+/// reaching Postgres and `begin()` returning, and the width of that gap is
+/// connection latency. Against Postgres in Docker Desktop it is wide enough to
+/// hit on the first cancellation. On CI, where Postgres is a host service over
+/// loopback, 2997 cancelled calls stranded nothing — so as a gate this test
+/// cannot tell "sqlx fixed it upstream" from "the window was never reachable
+/// here", which is the only thing it exists to tell you.
+///
+/// Run it deliberately, on a setup with real connection latency:
+///
+///     cargo test -p knot-storage --test cancel_safety -- --ignored
+///
+/// If it fails there, the window is genuinely gone and `knot_storage::begin`
+/// can be retired. The CI gate is `knot_begin_survives_cancellation` below.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cancelled_begin_does_not_poison_the_pool() {
+#[ignore = "reproduces only where connection latency makes the window reachable; see doc comment"]
+async fn the_raw_pool_begin_is_not_cancellation_safe() {
     let db = knot_test_support::fresh_db().await;
     let name = db_name(&db.url);
-    // The real pool builder — this test exists to prove ITS guard works, so
-    // it must not construct a bare sqlx pool.
     let pool = knot_storage::connect(&db.url, 1).await.unwrap();
     let obs = observer(&db.url).await;
 
-    // Sweep the timeout across the window in which BEGIN is in flight, and
-    // check after EVERY cancellation. Checking only at the end hides the bug:
-    // a later successful begin()/rollback() on the same pooled connection
-    // rolls the orphaned transaction back too.
     let mut cancelled = 0u32;
     for i in 0..3_000u64 {
         let d = Duration::from_micros(20 + (i % 400) * 5);
         match tokio::time::timeout(d, pool.begin()).await {
-            Ok(tx) => {
-                tx.unwrap().rollback().await.unwrap();
-            }
+            Ok(tx) => tx.unwrap().rollback().await.unwrap(),
             Err(_) => {
                 cancelled += 1;
                 if idle_in_transaction(&obs, &name).await > 0 {
-                    panic!(
-                        "a cancelled begin() left the pooled connection inside an open \
-                         transaction (after {cancelled} cancellations); every later query \
-                         on it joins that transaction and its locks are held until the \
-                         process exits"
-                    );
+                    return; // reproduced — the wrapper below is still needed
                 }
+            }
+        }
+    }
+    panic!(
+        "cancelled {cancelled} raw begin() calls without stranding a \
+         transaction. Either the window was never hit, or sqlx fixed this \
+         upstream — in which case knot_storage::begin can be retired."
+    );
+}
+
+/// And the guard: cancelling `knot_storage::begin` cannot poison the pool,
+/// because the BEGIN runs on a detached task that always completes and always
+/// drops its `Transaction`.
+#[tokio::test(flavor = "multi_thread")]
+async fn knot_begin_survives_cancellation() {
+    let db = knot_test_support::fresh_db().await;
+    let name = db_name(&db.url);
+    let pool = knot_storage::connect(&db.url, 1).await.unwrap();
+    let obs = observer(&db.url).await;
+
+    // Check after EVERY cancellation. Checking only at the end hides the bug:
+    // a later successful begin()/rollback() on the same pooled connection
+    // rolls the orphaned transaction back too.
+    //
+    // Honest about its own sensitivity: like the ignored test above, this can
+    // only catch a regression where connection latency makes the cancellation
+    // window reachable — on a loopback Postgres the sweep may cancel 3000
+    // times without ever landing in it. It is kept as the gate because it is
+    // green everywhere and decisive where the window exists, which is exactly
+    // the setup that found the bug.
+    let mut cancelled = 0u32;
+    for i in 0..3_000u64 {
+        let d = Duration::from_micros(20 + (i % 400) * 5);
+        match tokio::time::timeout(d, knot_storage::begin(&pool)).await {
+            Ok(tx) => tx.unwrap().rollback().await.unwrap(),
+            Err(_) => {
+                cancelled += 1;
+                // The guarantee is that the transaction is ALWAYS rolled back,
+                // not that it is rolled back before any particular instant:
+                // the detached task still has to finish its BEGIN, hand back a
+                // `Transaction`, and let `Drop` send the ROLLBACK. So poll for
+                // the connection to come clean rather than sleeping a fixed
+                // amount and hoping — a fixed wait is the same environment-
+                // specific bet that made the sweep above necessary.
+                //
+                // The bug this guards against does not resolve on its own at
+                // any deadline: the orphaned transaction stays open until the
+                // process exits.
+                let deadline = Duration::from_secs(5);
+                let step = Duration::from_millis(10);
+                let mut waited = Duration::ZERO;
+                let mut stranded = idle_in_transaction(&obs, &name).await;
+                while stranded > 0 && waited < deadline {
+                    tokio::time::sleep(step).await;
+                    waited += step;
+                    stranded = idle_in_transaction(&obs, &name).await;
+                }
+                assert_eq!(
+                    stranded, 0,
+                    "a cancelled knot_storage::begin left the pooled connection \
+                     inside an open transaction for {waited:?} (after \
+                     {cancelled} cancellations)"
+                );
             }
         }
     }
@@ -267,5 +348,5 @@ async fn a_cancelled_begin_does_not_poison_the_pool() {
         "no begin() was actually cancelled, so this proved nothing — \
          widen the timeout sweep"
     );
-    eprintln!("cancelled {cancelled} begin() calls with no poisoning");
+    eprintln!("cancelled {cancelled} knot_storage::begin calls with no poisoning");
 }

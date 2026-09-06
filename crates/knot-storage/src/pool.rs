@@ -50,35 +50,6 @@ pub async fn connect(url: &str, max_conn: u32) -> Result<Pool, PoolError> {
     let pool = PgPoolOptions::new()
         .max_connections(max_conn)
         .acquire_timeout(Duration::from_secs(10))
-        // `pool.begin()` is not cancellation-safe. Drop the future after BEGIN
-        // has reached Postgres but before `begin()` returns, and sqlx never
-        // gets a `Transaction` to roll back and holds no record that one is
-        // open — so the connection goes back to the pool looking clean. Every
-        // later query handed that connection silently joins the orphaned
-        // transaction, which never commits: it accumulates locks across
-        // unrelated tables, pins a transaction id against vacuum, and stalls
-        // any TRUNCATE or DDL until the process exits.
-        //
-        // axum drops a handler future exactly this way whenever a client
-        // disconnects mid-request, which is ordinary browser behaviour.
-        //
-        // Caught with `log_statement=all`: one backend logged 12 BEGIN, 11
-        // COMMIT and 0 ROLLBACK, and the statements after the unmatched BEGIN
-        // were unrelated work for a dozen different documents.
-        //
-        // No call-site change can fix this — the cancelled task never receives
-        // a `Transaction` to clean up — so it has to be caught here, on the
-        // way back into the pool. ROLLBACK is a no-op when no transaction is
-        // open, which is the overwhelmingly common case.
-        //
-        // `crates/knot-storage/tests/cancel_safety.rs` reproduces the leak and
-        // pins this fix.
-        .after_release(|conn, _meta| {
-            Box::pin(async move {
-                sqlx::Executor::execute(conn, "ROLLBACK").await?;
-                Ok(true)
-            })
-        })
         .connect_with(opts)
         .await?;
 
@@ -96,4 +67,38 @@ pub async fn connect(url: &str, max_conn: u32) -> Result<Pool, PoolError> {
     });
 
     Ok(pool)
+}
+
+/// Cancellation-safe replacement for `pool.begin()`.
+///
+/// `sqlx`'s own `Pool::begin` is not cancellation-safe: if the caller's future
+/// is dropped after BEGIN has reached Postgres but before `begin()` returns,
+/// sqlx never receives a `Transaction` to roll back and keeps no record that
+/// one is open. The connection goes back to the pool looking clean, and every
+/// later query handed it silently joins the orphaned transaction — which never
+/// commits. It accumulates locks across whatever tables the reused connection
+/// touches, pins a transaction id against vacuum, and stalls any TRUNCATE or
+/// DDL on those tables until the process exits.
+///
+/// axum drops a handler future exactly this way when a client disconnects
+/// mid-request, which is ordinary browser behaviour.
+///
+/// Running the BEGIN on a detached task makes the window unreachable: the
+/// caller can be cancelled, but the task still runs to completion, so the
+/// `Transaction` is always constructed and always dropped — and sqlx's own
+/// `Drop` issues the ROLLBACK.
+///
+/// The guarantee is that the transaction is always rolled back, not that it is
+/// rolled back instantly: after a cancellation the detached task still has to
+/// finish its BEGIN and let `Drop` send the ROLLBACK, so the connection can be
+/// briefly in a transaction. That window is milliseconds and self-clearing,
+/// against a bug that held locks until the process exited.
+///
+/// Use this instead of `pool.begin()` everywhere. `crates/knot-storage/tests/
+/// cancel_safety.rs` reproduces the leak against the raw call and pins this.
+pub async fn begin(pool: &Pool) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+    let pool = pool.clone();
+    tokio::spawn(async move { pool.begin().await })
+        .await
+        .map_err(|e| sqlx::Error::Io(std::io::Error::other(e)))?
 }
