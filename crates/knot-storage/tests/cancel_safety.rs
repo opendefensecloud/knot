@@ -70,8 +70,8 @@ async fn a_cancelled_fetch_does_not_strand_its_connection() {
 
     let store = PgUpdatesStore::new(pool.clone());
     let blob = vec![7u8; 4096];
-    for _ in 0..8 {
-        let batch: Vec<Vec<u8>> = (0..250).map(|_| blob.clone()).collect();
+    for _ in 0..2 {
+        let batch: Vec<Vec<u8>> = (0..125).map(|_| blob.clone()).collect();
         store
             .insert_batch(doc.id, Some(u.id), &batch)
             .await
@@ -83,18 +83,34 @@ async fn a_cancelled_fetch_does_not_strand_its_connection() {
 
     // `timeout` drops the query future — the same thing axum does to a
     // handler future when the client disconnects.
-    let r = tokio::time::timeout(Duration::from_millis(3), store.since(doc.id, 0)).await;
+    //
+    // The deadline is SWEPT rather than fixed. A fixed one is a bet on how long
+    // the fetch takes, and that bet is environment-specific: 3ms against this
+    // payload cancels reliably on a Docker Desktop VM and never fires on CI,
+    // where Postgres is a host service and the whole fetch lands first. That
+    // made this test pass in one environment and fail in the other while
+    // proving nothing in either. Sweeping upward from microseconds guarantees
+    // some attempt lands mid-flight on any hardware.
+    let mut cancelled = 0u32;
+    for i in 0..60u64 {
+        let d = Duration::from_micros(10 + (i % 30) * 40);
+        if tokio::time::timeout(d, store.since(doc.id, 0))
+            .await
+            .is_err()
+        {
+            cancelled += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(
+                idle_in_transaction(&obs, &name).await,
+                0,
+                "a cancelled fetch left a backend idle in transaction"
+            );
+        }
+    }
     assert!(
-        r.is_err(),
-        "the query finished inside the timeout, so nothing was cancelled — \
-         raise the payload or lower the timeout"
-    );
-
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(
-        idle_in_transaction(&obs, &name).await,
-        0,
-        "a cancelled fetch left a backend idle in transaction"
+        cancelled > 0,
+        "every fetch completed inside its deadline, so nothing was ever \
+         cancelled and this proved nothing — lower the sweep"
     );
 }
 
@@ -276,14 +292,31 @@ async fn knot_begin_survives_cancellation() {
             Ok(tx) => tx.unwrap().rollback().await.unwrap(),
             Err(_) => {
                 cancelled += 1;
-                // The detached BEGIN may still be in flight; give its
-                // Transaction a moment to drop and roll back.
-                tokio::time::sleep(Duration::from_millis(2)).await;
-                let stranded = idle_in_transaction(&obs, &name).await;
+                // The guarantee is that the transaction is ALWAYS rolled back,
+                // not that it is rolled back before any particular instant:
+                // the detached task still has to finish its BEGIN, hand back a
+                // `Transaction`, and let `Drop` send the ROLLBACK. So poll for
+                // the connection to come clean rather than sleeping a fixed
+                // amount and hoping — a fixed wait is the same environment-
+                // specific bet that made the sweep above necessary.
+                //
+                // The bug this guards against does not resolve on its own at
+                // any deadline: the orphaned transaction stays open until the
+                // process exits.
+                let deadline = Duration::from_secs(5);
+                let step = Duration::from_millis(10);
+                let mut waited = Duration::ZERO;
+                let mut stranded = idle_in_transaction(&obs, &name).await;
+                while stranded > 0 && waited < deadline {
+                    tokio::time::sleep(step).await;
+                    waited += step;
+                    stranded = idle_in_transaction(&obs, &name).await;
+                }
                 assert_eq!(
                     stranded, 0,
                     "a cancelled knot_storage::begin left the pooled connection \
-                     inside an open transaction (after {cancelled} cancellations)"
+                     inside an open transaction for {waited:?} (after \
+                     {cancelled} cancellations)"
                 );
             }
         }

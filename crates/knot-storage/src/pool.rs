@@ -88,6 +88,12 @@ pub async fn connect(url: &str, max_conn: u32) -> Result<Pool, PoolError> {
 /// `Transaction` is always constructed and always dropped — and sqlx's own
 /// `Drop` issues the ROLLBACK.
 ///
+/// The guarantee is that the transaction is always rolled back, not that it is
+/// rolled back instantly: after a cancellation the detached task still has to
+/// finish its BEGIN and let `Drop` send the ROLLBACK, so the connection can be
+/// briefly in a transaction. That window is milliseconds and self-clearing,
+/// against a bug that held locks until the process exited.
+///
 /// Use this instead of `pool.begin()` everywhere. `crates/knot-storage/tests/
 /// cancel_safety.rs` reproduces the leak against the raw call and pins this.
 pub async fn begin(pool: &Pool) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
