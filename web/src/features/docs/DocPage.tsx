@@ -169,19 +169,17 @@ export default function DocPage() {
       <div className="measure">
         <Breadcrumb items={[{ title: "Documents" }, { title: meta.title }]} />
       </div>
-      {/* Wraps rather than overflows. The action row is 412px intrinsic on a
-          phone (the width toggle is hidden there) against a 327px content box,
-          and `shrink-0` with no wrapping used to force the last two buttons
-          off-screen. The title's min-width now breaks the row instead, and the
-          action row wraps internally into whatever width it is given. On the
-          desktop column it still fits one line — 200 + 452 + 12 <= 712 — so
-          that layout is unchanged. */}
-      <div className="measure mt-3 flex flex-wrap items-start gap-3">
-        <div className="flex-1 min-w-[200px]">
-          <DocTitle key={id} id={id} initialTitle={meta.title}
-                    editable={effRole !== "viewer" && editMode} />
-        </div>
-        <div className="flex flex-wrap items-center gap-1 pt-2">
+      {/* The title gets the whole column and the action row sits beneath it
+          (issue #29). Sharing one line left the title only what the ~490px
+          action row did not take — 208px of the 712px measure, about fifteen
+          characters at 30px bold — and an <input> never wraps, so anything
+          longer was cut off behind the tool icons. The action row still
+          wraps internally so that on a phone, where its intrinsic 412px
+          exceeds the 327px content box, no control lands off-screen. */}
+      <div className="measure mt-3">
+        <DocTitle key={id} id={id} initialTitle={meta.title}
+                  editable={effRole !== "viewer" && editMode} />
+        <div className="mt-2 flex flex-wrap items-center gap-1">
           <SyncStatus sync={{ status, pendingBytes }} />
           {/* Keep the bare StatusDot mounted (invisible) so existing tests
               targeting `data-testid="status-dot"` still find it; SyncStatus
