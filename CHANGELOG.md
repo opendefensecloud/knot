@@ -26,6 +26,15 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   rather than set directly, so existing `[data-theme="dark"]` overrides keep
   working. JetBrains Mono, which code blocks have asked for since the start,
   is now actually bundled.
+### Fixed
+- **A document title longer than about fifteen characters was cut off behind
+  the tool icons.** On the desktop column the title shared its line with the
+  header's action row, and the row's ~490px left the title only 208px of the
+  712px measure — an `<input>` never wraps, so everything past that was
+  simply clipped. The title now takes the whole column and the action row
+  sits beneath it, so any title up to roughly 45 characters is shown in full.
+  Narrow screens already laid the header out this way; it is now the layout
+  at every width. (#29)
 
 ## [0.5.0] - 2026-09-06
 
