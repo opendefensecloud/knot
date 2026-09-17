@@ -9,9 +9,11 @@ import { SessionProvider } from "./auth/SessionContext";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { queryClient } from "./lib/queryClient";
 import { router } from "./routes";
+import { readInitialSkin, stampSkin } from "./stores/ui";
 
-const initialTheme = (localStorage.getItem("knot.theme") as "light" | "dark" | null) ?? "light";
-document.documentElement.setAttribute("data-theme", initialTheme);
+// Stamp data-skin + data-theme before first paint so a dark-skin user
+// never sees the light palette flash in before React hydrates.
+stampSkin(readInitialSkin());
 
 // Stamped before first paint, like the theme above, so a wide-mode user
 // never sees the narrow column flash in before React hydrates.

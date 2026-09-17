@@ -1,5 +1,7 @@
 import { create } from "zustand";
 
+import { DEFAULT_SKIN_ID, findSkin, schemeOf } from "../styles/skins";
+
 export type Toast = {
   id: number;
   kind: "info" | "warn" | "error";
@@ -12,6 +14,7 @@ export type PendingAnchor = {
   anchorText: string;
 };
 
+/** The light/dark axis. Derived from the active skin; never set directly. */
 export type Theme = "light" | "dark";
 
 /** Document layout mode. "fixed" is the classic narrow column. */
@@ -38,10 +41,11 @@ type UiState = {
   // and the sidebar scroll-into-view + focus ring.
   activeCommentId: string | null;
   setActiveCommentId: (id: string | null) => void;
-  // Theme
+  // Skin — the palette + typography set. `theme` is its light/dark
+  // scheme, kept in the store so consumers can branch on it cheaply.
+  skin: string;
   theme: Theme;
-  setTheme: (t: Theme) => void;
-  toggleTheme: () => void;
+  setSkin: (id: string) => void;
   // Document width — a global reading preference, not a document property.
   docWidth: DocWidth;
   setDocWidth: (w: DocWidth) => void;
@@ -50,9 +54,18 @@ type UiState = {
 
 let nextId = 1;
 
-function readInitialTheme(): Theme {
-  if (typeof localStorage === "undefined") return "light";
-  return (localStorage.getItem("knot.theme") as Theme | null) ?? "light";
+/** Exported for tests and for the pre-paint stamp in main.tsx. Falls
+ *  back to the default skin for anything unknown, and honours the old
+ *  `knot.theme = "dark"` preference from before skins existed. */
+export function readInitialSkin(): string {
+  try {
+    const stored = localStorage.getItem("knot.skin");
+    if (findSkin(stored)) return stored!;
+    if (localStorage.getItem("knot.theme") === "dark") return "dark";
+  } catch {
+    /* storage unavailable */
+  }
+  return DEFAULT_SKIN_ID;
 }
 
 /** Exported for tests: the storage read has to survive a disabled or
@@ -76,12 +89,21 @@ function applyDocWidth(w: DocWidth) {
   }
 }
 
-function applyTheme(t: Theme) {
+/** Exported for main.tsx, which stamps the attributes before first paint
+ *  so a dark-skin user never sees the light palette flash in. */
+export function stampSkin(id: string) {
   if (typeof document !== "undefined") {
-    document.documentElement.setAttribute("data-theme", t);
+    document.documentElement.setAttribute("data-skin", id);
+    document.documentElement.setAttribute("data-theme", schemeOf(id));
   }
-  if (typeof localStorage !== "undefined") {
-    localStorage.setItem("knot.theme", t);
+}
+
+function applySkin(id: string) {
+  stampSkin(id);
+  try {
+    localStorage.setItem("knot.skin", id);
+  } catch {
+    /* storage unavailable — the skin still applies for this session */
   }
 }
 
@@ -104,12 +126,12 @@ export const useUi = create<UiState>((set, get) => ({
   clearPendingAnchor: () => set({ pendingAnchor: null }),
   activeCommentId: null,
   setActiveCommentId: (id) => set({ activeCommentId: id }),
-  theme: readInitialTheme(),
-  setTheme: (t) => { applyTheme(t); set({ theme: t }); },
-  toggleTheme: () => {
-    const next: Theme = get().theme === "light" ? "dark" : "light";
-    applyTheme(next);
-    set({ theme: next });
+  skin: readInitialSkin(),
+  theme: schemeOf(readInitialSkin()),
+  setSkin: (id) => {
+    const skinId = findSkin(id) ? id : DEFAULT_SKIN_ID;
+    applySkin(skinId);
+    set({ skin: skinId, theme: schemeOf(skinId) });
   },
   docWidth: readInitialDocWidth(),
   setDocWidth: (w) => { applyDocWidth(w); set({ docWidth: w }); },
