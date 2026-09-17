@@ -1091,6 +1091,9 @@ mod tests {
             Arc::new(knot_storage::PgSnapshotStore::new(pool.clone()));
         let bus = Arc::new(MemBus::new());
         let sub = bus.subscribe(d.id).await.unwrap();
+        // Second subscription so the test can observe the writer's publish,
+        // which happens only after the batch is durably inserted.
+        let mut persisted = bus.subscribe(d.id).await.unwrap();
         let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
         let policy = crate::snapshot::SnapshotPolicy {
             every_n: 1000,
@@ -1134,8 +1137,15 @@ mod tests {
         .await
         .unwrap();
 
-        // Writer batches 250 ms; wait 500 ms then assert.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // The writer batches for 250 ms, then inserts and publishes the seq on
+        // the bus. Wait for that publish rather than sleeping a fixed amount:
+        // on a loaded CI runner the insert can land well after 500 ms.
+        let seq =
+            tokio::time::timeout(std::time::Duration::from_secs(10), persisted.updates.recv())
+                .await
+                .expect("timed out waiting for the writer to persist the update")
+                .expect("bus closed before the writer published");
+        assert!(seq > 0, "writer published a non-positive seq: {seq}");
         let max = updates_store.max_seq(d.id).await.unwrap();
         assert!(
             max > 0,
