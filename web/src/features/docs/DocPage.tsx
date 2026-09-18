@@ -54,7 +54,7 @@ export function DocTitle({
       onChange={(e) => setTitle(e.target.value)}
       onBlur={() => { if (editable && title !== initialTitle) rename.mutate(title); }}
       placeholder="Untitled"
-      className={`w-full border-none bg-transparent text-[30px] font-bold text-fg placeholder:text-fg-muted/60 focus:outline-none focus:ring-0 px-0 ${
+      className={`w-full border-none bg-transparent font-body text-[30px] font-bold text-fg placeholder:text-fg-muted/60 focus:outline-none focus:ring-0 px-0 ${
         editable ? "" : "cursor-default"
       }`}
     />

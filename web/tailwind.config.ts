@@ -16,11 +16,18 @@ export default {
         "accent-fg": "var(--color-accent-fg)",
         destructive: "var(--color-destructive)",
       },
+      // Fonts and radii come from the active skin; see styles/tokens.css.
       fontFamily: {
-        sans: ["'Inter Variable'", "Inter", "system-ui", "sans-serif"],
-        mono: ["'JetBrains Mono'", "ui-monospace", "monospace"],
+        sans: "var(--font-ui)",
+        body: "var(--font-body)",
+        mono: "var(--font-mono)",
       },
-      borderRadius: { sm: "4px", DEFAULT: "6px", md: "8px", lg: "12px" },
+      borderRadius: {
+        sm: "calc(var(--radius-unit) * 2)",
+        DEFAULT: "calc(var(--radius-unit) * 3)",
+        md: "calc(var(--radius-unit) * 4)",
+        lg: "calc(var(--radius-unit) * 6)",
+      },
       transitionTimingFunction: { swift: "cubic-bezier(0.16, 1, 0.3, 1)" },
     },
   },

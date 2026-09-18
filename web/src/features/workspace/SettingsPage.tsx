@@ -2,13 +2,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { useState } from "react";
 
-import { FoldHorizontal, Moon, Sun, UnfoldHorizontal } from "lucide-react";
+import { FoldHorizontal, UnfoldHorizontal } from "lucide-react";
 
 import { authApi } from "../../auth/session.api";
 import { useSession } from "../../auth/SessionContext";
 import { useUi } from "../../stores/ui";
 
 import { readCookie } from "../../lib/csrf";
+import { SkinPicker } from "./SkinPicker";
 import { workspaceApi } from "./workspace.api";
 
 export default function SettingsPage() {
@@ -17,8 +18,6 @@ export default function SettingsPage() {
   const qc = useQueryClient();
   const nav = useNavigate();
   const notify = useUi((s) => s.notify);
-  const theme = useUi((s) => s.theme);
-  const toggleTheme = useUi((s) => s.toggleTheme);
   const docWidth = useUi((s) => s.docWidth);
   const toggleDocWidth = useUi((s) => s.toggleDocWidth);
 
@@ -73,30 +72,7 @@ export default function SettingsPage() {
         )}
         <section data-testid="appearance" className="bg-surface border border-border rounded-lg px-5 py-4">
           <h2 className="text-[13px] font-semibold uppercase tracking-wider text-fg-muted mb-3">Appearance</h2>
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-sm text-fg m-0">Theme</p>
-              <p className="text-[13px] text-fg-muted m-0 mt-0.5">
-                Currently: {theme === "dark" ? "Dark" : "Light"}
-              </p>
-            </div>
-            <button
-              type="button"
-              data-testid="theme-toggle"
-              onClick={toggleTheme}
-              className="inline-flex items-center gap-2 h-9 px-3 rounded border border-border bg-surface text-fg text-sm font-medium hover:bg-muted transition-colors"
-            >
-              {theme === "dark" ? (
-                <>
-                  <Sun size={14} aria-hidden /> Switch to light
-                </>
-              ) : (
-                <>
-                  <Moon size={14} aria-hidden /> Switch to dark
-                </>
-              )}
-            </button>
-          </div>
+          <SkinPicker />
           <div className="flex items-center justify-between gap-3 mt-4 pt-4 border-t border-border">
             <div>
               <p className="text-sm text-fg m-0">Document width</p>

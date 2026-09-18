@@ -8,6 +8,24 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Added
+- **Skins.** Settings → Appearance is now a picker with thirteen skins instead
+  of a light/dark switch: Light, Paper, Solarized Light, Rosé Pine Dawn, Sage
+  and High Contrast on the light side; Dark, Nord, Gruvbox, Catppuccin Mocha,
+  Everforest, Dracula and Terminal on the dark side. Each card previews itself
+  in its own palette. A skin sets the nine colour tokens plus a UI font, a
+  document body font and a corner-radius unit — Paper reads in Source Serif 4,
+  Terminal is JetBrains Mono throughout with square corners. Every new palette
+  clears WCAG AA on muted text and buttons, and AAA on body text; where a
+  canonical palette did not (Solarized's base01, Nord's aurora red), the
+  offending token was nudged rather than shipped illegible. Stored as
+  `knot.skin`; a saved `knot.theme = "dark"` from before lands on Dark.
+
+### Changed
+- `data-theme` on `<html>` is now derived from the skin's light/dark scheme
+  rather than set directly, so existing `[data-theme="dark"]` overrides keep
+  working. JetBrains Mono, which code blocks have asked for since the start,
+  is now actually bundled.
 ### Fixed
 - **A document title longer than about fifteen characters was cut off behind
   the tool icons.** On the desktop column the title shared its line with the
