@@ -309,3 +309,185 @@ async fn empty_file_is_400() {
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["error"]["code"], "blob.empty");
 }
+
+// ---------------------------------------------------------------------------
+// Conditional GET: a blob id never changes content, so its sha256 is a strong
+// ETag and a revalidation can be answered without reading the bytes.
+// ---------------------------------------------------------------------------
+
+/// sha256(TINY_PNG), computed independently (python hashlib).
+const TINY_PNG_ETAG: &str = "\"90c86432df503e9bea47ad2d4989a0b5c5911eb60e01fb1baf78c17151cce11f\"";
+
+/// Wraps the real store and counts byte reads, so a test can prove a 304
+/// was answered from metadata alone.
+struct CountingStore {
+    inner: Arc<dyn knot_storage::BlobStore>,
+    gets: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl knot_storage::BlobStore for CountingStore {
+    async fn put(
+        &self,
+        id: Uuid,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<(), knot_storage::BlobStoreError> {
+        self.inner.put(id, bytes, content_type).await
+    }
+    async fn get(&self, id: Uuid) -> Result<Vec<u8>, knot_storage::BlobStoreError> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get(id).await
+    }
+    async fn delete(&self, id: Uuid) -> Result<(), knot_storage::BlobStoreError> {
+        self.inner.delete(id).await
+    }
+}
+
+async fn get_blob(
+    app: &axum::Router,
+    sid_kv: &str,
+    blob_url: &str,
+    if_none_match: Option<&str>,
+) -> axum::response::Response<Body> {
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(blob_url)
+        .header("cookie", sid_kv);
+    if let Some(tag) = if_none_match {
+        request = request.header("if-none-match", tag);
+    }
+    app.clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn upload_tiny_png(app: &axum::Router, sid: &str, csrf: &str, doc_id: Uuid) -> String {
+    let r = upload(
+        app,
+        sid,
+        csrf,
+        doc_id,
+        multipart_body("tiny.png", "image/png", TINY_PNG),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let bytes = r.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    v["url"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn download_carries_the_content_sha256_as_etag() {
+    let (state, _ws, doc_id, _u) = state_with_seeded(WorkspaceRole::Owner).await;
+    let app = router_with_state(state);
+    let (sid, csrf) = login_alice(&app).await;
+    let url = upload_tiny_png(&app, &sid, &csrf, doc_id).await;
+
+    let r = get_blob(&app, &sid, &url, None).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers().get("etag").unwrap(), TINY_PNG_ETAG);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matching_if_none_match_is_304_without_reading_the_bytes() {
+    let (mut state, _ws, doc_id, _u) = state_with_seeded(WorkspaceRole::Owner).await;
+    let counting = Arc::new(CountingStore {
+        inner: state.blob_store.clone().unwrap(),
+        gets: Default::default(),
+    });
+    state.blob_store = Some(counting.clone());
+    let app = router_with_state(state);
+    let (sid, csrf) = login_alice(&app).await;
+    let url = upload_tiny_png(&app, &sid, &csrf, doc_id).await;
+
+    let r = get_blob(&app, &sid, &url, Some(TINY_PNG_ETAG)).await;
+    assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(r.headers().get("etag").unwrap(), TINY_PNG_ETAG);
+    assert!(r.headers().get("cache-control").is_some());
+    assert!(r.into_body().collect().await.unwrap().to_bytes().is_empty());
+    assert_eq!(counting.gets.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_if_none_match_gets_the_full_body() {
+    let (state, _ws, doc_id, _u) = state_with_seeded(WorkspaceRole::Owner).await;
+    let app = router_with_state(state);
+    let (sid, csrf) = login_alice(&app).await;
+    let url = upload_tiny_png(&app, &sid, &csrf, doc_id).await;
+
+    let r = get_blob(&app, &sid, &url, Some("\"not-this-one\", W/\"nor-this\"")).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        r.into_body().collect().await.unwrap().to_bytes().as_ref(),
+        TINY_PNG
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matching_if_none_match_does_not_bypass_the_acl() {
+    let (state, _ws, _doc, _u) = state_with_seeded(WorkspaceRole::Owner).await;
+    // A blob in another workspace: alice has no role there.
+    let other_ws = state
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .create("other", "Other")
+        .await
+        .unwrap();
+    let outsider = state
+        .users
+        .as_ref()
+        .unwrap()
+        .create_local("bob@example.com", "Bob", "$h$")
+        .await
+        .unwrap();
+    let other_doc = state
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(other_ws.id, None, "Secret", "m", outsider.id)
+        .await
+        .unwrap();
+    let blob_id = Uuid::new_v4();
+    state
+        .blob_meta
+        .as_ref()
+        .unwrap()
+        .insert(&knot_storage::BlobMetadata {
+            id: blob_id,
+            workspace_id: other_ws.id,
+            doc_id: other_doc.id,
+            content_type: "image/png".into(),
+            byte_size: TINY_PNG.len() as i64,
+            sha256: vec![
+                0x90, 0xc8, 0x64, 0x32, 0xdf, 0x50, 0x3e, 0x9b, 0xea, 0x47, 0xad, 0x2d, 0x49, 0x89,
+                0xa0, 0xb5, 0xc5, 0x91, 0x1e, 0xb6, 0x0e, 0x01, 0xfb, 0x1b, 0xaf, 0x78, 0xc1, 0x71,
+                0x51, 0xcc, 0xe1, 0x1f,
+            ],
+            original_name: None,
+            created_by: outsider.id,
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    state
+        .blob_store
+        .as_ref()
+        .unwrap()
+        .put(blob_id, TINY_PNG, "image/png")
+        .await
+        .unwrap();
+    let app = router_with_state(state);
+    let (sid, _csrf) = login_alice(&app).await;
+
+    let r = get_blob(
+        &app,
+        &sid,
+        &format!("/api/blobs/{blob_id}"),
+        Some(TINY_PNG_ETAG),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+}
