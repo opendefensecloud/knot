@@ -188,7 +188,10 @@ export function DocTree() {
       {list.data && "ok" in list.data && (
         <DndContext sensors={sensors} collisionDetection={closestCenter} onDragOver={onDragOver} onDragEnd={onDragEnd} onDragCancel={() => setDrop(null)}>
           <SortableContext items={flatIds} strategy={verticalListSortingStrategy}>
-            <ul className="px-2 pb-3 list-none m-0 flex-1">
+            {/* 12px clear on the right, like the rest of the sidebar: rows
+                are drag targets, and the 8px resize handle on the edge needs
+                that much room around it (WCAG 2.5.8 target spacing). */}
+            <ul className="pl-2 pr-3 pb-3 list-none m-0 flex-1">
               {tree.map((n) => (
                 <TreeRow
                   key={n.id}

@@ -9,7 +9,7 @@ import { SessionProvider } from "./auth/SessionContext";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { queryClient } from "./lib/queryClient";
 import { router } from "./routes";
-import { readInitialSkin, stampSkin } from "./stores/ui";
+import { readInitialSidebarWidth, readInitialSkin, stampSidebarWidth, stampSkin } from "./stores/ui";
 
 // Stamp data-skin + data-theme before first paint so a dark-skin user
 // never sees the light palette flash in before React hydrates.
@@ -22,6 +22,10 @@ try {
   if (localStorage.getItem("knot.docWidth") === "wide") initialDocWidth = "wide";
 } catch { /* storage unavailable */ }
 document.documentElement.setAttribute("data-doc-width", initialDocWidth);
+
+// And the sidebar width, so a user who dragged the sidebar wider never sees
+// it open at the default 260px first. AppShell keeps it current from here.
+stampSidebarWidth(readInitialSidebarWidth());
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

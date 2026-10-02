@@ -24,6 +24,13 @@
   /* Room reserved on the right for the comment rail. Overridden per
      element below; declared here so the calc()s always resolve. */
   --knot-doc-inset-right: 0px;
+  /* Rendered width of the left sidebar's column: the saved preference,
+     clamped to what the window allows. main.tsx stamps the real value on
+     <html> before first paint and AppShell keeps it current (zeroing it on
+     its grid while the sidebar is closed); this only covers the moment
+     before. A drag holds the column inline instead while it lasts, and
+     stamps the variable once, on release. */
+  --knot-sidebar-w: 260px;
 }
 
 /* Pins page chrome (breadcrumb, title row, toolbar) to the text column so
@@ -73,11 +80,45 @@
    route-change reset, so a <main>-level inset would leave phantom padding
    on Tasks/Templates/Settings/Members.
 
-   Below 1280 the rail keeps overlaying as it does today — at 1280 with a
-   260px sidebar there are only 620px left, and insetting would starve the
-   column rather than help it. */
-@media (min-width: 1280px) {
-  .doc-shell {
-    --knot-doc-inset-right: var(--knot-rail-w, 0px);
-  }
+   Only once the content column — the window minus the sidebar — is at
+   least 1020px wide. Narrower, the rail keeps overlaying: at 1020 the
+   inset already leaves the text only 572px, and any less would starve the
+   column rather than help it. This used to be @media (min-width: 1280px),
+   which silently assumed a 260px sidebar; 1280 - 260 = 1020, so at the
+   default width nothing moves. A 480px sidebar on a 1280px screen now
+   gets the overlay, rather than a document squeezed into the 400px the
+   rail leaves beside it.
+
+   A media query cannot see the sidebar, so the gate is a clamp():
+   (column - 1019.99px) × 100000 is ≤ 0 up to a 1019.99px column and
+   ≥ 1000px — well past the 400px rail — from 1020px on, which clamp()
+   turns into "none" or "the whole rail". It reads the stamped width, so it
+   moves with every stamp: a key press, a window resize, another tab. A
+   drag stamps only on release, so with the rail open the gate settles
+   then, not frame by frame. At whole pixels it is a clean step at a
+   1020px column, as sharp as a media query (the sidebar width is always
+   whole). A zoomed window's 100vw can be fractional, and the column with
+   it, but the only partial inset lies between 1019.99 and 1019.994px,
+   which no common zoom level or display scale lands on: even then it is
+   the overlay or the whole rail. */
+.doc-shell {
+  --knot-doc-inset-right: clamp(
+    0px,
+    (100vw - var(--knot-sidebar-w) - 1019.99px) * 100000,
+    var(--knot-rail-w, 0px)
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Sidebar resize                                                      */
+/* ------------------------------------------------------------------ */
+
+/* Set on <html> by SidebarResizeHandle for the length of a drag. The
+   pointer spends most of a drag over the tree and the editor, whose links,
+   inputs and text would otherwise put up their own cursors and start a
+   selection; !important on every element is what outranks all of them. */
+[data-sidebar-resizing],
+[data-sidebar-resizing] * {
+  cursor: col-resize !important;
+  user-select: none !important;
 }
