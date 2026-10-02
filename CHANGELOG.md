@@ -8,66 +8,46 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-02
+
 ### Added
-- **Skins.** Settings → Appearance is now a picker with thirteen skins instead
-  of a light/dark switch: Light, Paper, Solarized Light, Rosé Pine Dawn, Sage
-  and High Contrast on the light side; Dark, Nord, Gruvbox, Catppuccin Mocha,
-  Everforest, Dracula and Terminal on the dark side. Each card previews itself
-  in its own palette. A skin sets the nine colour tokens plus a UI font, a
-  document body font and a corner-radius unit — Paper reads in Source Serif 4,
-  Terminal is JetBrains Mono throughout with square corners. Every new palette
-  clears WCAG AA on muted text and buttons, and AAA on body text; where a
-  canonical palette did not (Solarized's base01, Nord's aurora red), the
-  offending token was nudged rather than shipped illegible. Stored as
-  `knot.skin`; a saved `knot.theme = "dark"` from before lands on Dark.
-- **The sidebar is resizable.** Drag its right edge anywhere from 200 to
-  480px, or double-click the edge to go back to the default 260px. The edge
-  is a focusable separator too: ← and → move it 16px (64 with Shift),
-  Home and End jump to the limits. The width is saved per browser as
-  `knot.sidebarWidth`, is in place before first paint and follows into other
-  open tabs. A narrow window clamps the sidebar so the document always keeps
-  at least 380px, and widening it again brings the saved width back; the
-  phone drawer stays 260px.
+- Resizable sidebar: drag its right edge (200–480px), or focus it and use ←/→
+  (Shift for larger steps) and Home/End; double-click resets it to 260px. The
+  width is saved per browser and synced across tabs. (#33)
+- Histograms `knot_collab_initial_sync_seconds` and `knot_room_hydrate_seconds`
+  for document-open time. (#32)
 
 ### Changed
-- `data-theme` on `<html>` is now derived from the skin's light/dark scheme
-  rather than set directly, so existing `[data-theme="dark"]` overrides keep
-  working. JetBrains Mono, which code blocks have asked for since the start,
-  is now actually bundled.
-- The comment rail insets the document only while the content column (the
-  window minus the sidebar) is at least 1020px wide, instead of from a 1280px
-  breakpoint that assumed a 260px sidebar. With the default sidebar nothing
-  moves; a wide sidebar gets the overlay rather than a squeezed page.
-- **Opening a document downloads less and waits less.** The SPA's hashed
-  bundles are brotli-compressed (the 749 KB editor chunk goes over the wire as
-  241 KB) and cached as `immutable`; `index.html` is `no-cache`, so a deploy is
-  picked up on the next load. The editor chunk now downloads alongside the
-  document's metadata instead of after it. An image or attachment carries its
-  sha256 as `ETag`, so a revalidation after the one-minute `max-age` is a 304
-  answered without reading the bytes.
-- **Two new histograms time opening a document:**
-  `knot_collab_initial_sync_seconds` (socket upgraded → document state queued
-  to the client) and `knot_room_hydrate_seconds` (loading a room that was not
-  in memory). The HTTP histogram stops at the WebSocket upgrade, so neither
-  was visible before.
+- Faster document open: hashed assets are brotli-compressed and cached as
+  immutable (`index.html` is `no-cache`), the editor loads in parallel with the
+  document, and images and attachments revalidate via `ETag`. (#32)
+- With comments open, the document is inset only while the content column
+  (window minus sidebar) is at least 1020px wide, replacing the fixed 1280px
+  breakpoint. (#33)
+
 ### Fixed
-- **Every latency panel, SLO query and the latency alert showed nothing.** The
-  Prometheus exporter was installed without buckets, so it exported every
-  histogram as a summary: `knot_http_request_duration_seconds_bucket` never
-  existed for the dashboard's `histogram_quantile` to read. Histograms now
-  export buckets whose edges include each SLO threshold.
-- **A deep link such as `/docs/<id>` answered 404** (with the app's HTML, so
-  it still rendered). Client-side routes now answer 200, and a missing
-  `/assets/*` chunk is a plain 404 instead of `index.html` served as
-  JavaScript.
-- **A document title longer than about fifteen characters was cut off behind
-  the tool icons.** On the desktop column the title shared its line with the
-  header's action row, and the row's ~490px left the title only 208px of the
-  712px measure — an `<input>` never wraps, so everything past that was
-  simply clipped. The title now takes the whole column and the action row
-  sits beneath it, so any title up to roughly 45 characters is shown in full.
-  Narrow screens already laid the header out this way; it is now the layout
-  at every width. (#29)
+- Latency metrics were exported as summaries, leaving the Grafana latency
+  panels, SLO queries and latency alert without data; they are now histograms
+  with `_bucket` series. (#32)
+- Deep links such as `/docs/<id>` returned 404 (while still rendering); they
+  now return 200, and a missing `/assets/*` file returns a plain 404. (#32)
+
+## [0.6.0] - 2026-09-18
+
+### Added
+- Skins: Settings → Appearance offers 13 light and dark skins, each with its
+  own colours, fonts and corner radius. A saved dark theme becomes the Dark
+  skin. (#31)
+
+### Changed
+- `data-theme` on `<html>` follows the active skin's light/dark scheme, and
+  JetBrains Mono is bundled for code. (#31)
+
+### Fixed
+- Long document titles were cut off by the toolbar; the title now has its own
+  line. (#30)
+- Creating a subpage after deleting one failed with a 500; sort-key conflicts
+  now return 409. (#27)
 
 ## [0.5.0] - 2026-09-06
 
@@ -511,7 +491,9 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/opendefensecloud/knot/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/opendefensecloud/knot/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/opendefensecloud/knot/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/opendefensecloud/knot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/opendefensecloud/knot/compare/v0.2.1...v0.3.0
