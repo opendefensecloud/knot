@@ -26,7 +26,28 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   rather than set directly, so existing `[data-theme="dark"]` overrides keep
   working. JetBrains Mono, which code blocks have asked for since the start,
   is now actually bundled.
+- **Opening a document downloads less and waits less.** The SPA's hashed
+  bundles are brotli-compressed (the 749 KB editor chunk goes over the wire as
+  241 KB) and cached as `immutable`; `index.html` is `no-cache`, so a deploy is
+  picked up on the next load. The editor chunk now downloads alongside the
+  document's metadata instead of after it. An image or attachment carries its
+  sha256 as `ETag`, so a revalidation after the one-minute `max-age` is a 304
+  answered without reading the bytes.
+- **Two new histograms time opening a document:**
+  `knot_collab_initial_sync_seconds` (socket upgraded → document state queued
+  to the client) and `knot_room_hydrate_seconds` (loading a room that was not
+  in memory). The HTTP histogram stops at the WebSocket upgrade, so neither
+  was visible before.
 ### Fixed
+- **Every latency panel, SLO query and the latency alert showed nothing.** The
+  Prometheus exporter was installed without buckets, so it exported every
+  histogram as a summary: `knot_http_request_duration_seconds_bucket` never
+  existed for the dashboard's `histogram_quantile` to read. Histograms now
+  export buckets whose edges include each SLO threshold.
+- **A deep link such as `/docs/<id>` answered 404** (with the app's HTML, so
+  it still rendered). Client-side routes now answer 200, and a missing
+  `/assets/*` chunk is a plain 404 instead of `index.html` served as
+  JavaScript.
 - **A document title longer than about fifteen characters was cut off behind
   the tool icons.** On the desktop column the title shared its line with the
   header's action row, and the row's ~490px left the title only 208px of the

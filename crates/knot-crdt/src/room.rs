@@ -132,6 +132,7 @@ impl Room {
         dirty_tx: Option<mpsc::Sender<Uuid>>,
     ) -> Result<RoomHandle, EngineError> {
         // Hydrate the doc.
+        let hydrate_started = std::time::Instant::now();
         let doc = engine.new_doc();
         let mut last_applied_seq: i64 = 0;
         if let Ok(Some(snap)) = snapshots.latest(doc_id).await {
@@ -146,6 +147,8 @@ impl Room {
                 }
             }
         }
+        metrics::histogram!("knot_room_hydrate_seconds")
+            .record(hydrate_started.elapsed().as_secs_f64());
 
         // Spawn the actor with the hydrated doc + watermark.
         let (tx, rx) = mpsc::channel::<Event>(256);
