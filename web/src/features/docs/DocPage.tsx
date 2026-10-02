@@ -171,8 +171,9 @@ export default function DocPage() {
     <section
       data-testid="doc-page"
       className="doc-shell"
-      // Drives the comment-rail inset in layout.css (>=1280 only), so the
-      // rail reserves space instead of covering live text.
+      // Drives the comment-rail inset in layout.css (only where the content
+      // column is 1020px or wider), so the rail reserves space instead of
+      // covering live text.
       style={{ "--knot-rail-w": commentSidebarOpen ? "400px" : "0px" } as CSSProperties}
     >
       <div className="measure">

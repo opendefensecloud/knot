@@ -20,12 +20,24 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   canonical palette did not (Solarized's base01, Nord's aurora red), the
   offending token was nudged rather than shipped illegible. Stored as
   `knot.skin`; a saved `knot.theme = "dark"` from before lands on Dark.
+- **The sidebar is resizable.** Drag its right edge anywhere from 200 to
+  480px, or double-click the edge to go back to the default 260px. The edge
+  is a focusable separator too: ← and → move it 16px (64 with Shift),
+  Home and End jump to the limits. The width is saved per browser as
+  `knot.sidebarWidth`, is in place before first paint and follows into other
+  open tabs. A narrow window clamps the sidebar so the document always keeps
+  at least 380px, and widening it again brings the saved width back; the
+  phone drawer stays 260px.
 
 ### Changed
 - `data-theme` on `<html>` is now derived from the skin's light/dark scheme
   rather than set directly, so existing `[data-theme="dark"]` overrides keep
   working. JetBrains Mono, which code blocks have asked for since the start,
   is now actually bundled.
+- The comment rail insets the document only while the content column (the
+  window minus the sidebar) is at least 1020px wide, instead of from a 1280px
+  breakpoint that assumed a 260px sidebar. With the default sidebar nothing
+  moves; a wide sidebar gets the overlay rather than a squeezed page.
 - **Opening a document downloads less and waits less.** The SPA's hashed
   bundles are brotli-compressed (the 749 KB editor chunk goes over the wire as
   241 KB) and cached as `immutable`; `index.html` is `no-cache`, so a deploy is
