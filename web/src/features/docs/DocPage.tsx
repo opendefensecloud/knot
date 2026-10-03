@@ -190,7 +190,9 @@ export default function DocPage() {
       <div className="measure mt-3">
         <DocTitle key={id} id={id} initialTitle={meta.title}
                   editable={effRole !== "viewer" && editMode} />
-        <DocByline key={id} docId={id} />
+        {/* Its own key: sibling keys must be unique, and sharing DocTitle's
+            `id` left the previous doc's title input mounted on navigation. */}
+        <DocByline key={`byline:${id}`} docId={id} />
         <div className="mt-2 flex flex-wrap items-center gap-1">
           <SyncStatus sync={{ status, pendingBytes }} />
           {/* Keep the bare StatusDot mounted (invisible) so existing tests
