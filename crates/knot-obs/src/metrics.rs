@@ -70,6 +70,12 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         "Collab socket upgraded -> initial document state queued to the client"
     );
 
+    // Notifications
+    describe_counter!(
+        "knot_notifications_emitted_total",
+        "Notifications written to the inbox, by kind"
+    );
+
     // Storage / pool
     describe_gauge!("knot_db_pool_size", "Total connections in the pool");
     describe_gauge!("knot_db_pool_idle", "Idle connections in the pool");
