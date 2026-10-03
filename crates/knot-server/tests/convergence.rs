@@ -179,15 +179,28 @@ fn append_var_uint(out: &mut Vec<u8>, mut v: u64) {
     out.push(v as u8);
 }
 
-/// Drain all messages currently queued on `ws`, discarding them.
-/// Used to consume the initial sync-step-2 frame the server sends on connect.
+/// Consume the handshake the server sends on connect: its sync-step-2 (full
+/// state) followed by its own sync-step-1 (asking the client for anything the
+/// server lacks). This test client has nothing to offer, so it leaves the
+/// step-1 unanswered.
 async fn drain_initial(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) {
-    // The server sends exactly one sync-step-2 on join. Read it.
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    for expected_subtype in [1u8, 0u8] {
+        let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("handshake frame")
+            .expect("stream open")
+            .expect("ws ok")
+            .into_data();
+        assert_eq!(
+            &frame[..2],
+            &[0u8, expected_subtype],
+            "unexpected handshake frame"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

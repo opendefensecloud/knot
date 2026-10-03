@@ -8,6 +8,7 @@ use crate::auth::{csrf_mw, require_session_mw};
 pub mod blobs;
 pub mod boards;
 pub mod comments;
+pub mod contributors;
 pub mod docs;
 pub mod export_import;
 pub mod grants;

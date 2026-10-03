@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
+
+import { FakeSocket } from "../../test/fakeSocket";
 
 import { KnotProvider } from "./KnotProvider";
 
@@ -95,3 +97,91 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
   out.set(b, a.length);
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Edits made while the socket is down
+// ---------------------------------------------------------------------------
+
+/**
+ * The client half of offline sync. The provider forwards edits only while its
+ * socket is open, so an edit made offline lives solely in the local doc until
+ * the server asks for it: on (re)connect the server sends SYNC_STEP_1 with its
+ * state vector and the provider answers with a SYNC_STEP_2 carrying whatever
+ * the server lacks (crates/knot-server/tests/offline_sync.rs drives the server
+ * half). These pin that answer, offline deletions included.
+ */
+describe("KnotProvider offline edits", () => {
+  beforeEach(() => {
+    FakeSocket.all = [];
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeSocket);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /** Open the newest socket and play the server's handshake: full state as
+   *  SYNC_STEP_2, then SYNC_STEP_1 asking for what it lacks. */
+  function handshake(p: KnotProvider, server: Y.Doc): FakeSocket {
+    const ws = FakeSocket.all.at(-1)!;
+    ws.open();
+    ws.serverState(server);
+    ws.serverAsks(server);
+    expect(p.status).toBe("connected");
+    return ws;
+  }
+
+  function dropAndReconnect(p: KnotProvider, server: Y.Doc, offline: () => void): FakeSocket {
+    FakeSocket.all.at(-1)!.drop();
+    expect(p.status).toBe("offline");
+    offline();
+    const before = FakeSocket.all.length;
+    vi.advanceTimersByTime(31_000);
+    expect(FakeSocket.all.length).toBe(before + 1);
+    return handshake(p, server);
+  }
+
+  const text = (d: Y.Doc) => d.getText("t").toJSON();
+
+  it("hands over what was typed while offline when the server asks", () => {
+    const server = new Y.Doc();
+    server.getText("t").insert(0, "hello");
+    const doc = new Y.Doc();
+    const p = new KnotProvider({ url: "ws://x/collab", doc });
+    handshake(p, server);
+
+    const ws2 = dropAndReconnect(p, server, () => doc.getText("t").insert(5, " world"));
+
+    for (const u of ws2.edits()) Y.applyUpdate(server, u);
+    expect(text(server)).toBe("hello world");
+    p.destroy();
+  });
+
+  it("hands over an offline deletion, which moves no state-vector clock", () => {
+    const server = new Y.Doc();
+    server.getText("t").insert(0, "hello world");
+    const doc = new Y.Doc();
+    const p = new KnotProvider({ url: "ws://x/collab", doc });
+    handshake(p, server);
+
+    const ws2 = dropAndReconnect(p, server, () => doc.getText("t").delete(5, 6));
+
+    for (const u of ws2.edits()) Y.applyUpdate(server, u);
+    expect(text(server)).toBe("hello");
+    p.destroy();
+  });
+
+  it("hands over edits made before the first connection opened", () => {
+    const server = new Y.Doc();
+    const doc = new Y.Doc();
+    const p = new KnotProvider({ url: "ws://x/collab", doc });
+    doc.getText("t").insert(0, "early");
+
+    const ws = handshake(p, server);
+
+    for (const u of ws.edits()) Y.applyUpdate(server, u);
+    expect(text(server)).toBe("early");
+    p.destroy();
+  });
+});

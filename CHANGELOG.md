@@ -8,6 +8,29 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Added
+- Page byline: "Created by … · date" under the title, plus the people who have
+  changed the page's content (typing, imports, restores, task toggles), each
+  with when they last edited. Visible to every role that can open the page;
+  names only. Pages created before this release list only contributions made
+  from now on, and say so. `GET /api/docs/{id}/contributors`.
+
+### Fixed
+- **Edits typed while disconnected never reached the server.** The client kept
+  them locally but only sent changes while its socket was open, and the server
+  never asked a reconnecting client for what it was missing. They were lost on
+  reload, and later edits building on them were parked by the server as
+  pending, invisible to everyone else. The server now sends its state vector
+  on join (y-protocol SyncStep1), so the client uploads what the server lacks.
+  Already-loaded clients benefit without a reload. Boards had the same gap and
+  get the same fix.
+- Live edits were stored without an author, and a writer batch was stamped
+  with its first row's author. Every `doc_updates` row now records who made it;
+  history restore and workspace import are attributed too.
+- An open editor no longer autolinks text that arrives from someone else's
+  change, which wrote a link edit into the shared document under the
+  observer's name.
+
 ## [0.7.0] - 2026-10-02
 
 ### Added

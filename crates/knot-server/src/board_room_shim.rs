@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::protocol::{YSyncMessage, decode, encode_sync_step2};
+use crate::protocol::{YSyncMessage, decode, encode_sync_step1, encode_sync_step2};
 
 pub async fn serve(
     rooms: Arc<knot_crdt::BoardRooms>,
@@ -40,11 +40,17 @@ pub async fn serve(
     {
         return;
     }
-    let initial = match reply_rx.await {
-        Ok(Ok(b)) => encode_sync_step2(&b),
+    let joined = match reply_rx.await {
+        Ok(Ok(j)) => j,
         _ => return,
     };
-    let _ = out_tx.send(initial).await;
+    let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
+    // Ask the client for what we lack, exactly as `room::serve` does: the
+    // board provider has the same offline gap (edits made while the socket is
+    // down are applied locally but never sent) and the same SyncStep1 answer.
+    // Sent as its own WS message — BoardProvider decodes one y-protocol
+    // message per frame.
+    let _ = out_tx.send(encode_sync_step1(&joined.state_vector)).await;
 
     let (mut sink, mut stream) = socket.split();
     let writer_shutdown = shutdown.clone();
@@ -101,8 +107,8 @@ pub async fn serve(
                             reply: rtx,
                         })
                         .await;
-                    if let Ok(Ok(state)) = rrx.await {
-                        let _ = out_tx.send(encode_sync_step2(&state)).await;
+                    if let Ok(Ok(joined)) = rrx.await {
+                        let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
                     }
                 }
                 Ok(YSyncMessage::SyncStep2(inner)) | Ok(YSyncMessage::Update(inner)) => {

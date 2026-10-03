@@ -88,9 +88,13 @@ async fn flush(
     applied_tx: &mpsc::Sender<Applied>,
     buf: &mut Vec<PersistJob>,
 ) {
-    let by_user = buf.first().and_then(|j| j.by_user_id);
-    let updates: Vec<Vec<u8>> = buf.iter().map(|j| j.bytes.clone()).collect();
-    match store.insert_batch(doc_id, by_user, &updates).await {
+    // Each row keeps its own author: a batch is just whatever arrived within
+    // BATCH_INTERVAL, so it routinely mixes several people's live edits.
+    let updates: Vec<(Option<Uuid>, Vec<u8>)> = buf
+        .iter()
+        .map(|j| (j.by_user_id, j.bytes.clone()))
+        .collect();
+    match store.insert_batch(doc_id, &updates).await {
         Ok(seqs) => {
             for (seq, job) in seqs.into_iter().zip(buf.drain(..)) {
                 if bus.publish(doc_id, seq).await.is_err() {

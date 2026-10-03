@@ -1,7 +1,7 @@
 import * as v from "valibot";
 
 import { apiFetch } from "../../lib/api";
-import { Doc, DocWithRole, parse } from "../../lib/validators";
+import { Doc, DocContributors, DocWithRole, parse } from "../../lib/validators";
 
 export type DocCreate = { title?: string; parent_id?: string; after_id?: string };
 export type DocPatch = { title?: string; icon?: string };
@@ -17,6 +17,13 @@ export const docsApi = {
     const r = await apiFetch<unknown>(`/api/docs/${encodeURIComponent(id)}`);
     if ("error" in r) return r;
     return { ok: parse(DocWithRole, r.ok) };
+  },
+  /** Creator plus everyone who changed the page content. Readable by any
+   *  role that can open the doc. */
+  async contributors(id: string) {
+    const r = await apiFetch<unknown>(`/api/docs/${encodeURIComponent(id)}/contributors`);
+    if ("error" in r) return r;
+    return { ok: parse(DocContributors, r.ok) };
   },
   create(body: DocCreate) {
     return apiFetch<unknown>("/api/docs", { method: "POST", body });

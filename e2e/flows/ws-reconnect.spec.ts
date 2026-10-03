@@ -1,5 +1,6 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
+import { docText } from "../support/docText";
 import { reset } from "../support/reset";
 
 const TOXIPROXY = "http://localhost:8474";
@@ -16,13 +17,15 @@ async function setProxyEnabled(enabled: boolean): Promise<void> {
   if (!r.ok) throw new Error(`toxiproxy enabled=${enabled}: ${r.status} ${await r.text()}`);
 }
 
-test.beforeAll(async () => {
+// Per test: each one bootstraps through /setup, which only works on an empty
+// database.
+test.beforeEach(async () => {
   reset();
   await setProxyEnabled(true);
 });
 test.afterEach(async () => { await setProxyEnabled(true); });
 
-test("editor reconnects after a forced WS flap; content preserved", async ({ page }) => {
+async function setupAndOpenBlankDoc(page: Page): Promise<void> {
   await page.goto("/setup");
   await page.getByTestId("setup-email").fill("o@e.com");
   await page.getByTestId("setup-display-name").fill("O");
@@ -33,6 +36,10 @@ test("editor reconnects after a forced WS flap; content preserved", async ({ pag
   await page.getByTestId("new-doc-blank").click();
   await page.waitForURL(/\/doc\/.+/);
   await expect(page.getByTestId("status-dot")).toHaveAttribute("data-status", "connected", { timeout: 10_000 });
+}
+
+test("editor reconnects after a forced WS flap; content preserved", async ({ page }) => {
+  await setupAndOpenBlankDoc(page);
 
   const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
   await editor.click();
@@ -50,4 +57,32 @@ test("editor reconnects after a forced WS flap; content preserved", async ({ pag
 
   // Y.Doc never lost state.
   await expect(editor).toContainText("Before the flap.");
+});
+
+test("edits typed while disconnected reach the server after reconnect", async ({ page, context }) => {
+  await setupAndOpenBlankDoc(page);
+  const docUrl = page.url();
+
+  const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
+  await editor.click();
+  await page.keyboard.type("Before the outage.");
+  await page.waitForTimeout(300);
+
+  await setProxyEnabled(false);
+  await expect(page.getByTestId("status-dot")).toHaveAttribute("data-status", "offline", { timeout: 5_000 });
+
+  // The editor stays editable while offline; these keystrokes exist only in
+  // this tab's Y.Doc until the connection comes back.
+  await page.keyboard.type(" Typed offline.");
+  await expect(editor).toContainText("Typed offline.");
+
+  await setProxyEnabled(true);
+  await expect(page.getByTestId("status-dot")).toHaveAttribute("data-status", "connected", { timeout: 10_000 });
+
+  // A second tab loads the doc from the server: it only sees the offline
+  // text if the reconnecting tab uploaded it.
+  const second = await context.newPage();
+  await second.goto(docUrl);
+  const secondEditor = second.locator("[data-testid='editor-host'] .ProseMirror");
+  await expect.poll(() => secondEditor.evaluate(docText), { timeout: 10_000 }).toMatch(/Before the outage\. Typed offline\./);
 });

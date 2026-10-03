@@ -73,6 +73,31 @@ const grantSchema = v.object({
 export type Grant = v.InferOutput<typeof grantSchema>;
 export const Grant = grantSchema;
 
+/**
+ * GET /api/docs/{id}/contributors. Names only — the server joins `users` for
+ * display names and never sends emails, so neither does this schema.
+ * `contributors` arrives most-recent-first; the client keeps that order.
+ * `contributors_since` is when tracking began for this doc: edits made before
+ * it were never attributed, so the byline says so instead of implying a
+ * complete list.
+ */
+const docContributorSchema = v.object({
+  user_id: v.string(),
+  display_name: v.string(),
+  first_edited_at: v.string(),
+  last_edited_at: v.string(),
+});
+export type DocContributor = v.InferOutput<typeof docContributorSchema>;
+
+const docContributorsSchema = v.object({
+  created_by: v.object({ id: v.string(), display_name: v.string() }),
+  created_at: v.string(),
+  contributors_since: v.string(),
+  contributors: v.array(docContributorSchema),
+});
+export type DocContributors = v.InferOutput<typeof docContributorsSchema>;
+export const DocContributors = docContributorsSchema;
+
 export function parse<T>(schema: v.GenericSchema<T>, data: unknown): T {
   return v.parse(schema, data);
 }

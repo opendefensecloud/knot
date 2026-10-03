@@ -25,6 +25,10 @@ pub type ConnId = Uuid;
 /// Bytes delivered from a local connection's WS read task.
 pub struct InMsg {
     pub from: ConnId,
+    /// The authenticated user behind the connection, persisted as the
+    /// update's author (`doc_updates.by_user_id`) and thereby credited as a
+    /// contributor. `None` only where no user is meaningful (tests).
+    pub by_user: Option<Uuid>,
     pub bytes: Vec<u8>,
 }
 
@@ -34,13 +38,36 @@ pub struct ConnHandle {
     pub tx: mpsc::Sender<Vec<u8>>,
 }
 
+/// What a joining connection needs for both halves of the y-sync handshake.
+///
+/// `update` is the full document state, sent as SyncStep2. `state_vector` is
+/// sent as the server's own SyncStep1 so the client replies with whatever the
+/// server lacks — the only path by which edits a client made while its socket
+/// was down ever reach the server (the web providers apply offline edits
+/// locally but do not queue them for sending). Both are read in the same
+/// actor turn, so they describe the same document state.
+#[derive(Debug)]
+pub struct JoinState {
+    pub update: Vec<u8>,
+    pub state_vector: Vec<u8>,
+}
+
+impl JoinState {
+    pub(crate) fn of(engine: &dyn Engine, doc: &DocHandle) -> Result<Self, EngineError> {
+        Ok(Self {
+            update: engine.encode_state_as_update(doc, None)?,
+            state_vector: engine.encode_state_vector(doc)?,
+        })
+    }
+}
+
 /// All inputs the room actor multiplexes.
 pub enum Event {
     Inbound(InMsg),
     Join {
         conn_id: ConnId,
         handle: ConnHandle,
-        reply: oneshot::Sender<Result<Vec<u8>, EngineError>>,
+        reply: oneshot::Sender<Result<JoinState, EngineError>>,
     },
     Leave(ConnId),
     AwarenessIn {
@@ -67,9 +94,9 @@ pub enum Event {
     ReplaceWithMarkdown {
         /// Full-state update bytes encoding the replacement content.
         update_bytes: Vec<u8>,
-        /// Attribution for the persisted update, mirroring `ApplyUpdate`.
-        /// `None` where there is no meaningful actor (workspace import), or
-        /// where the caller has not been threaded through yet.
+        /// Attribution for the persisted update, mirroring `ApplyUpdate`:
+        /// the importer / restorer, credited as a contributor. `None` only
+        /// where there is no meaningful actor (tests).
         by_user: Option<Uuid>,
         reply: oneshot::Sender<Result<i64, String>>,
     },
@@ -553,18 +580,27 @@ impl Room {
         &mut self,
         conn_id: ConnId,
         handle: ConnHandle,
-        reply: oneshot::Sender<Result<Vec<u8>, EngineError>>,
+        reply: oneshot::Sender<Result<JoinState, EngineError>>,
     ) {
         self.conns.insert(conn_id, handle);
-        let r = self.engine.encode_state_as_update(&self.doc, None);
-        let _ = reply.send(r);
+        let _ = reply.send(JoinState::of(self.engine.as_ref(), &self.doc));
     }
 
     #[tracing::instrument(skip(self, m), fields(doc_id = %self.doc_id, bytes = m.bytes.len()))]
     async fn on_inbound(&mut self, m: InMsg) {
-        if let Err(e) = self.engine.apply_update(&self.doc, &m.bytes) {
-            tracing::debug!(error=?e, "apply_update failed");
-            return;
+        match self.engine.apply_update_changed(&self.doc, &m.bytes) {
+            Ok(true) => {}
+            // Nothing new — typically the SyncStep2 a (re)connecting writer
+            // sends in answer to the server's SyncStep1, which re-sends the
+            // whole delete set even when the client has no offline edits.
+            // Persisting it would write a `doc_updates` row on every page
+            // open (and attribute an edit to someone who only looked);
+            // fanning it out would make every peer re-apply a no-op.
+            Ok(false) => return,
+            Err(e) => {
+                tracing::debug!(error=?e, "apply_update failed");
+                return;
+            }
         }
         metrics::counter!("knot_room_updates_total", "source" => "local").increment(1);
         let framed = wrap_sync_update(&m.bytes);
@@ -586,7 +622,7 @@ impl Room {
             .persist_tx
             .send(crate::writer::PersistJob {
                 bytes: m.bytes,
-                by_user_id: None,
+                by_user_id: m.by_user,
                 // Inbound WS updates are fire-and-forget — the client
                 // already has the update locally, so we don't need to
                 // hold up acknowledgement on the durable insert.
@@ -658,8 +694,7 @@ mod tests {
         async fn insert_batch(
             &self,
             _: Uuid,
-            _: Option<Uuid>,
-            updates: &[Vec<u8>],
+            updates: &[(Option<Uuid>, Vec<u8>)],
         ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
             Ok((1..=updates.len() as i64).collect())
         }
@@ -682,7 +717,7 @@ mod tests {
         }
     }
 
-    /// Records the `by_user` argument each persist passes through, so
+    /// Records the author of every row the writer persists, in order, so
     /// tests can assert attribution reaches the store.
     struct RecordingUpdates {
         seen: std::sync::Arc<std::sync::Mutex<Vec<Option<Uuid>>>>,
@@ -692,11 +727,47 @@ mod tests {
         async fn insert_batch(
             &self,
             _: Uuid,
-            by_user: Option<Uuid>,
-            updates: &[Vec<u8>],
+            updates: &[(Option<Uuid>, Vec<u8>)],
         ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
-            self.seen.lock().unwrap().push(by_user);
-            Ok((1..=updates.len() as i64).collect())
+            let mut seen = self.seen.lock().unwrap();
+            let first = seen.len() as i64 + 1;
+            seen.extend(updates.iter().map(|(by, _)| *by));
+            Ok((first..first + updates.len() as i64).collect())
+        }
+        async fn since(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+            Ok(vec![])
+        }
+        async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
+            Ok(0)
+        }
+        async fn delete_up_to(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<u64, knot_storage::UpdatesStoreError> {
+            Ok(0)
+        }
+    }
+
+    /// Records every update the writer persists, in order.
+    struct CapturingUpdates {
+        persisted: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+    #[async_trait::async_trait]
+    impl knot_storage::UpdatesStore for CapturingUpdates {
+        async fn insert_batch(
+            &self,
+            _: Uuid,
+            updates: &[(Option<Uuid>, Vec<u8>)],
+        ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+            let mut p = self.persisted.lock().unwrap();
+            let first = p.len() as i64 + 1;
+            p.extend(updates.iter().map(|(_, b)| b.clone()));
+            Ok((first..first + updates.len() as i64).collect())
         }
         async fn since(
             &self,
@@ -969,7 +1040,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let peer_state = join_rx.await.unwrap().unwrap();
+        let peer_state = join_rx.await.unwrap().unwrap().update;
 
         let peer = engine.new_doc();
         engine.apply_update(&peer, &peer_state).unwrap();
@@ -1115,11 +1186,19 @@ mod tests {
         .await
         .unwrap();
 
-        // Produce an actual yrs update from a separate doc.
-        let other = engine.new_doc();
-        // Force a tiny state change so encode_state_as_update returns non-empty bytes.
-        // (yrs always returns something even for an empty doc — this is enough.)
-        let real_update = engine.encode_state_as_update(&other, None).unwrap();
+        // Produce an actual yrs update from a separate doc. It must change
+        // something: the room drops updates that leave its doc unchanged, so
+        // the bytes of an empty doc would never reach the writer.
+        let real_update = {
+            use yrs::{ReadTxn, Text, Transact};
+            let other = yrs::Doc::new();
+            other
+                .get_or_insert_text("t")
+                .push(&mut other.transact_mut(), "hello");
+            other
+                .transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default())
+        };
 
         // Join + send.
         let conn_id = Uuid::new_v4();
@@ -1135,6 +1214,7 @@ mod tests {
         let _ = reply_rx.await.unwrap().unwrap();
         h.tx.send(Event::Inbound(InMsg {
             from: conn_id,
+            by_user: None,
             bytes: real_update.clone(),
         }))
         .await
@@ -1187,7 +1267,7 @@ mod tests {
         let seed_bytes = engine.encode_state_as_update(&seed_doc, None).unwrap();
         let updates = PgUpdatesStore::new(pool.clone());
         updates
-            .insert_batch(d.id, Some(u.id), std::slice::from_ref(&seed_bytes))
+            .insert_batch(d.id, &[(Some(u.id), seed_bytes)])
             .await
             .unwrap();
 
@@ -1222,7 +1302,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let state = reply_rx.await.unwrap().unwrap();
+        let state = reply_rx.await.unwrap().unwrap().update;
         assert!(
             !state.is_empty(),
             "hydrated state should include the seed update"
@@ -1276,5 +1356,263 @@ mod tests {
             vec![Some(alice)],
             "replace should persist with its author, got {recorded:?}"
         );
+    }
+
+    /// Once the server asks every joining writer for its state (SyncStep1),
+    /// most replies carry nothing new — Yjs always includes the whole delete
+    /// set. Such a no-op must not be persisted (a `doc_updates` row per page
+    /// open, and the opener would count as a contributor), fanned out to
+    /// peers, or counted as an update.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn noop_inbound_update_is_neither_fanned_out_nor_persisted() {
+        use yrs::{ReadTxn, Text, Transact};
+
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let persisted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates: Arc<dyn knot_storage::UpdatesStore> = Arc::new(CapturingUpdates {
+            persisted: persisted.clone(),
+        });
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // A client's history, including a deletion so the no-op carries a
+        // non-empty delete set like a real SyncStep2 reply does.
+        let client = yrs::Doc::new();
+        let text = client.get_or_insert_text("t");
+        text.push(&mut client.transact_mut(), "hellox");
+        text.remove_range(&mut client.transact_mut(), 5, 1);
+        let real = client
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        let sv_before_sentinel = client.transact().state_vector();
+        text.push(&mut client.transact_mut(), "!");
+        let sentinel = client
+            .transact()
+            .encode_state_as_update_v1(&sv_before_sentinel);
+
+        let sender = Uuid::new_v4();
+        let (sender_tx, _sender_rx) = mpsc::channel(8);
+        let (peer_tx, mut peer_rx) = mpsc::channel(8);
+        for (conn_id, tx) in [(sender, sender_tx), (Uuid::new_v4(), peer_tx)] {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            h.tx.send(Event::Join {
+                conn_id,
+                handle: ConnHandle { tx },
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+            reply_rx.await.unwrap().unwrap();
+        }
+
+        // Real edit, then the identical bytes again (the no-op), then a
+        // second real edit. The actor handles them strictly in order.
+        for bytes in [real.clone(), real.clone(), sentinel.clone()] {
+            h.tx.send(Event::Inbound(InMsg {
+                from: sender,
+                by_user: None,
+                bytes,
+            }))
+            .await
+            .unwrap();
+        }
+
+        let mut fanned = Vec::new();
+        for _ in 0..2 {
+            fanned.push(
+                tokio::time::timeout(std::time::Duration::from_secs(10), peer_rx.recv())
+                    .await
+                    .expect("peer got no fan-out")
+                    .expect("peer channel closed"),
+            );
+        }
+        let (first, second) = (&fanned[0], &fanned[1]);
+        assert_eq!(*first, wrap_sync_update(&real));
+        assert_eq!(
+            *second,
+            wrap_sync_update(&sentinel),
+            "the peer was sent the no-op instead of the next real edit"
+        );
+
+        // The writer persists in arrival order: once the sentinel is in, a
+        // persisted no-op would be too.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !persisted.lock().unwrap().contains(&sentinel) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer never persisted the sentinel"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            *persisted.lock().unwrap(),
+            vec![real, sentinel],
+            "the no-op update was persisted"
+        );
+
+        h.shutdown.cancel();
+    }
+
+    /// The flip side: content the room cannot integrate yet (a dependency is
+    /// missing) is parked as pending by yrs. It must still be persisted and
+    /// fanned out — dropping it would lose the edit once the gap is filled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inbound_update_with_missing_dependency_is_still_persisted() {
+        use yrs::{ReadTxn, Text, Transact};
+
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let persisted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates: Arc<dyn knot_storage::UpdatesStore> = Arc::new(CapturingUpdates {
+            persisted: persisted.clone(),
+        });
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let client = yrs::Doc::new();
+        let text = client.get_or_insert_text("t");
+        text.push(&mut client.transact_mut(), "a");
+        let sv = client.transact().state_vector();
+        text.push(&mut client.transact_mut(), "b");
+        let dependent = client.transact().encode_state_as_update_v1(&sv);
+
+        let (peer_tx, mut peer_rx) = mpsc::channel(8);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(Event::Join {
+            conn_id: Uuid::new_v4(),
+            handle: ConnHandle { tx: peer_tx },
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        h.tx.send(Event::Inbound(InMsg {
+            from: Uuid::new_v4(),
+            by_user: None,
+            bytes: dependent.clone(),
+        }))
+        .await
+        .unwrap();
+
+        let fanned = tokio::time::timeout(std::time::Duration::from_secs(10), peer_rx.recv())
+            .await
+            .expect("pending update was not fanned out")
+            .unwrap();
+        assert_eq!(fanned, wrap_sync_update(&dependent));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while persisted.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pending update was never persisted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(*persisted.lock().unwrap(), vec![dependent]);
+
+        h.shutdown.cancel();
+    }
+
+    /// Live edits carry the authenticated user who typed them, row by row.
+    /// The writer batches whatever arrives within 250 ms, so two people
+    /// typing at once share a flush; each row must still be stored under
+    /// its own author — not the batch's first — or one of them would be
+    /// credited with the other's work (and the other with nothing).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inbound_updates_persist_under_each_senders_own_author() {
+        use yrs::{ReadTxn, Text, Transact};
+
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates: Arc<dyn knot_storage::UpdatesStore> =
+            Arc::new(RecordingUpdates { seen: seen.clone() });
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Two independent clients, each with one real edit.
+        let edit = |s: &str| {
+            let d = yrs::Doc::new();
+            d.get_or_insert_text("t").push(&mut d.transact_mut(), s);
+            d.transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        // Sent back-to-back: both reach the writer well inside one batch
+        // window, which is exactly the case a per-batch author gets wrong.
+        for (by, bytes) in [(alice, edit("a")), (bob, edit("b"))] {
+            h.tx.send(Event::Inbound(InMsg {
+                from: Uuid::new_v4(),
+                by_user: Some(by),
+                bytes,
+            }))
+            .await
+            .unwrap();
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while seen.lock().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer never persisted both edits"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some(alice), Some(bob)],
+            "each live edit must be persisted under its sender"
+        );
+
+        h.shutdown.cancel();
     }
 }
