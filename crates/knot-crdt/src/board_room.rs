@@ -20,6 +20,7 @@ use crate::bus::Bus;
 use crate::engine::{DocHandle, Engine, EngineError};
 
 use crate::protocol::wrap_sync_update;
+pub use crate::room::JoinState;
 
 pub type ConnId = Uuid;
 
@@ -37,7 +38,7 @@ pub enum Event {
     Join {
         conn_id: ConnId,
         handle: ConnHandle,
-        reply: oneshot::Sender<Result<Vec<u8>, EngineError>>,
+        reply: oneshot::Sender<Result<JoinState, EngineError>>,
     },
     Leave(ConnId),
     AwarenessIn {
@@ -219,18 +220,24 @@ impl BoardRoom {
         &mut self,
         conn_id: ConnId,
         handle: ConnHandle,
-        reply: oneshot::Sender<Result<Vec<u8>, EngineError>>,
+        reply: oneshot::Sender<Result<JoinState, EngineError>>,
     ) {
         self.conns.insert(conn_id, handle);
-        let r = self.engine.encode_state_as_update(&self.doc, None);
-        let _ = reply.send(r);
+        let _ = reply.send(JoinState::of(self.engine.as_ref(), &self.doc));
     }
 
     #[tracing::instrument(skip(self, m), fields(board_id = %self.board_id, bytes = m.bytes.len()))]
     async fn on_inbound(&mut self, m: InMsg) {
-        if let Err(e) = self.engine.apply_update(&self.doc, &m.bytes) {
-            tracing::debug!(error=?e, "apply_update failed");
-            return;
+        match self.engine.apply_update_changed(&self.doc, &m.bytes) {
+            Ok(true) => {}
+            // Nothing new — the usual answer to the server's SyncStep1 from a
+            // (re)connecting client. Don't append a `board_updates` row per
+            // open or echo the no-op to every peer (see `Room::on_inbound`).
+            Ok(false) => return,
+            Err(e) => {
+                tracing::debug!(error=?e, "apply_update failed");
+                return;
+            }
         }
         // Persist inline and capture the seq so we can advance the watermark
         // before publishing — ensures the self-NOTIFY from our own publish

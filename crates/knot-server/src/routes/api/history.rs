@@ -112,6 +112,10 @@ pub async fn restore(
     if let Some(r) = require_editor(&req) {
         return r;
     }
+    // Present: require_editor rejected the request otherwise.
+    let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
+        return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
+    };
     let Some(snapshots) = state.snapshots.clone() else {
         return internal();
     };
@@ -172,7 +176,9 @@ pub async fn restore(
         .tx
         .send(knot_crdt::Event::ReplaceWithMarkdown {
             update_bytes,
-            by_user: None,
+            // The restorer rewrote the page, so they are its latest
+            // contributor — not the authors of the snapshot's content.
+            by_user: Some(ctx.user_id),
             reply: tx,
         })
         .await

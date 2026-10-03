@@ -3,7 +3,9 @@ import CollaborationCaret from "@tiptap/extension-collaboration-caret";
 import Image from "@tiptap/extension-image";
 import Link from "@tiptap/extension-link";
 import Underline from "@tiptap/extension-underline";
+import { Plugin, type Transaction } from "@tiptap/pm/state";
 import StarterKit from "@tiptap/starter-kit";
+import { ySyncPluginKey } from "@tiptap/y-tiptap";
 import type { Awareness } from "y-protocols/awareness";
 import type * as Y from "yjs";
 import type { NavigateFunction } from "react-router-dom";
@@ -52,7 +54,49 @@ const KnotLink = Link.extend({
       },
     };
   },
+
+  /**
+   * Autolink only the local user's own typing.
+   *
+   * Upstream's autolink plugin is an `appendTransaction` hook that fires on
+   * any doc-changing transaction, and y-tiptap mirrors every peer edit into
+   * this editor as one. So a peer typing "https://… " made every other open
+   * editor append a link mark and write it into the shared doc as its own
+   * edit: duplicate traffic, and — since the server records who changed a
+   * page — a contributor credit for someone who only had the page open. The
+   * peer's own editor already linked the URL in its local transaction, so
+   * skipping the mirrored copy loses nothing.
+   *
+   * The batch is skipped only when every transaction in it came from y-sync;
+   * a local keystroke batched alongside a remote change still autolinks.
+   * Undo/redo also arrives as a y-sync change (Yjs UndoManager owns undo),
+   * which is fine: re-linking text the user just undid would be wrong anyway.
+   *
+   * The plugin is found by its key name because upstream does not export it;
+   * autolink.test.ts fails if that lookup ever stops matching.
+   */
+  addProseMirrorPlugins() {
+    return (this.parent?.() ?? []).map((plugin) => {
+      const keyName = (plugin as unknown as { key?: string }).key ?? "";
+      const append = plugin.spec.appendTransaction;
+      if (!keyName.startsWith("autolink$") || !append) return plugin;
+      return new Plugin({
+        ...plugin.spec,
+        appendTransaction: (transactions, oldState, newState) => {
+          if (transactions.every(isRemoteSync)) return null;
+          return append.call(plugin, transactions, oldState, newState);
+        },
+      });
+    });
+  },
 });
+
+/** True for a transaction y-tiptap dispatched to mirror a Y.Doc change that
+ *  did not originate in this editor (a peer's edit, or a Yjs undo/redo). */
+function isRemoteSync(tr: Transaction): boolean {
+  const meta = tr.getMeta(ySyncPluginKey) as { isChangeOrigin?: boolean } | undefined;
+  return meta?.isChangeOrigin === true;
+}
 
 /**
  * v3's Image adds `width` and `height`. Nothing in knot sets them — the

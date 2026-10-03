@@ -5,6 +5,10 @@
 //! `can_write` is the effective-role gate decided at upgrade: Viewers may
 //! connect and hydrate (read), but their inbound CRDT updates are dropped so
 //! a read-only grant cannot mutate the document over the socket.
+//!
+//! `user_id` is the authenticated user behind the socket. Every update the
+//! connection forwards carries it, so the room persists live edits under
+//! their author and credits that user as a contributor.
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::{SinkExt, StreamExt};
@@ -14,11 +18,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::protocol::{YSyncMessage, decode, encode_sync_step2};
+use crate::protocol::{YSyncMessage, decode, encode_sync_step1, encode_sync_step2};
 
 pub async fn serve(
     rooms: Arc<knot_crdt::Rooms>,
     doc_id: Uuid,
+    user_id: Uuid,
     socket: WebSocket,
     can_write: bool,
     shutdown: CancellationToken,
@@ -48,11 +53,22 @@ pub async fn serve(
     {
         return;
     }
-    let initial = match reply_rx.await {
-        Ok(Ok(b)) => encode_sync_step2(&b),
+    let joined = match reply_rx.await {
+        Ok(Ok(j)) => j,
         _ => return,
     };
-    let _ = out_tx.send(initial).await;
+    let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
+    // Ask the client for what WE lack (standard y-protocol: both sides send
+    // SyncStep1). The web provider applies edits made while its socket was
+    // down to its local doc without queueing them, and its own SyncStep1 only
+    // fetches what the client lacks — so without this ask, offline edits never
+    // reach the server, and every later edit that builds on them is parked as
+    // pending by yrs and stays invisible to everyone else. The provider
+    // already answers a server SyncStep1 with
+    // `encodeStateAsUpdate(doc, serverSV)`, so already-deployed bundles are
+    // fixed by this alone. Viewers answer too; their reply is dropped below
+    // like any other inbound update from a read-only connection.
+    let _ = out_tx.send(encode_sync_step1(&joined.state_vector)).await;
     // Server-side share of "open a doc, wait for content": includes the
     // hydrate of a cold room (see knot_room_hydrate_seconds) and the wait for
     // the room actor's reply.
@@ -119,8 +135,8 @@ pub async fn serve(
                                 reply: rtx,
                             })
                             .await;
-                        if let Ok(Ok(state)) = rrx.await {
-                            let _ = out_tx.send(encode_sync_step2(&state)).await;
+                        if let Ok(Ok(joined)) = rrx.await {
+                            let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
                         }
                     }
                     Ok(YSyncMessage::SyncStep2(inner)) | Ok(YSyncMessage::Update(inner)) => {
@@ -131,6 +147,7 @@ pub async fn serve(
                                 .tx
                                 .send(Event::Inbound(InMsg {
                                     from: conn_id,
+                                    by_user: Some(user_id),
                                     bytes: inner,
                                 }))
                                 .await;
