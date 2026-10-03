@@ -17,7 +17,6 @@ use knot_storage::{
     PgSearchStore, PgSessionStore, PgShareTokenStore, PgUserStore, PgWorkspaceStore, Pool,
     SearchStore, SessionStore, ShareTokenStore, UserStore, WorkspaceStore,
 };
-use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 /// Max inbound collab/board WS message. CRDT updates and board ops are far
@@ -36,6 +35,7 @@ pub mod reindex;
 pub mod room;
 pub mod routes;
 pub mod security_headers;
+pub mod static_files;
 
 use auth::SessionDeps;
 
@@ -190,10 +190,6 @@ pub fn router() -> Router {
 
 pub fn router_with_state(state: AppState) -> Router {
     let web_dist = std::env::var("KNOT_WEB_DIST").unwrap_or_else(|_| "/web/dist".into());
-    let index_path = format!("{web_dist}/index.html");
-    let spa = ServeDir::new(&web_dist)
-        .append_index_html_on_directories(true)
-        .not_found_service(ServeFile::new(&index_path));
 
     // WS routes: NO timeout / body-limit (long-lived, streamed).
     let collab = Router::new()
@@ -206,7 +202,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .merge(routes::auth::router())
         .merge(routes::public::router())
         .merge(routes::api::router(state.clone()))
-        .fallback_service(spa)
+        .merge(static_files::router(&web_dist))
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,

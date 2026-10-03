@@ -23,6 +23,7 @@ pub async fn serve(
     can_write: bool,
     shutdown: CancellationToken,
 ) {
+    let join_started = std::time::Instant::now();
     let handle = match rooms.acquire(doc_id).await {
         Ok(h) => h,
         Err(e) => {
@@ -52,6 +53,11 @@ pub async fn serve(
         _ => return,
     };
     let _ = out_tx.send(initial).await;
+    // Server-side share of "open a doc, wait for content": includes the
+    // hydrate of a cold room (see knot_room_hydrate_seconds) and the wait for
+    // the room actor's reply.
+    metrics::histogram!("knot_collab_initial_sync_seconds")
+        .record(join_started.elapsed().as_secs_f64());
 
     let (mut sink, mut stream) = socket.split();
     let writer_shutdown = shutdown.clone();

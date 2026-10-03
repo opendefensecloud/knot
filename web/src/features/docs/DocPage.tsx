@@ -17,8 +17,12 @@ import { HistoryDrawer } from "./HistoryDrawer";
 import { DocWidthToggle } from "./DocWidthToggle";
 import { ImportMarkdownButton } from "./ImportMarkdownButton";
 
+// DocPage starts this download on mount (see the effect below) so the ~750 KB
+// editor chunk overlaps the doc-metadata request instead of waiting for it.
+// `import()` is cached: the preload and `lazy` share one fetch.
+const loadKnotEditor = () => import("../editor/KnotEditor");
 const KnotEditor = lazy(() =>
-  import("../editor/KnotEditor").then((m) => ({ default: m.KnotEditor })),
+  loadKnotEditor().then((m) => ({ default: m.KnotEditor })),
 );
 
 export function DocTitle({
@@ -54,7 +58,7 @@ export function DocTitle({
       onChange={(e) => setTitle(e.target.value)}
       onBlur={() => { if (editable && title !== initialTitle) rename.mutate(title); }}
       placeholder="Untitled"
-      className={`w-full border-none bg-transparent text-[30px] font-bold text-fg placeholder:text-fg-muted/60 focus:outline-none focus:ring-0 px-0 ${
+      className={`w-full border-none bg-transparent font-body text-[30px] font-bold text-fg placeholder:text-fg-muted/60 focus:outline-none focus:ring-0 px-0 ${
         editable ? "" : "cursor-default"
       }`}
     />
@@ -69,6 +73,11 @@ export default function DocPage() {
   const notify = useUi((s) => s.notify);
   const [status, setStatus] = useState<ConnStatus>("connecting");
   const [pendingBytes, setPendingBytes] = useState(0);
+  useEffect(() => {
+    // A failed preload is not reported here: the `lazy` import meets the same
+    // failure when the editor renders, and surfaces it there.
+    loadKnotEditor().catch(() => {});
+  }, []);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [mdView, setMdView] = useState(false);
   // View mode by default — viewers are always read-only anyway; editors and
@@ -176,8 +185,9 @@ export default function DocPage() {
     <section
       data-testid="doc-page"
       className="doc-shell"
-      // Drives the comment-rail inset in layout.css (>=1280 only), so the
-      // rail reserves space instead of covering live text.
+      // Drives the comment-rail inset in layout.css (only where the content
+      // column is 1020px or wider), so the rail reserves space instead of
+      // covering live text.
       style={{ "--knot-rail-w": commentSidebarOpen ? "400px" : "0px" } as CSSProperties}
     >
       <div className="measure">

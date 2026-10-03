@@ -51,6 +51,46 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   sits beneath it, so any title up to roughly 45 characters is shown in full.
   Narrow screens already laid the header out this way; it is now the layout
   at every width. (#29)
+## [0.7.0] - 2026-10-02
+
+### Added
+- Resizable sidebar: drag its right edge (200–480px), or focus it and use ←/→
+  (Shift for larger steps) and Home/End; double-click resets it to 260px. The
+  width is saved per browser and synced across tabs. (#33)
+- Histograms `knot_collab_initial_sync_seconds` and `knot_room_hydrate_seconds`
+  for document-open time. (#32)
+
+### Changed
+- Faster document open: hashed assets are brotli-compressed and cached as
+  immutable (`index.html` is `no-cache`), the editor loads in parallel with the
+  document, and images and attachments revalidate via `ETag`. (#32)
+- With comments open, the document is inset only while the content column
+  (window minus sidebar) is at least 1020px wide, replacing the fixed 1280px
+  breakpoint. (#33)
+
+### Fixed
+- Latency metrics were exported as summaries, leaving the Grafana latency
+  panels, SLO queries and latency alert without data; they are now histograms
+  with `_bucket` series. (#32)
+- Deep links such as `/docs/<id>` returned 404 (while still rendering); they
+  now return 200, and a missing `/assets/*` file returns a plain 404. (#32)
+
+## [0.6.0] - 2026-09-18
+
+### Added
+- Skins: Settings → Appearance offers 13 light and dark skins, each with its
+  own colours, fonts and corner radius. A saved dark theme becomes the Dark
+  skin. (#31)
+
+### Changed
+- `data-theme` on `<html>` follows the active skin's light/dark scheme, and
+  JetBrains Mono is bundled for code. (#31)
+
+### Fixed
+- Long document titles were cut off by the toolbar; the title now has its own
+  line. (#30)
+- Creating a subpage after deleting one failed with a 500; sort-key conflicts
+  now return 409. (#27)
 
 ## [0.5.0] - 2026-09-06
 
@@ -494,7 +534,9 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/opendefensecloud/knot/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/opendefensecloud/knot/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/opendefensecloud/knot/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/opendefensecloud/knot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/opendefensecloud/knot/compare/v0.2.1...v0.3.0

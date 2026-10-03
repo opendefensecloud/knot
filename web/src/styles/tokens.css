@@ -1,4 +1,26 @@
-:root, [data-theme="light"] {
+/* Skins. Each [data-skin] block redefines the palette and typography
+   tokens. The light/dark axis lives on data-theme (derived from the
+   skin in stores/ui.ts) and only carries color-scheme, so dark-only
+   overrides elsewhere keep selecting on [data-theme="dark"].
+
+   Adding a skin: one block here, one entry in skins.ts. Keep body text
+   at 7:1 against bg and surface, muted text and destructive at 4.5:1,
+   accent at 3:1, and accent-fg at 4.5:1 on accent. */
+
+:root {
+  --font-ui: 'Inter Variable', Inter, system-ui, sans-serif;
+  --font-body: var(--font-ui);
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, monospace;
+  /* Tailwind's sm / DEFAULT / md / lg radii are 2, 3, 4 and 6 units. */
+  --radius-unit: 2px;
+}
+
+:root, [data-theme="light"] { color-scheme: light; }
+[data-theme="dark"] { color-scheme: dark; }
+
+/* ── Light ─────────────────────────────────────────────────────────── */
+
+:root, [data-skin="light"] {
   --color-bg: #F8FAFC;
   --color-surface: #FFFFFF;
   --color-border: #E2E8F0;
@@ -8,10 +30,77 @@
   --color-accent: #2563EB;
   --color-accent-fg: #FFFFFF;
   --color-destructive: #DC2626;
-  color-scheme: light;
 }
 
-[data-theme="dark"] {
+/* Warm cream and ink, with a serif for the document body. */
+[data-skin="paper"] {
+  --color-bg: #F4EEE2;
+  --color-surface: #FCF9F2;
+  --color-border: #E0D6C2;
+  --color-muted: #ECE5D4;
+  --color-fg: #2A251E;
+  --color-fg-muted: #6B6357;
+  --color-accent: #9C4A2C;
+  --color-accent-fg: #FFFFFF;
+  --color-destructive: #B42318;
+  --font-body: 'Source Serif 4 Variable', 'Source Serif 4', Georgia, 'Times New Roman', serif;
+}
+
+/* Ethan Schoonover's palette. Body text is base02 rather than base01 —
+   the canonical choice sits under 5:1 and reads as fog on long pages. */
+[data-skin="solarized-light"] {
+  --color-bg: #EEE8D5;
+  --color-surface: #FDF6E3;
+  --color-border: #D9D2B9;
+  --color-muted: #E8E1CB;
+  --color-fg: #073642;
+  --color-fg-muted: #52676E;
+  --color-accent: #1D6FB3;
+  --color-accent-fg: #FFFFFF;
+  --color-destructive: #BC2D1B;
+}
+
+[data-skin="rose-pine-dawn"] {
+  --color-bg: #FAF4ED;
+  --color-surface: #FFFAF3;
+  --color-border: #DFDAD9;
+  --color-muted: #F2E9E1;
+  --color-fg: #4F4A6E;
+  --color-fg-muted: #6E6A86;
+  --color-accent: #286983;
+  --color-accent-fg: #FFFFFF;
+  --color-destructive: #A04A62;
+}
+
+[data-skin="sage"] {
+  --color-bg: #F1F6F3;
+  --color-surface: #FFFFFF;
+  --color-border: #D3DFD8;
+  --color-muted: #E4EDE7;
+  --color-fg: #1B2A22;
+  --color-fg-muted: #5A6B62;
+  --color-accent: #1F7A5C;
+  --color-accent-fg: #FFFFFF;
+  --color-destructive: #C0392B;
+  --radius-unit: 3px;
+}
+
+[data-skin="high-contrast"] {
+  --color-bg: #FFFFFF;
+  --color-surface: #FFFFFF;
+  --color-border: #3D3D3D;
+  --color-muted: #E8E8E8;
+  --color-fg: #000000;
+  --color-fg-muted: #3D3D3D;
+  --color-accent: #0B3FC2;
+  --color-accent-fg: #FFFFFF;
+  --color-destructive: #B00020;
+  --radius-unit: 0px;
+}
+
+/* ── Dark ──────────────────────────────────────────────────────────── */
+
+[data-skin="dark"] {
   --color-bg: #0B1220;
   --color-surface: #0F172A;
   --color-border: #1E293B;
@@ -21,5 +110,80 @@
   --color-accent: #3B82F6;
   --color-accent-fg: #FFFFFF;
   --color-destructive: #F87171;
-  color-scheme: dark;
+}
+
+[data-skin="nord"] {
+  --color-bg: #2E3440;
+  --color-surface: #3B4252;
+  --color-border: #4C566A;
+  --color-muted: #434C5E;
+  --color-fg: #ECEFF4;
+  --color-fg-muted: #AFB8CA;
+  --color-accent: #88C0D0;
+  --color-accent-fg: #2E3440;
+  --color-destructive: #EC9AA1;
+}
+
+[data-skin="gruvbox"] {
+  --color-bg: #1D2021;
+  --color-surface: #282828;
+  --color-border: #3C3836;
+  --color-muted: #3C3836;
+  --color-fg: #EBDBB2;
+  --color-fg-muted: #A89984;
+  --color-accent: #FE8019;
+  --color-accent-fg: #1D2021;
+  --color-destructive: #FF6B52;
+}
+
+[data-skin="catppuccin-mocha"] {
+  --color-bg: #181825;
+  --color-surface: #1E1E2E;
+  --color-border: #313244;
+  --color-muted: #313244;
+  --color-fg: #CDD6F4;
+  --color-fg-muted: #A6ADC8;
+  --color-accent: #CBA6F7;
+  --color-accent-fg: #1E1E2E;
+  --color-destructive: #F38BA8;
+}
+
+[data-skin="everforest"] {
+  --color-bg: #232A2E;
+  --color-surface: #2D353B;
+  --color-border: #3D484D;
+  --color-muted: #343F44;
+  --color-fg: #D3C6AA;
+  --color-fg-muted: #9DA9A0;
+  --color-accent: #A7C080;
+  --color-accent-fg: #232A2E;
+  --color-destructive: #EC8B8D;
+}
+
+[data-skin="dracula"] {
+  --color-bg: #21222C;
+  --color-surface: #282A36;
+  --color-border: #3B3D4E;
+  --color-muted: #343746;
+  --color-fg: #F8F8F2;
+  --color-fg-muted: #9DA5CC;
+  --color-accent: #BD93F9;
+  --color-accent-fg: #21222C;
+  --color-destructive: #FF6E6E;
+}
+
+/* True black, phosphor green, monospace for everything. */
+[data-skin="terminal"] {
+  --color-bg: #000000;
+  --color-surface: #0C0C0C;
+  --color-border: #262626;
+  --color-muted: #161616;
+  --color-fg: #E5E5E5;
+  --color-fg-muted: #8A8A8A;
+  --color-accent: #5AF78E;
+  --color-accent-fg: #000000;
+  --color-destructive: #FF5C5C;
+  --font-ui: var(--font-mono);
+  --font-body: var(--font-mono);
+  --radius-unit: 0px;
 }

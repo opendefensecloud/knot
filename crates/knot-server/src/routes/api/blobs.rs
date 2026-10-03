@@ -205,6 +205,26 @@ async fn download(State(state): State<AppState>, Path(id): Path<Uuid>, req: Requ
         Err(_) => return internal(),
     }
 
+    // A blob id never changes content, so its sha256 is a strong ETag. The
+    // short max-age keeps an ACL revoke effective within a minute; after that
+    // the browser revalidates, and a match is answered from metadata alone,
+    // skipping the byte read. Only after the ACL check above.
+    let etag = format!(
+        "\"{}\"",
+        meta.sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    if if_none_match_hits(req.headers(), &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, "private, max-age=60")
+            .body(Body::empty())
+            .unwrap();
+    }
+
     let bytes = match store.get(id).await {
         Ok(b) => b,
         Err(knot_storage::BlobStoreError::NotFound) => {
@@ -223,9 +243,22 @@ async fn download(State(state): State<AppState>, Path(id): Path<Uuid>, req: Requ
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::CONTENT_DISPOSITION, disposition)
         .header(header::CACHE_CONTROL, "private, max-age=60")
+        .header(header::ETAG, &etag)
         .header(header::CONTENT_LENGTH, meta.byte_size)
         .body(Body::from(bytes))
         .unwrap()
+}
+
+/// RFC 9110 §13.1.2: `If-None-Match` uses weak comparison, so a `W/` prefix
+/// on the client's tag still matches, and `*` matches any existing blob.
+fn if_none_match_hits(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate.trim_start_matches("W/") == etag)
 }
 
 async fn delete_blob(

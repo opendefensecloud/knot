@@ -13,6 +13,13 @@ pub enum MetricsError {
     Install(String),
 }
 
+/// Shared by every histogram (all of them are latencies in seconds). The
+/// edges include each SLO threshold in docs/SLO.md so a target reads off a
+/// bucket boundary instead of an interpolation.
+const LATENCY_BUCKETS_SECONDS: [f64; 13] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0,
+];
+
 /// Install the global metrics recorder and start the HTTP exporter
 /// on `addr` (e.g. ":9090" or "0.0.0.0:9090").
 pub fn init(addr: &str) -> Result<(), MetricsError> {
@@ -20,8 +27,13 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         .parse()
         .map_err(|e| MetricsError::Address(format!("{addr}: {e}")))?;
 
+    // Without buckets the exporter renders every histogram as a summary, and
+    // the dashboard, SLO queries and alert rule (`histogram_quantile` over
+    // `_bucket`) all come back empty.
     PrometheusBuilder::new()
         .with_http_listener(sa)
+        .set_buckets(&LATENCY_BUCKETS_SECONDS)
+        .map_err(|e| MetricsError::Install(e.to_string()))?
         .install()
         .map_err(|e| MetricsError::Install(e.to_string()))?;
 
@@ -47,6 +59,16 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         "CRDT updates applied to rooms, by source (local|peer)"
     );
     describe_counter!("knot_room_snapshots_total", "Snapshots written to storage");
+    describe_histogram!(
+        "knot_room_hydrate_seconds",
+        Unit::Seconds,
+        "Loading a cold room: latest snapshot + replay of later updates"
+    );
+    describe_histogram!(
+        "knot_collab_initial_sync_seconds",
+        Unit::Seconds,
+        "Collab socket upgraded -> initial document state queued to the client"
+    );
 
     // Notifications
     describe_counter!(

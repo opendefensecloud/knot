@@ -9,9 +9,11 @@ import { SessionProvider } from "./auth/SessionContext";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { queryClient } from "./lib/queryClient";
 import { router } from "./routes";
+import { readInitialSidebarWidth, readInitialSkin, stampSidebarWidth, stampSkin } from "./stores/ui";
 
-const initialTheme = (localStorage.getItem("knot.theme") as "light" | "dark" | null) ?? "light";
-document.documentElement.setAttribute("data-theme", initialTheme);
+// Stamp data-skin + data-theme before first paint so a dark-skin user
+// never sees the light palette flash in before React hydrates.
+stampSkin(readInitialSkin());
 
 // Stamped before first paint, like the theme above, so a wide-mode user
 // never sees the narrow column flash in before React hydrates.
@@ -20,6 +22,10 @@ try {
   if (localStorage.getItem("knot.docWidth") === "wide") initialDocWidth = "wide";
 } catch { /* storage unavailable */ }
 document.documentElement.setAttribute("data-doc-width", initialDocWidth);
+
+// And the sidebar width, so a user who dragged the sidebar wider never sees
+// it open at the default 260px first. AppShell keeps it current from here.
+stampSidebarWidth(readInitialSidebarWidth());
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

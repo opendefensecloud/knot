@@ -1,4 +1,8 @@
 @import "@fontsource-variable/inter";
+@import "@fontsource-variable/source-serif-4";
+@import "@fontsource-variable/source-serif-4/wght-italic.css";
+@import "@fontsource-variable/jetbrains-mono";
+@import "@fontsource-variable/jetbrains-mono/wght-italic.css";
 @import "./tokens.css";
 @import "./layout.css";
 @import "./prose.css";
@@ -11,7 +15,7 @@ html, body, #root { height: 100%; }
 body {
   background: var(--color-bg);
   color: var(--color-fg);
-  font-family: 'Inter Variable', Inter, system-ui, sans-serif;
+  font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }

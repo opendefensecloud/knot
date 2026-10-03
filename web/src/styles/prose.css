@@ -1,4 +1,5 @@
 .ProseMirror {
+  font-family: var(--font-body);
   outline: none;
   color: var(--color-fg);
   font-size: 16px;
@@ -40,7 +41,7 @@
   background: var(--color-muted);
   border-radius: 4px;
   padding: 1px 4px;
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-family: var(--font-mono);
   font-size: 0.92em;
 }
 
@@ -256,7 +257,7 @@
   white-space: nowrap;
   user-select: none;
   pointer-events: none;
-  font-family: 'Inter Variable', Inter, system-ui, sans-serif;
+  font-family: var(--font-ui);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
   /* Fade the label after a short delay so it does not clutter the view */
   animation: caret-label-fade 4s ease-out forwards;
@@ -292,7 +293,7 @@
   border-radius: 0;
   margin: 0;
   padding: 12px 14px;
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.55;
   white-space: pre;
