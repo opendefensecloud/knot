@@ -65,19 +65,22 @@ impl Engine for YrsEngine {
     fn apply_update_changed(&self, d: &DocHandle, update: &[u8]) -> Result<bool, EngineError> {
         let u = Update::decode_v1(update).map_err(|e| EngineError::Apply(e.to_string()))?;
         let mut txn = d.0.transact_mut();
+        let pending_before = pending_fingerprint(&txn);
         txn.apply_update(u)
             .map_err(|e| EngineError::Apply(e.to_string()))?;
-        // - state moved: new structs were integrated;
-        // - delete_set: holds only items THIS transaction newly deleted
-        //   (re-deleting an already-deleted item adds nothing), so the full
+        // - insert_set: structs THIS transaction integrated (yrs records every
+        //   integrated item and GC range there), so already-known structs in
+        //   a re-sent state do not count;
+        // - delete_set: likewise only items newly deleted here, so the full
         //   delete set every SyncStep2 carries does not count by itself;
-        // - missing updates: structs/deletes yrs had to park as pending.
-        //   Doc-wide rather than per-update, so while anything is pending every
-        //   update counts as a change — conservative on purpose: persisting a
-        //   redundant row is harmless, dropping unintegrated content is not.
-        Ok(txn.before_state() != txn.after_state()
+        // - pending: structs/deletes yrs had to park because a dependency is
+        //   missing. Compared before/after, not as a doc-wide flag: a doc can
+        //   hold pending content indefinitely (and snapshots and every
+        //   client's state re-send it), and re-delivering it changes nothing.
+        //   Content that is newly parked does change it, and is never dropped.
+        Ok(!txn.insert_set().is_empty()
             || !txn.delete_set().is_empty()
-            || txn.has_missing_updates())
+            || pending_fingerprint(&txn) != pending_before)
     }
 
     fn encode_state_as_update(
@@ -99,6 +102,19 @@ impl Engine for YrsEngine {
         let txn = d.0.transact();
         Ok(txn.state_vector().encode_v1())
     }
+}
+
+/// The doc's pending (not yet integrable) structs and deletes, encoded, so a
+/// caller can tell whether a transaction parked anything new. `None` in the
+/// common case of nothing pending, which costs nothing to compute.
+fn pending_fingerprint<T: ReadTxn>(txn: &T) -> Option<(Vec<u8>, Vec<u8>)> {
+    let store = txn.store();
+    let structs = store.pending_update().map(|p| p.update.encode_v1());
+    let deletes = store.pending_ds().map(|ds| ds.encode_v1());
+    if structs.is_none() && deletes.is_none() {
+        return None;
+    }
+    Some((structs.unwrap_or_default(), deletes.unwrap_or_default()))
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +230,64 @@ mod tests {
             StateVector::default().encode_v1(),
             "fixture: the dependent update must not have integrated"
         );
+    }
+
+    /// A doc can hold pending content for good: the offline-edit bug left
+    /// docs whose later edits depend on clocks that were never uploaded, and
+    /// snapshots keep the pending part (yrs and Yjs both re-encode it into
+    /// every state update). Then every client's SyncStep2 reply carries that
+    /// pending content again. Re-delivering what is already pending changes
+    /// nothing and must not read as a change — or every page open on such a
+    /// doc would be persisted and credited as an edit.
+    #[test]
+    fn redelivering_already_pending_content_is_unchanged() {
+        let src = Doc::new();
+        let t = src.get_or_insert_text("t");
+        t.push(&mut src.transact_mut(), "a");
+        let sv_after_a = src.transact().state_vector();
+        t.push(&mut src.transact_mut(), "b");
+        let only_b = src.transact().encode_state_as_update_v1(&sv_after_a);
+
+        let e = YrsEngine;
+        let d = e.new_doc();
+        assert!(e.apply_update_changed(&d, &only_b).unwrap());
+        assert!(
+            d.0.transact().has_missing_updates(),
+            "fixture: b must be pending"
+        );
+
+        assert!(
+            !e.apply_update_changed(&d, &only_b).unwrap(),
+            "re-delivering the pending update must be a no-op"
+        );
+        // What a client that loaded this doc answers to SyncStep1: the doc's
+        // state relative to the server's (empty) state vector, which includes
+        // the pending content.
+        let reply = full_update(&d.0);
+        assert!(
+            !e.apply_update_changed(&d, &reply).unwrap(),
+            "a SyncStep2 reply that only re-sends pending content must be a no-op"
+        );
+    }
+
+    /// The counterpart: filling the gap integrates the pending content.
+    #[test]
+    fn filling_the_missing_dependency_is_changed() {
+        let src = Doc::new();
+        let t = src.get_or_insert_text("t");
+        t.push(&mut src.transact_mut(), "a");
+        let only_a = full_update(&src);
+        let sv_after_a = src.transact().state_vector();
+        t.push(&mut src.transact_mut(), "b");
+        let only_b = src.transact().encode_state_as_update_v1(&sv_after_a);
+
+        let e = YrsEngine;
+        let d = e.new_doc();
+        e.apply_update(&d, &only_b).unwrap();
+        assert!(e.apply_update_changed(&d, &only_a).unwrap());
+        assert!(!d.0.transact().has_missing_updates());
+        let txt = d.0.get_or_insert_text("t");
+        assert_eq!(txt.get_string(&d.0.transact()), "ab");
     }
 
     #[test]

@@ -180,15 +180,17 @@ fn append_var_uint(out: &mut Vec<u8>, mut v: u64) {
 }
 
 /// Consume the handshake the server sends on connect: its sync-step-2 (full
-/// state) followed by its own sync-step-1 (asking the client for anything the
-/// server lacks). This test client has nothing to offer, so it leaves the
-/// step-1 unanswered.
+/// state), followed — for connections that can write — by its own
+/// sync-step-1 (asking the client for anything the server lacks). This test
+/// client has nothing to offer, so it leaves the step-1 unanswered.
 async fn drain_initial(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    can_write: bool,
 ) {
-    for expected_subtype in [1u8, 0u8] {
+    let expected: &[u8] = if can_write { &[1, 0] } else { &[1] };
+    for &expected_subtype in expected {
         let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
             .await
             .expect("handshake frame")
@@ -330,8 +332,8 @@ async fn viewer_cannot_write_owner_can() {
     let mut viewer_ws = open_authed_ws(addr, doc_id, &viewer_sid).await;
 
     // Drain the initial sync-step-2 frame from each connection.
-    drain_initial(&mut owner_ws).await;
-    drain_initial(&mut viewer_ws).await;
+    drain_initial(&mut owner_ws, true).await;
+    drain_initial(&mut viewer_ws, false).await;
 
     // --- T1: Viewer sends an update; owner should NOT receive it -----------
     // (The server drops inbound updates from can_write=false connections.)

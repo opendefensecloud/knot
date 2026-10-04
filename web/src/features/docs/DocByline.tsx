@@ -35,6 +35,11 @@ export function DocByline({ docId }: { docId: string }) {
   const q = useQuery({
     queryKey: ["contributors", docId],
     queryFn: () => docsApi.contributors(docId),
+    // Edits made while the page is open (your own first edit, or anyone
+    // else's) must show without a reload. With no contributors there is no
+    // button whose opening could refetch, and focus refetch is off app-wide.
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: true,
   });
 
   useEffect(() => {

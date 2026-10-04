@@ -235,4 +235,26 @@ describe("DocByline", () => {
 
     await waitFor(() => expect(screen.queryByTestId("doc-byline")).toBeNull());
   });
+
+  // Edits made while the page is open — your own first edit on a new page,
+  // or anyone else's — must show up without a reload. With zero contributors
+  // there is no button whose opening could refetch, and window-focus refetch
+  // is off app-wide, so the byline polls.
+  it("refreshes while the page stays open", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      contributors
+        .mockResolvedValueOnce({ ok: body() })
+        .mockResolvedValue({ ok: body({ contributors: [person("u-alice", "Alice")] }) });
+      renderByline();
+      await screen.findByTestId("doc-byline-creator");
+      expect(screen.queryByTestId("doc-contributors-button")).toBeNull();
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await screen.findByTestId("doc-contributors-button")).toHaveTextContent("1 contributor");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
+

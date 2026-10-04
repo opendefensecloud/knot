@@ -395,6 +395,9 @@ impl Peer {
     /// Dial as `who`, send SyncStep1, and complete the handshake: apply the
     /// server's state and answer its SyncStep1 exactly like the web provider
     /// (for a writer that answer reaches the room; it carries nothing new).
+    /// Viewers are not sent a SyncStep1. Done once the server's reply to our
+    /// own SyncStep1 (its second SyncStep2) is in: the server queues its
+    /// SyncStep1, if any, ahead of that reply.
     async fn join(fx: &Fixture, who: &Member) -> Self {
         let mut p = Self::new();
         let mut req = format!("ws://{}/collab/doc/{}", fx.addr, fx.doc_id)
@@ -413,8 +416,7 @@ impl Peer {
             .unwrap();
         p.ws = Some(ws);
         assert!(
-            p.pump_until(|p| p.step2_received >= 1 && p.step1_answered >= 1)
-                .await,
+            p.pump_until(|p| p.step2_received >= 2).await,
             "handshake never completed"
         );
         p
@@ -961,4 +963,127 @@ async fn byline_still_names_a_former_member() {
             "last_edited_at": v["contributors"][0]["last_edited_at"],
         }])
     );
+}
+
+// ---------------------------------------------------------------------------
+// The sync handshake and access changes
+// ---------------------------------------------------------------------------
+
+/// Only connections that can write are asked for their state (SyncStep1).
+/// A viewer's answer would always be dropped, and costs it an upload of at
+/// least its whole delete set on every connect.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_writers_are_asked_for_their_state() {
+    let fx = fixture().await;
+    let bob = Peer::join(&fx, &fx.bob).await;
+    let vic = Peer::join(&fx, &fx.vic).await;
+    assert_eq!(
+        bob.step1_answered, 1,
+        "an editor must be asked for its offline edits"
+    );
+    assert_eq!(vic.step1_answered, 0, "a viewer was asked for its state");
+    bob.leave().await;
+    vic.leave().await;
+}
+
+/// Wait for the server to close `peer`'s socket and return the close code.
+async fn close_code(peer: &mut Peer) -> u16 {
+    let ws = peer.ws.as_mut().expect("connected peer");
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(tungstenite::Message::Close(Some(frame))))) => return frame.code.into(),
+            Ok(Some(Ok(tungstenite::Message::Close(None)))) | Ok(None) => {
+                panic!("socket closed without a close code")
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(e))) => panic!("ws error: {e}"),
+            Err(_) => panic!("the server never closed the socket"),
+        }
+    }
+}
+
+/// An ACL change that revokes access must reach sockets that are already
+/// open: the server closes them with 4403, and nothing the revoked user sends
+/// on the way out is applied, persisted or credited.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoked_editor_is_closed_with_4403_and_its_edits_are_dropped() {
+    let fx = fixture().await;
+    let mut bob = Peer::join(&fx, &fx.bob).await;
+
+    fx.state
+        .rooms_v2
+        .as_ref()
+        .expect("fixture wires rooms")
+        .revoke_all_for_doc(fx.doc_id)
+        .await;
+    // Bob's editor has not seen the close yet and keeps typing.
+    bob.type_paragraph("after the revoke").await;
+    assert_eq!(close_code(&mut bob).await, 4403);
+
+    // Sentinel: once Carol's later edit is durable, an accepted edit of
+    // Bob's would be too.
+    let mut carol = Peer::join(&fx, &fx.carol).await;
+    carol.type_paragraph("sentinel").await;
+    wait_for_durable_text(&fx.pool, fx.doc_id, "sentinel").await;
+    let byline = wait_for_byline(&fx, fx.doc_id, "sentinel", |l| l.contains(&fx.carol.id)).await;
+    assert_eq!(
+        listed(&byline),
+        vec![fx.carol.id],
+        "a revoked editor was credited"
+    );
+    let rows = update_rows(&fx.pool, fx.doc_id).await;
+    assert!(
+        rows.iter().all(|r| r.by_user_id != Some(fx.bob.id)),
+        "an edit sent after the revoke was persisted"
+    );
+    carol.leave().await;
+}
+
+/// Docs damaged by the old offline-edit bug hold pending content for good
+/// (later edits depend on clocks that were never uploaded), and every client
+/// that loads such a doc re-sends that content in its SyncStep2 answer.
+/// Re-delivering it must not count as an edit: opening the page is not
+/// contributing.
+#[tokio::test(flavor = "multi_thread")]
+async fn opening_a_doc_with_pending_content_credits_nobody() {
+    let fx = fixture().await;
+    // "b" depends on "a", which the server never received.
+    let dependent = {
+        let src = Doc::new();
+        let t = src.get_or_insert_text("t");
+        t.push(&mut src.transact_mut(), "a");
+        let sv = src.transact().state_vector();
+        t.push(&mut src.transact_mut(), "b");
+        src.transact().encode_state_as_update_v1(&sv)
+    };
+    knot_storage::PgUpdatesStore::new(fx.pool.clone())
+        .insert_batch(fx.doc_id, &[(None, dependent)])
+        .await
+        .unwrap();
+
+    let mut bob = Peer::join(&fx, &fx.bob).await;
+    assert!(
+        bob.doc.transact().has_missing_updates(),
+        "fixture: the doc's pending content must reach the client"
+    );
+    bob.settle().await;
+
+    let mut carol = Peer::join(&fx, &fx.carol).await;
+    carol.type_paragraph("sentinel").await;
+    wait_for_durable_text(&fx.pool, fx.doc_id, "sentinel").await;
+    let byline = wait_for_byline(&fx, fx.doc_id, "sentinel", |l| l.contains(&fx.carol.id)).await;
+    assert_eq!(
+        listed(&byline),
+        vec![fx.carol.id],
+        "opening a doc with pending content credited the opener"
+    );
+    let rows = update_rows(&fx.pool, fx.doc_id).await;
+    assert!(
+        rows.iter().all(|r| r.by_user_id != Some(fx.bob.id)),
+        "the opener's no-op answer was persisted"
+    );
+    bob.leave().await;
+    carol.leave().await;
 }

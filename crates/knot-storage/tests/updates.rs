@@ -278,3 +278,37 @@ async fn contributor_last_edited_at_refresh_is_throttled_to_once_a_minute() {
         "a stale last_edited_at must be refreshed to now(): {stale} -> {got_last}"
     );
 }
+
+/// Continuous typing flushes every 250 ms. A flush for an author credited
+/// within the last minute must not even lock their contributor row: `ON
+/// CONFLICT … DO UPDATE … WHERE` locks the row although the WHERE skips the
+/// update, so concurrent flushes of the same doc (other replicas) would queue
+/// on it — and a waiting insert holds an allocated seq while later seqs
+/// commit, widening the window in which replay can see seqs out of order.
+#[tokio::test(flavor = "multi_thread")]
+async fn flush_for_a_freshly_credited_author_does_not_lock_their_row() {
+    let a = two_authors().await;
+    let one_edit = [(Some(a.alice), vec![1u8])];
+    a.s.insert_batch(a.doc, &one_edit).await.unwrap();
+
+    // Another session holds Alice's contributor row.
+    let mut holder = a.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM doc_contributors WHERE doc_id = $1 AND user_id = $2 FOR UPDATE")
+        .bind(a.doc)
+        .bind(a.alice)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let flushed = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        a.s.insert_batch(a.doc, &one_edit),
+    )
+    .await;
+    holder.rollback().await.unwrap();
+    assert!(
+        flushed.is_ok(),
+        "the flush waited on the contributor row's lock"
+    );
+    flushed.unwrap().unwrap();
+}

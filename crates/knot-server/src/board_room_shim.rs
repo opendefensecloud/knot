@@ -1,8 +1,8 @@
 //! WebSocket → BoardRoom shim. Mirrors `room::serve` but against the
 //! `BoardRooms` registry, since boards have their own y-protocol session.
 
-use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures::{SinkExt, StreamExt};
+use axum::extract::ws::{Message, WebSocket};
+use futures::StreamExt;
 use knot_crdt::board_room::{ConnHandle, ConnId, Event, InMsg};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -25,7 +25,7 @@ pub async fn serve(
         }
     };
     let conn_id: ConnId = Uuid::new_v4();
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(256);
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if handle
@@ -52,44 +52,24 @@ pub async fn serve(
     // message per frame.
     let _ = out_tx.send(encode_sync_step1(&joined.state_vector)).await;
 
-    let (mut sink, mut stream) = socket.split();
-    let writer_shutdown = shutdown.clone();
-    let writer = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                _ = writer_shutdown.cancelled() => {
-                    let _ = sink
-                        .send(Message::Close(Some(CloseFrame {
-                            code: 1001,
-                            reason: "server.shutdown".into(),
-                        })))
-                        .await;
-                    return;
-                }
-                maybe = out_rx.recv() => match maybe {
-                    Some(bytes) => {
-                        if sink.send(Message::Binary(bytes.into())).await.is_err() {
-                            return;
-                        }
-                    }
-                    None => {
-                        let _ = sink
-                            .send(Message::Close(Some(CloseFrame {
-                                code: 4403,
-                                reason: "acl.revoked".into(),
-                            })))
-                            .await;
-                        return;
-                    }
-                },
-            }
-        }
-    });
+    let (sink, mut stream) = socket.split();
+    // As in `room::serve`: whichever half ends the session cancels `done` so
+    // the other stops. Boards have no ACL revocation of their own, so the
+    // writer's revoke signal is never raised here.
+    let done = CancellationToken::new();
+    let writer = tokio::spawn(crate::ws_writer::run(
+        sink,
+        out_rx,
+        shutdown.clone(),
+        CancellationToken::new(),
+        done.clone(),
+    ));
 
     loop {
         let msg = tokio::select! {
+            biased;
             _ = shutdown.cancelled() => break,
+            _ = done.cancelled() => break,
             m = stream.next() => match m {
                 Some(Ok(m)) => m,
                 _ => break,
@@ -135,6 +115,9 @@ pub async fn serve(
             _ => {}
         }
     }
+    // Stop the writer before waiting for it: this function still holds a
+    // sender, so the channel alone would never end it.
+    done.cancel();
     let _ = handle.tx.send(Event::Leave(conn_id)).await;
     let _ = writer.await;
 }

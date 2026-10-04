@@ -31,7 +31,7 @@ static MENTION_RE: std::sync::LazyLock<Regex> =
     std::sync::LazyLock::new(|| Regex::new(r"(?:^|\s)@(\w+)").expect("valid mention regex"));
 
 use crate::AppState;
-use crate::auth::{AuthContext, EffectiveDocRole};
+use crate::auth::{AuthContext, EffectiveDocRole, require_viewer};
 use crate::http_error::json_err;
 
 // ---------------------------------------------------------------------------
@@ -105,20 +105,6 @@ fn require_editor(req: &Request<Body>) -> Option<Response> {
         }
         Some(_) => None,
     }
-}
-
-fn require_viewer(req: &Request<Body>) -> Option<Response> {
-    if req.extensions().get::<AuthContext>().is_none() {
-        return Some(json_err(
-            StatusCode::UNAUTHORIZED,
-            "auth.session_required",
-            "",
-        ));
-    }
-    if req.extensions().get::<EffectiveDocRole>().is_none() {
-        return Some(json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""));
-    }
-    None
 }
 
 fn internal() -> Response {

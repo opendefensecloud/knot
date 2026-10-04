@@ -59,3 +59,21 @@ pub async fn require_doc_role_mw(
     req.extensions_mut().insert(EffectiveDocRole(role));
     next.run(req).await
 }
+
+/// Handler-side gate for doc sub-resources any role may read (Viewer and
+/// up). Expects `EffectiveDocRole` already set by `require_doc_role_mw`:
+/// 401 `auth.session_required` without a session, 403 `acl.no_grant`
+/// without a role on the doc.
+pub fn require_viewer(req: &Request<Body>) -> Option<Response> {
+    if req.extensions().get::<AuthContext>().is_none() {
+        return Some(json_err(
+            StatusCode::UNAUTHORIZED,
+            "auth.session_required",
+            "",
+        ));
+    }
+    if req.extensions().get::<EffectiveDocRole>().is_none() {
+        return Some(json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""));
+    }
+    None
+}

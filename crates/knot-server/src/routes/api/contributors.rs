@@ -17,24 +17,8 @@ use axum::{
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::{AuthContext, EffectiveDocRole};
+use crate::auth::require_viewer;
 use crate::http_error::json_err;
-
-/// Any effective role (Viewer and up). Expects `EffectiveDocRole` already
-/// set by `require_doc_role_mw`; same responses as comments' `require_viewer`.
-fn require_viewer(req: &Request) -> Option<Response> {
-    if req.extensions().get::<AuthContext>().is_none() {
-        return Some(json_err(
-            StatusCode::UNAUTHORIZED,
-            "auth.session_required",
-            "",
-        ));
-    }
-    if req.extensions().get::<EffectiveDocRole>().is_none() {
-        return Some(json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""));
-    }
-    None
-}
 
 pub async fn byline(
     State(state): State<AppState>,

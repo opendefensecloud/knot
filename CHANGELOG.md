@@ -30,6 +30,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - An open editor no longer autolinks text that arrives from someone else's
   change, which wrote a link edit into the shared document under the
   observer's name.
+- **Revoking access did not reach open editors.** The 4403 close an ACL change
+  should send never fired, so a revoked user kept a working socket and their
+  edits were still applied and saved. Open connections are now closed with
+  4403 and anything they send after the revoke is dropped. The same defect
+  leaked a task and a socket on the server for every disconnect, until
+  restart.
 
 ## [0.7.0] - 2026-10-02
 

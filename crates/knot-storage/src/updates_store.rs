@@ -88,9 +88,15 @@ impl UpdatesStore for PgUpdatesStore {
         //     one statement, and a batch often holds many rows per author.
         //   - ORDER BY by_user_id: replicas flush the same doc concurrently;
         //     taking the row locks in one global order rules out deadlocks.
-        //   - the WHERE throttles the refresh to once a minute — continuous
-        //     typing flushes every 250 ms, and a minute-old "last edited" is
-        //     as good as a fresh one for a byline.
+        //   - the refresh is throttled to once a minute — continuous typing
+        //     flushes every 250 ms, and a minute-old "last edited" is as good
+        //     as a fresh one for a byline. The NOT EXISTS skips authors
+        //     credited within the minute before the upsert, because ON
+        //     CONFLICT … DO UPDATE locks the existing row even when its WHERE
+        //     then skips the update; without it every flush would queue on
+        //     the rows of concurrent flushes (other replicas) of the same doc
+        //     while holding an allocated seq. The WHERE stays for the race
+        //     where a row turns fresh after the NOT EXISTS ran.
         let seqs = sqlx::query_scalar::<_, i64>(
             "WITH ins AS (
                  INSERT INTO doc_updates (doc_id, by_user_id, update_bytes)
@@ -102,10 +108,16 @@ impl UpdatesStore for PgUpdatesStore {
              ),
              contrib AS (
                  INSERT INTO doc_contributors (doc_id, user_id)
-                 SELECT DISTINCT $1::uuid, by_user_id
+                 SELECT DISTINCT $1::uuid, ins.by_user_id
                  FROM ins
-                 WHERE by_user_id IS NOT NULL
-                 ORDER BY by_user_id
+                 WHERE ins.by_user_id IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM doc_contributors c
+                       WHERE c.doc_id = $1
+                         AND c.user_id = ins.by_user_id
+                         AND c.last_edited_at >= now() - interval '1 minute'
+                   )
+                 ORDER BY ins.by_user_id
                  ON CONFLICT (doc_id, user_id) DO UPDATE
                      SET last_edited_at = now()
                      WHERE doc_contributors.last_edited_at < now() - interval '1 minute'

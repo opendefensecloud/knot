@@ -36,6 +36,21 @@ pub struct InMsg {
 /// to send framed messages back to the client.
 pub struct ConnHandle {
     pub tx: mpsc::Sender<Vec<u8>>,
+    /// Cancelled by the room when the connection's access is revoked; the WS
+    /// shim then closes the socket with 4403. A dedicated signal because the
+    /// channel cannot carry it by closing (the shim holds its own sender for
+    /// the whole session) and no frame value is free to mean it (an empty
+    /// frame is already the presence-clearing message).
+    pub revoked: CancellationToken,
+}
+
+impl ConnHandle {
+    pub fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            tx,
+            revoked: CancellationToken::new(),
+        }
+    }
 }
 
 /// What a joining connection needs for both halves of the y-sync handshake.
@@ -475,8 +490,12 @@ impl Room {
                         let _ = reply.send(Ok(final_seq));
                     }
                     Some(Event::Revoke) => {
-                        // Drop all conns. WS shim's writer task sees the
-                        // closed channel and closes the socket with 4403.
+                        // Tell every connection to close (the WS shim sends
+                        // 4403) and drop them: from here on `on_inbound`
+                        // ignores anything they still send.
+                        for conn in self.conns.values() {
+                            conn.revoked.cancel();
+                        }
                         self.conns.clear();
                     }
                     Some(Event::Shutdown) | None => break,
@@ -582,12 +601,26 @@ impl Room {
         handle: ConnHandle,
         reply: oneshot::Sender<Result<JoinState, EngineError>>,
     ) {
+        // A re-join (client SyncStep1) racing a revoke still carries the
+        // connection's cancelled handle. Refuse it by dropping `reply`: no
+        // state for someone whose access just ended, and no re-registration
+        // that would let their updates through again.
+        if handle.revoked.is_cancelled() {
+            return;
+        }
         self.conns.insert(conn_id, handle);
         let _ = reply.send(JoinState::of(self.engine.as_ref(), &self.doc));
     }
 
     #[tracing::instrument(skip(self, m), fields(doc_id = %self.doc_id, bytes = m.bytes.len()))]
     async fn on_inbound(&mut self, m: InMsg) {
+        // Only connections the room still holds may write. A revoked one (or
+        // one dropped as a slow consumer) can keep sending until its socket
+        // is torn down; its access ended when it left `conns`.
+        if !self.conns.contains_key(&m.from) {
+            tracing::debug!(conn = %m.from, "dropping update from a connection the room no longer holds");
+            return;
+        }
         match self.engine.apply_update_changed(&self.doc, &m.bytes) {
             Ok(true) => {}
             // Nothing new — typically the SyncStep2 a (re)connecting writer
@@ -687,6 +720,25 @@ fn patch_task_checked(
 mod tests {
     use super::*;
     use crate::{MemBus, YrsEngine};
+
+    /// Register a connection with the room, as the WS shim does before it
+    /// forwards anything: the room only accepts updates from connections it
+    /// holds. Keep the receiver alive — a closed one gets the conn dropped
+    /// on the next fan-out.
+    async fn join(h: &RoomHandle) -> (ConnId, mpsc::Receiver<Vec<u8>>) {
+        let conn_id = Uuid::new_v4();
+        let (tx, rx) = mpsc::channel(64);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(Event::Join {
+            conn_id,
+            handle: ConnHandle::new(tx),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        (conn_id, rx)
+    }
 
     struct NoopUpdates;
     #[async_trait::async_trait]
@@ -1035,7 +1087,7 @@ mod tests {
         let (join_tx, join_rx) = tokio::sync::oneshot::channel();
         h.tx.send(Event::Join {
             conn_id: Uuid::new_v4(),
-            handle: ConnHandle { tx: conn_tx },
+            handle: ConnHandle::new(conn_tx),
             reply: join_tx,
         })
         .await
@@ -1206,7 +1258,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(Event::Join {
             conn_id,
-            handle: ConnHandle { tx },
+            handle: ConnHandle::new(tx),
             reply: reply_tx,
         })
         .await
@@ -1297,7 +1349,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(Event::Join {
             conn_id: Uuid::new_v4(),
-            handle: ConnHandle { tx },
+            handle: ConnHandle::new(tx),
             reply: reply_tx,
         })
         .await
@@ -1414,7 +1466,7 @@ mod tests {
             let (reply_tx, reply_rx) = oneshot::channel();
             h.tx.send(Event::Join {
                 conn_id,
-                handle: ConnHandle { tx },
+                handle: ConnHandle::new(tx),
                 reply: reply_tx,
             })
             .await
@@ -1513,15 +1565,16 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(Event::Join {
             conn_id: Uuid::new_v4(),
-            handle: ConnHandle { tx: peer_tx },
+            handle: ConnHandle::new(peer_tx),
             reply: reply_tx,
         })
         .await
         .unwrap();
         reply_rx.await.unwrap().unwrap();
+        let (sender, _sender_rx) = join(&h).await;
 
         h.tx.send(Event::Inbound(InMsg {
-            from: Uuid::new_v4(),
+            from: sender,
             by_user: None,
             bytes: dependent.clone(),
         }))
@@ -1587,11 +1640,13 @@ mod tests {
                 .encode_state_as_update_v1(&yrs::StateVector::default())
         };
         let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        let (alice_conn, _alice_rx) = join(&h).await;
+        let (bob_conn, _bob_rx) = join(&h).await;
         // Sent back-to-back: both reach the writer well inside one batch
         // window, which is exactly the case a per-batch author gets wrong.
-        for (by, bytes) in [(alice, edit("a")), (bob, edit("b"))] {
+        for (conn, by, bytes) in [(alice_conn, alice, edit("a")), (bob_conn, bob, edit("b"))] {
             h.tx.send(Event::Inbound(InMsg {
-                from: Uuid::new_v4(),
+                from: conn,
                 by_user: Some(by),
                 bytes,
             }))
@@ -1611,6 +1666,143 @@ mod tests {
             *seen.lock().unwrap(),
             vec![Some(alice), Some(bob)],
             "each live edit must be persisted under its sender"
+        );
+
+        h.shutdown.cancel();
+    }
+
+    /// An ACL change must take effect on sockets that are already open. The
+    /// room tells each connection to close (4403) through its `revoked`
+    /// token — the channel cannot carry that by closing, because the WS shim
+    /// keeps its own sender for the whole session — and ignores anything a
+    /// revoked connection still sends before its socket is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoke_signals_each_conn_and_ignores_its_updates() {
+        use yrs::{ReadTxn, Text, Transact};
+
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let persisted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates: Arc<dyn knot_storage::UpdatesStore> = Arc::new(CapturingUpdates {
+            persisted: persisted.clone(),
+        });
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let conn_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(8);
+        let handle = ConnHandle::new(tx);
+        let revoked = handle.revoked.clone();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(Event::Join {
+            conn_id,
+            handle,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        h.tx.send(Event::Revoke).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), revoked.cancelled())
+            .await
+            .expect("the revoked connection was never told to close");
+
+        let edit = |text: &str| {
+            let d = yrs::Doc::new();
+            d.get_or_insert_text("t").push(&mut d.transact_mut(), text);
+            d.transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        h.tx.send(Event::Inbound(InMsg {
+            from: conn_id,
+            by_user: None,
+            bytes: edit("after the revoke"),
+        }))
+        .await
+        .unwrap();
+        // Events are handled in order: once a later HTTP edit is durably
+        // persisted, the revoked connection's update would have been too.
+        let sentinel = edit("sentinel");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(Event::ApplyUpdate {
+            update_bytes: sentinel.clone(),
+            by_user: None,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        assert_eq!(
+            *persisted.lock().unwrap(),
+            vec![sentinel],
+            "an update from a revoked connection was persisted"
+        );
+
+        h.shutdown.cancel();
+    }
+
+    /// A client SyncStep1 that races the revoke would re-join the room with
+    /// the connection's (already cancelled) handle. The room must refuse it:
+    /// no state for someone whose access just ended, and no re-registration
+    /// that would let their updates through again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn join_with_a_revoked_handle_is_refused() {
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let updates: Arc<dyn knot_storage::UpdatesStore> = Arc::new(NoopUpdates);
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (tx, _rx) = mpsc::channel(8);
+        let handle = ConnHandle::new(tx);
+        handle.revoked.cancel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(Event::Join {
+            conn_id: Uuid::new_v4(),
+            handle,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .expect("the room never answered the join");
+        assert!(
+            reply.is_err(),
+            "a revoked connection was sent the document state"
         );
 
         h.shutdown.cancel();
