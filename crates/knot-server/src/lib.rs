@@ -35,6 +35,7 @@ pub mod room;
 pub mod routes;
 pub mod security_headers;
 pub mod static_files;
+mod ws_writer;
 
 use auth::SessionDeps;
 
@@ -59,6 +60,7 @@ pub struct AppState {
     pub boards: Option<Arc<dyn knot_storage::BoardStore>>,
     pub board_rooms: Option<Arc<knot_crdt::BoardRooms>>,
     pub tasks: Option<Arc<dyn knot_storage::TaskStore>>,
+    pub contributors: Option<Arc<dyn knot_storage::ContributorStore>>,
     pub hasher: Arc<Hasher>,
     pub throttle: Arc<Throttle>,
     pub session_key: Vec<u8>,
@@ -95,6 +97,7 @@ impl AppState {
             boards: None,
             board_rooms: None,
             tasks: None,
+            contributors: None,
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
@@ -136,6 +139,8 @@ impl AppState {
             Arc::new(knot_storage::PgBoardStore::new(pool.clone()));
         let tasks: Arc<dyn knot_storage::TaskStore> =
             Arc::new(knot_storage::PgTaskStore::new(pool.clone()));
+        let contributors: Arc<dyn knot_storage::ContributorStore> =
+            Arc::new(knot_storage::PgContributorStore::new(pool.clone()));
         Self {
             pool: Some(pool),
             users: Some(users),
@@ -156,6 +161,7 @@ impl AppState {
             boards: Some(boards),
             board_rooms: None,
             tasks: Some(tasks),
+            contributors: Some(contributors),
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
@@ -266,7 +272,7 @@ async fn collab_upgrade(
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
-        crate::room::serve(rooms, doc_id, socket, can_write, shutdown).await;
+        crate::room::serve(rooms, doc_id, ctx.user_id, socket, can_write, shutdown).await;
     })
     .into_response()
 }

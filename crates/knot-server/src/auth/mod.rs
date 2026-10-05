@@ -11,4 +11,4 @@ pub mod csrf;
 pub use csrf::{CSRF_COOKIE, CSRF_HEADER, csrf_mw};
 
 pub mod require_doc_role;
-pub use require_doc_role::{EffectiveDocRole, require_doc_role_mw};
+pub use require_doc_role::{EffectiveDocRole, require_doc_role_mw, require_viewer};

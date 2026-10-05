@@ -29,6 +29,8 @@ export function HistoryDrawer({ docId, onClose }: { docId: string; onClose: () =
       if ("error" in r) { notify("error", "Restore failed"); return; }
       notify("info", "Restored — your editor will refresh shortly.");
       await qc.invalidateQueries({ queryKey: ["doc", docId] });
+      // The restore is credited to the restorer; show them in the byline now.
+      await qc.invalidateQueries({ queryKey: ["contributors", docId] });
       onClose();
     },
   });

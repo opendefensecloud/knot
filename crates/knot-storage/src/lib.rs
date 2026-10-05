@@ -4,6 +4,7 @@ pub mod audit;
 pub mod blobs;
 pub mod boards;
 pub mod comments;
+pub mod contributors;
 pub mod doc_store;
 pub mod grant_store;
 pub mod invalidations;
@@ -22,6 +23,9 @@ pub mod workspace_store;
 pub use blobs::{BlobMeta, BlobMetadata, BlobStore, BlobStoreError, PgBytesStore, S3Store};
 pub use boards::{Board, BoardStore, BoardStoreError, PgBoardStore};
 pub use comments::{Comment, CommentStore, CommentStoreError, PgCommentStore, Reaction};
+pub use contributors::{
+    Contributor, ContributorStore, ContributorStoreError, DocByline, PersonRef, PgContributorStore,
+};
 pub use doc_store::{DocStore, DocStoreError, Document, PgDocStore};
 pub use grant_store::{Grant, GrantStore, GrantStoreError, PgGrantStore};
 pub use lexorank::between as sort_key_between;

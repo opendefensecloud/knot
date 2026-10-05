@@ -82,6 +82,10 @@ pub fn router(state: AppState) -> Router<AppState> {
             post(crate::routes::api::history::restore),
         )
         .merge(crate::routes::api::comments::routes())
+        .route(
+            "/api/docs/{id}/contributors",
+            get(crate::routes::api::contributors::byline),
+        )
         .route("/api/docs/{id}/template", post(set_template_inline))
         .route(
             "/api/docs/from-template/{id}",

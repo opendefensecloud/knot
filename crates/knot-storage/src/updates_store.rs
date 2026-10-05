@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::{AssertSqlSafe, PgPool};
+use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -27,14 +27,14 @@ pub enum UpdatesStoreError {
 
 #[async_trait]
 pub trait UpdatesStore: Send + Sync + 'static {
-    /// Insert a batch of updates atomically. Returns the assigned seqs in
-    /// the same order as the input. The batch is one INSERT with a multi-row
-    /// VALUES list so all rows share one round-trip.
+    /// Insert a batch of `(by_user_id, update_bytes)` rows atomically, each
+    /// row stored with its OWN author: one batch can mix several people's
+    /// edits (the room writer flushes whatever arrived in its window).
+    /// Returns the assigned seqs in the same order as the input.
     async fn insert_batch(
         &self,
         doc_id: Uuid,
-        by_user_id: Option<Uuid>,
-        updates: &[Vec<u8>],
+        updates: &[(Option<Uuid>, Vec<u8>)],
     ) -> Result<Vec<i64>, UpdatesStoreError>;
 
     /// Fetch updates with `seq > after_seq` for a doc, in seq order.
@@ -67,34 +67,68 @@ impl UpdatesStore for PgUpdatesStore {
     async fn insert_batch(
         &self,
         doc_id: Uuid,
-        by_user_id: Option<Uuid>,
-        updates: &[Vec<u8>],
+        updates: &[(Option<Uuid>, Vec<u8>)],
     ) -> Result<Vec<i64>, UpdatesStoreError> {
         if updates.is_empty() {
             return Ok(Vec::new());
         }
-        // Build "($1, $2, $3), ($1, $2, $4), ..." with shared doc_id +
-        // by_user_id binds and one per-update bytea bind.
+        let (authors, bytes): (Vec<Option<Uuid>>, Vec<&[u8]>) =
+            updates.iter().map(|(by, b)| (*by, b.as_slice())).unzip();
+        // One statement whatever the batch size: the rows travel as two
+        // parallel arrays. `seq` comes from nextval() as rows are inserted,
+        // and UNNEST … ORDER BY ord feeds them in input order, so ascending
+        // seq IS input order — which the writer relies on to zip seqs back
+        // onto its jobs.
         //
-        // The generated string contains only a fixed prefix and `$N` placeholder
-        // tuples whose N is a loop counter, so the `AssertSqlSafe` below is
-        // sound: no caller data reaches the SQL text, only the binds.
-        let mut sql =
-            String::from("INSERT INTO doc_updates (doc_id, by_user_id, update_bytes) VALUES ");
-        for i in 0..updates.len() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("($1, $2, ${})", i + 3));
-        }
-        sql.push_str(" RETURNING seq");
-        let mut q = sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql))
-            .bind(doc_id)
-            .bind(by_user_id);
-        for u in updates {
-            q = q.bind(u);
-        }
-        let seqs = q.fetch_all(&self.pool).await?;
+        // The `contrib` CTE credits every distinct author in the SAME
+        // statement, so a content change and its byline entry commit or fail
+        // together. A data-modifying CTE always runs to completion even
+        // though the outer SELECT never reads it. Details:
+        //   - DISTINCT: ON CONFLICT DO UPDATE may not touch a row twice in
+        //     one statement, and a batch often holds many rows per author.
+        //   - ORDER BY by_user_id: replicas flush the same doc concurrently;
+        //     taking the row locks in one global order rules out deadlocks.
+        //   - the refresh is throttled to once a minute — continuous typing
+        //     flushes every 250 ms, and a minute-old "last edited" is as good
+        //     as a fresh one for a byline. The NOT EXISTS skips authors
+        //     credited within the minute before the upsert, because ON
+        //     CONFLICT … DO UPDATE locks the existing row even when its WHERE
+        //     then skips the update; without it every flush would queue on
+        //     the rows of concurrent flushes (other replicas) of the same doc
+        //     while holding an allocated seq. The WHERE stays for the race
+        //     where a row turns fresh after the NOT EXISTS ran.
+        let seqs = sqlx::query_scalar::<_, i64>(
+            "WITH ins AS (
+                 INSERT INTO doc_updates (doc_id, by_user_id, update_bytes)
+                 SELECT $1, u.by_user_id, u.update_bytes
+                 FROM UNNEST($2::uuid[], $3::bytea[])
+                      WITH ORDINALITY AS u(by_user_id, update_bytes, ord)
+                 ORDER BY u.ord
+                 RETURNING seq, by_user_id
+             ),
+             contrib AS (
+                 INSERT INTO doc_contributors (doc_id, user_id)
+                 SELECT DISTINCT $1::uuid, ins.by_user_id
+                 FROM ins
+                 WHERE ins.by_user_id IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM doc_contributors c
+                       WHERE c.doc_id = $1
+                         AND c.user_id = ins.by_user_id
+                         AND c.last_edited_at >= now() - interval '1 minute'
+                   )
+                 ORDER BY ins.by_user_id
+                 ON CONFLICT (doc_id, user_id) DO UPDATE
+                     SET last_edited_at = now()
+                     WHERE doc_contributors.last_edited_at < now() - interval '1 minute'
+             )
+             SELECT seq FROM ins ORDER BY seq",
+        )
+        .bind(doc_id)
+        .bind(&authors)
+        .bind(&bytes)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(seqs)
     }
 

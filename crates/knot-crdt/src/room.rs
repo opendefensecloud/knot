@@ -25,6 +25,10 @@ pub type ConnId = Uuid;
 /// Bytes delivered from a local connection's WS read task.
 pub struct InMsg {
     pub from: ConnId,
+    /// The authenticated user behind the connection, persisted as the
+    /// update's author (`doc_updates.by_user_id`) and thereby credited as a
+    /// contributor. `None` only where no user is meaningful (tests).
+    pub by_user: Option<Uuid>,
     pub bytes: Vec<u8>,
 }
 
@@ -32,6 +36,44 @@ pub struct InMsg {
 /// to send framed messages back to the client.
 pub struct ConnHandle {
     pub tx: mpsc::Sender<Vec<u8>>,
+    /// Cancelled by the room when the connection's access is revoked; the WS
+    /// shim then closes the socket with 4403. A dedicated signal because the
+    /// channel cannot carry it by closing (the shim holds its own sender for
+    /// the whole session) and no frame value is free to mean it (an empty
+    /// frame is already the presence-clearing message).
+    pub revoked: CancellationToken,
+}
+
+impl ConnHandle {
+    pub fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            tx,
+            revoked: CancellationToken::new(),
+        }
+    }
+}
+
+/// What a joining connection needs for both halves of the y-sync handshake.
+///
+/// `update` is the full document state, sent as SyncStep2. `state_vector` is
+/// sent as the server's own SyncStep1 so the client replies with whatever the
+/// server lacks — the only path by which edits a client made while its socket
+/// was down ever reach the server (the web providers apply offline edits
+/// locally but do not queue them for sending). Both are read in the same
+/// actor turn, so they describe the same document state.
+#[derive(Debug)]
+pub struct JoinState {
+    pub update: Vec<u8>,
+    pub state_vector: Vec<u8>,
+}
+
+impl JoinState {
+    pub(crate) fn of(engine: &dyn Engine, doc: &DocHandle) -> Result<Self, EngineError> {
+        Ok(Self {
+            update: engine.encode_state_as_update(doc, None)?,
+            state_vector: engine.encode_state_vector(doc)?,
+        })
+    }
 }
 
 /// All inputs the room actor multiplexes.
@@ -40,7 +82,7 @@ pub enum Event {
     Join {
         conn_id: ConnId,
         handle: ConnHandle,
-        reply: oneshot::Sender<Result<Vec<u8>, EngineError>>,
+        reply: oneshot::Sender<Result<JoinState, EngineError>>,
     },
     Leave(ConnId),
     AwarenessIn {
@@ -67,9 +109,9 @@ pub enum Event {
     ReplaceWithMarkdown {
         /// Full-state update bytes encoding the replacement content.
         update_bytes: Vec<u8>,
-        /// Attribution for the persisted update, mirroring `ApplyUpdate`.
-        /// `None` where there is no meaningful actor (workspace import), or
-        /// where the caller has not been threaded through yet.
+        /// Attribution for the persisted update, mirroring `ApplyUpdate`:
+        /// the importer / restorer, credited as a contributor. `None` only
+        /// where there is no meaningful actor (tests).
         by_user: Option<Uuid>,
         reply: oneshot::Sender<Result<i64, String>>,
     },
@@ -448,8 +490,12 @@ impl Room {
                         let _ = reply.send(Ok(final_seq));
                     }
                     Some(Event::Revoke) => {
-                        // Drop all conns. WS shim's writer task sees the
-                        // closed channel and closes the socket with 4403.
+                        // Tell every connection to close (the WS shim sends
+                        // 4403) and drop them: from here on `on_inbound`
+                        // ignores anything they still send.
+                        for conn in self.conns.values() {
+                            conn.revoked.cancel();
+                        }
                         self.conns.clear();
                     }
                     Some(Event::Shutdown) | None => break,
@@ -553,18 +599,41 @@ impl Room {
         &mut self,
         conn_id: ConnId,
         handle: ConnHandle,
-        reply: oneshot::Sender<Result<Vec<u8>, EngineError>>,
+        reply: oneshot::Sender<Result<JoinState, EngineError>>,
     ) {
+        // A re-join (client SyncStep1) racing a revoke still carries the
+        // connection's cancelled handle. Refuse it by dropping `reply`: no
+        // state for someone whose access just ended, and no re-registration
+        // that would let their updates through again.
+        if handle.revoked.is_cancelled() {
+            return;
+        }
         self.conns.insert(conn_id, handle);
-        let r = self.engine.encode_state_as_update(&self.doc, None);
-        let _ = reply.send(r);
+        let _ = reply.send(JoinState::of(self.engine.as_ref(), &self.doc));
     }
 
     #[tracing::instrument(skip(self, m), fields(doc_id = %self.doc_id, bytes = m.bytes.len()))]
     async fn on_inbound(&mut self, m: InMsg) {
-        if let Err(e) = self.engine.apply_update(&self.doc, &m.bytes) {
-            tracing::debug!(error=?e, "apply_update failed");
+        // Only connections the room still holds may write. A revoked one (or
+        // one dropped as a slow consumer) can keep sending until its socket
+        // is torn down; its access ended when it left `conns`.
+        if !self.conns.contains_key(&m.from) {
+            tracing::debug!(conn = %m.from, "dropping update from a connection the room no longer holds");
             return;
+        }
+        match self.engine.apply_update_changed(&self.doc, &m.bytes) {
+            Ok(true) => {}
+            // Nothing new — typically the SyncStep2 a (re)connecting writer
+            // sends in answer to the server's SyncStep1, which re-sends the
+            // whole delete set even when the client has no offline edits.
+            // Persisting it would write a `doc_updates` row on every page
+            // open (and attribute an edit to someone who only looked);
+            // fanning it out would make every peer re-apply a no-op.
+            Ok(false) => return,
+            Err(e) => {
+                tracing::debug!(error=?e, "apply_update failed");
+                return;
+            }
         }
         metrics::counter!("knot_room_updates_total", "source" => "local").increment(1);
         let framed = wrap_sync_update(&m.bytes);
@@ -586,7 +655,7 @@ impl Room {
             .persist_tx
             .send(crate::writer::PersistJob {
                 bytes: m.bytes,
-                by_user_id: None,
+                by_user_id: m.by_user,
                 // Inbound WS updates are fire-and-forget — the client
                 // already has the update locally, so we don't need to
                 // hold up acknowledgement on the durable insert.
@@ -652,14 +721,32 @@ mod tests {
     use super::*;
     use crate::{MemBus, YrsEngine};
 
+    /// Register a connection with the room, as the WS shim does before it
+    /// forwards anything: the room only accepts updates from connections it
+    /// holds. Keep the receiver alive — a closed one gets the conn dropped
+    /// on the next fan-out.
+    async fn join(h: &RoomHandle) -> (ConnId, mpsc::Receiver<Vec<u8>>) {
+        let conn_id = Uuid::new_v4();
+        let (tx, rx) = mpsc::channel(64);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(Event::Join {
+            conn_id,
+            handle: ConnHandle::new(tx),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        (conn_id, rx)
+    }
+
     struct NoopUpdates;
     #[async_trait::async_trait]
     impl knot_storage::UpdatesStore for NoopUpdates {
         async fn insert_batch(
             &self,
             _: Uuid,
-            _: Option<Uuid>,
-            updates: &[Vec<u8>],
+            updates: &[(Option<Uuid>, Vec<u8>)],
         ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
             Ok((1..=updates.len() as i64).collect())
         }
@@ -682,7 +769,7 @@ mod tests {
         }
     }
 
-    /// Records the `by_user` argument each persist passes through, so
+    /// Records the author of every row the writer persists, in order, so
     /// tests can assert attribution reaches the store.
     struct RecordingUpdates {
         seen: std::sync::Arc<std::sync::Mutex<Vec<Option<Uuid>>>>,
@@ -692,11 +779,47 @@ mod tests {
         async fn insert_batch(
             &self,
             _: Uuid,
-            by_user: Option<Uuid>,
-            updates: &[Vec<u8>],
+            updates: &[(Option<Uuid>, Vec<u8>)],
         ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
-            self.seen.lock().unwrap().push(by_user);
-            Ok((1..=updates.len() as i64).collect())
+            let mut seen = self.seen.lock().unwrap();
+            let first = seen.len() as i64 + 1;
+            seen.extend(updates.iter().map(|(by, _)| *by));
+            Ok((first..first + updates.len() as i64).collect())
+        }
+        async fn since(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+            Ok(vec![])
+        }
+        async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
+            Ok(0)
+        }
+        async fn delete_up_to(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<u64, knot_storage::UpdatesStoreError> {
+            Ok(0)
+        }
+    }
+
+    /// Records every update the writer persists, in order.
+    struct CapturingUpdates {
+        persisted: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+    #[async_trait::async_trait]
+    impl knot_storage::UpdatesStore for CapturingUpdates {
+        async fn insert_batch(
+            &self,
+            _: Uuid,
+            updates: &[(Option<Uuid>, Vec<u8>)],
+        ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+            let mut p = self.persisted.lock().unwrap();
+            let first = p.len() as i64 + 1;
+            p.extend(updates.iter().map(|(_, b)| b.clone()));
+            Ok((first..first + updates.len() as i64).collect())
         }
         async fn since(
             &self,
@@ -964,12 +1087,12 @@ mod tests {
         let (join_tx, join_rx) = tokio::sync::oneshot::channel();
         h.tx.send(Event::Join {
             conn_id: Uuid::new_v4(),
-            handle: ConnHandle { tx: conn_tx },
+            handle: ConnHandle::new(conn_tx),
             reply: join_tx,
         })
         .await
         .unwrap();
-        let peer_state = join_rx.await.unwrap().unwrap();
+        let peer_state = join_rx.await.unwrap().unwrap().update;
 
         let peer = engine.new_doc();
         engine.apply_update(&peer, &peer_state).unwrap();
@@ -1115,11 +1238,19 @@ mod tests {
         .await
         .unwrap();
 
-        // Produce an actual yrs update from a separate doc.
-        let other = engine.new_doc();
-        // Force a tiny state change so encode_state_as_update returns non-empty bytes.
-        // (yrs always returns something even for an empty doc — this is enough.)
-        let real_update = engine.encode_state_as_update(&other, None).unwrap();
+        // Produce an actual yrs update from a separate doc. It must change
+        // something: the room drops updates that leave its doc unchanged, so
+        // the bytes of an empty doc would never reach the writer.
+        let real_update = {
+            use yrs::{ReadTxn, Text, Transact};
+            let other = yrs::Doc::new();
+            other
+                .get_or_insert_text("t")
+                .push(&mut other.transact_mut(), "hello");
+            other
+                .transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default())
+        };
 
         // Join + send.
         let conn_id = Uuid::new_v4();
@@ -1127,7 +1258,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(Event::Join {
             conn_id,
-            handle: ConnHandle { tx },
+            handle: ConnHandle::new(tx),
             reply: reply_tx,
         })
         .await
@@ -1135,6 +1266,7 @@ mod tests {
         let _ = reply_rx.await.unwrap().unwrap();
         h.tx.send(Event::Inbound(InMsg {
             from: conn_id,
+            by_user: None,
             bytes: real_update.clone(),
         }))
         .await
@@ -1187,7 +1319,7 @@ mod tests {
         let seed_bytes = engine.encode_state_as_update(&seed_doc, None).unwrap();
         let updates = PgUpdatesStore::new(pool.clone());
         updates
-            .insert_batch(d.id, Some(u.id), std::slice::from_ref(&seed_bytes))
+            .insert_batch(d.id, &[(Some(u.id), seed_bytes)])
             .await
             .unwrap();
 
@@ -1217,12 +1349,12 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(Event::Join {
             conn_id: Uuid::new_v4(),
-            handle: ConnHandle { tx },
+            handle: ConnHandle::new(tx),
             reply: reply_tx,
         })
         .await
         .unwrap();
-        let state = reply_rx.await.unwrap().unwrap();
+        let state = reply_rx.await.unwrap().unwrap().update;
         assert!(
             !state.is_empty(),
             "hydrated state should include the seed update"
@@ -1276,5 +1408,403 @@ mod tests {
             vec![Some(alice)],
             "replace should persist with its author, got {recorded:?}"
         );
+    }
+
+    /// Once the server asks every joining writer for its state (SyncStep1),
+    /// most replies carry nothing new — Yjs always includes the whole delete
+    /// set. Such a no-op must not be persisted (a `doc_updates` row per page
+    /// open, and the opener would count as a contributor), fanned out to
+    /// peers, or counted as an update.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn noop_inbound_update_is_neither_fanned_out_nor_persisted() {
+        use yrs::{ReadTxn, Text, Transact};
+
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let persisted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates: Arc<dyn knot_storage::UpdatesStore> = Arc::new(CapturingUpdates {
+            persisted: persisted.clone(),
+        });
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // A client's history, including a deletion so the no-op carries a
+        // non-empty delete set like a real SyncStep2 reply does.
+        let client = yrs::Doc::new();
+        let text = client.get_or_insert_text("t");
+        text.push(&mut client.transact_mut(), "hellox");
+        text.remove_range(&mut client.transact_mut(), 5, 1);
+        let real = client
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        let sv_before_sentinel = client.transact().state_vector();
+        text.push(&mut client.transact_mut(), "!");
+        let sentinel = client
+            .transact()
+            .encode_state_as_update_v1(&sv_before_sentinel);
+
+        let sender = Uuid::new_v4();
+        let (sender_tx, _sender_rx) = mpsc::channel(8);
+        let (peer_tx, mut peer_rx) = mpsc::channel(8);
+        for (conn_id, tx) in [(sender, sender_tx), (Uuid::new_v4(), peer_tx)] {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            h.tx.send(Event::Join {
+                conn_id,
+                handle: ConnHandle::new(tx),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+            reply_rx.await.unwrap().unwrap();
+        }
+
+        // Real edit, then the identical bytes again (the no-op), then a
+        // second real edit. The actor handles them strictly in order.
+        for bytes in [real.clone(), real.clone(), sentinel.clone()] {
+            h.tx.send(Event::Inbound(InMsg {
+                from: sender,
+                by_user: None,
+                bytes,
+            }))
+            .await
+            .unwrap();
+        }
+
+        let mut fanned = Vec::new();
+        for _ in 0..2 {
+            fanned.push(
+                tokio::time::timeout(std::time::Duration::from_secs(10), peer_rx.recv())
+                    .await
+                    .expect("peer got no fan-out")
+                    .expect("peer channel closed"),
+            );
+        }
+        let (first, second) = (&fanned[0], &fanned[1]);
+        assert_eq!(*first, wrap_sync_update(&real));
+        assert_eq!(
+            *second,
+            wrap_sync_update(&sentinel),
+            "the peer was sent the no-op instead of the next real edit"
+        );
+
+        // The writer persists in arrival order: once the sentinel is in, a
+        // persisted no-op would be too.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !persisted.lock().unwrap().contains(&sentinel) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer never persisted the sentinel"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            *persisted.lock().unwrap(),
+            vec![real, sentinel],
+            "the no-op update was persisted"
+        );
+
+        h.shutdown.cancel();
+    }
+
+    /// The flip side: content the room cannot integrate yet (a dependency is
+    /// missing) is parked as pending by yrs. It must still be persisted and
+    /// fanned out — dropping it would lose the edit once the gap is filled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inbound_update_with_missing_dependency_is_still_persisted() {
+        use yrs::{ReadTxn, Text, Transact};
+
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let persisted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates: Arc<dyn knot_storage::UpdatesStore> = Arc::new(CapturingUpdates {
+            persisted: persisted.clone(),
+        });
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let client = yrs::Doc::new();
+        let text = client.get_or_insert_text("t");
+        text.push(&mut client.transact_mut(), "a");
+        let sv = client.transact().state_vector();
+        text.push(&mut client.transact_mut(), "b");
+        let dependent = client.transact().encode_state_as_update_v1(&sv);
+
+        let (peer_tx, mut peer_rx) = mpsc::channel(8);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(Event::Join {
+            conn_id: Uuid::new_v4(),
+            handle: ConnHandle::new(peer_tx),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        let (sender, _sender_rx) = join(&h).await;
+
+        h.tx.send(Event::Inbound(InMsg {
+            from: sender,
+            by_user: None,
+            bytes: dependent.clone(),
+        }))
+        .await
+        .unwrap();
+
+        let fanned = tokio::time::timeout(std::time::Duration::from_secs(10), peer_rx.recv())
+            .await
+            .expect("pending update was not fanned out")
+            .unwrap();
+        assert_eq!(fanned, wrap_sync_update(&dependent));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while persisted.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pending update was never persisted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(*persisted.lock().unwrap(), vec![dependent]);
+
+        h.shutdown.cancel();
+    }
+
+    /// Live edits carry the authenticated user who typed them, row by row.
+    /// The writer batches whatever arrives within 250 ms, so two people
+    /// typing at once share a flush; each row must still be stored under
+    /// its own author — not the batch's first — or one of them would be
+    /// credited with the other's work (and the other with nothing).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inbound_updates_persist_under_each_senders_own_author() {
+        use yrs::{ReadTxn, Text, Transact};
+
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates: Arc<dyn knot_storage::UpdatesStore> =
+            Arc::new(RecordingUpdates { seen: seen.clone() });
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Two independent clients, each with one real edit.
+        let edit = |s: &str| {
+            let d = yrs::Doc::new();
+            d.get_or_insert_text("t").push(&mut d.transact_mut(), s);
+            d.transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        let (alice_conn, _alice_rx) = join(&h).await;
+        let (bob_conn, _bob_rx) = join(&h).await;
+        // Sent back-to-back: both reach the writer well inside one batch
+        // window, which is exactly the case a per-batch author gets wrong.
+        for (conn, by, bytes) in [(alice_conn, alice, edit("a")), (bob_conn, bob, edit("b"))] {
+            h.tx.send(Event::Inbound(InMsg {
+                from: conn,
+                by_user: Some(by),
+                bytes,
+            }))
+            .await
+            .unwrap();
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while seen.lock().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer never persisted both edits"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some(alice), Some(bob)],
+            "each live edit must be persisted under its sender"
+        );
+
+        h.shutdown.cancel();
+    }
+
+    /// An ACL change must take effect on sockets that are already open. The
+    /// room tells each connection to close (4403) through its `revoked`
+    /// token — the channel cannot carry that by closing, because the WS shim
+    /// keeps its own sender for the whole session — and ignores anything a
+    /// revoked connection still sends before its socket is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoke_signals_each_conn_and_ignores_its_updates() {
+        use yrs::{ReadTxn, Text, Transact};
+
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let persisted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates: Arc<dyn knot_storage::UpdatesStore> = Arc::new(CapturingUpdates {
+            persisted: persisted.clone(),
+        });
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let conn_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(8);
+        let handle = ConnHandle::new(tx);
+        let revoked = handle.revoked.clone();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(Event::Join {
+            conn_id,
+            handle,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        h.tx.send(Event::Revoke).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), revoked.cancelled())
+            .await
+            .expect("the revoked connection was never told to close");
+
+        let edit = |text: &str| {
+            let d = yrs::Doc::new();
+            d.get_or_insert_text("t").push(&mut d.transact_mut(), text);
+            d.transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        h.tx.send(Event::Inbound(InMsg {
+            from: conn_id,
+            by_user: None,
+            bytes: edit("after the revoke"),
+        }))
+        .await
+        .unwrap();
+        // Events are handled in order: once a later HTTP edit is durably
+        // persisted, the revoked connection's update would have been too.
+        let sentinel = edit("sentinel");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(Event::ApplyUpdate {
+            update_bytes: sentinel.clone(),
+            by_user: None,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        assert_eq!(
+            *persisted.lock().unwrap(),
+            vec![sentinel],
+            "an update from a revoked connection was persisted"
+        );
+
+        h.shutdown.cancel();
+    }
+
+    /// A client SyncStep1 that races the revoke would re-join the room with
+    /// the connection's (already cancelled) handle. The room must refuse it:
+    /// no state for someone whose access just ended, and no re-registration
+    /// that would let their updates through again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn join_with_a_revoked_handle_is_refused() {
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let updates: Arc<dyn knot_storage::UpdatesStore> = Arc::new(NoopUpdates);
+        let snapshots: Arc<dyn knot_storage::SnapshotStore> = Arc::new(NoopSnapshots);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (tx, _rx) = mpsc::channel(8);
+        let handle = ConnHandle::new(tx);
+        handle.revoked.cancel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(Event::Join {
+            conn_id: Uuid::new_v4(),
+            handle,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .expect("the room never answered the join");
+        assert!(
+            reply.is_err(),
+            "a revoked connection was sent the document state"
+        );
+
+        h.shutdown.cancel();
     }
 }

@@ -6,17 +6,10 @@ import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { useSession } from "../../auth/SessionContext";
 import { Avatar } from "../../components/ui/Avatar";
 import { commentsApi, ALLOWED_EMOJIS, type Comment } from "../../lib/comments.api";
+import { relTime } from "../../lib/relTime";
 import { workspaceApi } from "../workspace/workspace.api";
 import { useUi } from "../../stores/ui";
 import { CommentComposer } from "./CommentComposer";
-
-function relTime(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
-  if (diff < 60_000) return "just now";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
-  return `${Math.floor(diff / 86_400_000)}d ago`;
-}
 
 // ---------------------------------------------------------------------------
 // Reaction row

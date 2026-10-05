@@ -21,6 +21,6 @@ pub use engine::{DocHandle, Engine, EngineError, TextMark, TextMarkAttr, YrsEngi
 pub use gc::spawn as spawn_gc;
 pub use presence::PRESENCE_MAX_BYTES;
 pub use registry::{AcquireError, Rooms};
-pub use room::{ConnHandle, ConnId, Event, InMsg, Room, RoomHandle};
+pub use room::{ConnHandle, ConnId, Event, InMsg, JoinState, Room, RoomHandle};
 pub use snapshot::{SnapshotPolicy, SnapshotState};
 pub use writer::{Applied, PersistJob};

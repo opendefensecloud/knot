@@ -679,7 +679,8 @@ async fn import(
             .tx
             .send(knot_crdt::Event::ReplaceWithMarkdown {
                 update_bytes,
-                by_user: None,
+                // The importer put this content into the new page.
+                by_user: Some(ctx.user_id),
                 reply: tx,
             })
             .await;
