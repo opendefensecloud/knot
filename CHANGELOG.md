@@ -58,6 +58,16 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   leaked a task and a socket on the server for every disconnect, until
   restart.
 
+### Security
+- **`ammonia` 4.1.7** closes RUSTSEC-2021-0157 (quotes in CSS `url()` were not
+  escaped inside `style` attributes, allowing CSS injection). knot was not
+  reachable through it: the public share page sanitizes with ammonia's default
+  builder, which does not allow `style` attributes at all.
+- RUSTSEC-2024-0449 (`unsafe-libyaml` unmaintained) is acknowledged in
+  `deny.toml`. It arrives through figment's YAML provider, has no known
+  vulnerability and no maintained replacement reachable from figment 0.10.19,
+  and only ever parses the operator's own `KNOT_CONFIG` file.
+
 ## [0.7.0] - 2026-10-02
 
 ### Added

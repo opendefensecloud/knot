@@ -39,6 +39,17 @@ ignore = [
     # not help. Unmaintained-only: no known vulnerability.
     # Drop when: yrs replaces or vendors smallstr.
     { id = "RUSTSEC-2026-0215", reason = "smallstr unmaintained; pinned at ^0.3 by yrs through 0.27.3; no vulnerability, no successor crate" },
+
+    # unsafe-libyaml is unmaintained (repository archived; it is a c2rust
+    # translation of libyaml). Path: knot-config -> figment 0.10.19 (feature
+    # "yaml") -> serde_yaml 0.9.34 (itself deprecated) -> unsafe-libyaml
+    # 0.2.11. figment 0.10.19 is the current latest and its Yaml provider is
+    # built on serde_yaml, so no bump reaches a safe-Rust parser.
+    # Unmaintained-only: no known vulnerability. Reachability: parses only the
+    # operator-supplied config file named by KNOT_CONFIG, never user input.
+    # Drop when: figment moves its Yaml provider off serde_yaml, or knot drops
+    # YAML config files.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; via figment's Yaml provider (serde_yaml); parses only the operator's KNOT_CONFIG file; no vulnerability" },
 ]
 
 [licenses]
