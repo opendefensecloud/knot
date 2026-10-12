@@ -85,20 +85,32 @@
   color: var(--color-fg-muted);
 }
 
-/* Tables */
+/* Tables. Every table renders inside TableColumnView's wrapper. flow-root
+   keeps the table's margin inside the wrapper (the top-level one already did
+   so through overflow-x), so spacing around tables is unchanged and the
+   handle layer can be inset by exactly that margin to span the table.
+   Column widths are percentages on the <col>s. */
+.ProseMirror .tableWrapper {
+  --knot-table-margin: 0.8em;
+  position: relative;
+  display: flow-root;
+}
 .ProseMirror table {
   border-collapse: collapse;
   table-layout: fixed;
   width: 100%;
-  margin: 0.8em 0;
+  margin: var(--knot-table-margin, 0.8em) 0;
   overflow: hidden;
 }
+/* Widths come from the colgroup, so long URLs and identifiers have to break
+   inside their cell instead of spilling into the next column. */
 .ProseMirror th,
 .ProseMirror td {
   border: 1px solid var(--color-border);
   padding: 6px 8px;
   vertical-align: top;
   position: relative;
+  overflow-wrap: anywhere;
 }
 .ProseMirror th {
   background: var(--color-muted, rgb(0 0 0 / 0.03));
@@ -116,17 +128,53 @@
   background: rgb(99 102 241 / 0.10);
   pointer-events: none;
 }
-.ProseMirror .column-resize-handle {
+/* Column resize handles: one strip per inner border, positioned by
+   TableColumnView at the running total of the column shares. */
+.ProseMirror .knot-col-handles {
   position: absolute;
-  right: -2px;
-  top: 0;
-  bottom: -2px;
-  width: 4px;
-  background: var(--color-accent);
+  inset: var(--knot-table-margin) 0;
   pointer-events: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
-.ProseMirror.resize-cursor {
+.ProseMirror .knot-col-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 9px;
+  transform: translateX(-50%);
   cursor: col-resize;
+  pointer-events: auto;
+  /* A vertical swipe that starts on a strip still scrolls the page — the
+     browser then cancels the pointer, which abandons the drag — while a
+     horizontal one resizes. */
+  touch-action: pan-y pinch-zoom;
+  z-index: 1;
+}
+.ProseMirror .knot-col-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 3px;
+  transform: translateX(-50%);
+  background: var(--color-accent);
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.ProseMirror .knot-col-handle.is-dragging::after {
+  opacity: 1;
+}
+/* Hover only where there is one; on touch it would stay lit after a tap. */
+@media (hover: hover) {
+  .ProseMirror .knot-col-handle:hover::after {
+    opacity: 1;
+  }
+}
+/* Readers see the proportions but get nothing to drag. */
+.ProseMirror[contenteditable="false"] .knot-col-handles {
+  display: none;
 }
 
 /* Task list items: a list_item with a `data-checked` attribute renders
@@ -387,11 +435,9 @@
   max-width: 100%;
 }
 
-/* The wrapper has never had this rule, and without it a table carrying
-   persisted `colwidth` attributes overflows: the inline width TableView
-   writes beats the `width: 100%` above. `colwidth` rides Yjs, so one
-   collaborator's column drag would otherwise blow out the page for every
-   reader. KnotTable sets renderWrapper so this exists in view mode too. */
+/* Column widths are proportions of a full-width table, so a table no longer
+   overflows on its own; this stays as a safety net so that nothing inside
+   one can ever give the page a horizontal scrollbar. */
 .ProseMirror > .tableWrapper {
   overflow-x: auto;
 }
@@ -437,8 +483,8 @@
 }
 
 /* Clip illegitimate horizontal bleed (peer cursor labels are absolutely
-   positioned, white-space:nowrap and unclamped) while keeping the 2px
-   table column-resize handle grabbable. `clip` is not a scroll container
+   positioned, white-space:nowrap and unclamped) with a few pixels of slack
+   for edge decorations. `clip` is not a scroll container
    and creates no containing block for fixed elements, so the sticky
    toolbar — a sibling before this host, not a descendant — and the z-40
    rails are unaffected. */
