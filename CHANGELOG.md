@@ -14,8 +14,29 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   with when they last edited. Visible to every role that can open the page;
   names only. Pages created before this release list only contributions made
   from now on, and say so. `GET /api/docs/{id}/contributors`.
+- **Resizable table columns** ([#36](https://github.com/opendefensecloud/knot/issues/36)).
+  In edit mode, drag the line between two columns to move width from one to
+  the other. Widths are stored as proportions, so a table keeps its layout on
+  every screen and always fills the page width; readers see the result, and it
+  is saved with the page. Works with mouse, touch and pen (a vertical swipe on
+  a column line still scrolls); `Escape` cancels a drag. Widths do not survive
+  a trip through Markdown (export/import, creating a page from a template) —
+  tables arriving that way start with equal columns.
+
+### Changed
+- Tables whose columns were dragged before this release now fill the page width
+  instead of being pinned to the pixel widths of whoever dragged them and
+  scrolling sideways on smaller screens. A table with every column dragged
+  keeps its ratios exactly; where only some were, those keep their share of a
+  1000px table and the rest split what is left.
 
 ### Fixed
+- **Column resizing never worked on existing pages.** The drag handles were
+  only installed when the editor was created editable, and pages open in view
+  mode, so switching to Edit never showed them — only brand-new pages could be
+  resized.
+- Long URLs and other unbreakable text in a table cell now wrap inside the cell
+  instead of running over the neighbouring column.
 - **Edits typed while disconnected never reached the server.** The client kept
   them locally but only sent changes while its socket was open, and the server
   never asked a reconnecting client for what it was missing. They were lost on

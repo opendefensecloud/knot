@@ -56,7 +56,7 @@ export function fragmentXml(bound: BoundEditor): string {
 }
 
 export function mountBoundEditor(
-  opts: { user?: { name: string; color: string } } = {},
+  opts: { user?: { name: string; color: string }; editable?: boolean } = {},
 ): BoundEditor {
   const ydoc = new Y.Doc();
   const awareness = new Awareness(ydoc);
@@ -65,6 +65,7 @@ export function mountBoundEditor(
 
   const editor = new Editor({
     element,
+    editable: opts.editable ?? true,
     extensions: createExtensions({
       doc: ydoc,
       awareness,
