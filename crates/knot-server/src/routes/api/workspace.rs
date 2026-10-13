@@ -39,6 +39,8 @@ struct WorkspaceResponse {
     slug: String,
     name: String,
     role: String,
+    /// Days an archived doc stays restorable; the UI quotes it.
+    archive_retention_days: u32,
 }
 
 async fn get_workspace(State(state): State<AppState>, req: Request) -> Response {
@@ -57,6 +59,7 @@ async fn get_workspace(State(state): State<AppState>, req: Request) -> Response 
         slug: ws.slug,
         name: ws.name,
         role: ctx.role.as_str().into(),
+        archive_retention_days: state.config.archive_retention_days,
     })
     .into_response()
 }

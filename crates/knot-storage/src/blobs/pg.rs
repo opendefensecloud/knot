@@ -44,4 +44,9 @@ impl BlobStore for PgBytesStore {
             .await?;
         Ok(())
     }
+
+    /// `blob_bytes` references `blobs` with `ON DELETE CASCADE`.
+    fn bytes_deleted_with_metadata(&self) -> bool {
+        true
+    }
 }

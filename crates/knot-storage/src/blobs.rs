@@ -40,6 +40,12 @@ pub trait BlobStore: Send + Sync {
     async fn put(&self, id: Uuid, bytes: &[u8], content_type: &str) -> Result<()>;
     async fn get(&self, id: Uuid) -> Result<Vec<u8>>;
     async fn delete(&self, id: Uuid) -> Result<()>;
+    /// True when the bytes are rows that the `blobs` metadata row cascades
+    /// to (the Postgres backend), so deleting the metadata deletes them in
+    /// the same transaction and no separate `delete` is needed.
+    fn bytes_deleted_with_metadata(&self) -> bool {
+        false
+    }
 }
 
 /// Metadata operations against the `blobs` table. Pool-only — backend-agnostic.
@@ -92,14 +98,27 @@ impl BlobMeta {
     /// All blob metadata records owned by `workspace_id`. Used by the
     /// workspace export to bundle attachment bytes alongside the docs.
     pub async fn list_for_workspace(&self, workspace_id: Uuid) -> Result<Vec<BlobMetadata>> {
+        // Archived docs are left out of the export, so their attachments are too.
         let rows: Vec<BlobRow> = sqlx::query_as(
             "SELECT id, workspace_id, doc_id, content_type, byte_size, sha256, original_name, created_by, created_at \
-             FROM blobs WHERE workspace_id = $1",
+             FROM blobs WHERE workspace_id = $1 \
+             AND EXISTS (SELECT 1 FROM documents d WHERE d.id = blobs.doc_id AND d.archived_at IS NULL)",
         )
         .bind(workspace_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Ids of every blob attached to one of `doc_ids`. Purge deletes their
+    /// bytes from the backend before the rows cascade away.
+    pub async fn ids_for_docs(&self, doc_ids: &[Uuid]) -> Result<Vec<Uuid>> {
+        Ok(
+            sqlx::query_scalar("SELECT id FROM blobs WHERE doc_id = ANY($1) ORDER BY id")
+                .bind(doc_ids)
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 }
 

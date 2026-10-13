@@ -66,6 +66,13 @@ async fn create(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Re
     if let Some(r) = require_owner(&state, &ctx, doc_id).await {
         return r;
     }
+    // No new public links to an archived doc; existing ones stop resolving
+    // (see `ShareTokenStore::find_alive`) and can still be listed and revoked.
+    if let Some(r) =
+        crate::archive::refuse_if_archived(&state, ctx.workspace_id, doc_id, ctx.user_id).await
+    {
+        return r;
+    }
     let bytes = match axum::body::to_bytes(req.into_body(), 4096).await {
         Ok(b) => b,
         Err(_) => return json_err(StatusCode::BAD_REQUEST, "bad_request", ""),

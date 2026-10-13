@@ -1,7 +1,7 @@
 import * as v from "valibot";
 
 import { apiFetch } from "../../lib/api";
-import { Doc, DocContributors, DocWithRole, parse } from "../../lib/validators";
+import { ArchiveEntry, Doc, DocContributors, DocWithRole, parse } from "../../lib/validators";
 
 export type DocCreate = { title?: string; parent_id?: string; after_id?: string };
 export type DocPatch = { title?: string; icon?: string };
@@ -37,11 +37,22 @@ export const docsApi = {
       body,
     });
   },
+  /** Move a doc and its subpages to the archive (editors and owners). */
   archive(id: string) {
     return apiFetch<void>(`/api/docs/${encodeURIComponent(id)}`, { method: "DELETE" });
   },
   restore(id: string) {
     return apiFetch<void>(`/api/docs/${encodeURIComponent(id)}/restore`, { method: "POST" });
+  },
+  /** Delete an archived doc and its subpages for good (owners). */
+  purge(id: string) {
+    return apiFetch<void>(`/api/docs/${encodeURIComponent(id)}/purge`, { method: "POST" });
+  },
+  /** Docs moved to the archive, newest first (editors and owners). */
+  async listArchive() {
+    const r = await apiFetch<unknown>("/api/workspace/archive");
+    if ("error" in r) return r;
+    return { ok: parse(v.array(ArchiveEntry), r.ok) };
   },
   setTemplate(id: string, isTemplate: boolean) {
     return apiFetch<unknown>(`/api/docs/${encodeURIComponent(id)}/template`, {

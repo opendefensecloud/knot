@@ -1,10 +1,13 @@
 //! Documents API:
 //! - GET    /api/docs            flat list (alive only)
 //! - POST   /api/docs            body: {title?, parent_id?, after_id?}
-//! - GET    /api/docs/{id}        metadata + effective_role
-//!
-//! PATCH/DELETE/move/restore land in T13/T14 (handlers stubbed below for
-//! router shape; replaced in later tasks).
+//! - GET    /api/docs/{id}        metadata + effective_role (+ archive state)
+//! - PATCH  /api/docs/{id}        rename / icon
+//! - POST   /api/docs/{id}/move   reparent / reorder
+//! - DELETE /api/docs/{id}        move to the archive, with its subtree (editor+)
+//! - POST   /api/docs/{id}/restore  bring an archive root back (editor+)
+//! - POST   /api/docs/{id}/purge  delete an archive root for good (owner)
+//! - GET    /api/workspace/archive  archive roots, newest first (editor+)
 
 use axum::{
     Json, Router,
@@ -14,13 +17,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use knot_storage::{Document, WorkspaceRole, sort_key_between};
+use knot_storage::{Document, PersonRef, WorkspaceRole, sort_key_between};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::{AuthContext, EffectiveDocRole, require_doc_role_mw};
-use crate::http_error::json_err;
+use crate::archive::{PurgeError, PurgeTrigger};
+use crate::auth::{AuthContext, DocArchived, EffectiveDocRole, require_doc_role_mw};
+use crate::http_error::{doc_archived, json_err};
 
 #[derive(Serialize)]
 struct DocResponse {
@@ -53,7 +57,8 @@ pub fn router(state: AppState) -> Router<AppState> {
     let doc_id_routes: Router<AppState> = Router::new()
         .route("/api/docs/{id}", get(get_one).patch(rename).delete(archive))
         .route("/api/docs/{id}/move", post(move_doc))
-        .route("/api/docs/{id}/restore", post(restore))
+        .route(crate::auth::ARCHIVE_RESTORE_ROUTE, post(restore))
+        .route(crate::auth::ARCHIVE_PURGE_ROUTE, post(purge))
         .route(
             "/api/docs/{id}/markdown",
             get(crate::routes::api::markdown::export_inline)
@@ -94,7 +99,8 @@ pub fn router(state: AppState) -> Router<AppState> {
         .layer(middleware::from_fn_with_state(state, require_doc_role_mw));
     let list_routes: Router<AppState> = Router::new()
         .route("/api/docs", get(list).post(create))
-        .route("/api/workspace/templates", get(list_templates));
+        .route("/api/workspace/templates", get(list_templates))
+        .route("/api/workspace/archive", get(list_archive));
     list_routes.merge(doc_id_routes)
 }
 
@@ -170,6 +176,8 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
         Err(knot_storage::DocStoreError::Conflict) => {
             json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "")
         }
+        // The parent is in the archive.
+        Err(knot_storage::DocStoreError::Archived) => doc_archived(),
         Err(e) => {
             tracing::error!(error=?e, "create");
             internal()
@@ -204,12 +212,69 @@ async fn get_one(
         #[serde(flatten)]
         doc: DocResponse,
         effective_role: String,
+        #[serde(flatten)]
+        archive: ArchiveInfo,
     }
+    let archive = match archive_info(&state, &doc).await {
+        Ok(info) => info,
+        Err(e) => {
+            tracing::error!(error = %e, "get archive info");
+            return internal();
+        }
+    };
     Json(GetResponse {
         doc: to_response(&doc),
         effective_role: role.0.as_str().into(),
+        archive,
     })
     .into_response()
+}
+
+/// What the archived-doc banner needs; every field is `null` on a live doc.
+#[derive(Serialize, Default)]
+struct ArchiveInfo {
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    archived_by: Option<PersonRef>,
+    purge_at: Option<chrono::DateTime<chrono::Utc>>,
+    archive_root_id: Option<Uuid>,
+    archive_root_title: Option<String>,
+}
+
+async fn archive_info(state: &AppState, doc: &Document) -> Result<ArchiveInfo, String> {
+    let (Some(archived_at), Some(root_id)) = (doc.archived_at, doc.archive_root_id) else {
+        return Ok(ArchiveInfo::default());
+    };
+    let users = state.users.clone().ok_or("users not configured")?;
+    let docs = state.docs.clone().ok_or("docs not configured")?;
+    let root = if root_id == doc.id {
+        Some(doc.clone())
+    } else {
+        docs.get(root_id).await.map_err(|e| e.to_string())?
+    };
+    let archived_by = match doc.archived_by {
+        Some(user_id) => users
+            .find_by_id(user_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|user| PersonRef {
+                id: user.id,
+                display_name: user.display_name,
+            }),
+        None => None,
+    };
+    Ok(ArchiveInfo {
+        archived_at: Some(archived_at),
+        archived_by,
+        // A descendant goes when its root does.
+        purge_at: Some(
+            root.as_ref()
+                .and_then(|r| r.archived_at)
+                .unwrap_or(archived_at)
+                + crate::archive::retention(state),
+        ),
+        archive_root_id: Some(root_id),
+        archive_root_title: root.map(|r| r.title),
+    })
 }
 
 #[derive(Deserialize)]
@@ -343,6 +408,8 @@ async fn move_doc(
         Err(knot_storage::DocStoreError::Cycle) => {
             json_err(StatusCode::CONFLICT, "doc.move_cycle", "")
         }
+        // The destination parent is in the archive.
+        Err(knot_storage::DocStoreError::Archived) => doc_archived(),
         Err(e) => {
             tracing::error!(error=?e, "move");
             internal()
@@ -362,17 +429,23 @@ async fn archive(
     let Some(role) = req.extensions().get::<EffectiveDocRole>().copied() else {
         return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
     };
-    if role.0 != WorkspaceRole::Owner {
-        return json_err(StatusCode::FORBIDDEN, "acl.owner_required", "");
+    // Whoever can edit a doc can move it to the archive (#37: the sidebar
+    // offered Delete to editors, but this required owner).
+    if role.0 == WorkspaceRole::Viewer {
+        return json_err(StatusCode::FORBIDDEN, "acl.editor_required", "");
     }
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
     match docs.archive(ctx.workspace_id, doc_id, ctx.user_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(archived_ids) => {
+            crate::archive::evict_local(&state, &archived_ids).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(knot_storage::DocStoreError::NotFound) => {
             json_err(StatusCode::NOT_FOUND, "doc.not_found", "")
         }
+        Err(knot_storage::DocStoreError::Archived) => doc_archived(),
         Err(e) => {
             tracing::error!(error=?e, "archive");
             internal()
@@ -391,19 +464,122 @@ async fn restore(
     let Some(role) = req.extensions().get::<EffectiveDocRole>().copied() else {
         return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
     };
-    if role.0 != WorkspaceRole::Owner {
-        return json_err(StatusCode::FORBIDDEN, "acl.owner_required", "");
+    // Anyone who could archive it can undo that.
+    if role.0 == WorkspaceRole::Viewer {
+        return json_err(StatusCode::FORBIDDEN, "acl.editor_required", "");
     }
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
     match docs.restore(ctx.workspace_id, doc_id, ctx.user_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(restored_ids) => {
+            crate::archive::evict_local(&state, &restored_ids).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(knot_storage::DocStoreError::NotFound) => {
             json_err(StatusCode::NOT_FOUND, "doc.not_found", "")
         }
+        Err(knot_storage::DocStoreError::NotArchiveRoot) => {
+            json_err(StatusCode::CONFLICT, "doc.not_archive_root", "")
+        }
+        // A purge has started deleting its attachments.
+        Err(knot_storage::DocStoreError::Purging) => {
+            json_err(StatusCode::CONFLICT, "doc.purging", "")
+        }
         Err(e) => {
             tracing::error!(error=?e, "restore");
+            internal()
+        }
+    }
+}
+
+#[tracing::instrument(skip_all, name = "docs.purge")]
+async fn purge(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Request) -> Response {
+    let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
+        return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
+    };
+    let Some(role) = req.extensions().get::<EffectiveDocRole>().copied() else {
+        return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
+    };
+    // Purging can't be undone; only owners may do it ahead of retention.
+    if role.0 != WorkspaceRole::Owner {
+        return json_err(StatusCode::FORBIDDEN, "acl.owner_required", "");
+    }
+    if req.extensions().get::<DocArchived>().is_none() {
+        return json_err(StatusCode::CONFLICT, "doc.not_archived", "");
+    }
+    match crate::archive::purge_doc(
+        &state,
+        ctx.workspace_id,
+        doc_id,
+        Some(ctx.user_id),
+        PurgeTrigger::Manual,
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(PurgeError::NotFound) => json_err(StatusCode::NOT_FOUND, "doc.not_found", ""),
+        Err(PurgeError::NotArchived) => json_err(StatusCode::CONFLICT, "doc.not_archived", ""),
+        Err(PurgeError::NotArchiveRoot) => {
+            json_err(StatusCode::CONFLICT, "doc.not_archive_root", "")
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %doc_id, "purge");
+            internal()
+        }
+    }
+}
+
+/// One row of `GET /api/workspace/archive`.
+#[derive(Serialize)]
+struct ArchiveEntry {
+    id: Uuid,
+    title: String,
+    parent_id: Option<Uuid>,
+    parent_title: Option<String>,
+    subpage_count: i64,
+    archived_at: chrono::DateTime<chrono::Utc>,
+    archived_by: Option<PersonRef>,
+    purge_at: chrono::DateTime<chrono::Utc>,
+    /// A purge has started and not finished (it is retried hourly).
+    purging: bool,
+}
+
+async fn list_archive(State(state): State<AppState>, req: Request) -> Response {
+    let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
+        return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
+    };
+    // Viewers never see archived docs, so the archive isn't theirs to browse.
+    if ctx.role == WorkspaceRole::Viewer {
+        return json_err(StatusCode::FORBIDDEN, "acl.editor_required", "");
+    }
+    let Some(docs) = state.docs.clone() else {
+        return internal();
+    };
+    let retention = crate::archive::retention(&state);
+    match docs.list_archive_roots(ctx.workspace_id).await {
+        Ok(roots) => Json(
+            roots
+                .into_iter()
+                .map(|root| ArchiveEntry {
+                    id: root.id,
+                    title: root.title,
+                    parent_id: root.parent_id,
+                    parent_title: root.parent_title,
+                    subpage_count: root.subpage_count,
+                    archived_at: root.archived_at,
+                    archived_by: root
+                        .archived_by
+                        .zip(root.archived_by_name)
+                        .map(|(id, display_name)| PersonRef { id, display_name }),
+                    purge_at: root.archived_at + retention,
+                    purging: root.purging,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error=?e, "list_archive");
             internal()
         }
     }
@@ -537,6 +713,7 @@ async fn create_from_template_inline(
         Err(knot_storage::DocStoreError::Conflict) => {
             return json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "");
         }
+        Err(knot_storage::DocStoreError::Archived) => return doc_archived(),
         Err(e) => {
             tracing::error!(error=?e, "from_template create");
             return internal();

@@ -81,6 +81,11 @@ async fn upload(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Re
         }
         Err(_) => return internal(),
     }
+    if let Some(r) =
+        crate::archive::refuse_if_archived(&state, ctx.workspace_id, doc_id, ctx.user_id).await
+    {
+        return r;
+    }
 
     let Some(boundary) = req
         .headers()
@@ -296,6 +301,12 @@ async fn delete_blob(
                 "editor role required",
             );
         }
+    }
+    if let Some(r) =
+        crate::archive::refuse_if_archived(&state, meta.workspace_id, meta.doc_id, ctx.user_id)
+            .await
+    {
+        return r;
     }
 
     let _ = store.delete(id).await;

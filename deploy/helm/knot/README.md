@@ -120,6 +120,25 @@ oidc:
   extraAudiences: '^\d{18}$'   # trust any 18-digit Zitadel id (project, grants, …)
 ```
 
+## Archive retention
+
+Deleting a document moves it, with its subpages, to the archive. Editors
+can open and restore archived documents; owners can also delete them
+permanently ahead of time. An hourly job on one replica (Postgres advisory
+lock) permanently deletes whatever has been in the archive for longer than
+`archive.retentionDays` (default 30, `KNOT_ARCHIVE_RETENTION_DAYS`),
+including the documents' attachments in the S3 bucket.
+
+```yaml
+archive:
+  retentionDays: 30
+```
+
+Permanent deletion covers the live database and blob storage only. Database
+backups and point-in-time recovery keep purged content for as long as you
+keep them; size their retention accordingly if you rely on deletions
+taking effect.
+
 ## S3 blob backend
 
 knot stores attachments in either Postgres `bytea` (default, 10 MB hard cap, no extra infrastructure) or an S3-compatible bucket (recommended for workspaces with more than a few hundred attachments). The backend is selected at runtime — the same image handles both — and you can switch by changing `blob.backend` and rolling the deployment.

@@ -160,6 +160,7 @@ impl TaskStore for PgTaskStore {
                 "SELECT id, workspace_id, doc_id, item_index, text, assignee_user_id, checked, completed_at, due_at, created_at, updated_at \
                  FROM doc_tasks \
                  WHERE workspace_id = $1 AND assignee_user_id = $2 \
+                 AND EXISTS (SELECT 1 FROM documents d WHERE d.id = doc_tasks.doc_id AND d.archived_at IS NULL) \
                  ORDER BY checked, due_at NULLS LAST, updated_at DESC",
             )
             .bind(workspace_id)
@@ -171,6 +172,7 @@ impl TaskStore for PgTaskStore {
                 "SELECT id, workspace_id, doc_id, item_index, text, assignee_user_id, checked, completed_at, due_at, created_at, updated_at \
                  FROM doc_tasks \
                  WHERE workspace_id = $1 AND assignee_user_id = $2 AND completed_at IS NULL \
+                 AND EXISTS (SELECT 1 FROM documents d WHERE d.id = doc_tasks.doc_id AND d.archived_at IS NULL) \
                  ORDER BY due_at NULLS LAST, updated_at DESC",
             )
             .bind(workspace_id)

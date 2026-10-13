@@ -38,6 +38,8 @@ import { type Doc } from "../../lib/validators";
 import { type ApiError } from "../../lib/api";
 
 import { WorkspaceHeader } from "../workspace/WorkspaceHeader";
+import { workspaceApi } from "../workspace/workspace.api";
+import { archiveConfirmText, archiveErrorText } from "./archive";
 import { docsApi } from "./docs.api";
 import { markDocEditMode } from "./editMode";
 import { placementParent, type Placement } from "./placement";
@@ -58,6 +60,10 @@ export function DocTree() {
     queryKey: ["docs"],
     queryFn: () => docsApi.list(),
   });
+  // Only for the "permanently deleted in N days" line of the archive prompt.
+  const workspaceQuery = useQuery({ queryKey: ["workspace"], queryFn: () => workspaceApi.get() });
+  const retentionDays =
+    workspaceQuery.data && "ok" in workspaceQuery.data ? workspaceQuery.data.ok.archive_retention_days : 30;
 
   const create = useMutation({
     mutationFn: async (parent_id?: string) =>
@@ -200,6 +206,7 @@ export function DocTree() {
                   activeId={activeId}
                   canEdit={canEdit}
                   isOwner={isOwner}
+                  retentionDays={retentionDays}
                   onNewChild={(pid) => create.mutate(pid)}
                   dropHint={drop && drop.overId === n.id ? drop.intent : null}
                   drop={drop}
@@ -352,12 +359,18 @@ export function NewDocPicker({
   );
 }
 
+/** Subpages (at any depth) that go to the archive with `node`. */
+function countDescendants(node: TreeNode): number {
+  return node.children.reduce((sum, child) => sum + 1 + countDescendants(child), 0);
+}
+
 function TreeRow({
   node,
   depth,
   activeId,
   canEdit,
   isOwner,
+  retentionDays,
   onNewChild,
   dropHint,
   drop,
@@ -367,6 +380,7 @@ function TreeRow({
   activeId?: string;
   canEdit: boolean;
   isOwner: boolean;
+  retentionDays: number;
   onNewChild: (parentId: string) => void;
   dropHint: "before" | "after" | "into" | null;
   drop: { overId: string; intent: "before" | "after" | "into" } | null;
@@ -378,10 +392,19 @@ function TreeRow({
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const [expanded, setExpanded] = useState(true);
 
-  const { attributes, listeners, setNodeRef, transform, isDragging } = useSortable({
-    id: node.id,
-    disabled: !canEdit,
-  });
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, isDragging } =
+    useSortable({
+      id: node.id,
+      disabled: !canEdit,
+    });
+  // The row itself is the keyboard drag handle. Without an activator node
+  // the sensor starts a drag (and swallows the key) on Enter/Space anywhere
+  // inside the row, so its link and buttons never got the key. Pointer
+  // drags still start anywhere in the row.
+  const setRowRef = (el: HTMLLIElement | null) => {
+    setNodeRef(el);
+    setActivatorNodeRef(el);
+  };
   const sortableStyle = {
     transform: CSS.Transform.toString(transform),
     opacity: isDragging ? 0.5 : 1,
@@ -396,10 +419,17 @@ function TreeRow({
   }
 
   async function onArchive() {
-    if (!window.confirm(`Delete "${node.title}"?`)) return;
+    if (!window.confirm(archiveConfirmText(node.title, countDescendants(node), retentionDays))) return;
     const r = await docsApi.archive(node.id);
-    if ("error" in r) notify("error", "Delete failed");
-    else await qc.invalidateQueries({ queryKey: ["docs"] });
+    if ("error" in r) {
+      notify("error", archiveErrorText(r.error.code));
+      return;
+    }
+    notify("info", "Moved to archive");
+    await qc.invalidateQueries({ queryKey: ["docs"] });
+    await qc.invalidateQueries({ queryKey: ["archive"] });
+    // An open page in the moved subtree switches to its archived view.
+    await qc.invalidateQueries({ queryKey: ["doc"] });
   }
 
   async function onToggleTemplate() {
@@ -431,11 +461,11 @@ function TreeRow({
     });
   }
   if (canEdit) {
-    items.push({ label: "Delete", testId: "ctx-delete", destructive: true, onSelect: () => void onArchive() });
+    items.push({ label: "Move to archive", testId: "ctx-delete", destructive: true, onSelect: () => void onArchive() });
   }
 
   return (
-    <li ref={setNodeRef} style={sortableStyle} {...attributes} {...listeners}>
+    <li ref={setRowRef} style={sortableStyle} {...attributes} {...listeners}>
       <div
         className={`relative group flex items-center gap-1 rounded h-7 pr-1 transition-colors ease-swift duration-150 ${
           isActive
@@ -517,6 +547,7 @@ function TreeRow({
               activeId={activeId}
               canEdit={canEdit}
               isOwner={isOwner}
+              retentionDays={retentionDays}
               onNewChild={onNewChild}
               dropHint={drop && drop.overId === c.id ? drop.intent : null}
               drop={drop}

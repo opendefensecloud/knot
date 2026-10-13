@@ -1,4 +1,4 @@
-import { CheckSquare, LayoutTemplate, Search, Settings, Users } from "lucide-react";
+import { Archive, CheckSquare, LayoutTemplate, Search, Settings, Users } from "lucide-react";
 import { Link } from "react-router-dom";
 
 import { useSession } from "../../auth/SessionContext";
@@ -8,6 +8,8 @@ export function WorkspaceHeader() {
   const session = useSession();
   const user = session.data && "ok" in session.data ? session.data.ok : null;
   const openPalette = useUi((s) => s.openPalette);
+  // Viewers never see archived docs, so the archive isn't theirs to browse.
+  const canSeeArchive = user?.role === "owner" || user?.role === "editor";
 
   const initial = (user?.display_name ?? "?").slice(0, 1).toUpperCase();
 
@@ -50,6 +52,15 @@ export function WorkspaceHeader() {
         >
           <LayoutTemplate size={14} aria-hidden /> Templates
         </Link>
+        {canSeeArchive && (
+          <Link
+            to="/archive"
+            data-testid="sidebar-archive"
+            className="inline-flex items-center gap-2 h-7 px-2 rounded text-[13px] text-fg-muted hover:text-fg hover:bg-muted transition-colors ease-swift duration-150"
+          >
+            <Archive size={14} aria-hidden /> Archive
+          </Link>
+        )}
         <Link
           to="/members"
           data-testid="sidebar-members"

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, Eye, FileCode, History, LayoutTemplate, MessageSquare, Pencil, Share2 } from "lucide-react";
-import { lazy, Suspense, useEffect, useState, type CSSProperties } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties } from "react";
 import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
 
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
@@ -10,6 +10,8 @@ import { useUi } from "../../stores/ui";
 
 import { CommentSidebar } from "../comments/CommentSidebar";
 import { MarkdownView } from "../editor/MarkdownView";
+import { purgeConfirmText } from "./archive";
+import { ArchivedBanner } from "./ArchivedBanner";
 import { Breadcrumb } from "./Breadcrumb";
 import { DocByline } from "./DocByline";
 import { docsApi } from "./docs.api";
@@ -133,13 +135,53 @@ export default function DocPage() {
     queryFn: () => docsApi.get(id!),
     enabled: Boolean(id),
   });
+  const { refetch: refetchDoc } = doc;
+  const docMeta = doc.data && "ok" in doc.data ? doc.data.ok : null;
+  const archived = Boolean(docMeta?.archived_at);
+  const isArchiveRoot = archived && docMeta?.archive_root_id === docMeta?.id;
+  // Only for the subpage count in the "Delete permanently" prompt.
+  const archiveList = useQuery({
+    queryKey: ["archive"],
+    queryFn: () => docsApi.listArchive(),
+    enabled: isArchiveRoot && docMeta?.effective_role === "owner",
+  });
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  // Bumped to remount the editor, which reconnects its socket.
+  const [editorEpoch, setEditorEpoch] = useState(0);
+  // The archive state the editor is currently mounted for.
+  const mountedArchived = useRef(archived);
+  useEffect(() => {
+    mountedArchived.current = archived;
+  }, [archived]);
+  // Set while this page purges its own doc, which also revokes its socket.
+  const leaving = useRef(false);
 
   useEffect(() => {
-    if (status === "unauthorised") {
+    if (status !== "unauthorised" || leaving.current) return;
+    // The server closes every socket on a doc (4403) whenever its access
+    // changes: archive, restore, a grant. Look before leaving: if the doc is
+    // still readable, stay and reconnect with whatever the server grants
+    // now (read-only once archived). Only a doc we can no longer read sends
+    // the user away.
+    let cancelled = false;
+    void (async () => {
+      const fresh = await refetchDoc();
+      if (cancelled || leaving.current) return;
+      if (fresh.data && "ok" in fresh.data) {
+        // A change of archive state remounts the editor through its key;
+        // otherwise remount it here.
+        if (Boolean(fresh.data.ok.archived_at) === mountedArchived.current) {
+          setEditorEpoch((n) => n + 1);
+        }
+        return;
+      }
       notify("error", "You no longer have access to this document.");
       void nav("/", { replace: true });
-    }
-  }, [status, notify, nav]);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [status, notify, nav, refetchDoc]);
 
   if (!id) return null;
   if (doc.isLoading) {
@@ -150,6 +192,45 @@ export default function DocPage() {
   }
 
   const meta = doc.data.ok;
+  // Archived docs are read-only for everyone until restored.
+  const canEditDoc = !archived && (effRole === "owner" || effRole === "editor");
+  const isDocOwner = !archived && effRole === "owner";
+
+  async function afterArchiveChange() {
+    await qc.invalidateQueries({ queryKey: ["doc"] });
+    await qc.invalidateQueries({ queryKey: ["docs"] });
+    await qc.invalidateQueries({ queryKey: ["archive"] });
+  }
+
+  async function restoreFromArchive() {
+    setArchiveBusy(true);
+    const r = await docsApi.restore(id!);
+    setArchiveBusy(false);
+    if ("error" in r) {
+      notify("error", "Couldn't restore");
+      return;
+    }
+    notify("info", "Restored");
+    await afterArchiveChange();
+  }
+
+  async function purgeFromArchive() {
+    const entries = archiveList.data && "ok" in archiveList.data ? archiveList.data.ok : [];
+    const subpages = entries.find((e) => e.id === id)?.subpage_count ?? 0;
+    if (!window.confirm(purgeConfirmText(meta.title, subpages))) return;
+    setArchiveBusy(true);
+    leaving.current = true;
+    const r = await docsApi.purge(id!);
+    setArchiveBusy(false);
+    if ("error" in r) {
+      leaving.current = false;
+      notify("error", "Couldn't delete permanently");
+      return;
+    }
+    notify("info", "Deleted permanently");
+    await qc.invalidateQueries({ queryKey: ["archive"] });
+    await nav("/archive", { replace: true });
+  }
 
   // Named rather than an inline `async` handler: `onClick` is typed to
   // return void, so handing it a promise leaves rejections unhandled.
@@ -189,7 +270,7 @@ export default function DocPage() {
           exceeds the 327px content box, no control lands off-screen. */}
       <div className="measure mt-3">
         <DocTitle key={id} id={id} initialTitle={meta.title}
-                  editable={effRole !== "viewer" && editMode} />
+                  editable={canEditDoc && editMode} />
         {/* Its own key: sibling keys must be unique, and sharing DocTitle's
             `id` left the previous doc's title input mounted on navigation. */}
         <DocByline key={`byline:${id}`} docId={id} />
@@ -199,7 +280,7 @@ export default function DocPage() {
               targeting `data-testid="status-dot"` still find it; SyncStatus
               is the user-facing affordance now. */}
           <span className="sr-only"><StatusDot status={status} /></span>
-          {effRole === "owner" && (
+          {isDocOwner && (
             <Link
               to="permissions"
               data-testid="open-permissions"
@@ -212,7 +293,7 @@ export default function DocPage() {
             </Link>
           )}
           <DocWidthToggle />
-          {(effRole === "owner" || effRole === "editor") && (
+          {canEditDoc && (
             <IconButton
               data-testid="toggle-edit-mode"
               label={editMode ? "Stop editing (⌘E)" : "Edit (⌘E)"}
@@ -222,7 +303,7 @@ export default function DocPage() {
               {editMode ? <Eye size={16} aria-hidden /> : <Pencil size={16} aria-hidden />}
             </IconButton>
           )}
-          {(effRole === "owner" || effRole === "editor") && (
+          {canEditDoc && (
             <IconButton
               data-testid="open-history"
               label="History"
@@ -239,26 +320,29 @@ export default function DocPage() {
           >
             <FileCode size={16} aria-hidden />
           </IconButton>
-          {(effRole === "owner" || effRole === "editor") && (
+          {canEditDoc && (
             <ImportMarkdownButton docId={id} docTitle={meta.title} />
           )}
-          <IconButton
-            data-testid="doc-export"
-            label="Export doc (shift-click for subtree)"
-            onClick={(e) => {
-              // Default: just this doc. Shift-click pulls the whole
-              // subtree — a power-user shortcut without cluttering the
-              // header with a separate button.
-              const descendants = e.shiftKey;
-              const a = document.createElement("a");
-              a.href = `/api/docs/${id}/export?descendants=${descendants ? "true" : "false"}`;
-              a.download = `${meta.title || "doc"}.zip`;
-              a.click();
-            }}
-          >
-            <Download size={16} aria-hidden />
-          </IconButton>
-          {effRole === "owner" && (
+          {/* The zip export reads live docs only; restore to export. */}
+          {!archived && (
+            <IconButton
+              data-testid="doc-export"
+              label="Export doc (shift-click for subtree)"
+              onClick={(e) => {
+                // Default: just this doc. Shift-click pulls the whole
+                // subtree — a power-user shortcut without cluttering the
+                // header with a separate button.
+                const descendants = e.shiftKey;
+                const a = document.createElement("a");
+                a.href = `/api/docs/${id}/export?descendants=${descendants ? "true" : "false"}`;
+                a.download = `${meta.title || "doc"}.zip`;
+                a.click();
+              }}
+            >
+              <Download size={16} aria-hidden />
+            </IconButton>
+          )}
+          {isDocOwner && (
             <IconButton
               data-testid="toggle-template"
               label={meta.is_template ? "Remove from templates" : "Save as template"}
@@ -268,35 +352,49 @@ export default function DocPage() {
               <LayoutTemplate size={16} aria-hidden />
             </IconButton>
           )}
-          <IconButton
-            data-testid="open-comments"
-            label="Comments"
-            onClick={openCommentSidebar}
-          >
-            <MessageSquare size={16} aria-hidden />
-          </IconButton>
+          {!archived && (
+            <IconButton
+              data-testid="open-comments"
+              label="Comments"
+              onClick={openCommentSidebar}
+            >
+              <MessageSquare size={16} aria-hidden />
+            </IconButton>
+          )}
         </div>
       </div>
+      {archived && (
+        <ArchivedBanner
+          doc={meta}
+          canPurge={effRole === "owner"}
+          busy={archiveBusy}
+          onRestore={() => void restoreFromArchive()}
+          onPurge={() => void purgeFromArchive()}
+        />
+      )}
       <div className="mt-6">
         {mdView ? (
           <MarkdownView docId={id} />
         ) : (
           <Suspense fallback={<p className="measure text-fg-muted">Loading editor…</p>}>
             <KnotEditor
+              // Remount on archive/restore so the socket reconnects with
+              // the access the server now grants (read-only when archived).
+              key={`${archived ? "archived" : "live"}:${editorEpoch}`}
               docId={id}
               onStatus={setStatus}
               onPendingBytes={setPendingBytes}
-              role={meta.effective_role}
-              editMode={editMode}
+              role={archived ? "viewer" : meta.effective_role}
+              editMode={!archived && editMode}
             />
           </Suspense>
         )}
       </div>
       <Outlet />
-      {historyOpen && id && (
+      {historyOpen && id && !archived && (
         <HistoryDrawer docId={id} onClose={() => setHistoryOpen(false)} />
       )}
-      {commentSidebarOpen && id && <CommentSidebar docId={id} />}
+      {commentSidebarOpen && id && !archived && <CommentSidebar docId={id} />}
     </section>
   );
 }

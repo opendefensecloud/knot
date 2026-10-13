@@ -115,9 +115,6 @@ async fn patch_checked(
     let Some(acl) = state.acl.clone() else {
         return internal();
     };
-    let Some(rooms) = state.rooms_v2.clone() else {
-        return internal();
-    };
     // Editor+ on the parent doc; checking off a task is an edit.
     match acl
         .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
@@ -127,6 +124,14 @@ async fn patch_checked(
         Ok(_) => return json_err(StatusCode::FORBIDDEN, "acl.editor_required", ""),
         Err(_) => return internal(),
     }
+    if let Some(r) =
+        crate::archive::refuse_if_archived(&state, ctx.workspace_id, doc_id, ctx.user_id).await
+    {
+        return r;
+    }
+    let Some(rooms) = state.rooms_v2.clone() else {
+        return internal();
+    };
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024).await {
         Ok(b) => b,
         Err(_) => return json_err(StatusCode::BAD_REQUEST, "bad_request", ""),

@@ -134,6 +134,12 @@
         "backend": { "enum": ["postgres", "s3"] },
         "s3": { "type": "object" }
       }
+    },
+    "archive": {
+      "type": "object",
+      "properties": {
+        "retentionDays": { "type": "integer", "minimum": 1 }
+      }
     }
   }
 }
