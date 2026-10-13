@@ -8,119 +8,73 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-13
+
+### Upgrading
+- Two database migrations run on upgrade (the Helm chart's migrate hook applies
+  them).
+- Pages deleted in earlier versions move to the archive with a 30-day
+  retention starting at the upgrade, and are then permanently deleted unless
+  restored. To change the period, set `KNOT_ARCHIVE_RETENTION_DAYS` (Helm
+  `archive.retentionDays`) before upgrading.
+- Subpages of previously deleted pages are moved to the top level, where the
+  sidebar already showed them.
+- Contributor lists count edits from this version on only.
+
 ### Added
-- Page byline: "Created by … · date" under the title, plus the people who have
-  changed the page's content (typing, imports, restores, task toggles), each
-  with when they last edited. Visible to every role that can open the page;
-  names only. Pages created before this release list only contributions made
-  from now on, and say so. `GET /api/docs/{id}/contributors`.
-- **Resizable table columns** ([#36](https://github.com/opendefensecloud/knot/issues/36)).
-  In edit mode, drag the line between two columns to move width from one to
-  the other. Widths are stored as proportions, so a table keeps its layout on
-  every screen and always fills the page width; readers see the result, and it
-  is saved with the page. Works with mouse, touch and pen (a vertical swipe on
-  a column line still scrolls); `Escape` cancels a drag. Widths do not survive
-  a trip through Markdown (export/import, creating a page from a template) —
-  tables arriving that way start with equal columns.
-- **Document archive with retention** ([#37](https://github.com/opendefensecloud/knot/issues/37)).
-  Deleting a page now moves it, with all its subpages, to the archive
-  (sidebar → *Move to archive*; the prompt names the subpages that go with
-  it). Editors and owners find it under **Archive** in the sidebar, can open a
-  read-only preview and restore it; restoring brings the whole set back where
-  it was (or to the top level if its parent is itself archived). Owners can
-  also *Delete permanently* right away. After `KNOT_ARCHIVE_RETENTION_DAYS`
-  (default 30; Helm `archive.retentionDays`) an hourly job, run by one replica
-  at a time, deletes it for good — history, comments, attachments (including
-  S3 objects), boards, tasks and share links. Viewers no longer see archived
-  pages at all. If deleting a page's S3 objects fails part-way, the page can
-  no longer be restored and the job finishes the deletion on its next run.
-  `GET /api/workspace/archive`, `POST /api/docs/{id}/purge`.
-  Pages deleted before this release appear in the archive with a fresh 30
-  days.
+- Page byline showing who created the page and who has edited it, with their
+  last edit. `GET /api/docs/{id}/contributors`. (#35)
+- Resizable table columns. Widths are stored as proportions, so tables fill the
+  page width on any screen. Widths are not kept through Markdown export/import.
+  (#38)
+- Document archive. Deleting a page moves it and its subpages to the archive,
+  where editors and owners can preview and restore it, and owners can delete
+  it permanently. Archived pages are purged after `KNOT_ARCHIVE_RETENTION_DAYS`
+  (default 30). `GET /api/workspace/archive`, `POST /api/docs/{id}/purge`.
+  (#39)
 
 ### Changed
-- Archived pages are read-only everywhere: every write to one (rename, move,
-  comments, grants, imports, uploads, task checkboxes, new subpages, share
-  links) answers `409 doc.archived`, its live editors reconnect read-only, and
-  its public share links stop working until it is restored. It is left out of
-  search, My Tasks and workspace export.
-- Subpages of pages deleted before this release, which the sidebar showed at
-  the top level, are now actually moved there, so purging their old parent
-  cannot take them with it.
-- Tables whose columns were dragged before this release now fill the page width
-  instead of being pinned to the pixel widths of whoever dragged them and
-  scrolling sideways on smaller screens. A table with every column dragged
-  keeps its ratios exactly; where only some were, those keep their share of a
-  1000px table and the rest split what is left.
+- Archived pages are read-only. Writes return `409 doc.archived`, open editors
+  switch to read-only, and share links stop working. Archived pages are left
+  out of search, My Tasks and workspace export. (#39)
+- Tables with columns resized in earlier versions now fill the page width
+  instead of keeping fixed pixel widths. (#38)
+- A link now ends where its text ends. Retyping a link's last character, or
+  typing over all of its text, gives plain text. (#40)
 
 ### Fixed
-- **Editors could not delete pages** ([#37](https://github.com/opendefensecloud/knot/issues/37)).
-  The sidebar offered *Delete* to editors, but the server only allowed owners,
-  so the attempt failed with a bare "Delete failed". Editors can now move
-  pages to the archive, and failures say why.
-- **Deleting a folder left its subpages behind**: they popped up at the top of
-  the sidebar and stayed in search. The whole subtree now goes to the archive
-  together.
-- The sidebar's row menu (Rename, Move to archive, …) could not be used with
-  the keyboard: Enter and Space anywhere in a row were taken by
-  drag-and-drop. Only the focused row itself now starts a keyboard drag, and
-  the menu takes focus when it opens (arrow keys move between items).
-- A page whose access changed while it was open (shared differently,
-  archived, restored) no longer sends you away with "You no longer have
-  access" if you can still read it; it reconnects in place.
-- **Column resizing never worked on existing pages.** The drag handles were
-  only installed when the editor was created editable, and pages open in view
-  mode, so switching to Edit never showed them — only brand-new pages could be
-  resized.
-- Long URLs and other unbreakable text in a table cell now wrap inside the cell
-  instead of running over the neighbouring column.
-- **Edits typed while disconnected never reached the server.** The client kept
-  them locally but only sent changes while its socket was open, and the server
-  never asked a reconnecting client for what it was missing. They were lost on
-  reload, and later edits building on them were parked by the server as
-  pending, invisible to everyone else. The server now sends its state vector
-  on join (y-protocol SyncStep1), so the client uploads what the server lacks.
-  Already-loaded clients benefit without a reload. Boards had the same gap and
-  get the same fix.
-- Live edits were stored without an author, and a writer batch was stamped
-  with its first row's author. Every `doc_updates` row now records who made it;
-  history restore and workspace import are attributed too.
-- An open editor no longer autolinks text that arrives from someone else's
-  change, which wrote a link edit into the shared document under the
-  observer's name.
-- **Text typed after a pasted link became part of the link.** Paste a URL,
-  keep typing, and the rest of the sentence was linked to that URL. The same
-  happened when typing at the end of any link (after a document link, an
-  edited date, or clicking at a link's end) and at the start of a paragraph
-  that opens with one. A link now ends where its text ends. As a result,
-  retyping a link's last character, or typing over all of its text, gives
-  plain text; use the toolbar's Link button to change a link.
-- Pasting a URL over selected text leaves the cursor after the new link
-  instead of keeping it selected, so the next keystroke no longer replaces it.
-- With the cursor at the start or end of a link, the toolbar's Link button
-  shows that link. It could open with an empty URL, and applying that empty URL
-  removed the link.
-- Applying a URL from the toolbar with nothing selected inserts the URL as the
-  link's text, instead of linking whatever was typed next.
-- Typing or pasting a URL such as `https://…` or `file:///…` no longer opens
-  the date picker, which took the keyboard focus so the next keystrokes went
-  into it.
-- **Revoking access did not reach open editors.** The 4403 close an ACL change
-  should send never fired, so a revoked user kept a working socket and their
-  edits were still applied and saved. Open connections are now closed with
-  4403 and anything they send after the revoke is dropped. The same defect
-  leaked a task and a socket on the server for every disconnect, until
-  restart.
+- Edits made while offline never reached the server and were lost on reload.
+  Boards had the same problem. (#35)
+- Revoking access did not disconnect open editors, and their edits kept being
+  saved. (#35)
+- Live edits were stored without an author, and batched edits were credited to
+  the first author in the batch. (#35)
+- An open editor wrote an autolink edit in response to another user's typing.
+  (#35)
+- Editors could not delete pages; only owners could. (#39)
+- Deleting a page left its subpages at the top level of the sidebar and in
+  search. (#39)
+- The sidebar row menu could not be used with the keyboard. (#39)
+- A page whose access changed while it was open showed "You no longer have
+  access" even when you could still read it. (#39)
+- Column resizing did not work on existing pages. (#38)
+- Long URLs in table cells overflowed into the next column. (#38)
+- Text typed after a pasted link, or at the edge of any link, became part of
+  the link. (#40)
+- Pasting a URL over selected text left the new link selected, so the next
+  keystroke replaced it. (#40)
+- The toolbar Link button opened empty with the cursor at a link's edge, and
+  applying the empty value removed the link. With nothing selected, Apply now
+  inserts the URL as link text. (#40)
+- Typing or pasting `https://…` opened the date picker, which took the
+  keyboard focus. (#40)
 
 ### Security
-- **`ammonia` 4.1.7** closes RUSTSEC-2021-0157 (quotes in CSS `url()` were not
-  escaped inside `style` attributes, allowing CSS injection). knot was not
-  reachable through it: the public share page sanitizes with ammonia's default
-  builder, which does not allow `style` attributes at all.
-- RUSTSEC-2024-0449 (`unsafe-libyaml` unmaintained) is acknowledged in
-  `deny.toml`. It arrives through figment's YAML provider, has no known
-  vulnerability and no maintained replacement reachable from figment 0.10.19,
-  and only ever parses the operator's own `KNOT_CONFIG` file.
+- `ammonia` 4.1.7 fixes RUSTSEC-2021-0157. knot was not affected: its
+  sanitizer does not allow `style` attributes. (#38)
+- RUSTSEC-2024-0449 (`unsafe-libyaml`, unmaintained) is acknowledged in
+  `deny.toml`. It has no known vulnerability and only parses the operator's
+  own config file. (#38)
 
 ## [0.7.0] - 2026-10-02
 
@@ -605,7 +559,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/opendefensecloud/knot/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/opendefensecloud/knot/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/opendefensecloud/knot/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/opendefensecloud/knot/compare/v0.4.0...v0.5.0
