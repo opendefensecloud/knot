@@ -30,6 +30,7 @@ import {
 
 import { boardsApi } from "../../lib/boards.api";
 import { useUi } from "../../stores/ui";
+import { applyLinkUrl, toolbarLinkState } from "./toolbarLink";
 
 type ToolbarBtnProps = {
   testId: string;
@@ -286,9 +287,9 @@ export function EditorToolbar({
         <Btn
           testId="toolbar-link"
           label="Link"
-          active={editor.isActive("link")}
+          active={toolbarLinkState(editor).active}
           onClick={() => {
-            const current = editor.getAttributes("link").href as string | undefined;
+            const current = toolbarLinkState(editor).href;
             setLinkUrl(current ?? "");
             setLinkMode(current?.startsWith("knot://doc/") ? "doc" : "url");
             setDocQuery("");
@@ -338,7 +339,7 @@ export function EditorToolbar({
                   type="button"
                   className="h-8 px-2.5 rounded bg-accent text-accent-fg text-[13px] font-medium hover:opacity-90 transition-opacity"
                   onClick={() => {
-                    if (linkUrl) c().extendMarkRange("link").setLink({ href: linkUrl }).run();
+                    if (linkUrl) applyLinkUrl(editor, linkUrl);
                     else c().unsetLink().run();
                     setLinkOpen(false);
                   }}
