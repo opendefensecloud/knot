@@ -22,8 +22,31 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   a column line still scrolls); `Escape` cancels a drag. Widths do not survive
   a trip through Markdown (export/import, creating a page from a template) —
   tables arriving that way start with equal columns.
+- **Document archive with retention** ([#37](https://github.com/opendefensecloud/knot/issues/37)).
+  Deleting a page now moves it, with all its subpages, to the archive
+  (sidebar → *Move to archive*; the prompt names the subpages that go with
+  it). Editors and owners find it under **Archive** in the sidebar, can open a
+  read-only preview and restore it; restoring brings the whole set back where
+  it was (or to the top level if its parent is itself archived). Owners can
+  also *Delete permanently* right away. After `KNOT_ARCHIVE_RETENTION_DAYS`
+  (default 30; Helm `archive.retentionDays`) an hourly job, run by one replica
+  at a time, deletes it for good — history, comments, attachments (including
+  S3 objects), boards, tasks and share links. Viewers no longer see archived
+  pages at all. If deleting a page's S3 objects fails part-way, the page can
+  no longer be restored and the job finishes the deletion on its next run.
+  `GET /api/workspace/archive`, `POST /api/docs/{id}/purge`.
+  Pages deleted before this release appear in the archive with a fresh 30
+  days.
 
 ### Changed
+- Archived pages are read-only everywhere: every write to one (rename, move,
+  comments, grants, imports, uploads, task checkboxes, new subpages, share
+  links) answers `409 doc.archived`, its live editors reconnect read-only, and
+  its public share links stop working until it is restored. It is left out of
+  search, My Tasks and workspace export.
+- Subpages of pages deleted before this release, which the sidebar showed at
+  the top level, are now actually moved there, so purging their old parent
+  cannot take them with it.
 - Tables whose columns were dragged before this release now fill the page width
   instead of being pinned to the pixel widths of whoever dragged them and
   scrolling sideways on smaller screens. A table with every column dragged
@@ -31,6 +54,20 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   1000px table and the rest split what is left.
 
 ### Fixed
+- **Editors could not delete pages** ([#37](https://github.com/opendefensecloud/knot/issues/37)).
+  The sidebar offered *Delete* to editors, but the server only allowed owners,
+  so the attempt failed with a bare "Delete failed". Editors can now move
+  pages to the archive, and failures say why.
+- **Deleting a folder left its subpages behind**: they popped up at the top of
+  the sidebar and stayed in search. The whole subtree now goes to the archive
+  together.
+- The sidebar's row menu (Rename, Move to archive, …) could not be used with
+  the keyboard: Enter and Space anywhere in a row were taken by
+  drag-and-drop. Only the focused row itself now starts a keyboard drag, and
+  the menu takes focus when it opens (arrow keys move between items).
+- A page whose access changed while it was open (shared differently,
+  archived, restored) no longer sends you away with "You no longer have
+  access" if you can still read it; it reconnects in place.
 - **Column resizing never worked on existing pages.** The drag handles were
   only installed when the editor was created editable, and pages open in view
   mode, so switching to Edit never showed them — only brand-new pages could be

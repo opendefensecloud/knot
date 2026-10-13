@@ -24,6 +24,7 @@ use uuid::Uuid;
 const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 pub mod admin;
+pub mod archive;
 pub mod auth;
 pub mod board_room_shim;
 pub mod comments_listener;
@@ -227,6 +228,19 @@ pub fn router_with_state(state: AppState) -> Router {
     .with_state(state)
 }
 
+/// Whether a collab connection may write (`Ok(true)`), may only read
+/// (`Ok(false)`), or is refused. Viewers read; editors and owners write,
+/// except on archived docs, which open read-only for them and not at all
+/// for viewers.
+pub fn collab_write_access(
+    access: Option<knot_docs::DocAccess>,
+) -> Result<bool, axum::http::StatusCode> {
+    match access {
+        Some(access) if access.can_read() => Ok(access.can_write()),
+        _ => Err(axum::http::StatusCode::FORBIDDEN),
+    }
+}
+
 #[tracing::instrument(skip_all, name = "collab.upgrade", fields(doc_id = %doc_id))]
 async fn collab_upgrade(
     Path(doc_id): Path<Uuid>,
@@ -247,16 +261,11 @@ async fn collab_upgrade(
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
     };
-    let can_write = match acl
-        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
-        .await
-    {
-        // Viewers may connect (read/hydrate) but cannot write; Owner/Editor can.
-        Ok(Some(role)) => {
-            use knot_storage::WorkspaceRole;
-            matches!(role, WorkspaceRole::Owner | WorkspaceRole::Editor)
-        }
-        Ok(None) => return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response(),
+    let can_write = match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
+        Ok(access) => match collab_write_access(access) {
+            Ok(can_write) => can_write,
+            Err(status) => return (status, "acl.no_grant").into_response(),
+        },
         Err(_) => {
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
@@ -302,17 +311,18 @@ async fn collab_board_upgrade(
         Ok(b) => b,
         Err(_) => return (axum::http::StatusCode::NOT_FOUND, "board.not_found").into_response(),
     };
+    // The board socket only exists for editing, so it needs write access:
+    // refused for viewers and for every board of an archived doc (whose
+    // read-only preview shows boards through their cached SVG).
     match acl
-        .effective_role(ctx.workspace_id, board.doc_id, ctx.user_id)
+        .access(ctx.workspace_id, board.doc_id, ctx.user_id)
         .await
     {
-        Ok(Some(role)) => {
-            use knot_storage::WorkspaceRole;
-            if !matches!(role, WorkspaceRole::Owner | WorkspaceRole::Editor) {
-                return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response();
-            }
+        Ok(Some(access)) if access.can_write() => {}
+        Ok(Some(access)) if access.archived && access.can_read() => {
+            return (axum::http::StatusCode::CONFLICT, "doc.archived").into_response();
         }
-        Ok(None) => return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response(),
+        Ok(_) => return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response(),
         Err(_) => {
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
@@ -328,4 +338,42 @@ async fn collab_board_upgrade(
         crate::board_room_shim::serve(board_rooms, board_id, socket, shutdown).await;
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod collab_access_tests {
+    use super::collab_write_access;
+    use axum::http::StatusCode;
+    use knot_docs::DocAccess;
+    use knot_storage::WorkspaceRole::{Editor, Owner, Viewer};
+
+    #[test]
+    fn live_doc_writable_for_editors_read_only_for_viewers() {
+        let live = |role| {
+            Some(DocAccess {
+                role,
+                archived: false,
+            })
+        };
+        assert_eq!(collab_write_access(live(Owner)), Ok(true));
+        assert_eq!(collab_write_access(live(Editor)), Ok(true));
+        assert_eq!(collab_write_access(live(Viewer)), Ok(false));
+    }
+
+    #[test]
+    fn archived_doc_read_only_for_editors_refused_for_viewers() {
+        let archived = |role| {
+            Some(DocAccess {
+                role,
+                archived: true,
+            })
+        };
+        assert_eq!(collab_write_access(archived(Owner)), Ok(false));
+        assert_eq!(collab_write_access(archived(Editor)), Ok(false));
+        assert_eq!(
+            collab_write_access(archived(Viewer)),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(collab_write_access(None), Err(StatusCode::FORBIDDEN));
+    }
 }

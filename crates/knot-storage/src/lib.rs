@@ -26,7 +26,7 @@ pub use comments::{Comment, CommentStore, CommentStoreError, PgCommentStore, Rea
 pub use contributors::{
     Contributor, ContributorStore, ContributorStoreError, DocByline, PersonRef, PgContributorStore,
 };
-pub use doc_store::{DocStore, DocStoreError, Document, PgDocStore};
+pub use doc_store::{ArchivedRoot, DocStore, DocStoreError, Document, PgDocStore};
 pub use grant_store::{Grant, GrantStore, GrantStoreError, PgGrantStore};
 pub use lexorank::between as sort_key_between;
 pub use markdown_cache::{

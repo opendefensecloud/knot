@@ -17,3 +17,9 @@ pub fn json_err(status: StatusCode, code: &str, message: &str) -> Response {
     )
         .into_response()
 }
+
+/// 409 `doc.archived`: the doc (or the parent a doc would go under) is in
+/// the archive, where everything is read-only until it is restored.
+pub fn doc_archived() -> Response {
+    json_err(StatusCode::CONFLICT, "doc.archived", "")
+}

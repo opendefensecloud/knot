@@ -23,6 +23,8 @@ const workspaceSchema = v.object({
   slug: v.string(),
   name: v.string(),
   role: v.picklist(["owner", "editor", "viewer"]),
+  /** Days an archived doc stays restorable before the server purges it. */
+  archive_retention_days: v.fallback(v.number(), 30),
 });
 export type Workspace = v.InferOutput<typeof workspaceSchema>;
 export const Workspace = workspaceSchema;
@@ -46,9 +48,14 @@ const docSchema = v.object({
   created_by: v.string(),
   archived: v.boolean(),
   is_template: v.fallback(v.boolean(), false),
+  archived_at: v.fallback(v.nullable(v.string()), null),
+  /** The doc the user archived; set on it and on every subpage that went with it. */
+  archive_root_id: v.fallback(v.nullable(v.string()), null),
 });
 export type Doc = v.InferOutput<typeof docSchema>;
 export const Doc = docSchema;
+
+const personRefSchema = v.object({ id: v.string(), display_name: v.string() });
 
 const docWithRoleSchema = v.object({
   id: v.string(),
@@ -61,9 +68,31 @@ const docWithRoleSchema = v.object({
   archived: v.boolean(),
   is_template: v.fallback(v.boolean(), false),
   effective_role: v.picklist(["owner", "editor", "viewer"]),
+  // Archive state for the banner; all null on a live doc.
+  archived_at: v.fallback(v.nullable(v.string()), null),
+  archived_by: v.fallback(v.nullable(personRefSchema), null),
+  purge_at: v.fallback(v.nullable(v.string()), null),
+  archive_root_id: v.fallback(v.nullable(v.string()), null),
+  archive_root_title: v.fallback(v.nullable(v.string()), null),
 });
 export type DocWithRole = v.InferOutput<typeof docWithRoleSchema>;
 export const DocWithRole = docWithRoleSchema;
+
+/** One row of GET /api/workspace/archive: a doc someone moved to the archive. */
+const archiveEntrySchema = v.object({
+  id: v.string(),
+  title: v.string(),
+  parent_id: v.nullable(v.string()),
+  parent_title: v.nullable(v.string()),
+  subpage_count: v.number(),
+  archived_at: v.string(),
+  archived_by: v.nullable(personRefSchema),
+  purge_at: v.string(),
+  /** A permanent deletion has started and not finished; it can't be restored. */
+  purging: v.fallback(v.boolean(), false),
+});
+export type ArchiveEntry = v.InferOutput<typeof archiveEntrySchema>;
+export const ArchiveEntry = archiveEntrySchema;
 
 const grantSchema = v.object({
   principal: v.string(),

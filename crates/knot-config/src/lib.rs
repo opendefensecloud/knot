@@ -134,6 +134,10 @@ pub struct Config {
     pub s3_region: String,
     /// Optional key prefix (e.g. `knot/blobs`). Empty = bucket root.
     pub s3_prefix: String,
+
+    /// Days a deleted doc stays in the archive (restorable) before the
+    /// hourly purge job deletes it for good. Minimum 1.
+    pub archive_retention_days: u32,
 }
 
 impl Default for Config {
@@ -169,6 +173,7 @@ impl Default for Config {
             s3_endpoint: String::new(),
             s3_region: "us-east-1".into(),
             s3_prefix: String::new(),
+            archive_retention_days: 30,
         }
     }
 }
@@ -220,6 +225,11 @@ impl Config {
                 "KNOT_SESSION_KEY must be at least 32 bytes (got {})",
                 self.session_key.len()
             )));
+        }
+        if self.archive_retention_days == 0 {
+            return Err(ConfigError::Invalid(
+                "KNOT_ARCHIVE_RETENTION_DAYS must be >= 1".into(),
+            ));
         }
         if self.db_max_connections == 0 {
             return Err(ConfigError::Invalid(
@@ -324,6 +334,21 @@ mod tests {
         };
         assert_eq!(cfg.session_key.len(), 32);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn archive_retention_defaults_to_30_days() {
+        assert_eq!(Config::default().archive_retention_days, 30);
+    }
+
+    #[test]
+    fn zero_archive_retention_is_rejected() {
+        let cfg = Config {
+            session_key: "0123456789abcdef0123456789abcdef".into(),
+            archive_retention_days: 0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

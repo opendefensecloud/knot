@@ -471,6 +471,12 @@ async fn import(
                 Ok(Some(WorkspaceRole::Owner | WorkspaceRole::Editor)) => {}
                 _ => return json_err(StatusCode::FORBIDDEN, "acl.editor_required", ""),
             }
+            if let Some(r) =
+                crate::archive::refuse_if_archived(&state, ctx.workspace_id, parent, ctx.user_id)
+                    .await
+            {
+                return r;
+            }
         }
     }
     let Some(docs) = state.docs.clone() else {

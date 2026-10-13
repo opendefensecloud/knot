@@ -37,6 +37,21 @@ export function ContextMenu({
     };
   }, [onClose]);
 
+  // Portalled to the end of <body>, the menu is out of reach by Tab; take
+  // focus so keyboard users land on its first item.
+  useEffect(() => {
+    ref.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+  }, []);
+
+  function moveFocus(step: 1 | -1) {
+    const buttons = Array.from(
+      ref.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [],
+    );
+    if (buttons.length === 0) return;
+    const at = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    buttons[(at + step + buttons.length) % buttons.length]!.focus();
+  }
+
   return createPortal(
     <div
       ref={ref}
@@ -44,6 +59,22 @@ export function ContextMenu({
       data-testid="context-menu"
       className="fixed z-50 min-w-[160px] py-1 rounded-md bg-surface border border-border shadow-lg"
       style={{ top: y, left: x }}
+      // The portal moves the menu in the DOM, not in the React tree: its
+      // events still bubble to the component that rendered it. In the
+      // sidebar that is a sortable row whose keyboard sensor takes
+      // Enter/Space (and calls preventDefault), so no item could be chosen
+      // by keyboard. Stopping here also stops the native event at the
+      // portal container, before the document listener above, so Escape is
+      // handled here too.
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onClose();
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          moveFocus(e.key === "ArrowDown" ? 1 : -1);
+        }
+        e.stopPropagation();
+      }}
+      onPointerDown={(e) => e.stopPropagation()}
     >
       {items.map((it) => (
         <button

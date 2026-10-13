@@ -13,6 +13,8 @@ function doc(id: string, parent: string | null, sort_key: string): Doc {
     created_by: "u",
     archived: false,
     is_template: false,
+    archived_at: null,
+    archive_root_id: null,
   };
 }
 

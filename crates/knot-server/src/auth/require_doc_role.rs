@@ -5,11 +5,16 @@
 //! On success: inserts `EffectiveDocRole(role)` and calls next.
 //! On no AuthContext: 401 auth.session_required.
 //! On no role (non-member with no grant): 403 acl.no_grant.
+//!
+//! Archived docs (#37): viewers get 404 doc.not_found; for everyone else
+//! the doc is read-only, so any non-GET request is 409 doc.archived except
+//! the restore and purge routes. Handlers behind this layer need no archive
+//! check of their own.
 
 use axum::{
     body::Body,
-    extract::{Path, Request, State},
-    http::StatusCode,
+    extract::{MatchedPath, Path, Request, State},
+    http::{Method, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -19,10 +24,18 @@ use uuid::Uuid;
 
 use super::context::AuthContext;
 use crate::AppState;
-use crate::http_error::json_err;
+use crate::http_error::{doc_archived, json_err};
 
 #[derive(Debug, Clone, Copy)]
 pub struct EffectiveDocRole(pub WorkspaceRole);
+
+/// Present in request extensions when the doc is in the archive.
+#[derive(Debug, Clone, Copy)]
+pub struct DocArchived;
+
+/// The only writes an archived doc accepts.
+pub const ARCHIVE_RESTORE_ROUTE: &str = "/api/docs/{id}/restore";
+pub const ARCHIVE_PURGE_ROUTE: &str = "/api/docs/{id}/purge";
 
 // Named extractor so axum is happy on routes that carry extra path params
 // (e.g. `/api/docs/{id}/grants/{principal}`). A plain `Path<Uuid>` would fail
@@ -45,18 +58,29 @@ pub async fn require_doc_role_mw(
     let Some(acl) = state.acl.clone() else {
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "");
     };
-    let role = match acl
-        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
-        .await
-    {
-        Ok(Some(r)) => r,
+    let access = match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
+        Ok(Some(access)) => access,
         Ok(None) => return json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""),
         Err(e) => {
             tracing::error!(error=?e, "acl resolve");
             return json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "");
         }
     };
-    req.extensions_mut().insert(EffectiveDocRole(role));
+    if !access.can_read() {
+        return json_err(StatusCode::NOT_FOUND, "doc.not_found", "");
+    }
+    if access.archived {
+        let route = req
+            .extensions()
+            .get::<MatchedPath>()
+            .map(MatchedPath::as_str);
+        let archive_action = matches!(route, Some(ARCHIVE_RESTORE_ROUTE | ARCHIVE_PURGE_ROUTE));
+        if !matches!(*req.method(), Method::GET | Method::HEAD) && !archive_action {
+            return doc_archived();
+        }
+        req.extensions_mut().insert(DocArchived);
+    }
+    req.extensions_mut().insert(EffectiveDocRole(access.role));
     next.run(req).await
 }
 

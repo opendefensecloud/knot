@@ -255,6 +255,13 @@ async fn run_server(cfg: Config) {
         knot_server::reindex::spawn(state.clone(), rx);
         tracing::info!("reindex worker spawned");
     }
+    if state.pool.is_some() {
+        knot_server::archive::spawn_purge_job(state.clone());
+        tracing::info!(
+            retention_days = cfg.archive_retention_days,
+            "archive purge job spawned"
+        );
+    }
     if let (Some(pool), Some(acl), Some(docs)) =
         (state.pool.clone(), state.acl.clone(), state.docs.clone())
     {

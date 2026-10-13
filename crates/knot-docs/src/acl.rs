@@ -19,6 +19,27 @@ use uuid::Uuid;
 
 pub type EffectiveRole = WorkspaceRole;
 
+/// What a user may do with one doc: their effective role plus whether the
+/// doc is in the archive. Archived docs are read-only for editors and
+/// owners and invisible to viewers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocAccess {
+    pub role: WorkspaceRole,
+    pub archived: bool,
+}
+
+impl DocAccess {
+    /// Viewers lose sight of a doc once it is archived.
+    pub fn can_read(self) -> bool {
+        !(self.archived && self.role == WorkspaceRole::Viewer)
+    }
+
+    /// Nobody edits an archived doc; it has to be restored first.
+    pub fn can_write(self) -> bool {
+        !self.archived && matches!(self.role, WorkspaceRole::Owner | WorkspaceRole::Editor)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ResolveError {
     #[error("workspace: {0}")]
@@ -48,7 +69,7 @@ pub async fn resolve(
     workspace_id: Uuid,
     doc_id: Uuid,
     user_id: Uuid,
-) -> Result<Option<EffectiveRole>, ResolveError> {
+) -> Result<Option<DocAccess>, ResolveError> {
     // Tenancy guard: the document must belong to the caller's workspace.
     // Without this, `get_member_role(workspace_id, user_id)` returns the
     // caller's role in their OWN workspace for ANY doc_id — granting a member
@@ -56,10 +77,10 @@ pub async fn resolve(
     // by UUID. We re-assert the doc's workspace here (the cache key is
     // (doc_id, user_id), and a doc maps to exactly one workspace, so this does
     // not poison other users' entries).
-    match docs.get(doc_id).await? {
-        Some(doc) if doc.workspace_id == workspace_id => {}
+    let archived = match docs.get(doc_id).await? {
+        Some(doc) if doc.workspace_id == workspace_id => doc.archived_at.is_some(),
         _ => return Ok(None),
-    }
+    };
     let workspace_role = workspaces.get_member_role(workspace_id, user_id).await?;
     let principal = format!("user:{user_id}");
     let inherited = grants.list_inherited(workspace_id, doc_id).await?;
@@ -68,12 +89,13 @@ pub async fn resolve(
         .filter(|g| g.principal == principal)
         .map(|g| g.role)
         .reduce(max);
-    Ok(match (workspace_role, grant_role) {
+    let role = match (workspace_role, grant_role) {
         (None, None) => None,
         (Some(w), None) => Some(w),
         (None, Some(g)) => Some(g),
         (Some(w), Some(g)) => Some(max(w, g)),
-    })
+    };
+    Ok(role.map(|role| DocAccess { role, archived }))
 }
 
 #[cfg(test)]
@@ -98,12 +120,57 @@ mod tests {
         (ws_s, gs, ds, w.id, u.id)
     }
 
+    #[test]
+    fn archived_docs_are_read_only_and_hidden_from_viewers() {
+        use WorkspaceRole::{Editor, Owner, Viewer};
+        let access = |role, archived| DocAccess { role, archived };
+        assert!(access(Owner, false).can_write());
+        assert!(access(Editor, false).can_write());
+        assert!(!access(Viewer, false).can_write());
+        assert!(access(Viewer, false).can_read());
+        for role in [Owner, Editor, Viewer] {
+            assert!(
+                !access(role, true).can_write(),
+                "{role:?} wrote an archived doc"
+            );
+        }
+        assert!(access(Owner, true).can_read());
+        assert!(access(Editor, true).can_read());
+        assert!(!access(Viewer, true).can_read());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archived_doc_reports_archived() {
+        let (ws_s, gs, ds, ws, user) = ctx().await;
+        let live = ds.create(ws, None, "Live", "m", user).await.unwrap();
+        let gone = ds.create(ws, None, "Gone", "n", user).await.unwrap();
+        ds.archive(ws, gone.id, user).await.unwrap();
+
+        let live_access = resolve(&ws_s, &gs, &ds, ws, live.id, user).await.unwrap();
+        let gone_access = resolve(&ws_s, &gs, &ds, ws, gone.id, user).await.unwrap();
+
+        assert_eq!(
+            live_access,
+            Some(DocAccess {
+                role: WorkspaceRole::Viewer,
+                archived: false
+            })
+        );
+        assert_eq!(
+            gone_access,
+            Some(DocAccess {
+                role: WorkspaceRole::Viewer,
+                archived: true
+            })
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn workspace_role_used_when_no_grant() {
         let (ws_s, gs, ds, ws, user) = ctx().await;
         let d = ds.create(ws, None, "X", "m", user).await.unwrap();
         let r = resolve(&ws_s, &gs, &ds, ws, d.id, user).await.unwrap();
-        assert_eq!(r, Some(WorkspaceRole::Viewer));
+        assert_eq!(r.map(|a| a.role), Some(WorkspaceRole::Viewer));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -121,7 +188,7 @@ mod tests {
         .await
         .unwrap();
         let r = resolve(&ws_s, &gs, &ds, ws, d.id, user).await.unwrap();
-        assert_eq!(r, Some(WorkspaceRole::Owner));
+        assert_eq!(r.map(|a| a.role), Some(WorkspaceRole::Owner));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -140,7 +207,7 @@ mod tests {
         .await
         .unwrap();
         let r = resolve(&ws_s, &gs, &ds, ws, child.id, user).await.unwrap();
-        assert_eq!(r, Some(WorkspaceRole::Editor));
+        assert_eq!(r.map(|a| a.role), Some(WorkspaceRole::Editor));
     }
 
     #[tokio::test(flavor = "multi_thread")]
