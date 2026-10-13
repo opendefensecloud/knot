@@ -82,7 +82,7 @@ test("byline names the creator and lists only the people who edited the content"
   await expect.poll(() => editorOf(bob).evaluate(docText), { timeout: 8_000 }).toMatch(/Written by Alice\./);
 
   // While Bob watches, Alice types — including a URL, so autolink runs (a bare
-  // www. domain: typing "//" opens knot's date picker). Watching must never
+  // www. domain: a "//" after a space opens knot's date picker). Watching must never
   // credit Bob: not the handshake his editor answered on connect, and not any
   // edit his editor might send in reaction to hers. (Alice's own update
   // already carries the link mark, so this path does not exercise the

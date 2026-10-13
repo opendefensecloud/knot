@@ -3,7 +3,7 @@ import CollaborationCaret from "@tiptap/extension-collaboration-caret";
 import Image from "@tiptap/extension-image";
 import Link from "@tiptap/extension-link";
 import Underline from "@tiptap/extension-underline";
-import { Plugin, type Transaction } from "@tiptap/pm/state";
+import { Plugin, Selection, type Transaction } from "@tiptap/pm/state";
 import StarterKit from "@tiptap/starter-kit";
 import { ySyncPluginKey } from "@tiptap/y-tiptap";
 import type { Awareness } from "y-protocols/awareness";
@@ -56,40 +56,108 @@ const KnotLink = Link.extend({
   },
 
   /**
-   * Autolink only the local user's own typing.
+   * A link ends where its text ends: text typed or pasted at either edge of
+   * a link stays plain.
    *
-   * Upstream's autolink plugin is an `appendTransaction` hook that fires on
-   * any doc-changing transaction, and y-tiptap mirrors every peer edit into
-   * this editor as one. So a peer typing "https://… " made every other open
-   * editor append a link mark and write it into the shared doc as its own
-   * edit: duplicate traffic, and — since the server records who changed a
-   * page — a contributor credit for someone who only had the page open. The
-   * peer's own editor already linked the URL in its local transaction, so
-   * skipping the mirrored copy loses nothing.
+   * Upstream ties this to the `autolink` option (`inclusive() { return
+   * this.options.autolink }`), a v2 leftover from when autolink rewrote a
+   * growing link's href. It no longer does, so with autolink on, every
+   * keystroke at a link's end joined its text while the href stayed put.
+   * Paste made that the common case: the paste rule keeps the caret inside a
+   * link that ends the pasted text, precisely to honour `inclusive`
+   * (tiptap#7692), so "paste a URL, keep typing" linked the rest of the
+   * sentence. The same happened after a doc link, an edited date, an HTML
+   * paste or a click at the end of any link, and typing at the start of a
+   * paragraph joined a link that opened it.
    *
-   * The batch is skipped only when every transaction in it came from y-sync;
-   * a local keystroke batched alongside a remote change still autolinks.
-   * Undo/redo also arrives as a y-sync change (Yjs UndoManager owns undo),
-   * which is fine: re-linking text the user just undid would be wrong anyway.
+   * Tiptap's own fix (tiptap#8335, 3.31.4) only stops a typed space from
+   * joining; punctuation, and text typed without a space, still did.
+   * Non-inclusive is what prosemirror-schema-basic's link does, at the same
+   * cost: retyping a link's last character, or typing over all of its text,
+   * gives plain text. It also makes upstream's `exitable` ArrowRight handler
+   * inert, which is wanted — at the end of a paragraph it wrote a stray space
+   * into the shared doc.
    *
-   * The plugin is found by its key name because upstream does not export it;
-   * autolink.test.ts fails if that lookup ever stops matching.
+   * `inclusive` is a local editing rule and is never serialised, so the
+   * Y.Doc, `tools/schema.json` and the server are unaffected. Leave
+   * `excludes` alone: y-tiptap derives the `link` attribute key from it, and
+   * `to_markdown` reads that key.
+   */
+  inclusive() {
+    return false;
+  },
+
+  /**
+   * Adjusts two upstream plugins; see localAutolinkOnly and
+   * caretAfterPastedLink. Both are found by their key names because upstream
+   * exports neither; autolink.test.ts and linkBoundary.test.ts fail if a
+   * lookup ever stops matching.
    */
   addProseMirrorPlugins() {
     return (this.parent?.() ?? []).map((plugin) => {
       const keyName = (plugin as unknown as { key?: string }).key ?? "";
-      const append = plugin.spec.appendTransaction;
-      if (!keyName.startsWith("autolink$") || !append) return plugin;
-      return new Plugin({
-        ...plugin.spec,
-        appendTransaction: (transactions, oldState, newState) => {
-          if (transactions.every(isRemoteSync)) return null;
-          return append.call(plugin, transactions, oldState, newState);
-        },
-      });
+      if (keyName.startsWith("autolink$")) return localAutolinkOnly(plugin);
+      if (keyName.startsWith("handlePasteLink$")) return caretAfterPastedLink(plugin);
+      return plugin;
     });
   },
 });
+
+/**
+ * Autolink only the local user's own typing.
+ *
+ * Upstream's autolink plugin is an `appendTransaction` hook that fires on
+ * any doc-changing transaction, and y-tiptap mirrors every peer edit into
+ * this editor as one. So a peer typing "https://… " made every other open
+ * editor append a link mark and write it into the shared doc as its own
+ * edit: duplicate traffic, and — since the server records who changed a
+ * page — a contributor credit for someone who only had the page open. The
+ * peer's own editor already linked the URL in its local transaction, so
+ * skipping the mirrored copy loses nothing.
+ *
+ * The batch is skipped only when every transaction in it came from y-sync;
+ * a local keystroke batched alongside a remote change still autolinks.
+ * Undo/redo also arrives as a y-sync change (Yjs UndoManager owns undo),
+ * which is fine: re-linking text the user just undid would be wrong anyway.
+ */
+function localAutolinkOnly(plugin: Plugin): Plugin {
+  const append = plugin.spec.appendTransaction;
+  if (!append) return plugin;
+  return new Plugin({
+    ...plugin.spec,
+    appendTransaction: (transactions, oldState, newState) => {
+      if (transactions.every(isRemoteSync)) return null;
+      return append.call(plugin, transactions, oldState, newState);
+    },
+  });
+}
+
+/**
+ * Pasting a URL over selected text links that text and, upstream, leaves it
+ * selected — so the next keystroke replaced the new link outright. The caret
+ * moves to the link's end instead, where (non-inclusive) typing carries on
+ * as plain text.
+ *
+ * `Selection.near` rather than a TextSelection at `to`: after select-all or a
+ * table-cell selection, `to` is not inside a textblock, and a caret there
+ * made the next keystroke open a new paragraph.
+ */
+function caretAfterPastedLink(plugin: Plugin): Plugin {
+  const handlePaste = plugin.spec.props?.handlePaste;
+  if (!handlePaste) return plugin;
+  return new Plugin({
+    ...plugin.spec,
+    props: {
+      ...plugin.spec.props,
+      handlePaste: (view, event, slice) => {
+        if (!handlePaste.call(plugin, view, event, slice)) return false;
+        const { state } = view;
+        view.dispatch(state.tr.setSelection(Selection.near(state.doc.resolve(state.selection.to), -1)));
+        return true;
+      },
+    },
+  });
+}
 
 /** True for a transaction y-tiptap dispatched to mirror a Y.Doc change that
  *  did not originate in this editor (a peer's edit, or a Yjs undo/redo). */

@@ -88,6 +88,23 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - An open editor no longer autolinks text that arrives from someone else's
   change, which wrote a link edit into the shared document under the
   observer's name.
+- **Text typed after a pasted link became part of the link.** Paste a URL,
+  keep typing, and the rest of the sentence was linked to that URL. The same
+  happened when typing at the end of any link (after a document link, an
+  edited date, or clicking at a link's end) and at the start of a paragraph
+  that opens with one. A link now ends where its text ends. As a result,
+  retyping a link's last character, or typing over all of its text, gives
+  plain text; use the toolbar's Link button to change a link.
+- Pasting a URL over selected text leaves the cursor after the new link
+  instead of keeping it selected, so the next keystroke no longer replaces it.
+- With the cursor at the start or end of a link, the toolbar's Link button
+  shows that link. It could open with an empty URL, and applying that empty URL
+  removed the link.
+- Applying a URL from the toolbar with nothing selected inserts the URL as the
+  link's text, instead of linking whatever was typed next.
+- Typing or pasting a URL such as `https://…` or `file:///…` no longer opens
+  the date picker, which took the keyboard focus so the next keystrokes went
+  into it.
 - **Revoking access did not reach open editors.** The 4403 close an ACL change
   should send never fired, so a revoked user kept a working socket and their
   edits were still applied and saved. Open connections are now closed with
