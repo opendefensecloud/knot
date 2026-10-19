@@ -397,7 +397,8 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     let Some(parent) = stack.last() else {
                         continue;
                     };
-                    parent.push_back(&mut txn, XmlElementPrelim::empty("hard_break"));
+                    let target = inline_container(parent, &mut txn);
+                    target.push_back(&mut txn, XmlElementPrelim::empty("hard_break"));
                 }
                 Event::Rule => {
                     // CommonMark horizontal rule. Always lives at the top level.
@@ -442,7 +443,8 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         // Outside blockquote: treat as a space.
                         if parent.tag().as_ref() != "code_block" {
                             let attrs = attrs_from_marks(&active_marks);
-                            let text_ref = ensure_text_child(parent, &mut txn);
+                            let target = inline_container(parent, &mut txn);
+                            let text_ref = ensure_text_child(&target, &mut txn);
                             let pos = text_ref.len(&txn);
                             text_ref.insert_with_attributes(&mut txn, pos, " ", attrs);
                         }
@@ -549,6 +551,14 @@ fn ensure_para_child(parent: &XmlElementRef, txn: &mut yrs::TransactionMut) -> X
         return el;
     }
     parent.push_back(txn, XmlElementPrelim::empty("paragraph"))
+}
+
+fn inline_container(parent: &XmlElementRef, txn: &mut yrs::TransactionMut) -> XmlElementRef {
+    if parent.tag().as_ref() == "list_item" {
+        ensure_para_child(parent, txn)
+    } else {
+        parent.clone()
+    }
 }
 
 /// Find the last XmlText child of `parent`, or create one if none.

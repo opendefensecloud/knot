@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Doc } from "../../lib/validators";
-import { buildTree, descendantIds, dropIntent, applyOptimisticMove, moveArgs } from "./tree";
+import { buildTree, descendantIds, dropIntent, applyOptimisticMove, moveArgs, resolveDrop } from "./tree";
 
 function doc(id: string, parent: string | null, sort_key: string): Doc {
   return {
@@ -122,5 +122,70 @@ describe("moveArgs", () => {
   it("into puts parent_id only", () => {
     const t = doc("a", "p", "m");
     expect(moveArgs(t, "into")).toEqual({ parent_id: "a" });
+  });
+});
+
+describe("resolveDrop", () => {
+  const tree = buildTree([
+    doc("a", null, "m"),
+    doc("a1", "a", "m"),
+    doc("a2", "a", "n"),
+    doc("a2x", "a2", "m"),
+    doc("b", null, "n"),
+  ]);
+  const open = { pointerX: 999, titleX: 0, isExpanded: () => true };
+
+  it("into nests under the hovered row", () => {
+    expect(resolveDrop(tree, "b", "a", "into", open)).toMatchObject({ depth: 1, args: { parent_id: "a" } });
+  });
+
+  it("before places at the hovered row's level", () => {
+    expect(resolveDrop(tree, "b", "a", "before", open)).toMatchObject({
+      depth: 0,
+      args: { parent_id: null, before_id: "a" },
+    });
+  });
+
+  it("after an expanded parent becomes its first child", () => {
+    expect(resolveDrop(tree, "b", "a", "after", open)).toMatchObject({
+      depth: 1,
+      args: { parent_id: "a", before_id: "a1" },
+    });
+  });
+
+  it("after a collapsed parent stays at its level", () => {
+    expect(resolveDrop(tree, "b", "a", "after", { ...open, isExpanded: () => false })).toMatchObject({
+      depth: 0,
+      args: { parent_id: null, after_id: "a" },
+    });
+  });
+
+  it("after a last child climbs a level per step the pointer moves left of the row's title", () => {
+    const at = (pointerX: number) =>
+      resolveDrop(tree, "b", "a2x", "after", { pointerX, titleX: 48, isExpanded: () => true });
+    expect(at(60)).toMatchObject({ depth: 2, args: { parent_id: "a2", after_id: "a2x" } });
+    expect(at(48)).toMatchObject({ depth: 2, args: { parent_id: "a2", after_id: "a2x" } });
+    expect(at(40)).toMatchObject({ depth: 1, args: { parent_id: "a", after_id: "a2" } });
+    expect(at(20)).toMatchObject({ depth: 0, args: { parent_id: null, after_id: "a" } });
+    expect(at(-100)).toMatchObject({ depth: 0, args: { parent_id: null, after_id: "a" } });
+  });
+
+  it("after a child that is not last cannot climb", () => {
+    expect(resolveDrop(tree, "b", "a1", "after", { pointerX: 0, titleX: 100, isExpanded: () => true })).toMatchObject({
+      depth: 1,
+      args: { parent_id: "a", after_id: "a1" },
+    });
+  });
+
+  it("ignores the dragged row when deciding what is last", () => {
+    expect(resolveDrop(tree, "a2", "a1", "after", { pointerX: 0, titleX: 100, isExpanded: () => true })).toMatchObject({
+      depth: 0,
+      args: { parent_id: null, after_id: "a" },
+    });
+  });
+
+  it("refuses drops onto the dragged subtree", () => {
+    expect(resolveDrop(tree, "a", "a2x", "into", open)).toBeNull();
+    expect(resolveDrop(tree, "a", "a", "after", open)).toBeNull();
   });
 });
