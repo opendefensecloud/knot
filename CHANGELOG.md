@@ -8,6 +8,38 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-21
+
+### Upgrading
+- knot no longer trusts the `emSign ECC Root CA - G3` root certificate. If your
+  OIDC provider, S3 endpoint or Postgres server presents a certificate that
+  chains to it, knot can no longer connect to it. Chrome is removing the same
+  root. (#43)
+
+### Security
+- **eMudhra CA key compromise** (RUSTSEC-2026-0381, RUSTSEC-2026-0382). The
+  private keys of eight eMudhra intermediate CAs can be recovered from their
+  public certificates, so anyone can issue a certificate for any hostname that
+  knot accepted. This affected knot's connections to the OIDC provider, the S3
+  blob backend and Postgres. An attacker in the network path to the OIDC
+  provider could substitute their own signing keys when knot starts and then
+  sign in as any user, or capture the client secret and users' authorization
+  codes at login. knot's trusted roots are compiled into the binary and it
+  checks neither revocation nor Certificate Transparency, so eMudhra's
+  revocation and the browser blocks did not protect it, and there is no CA
+  bundle to update: upgrading is the only fix. `rustls-webpki` 0.103.16
+  rejects chains through the eight intermediates and `webpki-roots` 1.0.10
+  drops the root. The Postgres change-notification connection was not
+  affected: it trusts only `sslrootcert`. (#43)
+- `rustls` 0.23.46 fixes RUSTSEC-2026-0346, RUSTSEC-2026-0347,
+  RUSTSEC-2026-0348 and RUSTSEC-2026-0349. (#43)
+- `ammonia` 4.1.8 fixes RUSTSEC-2026-0373. knot was not affected: its
+  sanitizer does not allow `style` attributes. (#43)
+- RUSTSEC-2026-0367, RUSTSEC-2026-0368 and RUSTSEC-2026-0369 (`zip`
+  extraction) are acknowledged in `deny.toml`. knot was not affected: it reads
+  import archives in memory and never extracts them to disk. The fix needs
+  zip 9. (#43)
+
 ## [0.8.0] - 2026-10-13
 
 ### Upgrading
@@ -559,7 +591,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/opendefensecloud/knot/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/opendefensecloud/knot/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/opendefensecloud/knot/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/opendefensecloud/knot/compare/v0.5.0...v0.6.0
