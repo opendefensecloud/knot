@@ -50,6 +50,20 @@ ignore = [
     # Drop when: figment moves its Yaml provider off serde_yaml, or knot drops
     # YAML config files.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; via figment's Yaml provider (serde_yaml); parses only the operator's KNOT_CONFIG file; no vulnerability" },
+
+    # zip < 9 extracts archives unsafely: ZipArchive::extract and
+    # ZipStreamReader::extract keep SUID/SGID bits, create symlinks whose
+    # targets lie outside the destination, and apply permissions through them.
+    # zip is a DIRECT dependency of knot-server (workspace export/import),
+    # pinned at ^8; the fixes exist only in the 9.0 major, which Renovate raises
+    # from the Dependency Dashboard rather than on its own.
+    # Reachability: none. Import opens the upload with ZipArchive::new over an
+    # in-memory buffer and reads entries by name; export only writes through
+    # ZipWriter. Nothing calls extract() or writes to the filesystem.
+    # Drop when: knot-server moves to zip >= 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip extract() keeps SUID/SGID bits; fix only in zip 9; knot reads archives in memory and never extracts" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract() symlinks escape the destination; fix only in zip 9; knot reads archives in memory and never extracts" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract() chmods through symlinks; fix only in zip 9; knot reads archives in memory and never extracts" },
 ]
 
 [licenses]
