@@ -183,7 +183,7 @@ settings/     account · devices · appearance · editor · notifications · off
 
 - **Document ⋯ menu:** favorite, keep offline, copy link, share links, comments, info, history, permissions, move, save as template, archive/restore, import Markdown (document picker), export Markdown, open in browser, reading mode.
 - **Roles drive the UI.** Viewers get a read-only editor and no comment composer, as on the web. Destructive and admin actions need a connection and say why when offline. With app lock on, they also ask for re-authentication.
-- **Quick note** appends a timestamped paragraph to a page the user picked once (default: a "Quick notes" page they choose on first use). Because the page already exists, it works offline.
+- **Quick note** opens a page the user picked once (a "Quick notes" page they choose on first use) in the editor, with a new timestamped paragraph at the end, the caret in it and the keyboard up. It is an ordinary editor session, not a background edit, so it works offline [call].
 - **Multiple accounts.** The data model supports several accounts (servers) from day one. The account-switcher UI ships after 1.0 **[call]**.
 
 ### 5.4 Editor
@@ -511,7 +511,8 @@ knot becomes the login service for its own apps, so **nothing changes at the org
    - Under MDM, `allow_add_server=false` blocks the step.
 2. **Authorize in the system browser.** The app opens `https://host/auth/app/authorize?response_type=code&client_id=knot-mobile&redirect_uri=…&code_challenge=…&code_challenge_method=S256&state=…&device_name=…&platform=…`.
    - **iOS:** ASWebAuthenticationSession with the custom scheme `<rdns>.knot:/oauth`. The session keeps the callback to itself.
-   - **Android:** a verified https App Link on the relay domain, `https://<relay>/oauth/cb`, via Auth Tab where available, otherwise Custom Tabs. Any app can claim a custom scheme on Android, so the server accepts only the https redirect when `platform=android`.
+   - **Android:** a verified https App Link on the relay domain, `https://<relay>/oauth/cb`, via Auth Tab where available, otherwise Custom Tabs. Any app can claim a custom scheme on Android, so by default the server accepts only the https redirect when `platform=android`.
+   - **Android without the relay [call].** Fleets that cannot reach the relay or Google's link verifier (VPN-only, air-gapped, locked-down MDM) would otherwise be unable to sign in. The operator setting `KNOT_APP_ANDROID_REDIRECT=relay|scheme` (default `relay`) lets them accept the custom scheme instead. The operator guide says this is meant for managed fleets, where the MDM controls which apps are installed and so which app could claim the scheme.
    - The browser session is ephemeral by default. A server hint can switch that off for organisations that want IdP SSO reuse.
 3. **Sign in** on knot's normal login page: password, or OIDC through the existing callback with `return_to`. For OIDC, `/auth/app/authorize` requires a recent sign-in (`auth_time` within 10 minutes; the server passes `max_age` to the IdP).
 4. **Consent.** A server-rendered page asks "Sign in to the knot app on '<device, as reported by the app>' as <email> at <host>?". The page carries its own CSRF token.
@@ -603,10 +604,10 @@ knot becomes the login service for its own apps, so **nothing changes at the org
 ### 6.4 Tasks
 
 - **Tasks tab:** the user's tasks from the server, cached.
-- **Toggling.**
-  - If the page is cached, the toggle is applied as a CRDT edit through the document, which also works offline.
-  - Otherwise `PATCH …/tasks/{item_index}` carries `expected_text`, and the server answers 409 `task.stale` on a mismatch.
-  - Today's index-only toggle can tick the wrong task in a page that changed.
+- **Toggling [call].**
+  - Inside the open editor, a checkbox is an ordinary CRDT edit and works offline.
+  - From the Tasks tab, the toggle needs a connection in v1: `PATCH …/tasks/{item_index}` carries `expected_text`, and the server answers 409 `task.stale` on a mismatch. Today's index-only toggle can tick the wrong task in a page that changed.
+  - v1 has no "headless edit of a closed page" component; Hermes never builds a Y.Doc.
 
 ### 6.5 Settings, admin, policy (parity) [owner]
 
@@ -822,7 +823,7 @@ Effort is a rough size for one engineer who knows the codebase, including tests:
 | K-B1 | `feat(api)`: `GET /api/capabilities` (`instance_id`, issuer/`base_url`, version, `api_level`, `collab_proto`, schema version/hash, features, `app_auth`, `mobile{…}`, `mobile_policy{…}`, `push{…}`); login-relevant fields unauthenticated, the rest behind auth; Helm values | A2, A6 | S |
 | K-B2 | `feat(auth)`: `return_to` end to end (`RequireAuth` keeps path, query and hash; local login + OIDC flow state); HMAC-signed `oidc_flow`; open-redirect tests; IdP error page; `email_verified` fix | — | M |
 | K-B3 | `feat(auth)`: bearer device sessions (`AuthContext{session_id, via}`; header-only; no cookie fallback; CSRF skipped for bearer); sessions migration (public id, kind, client id, device name, platform, app version, auth method, idle TTL, absolute expiry); sliding expiry; revocation tombstones with reason and wipe; `KNOT_DEVICE_SESSION_*`; amend the foundation spec's non-goal | — | M |
-| K-B4 | `feat(auth)`: `/auth/app/authorize`, consent page, one-time PKCE-bound code, `iss`, `/auth/app/token`; redirect allowlist (`KNOT_APP_REDIRECT_URIS`) with https-only for Android; recent `auth_time` for OIDC; cleanup of the transient web session | B2, B3 | L |
+| K-B4 | `feat(auth)`: `/auth/app/authorize`, consent page, one-time PKCE-bound code, `iss`, `/auth/app/token`; redirect allowlist (`KNOT_APP_REDIRECT_URIS`) with https-only for Android unless `KNOT_APP_ANDROID_REDIRECT=scheme`; recent `auth_time` for OIDC; cleanup of the transient web session | B2, B3 | L |
 | K-B4b | `feat(auth)`: OIDC-backed device sessions follow the IdP: `offline_access` refresh daily → `idp_deprovisioned`; 30-day cap otherwise | B4 | M |
 | K-B5 | `feat(security)`: `KNOT_TRUSTED_PROXIES` for the login throttle; CSRF HMAC verification; WS Origin check for cookie connections; `GET /auth/verify` forward-auth endpoint | B3 | S–M |
 
@@ -843,7 +844,7 @@ Effort is a rough size for one engineer who knows the codebase, including tests:
 | K-D1 | `feat(favorites)`: `user_favorites(user_id, doc_id, sort_key, created_at)`; `GET /api/me/favorites`, idempotent `PUT /api/me/favorites/{doc_id}` (add or move with `after_id`/`before_id`), `DELETE`; ACL-filtered, hidden while archived, cascade on purge, limit 200. **Web:** a sidebar Favorites section, a star in the page header and tree menu, drag reorder. | — | M |
 | K-D2 | `feat(recents)`: `GET /api/me/recent`, "edited by me", from `doc_contributors` | — | S |
 
-**The "mobile baseline" server release** is Waves A–D plus K-C0. It becomes the app's minimum server version.
+**The "mobile baseline" server release** is Waves A–D plus K-C0, K-B5 and K-F3. It becomes the app's minimum server version.
 
 **Wave E: collaborate and link**
 
@@ -870,7 +871,7 @@ Effort is a rough size for one engineer who knows the codebase, including tests:
 |---|---|---|---|
 | K-F1 | `feat(push)`: Web Push in knot-server (migration, `/api/push/config`, `/api/me/push-subscriptions` CRUD + test, `GET /api/notifications/{id}`, worker, HMAC Topic, padding, allowlist SSRF guard, rate limits, metrics, `KNOT_PUSH_*` + Helm, e2e with a fake decrypting endpoint) | B3, E3, E10 | L |
 | K-F2 | `feat(push-gateway)`: `crates/knot-push-gateway` + image + Helm chart + release workflow + data-handling statement, with abuse controls (§7.2) | — | L |
-| K-F3 | `feat(collab)`: server-side validation of inbound updates on every write path (WS, HTTP sync, healing upload). Needs a v1 decoder that resolves parents against the existing doc, or apply + inspect + rebuild-and-close on violation. Covers names, attribute and mark keys, typed attribute values (heading 1–6, `colwidth` bounds, `href` scheme allowlist http/https/mailto/knot), depth ≤ 64, child counts, string lengths, update size. **Must be deployed before the first external organisation uses the app (M2 entry).** | A6, C2 | L |
+| K-F3 | `feat(collab)`: server-side validation of inbound updates on every write path (WS, HTTP sync, healing upload). Needs a v1 decoder that resolves parents against the existing doc, or apply + inspect + rebuild-and-close on violation. Covers names, attribute and mark keys, typed attribute values (heading 1–6, `colwidth` bounds, `href` scheme allowlist http/https/mailto/knot), depth ≤ 64, child counts, string lengths, update size. **Part of the mobile baseline: deployed before the app writes to any server (M1).** | A6, C2 | L |
 | K-F4 | `feat(api)`: client-chosen ids + idempotent replay on `POST /api/docs`, comments, replies and reactions (enables offline creation after 1.0) | — | S–M |
 | K-F5 | `feat(auth)`: `KNOT_SESSION_KEY` key set with key ids | B3 | S |
 
@@ -885,8 +886,8 @@ Each milestone gets its own implementation plan (`superpowers:writing-plans`), e
 | Milestone | Contents | Exit criteria |
 |---|---|---|
 | **M0: Spikes and groundwork** | S1–S13 on real devices; K-A0, K-A1, K-A2b; logistics (§13); demo server | S1 passes (go/no-go); S3 and S4 numbers confirm the design; S11 confirms SQLCipher |
-| **M1: Internal alpha, "write fast"** | Server: Waves A–D + K-C0 + K-B5, with B3, B4, C1 and C2 started in M0 and their golden frames frozen early, so the app can be built against a fake server. App: add server; login (password and SSO); Home (continue writing, favorites, recents, Quick note); open → type → sync → offline with v2 and Rescue; editor host; toolbar; input rules; undo; `@` and `//`; viewing images; local title search + server search; basic settings; beta crash reports. TestFlight and Play internal track. | Two weeks of daily use by the team with **zero integrity events and zero lost text**; G1 targets met; edits visible on the web within 1 s |
-| **M2: Closed beta, "collaborate and link"** | Server: Wave E, **K-F3 deployed**; K-F1 and K-F2 started. App: pages tree with create, rename, move and archive; uploads (HEIC→JPEG) and attachments; board SVG; Mermaid; `/` and `[[`; full comments; Inbox (polling); Tasks; full table editing; deep links (LinkRouter, relay, banner, `?thread=&comment=`); Copy link; Devices; FTS over bodies; keep offline; Connection doctor; quick actions. One or two friendly organisations. | Element link → exact comment in at most one extra tap on both platforms (G3); a 4403-storm soak stays green; no lost edits reported |
+| **M1: Internal alpha, "write fast"** | Server: Waves A–D + K-C0 + K-B5 + **K-F3** [call], with B3, B4, C1 and C2 started in M0 and their golden frames frozen early, so the app can be built against a fake server. The relay site (`deploy/relay/`, serving `assetlinks.json` and the Android OAuth callback) is live by S7 in M0. Before the alpha writes to any server holding real shared content, the pre-bind validator runs over a copy of that database to count pages the app would open read-only, and a backup-and-restore drill is done. App: add server; login (password and SSO); Home (continue writing, favorites, recents, Quick note); open → type → sync → offline with v2 and Rescue; editor host; toolbar; input rules; undo; `@` and `//`; viewing images; local title search + server search; basic settings; beta crash reports. TestFlight and Play internal track. | Two weeks of daily use by the team with **zero integrity events and zero lost text**; G1 targets met; edits visible on the web within 1 s |
+| **M2: Closed beta, "collaborate and link"** | Server: Wave E; K-F1 and K-F2 started. App: pages tree with create, rename, move and archive; uploads (HEIC→JPEG) and attachments; board SVG; Mermaid; `/` and `[[`; full comments; Inbox (polling); Tasks; full table editing; deep links (LinkRouter, relay, banner, `?thread=&comment=`); Copy link; Devices; FTS over bodies; keep offline; Connection doctor; quick actions. One or two friendly organisations. | Element link → exact comment in at most one extra tap on both platforms (G3); a 4403-storm soak stays green; no lost edits reported |
 | **M3: 1.0, "parity and push"** | Server: K-F1, K-F2, K-F4, K-F5, K-E13. App: push (APNs + extension, FCM); permissions and grants; share links; history and restore; templates; members and roles; archive list and purge; import/export; password change; app lock and strict mode; `mobile_policy` enforcement; MDM managed config; English + German; accessibility pass; store launch; signed APK on GitHub Releases | Parity checklist (G5) done, except Excalidraw editing; push p50 ≤ 3 s; store approval |
 | **M4: After 1.0** | UnifiedPush + Google-free build (IzzyOnDroid, then F-Droid); offline creation; account switcher UI; whole-workspace offline; mTLS; MDM `applinks` certification; iPad layouts; tree drag-reorder; ids-only push; widgets and share extension; self-hosted OTA if needed; per-organisation build kit | — |
 
@@ -922,6 +923,7 @@ These are not design questions, but the work is blocked without them:
 2. **Google Play Console** organisation account.
 3. **The domain** opendefensecloud wants for the bundle id / package name (`<rdns>.knot`), the link relay and the push gateway.
 4. **An APNs key and a Firebase project**, created under those accounts.
+4b. **CI signing material**: an App Store Connect API key, encrypted storage for fastlane `match`, a Play service account, and protected GitHub environments (with required reviewers) holding them.
 5. **Test phones**: at least one iPhone and one mid-range Android (ideally a Samsung), with access for installing builds.
 6. **A permanent public demo server** with a review account for store review.
 
