@@ -29,6 +29,7 @@ pub mod auth;
 pub mod board_room_shim;
 pub mod comments_listener;
 pub mod export;
+pub mod export_check;
 pub mod http_error;
 pub mod metrics;
 pub mod protocol;

@@ -174,6 +174,8 @@ helm upgrade knot ./deploy/helm/knot -n knot -f my-values.yaml
 
 The `pre-upgrade` Job re-runs `knot-server migrate` before the new pods land, so any new migrations in the release are applied first. Failed migrations halt the upgrade — fix the cause and re-run.
 
+Before rolling out a release that changes page export, run `knot-server export-check` against a staging copy of the production database: it exports every page to DOCX and ODT offline (no migration, no writes), prints the fallback counts, and exits 1 if any page fails.
+
 ## Operational notes
 
 - **Healthchecks** — readiness `/api/readyz`, liveness `/api/healthz`. Disable with `probes.enabled=false` if you want to debug a wedged pod.
