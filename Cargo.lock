@@ -2023,6 +2023,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "knot-export"
+version = "0.0.0"
+dependencies = [
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "url",
+ "uuid",
+ "yrs",
+]
+
+[[package]]
 name = "knot-markdown"
 version = "0.0.0"
 dependencies = [
