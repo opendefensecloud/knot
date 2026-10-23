@@ -666,7 +666,11 @@ fn deeply_nested_lists_are_capped_without_stack_overflow() {
         let mut txn = doc.transact_mut();
         let mut cur = frag.push_back(&mut txn, XmlElementPrelim::empty("bullet_list"));
         for i in 1..5_000 {
-            let tag = if i % 2 == 0 { "bullet_list" } else { "ordered_list" };
+            let tag = if i % 2 == 0 {
+                "bullet_list"
+            } else {
+                "ordered_list"
+            };
             cur = cur.push_back(&mut txn, XmlElementPrelim::empty(tag));
         }
         let para = cur.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
