@@ -10,7 +10,9 @@ pub mod tables;
 pub mod walk;
 pub mod xml;
 
+pub use assets::{Assets, ExportError, Fallbacks, ImageAsset, Meta, Output, PicFormat, Picture};
 pub use docx::write_docx;
+pub use media::{picture_from_png, prepare_image};
 pub use model::*;
 pub use odt::write_odt;
 pub use walk::{

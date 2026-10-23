@@ -12,14 +12,16 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
 use knot_crdt::{Rooms, SnapshotPolicy, YrsEngine};
-use knot_export::assets::{Fallbacks, ImageAsset};
-use knot_export::{Block, ExportDoc, ImageSource, Inline, LinkTarget, Marks, Run};
+use knot_export::{
+    Block, ExportDoc, Fallbacks, ImageAsset, ImageSource, Inline, LinkTarget, Marks, Run,
+};
 use knot_server::export::{self, Format};
 use knot_server::{AppState, router_with_state};
 use knot_storage::{PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore, WorkspaceRole};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
+use yrs::{Any, ReadTxn, Transact, Xml, XmlElementPrelim, XmlFragment, XmlTextPrelim};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -230,6 +232,32 @@ impl World {
         assert_eq!(response.status(), StatusCode::NO_CONTENT, "markdown import");
     }
 
+    /// Replace the page's content with `content`'s state through the room,
+    /// for shapes the markdown import cannot produce (unknown elements).
+    async fn set_content(&self, doc_id: Uuid, content: &yrs::Doc) {
+        let update_bytes = content
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        let room = self
+            .state
+            .rooms_v2
+            .as_ref()
+            .unwrap()
+            .acquire(doc_id)
+            .await
+            .unwrap();
+        let (reply, done) = tokio::sync::oneshot::channel();
+        room.tx
+            .send(knot_crdt::Event::ReplaceWithMarkdown {
+                update_bytes,
+                by_user: Some(self.owner.user_id),
+                reply,
+            })
+            .await
+            .unwrap();
+        done.await.unwrap().expect("replace page content");
+    }
+
     /// Upload `bytes` as a blob of `doc_id`; returns its `/api/blobs/<id>` url.
     async fn upload(&self, doc_id: Uuid, content_type: &str, bytes: &[u8]) -> String {
         const BOUNDARY: &str = "----ExportTestBoundary";
@@ -382,6 +410,89 @@ async fn resolve_assets_checks_blob_access_and_budget() {
     ));
 }
 
+/// The budget is a running total over the page: once earlier images have
+/// spent it, an image that alone would fit is still refused. A smaller one
+/// after it that fits the remainder is embedded, so the budget skips images
+/// rather than stopping at the first refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn image_budget_is_a_running_total() {
+    let world = world().await;
+    let page = world.create_doc("Pictures").await;
+    let first = world.insert_blob(world.workspace_id, page, PNG_3X2).await;
+    let second = world.insert_blob(world.workspace_id, page, PNG_3X2).await;
+    let smaller = world.insert_blob(world.workspace_id, page, TINY_PNG).await;
+    let doc = ExportDoc {
+        blocks: vec![image(first), image(second), image(smaller)],
+    };
+    // Room for one PNG_3X2 plus TINY_PNG, but not for two PNG_3X2.
+    let budget = 2 * PNG_3X2.len() as i64 - 1;
+    assert!((PNG_3X2.len() + TINY_PNG.len()) as i64 <= budget);
+
+    let user = world.owner.user_id;
+    let assets =
+        export::resolve_assets_with_budget(&world.state, user, &doc, HashMap::new(), budget)
+            .await
+            .unwrap();
+    assert!(
+        matches!(assets.images[&first.to_string()], ImageAsset::Embedded(_)),
+        "first: {:?}",
+        assets.images[&first.to_string()]
+    );
+    assert!(
+        matches!(assets.images[&second.to_string()], ImageAsset::OverBudget),
+        "second: {:?}",
+        assets.images[&second.to_string()]
+    );
+    assert!(
+        matches!(assets.images[&smaller.to_string()], ImageAsset::Embedded(_)),
+        "smaller: {:?}",
+        assets.images[&smaller.to_string()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn build_counts_each_fallback_kind() {
+    let world = world().await;
+    let page = world.create_doc("Fallbacks").await;
+    let owner = world.owner.user_id;
+    let (other_ws, other_doc) = world.foreign_doc().await;
+    let foreign = world.insert_blob(other_ws, other_doc, PNG_3X2).await;
+
+    // An unreadable image, a board nobody supplied a picture for, and an
+    // element the walker does not know.
+    let content = yrs::Doc::new();
+    let fragment = content.get_or_insert_xml_fragment("default");
+    {
+        let mut txn = content.transact_mut();
+        let picture = fragment.push_back(&mut txn, XmlElementPrelim::empty("image"));
+        picture.insert_attribute(&mut txn, "src", Any::from(format!("/api/blobs/{foreign}")));
+        let board = fragment.push_back(&mut txn, XmlElementPrelim::empty("excalidraw_board"));
+        board.insert_attribute(&mut txn, "board_id", Any::from(Uuid::new_v4().to_string()));
+        let callout = fragment.push_back(&mut txn, XmlElementPrelim::empty("callout"));
+        callout.push_back(&mut txn, XmlTextPrelim::new("Heads up"));
+    }
+    world.set_content(page, &content).await;
+
+    let snapshot = export::snapshot(&world.state, page).await.unwrap();
+    let walked = knot_export::walk(snapshot.inner());
+    assert_eq!(walked.unknown_elements, ["callout"]);
+
+    for format in [Format::Docx, Format::Odt] {
+        let built = export::build(&world.state, owner, page, format, HashMap::new())
+            .await
+            .unwrap();
+        let fallbacks = built.fallbacks;
+        assert_eq!(fallbacks.image_unavailable, 1, "{format:?}: {fallbacks:?}");
+        assert!(fallbacks.diagram >= 1, "{format:?}: {fallbacks:?}");
+        assert_eq!(fallbacks.image_over_budget, 0, "{format:?}: {fallbacks:?}");
+        assert_eq!(
+            fallbacks.unknown_element,
+            walked.unknown_elements.len() as u32,
+            "{format:?}: {fallbacks:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn resolve_assets_keeps_page_diagrams_and_names_mentions() {
     let world = world().await;
@@ -437,7 +548,7 @@ async fn converted_webp_is_charged_at_its_prepared_size() {
             alt: String::new(),
         }],
     };
-    let prepared = knot_export::media::prepare_image(WEBP_2X2).unwrap();
+    let prepared = knot_export::prepare_image(WEBP_2X2).unwrap();
     assert!(
         prepared.bytes.len() > WEBP_2X2.len(),
         "the PNG outgrows the WebP"

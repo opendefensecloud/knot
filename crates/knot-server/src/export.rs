@@ -7,14 +7,15 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use knot_crdt::{DocHandle, Engine, YrsEngine};
-use knot_export::assets::{Assets, Fallbacks, ImageAsset, Meta};
-use knot_export::media::{picture_from_png, prepare_image};
-use knot_export::{DiagramRef, ExportDoc};
+use knot_crdt::DocHandle;
+use knot_export::{
+    Assets, DiagramRef, ExportDoc, Fallbacks, ImageAsset, Meta, picture_from_png, prepare_image,
+};
 use knot_storage::BlobStoreError;
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::routes::api::markdown::live_snapshot;
 
 /// Image bytes one export may embed (40 MiB), counted after preparation.
 pub const IMAGE_BUDGET_BYTES: i64 = 40 * 1024 * 1024;
@@ -83,37 +84,12 @@ fn not_configured(what: &str) -> ExportFailure {
     ExportFailure::Store(format!("{what} not configured"))
 }
 
-/// The page's live state, copied into a transient doc (the snapshot step of
-/// `routes/api/markdown.rs`). The room actor only encodes its state, so it
-/// keeps serving editors while the export walks the copy.
+/// The page's live state, copied into a transient doc by the same
+/// [`live_snapshot`] the markdown export uses. The room actor only encodes
+/// its state, so it keeps serving editors while the export walks the copy.
 pub async fn snapshot(state: &AppState, doc_id: Uuid) -> Result<DocHandle, ExportFailure> {
-    let unreachable = || ExportFailure::Room(format!("room actor unreachable for {doc_id}"));
-    let rooms = state
-        .rooms_v2
-        .clone()
-        .ok_or_else(|| ExportFailure::Room("server state missing rooms registry".into()))?;
-    let room = rooms
-        .acquire(doc_id)
+    let (transient, _seq) = live_snapshot(state, doc_id)
         .await
-        .map_err(|e| ExportFailure::Room(format!("acquire {doc_id}: {e}")))?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if room
-        .tx
-        .send(knot_crdt::Event::ExportState(tx))
-        .await
-        .is_err()
-    {
-        return Err(unreachable());
-    }
-    let (state_bytes, _seq) = match rx.await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(ExportFailure::Room(format!("room actor: {e}"))),
-        Err(_) => return Err(unreachable()),
-    };
-    let engine = YrsEngine;
-    let transient = engine.new_doc();
-    engine
-        .apply_update(&transient, &state_bytes)
         .map_err(|e| ExportFailure::Room(e.to_string()))?;
     Ok(transient)
 }
