@@ -233,6 +233,15 @@ fn walk_element<T: ReadTxn>(
     unknown: &mut Vec<String>,
     depth: usize,
 ) -> Block {
+    if depth > MAX_DEPTH {
+        // Reached through list/element recursion that never passes through
+        // walk_blocks or inlines; cap here too.
+        unknown.push("depth-limit".to_owned());
+        return Block::Paragraph(vec![Inline::Run(Run {
+            text: flatten_text(el, txn),
+            marks: Marks::default(),
+        })]);
+    }
     let tag = el.tag().to_string();
     match tag.as_str() {
         "paragraph" => Block::Paragraph(inlines(el, txn, depth)),

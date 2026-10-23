@@ -658,6 +658,36 @@ fn deep_nesting_is_capped_without_stack_overflow() {
 }
 
 #[test]
+fn deeply_nested_lists_are_capped_without_stack_overflow() {
+    use yrs::{Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+    let doc = yrs::Doc::new();
+    {
+        let frag = doc.get_or_insert_xml_fragment("default");
+        let mut txn = doc.transact_mut();
+        let mut cur = frag.push_back(&mut txn, XmlElementPrelim::empty("bullet_list"));
+        for i in 1..5_000 {
+            let tag = if i % 2 == 0 { "bullet_list" } else { "ordered_list" };
+            cur = cur.push_back(&mut txn, XmlElementPrelim::empty(tag));
+        }
+        let para = cur.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+        para.push_back(&mut txn, XmlTextPrelim::new("deep"));
+    }
+    let unknown = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let w = walk(&doc);
+            let u = w.unknown_elements.clone();
+            // Leak the shallow capped model; the test only needs the walk.
+            std::mem::forget(w);
+            u
+        })
+        .unwrap()
+        .join()
+        .expect("walk must not overflow the stack on nested lists");
+    assert!(unknown.iter().any(|u| u == "depth-limit"), "{unknown:?}");
+}
+
+#[test]
 fn heading_level_non_finite_defaults_to_1() {
     let w = walk(&build(vec![
         el("heading", vec![("level", "NaN".into())], vec![t("a")]),
