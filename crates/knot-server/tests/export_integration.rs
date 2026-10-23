@@ -1,5 +1,6 @@
 //! Page export to DOCX/ODT: the export service (snapshot, asset resolution,
-//! build) against a fresh database per test, with a real rooms registry.
+//! build) and its routes, against a fresh database per test, with a real
+//! rooms registry.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -9,6 +10,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::response::Response;
 use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
 use knot_crdt::{Rooms, SnapshotPolicy, YrsEngine};
@@ -19,6 +21,8 @@ use knot_server::export::{self, Format};
 use knot_server::{AppState, router_with_state};
 use knot_storage::{PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore, WorkspaceRole};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 use tower::ServiceExt;
 use uuid::Uuid;
 use yrs::{Any, ReadTxn, Transact, Xml, XmlElementPrelim, XmlFragment, XmlTextPrelim};
@@ -170,7 +174,7 @@ async fn send_raw(
     uri: &str,
     content_type: Option<&str>,
     body: Vec<u8>,
-) -> axum::response::Response {
+) -> Response {
     let mut request = Request::builder().method(method).uri(uri);
     if let Some(who) = who {
         request = request
@@ -186,7 +190,7 @@ async fn send_raw(
         .unwrap()
 }
 
-async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
+async fn body_bytes(response: Response) -> Vec<u8> {
     response
         .into_body()
         .collect()
@@ -196,7 +200,7 @@ async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
         .to_vec()
 }
 
-async fn body_json(response: axum::response::Response) -> Value {
+async fn body_json(response: Response) -> Value {
     serde_json::from_slice(&body_bytes(response).await).unwrap()
 }
 
@@ -260,21 +264,13 @@ impl World {
 
     /// Upload `bytes` as a blob of `doc_id`; returns its `/api/blobs/<id>` url.
     async fn upload(&self, doc_id: Uuid, content_type: &str, bytes: &[u8]) -> String {
-        const BOUNDARY: &str = "----ExportTestBoundary";
-        let mut body = Vec::new();
-        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
-        body.extend_from_slice(
-            b"Content-Disposition: form-data; name=\"file\"; filename=\"picture\"\r\n",
-        );
-        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
-        body.extend_from_slice(bytes);
-        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        let (multipart_type, body) = multipart(&[("file", bytes)], content_type);
         let response = send_raw(
             &self.app,
             Some(&self.owner),
             "POST",
             &format!("/api/docs/{doc_id}/blobs"),
-            Some(&format!("multipart/form-data; boundary={BOUNDARY}")),
+            Some(&multipart_type),
             body,
         )
         .await;
@@ -341,6 +337,145 @@ impl World {
             .unwrap();
         (other_ws.id, doc.id)
     }
+
+    /// Invite a member with `role` ("viewer" or "editor") and log them in.
+    async fn member(&self, email: &str, role: &str) -> Session {
+        let response = send_raw(
+            &self.app,
+            Some(&self.owner),
+            "POST",
+            "/api/workspace/members",
+            Some("application/json"),
+            json!({"email": email, "role": role, "password": PASSWORD, "display_name": role})
+                .to_string()
+                .into_bytes(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "invite {email}");
+        let user = self
+            .state
+            .users
+            .as_ref()
+            .unwrap()
+            .find_by_email(email)
+            .await
+            .unwrap()
+            .unwrap();
+        login(&self.app, email, user.id).await
+    }
+
+    /// Move `doc_id` to the archive as the owner.
+    async fn archive(&self, doc_id: Uuid) {
+        let response = send_raw(
+            &self.app,
+            Some(&self.owner),
+            "DELETE",
+            &format!("/api/docs/{doc_id}"),
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "archive");
+    }
+
+    /// `GET /api/docs/{doc_id}/export/diagrams` as `who`.
+    async fn diagrams(&self, who: &Session, doc_id: Uuid) -> Response {
+        send_raw(
+            &self.app,
+            Some(who),
+            "GET",
+            &format!("/api/docs/{doc_id}/export/diagrams"),
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// The diagram keys the listing gives for `doc_id`, in its order.
+    async fn diagram_keys(&self, doc_id: Uuid) -> Vec<String> {
+        let response = self.diagrams(&self.owner, doc_id).await;
+        assert_eq!(response.status(), StatusCode::OK, "diagrams listing");
+        body_json(response).await["diagrams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["key"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// `POST /api/docs/{doc_id}/export/{format}` as `who`, with one PNG part
+    /// per `(name, bytes)`, or an empty body without a content type when
+    /// there are none.
+    async fn export(
+        &self,
+        who: &Session,
+        doc_id: Uuid,
+        format: &str,
+        pictures: &[(&str, &[u8])],
+    ) -> Response {
+        let (content_type, body) = if pictures.is_empty() {
+            (None, Vec::new())
+        } else {
+            let (content_type, body) = multipart(pictures, "image/png");
+            (Some(content_type), body)
+        };
+        send_raw(
+            &self.app,
+            Some(who),
+            "POST",
+            &format!("/api/docs/{doc_id}/export/{format}"),
+            content_type.as_deref(),
+            body,
+        )
+        .await
+    }
+}
+
+/// A `multipart/form-data` body with one `content_type` part per
+/// `(name, bytes)`; returns the request's content type and the body.
+fn multipart(parts: &[(&str, &[u8])], content_type: &str) -> (String, Vec<u8>) {
+    const BOUNDARY: &str = "----ExportTestBoundary";
+    let mut body = Vec::new();
+    for (name, bytes) in parts {
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"; filename=\"picture\"\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={BOUNDARY}"), body)
+}
+
+/// A PNG of exactly `len` bytes: `TINY_PNG` padded after its end chunk, so
+/// it still reads as a 1×1 picture.
+fn padded_png(len: usize) -> Vec<u8> {
+    let mut png = TINY_PNG.to_vec();
+    png.resize(len, 0);
+    png
+}
+
+fn header<'a>(response: &'a Response, name: &str) -> &'a str {
+    response
+        .headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("{name} missing"))
+        .to_str()
+        .unwrap()
+}
+
+fn fallbacks_header(response: &Response) -> &str {
+    header(response, "x-knot-export-fallbacks")
+}
+
+async fn error_code(response: Response) -> String {
+    body_json(response).await["error"]["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// One zip entry's bytes, or `None` when absent.
@@ -350,6 +485,16 @@ fn zip_entry(zip: &[u8], name: &str) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     file.read_to_end(&mut out).unwrap();
     Some(out)
+}
+
+/// The names of all zip entries starting with `prefix`.
+fn zip_names(zip: &[u8], prefix: &str) -> Vec<String> {
+    let archive = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
+    archive
+        .file_names()
+        .filter(|name| name.starts_with(prefix))
+        .map(str::to_string)
+        .collect()
 }
 
 fn zip_text(zip: &[u8], name: &str) -> String {
@@ -641,4 +786,292 @@ async fn build_uses_live_state_and_current_display_names() {
         assert!(body.contains("@Olive Owner"), "{format:?}: {body}");
         assert!(!body.contains("@Old"), "{format:?}: {body}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+const DOCX_TYPE: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const ODT_TYPE: &str = "application/vnd.oasis.opendocument.text";
+const NO_FALLBACKS: &str = "diagrams=0, images=0, unknown=0";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn viewer_can_export_docx_and_odt() {
+    let world = world().await;
+    let viewer = world.member("viewer@export.test", "viewer").await;
+    let page = world.create_doc("Plan").await;
+    world.set_markdown(page, "# Plan\n\nHello.\n").await;
+
+    for (format, content_type) in [("docx", DOCX_TYPE), ("odt", ODT_TYPE)] {
+        let response = world.export(&viewer, page, format, &[]).await;
+        assert_eq!(response.status(), StatusCode::OK, "{format}");
+        assert_eq!(header(&response, "content-type"), content_type);
+        let disposition = header(&response, "content-disposition");
+        assert!(disposition.starts_with("attachment; "), "{disposition}");
+        assert!(
+            disposition.contains(&format!("filename*=UTF-8''Plan.{format}")),
+            "{disposition}"
+        );
+        assert_eq!(fallbacks_header(&response), NO_FALLBACKS);
+        assert!(body_bytes(response).await.starts_with(b"PK"), "{format}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn template_pages_export() {
+    let world = world().await;
+    let page = world.create_doc("Meeting notes").await;
+    world
+        .state
+        .docs
+        .as_ref()
+        .unwrap()
+        .set_template(world.workspace_id, page, world.owner.user_id, true)
+        .await
+        .unwrap();
+
+    let response = world.export(&world.owner, page, "odt", &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_bytes(response).await.starts_with(b"PK"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn archived_pages_are_refused() {
+    let world = world().await;
+    let viewer = world.member("viewer@export.test", "viewer").await;
+    let editor = world.member("editor@export.test", "editor").await;
+    let page = world.create_doc("Old plan").await;
+    world.archive(page).await;
+
+    for response in [
+        world.diagrams(&viewer, page).await,
+        world.export(&viewer, page, "docx", &[]).await,
+    ] {
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(response).await, "doc.not_found");
+    }
+    for response in [
+        world.diagrams(&editor, page).await,
+        world.export(&editor, page, "docx", &[]).await,
+    ] {
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(error_code(response).await, "doc.archived");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_errors() {
+    let world = world().await;
+    let page = world.create_doc("Page").await;
+    let uri = format!("/api/docs/{page}/export/docx");
+
+    // The session cookie alone, without the CSRF header.
+    let response = world
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("cookie", &world.owner.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_code(response).await, "auth.csrf");
+
+    let response = world.export(&world.owner, page, "pdf", &[]).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(response).await, "export.bad_format");
+
+    let response = send_raw(&world.app, None, "POST", &uri, None, Vec::new()).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(error_code(response).await, "auth.session_required");
+
+    let (_, foreign) = world.foreign_doc().await;
+    for response in [
+        world.diagrams(&world.owner, foreign).await,
+        world.export(&world.owner, foreign, "docx", &[]).await,
+    ] {
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(error_code(response).await, "acl.no_grant");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn body_over_limit_is_413_but_big_part_falls_back() {
+    let world = world().await;
+    let page = world.create_doc("Diagrams").await;
+    world
+        .set_markdown(
+            page,
+            "```mermaid\ngraph TD; A-->B\n```\n\n```mermaid\ngraph TD; B-->C\n```\n",
+        )
+        .await;
+    let keys = world.diagram_keys(page).await;
+    assert_eq!(keys.len(), 2, "{keys:?}");
+
+    let huge = padded_png(11 * 1024 * 1024);
+    let response = world
+        .export(&world.owner, page, "docx", &[(&keys[0], &huge)])
+        .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(error_code(response).await, "export.too_large");
+
+    // A readable picture past the 2 MiB part cap is dropped; the part after
+    // it is still read.
+    let big = padded_png(3 * 1024 * 1024);
+    let response = world
+        .export(
+            &world.owner,
+            page,
+            "docx",
+            &[(&keys[0], &big), (&keys[1], TINY_PNG)],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fallbacks_header(&response),
+        "diagrams=1, images=0, unknown=0"
+    );
+
+    // A part of exactly 2 MiB is kept.
+    let at_cap = padded_png(2 * 1024 * 1024);
+    let response = world
+        .export(
+            &world.owner,
+            page,
+            "docx",
+            &[(&keys[0], &at_cap), (&keys[1], TINY_PNG)],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fallbacks_header(&response), NO_FALLBACKS);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diagrams_listing_matches_writer_keys() {
+    let world = world().await;
+    let page = world.create_doc("Flow").await;
+    world
+        .set_markdown(page, "```mermaid\ngraph TD; A-->B\n```\n")
+        .await;
+    let key = format!("mermaid-{:x}", Sha256::digest(b"graph TD; A-->B"));
+
+    let response = world.diagrams(&world.owner, page).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await,
+        json!({
+            "limits": {
+                "max_body_bytes": 10485760,
+                "max_part_bytes": 2097152,
+                "max_parts": 100,
+                "scale": 2,
+            },
+            "diagrams": [{"key": key, "kind": "mermaid", "source": "graph TD; A-->B"}],
+        })
+    );
+
+    // A part named after nothing on the page is ignored.
+    let response = world
+        .export(
+            &world.owner,
+            page,
+            "docx",
+            &[("mermaid-not-on-page", TINY_PNG), (&key, TINY_PNG)],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fallbacks_header(&response), NO_FALLBACKS);
+    let docx = body_bytes(response).await;
+    assert_eq!(zip_names(&docx, "word/media/").len(), 1);
+
+    // Boards are listed with their id and label.
+    let board_page = world.create_doc("Board").await;
+    let board_id = Uuid::new_v4().to_string();
+    let content = yrs::Doc::new();
+    let fragment = content.get_or_insert_xml_fragment("default");
+    {
+        let mut txn = content.transact_mut();
+        let board = fragment.push_back(&mut txn, XmlElementPrelim::empty("excalidraw_board"));
+        board.insert_attribute(&mut txn, "board_id", Any::from(board_id.clone()));
+        board.insert_attribute(&mut txn, "label", Any::from("Roadmap"));
+    }
+    world.set_content(board_page, &content).await;
+    let response = world.diagrams(&world.owner, board_page).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await["diagrams"],
+        json!([{
+            "key": format!("board-{board_id}"),
+            "kind": "board",
+            "board_id": board_id,
+            "label": "Roadmap",
+        }])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn third_concurrent_export_gets_503() {
+    let world = world_with(|s| {
+        s.export_permits = Arc::new(Semaphore::new(0));
+        s.export_busy_wait = Duration::from_millis(50);
+    })
+    .await;
+    let page = world.create_doc("Busy").await;
+
+    let response = world.export(&world.owner, page, "docx", &[]).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(header(&response, "retry-after"), "5");
+    assert_eq!(error_code(response).await, "export.busy");
+
+    // One free slot serves exports one after the other: each gives its
+    // permit back when it is done.
+    world.state.export_permits.add_permits(1);
+    for _ in 0..2 {
+        let response = world.export(&world.owner, page, "docx", &[]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parts_beyond_one_hundred_fall_back() {
+    let world = world().await;
+    let page = world.create_doc("Many diagrams").await;
+    let markdown: String = (0..101)
+        .map(|i| format!("```mermaid\ngraph TD; A-->N{i}\n```\n\n"))
+        .collect();
+    world.set_markdown(page, &markdown).await;
+    let keys = world.diagram_keys(page).await;
+    assert_eq!(keys.len(), 101);
+
+    let parts: Vec<(&str, &[u8])> = keys.iter().map(|key| (key.as_str(), TINY_PNG)).collect();
+    let response = world.export(&world.owner, page, "docx", &parts).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fallbacks_header(&response),
+        "diagrams=1, images=0, unknown=0"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn filename_is_sanitized_on_both_sides() {
+    let world = world().await;
+    let page = world.create_doc("Q4 / Plan").await;
+
+    let response = world.export(&world.owner, page, "docx", &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let disposition = header(&response, "content-disposition");
+    assert!(
+        disposition.contains("filename*=UTF-8''Q4%20-%20Plan.docx"),
+        "{disposition}"
+    );
+    assert!(
+        disposition.contains(r#"filename="Q4 - Plan.docx""#),
+        "{disposition}"
+    );
 }

@@ -23,6 +23,9 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   the card hides it until the next upgrade, on every device. New users start
   caught up, and development builds never show it. `GET /api/whats-new`,
   `POST /api/whats-new/seen`. (#45)
+- Word (DOCX) and OpenDocument (ODT) export from the page header's download
+  menu, with diagrams as pictures. `GET /api/docs/{id}/export/diagrams`,
+  `POST /api/docs/{id}/export/{docx|odt}`.
 
 ### Security
 - `ctutils` 0.4.5 fixes RUSTSEC-2026-0385: its constant-time helpers could
