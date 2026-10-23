@@ -1,10 +1,8 @@
 //! Tables: a fixed grid of `w:gridCol`s from the column shares, every row
 //! filled out to that grid, and spans as `w:gridSpan` and `w:vMerge`.
 
-use std::collections::BTreeMap;
-
 use crate::model::{Align, Cell, Table};
-use crate::tables::header_rows;
+use crate::tables::{Slot, grid_edges, header_rows, layout};
 
 use super::body::QUOTE_INDENT_TWIPS;
 use super::{Ctx, body};
@@ -15,18 +13,6 @@ const CELL_MARGINS_TWIPS: u32 = 216;
 
 const V_MERGE_RESTART: &str = r#"<w:vMerge w:val="restart"/>"#;
 const V_MERGE_CONTINUE: &str = "<w:vMerge/>";
-
-/// A vertical merge that still covers rows below the current one.
-#[derive(Clone, Copy)]
-struct Merge {
-    /// Grid columns it spans.
-    span: usize,
-    /// Rows it still covers, counting from the next row written.
-    rows_left: usize,
-    /// Whether it started in a header cell; its continuations are shaded
-    /// like it.
-    header: bool,
-}
 
 /// Write `t`, `avail_twips` wide. A table without columns or rows writes
 /// nothing. Word joins adjacent tables into one, so a table right after
@@ -63,87 +49,40 @@ pub(super) fn table(cx: &mut Ctx, t: &Table, avail_twips: u32) {
     cx.xml.push_str("</w:tblGrid>");
 
     let heads = header_rows(t);
-    // Open vertical merges by their first grid column. They never overlap.
-    let mut merges = BTreeMap::new();
-    for (r, cells) in t.rows.iter().enumerate() {
+    // The whole table is one row group: a row span is clamped to the end of
+    // the table, also when it starts in a header row.
+    let rows = t.rows.len();
+    for (r, slots) in layout(t, move |_| rows).enumerate() {
         cx.xml.push_str("<w:tr>");
         if r < heads {
             cx.xml.push_str("<w:trPr><w:tblHeader/></w:trPr>");
         }
-        row(cx, cells, t.rows.len() - r, &edges, &mut merges);
+        for slot in slots {
+            row_slot(cx, slot, &edges);
+        }
         cx.xml.push_str("</w:tr>");
     }
     cx.xml.push_str("</w:tbl>");
 }
 
-/// Column boundaries in twips from the table's left edge, `shares.len() + 1`
-/// of them from 0 to `avail_twips`. Each column gets its share of the
-/// width, rounded, and the last one what is left, so they add up exactly.
-fn grid_edges(shares: &[f64], avail_twips: u32) -> Vec<u32> {
-    let mut edges = vec![0];
-    let mut at = 0;
-    for share in &shares[..shares.len().saturating_sub(1)] {
-        let width = (share * f64::from(avail_twips)).round() as u32;
-        at += width.min(avail_twips - at);
-        edges.push(at);
-    }
-    edges.push(avail_twips);
-    edges
-}
-
-/// One row across the whole grid, left to right: each cell at its column, a
-/// continuation wherever a merge from a row above reaches into this one, and
-/// an empty cell for each gap that is left. A column span is clamped to the
-/// grid and stops short of a merge; a row span is clamped to the
-/// `rows_to_end` rows from this one to the end of the table.
-fn row(
-    cx: &mut Ctx,
-    cells: &[Cell],
-    rows_to_end: usize,
-    edges: &[u32],
-    merges: &mut BTreeMap<usize, Merge>,
-) {
-    let width = edges.len() - 1;
-    let mut opened = Vec::new();
-    let mut cells = cells.iter().peekable();
-    let mut pos = 0;
-    while pos < width {
-        let next_merge = merges.range(pos..).next().map(|(col, m)| (*col, *m));
-        if let Some((col, m)) = next_merge.filter(|(col, _)| *col == pos) {
-            let twips = edges[col + m.span] - edges[col];
-            empty_cell(cx, twips, m.span, Some(V_MERGE_CONTINUE), m.header);
-            pos += m.span;
-            continue;
+/// One slot of a row: a cell, a continuation of a merge from a row above
+/// (shaded like the cell it continues), or an empty cell filling a gap.
+fn row_slot(cx: &mut Ctx, slot: Slot, edges: &[u32]) {
+    match slot {
+        Slot::Cell {
+            cell: c,
+            pos,
+            span,
+            rowspan,
+        } => cell(cx, c, edges[pos + span] - edges[pos], span, rowspan > 1),
+        Slot::Covered { pos, span, header } => {
+            let twips = edges[pos + span] - edges[pos];
+            empty_cell(cx, twips, span, Some(V_MERGE_CONTINUE), header);
         }
-        let limit = next_merge.map_or(width, |(col, _)| col);
-        if let Some(c) = cells.next_if(|c| c.col <= pos) {
-            let span = c.colspan.clamp(1, limit - pos);
-            let rowspan = c.rowspan.clamp(1, rows_to_end);
-            if rowspan > 1 {
-                opened.push((
-                    pos,
-                    Merge {
-                        span,
-                        rows_left: rowspan - 1,
-                        header: c.header,
-                    },
-                ));
-            }
-            cell(cx, c, edges[pos + span] - edges[pos], span, rowspan > 1);
-            pos += span;
-        } else {
-            // One cell per gap, however wide, so a crafted wide grid can't
-            // multiply the output.
-            let end = cells.peek().map_or(limit, |c| c.col.min(limit));
+        Slot::Gap { pos, end } => {
             empty_cell(cx, edges[end] - edges[pos], end - pos, None, false);
-            pos = end;
         }
     }
-    merges.retain(|_, m| {
-        m.rows_left -= 1;
-        m.rows_left > 0
-    });
-    merges.extend(opened);
 }
 
 /// A cell with `c`'s blocks, `twips` wide over `span` grid columns.

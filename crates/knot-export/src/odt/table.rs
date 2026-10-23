@@ -3,10 +3,8 @@
 //! `number-columns-spanned` / `number-rows-spanned` on its cell plus a
 //! `table:covered-table-cell` for each other grid position it covers.
 
-use std::collections::BTreeMap;
-
 use crate::model::{Align, Cell, Table};
-use crate::tables::header_rows;
+use crate::tables::{Slot, grid_edges, header_rows, layout};
 
 use super::{CellCx, Ctx, body};
 
@@ -30,15 +28,6 @@ const CELL_STYLES: &str = concat!(
     r#"fo:padding-left="0.19cm" fo:padding-right="0.19cm" fo:border="0.5pt solid #bfbfbf"/>"#,
     r#"</style:style>"#,
 );
-
-/// A row span that still covers rows below the current one.
-#[derive(Clone, Copy)]
-struct Merge {
-    /// Grid columns it spans.
-    span: usize,
-    /// Rows it still covers, counting from the next row written.
-    rows_left: usize,
-}
 
 /// Write `t`, `avail_cm` wide. A table without columns or rows writes
 /// nothing.
@@ -69,35 +58,23 @@ pub(super) fn table(cx: &mut Ctx, t: &Table, avail_cm: f64) {
     }
     // The header rows form a group of their own, which no row span leaves.
     let heads = header_rows(t);
-    let mut merges = BTreeMap::new();
-    for (r, cells) in t.rows.iter().enumerate() {
+    let rows = t.rows.len();
+    let group_end = move |r| if r < heads { heads } else { rows };
+    for (r, slots) in layout(t, group_end).enumerate() {
         if r == 0 && heads > 0 {
             cx.body.push_str("<table:table-header-rows>");
         }
-        let group_end = if r < heads { heads } else { t.rows.len() };
-        row(cx, cells, group_end - r, &edges, &mut merges);
+        cx.body.push_str("<table:table-row>");
+        for slot in slots {
+            row_slot(cx, slot, &edges);
+        }
+        cx.body.push_str("</table:table-row>");
         if r + 1 == heads {
             cx.body.push_str("</table:table-header-rows>");
         }
     }
     cx.body.push_str("</table:table>");
     body::reopen_lists(cx, lists);
-}
-
-/// Column boundaries in thousandths of a cm from the table's left edge,
-/// `shares.len() + 1` of them from 0 to `total`. Each column gets its share
-/// of the width, rounded, and the last one what is left, so they add up
-/// exactly.
-fn grid_edges(shares: &[f64], total: u32) -> Vec<u32> {
-    let mut edges = vec![0];
-    let mut at = 0;
-    for share in &shares[..shares.len() - 1] {
-        let width = (share * f64::from(total)).round() as u32;
-        at += width.min(total - at);
-        edges.push(at);
-    }
-    edges.push(total);
-    edges
 }
 
 /// A length in thousandths of a cm, never zero (ODF lengths of tables and
@@ -145,59 +122,23 @@ fn styles(cx: &mut Ctx, name: &str, shares: &[f64], edges: &[u32], indent_cm: f6
     }
 }
 
-/// One row across the whole grid, left to right: each cell at its column,
-/// covered cells wherever a row span from above reaches into this one, and
-/// one empty cell spanning each gap that is left. A column span is clamped
-/// to the grid and stops short of a row span; a row span is clamped to the
-/// `rows_to_end` rows from this one to the end of its row group.
-fn row(
-    cx: &mut Ctx,
-    cells: &[Cell],
-    rows_to_end: usize,
-    edges: &[u32],
-    merges: &mut BTreeMap<usize, Merge>,
-) {
-    let width = edges.len() - 1;
-    cx.body.push_str("<table:table-row>");
-    let mut opened = Vec::new();
-    let mut cells = cells.iter().peekable();
-    let mut pos = 0;
-    while pos < width {
-        let next_merge = merges.range(pos..).next().map(|(col, m)| (*col, *m));
-        if let Some((_, m)) = next_merge.filter(|(col, _)| *col == pos) {
-            covered(cx, m.span);
-            pos += m.span;
-            continue;
-        }
-        let limit = next_merge.map_or(width, |(col, _)| col);
-        if let Some(c) = cells.next_if(|c| c.col <= pos) {
-            let span = c.colspan.clamp(1, limit - pos);
-            let rowspan = c.rowspan.clamp(1, rows_to_end);
-            if rowspan > 1 {
-                opened.push((
-                    pos,
-                    Merge {
-                        span,
-                        rows_left: rowspan - 1,
-                    },
-                ));
-            }
-            cell(cx, c, edges[pos + span] - edges[pos], span, rowspan);
-            pos += span;
-        } else {
-            let end = cells.peek().map_or(limit, |c| c.col.min(limit));
+/// One slot of a row: a cell, covered cells where a row span from above
+/// reaches into the row, or one empty cell spanning a gap.
+fn row_slot(cx: &mut Ctx, slot: Slot, edges: &[u32]) {
+    match slot {
+        Slot::Cell {
+            cell: c,
+            pos,
+            span,
+            rowspan,
+        } => cell(cx, c, edges[pos + span] - edges[pos], span, rowspan),
+        Slot::Covered { span, .. } => covered(cx, span),
+        Slot::Gap { pos, end } => {
             open_cell(cx, CELL, end - pos, 1);
             cx.body.push_str("</table:table-cell>");
             covered(cx, end - pos - 1);
-            pos = end;
         }
     }
-    merges.retain(|_, m| {
-        m.rows_left -= 1;
-        m.rows_left > 0
-    });
-    merges.extend(opened);
-    cx.body.push_str("</table:table-row>");
 }
 
 /// The opening tag of a cell spanning `span` columns and `rows` rows.
