@@ -75,6 +75,40 @@ describe("ExportMenu", () => {
     expect(screen.getByTestId("doc-export")).toHaveFocus();
   });
 
+  describe("at phone width", () => {
+    /** Lays the menu out at `left`..`right` in a 375 px wide viewport. */
+    function layOut(left: number, right: number) {
+      vi.spyOn(document.documentElement, "clientWidth", "get").mockReturnValue(375);
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+        const [l, r] = this.getAttribute("role") === "menu" ? [left, right] : [0, 0];
+        return { left: l, right: r, width: r - l, top: 0, bottom: 0, height: 0, x: l, y: 0, toJSON: () => ({}) };
+      });
+    }
+    afterEach(() => vi.restoreAllMocks());
+
+    it("shifts a menu that would open past the left edge back into view", () => {
+      // A trigger near the left edge of a wrapped header row.
+      layOut(-190, 100);
+      mount();
+      open();
+      expect(screen.getByRole("menu").style.transform).toBe("translateX(206px)");
+    });
+
+    it("shifts a menu that would open past the right edge back into view", () => {
+      layOut(300, 590);
+      mount();
+      open();
+      expect(screen.getByRole("menu").style.transform).toBe("translateX(-231px)");
+    });
+
+    it("leaves a menu that fits where it is", () => {
+      layOut(40, 330);
+      mount();
+      open();
+      expect(screen.getByRole("menu").style.transform).toBe("");
+    });
+  });
+
   it("closes on an outside mousedown", () => {
     mount();
     open();

@@ -61,6 +61,9 @@ pub(super) fn table(cx: &mut Ctx, t: &Table, avail_cm: f64) {
     let rows = t.rows.len();
     let group_end = move |r| if r < heads { heads } else { rows };
     for (r, slots) in layout(t, group_end).enumerate() {
+        if cx.full() {
+            break;
+        }
         if r == 0 && heads > 0 {
             cx.body.push_str("<table:table-header-rows>");
         }

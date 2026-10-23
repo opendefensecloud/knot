@@ -89,27 +89,41 @@ pub fn picture_from_png(bytes: Vec<u8>, scale: u32) -> Option<Picture> {
 }
 
 /// Size in EMU: natural `px / scale` at 96 dpi, shrunk proportionally to
-/// `max_width_emu`, never enlarged.
-pub fn fit_emu(p: &Picture, max_width_emu: u64) -> (u64, u64) {
+/// fit within `max_width_emu` by `max_height_emu`, never enlarged.
+pub fn fit_emu(p: &Picture, max_width_emu: u64, max_height_emu: u64) -> (u64, u64) {
     let scale = u64::from(p.scale.max(1));
     let nat_w = u64::from(p.width_px) * EMU_PER_PX / scale;
     let nat_h = u64::from(p.height_px) * EMU_PER_PX / scale;
-    if nat_w <= max_width_emu {
+    if nat_w <= max_width_emu && nat_h <= max_height_emu {
         return (nat_w, nat_h);
     }
-    let h = u128::from(nat_h) * u128::from(max_width_emu) / u128::from(nat_w);
-    (max_width_emu, h as u64)
+    let (w, h, max_w, max_h) = (
+        u128::from(nat_w),
+        u128::from(nat_h),
+        u128::from(max_width_emu),
+        u128::from(max_height_emu),
+    );
+    // The tighter bound wins: width when max_w / w <= max_h / h.
+    if max_w * h <= max_h * w {
+        (max_width_emu, (h * max_w / w) as u64)
+    } else {
+        ((w * max_h / h) as u64, max_height_emu)
+    }
 }
 
 /// Size in centimetres at 96 dpi, same rule as [`fit_emu`].
-pub fn fit_cm(p: &Picture, max_width_cm: f64) -> (f64, f64) {
+pub fn fit_cm(p: &Picture, max_width_cm: f64, max_height_cm: f64) -> (f64, f64) {
     let scale = f64::from(p.scale.max(1));
     let nat_w = f64::from(p.width_px) / scale * CM_PER_PX;
     let nat_h = f64::from(p.height_px) / scale * CM_PER_PX;
-    if nat_w <= max_width_cm {
+    if nat_w <= max_width_cm && nat_h <= max_height_cm {
         return (nat_w, nat_h);
     }
-    (max_width_cm, nat_h * max_width_cm / nat_w)
+    if max_width_cm * nat_h <= max_height_cm * nat_w {
+        (max_width_cm, nat_h * max_width_cm / nat_w)
+    } else {
+        (nat_w * max_height_cm / nat_h, max_height_cm)
+    }
 }
 
 /// A base URL without trailing slashes, ready to prefix a path.

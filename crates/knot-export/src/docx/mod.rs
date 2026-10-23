@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use crate::assets::{Assets, ExportError, Fallbacks, Meta, Output, PicFormat, Picture};
 use crate::model::ExportDoc;
-use crate::xml::{ZipOut, esc_attr, esc_text};
+use crate::xml::{MAX_XML_BYTES, ZipOut, esc_attr, esc_text};
 
 /// A4 portrait with 2.5 cm margins, in twips.
 const PAGE_WIDTH_TWIPS: u32 = 11906;
@@ -22,6 +22,9 @@ const PAGE_HEIGHT_TWIPS: u32 = 16838;
 const MARGIN_TWIPS: u32 = 1417;
 /// Width available to top-level blocks (16 cm).
 const TEXT_WIDTH_TWIPS: u32 = PAGE_WIDTH_TWIPS - 2 * MARGIN_TWIPS;
+/// Height available to the body (24.7 cm); the footer sits in the bottom
+/// margin.
+const TEXT_HEIGHT_TWIPS: u32 = PAGE_HEIGHT_TWIPS - 2 * MARGIN_TWIPS;
 
 const REL_TYPE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
 
@@ -69,17 +72,29 @@ pub fn write_docx_with(
 ) -> Result<Output, ExportError> {
     let mut cx = Ctx::new(meta, assets);
     body::document(&mut cx, doc);
+    if cx.full() {
+        return Err(ExportError::TooLarge);
+    }
 
     let numbering_xml = numbering::with_nums(&defaults.numbering_xml, &cx.nums)
         .ok_or_else(|| ExportError::Io("numbering part has no </w:numbering>".into()))?;
+    let rels_xml = cx.rels_xml();
 
-    let mut zip = ZipOut::new();
+    // Room for the media, stored as they are, and the XML before
+    // compression, so the buffer never grows by copying itself.
+    let media_bytes: usize = cx.media.iter().map(|(_, bytes)| bytes.len()).sum();
+    let xml_bytes = cx.xml.len()
+        + rels_xml.len()
+        + numbering_xml.len()
+        + defaults.styles_xml.len()
+        + defaults.footer_xml.len();
+    let mut zip = ZipOut::with_capacity(media_bytes + xml_bytes);
     zip.deflated("[Content_Types].xml", CONTENT_TYPES.as_bytes())?;
     zip.deflated("_rels/.rels", ROOT_RELS.as_bytes())?;
     zip.deflated("docProps/core.xml", core_xml(meta).as_bytes())?;
     zip.deflated("docProps/app.xml", APP_XML.as_bytes())?;
     zip.deflated("word/document.xml", cx.xml.as_bytes())?;
-    zip.deflated("word/_rels/document.xml.rels", cx.rels_xml().as_bytes())?;
+    zip.deflated("word/_rels/document.xml.rels", rels_xml.as_bytes())?;
     zip.deflated("word/styles.xml", defaults.styles_xml.as_bytes())?;
     zip.deflated("word/numbering.xml", numbering_xml.as_bytes())?;
     zip.deflated("word/settings.xml", SETTINGS_XML.as_bytes())?;
@@ -131,7 +146,8 @@ struct Ctx<'a> {
     /// Last drawing id handed out; ids are document-wide.
     last_doc_pr: u32,
     /// Media parts as (package path, bytes); `media[i]` is `image{i + 1}`.
-    media: Vec<(String, Vec<u8>)>,
+    /// The bytes are borrowed from `assets`, never copied.
+    media: Vec<(String, &'a [u8])>,
     /// Picture key to its media number, relationship id and extension, so a
     /// picture used twice is stored once.
     media_index: HashMap<String, (usize, String, &'static str)>,
@@ -165,6 +181,12 @@ impl<'a> Ctx<'a> {
             media: Vec::new(),
             media_index: HashMap::new(),
         }
+    }
+
+    /// Whether the XML written so far has passed [`MAX_XML_BYTES`]. Once it
+    /// has, the emitters stop writing and the export fails.
+    fn full(&self) -> bool {
+        self.xml.len() + self.nums.len() > MAX_XML_BYTES
     }
 
     fn add_rel(&mut self, kind: &'static str, target: String, external: bool) -> String {
@@ -202,14 +224,14 @@ impl<'a> Ctx<'a> {
 
     /// The media part of the picture `key`, stored on first use, as
     /// (number, relationship id, extension).
-    fn media_part(&mut self, key: &str, pic: &Picture) -> (usize, String, &'static str) {
+    fn media_part(&mut self, key: &str, pic: &'a Picture) -> (usize, String, &'static str) {
         if let Some((n, rid, ext)) = self.media_index.get(key) {
             return (*n, rid.clone(), ext);
         }
         let n = self.media.len() + 1;
         let ext = extension(pic.format);
         self.media
-            .push((format!("word/media/image{n}.{ext}"), pic.bytes.clone()));
+            .push((format!("word/media/image{n}.{ext}"), &pic.bytes));
         let rid = self.add_rel("image", format!("media/image{n}.{ext}"), false);
         self.media_index
             .insert(key.to_owned(), (n, rid.clone(), ext));

@@ -15,12 +15,15 @@ use std::collections::HashMap;
 
 use crate::assets::{Assets, ExportError, Fallbacks, Meta, Output, Picture};
 use crate::model::{ExportDoc, Marks};
-use crate::xml::{ZipOut, esc_attr, esc_text};
+use crate::xml::{MAX_XML_BYTES, ZipOut, esc_attr, esc_text};
 
 const MIMETYPE: &str = "application/vnd.oasis.opendocument.text";
 
 /// Width available to top-level blocks: A4 less two 2.5 cm margins.
 const TEXT_WIDTH_CM: f64 = 16.0;
+/// Height available to the body: A4 less the 2.5 cm top margin and the
+/// 2.5 cm the footer takes with the bottom margin (see `styles::PAGE`).
+const TEXT_HEIGHT_CM: f64 = 24.7;
 /// Left margin of the Quotations style.
 const QUOTE_INDENT_CM: f64 = 1.0;
 /// Indent step per list level.
@@ -58,26 +61,39 @@ pub fn write_odt_with(
 ) -> Result<Output, ExportError> {
     let mut cx = Ctx::new(meta, assets);
     body::document(&mut cx, doc);
+    if cx.full() {
+        return Err(ExportError::TooLarge);
+    }
 
+    // `content.xml` goes into the zip in pieces, never copied into one
+    // buffer.
     let content = cx.content_xml();
     let meta = meta_xml(meta);
-    // Every part but the mimetype and the manifest, as (path, media type,
-    // bytes); the manifest lists them.
+    // Every other part but the mimetype and the manifest, as (path, media
+    // type, bytes); the manifest lists them after `content.xml`.
     let mut parts: Vec<(&str, &str, &[u8])> = vec![
-        ("content.xml", "text/xml", content.as_bytes()),
         ("styles.xml", "text/xml", defaults.styles_xml.as_bytes()),
         ("meta.xml", "text/xml", meta.as_bytes()),
     ];
     for (path, kind, bytes) in &cx.media {
         parts.push((path, kind, bytes));
     }
-    let mut zip = ZipOut::new();
+    let manifest = manifest_xml(
+        std::iter::once(("content.xml", "text/xml"))
+            .chain(parts.iter().map(|(path, kind, _)| (*path, *kind))),
+    );
+    // Room for every part before compression, so the buffer never grows by
+    // copying itself.
+    let data_bytes = content.iter().map(|piece| piece.len()).sum::<usize>()
+        + parts.iter().map(|(_, _, bytes)| bytes.len()).sum::<usize>()
+        + manifest.len();
+    let mut zip = ZipOut::with_capacity(data_bytes);
     // First and uncompressed, so the file type can be read at a fixed offset.
     zip.stored("mimetype", MIMETYPE.as_bytes())?;
+    zip.deflated_pieces("content.xml", &content)?;
     for (path, _, bytes) in &parts {
         zip.deflated(path, bytes)?;
     }
-    let manifest = manifest_xml(parts.iter().map(|(path, kind, _)| (*path, *kind)));
     zip.deflated("META-INF/manifest.xml", manifest.as_bytes())?;
     Ok(Output {
         bytes: zip.finish()?,
@@ -127,7 +143,8 @@ struct Ctx<'a> {
     /// Last picture frame number; it names the frame.
     last_frame: u32,
     /// The picture parts as (path, media type, bytes), in order of first use.
-    media: Vec<(String, &'static str, Vec<u8>)>,
+    /// The bytes are borrowed from `assets`, never copied.
+    media: Vec<(String, &'static str, &'a [u8])>,
     /// Part number and extension per picture key, so a picture used twice is
     /// stored once.
     media_index: HashMap<String, (usize, &'static str)>,
@@ -159,7 +176,7 @@ impl<'a> Ctx<'a> {
 
     /// The picture part of `key`, stored on first use, as (number,
     /// extension).
-    fn media_part(&mut self, key: &str, pic: &Picture) -> (usize, &'static str) {
+    fn media_part(&mut self, key: &str, pic: &'a Picture) -> (usize, &'static str) {
         if let Some(&part) = self.media_index.get(key) {
             return part;
         }
@@ -168,10 +185,16 @@ impl<'a> Ctx<'a> {
         self.media.push((
             format!("Pictures/img{n}.{ext}"),
             picture::media_type(ext),
-            pic.bytes.clone(),
+            &pic.bytes,
         ));
         self.media_index.insert(key.to_owned(), (n, ext));
         (n, ext)
+    }
+
+    /// Whether the XML written so far has passed [`MAX_XML_BYTES`]. Once it
+    /// has, the emitters stop writing and the export fails.
+    fn full(&self) -> bool {
+        self.body.len() + self.auto_styles.len() > MAX_XML_BYTES
     }
 
     fn next_frame_name(&mut self) -> String {
@@ -248,17 +271,15 @@ impl<'a> Ctx<'a> {
         name
     }
 
-    fn content_xml(&self) -> String {
-        let mut s = String::with_capacity(
-            CONTENT_HEAD.len() + self.auto_styles.len() + self.body.len() + 200,
-        );
-        s.push_str(CONTENT_HEAD);
-        s.push_str("<office:automatic-styles>");
-        s.push_str(&self.auto_styles);
-        s.push_str("</office:automatic-styles><office:body><office:text>");
-        s.push_str(&self.body);
-        s.push_str("</office:text></office:body></office:document-content>");
-        s
+    /// `content.xml`, as the pieces it is made of in order.
+    fn content_xml(&self) -> [&[u8]; 5] {
+        [
+            CONTENT_HEAD.as_bytes(),
+            self.auto_styles.as_bytes(),
+            b"</office:automatic-styles><office:body><office:text>",
+            self.body.as_bytes(),
+            b"</office:text></office:body></office:document-content>",
+        ]
     }
 }
 
@@ -270,6 +291,7 @@ const UNDERLINE: &str = r#" style:text-underline-style="solid" style:text-underl
 const STRIKE: &str =
     r#" style:text-line-through-style="solid" style:text-line-through-type="single""#;
 
+/// `content.xml` up to its automatic styles.
 const CONTENT_HEAD: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8"?>"#,
     r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" "#,
@@ -280,7 +302,7 @@ const CONTENT_HEAD: &str = concat!(
     r#"xmlns:xlink="http://www.w3.org/1999/xlink" "#,
     r#"xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" "#,
     r#"xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" "#,
-    r#"office:version="1.3">"#,
+    r#"office:version="1.3"><office:automatic-styles>"#,
 );
 
 /// The title and the generator. No creator, so the exporter's name stays

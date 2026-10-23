@@ -73,12 +73,12 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     // Export
     describe_counter!(
         "knot_export_total",
-        "Page exports to DOCX/ODT, by format (docx|odt|unknown) and outcome (ok|client_error|busy|server_error)"
+        "Page exports to DOCX/ODT, by format (docx|odt|unknown) and outcome (ok|client_error|busy|server_error); a request timed out or abandoned before its response counts as client_error (408)"
     );
     describe_histogram!(
         "knot_export_duration_seconds",
         Unit::Seconds,
-        "Page export request duration, from the request to the written file"
+        "Page export request duration, from the request to the written file, or to the request timeout or the client going away"
     );
     describe_counter!(
         "knot_export_fallback_total",

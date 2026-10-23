@@ -95,21 +95,50 @@ fn picture_from_png_keeps_scale() {
     assert_eq!((p.width_px, p.height_px, p.scale), (4, 2, 2));
 }
 
+/// 24 cm in EMU: taller than any picture in `fit_scales_down_never_up`.
+const TALL_EMU: u64 = 8_640_000;
+
 #[test]
 fn fit_scales_down_never_up() {
     assert_eq!(
-        fit_emu(&pic(800, 400, 1), 5_760_720),
+        fit_emu(&pic(800, 400, 1), 5_760_720, TALL_EMU),
         (5_760_720, 2_880_360)
     );
-    assert_eq!(fit_emu(&pic(100, 50, 1), 5_760_720), (952_500, 476_250));
-    assert_eq!(fit_emu(&pic(400, 200, 2), 5_760_720), (1_905_000, 952_500));
+    assert_eq!(
+        fit_emu(&pic(100, 50, 1), 5_760_720, TALL_EMU),
+        (952_500, 476_250)
+    );
+    assert_eq!(
+        fit_emu(&pic(400, 200, 2), 5_760_720, TALL_EMU),
+        (1_905_000, 952_500)
+    );
 
-    let (w, h) = fit_cm(&pic(1600, 800, 1), 16.0);
+    let (w, h) = fit_cm(&pic(1600, 800, 1), 16.0, 24.0);
     assert!((w - 16.0).abs() < 1e-9 && (h - 8.0).abs() < 1e-9);
-    let (w, h) = fit_cm(&pic(96, 48, 1), 16.0);
+    let (w, h) = fit_cm(&pic(96, 48, 1), 16.0, 24.0);
     assert!((w - 2.54).abs() < 1e-9 && (h - 1.27).abs() < 1e-9);
-    let (w, _) = fit_cm(&pic(192, 96, 2), 16.0);
+    let (w, _) = fit_cm(&pic(192, 96, 2), 16.0, 24.0);
     assert!((w - 2.54).abs() < 1e-9);
+}
+
+#[test]
+fn fit_keeps_a_tall_picture_on_the_page() {
+    // A phone screenshot: at the text width it would be 34.6 cm tall.
+    let shot = pic(1170, 2532, 1);
+    let (w, h) = fit_emu(&shot, 5_760_720, TALL_EMU);
+    assert_eq!(h, TALL_EMU);
+    assert_eq!(w, 1170 * TALL_EMU / 2532);
+    let (w, h) = fit_cm(&shot, 16.0, 24.0);
+    assert!((h - 24.0).abs() < 1e-9, "{h}");
+    assert!((w - 24.0 * 1170.0 / 2532.0).abs() < 1e-9, "{w}");
+
+    // Tall but narrow: only the height bound applies, and it never enlarges.
+    let (w, h) = fit_emu(&pic(100, 4000, 1), 5_760_720, TALL_EMU);
+    assert_eq!((w, h), (100 * TALL_EMU / 4000, TALL_EMU));
+    assert_eq!(
+        fit_emu(&pic(100, 900, 1), 5_760_720, TALL_EMU),
+        (952_500, 8_572_500)
+    );
 }
 
 #[test]

@@ -8,6 +8,15 @@ use zip::write::SimpleFileOptions;
 
 use crate::assets::ExportError;
 
+/// Most XML one document may write (64 MiB). The walker's limits keep real
+/// pages far below it; a writer that passes it stops and fails with
+/// [`ExportError::TooLarge`] rather than run the server out of memory.
+pub const MAX_XML_BYTES: usize = 64 * 1024 * 1024;
+
+/// Room in the zip buffer beyond its entries' data: headers, the central
+/// directory, and deflate's overhead on data that doesn't compress.
+const ZIP_SLACK_BYTES: usize = 64 * 1024;
+
 fn invalid_xml_char(c: char) -> bool {
     matches!(c,
         '\u{0}'..='\u{8}' | '\u{B}' | '\u{C}' | '\u{E}'..='\u{1F}'
@@ -60,33 +69,50 @@ impl Default for ZipOut {
 
 impl ZipOut {
     pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    /// A zip whose entries hold about `data_bytes` in all. The buffer is
+    /// sized for them up front, so a large package is never copied while
+    /// it grows.
+    pub fn with_capacity(data_bytes: usize) -> Self {
+        let buf = Vec::with_capacity(data_bytes.saturating_add(ZIP_SLACK_BYTES));
         Self {
-            zip: ZipWriter::new(Cursor::new(Vec::new())),
+            zip: ZipWriter::new(Cursor::new(buf)),
         }
     }
 
     fn add(
         &mut self,
         name: &str,
-        data: &[u8],
+        pieces: &[&[u8]],
         method: CompressionMethod,
     ) -> Result<(), ExportError> {
         let opts = SimpleFileOptions::default().compression_method(method);
         self.zip
             .start_file(name, opts)
             .map_err(|e| ExportError::Zip(e.to_string()))?;
-        self.zip
-            .write_all(data)
-            .map_err(|e| ExportError::Io(e.to_string()))
+        for piece in pieces {
+            self.zip
+                .write_all(piece)
+                .map_err(|e| ExportError::Io(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Store without compression (the ODT mimetype entry, and media files).
     pub fn stored(&mut self, name: &str, data: &[u8]) -> Result<(), ExportError> {
-        self.add(name, data, CompressionMethod::Stored)
+        self.add(name, &[data], CompressionMethod::Stored)
     }
 
     pub fn deflated(&mut self, name: &str, data: &[u8]) -> Result<(), ExportError> {
-        self.add(name, data, CompressionMethod::Deflated)
+        self.add(name, &[data], CompressionMethod::Deflated)
+    }
+
+    /// One deflated entry holding `pieces` one after another, so a part
+    /// built in pieces is never copied into one buffer first.
+    pub fn deflated_pieces(&mut self, name: &str, pieces: &[&[u8]]) -> Result<(), ExportError> {
+        self.add(name, pieces, CompressionMethod::Deflated)
     }
 
     pub fn finish(self) -> Result<Vec<u8>, ExportError> {

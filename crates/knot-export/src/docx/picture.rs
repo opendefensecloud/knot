@@ -7,11 +7,17 @@ use crate::media::{base_url, fit_emu, human_size};
 use crate::model::{ImageSource, Marks};
 use crate::xml::esc_attr;
 
-use super::Ctx;
 use super::body::{open_paragraph, run};
+use super::{Ctx, TEXT_HEIGHT_TWIPS};
 
 /// EMU per twip (914400 EMU per inch, 1440 twips per inch).
 const EMU_PER_TWIP: u64 = 635;
+
+/// Tallest picture, in EMU: one that still fits on a page. Word lays an
+/// inline picture out in a Normal paragraph, whose 1.15 line spacing
+/// (`w:line="276"`) it applies to the picture's line too, followed by
+/// 160 twips of spacing. About 21.2 cm.
+const MAX_HEIGHT_EMU: u64 = (TEXT_HEIGHT_TWIPS as u64 - 160) * 240 / 276 * EMU_PER_TWIP;
 
 /// A body image. Embedded ones become drawings; the rest become a caption
 /// or a link, and the fallback counts say which.
@@ -121,10 +127,11 @@ fn link_run(cx: &mut Ctx, text: &str, url: &str) {
 }
 
 /// An inline drawing of `pic` in its own paragraph, at most `avail_twips`
-/// wide. `key` identifies the picture, so one used twice is stored once.
-fn drawing(cx: &mut Ctx, key: &str, pic: &Picture, descr: &str, avail_twips: u32) {
+/// wide and a page high. `key` identifies the picture, so one used twice is
+/// stored once.
+fn drawing<'a>(cx: &mut Ctx<'a>, key: &str, pic: &'a Picture, descr: &str, avail_twips: u32) {
     let (n, rid, ext) = cx.media_part(key, pic);
-    let (cx_emu, cy_emu) = fit_emu(pic, u64::from(avail_twips) * EMU_PER_TWIP);
+    let (cx_emu, cy_emu) = fit_emu(pic, u64::from(avail_twips) * EMU_PER_TWIP, MAX_HEIGHT_EMU);
     // A zero extent is invalid; a collapsed width or height is still drawn.
     let (w, h) = (cx_emu.max(1), cy_emu.max(1));
     let id = cx.doc_pr_id();

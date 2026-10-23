@@ -23,9 +23,22 @@ const MARKDOWN = `# Export test
 | 1 | 2 |
 
 \`\`\`mermaid
-graph TD; A-->B
+graph LR; A[Collect the requirements] --> B[Draft the design] --> C[Review it with the team] --> D[Build it] --> E[Ship it]
 \`\`\`
 `;
+
+/** The width of a PNG, from its IHDR chunk. */
+function pngWidth(png: Buffer | undefined): number {
+  if (!png || png.subarray(12, 16).toString("latin1") !== "IHDR") throw new Error("not a PNG");
+  return png.readUInt32BE(16);
+}
+
+/**
+ * The wide flowchart at its on-screen size, rendered at 2×: well over 600 px
+ * wide. Sized from the browser's default 300×150 box instead, it came out
+ * 600×32 px and unreadable.
+ */
+const MIN_DIAGRAM_PNG_WIDTH = 1200;
 
 test.beforeAll(async () => {
   reset();
@@ -91,6 +104,10 @@ test("export: a page downloads as a Word document with its diagram", async ({ pa
   expect(body).toContain(TITLE);
   expect(body).toContain('w:val="Heading1"');
   expect([...entries.keys()]).toContain("word/media/image1.png");
+  expect(pngWidth(entries.get("word/media/image1.png"))).toBeGreaterThanOrEqual(MIN_DIAGRAM_PNG_WIDTH);
+  // Placed at least 11 cm wide (it is capped at the 16 cm text width).
+  const extent = /<wp:extent cx="(\d+)" cy="(\d+)"\/>/.exec(body ?? "");
+  expect(Number(extent?.[1])).toBeGreaterThanOrEqual(4_000_000);
 });
 
 test("export: a page downloads as an OpenDocument text with its diagram", async ({ page }) => {
@@ -101,5 +118,7 @@ test("export: a page downloads as an OpenDocument text with its diagram", async 
   expect(body).toBeDefined();
   expect(body).toContain(TITLE);
   expect(body).toContain('text:outline-level="1"');
-  expect([...entries.keys()]).toContainEqual(expect.stringMatching(/^Pictures\//));
+  const picture = [...entries.keys()].find((k) => /^Pictures\/.+\.png$/.test(k));
+  expect(picture).toBeDefined();
+  expect(pngWidth(entries.get(picture ?? ""))).toBeGreaterThanOrEqual(MIN_DIAGRAM_PNG_WIDTH);
 });

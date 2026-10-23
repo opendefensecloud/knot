@@ -143,17 +143,49 @@ async fn export_file(
     Path((doc_id, format)): Path<(Uuid, String)>,
     req: Request,
 ) -> Response {
-    let started = Instant::now();
     let format = Format::parse(&format);
+    let mut recorded = Recorded::start(format);
     let response = export_response(&state, doc_id, format, req).await;
-    let labels = [
-        ("format", format.map_or("unknown", Format::extension)),
-        ("outcome", outcome(response.status())),
-    ];
-    metrics::counter!("knot_export_total", &labels).increment(1);
-    metrics::histogram!("knot_export_duration_seconds", &labels)
-        .record(started.elapsed().as_secs_f64());
+    recorded.status = Some(response.status());
     response
+}
+
+/// Counts an export request in `knot_export_total` and times it in
+/// `knot_export_duration_seconds` when dropped, so a request that never
+/// gets its response counts too: the request timeout drops the handler
+/// (the client sees 408), as does the client going away. Both count as
+/// that 408, and are logged.
+struct Recorded {
+    started: Instant,
+    format: &'static str,
+    /// The response's status, once the handler has one.
+    status: Option<StatusCode>,
+}
+
+impl Recorded {
+    fn start(format: Option<Format>) -> Self {
+        Self {
+            started: Instant::now(),
+            format: format.map_or("unknown", Format::extension),
+            status: None,
+        }
+    }
+}
+
+impl Drop for Recorded {
+    fn drop(&mut self) {
+        let status = self.status.unwrap_or_else(|| {
+            tracing::warn!(
+                format = self.format,
+                "export ended without a response: timed out or the client went away"
+            );
+            StatusCode::REQUEST_TIMEOUT
+        });
+        let labels = [("format", self.format), ("outcome", outcome(status))];
+        metrics::counter!("knot_export_total", &labels).increment(1);
+        metrics::histogram!("knot_export_duration_seconds", &labels)
+            .record(self.started.elapsed().as_secs_f64());
+    }
 }
 
 async fn export_response(
@@ -357,6 +389,78 @@ mod tests {
         assert_eq!(
             fallbacks_header(&fallbacks),
             "diagrams=2, images=4, unknown=4"
+        );
+    }
+
+    /// Remembers the labels of every counter registered with it.
+    #[derive(Default)]
+    struct Counters(std::sync::Mutex<Vec<Vec<(String, String)>>>);
+
+    impl metrics::Recorder for Counters {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            let labels = key
+                .labels()
+                .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                .collect();
+            self.0.lock().unwrap().push(labels);
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn a_request_dropped_before_its_response_still_counts() {
+        let counters = Counters::default();
+        metrics::with_local_recorder(&counters, || {
+            // The request timeout drops the handler mid-export.
+            drop(Recorded::start(Some(Format::Docx)));
+            let mut done = Recorded::start(Some(Format::Odt));
+            done.status = Some(StatusCode::OK);
+            drop(done);
+        });
+        let label = |format: &str, outcome: &str| {
+            vec![
+                ("format".to_owned(), format.to_owned()),
+                ("outcome".to_owned(), outcome.to_owned()),
+            ]
+        };
+        assert_eq!(
+            *counters.0.lock().unwrap(),
+            [label("docx", "client_error"), label("odt", "ok")]
         );
     }
 

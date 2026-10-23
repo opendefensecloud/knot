@@ -94,6 +94,63 @@ pub fn linked(s: &str, href: &str) -> N {
     N::Text(vec![(s.to_owned(), vec![("link", Any::Map(Arc::new(m)))])])
 }
 
+/// A table inside every per-table limit whose grid, not its content, sets
+/// the output size: a first row of one cell spanning all `width` columns,
+/// then `rows - 1` empty rows. ODT writes a cell and `width - 1` covered
+/// cells for each of them.
+pub fn wide_empty_table(width: usize, rows: usize) -> N {
+    let mut out = vec![el(
+        "table_row",
+        vec![],
+        vec![el(
+            "table_cell",
+            vec![("colspan", Any::Number(width as f64))],
+            vec![p("x")],
+        )],
+    )];
+    out.extend((1..rows).map(|_| el("table_row", vec![], vec![])));
+    el("table", vec![], out)
+}
+
+/// A table inside every per-table limit made of row spans: every `span`th
+/// row holds `width` cells spanning `span` rows, the rows between are
+/// empty. DOCX writes a `vMerge` continuation cell per column for each of
+/// them.
+pub fn row_spanning_table(width: usize, span: usize, rows: usize) -> N {
+    let out = (0..rows)
+        .map(|r| {
+            let cells = if r % span == 0 {
+                (0..width)
+                    .map(|_| {
+                        el(
+                            "table_cell",
+                            vec![("rowspan", Any::Number(span as f64))],
+                            vec![p("y")],
+                        )
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+            el("table_row", vec![], cells)
+        })
+        .collect();
+    el("table", vec![], out)
+}
+
+/// `len` bytes that don't compress, like a real picture's.
+pub fn noise(len: usize) -> Vec<u8> {
+    let mut x: u32 = 0x9E37_79B9;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect()
+}
+
 /// Every entry of a zip archive, keyed by name. Entries are read with
 /// `ZipArchive::by_name` only.
 pub fn unzip(bytes: &[u8]) -> HashMap<String, Vec<u8>> {

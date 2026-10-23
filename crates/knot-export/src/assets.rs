@@ -64,4 +64,7 @@ pub enum ExportError {
     Zip(String),
     #[error("io: {0}")]
     Io(String),
+    /// The document's XML passed [`crate::xml::MAX_XML_BYTES`].
+    #[error("document too large: over {} MiB of XML", crate::xml::MAX_XML_BYTES >> 20)]
+    TooLarge,
 }

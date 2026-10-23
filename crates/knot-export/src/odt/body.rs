@@ -82,6 +82,9 @@ pub(super) fn blocks(cx: &mut Ctx, items: &[Block], avail_cm: f64) {
 }
 
 fn block(cx: &mut Ctx, b: &Block, avail_cm: f64) {
+    if cx.full() {
+        return;
+    }
     match b {
         Block::Paragraph(content) => {
             let style = if cx.quote_depth > 0 {
@@ -153,6 +156,9 @@ fn open(cx: &mut Ctx, tag: &str, style: &'static str, attrs: &str) {
 fn list(cx: &mut Ctx, l: &List, avail_cm: f64) {
     if cx.lists.len() >= LIST_LEVELS as usize {
         for item in &l.items {
+            if cx.full() {
+                break;
+            }
             close_item(cx);
             list_item(cx, item, None, avail_cm);
         }
@@ -181,6 +187,9 @@ fn list(cx: &mut Ctx, l: &List, avail_cm: f64) {
     });
     let inner = (avail_cm - LIST_INDENT_CM).max(0.0);
     for (i, item) in l.items.iter().enumerate() {
+        if cx.full() {
+            break;
+        }
         let start = (l.ordered && i == 0).then_some(l.start);
         list_item(cx, item, start, inner);
         close_item(cx);

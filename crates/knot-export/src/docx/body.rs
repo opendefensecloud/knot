@@ -57,6 +57,9 @@ pub(super) fn blocks(cx: &mut Ctx, items: &[Block], avail_twips: u32) {
 }
 
 fn block(cx: &mut Ctx, b: &Block, avail_twips: u32) {
+    if cx.full() {
+        return;
+    }
     match b {
         Block::Paragraph(content) => {
             let style = if cx.quote_depth > 0 {
@@ -151,6 +154,9 @@ fn list(cx: &mut Ctx, l: &List, avail_twips: u32) {
     cx.list_depth += 1;
     let inner = avail_twips.saturating_sub(INDENT_TWIPS);
     for item in &l.items {
+        if cx.full() {
+            break;
+        }
         list_item(cx, item, (num_id, ilvl), inner);
     }
     cx.list_depth -= 1;

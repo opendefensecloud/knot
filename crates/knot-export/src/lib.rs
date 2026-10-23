@@ -16,6 +16,6 @@ pub use media::{picture_from_png, prepare_image};
 pub use model::*;
 pub use odt::write_odt;
 pub use walk::{
-    DiagramRef, MAX_DEPTH, MAX_SPAN, MAX_TABLE_COLUMNS, MAX_TABLE_GRID_CELLS, Walked, blob_ids,
-    diagrams, user_ids, walk,
+    DiagramRef, MAX_DEPTH, MAX_PAGE_GRID_CELLS, MAX_SPAN, MAX_TABLE_COLUMNS, MAX_TABLE_GRID_CELLS,
+    TABLE_COLUMN_ROWS, Walked, blob_ids, diagrams, user_ids, walk,
 };

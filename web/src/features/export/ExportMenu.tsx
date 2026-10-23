@@ -1,5 +1,5 @@
 import { Download, LoaderCircle } from "lucide-react";
-import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 
 import type { ConnStatus } from "../../components/StatusDot";
 import { IconButton } from "../../components/ui/IconButton";
@@ -15,6 +15,8 @@ type Props = {
 
 const ITEM_CLS =
   "flex w-full flex-col items-start gap-0.5 px-3 py-1.5 text-left text-[13px] text-fg hover:bg-muted focus-visible:bg-muted focus-visible:outline-none disabled:opacity-40 disabled:cursor-not-allowed";
+/** Space the menu keeps from the viewport's edges, in px (as its `max-w`). */
+const VIEWPORT_GUTTER_PX = 16;
 
 /** Download-as menu in the page header: Word, OpenDocument, Markdown zips. */
 export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: Props) {
@@ -48,6 +50,19 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
     };
+  }, [open]);
+
+  // The menu hangs from the trigger's right edge. At phone width the header
+  // row wraps and can put the trigger near the left edge, so shift the menu
+  // back into the viewport before it paints. Each open renders a new menu.
+  useLayoutEffect(() => {
+    const menu = menuRef.current;
+    if (!open || !menu) return;
+    const { left, right, width } = menu.getBoundingClientRect();
+    if (width === 0) return;
+    const max = document.documentElement.clientWidth - VIEWPORT_GUTTER_PX;
+    const dx = left < VIEWPORT_GUTTER_PX ? VIEWPORT_GUTTER_PX - left : right > max ? max - right : 0;
+    if (dx !== 0) menu.style.transform = `translateX(${dx}px)`;
   }, [open]);
 
   function onMenuKeyDown(e: KeyboardEvent<HTMLDivElement>) {

@@ -8,11 +8,16 @@ use crate::media::{base_url, fit_cm, human_size};
 use crate::model::ImageSource;
 use crate::xml::{esc_attr, esc_text};
 
-use super::Ctx;
 use super::body::{open_paragraph, text_paragraph};
+use super::{Ctx, TEXT_HEIGHT_CM};
 
 /// Smallest frame side written, in cm: a zero size is invalid.
 const MIN_CM: f64 = 0.001;
+
+/// Tallest frame, in cm: one that still fits on a page. The frame sits in
+/// a Standard paragraph, whose 115% line height applies to its line too,
+/// followed by a 0.282 cm bottom margin. About 21.2 cm.
+const MAX_HEIGHT_CM: f64 = (TEXT_HEIGHT_CM - 0.282) / 1.15;
 
 /// A body image. Embedded ones become frames; the rest become a caption or
 /// a link, and the fallback counts say which.
@@ -111,11 +116,11 @@ fn link(cx: &mut Ctx, text: &str, url: &str) {
 }
 
 /// An as-character frame holding `pic` in its own paragraph, at most
-/// `avail_cm` wide. `key` identifies the picture, so one used twice is
-/// stored once.
-fn frame(cx: &mut Ctx, key: &str, pic: &Picture, descr: &str, avail_cm: f64) {
+/// `avail_cm` wide and a page high. `key` identifies the picture, so one
+/// used twice is stored once.
+fn frame<'a>(cx: &mut Ctx<'a>, key: &str, pic: &'a Picture, descr: &str, avail_cm: f64) {
     let (n, ext) = cx.media_part(key, pic);
-    let (w, h) = fit_cm(pic, avail_cm);
+    let (w, h) = fit_cm(pic, avail_cm, MAX_HEIGHT_CM);
     let (w, h) = (w.max(MIN_CM), h.max(MIN_CM));
     let name = cx.next_frame_name();
     let style = cx.frame_style();

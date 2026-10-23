@@ -1631,6 +1631,22 @@ fn image_in_table_cell_fits_the_cell() {
 }
 
 #[test]
+fn tall_image_fits_the_page_height() {
+    // A phone screenshot: at the 16 cm text width it would be 34.6 cm
+    // tall, past the page. It shrinks to 21.2 cm, which with the Normal
+    // paragraph's 1.15 line spacing and spacing after still fits the
+    // 24.7 cm of body.
+    let mut assets = Assets::default();
+    assets.images.insert(
+        BLOB_A.into(),
+        ImageAsset::Embedded(picture(PicFormat::Png, 1170, 2532, 1)),
+    );
+    let docx = export_with(vec![image_block(BLOB_A, "screenshot")], &assets);
+    let d = xml(docx.part("word/document.xml"));
+    assert_eq!(extents(&d), [(3_532_240, 7_644_130)]);
+}
+
+#[test]
 fn same_blob_twice_shares_one_media_part() {
     let mut assets = Assets::default();
     assets.images.insert(
@@ -1841,30 +1857,82 @@ fn table_in_quote_is_indented_and_top_level_is_not() {
     assert!(child(child(tbls[1], "tblPr").unwrap(), "tblInd").is_none());
 }
 
+/// Most `word/document.xml` a crafted table may make per grid position the
+/// walker counts: a merge continuation is an empty `w:tc` of about 80 bytes.
+const BYTES_PER_GRID_CELL: usize = 100;
+
 #[test]
 fn amplification_is_bounded() {
-    use common::{build, el, p};
-    use yrs::Any;
-    let span = |n: f64| vec![("colspan", Any::Number(n)), ("rowspan", Any::Number(n))];
-    let mut rows = vec![el(
-        "table_row",
-        vec![],
-        (0..64)
-            .map(|_| el("table_cell", span(1000.), vec![p("x")]))
-            .collect(),
-    )];
-    for _ in 0..63 {
-        rows.push(el(
-            "table_row",
-            vec![],
-            vec![el(
-                "table_cell",
-                vec![("rowspan", Any::Number(1000.))],
-                vec![p("y")],
-            )],
-        ));
-    }
-    let walked = knot_export::walk(&build(vec![el("table", vec![], rows)]));
+    use common::{build, row_spanning_table};
+    use knot_export::{MAX_PAGE_GRID_CELLS, MAX_TABLE_GRID_CELLS, walk};
+    // A table inside every limit: 64 columns of cells spanning 64 rows.
+    // Between them the page holds empty rows; the file, a `vMerge`
+    // continuation cell per column.
+    let rows = MAX_TABLE_GRID_CELLS / 64;
+    let walked = walk(&build(vec![row_spanning_table(64, 64, rows)]));
+    assert!(
+        walked.unknown_elements.is_empty(),
+        "{:?}",
+        walked.unknown_elements
+    );
+    assert!(matches!(walked.doc.blocks.as_slice(), [Block::Table(_)]));
     let docx = export(walked.doc.blocks);
-    assert!(docx.part("word/document.xml").len() < 2_000_000);
+    let body = docx.part("word/document.xml");
+    let restarts = rows.div_ceil(64);
+    assert_eq!(body.matches("<w:vMerge/>").count(), 64 * (rows - restarts));
+    assert!(
+        body.len() < 64 * rows * BYTES_PER_GRID_CELL,
+        "{}",
+        body.len()
+    );
+
+    // A page of them: the page budget keeps three, and degrades the rest.
+    let walked = walk(&build(
+        (0..6).map(|_| row_spanning_table(64, 64, rows)).collect(),
+    ));
+    assert_eq!(walked.unknown_elements, ["table-limit"; 3]);
+    let docx = export(walked.doc.blocks);
+    let len = docx.part("word/document.xml").len();
+    assert!(len < MAX_PAGE_GRID_CELLS * BYTES_PER_GRID_CELL, "{len}");
+}
+
+#[test]
+fn xml_past_the_cap_fails_the_export() {
+    use knot_export::ExportError;
+    use knot_export::xml::MAX_XML_BYTES;
+    // Only a page far past the walker's limits gets here: the writer stops
+    // and fails instead of building the rest.
+    let text = "x".repeat(1 << 20);
+    let blocks = vec![para(&text); MAX_XML_BYTES / text.len() + 1];
+    let result = write_docx(&ExportDoc { blocks }, &meta(), &Assets::default());
+    assert!(
+        matches!(result, Err(ExportError::TooLarge)),
+        "{:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn output_buffer_is_sized_up_front() {
+    // A megabyte of picture: grown by doubling, the buffer would end up
+    // about twice that.
+    let mut assets = Assets::default();
+    let pic = Picture {
+        format: PicFormat::Png,
+        bytes: common::noise(1 << 20),
+        width_px: 10,
+        height_px: 10,
+        scale: 1,
+    };
+    assets
+        .images
+        .insert(BLOB_A.into(), ImageAsset::Embedded(pic));
+    let blocks = vec![Block::Image {
+        source: ImageSource::Blob(BLOB_A.into()),
+        alt: String::new(),
+    }];
+    let out = write_docx(&ExportDoc { blocks }, &meta(), &assets).expect("export");
+    assert!(out.bytes.len() > 1 << 20);
+    let spare = out.bytes.capacity() - out.bytes.len();
+    assert!(spare < 256 * 1024, "{spare} bytes spare");
 }

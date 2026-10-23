@@ -53,6 +53,9 @@ pub(super) fn table(cx: &mut Ctx, t: &Table, avail_twips: u32) {
     // the table, also when it starts in a header row.
     let rows = t.rows.len();
     for (r, slots) in layout(t, move |_| rows).enumerate() {
+        if cx.full() {
+            break;
+        }
         cx.xml.push_str("<w:tr>");
         if r < heads {
             cx.xml.push_str("<w:trPr><w:tblHeader/></w:trPr>");

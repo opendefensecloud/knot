@@ -273,6 +273,35 @@ fn too_many_grid_cells_degrade() {
     );
 }
 
+#[test]
+fn tables_past_the_page_budget_degrade() {
+    use knot_export::{MAX_PAGE_GRID_CELLS, MAX_TABLE_GRID_CELLS, TABLE_COLUMN_ROWS};
+    // 64 x 773 grid positions each, inside the per-table limits; with
+    // their columns each counts 64 x 781 = 49,984, and four of them fill
+    // the page budget.
+    let rows = MAX_TABLE_GRID_CELLS / 64 - TABLE_COLUMN_ROWS;
+    let per_table = 64 * (rows + TABLE_COLUMN_ROWS);
+    assert!(4 * per_table <= MAX_PAGE_GRID_CELLS && 5 * per_table > MAX_PAGE_GRID_CELLS);
+    let mut blocks: Vec<N> = (0..5).map(|_| wide_empty_table(64, rows)).collect();
+    // The budget counts kept tables only: a small table after the
+    // degraded one still fits.
+    blocks.push(el("table", vec![], vec![row(vec![td("a"), td("b")])]));
+    let w = walk(&build(blocks));
+
+    assert_eq!(w.unknown_elements, ["table-limit"]);
+    let kept: Vec<usize> = w
+        .doc
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| matches!(b, Block::Table(_)).then_some(i))
+        .collect();
+    // Four tables, the fifth as one paragraph per row, then the small one.
+    assert_eq!(kept, [0, 1, 2, 3, 4 + rows]);
+    assert_eq!(w.doc.blocks.len(), 5 + rows);
+    assert!(matches!(&w.doc.blocks[4], Block::Paragraph(_)));
+}
+
 fn grid_cell(col: usize, colspan: usize, rowspan: usize) -> Cell {
     Cell {
         col,

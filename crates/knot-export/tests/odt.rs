@@ -1494,32 +1494,121 @@ fn table_in_quote_is_indented_and_cell_content_starts_at_the_cell_edge() {
     assert_eq!(prop(top, FO, "margin-left"), None);
 }
 
+/// Most `content.xml` a crafted table may make per grid position the walker
+/// counts: a covered position is a 27-byte `table:covered-table-cell`.
+const BYTES_PER_GRID_CELL: usize = 40;
+
 #[test]
 fn amplification_is_bounded_odt() {
-    use common::{build, el, p};
-    use yrs::Any;
-    let span = |n: f64| vec![("colspan", Any::Number(n)), ("rowspan", Any::Number(n))];
-    let mut rows = vec![el(
-        "table_row",
-        vec![],
-        (0..64)
-            .map(|_| el("table_cell", span(1000.), vec![p("x")]))
-            .collect(),
-    )];
-    for _ in 0..63 {
-        rows.push(el(
-            "table_row",
-            vec![],
-            vec![el(
-                "table_cell",
-                vec![("rowspan", Any::Number(1000.))],
-                vec![p("y")],
-            )],
-        ));
-    }
-    let walked = knot_export::walk(&build(vec![el("table", vec![], rows)]));
+    use common::{build, wide_empty_table};
+    use knot_export::{MAX_PAGE_GRID_CELLS, MAX_TABLE_GRID_CELLS, walk};
+    // A table inside every limit: one cell spanning 64 columns, then rows
+    // that are empty in the page and a cell plus 63 covered cells each in
+    // the file.
+    let rows = MAX_TABLE_GRID_CELLS / 64;
+    let walked = walk(&build(vec![wide_empty_table(64, rows)]));
+    assert!(
+        walked.unknown_elements.is_empty(),
+        "{:?}",
+        walked.unknown_elements
+    );
+    assert!(matches!(walked.doc.blocks.as_slice(), [Block::Table(_)]));
     let odt = export(walked.doc.blocks);
-    assert!(odt.part("content.xml").len() < 2_000_000);
+    let content = odt.part("content.xml");
+    assert_eq!(
+        content.matches("<table:covered-table-cell/>").count(),
+        63 * rows
+    );
+    assert!(
+        content.len() < 64 * rows * BYTES_PER_GRID_CELL,
+        "{}",
+        content.len()
+    );
+
+    // Pages of them, and of one-row tables, whose column styles weigh the
+    // most: the page budget degrades the tables past it, and bounds both.
+    for tables in [
+        (0..6)
+            .map(|_| wide_empty_table(64, rows))
+            .collect::<Vec<_>>(),
+        (0..400).map(|_| wide_empty_table(64, 1)).collect(),
+    ] {
+        let walked = walk(&build(tables));
+        assert!(!walked.unknown_elements.is_empty());
+        assert!(walked.unknown_elements.iter().all(|u| u == "table-limit"));
+        let odt = export(walked.doc.blocks);
+        let len = odt.part("content.xml").len();
+        assert!(len < MAX_PAGE_GRID_CELLS * BYTES_PER_GRID_CELL, "{len}");
+    }
+}
+
+#[test]
+fn xml_past_the_cap_fails_the_export_odt() {
+    use knot_export::ExportError;
+    use knot_export::xml::MAX_XML_BYTES;
+    // Only a page far past the walker's limits gets here: the writer stops
+    // and fails instead of building the rest.
+    let text = "x".repeat(1 << 20);
+    let blocks = vec![para(&text); MAX_XML_BYTES / text.len() + 1];
+    let result = write_odt(&ExportDoc { blocks }, &meta(), &Assets::default());
+    assert!(
+        matches!(result, Err(ExportError::TooLarge)),
+        "{:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn output_buffer_is_sized_up_front_odt() {
+    // Three megabytes of pictures: grown as it fills, the buffer would end
+    // up with about another megabyte spare.
+    let mut assets = Assets::default();
+    for blob in [BLOB_A, BLOB_B, BLOB_C] {
+        let pic = Picture {
+            format: PicFormat::Png,
+            bytes: common::noise(1 << 20),
+            width_px: 10,
+            height_px: 10,
+            scale: 1,
+        };
+        assets.images.insert(blob.into(), ImageAsset::Embedded(pic));
+    }
+    let out = write_odt(
+        &ExportDoc {
+            blocks: [BLOB_A, BLOB_B, BLOB_C]
+                .iter()
+                .map(|blob| image_block(blob, ""))
+                .collect(),
+        },
+        &meta(),
+        &assets,
+    )
+    .expect("export");
+    assert!(out.bytes.len() > 3 << 20);
+    let spare = out.bytes.capacity() - out.bytes.len();
+    assert!(spare < 256 * 1024, "{spare} bytes spare");
+    // The content went into the zip in pieces and reads back whole.
+    let odt = Odt(unzip(&out.bytes));
+    xml(odt.part("content.xml"));
+}
+
+#[test]
+fn tall_image_fits_the_page_height_odt() {
+    // A phone screenshot: at the 16 cm text width it would be 34.6 cm
+    // tall, past the page. It shrinks to 21.2 cm, which with the Standard
+    // paragraph's 115% line height and bottom margin still fits the
+    // 24.7 cm of body.
+    let mut assets = Assets::default();
+    assets.images.insert(
+        BLOB_A.into(),
+        ImageAsset::Embedded(picture(PicFormat::Png, 1170, 2532, 1)),
+    );
+    let odt = export_with(vec![image_block(BLOB_A, "screenshot")], &assets);
+    let d = xml(odt.part("content.xml"));
+    let frames = all(&d, DRAW, "frame");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].attribute((SVG, "width")), Some("9.811cm"));
+    assert_eq!(frames[0].attribute((SVG, "height")), Some("21.233cm"));
 }
 
 const DRAW: &str = "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0";
@@ -1527,6 +1616,7 @@ const SVG: &str = "urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0";
 
 const BLOB_A: &str = "aaaaaaaa-1111-4222-8333-444444444444";
 const BLOB_B: &str = "bbbbbbbb-1111-4222-8333-444444444444";
+const BLOB_C: &str = "cccccccc-1111-4222-8333-444444444444";
 
 fn picture(format: PicFormat, width_px: u32, height_px: u32, scale: u32) -> Picture {
     Picture {
