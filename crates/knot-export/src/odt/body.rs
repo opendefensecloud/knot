@@ -8,7 +8,7 @@
 use crate::model::{Block, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, Run};
 use crate::xml::{esc_attr, esc_text};
 
-use super::{Ctx, LIST_INDENT_CM, LIST_LEVELS, QUOTE_INDENT_CM, TEXT_WIDTH_CM, table};
+use super::{Ctx, LIST_INDENT_CM, LIST_LEVELS, QUOTE_INDENT_CM, TEXT_WIDTH_CM, picture, table};
 
 const HEADINGS: [&str; 6] = [
     "Heading_20_1",
@@ -116,19 +116,15 @@ fn block(cx: &mut Ctx, b: &Block, avail_cm: f64) {
         }
         Block::List(l) => list(cx, l, avail_cm),
         Block::Table(t) => table::table(cx, t, avail_cm),
-        // Not written yet: an empty paragraph keeps the block's place.
-        Block::Image { .. }
-        | Block::Mermaid { .. }
-        | Block::Board { .. }
-        | Block::Attachment { .. } => {
-            open_paragraph(cx, "Standard");
-            cx.body.push_str("</text:p>");
-        }
+        Block::Image { source, alt } => picture::image(cx, source, alt, avail_cm),
+        Block::Mermaid { key, source } => picture::mermaid(cx, key, source, avail_cm),
+        Block::Board { key, label, .. } => picture::board(cx, key, label, avail_cm),
+        Block::Attachment { url, name, size } => picture::attachment(cx, url, name, *size),
     }
 }
 
 /// A paragraph in `style` holding `text` as one unmarked run.
-fn text_paragraph(cx: &mut Ctx, style: &'static str, text: &str) {
+pub(super) fn text_paragraph(cx: &mut Ctx, style: &'static str, text: &str) {
     open_paragraph(cx, style);
     run(cx, text, &Marks::default());
     cx.body.push_str("</text:p>");

@@ -9,10 +9,11 @@ use common::odt::{
     cm, content, elements, list_depth, office_text, prop, style, style_name, text,
 };
 use common::{unzip, xml};
-use knot_export::assets::{Assets, Meta};
+use knot_export::assets::{Assets, Fallbacks, ImageAsset, Meta, PicFormat, Picture};
 use knot_export::odt::{OdtDefaults, write_odt_with};
 use knot_export::{
-    Align, Block, Cell, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, Run, Table, write_odt,
+    Align, Block, Cell, ExportDoc, ImageSource, Inline, LinkTarget, List, ListItem, Marks, Run,
+    Table, write_odt,
 };
 use roxmltree::{Document, Node};
 
@@ -1519,4 +1520,230 @@ fn amplification_is_bounded_odt() {
     let walked = knot_export::walk(&build(vec![el("table", vec![], rows)]));
     let odt = export(walked.doc.blocks);
     assert!(odt.part("content.xml").len() < 2_000_000);
+}
+
+const DRAW: &str = "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0";
+const SVG: &str = "urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0";
+
+const BLOB_A: &str = "aaaaaaaa-1111-4222-8333-444444444444";
+const BLOB_B: &str = "bbbbbbbb-1111-4222-8333-444444444444";
+
+fn picture(format: PicFormat, width_px: u32, height_px: u32, scale: u32) -> Picture {
+    Picture {
+        format,
+        bytes: vec![1, 2, 3, width_px as u8],
+        width_px,
+        height_px,
+        scale,
+    }
+}
+
+fn image_block(blob: &str, alt: &str) -> Block {
+    Block::Image {
+        source: ImageSource::Blob(blob.into()),
+        alt: alt.into(),
+    }
+}
+
+#[test]
+fn odt_pictures_have_frames_and_manifest_entries() {
+    let mut assets = Assets::default();
+    assets.images.insert(
+        BLOB_A.into(),
+        ImageAsset::Embedded(picture(PicFormat::Png, 160, 80, 1)),
+    );
+    assets.images.insert(
+        BLOB_B.into(),
+        ImageAsset::Embedded(picture(PicFormat::Jpeg, 80, 40, 1)),
+    );
+    assets
+        .diagrams
+        .insert("m1".into(), picture(PicFormat::Png, 4000, 1000, 2));
+    let odt = export_with(
+        vec![
+            image_block(BLOB_A, "First <one>"),
+            image_block(BLOB_B, ""),
+            image_block(BLOB_A, "again"),
+            Block::Mermaid {
+                key: "m1".into(),
+                source: "graph TD".into(),
+            },
+        ],
+        &assets,
+    );
+    parse_all(&odt);
+    assert_eq!(odt.0["Pictures/img1.png"], [1, 2, 3, 160]);
+    assert_eq!(odt.0["Pictures/img2.jpeg"], [1, 2, 3, 80]);
+    assert_eq!(odt.0["Pictures/img3.png"], [1, 2, 3, 160]);
+    assert_eq!(
+        odt.0.keys().filter(|k| k.starts_with("Pictures/")).count(),
+        3
+    );
+
+    let manifest = xml(odt.part("META-INF/manifest.xml"));
+    let entries: HashMap<&str, &str> = all(&manifest, MANIFEST, "file-entry")
+        .into_iter()
+        .map(|e| {
+            (
+                e.attribute((MANIFEST, "full-path")).unwrap(),
+                e.attribute((MANIFEST, "media-type")).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(entries["Pictures/img1.png"], "image/png");
+    assert_eq!(entries["Pictures/img2.jpeg"], "image/jpeg");
+    assert_eq!(entries["Pictures/img3.png"], "image/png");
+
+    let d = xml(odt.part("content.xml"));
+    let frames = all(&d, DRAW, "frame");
+    assert_eq!(frames.len(), 4);
+    let names: HashSet<_> = frames
+        .iter()
+        .map(|f| f.attribute((DRAW, "name")).unwrap())
+        .collect();
+    assert_eq!(names.len(), 4);
+    for f in &frames {
+        assert_eq!(f.attribute((TEXT, "anchor-type")), Some("as-char"));
+    }
+    // 160 px at scale 1 is 4.233 cm.
+    assert_eq!(frames[0].attribute((SVG, "width")), Some("4.233cm"));
+    assert_eq!(frames[0].attribute((SVG, "height")), Some("2.117cm"));
+    assert_eq!(frames[1].attribute((SVG, "width")), Some("2.117cm"));
+    // The third frame shares the first part; the diagram is the third part.
+    let hrefs: Vec<_> = frames
+        .iter()
+        .map(|f| {
+            child(*f, DRAW, "image")
+                .unwrap()
+                .attribute((XLINK, "href"))
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        hrefs,
+        [
+            "Pictures/img1.png",
+            "Pictures/img2.jpeg",
+            "Pictures/img1.png",
+            "Pictures/img3.png"
+        ]
+    );
+    // Capped at the 16 cm text width.
+    assert_eq!(frames[3].attribute((SVG, "width")), Some("16.000cm"));
+    assert_eq!(frames[3].attribute((SVG, "height")), Some("4.000cm"));
+    let descr: Vec<_> = frames
+        .iter()
+        .map(|f| text(child(*f, SVG, "desc").unwrap()))
+        .collect();
+    assert_eq!(descr, ["First <one>", "", "again", "Mermaid diagram"]);
+    let style_ref = frames[0].attribute((DRAW, "style-name")).unwrap();
+    style(&d, style_ref);
+}
+
+#[test]
+fn odt_fallbacks_match_docx() {
+    let (doc, assets) = common::fallback_fixture();
+    let out = write_odt(&doc, &meta(), &assets).expect("export");
+    assert_eq!(
+        out.fallbacks,
+        Fallbacks {
+            diagram: 2,
+            image_unavailable: 2,
+            image_over_budget: 1,
+            unknown_element: 0,
+        }
+    );
+    let odt = Odt(unzip(&out.bytes));
+    parse_all(&odt);
+    let d = xml(odt.part("content.xml"));
+    let paras: Vec<(Option<&str>, String)> = content(&d)
+        .into_iter()
+        .map(|p| (style_name(p), text(p)))
+        .collect();
+    assert_eq!(
+        paras,
+        [
+            (
+                Some("Preformatted_20_Text"),
+                "graph TD\n  A --> B".to_owned()
+            ),
+            (Some("Caption"), "Mermaid diagram (not included)".to_owned()),
+            (
+                Some("Caption"),
+                "Diagram: Roadmap (not included)".to_owned()
+            ),
+            (
+                Some("Caption"),
+                "[Image not available] \u{2014} Org chart".to_owned()
+            ),
+            (Some("Caption"), "[Image too large to include]".to_owned()),
+            (
+                Some("Caption"),
+                "[Image not available] \u{2014} Local file".to_owned()
+            ),
+        ]
+    );
+    let link = all(&d, TEXT, "a").into_iter().next().expect("link");
+    assert_eq!(
+        link.attribute((XLINK, "href")),
+        Some(
+            format!(
+                "https://knot.example/api/blobs/{}",
+                common::OVER_BUDGET_BLOB
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(text(link), "[Image too large to include]");
+    assert!(all(&d, DRAW, "frame").is_empty());
+}
+
+#[test]
+fn odt_external_images_and_attachments_are_links() {
+    let url = "/api/blobs/cccccccc-1111-4222-8333-444444444444";
+    let odt = export(vec![
+        Block::Image {
+            source: ImageSource::External("https://img.example/a.png?x=1&y=2".into()),
+            alt: "Remote".into(),
+        },
+        Block::Image {
+            source: ImageSource::External("https://img.example/b.png".into()),
+            alt: String::new(),
+        },
+        Block::Attachment {
+            url: url.into(),
+            name: "budget.xlsx".into(),
+            size: Some(49152),
+        },
+        Block::Attachment {
+            url: "javascript:alert(1)".into(),
+            name: "odd".into(),
+            size: None,
+        },
+    ]);
+    parse_all(&odt);
+    let d = xml(odt.part("content.xml"));
+    let got: Vec<_> = all(&d, TEXT, "a")
+        .into_iter()
+        .map(|l| (text(l), l.attribute((XLINK, "href")).unwrap().to_owned()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (
+                "Remote".to_owned(),
+                "https://img.example/a.png?x=1&y=2".to_owned()
+            ),
+            (
+                "https://img.example/b.png".to_owned(),
+                "https://img.example/b.png".to_owned()
+            ),
+            (
+                "\u{1F4CE} budget.xlsx (48 KB)".to_owned(),
+                format!("https://knot.example{url}")
+            ),
+        ]
+    );
+    let texts: Vec<_> = content(&d).into_iter().map(text).collect();
+    assert_eq!(texts[3], "\u{1F4CE} odd");
 }

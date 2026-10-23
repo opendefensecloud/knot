@@ -6,13 +6,14 @@
 //! [`OdtDefaults`].
 
 mod body;
+mod picture;
 mod styles;
 mod table;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::assets::{Assets, ExportError, Fallbacks, Meta, Output};
+use crate::assets::{Assets, ExportError, Fallbacks, Meta, Output, Picture};
 use crate::model::{ExportDoc, Marks};
 use crate::xml::{ZipOut, esc_attr, esc_text};
 
@@ -62,11 +63,14 @@ pub fn write_odt_with(
     let meta = meta_xml(meta);
     // Every part but the mimetype and the manifest, as (path, media type,
     // bytes); the manifest lists them.
-    let parts = [
+    let mut parts: Vec<(&str, &str, &[u8])> = vec![
         ("content.xml", "text/xml", content.as_bytes()),
         ("styles.xml", "text/xml", defaults.styles_xml.as_bytes()),
         ("meta.xml", "text/xml", meta.as_bytes()),
     ];
+    for (path, kind, bytes) in &cx.media {
+        parts.push((path, kind, bytes));
+    }
     let mut zip = ZipOut::new();
     // First and uncompressed, so the file type can be read at a fixed offset.
     zip.stored("mimetype", MIMETYPE.as_bytes())?;
@@ -118,6 +122,15 @@ struct Ctx<'a> {
     para_styles: HashMap<(&'static str, &'static str), String>,
     /// Whether the table cell styles are in `auto_styles` yet.
     cell_styles: bool,
+    /// Whether the picture frame style is in `auto_styles` yet.
+    frame_style: bool,
+    /// Last picture frame number; it names the frame.
+    last_frame: u32,
+    /// The picture parts as (path, media type, bytes), in order of first use.
+    media: Vec<(String, &'static str, Vec<u8>)>,
+    /// Part number and extension per picture key, so a picture used twice is
+    /// stored once.
+    media_index: HashMap<String, (usize, &'static str)>,
 }
 
 impl<'a> Ctx<'a> {
@@ -137,7 +150,46 @@ impl<'a> Ctx<'a> {
             text_styles: HashMap::new(),
             para_styles: HashMap::new(),
             cell_styles: false,
+            frame_style: false,
+            last_frame: 0,
+            media: Vec::new(),
+            media_index: HashMap::new(),
         }
+    }
+
+    /// The picture part of `key`, stored on first use, as (number,
+    /// extension).
+    fn media_part(&mut self, key: &str, pic: &Picture) -> (usize, &'static str) {
+        if let Some(&part) = self.media_index.get(key) {
+            return part;
+        }
+        let n = self.media.len() + 1;
+        let ext = picture::extension(pic.format);
+        self.media.push((
+            format!("Pictures/img{n}.{ext}"),
+            picture::media_type(ext),
+            pic.bytes.clone(),
+        ));
+        self.media_index.insert(key.to_owned(), (n, ext));
+        (n, ext)
+    }
+
+    fn next_frame_name(&mut self) -> String {
+        self.last_frame += 1;
+        format!("Picture {}", self.last_frame)
+    }
+
+    /// The automatic graphic style of picture frames, written on first use.
+    fn frame_style(&mut self) -> &'static str {
+        if !self.frame_style {
+            self.frame_style = true;
+            self.auto_styles.push_str(concat!(
+                r#"<style:style style:name="fr1" style:family="graphic">"#,
+                r#"<style:graphic-properties text:anchor-type="as-char" style:wrap="none" "#,
+                r#"style:vertical-pos="top" style:vertical-rel="baseline"/></style:style>"#,
+            ));
+        }
+        "fr1"
     }
 
     /// The automatic text style carrying a run's bold, italic, underline and
@@ -226,6 +278,8 @@ const CONTENT_HEAD: &str = concat!(
     r#"xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" "#,
     r#"xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" "#,
     r#"xmlns:xlink="http://www.w3.org/1999/xlink" "#,
+    r#"xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" "#,
+    r#"xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" "#,
     r#"office:version="1.3">"#,
 );
 
