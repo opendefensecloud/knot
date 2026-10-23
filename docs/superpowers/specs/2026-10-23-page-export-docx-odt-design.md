@@ -595,3 +595,57 @@ Write tests first where practical (repo norm: TDD).
   `sanitizeSvg` strips `foreignObject` (Current state). Worth checking
   separately.
 - **Git sync** of Markdown files, as a separate brainstorm.
+
+## Planning clarifications
+
+These came out of writing the implementation plan
+(`docs/superpowers/plans/2026-10-23-page-export-docx-odt.md`). Each one
+settles a detail the sections above left open or got slightly wrong.
+
+- **`knot-export` dependencies.** It depends on `yrs` directly and takes
+  `&yrs::Doc`, not `knot-crdt`, which would pull in tokio, sqlx and S3. The
+  server passes the snapshot handle's inner doc.
+- **Mermaid config.** Mermaid resets its config on every `render()`, so export
+  renders append a per-render directive
+  `%%{init: {"htmlLabels": false}}%%` after the source. No re-initialise or
+  restore is needed (§8).
+- **Mermaid keys** hash the code block's plain text content (the concatenated
+  text runs), matching the browser's `textContent`.
+- **Attribute types.** The editor stores numeric attributes as numbers and
+  marks as `{}` maps. Markdown import stores strings. The walker accepts both,
+  and treats a mark as present by its key, whatever the value.
+- **Column widths** port both `resolveShares` and `readColumnWeights` (first
+  grid row, colspan-aware).
+- **Multipart parsing.** `multer` can't recover from a per-field limit, so only
+  the 10 MiB whole-body limit is enforced by multer (413). The 2 MiB
+  per-picture cap and the 100-part cap are enforced by hand, and those parts
+  fall back. An empty body, or a non-multipart content type, means "no
+  pictures".
+- **Unsaved edits** count as present while the editor isn't connected, as
+  well as while `pendingBytes > 0`. Offline edits don't show up in
+  `pendingBytes`.
+- **Markdown items** in the menu are hidden on template pages, because the
+  existing zip export refuses templates (out of scope to fix).
+- **File naming.** The browser names the downloaded file itself (a `blob:`
+  download ignores `Content-Disposition`). The server still sends
+  `filename*` for API users. Both apply the same rule.
+- **Busy wait.** The concurrency permit count and the busy wait live in
+  `AppState`, so tests can shorten them.
+- **`export-check`**:
+  - connects without running migrations (it must change nothing);
+  - loads page state from snapshots and updates, without rooms;
+  - runs offline: images are not fetched and count as unavailable. Its job
+    is to catch content that breaks the writers.
+- **Board previews.** The browser treats any non-200 board preview response
+  as "no picture". A board copied from a page the reader can't access
+  answers 403 or 404.
+- **e2e unzip.** The e2e suite reads the downloaded zip with a small
+  zlib-based helper instead of a new dependency.
+- **Memory and CPU safety.**
+  - WebP images are refused above 4096×4096 pixels.
+  - The image budget also counts the size after conversion, since a
+    converted WebP can grow.
+  - Image preparation and the walk-and-write step run on blocking threads,
+    so the single-CPU pod's live rooms keep running.
+- **Fallback header.** It also carries `unknown=<k>` (the count of unknown
+  elements), which the client doesn't show.
