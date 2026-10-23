@@ -6,6 +6,7 @@
 mod body;
 mod numbering;
 mod styles;
+mod table;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -108,6 +109,12 @@ struct Ctx<'a> {
     /// Left indent, in twips, for the paragraph a list item's non-paragraph
     /// block opens; 0 outside list items.
     block_indent: u32,
+    /// Whether the block being written is in a header cell, whose
+    /// paragraphs take the TableHeader style.
+    header_cell: bool,
+    /// `w:jc` of the table cell the block being written is in; `None`
+    /// outside cells and in left-aligned ones.
+    cell_jc: Option<&'static str>,
     /// The `w:num` elements of every list so far, for `numbering.xml`.
     nums: String,
     /// Last `w:numId` handed out.
@@ -138,6 +145,8 @@ impl<'a> Ctx<'a> {
             quote_depth: 0,
             list_depth: 0,
             block_indent: 0,
+            header_cell: false,
+            cell_jc: None,
             nums: String::new(),
             last_num_id: 0,
             rels,

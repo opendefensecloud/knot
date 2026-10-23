@@ -9,7 +9,9 @@ use crate::model::{Block, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, 
 use crate::xml::esc_text;
 
 use super::numbering::{INDENT_TWIPS, LEVELS};
-use super::{Ctx, FOOTER_RID, MARGIN_TWIPS, PAGE_HEIGHT_TWIPS, PAGE_WIDTH_TWIPS, TEXT_WIDTH_TWIPS};
+use super::{
+    Ctx, FOOTER_RID, MARGIN_TWIPS, PAGE_HEIGHT_TWIPS, PAGE_WIDTH_TWIPS, TEXT_WIDTH_TWIPS, table,
+};
 
 /// Left indent of the Quote style, in twips.
 const QUOTE_INDENT_TWIPS: u32 = 567;
@@ -44,7 +46,7 @@ pub(super) fn document(cx: &mut Ctx, doc: &ExportDoc) {
 }
 
 /// Write blocks whose content may use `avail_twips` of width.
-fn blocks(cx: &mut Ctx, items: &[Block], avail_twips: u32) {
+pub(super) fn blocks(cx: &mut Ctx, items: &[Block], avail_twips: u32) {
     for b in items {
         block(cx, b, avail_twips);
     }
@@ -53,7 +55,11 @@ fn blocks(cx: &mut Ctx, items: &[Block], avail_twips: u32) {
 fn block(cx: &mut Ctx, b: &Block, avail_twips: u32) {
     match b {
         Block::Paragraph(content) => {
-            let style = (cx.quote_depth > 0).then_some("Quote");
+            let style = if cx.quote_depth > 0 {
+                Some("Quote")
+            } else {
+                cx.header_cell.then_some("TableHeader")
+            };
             open_paragraph(cx, style);
             inlines(cx, content);
             cx.xml.push_str("</w:p>");
@@ -75,9 +81,9 @@ fn block(cx: &mut Ctx, b: &Block, avail_twips: u32) {
             cx.xml.push_str("</w:p>");
         }
         Block::List(l) => list(cx, l, avail_twips),
+        Block::Table(t) => table::table(cx, t, avail_twips),
         // Not written yet: an empty Normal paragraph keeps the document valid.
-        Block::Table(_)
-        | Block::Mermaid { .. }
+        Block::Mermaid { .. }
         | Block::Image { .. }
         | Block::Board { .. }
         | Block::Attachment { .. } => cx.xml.push_str("<w:p/>"),
@@ -99,15 +105,17 @@ fn open_paragraph(cx: &mut Ctx, style: Option<&str>) {
 }
 
 /// Open a `w:p` with optional style, list membership (`numId`, `ilvl`) and
-/// left indent. `w:pPr` children are written in schema order.
+/// left indent, aligned like the table cell it is in. `w:pPr` children are
+/// written in schema order.
 fn open_paragraph_with(
     cx: &mut Ctx,
     style: Option<&str>,
     num: Option<(u32, u32)>,
     indent: Option<u32>,
 ) {
+    let jc = cx.cell_jc;
     cx.xml.push_str("<w:p>");
-    if style.is_none() && num.is_none() && indent.is_none() {
+    if style.is_none() && num.is_none() && indent.is_none() && jc.is_none() {
         return;
     }
     cx.xml.push_str("<w:pPr>");
@@ -123,6 +131,9 @@ fn open_paragraph_with(
     }
     if let Some(left) = indent {
         cx.xml.push_str(&format!(r#"<w:ind w:left="{left}"/>"#));
+    }
+    if let Some(jc) = jc {
+        cx.xml.push_str(&format!(r#"<w:jc w:val="{jc}"/>"#));
     }
     cx.xml.push_str("</w:pPr>");
 }

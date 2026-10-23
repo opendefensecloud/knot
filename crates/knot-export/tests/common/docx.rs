@@ -94,6 +94,60 @@ pub fn content<'a, 'i>(d: &'a Document<'i>) -> Vec<Node<'a, 'i>> {
     kids[2..kids.len() - 1].to_vec()
 }
 
+/// Child elements named `w:<name>`.
+pub fn children<'a, 'i>(n: Node<'a, 'i>, name: &str) -> Vec<Node<'a, 'i>> {
+    n.children().filter(|c| c.has_tag_name((W, name))).collect()
+}
+
+/// Every `w:tbl` in a part, outer tables before the tables they hold.
+pub fn tables<'a, 'i>(d: &'a Document<'i>) -> Vec<Node<'a, 'i>> {
+    d.descendants()
+        .filter(|n| n.has_tag_name((W, "tbl")))
+        .collect()
+}
+
+/// The `w:tblW` of a table, in twips; asserts it is given in `dxa`.
+pub fn tbl_w(tbl: Node) -> u32 {
+    let w = child(tbl, "tblPr")
+        .and_then(|p| child(p, "tblW"))
+        .expect("tblW");
+    assert_eq!(wattr(w, "type"), Some("dxa"));
+    wattr(w, "w").unwrap().parse().unwrap()
+}
+
+/// The `w:gridCol` widths of a table, in twips.
+pub fn grid_cols(tbl: Node) -> Vec<u32> {
+    children(child(tbl, "tblGrid").expect("tblGrid"), "gridCol")
+        .into_iter()
+        .map(|c| wattr(c, "w").unwrap().parse().unwrap())
+        .collect()
+}
+
+/// A `w:tcPr` child of a table cell.
+pub fn tc_prop<'a, 'i>(tc: Node<'a, 'i>, name: &str) -> Option<Node<'a, 'i>> {
+    child(tc, "tcPr").and_then(|p| child(p, name))
+}
+
+/// The `w:tcW` of a table cell, in twips; asserts it is given in `dxa`.
+pub fn tc_w(tc: Node) -> u32 {
+    let w = tc_prop(tc, "tcW").expect("tcW");
+    assert_eq!(wattr(w, "type"), Some("dxa"));
+    wattr(w, "w").unwrap().parse().unwrap()
+}
+
+/// Grid columns a table cell spans (`w:gridSpan`, 1 without one).
+pub fn grid_span(tc: Node) -> usize {
+    tc_prop(tc, "gridSpan")
+        .and_then(val)
+        .map_or(1, |v| v.parse().unwrap())
+}
+
+/// A table cell's `w:vMerge`: "restart", "continue" (also for one without
+/// `w:val`), or `None` when the cell isn't vertically merged.
+pub fn v_merge<'a>(tc: Node<'a, '_>) -> Option<&'a str> {
+    tc_prop(tc, "vMerge").map(|m| val(m).unwrap_or("continue"))
+}
+
 pub fn style<'a, 'i>(styles: &'a Document<'i>, id: &str) -> Node<'a, 'i> {
     styles
         .descendants()
@@ -240,6 +294,29 @@ pub const SCHEMA_ORDER: &[(&str, &[&str])] = &[
             "tblLook",
             "tblCaption",
             "tblDescription",
+        ],
+    ),
+    (
+        "tcPr",
+        &[
+            "cnfStyle",
+            "tcW",
+            "gridSpan",
+            "hMerge",
+            "vMerge",
+            "tcBorders",
+            "shd",
+            "noWrap",
+            "tcMar",
+            "textDirection",
+            "tcFitText",
+            "vAlign",
+            "hideMark",
+            "headers",
+            "cellIns",
+            "cellDel",
+            "cellMerge",
+            "tcPrChange",
         ],
     ),
     (

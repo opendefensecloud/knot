@@ -2,15 +2,20 @@ mod common;
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use common::docx::{
-    Docx, PKG_REL, SCHEMA_ORDER, W, body, child, content, elements, p_style, r_style, rels, style,
-    style_name, text, val, wattr,
+    Docx, PKG_REL, SCHEMA_ORDER, W, body, child, children, content, elements, grid_cols, grid_span,
+    p_style, r_style, rels, style, style_name, tables, tbl_w, tc_prop, tc_w, text, v_merge, val,
+    wattr,
 };
 use common::{unzip, xml};
 use knot_export::assets::{Assets, Meta};
 use knot_export::docx::{DocxDefaults, write_docx_with};
-use knot_export::{Block, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, Run, write_docx};
+use knot_export::{
+    Align, Block, Cell, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, Run, Table,
+    write_docx,
+};
 use roxmltree::Node;
 
 const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -285,7 +290,9 @@ fn style_ids_carry_builtin_names() {
 
 #[test]
 fn every_referenced_style_exists() {
-    let docx = export(kitchen_sink());
+    let mut blocks = kitchen_sink();
+    blocks.push(sample_table());
+    let docx = export(blocks);
     let styles = xml(docx.part("word/styles.xml"));
     let ids: HashSet<&str> = styles
         .descendants()
@@ -315,6 +322,8 @@ fn every_referenced_style_exists() {
         "Code",
         "HorizontalRule",
         "Footer",
+        "TableGrid",
+        "TableHeader",
     ] {
         assert!(seen.contains(id), "kitchen sink should use {id}");
     }
@@ -328,6 +337,7 @@ fn properties_follow_schema_order() {
         1,
         vec![item(vec![para("a"), code("b")]), check_item(true, "c")],
     ));
+    blocks.push(sample_table());
     let docx = export(blocks);
     for part in [
         "word/document.xml",
@@ -343,11 +353,19 @@ fn properties_follow_schema_order() {
         {
             let name = n.tag_name().name();
             let kids = elements(n);
-            if matches!(name, "p" | "r") {
+            let props = [
+                ("p", "pPr"),
+                ("r", "rPr"),
+                ("tbl", "tblPr"),
+                ("tr", "trPr"),
+                ("tc", "tcPr"),
+            ]
+            .iter()
+            .find(|(el, _)| *el == name);
+            if let Some((_, props)) = props {
                 for (i, k) in kids.iter().enumerate() {
-                    let props = k.tag_name().name();
                     assert!(
-                        !matches!(props, "pPr" | "rPr") || i == 0,
+                        k.tag_name().name() != *props || i == 0,
                         "{part}: {props} is not the first child of {name}"
                     );
                 }
@@ -947,4 +965,481 @@ fn numbering_defines_both_abstract_nums_before_any_num() {
     let ind = child(child(lvl2, "pPr").unwrap(), "ind").unwrap();
     assert_eq!(wattr(ind, "left"), Some("2160"));
     assert_eq!(wattr(ind, "hanging"), Some("360"));
+}
+
+fn cell(col: usize, blocks: Vec<Block>) -> Cell {
+    Cell {
+        col,
+        colspan: 1,
+        rowspan: 1,
+        header: false,
+        align: Align::Left,
+        blocks,
+    }
+}
+
+fn td(col: usize, text: &str) -> Cell {
+    cell(col, vec![para(text)])
+}
+
+fn th(col: usize, text: &str) -> Cell {
+    Cell {
+        header: true,
+        ..td(col, text)
+    }
+}
+
+fn table(shares: Vec<f64>, rows: Vec<Vec<Cell>>) -> Block {
+    Block::Table(Table { shares, rows })
+}
+
+/// `n` equal column shares.
+fn even(n: usize) -> Vec<f64> {
+    vec![1.0 / n as f64; n]
+}
+
+/// A table with a header row, both kinds of span and a centred cell.
+fn sample_table() -> Block {
+    table(
+        even(3),
+        vec![
+            vec![th(0, "h1"), th(1, "h2"), th(2, "h3")],
+            vec![
+                Cell {
+                    colspan: 2,
+                    rowspan: 2,
+                    align: Align::Center,
+                    ..td(0, "merged")
+                },
+                td(2, "x"),
+            ],
+            vec![td(2, "y")],
+        ],
+    )
+}
+
+fn rows<'a, 'i>(tbl: Node<'a, 'i>) -> Vec<Node<'a, 'i>> {
+    children(tbl, "tr")
+}
+
+fn cells<'a, 'i>(tr: Node<'a, 'i>) -> Vec<Node<'a, 'i>> {
+    children(tr, "tc")
+}
+
+/// Each row's cells as "text, span N, restart|continue", leaving out what a
+/// cell doesn't have.
+fn shape(tbl: Node) -> Vec<Vec<String>> {
+    rows(tbl)
+        .into_iter()
+        .map(|tr| {
+            cells(tr)
+                .into_iter()
+                .map(|tc| {
+                    let mut parts = vec![text(tc)];
+                    if grid_span(tc) > 1 {
+                        parts.push(format!("span {}", grid_span(tc)));
+                    }
+                    parts.extend(v_merge(tc).map(str::to_owned));
+                    parts.retain(|p| !p.is_empty());
+                    parts.join(", ")
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The `w:jc` of a paragraph.
+fn jc<'a>(p: Node<'a, '_>) -> Option<&'a str> {
+    child(child(p, "pPr")?, "jc").and_then(val)
+}
+
+#[test]
+fn grid_columns_follow_shares_and_sum_to_text_width() {
+    let docx = export(vec![
+        table(vec![0.3, 0.7], vec![vec![td(0, "a"), td(1, "b")]]),
+        table(even(11), vec![vec![td(0, "c")]]),
+    ]);
+    let d = xml(docx.part("word/document.xml"));
+    let tbls = tables(&d);
+    assert_eq!(tbls.len(), 2);
+
+    let pr = child(tbls[0], "tblPr").expect("tblPr");
+    assert_eq!(child(pr, "tblStyle").and_then(val), Some("TableGrid"));
+    assert_eq!(tbl_w(tbls[0]), 9072);
+    let layout = child(pr, "tblLayout").and_then(|l| wattr(l, "type"));
+    assert_eq!(layout, Some("fixed"));
+    assert_eq!(grid_cols(tbls[0]), [2722, 6350]);
+    let widths: Vec<u32> = cells(rows(tbls[0])[0]).into_iter().map(tc_w).collect();
+    assert_eq!(widths, [2722, 6350]);
+
+    let cols = grid_cols(tbls[1]);
+    assert_eq!(cols[..10], [825; 10]);
+    assert_eq!(
+        cols[10], 822,
+        "the rounding remainder goes on the last column"
+    );
+    assert_eq!(cols.iter().sum::<u32>(), 9072);
+}
+
+#[test]
+fn spans_are_encoded() {
+    let docx = export(vec![table(
+        even(3),
+        vec![
+            vec![
+                Cell {
+                    colspan: 2,
+                    rowspan: 2,
+                    ..td(0, "A")
+                },
+                td(2, "B"),
+            ],
+            vec![Cell {
+                rowspan: 2,
+                ..td(2, "C")
+            }],
+            vec![Cell {
+                colspan: 2,
+                ..td(0, "D")
+            }],
+        ],
+    )]);
+    let d = xml(docx.part("word/document.xml"));
+    let tbl = tables(&d)[0];
+    assert_eq!(
+        shape(tbl),
+        vec![
+            vec!["A, span 2, restart", "B"],
+            vec!["span 2, continue", "C, restart"],
+            vec!["D, span 2", "continue"],
+        ]
+    );
+
+    let continuations: Vec<Node> = d
+        .descendants()
+        .filter(|n| n.has_tag_name((W, "tc")) && v_merge(*n) == Some("continue"))
+        .collect();
+    assert_eq!(continuations.len(), 2);
+    for tc in continuations {
+        assert_eq!(
+            val(tc_prop(tc, "vMerge").unwrap()),
+            None,
+            "a bare <w:vMerge/>"
+        );
+        let kids = elements(tc);
+        let tags: Vec<&str> = kids.iter().map(|k| k.tag_name().name()).collect();
+        assert_eq!(tags, ["tcPr", "p"]);
+        assert!(elements(kids[1]).is_empty(), "an empty <w:p/>");
+    }
+    assert_eq!(tc_w(cells(rows(tbl)[0])[0]), 6048);
+    assert_eq!(tc_w(cells(rows(tbl)[1])[0]), 6048, "as wide as its restart");
+}
+
+#[test]
+fn spans_are_clamped_to_the_table() {
+    let docx = export(vec![
+        table(
+            even(2),
+            vec![
+                vec![
+                    Cell {
+                        rowspan: 5,
+                        ..td(0, "A")
+                    },
+                    Cell {
+                        colspan: 4,
+                        ..td(1, "B")
+                    },
+                ],
+                vec![td(1, "C")],
+            ],
+        ),
+        // A span that runs into a merged cell stops short of it.
+        table(
+            even(3),
+            vec![
+                vec![
+                    td(0, "a"),
+                    Cell {
+                        rowspan: 2,
+                        ..td(1, "b")
+                    },
+                    td(2, "c"),
+                ],
+                vec![Cell {
+                    colspan: 3,
+                    ..td(0, "wide")
+                }],
+            ],
+        ),
+    ]);
+    let d = xml(docx.part("word/document.xml"));
+    let tbls = tables(&d);
+    assert_eq!(
+        shape(tbls[0]),
+        vec![vec!["A, restart", "B"], vec!["continue", "C"]]
+    );
+    assert_eq!(tc_w(cells(rows(tbls[0])[0])[1]), 4536);
+    assert_eq!(
+        shape(tbls[1]),
+        vec![vec!["a", "b, restart", "c"], vec!["wide", "continue", ""]]
+    );
+}
+
+#[test]
+fn header_rows_repeat_and_are_shaded() {
+    let docx = export(vec![table(
+        even(2),
+        vec![
+            vec![
+                Cell {
+                    rowspan: 2,
+                    ..th(0, "H1")
+                },
+                th(1, "H2"),
+            ],
+            vec![td(1, "body")],
+            vec![th(0, "side"), td(1, "x")],
+        ],
+    )]);
+    let d = xml(docx.part("word/document.xml"));
+    let trs = rows(tables(&d)[0]);
+    let repeats: Vec<bool> = trs
+        .iter()
+        .map(|tr| {
+            child(*tr, "trPr")
+                .and_then(|p| child(p, "tblHeader"))
+                .is_some()
+        })
+        .collect();
+    assert_eq!(repeats, [true, false, false]);
+
+    let tcs: Vec<Node> = trs.iter().flat_map(|tr| cells(*tr)).collect();
+    let expected = [
+        ("H1", true, Some("TableHeader")),
+        ("H2", true, Some("TableHeader")),
+        ("", true, None),
+        ("body", false, None),
+        ("side", true, Some("TableHeader")),
+        ("x", false, None),
+    ];
+    assert_eq!(tcs.len(), expected.len());
+    for (tc, (label, shaded, style)) in tcs.iter().zip(expected) {
+        assert_eq!(text(*tc), label);
+        let shd = tc_prop(*tc, "shd");
+        assert_eq!(shd.is_some(), shaded, "shading of {label:?}");
+        if let Some(shd) = shd {
+            assert_eq!(wattr(shd, "val"), Some("clear"));
+            assert_eq!(wattr(shd, "fill"), Some("F2F2F2"));
+        }
+        let p_styles: Vec<Option<&str>> = children(*tc, "p").into_iter().map(p_style).collect();
+        assert_eq!(p_styles, [style], "paragraph style in {label:?}");
+    }
+}
+
+#[test]
+fn rows_are_padded_and_cells_end_with_paragraph() {
+    let nested = table(even(2), vec![vec![td(0, "in"), td(1, "ner")]]);
+    let docx = export(vec![table(
+        even(3),
+        vec![
+            vec![td(0, "a"), td(1, "b"), td(2, "c")],
+            vec![td(0, "short")],
+            vec![td(0, "x"), td(2, "z")],
+            vec![cell(0, vec![nested]), cell(1, vec![])],
+        ],
+    )]);
+    let d = xml(docx.part("word/document.xml"));
+    let tbl = tables(&d)[0];
+    assert_eq!(
+        shape(tbl),
+        vec![
+            vec!["a", "b", "c"],
+            vec!["short", "span 2"],
+            vec!["x", "", "z"],
+            vec!["inner", "", ""],
+        ]
+    );
+    for tc in d.descendants().filter(|n| n.has_tag_name((W, "tc"))) {
+        let last = elements(tc).pop().unwrap();
+        assert!(
+            last.has_tag_name((W, "p")),
+            "{} ends with a paragraph",
+            text(tc)
+        );
+    }
+    let holder = cells(rows(tbl)[3])[0];
+    let tags: Vec<&str> = elements(holder)
+        .iter()
+        .map(|n| n.tag_name().name())
+        .collect();
+    assert_eq!(tags, ["tcPr", "tbl", "p"]);
+}
+
+#[test]
+fn adjacent_tables_are_separated() {
+    let t = || table(even(1), vec![vec![td(0, "t")]]);
+    let docx = export(vec![
+        t(),
+        t(),
+        table(vec![], vec![]),
+        t(),
+        para("after"),
+        t(),
+        table(even(1), vec![vec![cell(0, vec![t(), t()])]]),
+    ]);
+    let d = xml(docx.part("word/document.xml"));
+    let blocks = content(&d);
+    let tags: Vec<&str> = blocks.iter().map(|n| n.tag_name().name()).collect();
+    assert_eq!(
+        tags,
+        ["tbl", "p", "tbl", "p", "tbl", "p", "tbl", "p", "tbl"]
+    );
+    for sep in [blocks[1], blocks[3], blocks[7]] {
+        assert!(elements(sep).is_empty(), "an empty separator paragraph");
+    }
+    assert_eq!(text(blocks[5]), "after");
+
+    let holder = cells(rows(blocks[8])[0])[0];
+    let tags: Vec<&str> = elements(holder)
+        .iter()
+        .map(|n| n.tag_name().name())
+        .collect();
+    assert_eq!(tags, ["tcPr", "tbl", "p", "tbl", "p"]);
+}
+
+#[test]
+fn nested_table_fits_its_cell() {
+    let inner = || table(vec![0.3, 0.7], vec![vec![td(0, "i"), td(1, "j")]]);
+    let docx = export(vec![table(
+        vec![0.5, 0.5],
+        vec![
+            vec![cell(0, vec![inner()]), td(1, "b")],
+            vec![Cell {
+                colspan: 2,
+                ..cell(0, vec![inner()])
+            }],
+        ],
+    )]);
+    let d = xml(docx.part("word/document.xml"));
+    let tbls = tables(&d);
+    assert_eq!(tbls.len(), 3);
+    assert_eq!(tbl_w(tbls[0]), 9072);
+    assert_eq!(grid_cols(tbls[0]), [4536, 4536]);
+    for (tbl, width) in [(tbls[1], 4536 - 216), (tbls[2], 9072 - 216)] {
+        assert_eq!(tbl_w(tbl), width);
+        assert_eq!(grid_cols(tbl).iter().sum::<u32>(), width);
+    }
+    assert_eq!(grid_cols(tbls[1]), [1296, 3024]);
+}
+
+#[test]
+fn cell_align_sets_paragraph_jc() {
+    let docx = export(vec![table(
+        even(3),
+        vec![vec![
+            Cell {
+                align: Align::Center,
+                ..cell(
+                    0,
+                    vec![para("c"), list(false, 1, vec![item(vec![para("li")])])],
+                )
+            },
+            Cell {
+                align: Align::Right,
+                ..td(1, "r")
+            },
+            td(2, "l"),
+        ]],
+    )]);
+    let d = xml(docx.part("word/document.xml"));
+    let aligns: Vec<Vec<Option<&str>>> = cells(rows(tables(&d)[0])[0])
+        .into_iter()
+        .map(|tc| children(tc, "p").into_iter().map(jc).collect())
+        .collect();
+    assert_eq!(
+        aligns,
+        vec![
+            vec![Some("center"), Some("center")],
+            vec![Some("right")],
+            vec![None]
+        ]
+    );
+}
+
+#[test]
+fn cell_content_starts_at_the_cell_edge() {
+    let inner = || {
+        table(
+            even(1),
+            vec![vec![cell(
+                0,
+                vec![para("cell"), list(false, 1, vec![item(vec![para("li")])])],
+            )]],
+        )
+    };
+    let docx = export(vec![
+        Block::Quote(vec![inner()]),
+        list(false, 1, vec![item(vec![para("lead"), inner()])]),
+    ]);
+    let d = xml(docx.part("word/document.xml"));
+    let tbls = tables(&d);
+    assert_eq!(tbl_w(tbls[0]), 9072 - 567);
+    assert_eq!(tbl_w(tbls[1]), 9072 - 720);
+    for tbl in tbls {
+        let ps = children(cells(rows(tbl)[0])[0], "p");
+        assert_eq!(text(ps[0]), "cell");
+        assert_eq!(p_style(ps[0]), None, "no Quote style inside a cell");
+        assert_eq!(ind_left(ps[0]), None, "no list indent inside a cell");
+        assert_eq!(text(ps[1]), "li");
+        assert_eq!(num_pr(ps[1]).map(|(_, ilvl)| ilvl), Some(0));
+    }
+}
+
+#[test]
+fn empty_tables_write_nothing_and_parse() {
+    let docx = export(vec![
+        table(vec![], vec![]),
+        table(vec![], vec![vec![]]),
+        table(vec![1.0], vec![]),
+        para("after"),
+    ]);
+    for name in docx.0.keys() {
+        if name.ends_with(".xml") || name.ends_with(".rels") {
+            xml(docx.part(name));
+        }
+    }
+    let d = xml(docx.part("word/document.xml"));
+    assert!(tables(&d).is_empty());
+    let blocks = content(&d);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(text(blocks[0]), "after");
+}
+
+#[test]
+fn large_page_exports_valid_docx_quickly() {
+    let mut blocks: Vec<Block> = (0..2000)
+        .map(|i| para(&format!("Paragraph {i} of a long page, with some text.")))
+        .collect();
+    let grid = (0..50)
+        .map(|r| (0..20).map(|c| td(c, &format!("r{r}c{c}"))).collect())
+        .collect();
+    blocks.push(table(even(20), grid));
+
+    let started = Instant::now();
+    let out = write_docx(&ExportDoc { blocks }, &meta(), &Assets::default()).expect("export");
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(5), "export took {elapsed:?}");
+
+    let docx = Docx(unzip(&out.bytes));
+    for name in docx.0.keys() {
+        if name.ends_with(".xml") || name.ends_with(".rels") {
+            xml(docx.part(name));
+        }
+    }
+    let d = xml(docx.part("word/document.xml"));
+    assert_eq!(content(&d).len(), 2001);
+    let trs = rows(tables(&d)[0]);
+    assert_eq!(trs.len(), 50);
+    assert!(trs.iter().all(|tr| cells(*tr).len() == 20));
 }
