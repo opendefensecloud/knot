@@ -52,6 +52,22 @@ pub trait UserStore: Send + Sync + 'static {
     ) -> Result<Option<User>, UserStoreError>;
     async fn find_by_id(&self, id: Uuid) -> Result<Option<User>, UserStoreError>;
     async fn count(&self) -> Result<i64, UserStoreError>;
+
+    /// The newest release whose notes the user has seen. `None` until it is
+    /// first set (users created after the column was added), and for an
+    /// unknown user.
+    async fn last_seen_version(&self, id: Uuid) -> Result<Option<String>, UserStoreError>;
+
+    /// Compare-and-set: writes `version` only while the stored value is
+    /// still `current`, and returns whether it did. The store does not know
+    /// how versions order; the caller decides what counts as newer and
+    /// re-reads on `false`, so two requests cannot overwrite each other.
+    async fn set_last_seen_version(
+        &self,
+        id: Uuid,
+        current: Option<&str>,
+        version: &str,
+    ) -> Result<bool, UserStoreError>;
 }
 
 #[derive(Clone)]
@@ -200,5 +216,32 @@ impl UserStore for PgUserStore {
             .fetch_one(&self.pool)
             .await?;
         Ok(n)
+    }
+
+    async fn last_seen_version(&self, id: Uuid) -> Result<Option<String>, UserStoreError> {
+        let v: Option<Option<String>> =
+            sqlx::query_scalar("SELECT last_seen_version FROM users WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(v.flatten())
+    }
+
+    async fn set_last_seen_version(
+        &self,
+        id: Uuid,
+        current: Option<&str>,
+        version: &str,
+    ) -> Result<bool, UserStoreError> {
+        let r = sqlx::query(
+            "UPDATE users SET last_seen_version = $3
+             WHERE id = $1 AND last_seen_version IS NOT DISTINCT FROM $2",
+        )
+        .bind(id)
+        .bind(current)
+        .bind(version)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() == 1)
     }
 }

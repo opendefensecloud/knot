@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { sanitizeEditorFragment, sanitizeSvg } from "./sanitize";
+import { sanitizeEditorFragment, sanitizeReleaseNotes, sanitizeSvg } from "./sanitize";
 
 describe("sanitizeSvg", () => {
   it("strips <script> from board SVG", () => {
@@ -76,5 +76,34 @@ describe("sanitizeEditorFragment", () => {
   it("strips javascript: URLs", () => {
     const out = html(sanitizeEditorFragment('<a href="javascript:alert(1)">x</a>'));
     expect(out).not.toContain("javascript:");
+  });
+});
+
+describe("sanitizeReleaseNotes", () => {
+  it("keeps the markup a changelog section renders to", () => {
+    const ok =
+      '<ul><li><strong>eMudhra</strong> fix in <code>rustls</code> 0.23.46 ' +
+      '(<a href="https://github.com/opendefensecloud/knot/pull/43">#43</a>)</li></ul>' +
+      "<p>Run the <em>migrate</em> hook.</p><pre><code>make migrate.up</code></pre>";
+    expect(sanitizeReleaseNotes(ok)).toBe(ok);
+  });
+
+  it("strips scripts, event handlers and javascript: URLs", () => {
+    const out = sanitizeReleaseNotes(
+      '<p>hi</p><script>alert(1)</script><img src=x onerror="alert(1)">' +
+        '<a href="javascript:alert(1)">x</a>',
+    );
+    expect(out).not.toContain("script");
+    expect(out).not.toContain("onerror");
+    expect(out).not.toContain("javascript:");
+    expect(out).toContain("<p>hi</p>");
+  });
+
+  it("drops styling and markup release notes never carry", () => {
+    const out = sanitizeReleaseNotes(
+      '<p style="position:fixed;inset:0" class="x">a</p>' +
+        '<iframe src="https://x.test"></iframe><form><input></form>',
+    );
+    expect(out).toBe("<p>a</p>");
   });
 });

@@ -7,6 +7,8 @@ node_modules/
 docs/
 e2e/
 *.md
+# knot-server compiles the release notes in (include_str!, see release_notes.rs).
+!CHANGELOG.md
 deploy/compose/
 deploy/helm/
 **/.DS_Store

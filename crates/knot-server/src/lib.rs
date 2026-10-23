@@ -32,6 +32,7 @@ pub mod http_error;
 pub mod metrics;
 pub mod protocol;
 pub mod reindex;
+pub mod release_notes;
 pub mod room;
 pub mod routes;
 pub mod security_headers;
@@ -70,6 +71,10 @@ pub struct AppState {
     pub oidc_enabled: bool,
     pub oidc: Option<Arc<knot_auth::oidc::OidcClient>>,
     pub config: Arc<Config>,
+    /// The release this binary reports to what's-new: `KNOT_BUILD_VERSION`
+    /// ("dev" unless built with `KNOT_VERSION`). A field so tests can pose
+    /// as a release build.
+    pub build_version: &'static str,
     /// Cancelled on SIGTERM/SIGINT so in-flight collab sockets send a clean
     /// 1001 Close and the process can drain within the grace period instead
     /// of being SIGKILLed mid-rollout.
@@ -107,6 +112,7 @@ impl AppState {
             oidc_enabled: false,
             oidc: None,
             config: Arc::new(Config::default()),
+            build_version: env!("KNOT_BUILD_VERSION"),
             shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -171,6 +177,7 @@ impl AppState {
             oidc_enabled: false,
             oidc: None,
             config: Arc::new(Config::default()),
+            build_version: env!("KNOT_BUILD_VERSION"),
             shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
