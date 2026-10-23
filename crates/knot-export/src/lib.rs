@@ -6,4 +6,4 @@ pub mod tables;
 pub mod walk;
 
 pub use model::*;
-pub use walk::{Walked, walk};
+pub use walk::{DiagramRef, Walked, blob_ids, diagrams, user_ids, walk};

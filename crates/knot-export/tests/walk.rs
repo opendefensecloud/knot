@@ -1,7 +1,10 @@
 mod common;
 
 use common::*;
-use knot_export::{Block, Inline, LinkTarget, List, ListItem, Marks, Run, walk};
+use knot_export::{
+    Block, DiagramRef, ImageSource, Inline, LinkTarget, List, ListItem, Marks, Run, blob_ids,
+    diagrams, user_ids, walk,
+};
 use sha2::{Digest, Sha256};
 use yrs::Any;
 
@@ -395,4 +398,196 @@ fn text_under_blockquote_is_wrapped() {
         vec![Block::Quote(vec![para("loose"), para("real")])]
     );
     assert!(w.unknown_elements.is_empty());
+}
+
+const BLOB_A: &str = "11111111-2222-4333-8444-555555555555";
+const BLOB_B: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+
+fn image(src: &str) -> N {
+    el(
+        "image",
+        vec![("src", src.into()), ("alt", "pic".into())],
+        vec![],
+    )
+}
+
+fn mermaid(source: &str) -> N {
+    el(
+        "code_block",
+        vec![("language", "mermaid".into())],
+        vec![t(source)],
+    )
+}
+
+fn board(id: &str) -> N {
+    el("excalidraw_board", vec![("board_id", id.into())], vec![])
+}
+
+#[test]
+fn image_sources_are_classified() {
+    let blob = format!("/api/blobs/{BLOB_A}");
+    let w = walk(&build(vec![
+        image(&blob),
+        image("https://x/y.png"),
+        image("http://x/y.png"),
+        image("data:image/png;base64,AA"),
+        image("img/a.png"),
+    ]));
+    let sources: Vec<ImageSource> = w
+        .doc
+        .blocks
+        .iter()
+        .map(|b| match b {
+            Block::Image { source, alt } => {
+                assert_eq!(alt, "pic");
+                source.clone()
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        sources,
+        vec![
+            ImageSource::Blob(BLOB_A.into()),
+            ImageSource::External("https://x/y.png".into()),
+            ImageSource::External("http://x/y.png".into()),
+            ImageSource::Unsupported,
+            ImageSource::Unsupported,
+        ]
+    );
+    assert!(w.unknown_elements.is_empty());
+}
+
+#[test]
+fn board_and_attachment_attributes() {
+    let w = walk(&build(vec![
+        board("b1"),
+        el(
+            "excalidraw_board",
+            vec![("board_id", "b2".into()), ("label", "Flow".into())],
+            vec![],
+        ),
+        el(
+            "attachment",
+            vec![
+                ("url", "/api/blobs/x".into()),
+                ("name", "a.pdf".into()),
+                ("size", Any::Number(2048.0)),
+            ],
+            vec![],
+        ),
+        el(
+            "attachment",
+            vec![
+                ("url", "/api/blobs/y".into()),
+                ("name", "b.pdf".into()),
+                ("size", Any::Number(0.0)),
+            ],
+            vec![],
+        ),
+    ]));
+    assert_eq!(
+        w.doc.blocks,
+        vec![
+            Block::Board {
+                key: "board-b1".into(),
+                board_id: "b1".into(),
+                label: "Diagram".into()
+            },
+            Block::Board {
+                key: "board-b2".into(),
+                board_id: "b2".into(),
+                label: "Flow".into()
+            },
+            Block::Attachment {
+                url: "/api/blobs/x".into(),
+                name: "a.pdf".into(),
+                size: Some(2048)
+            },
+            Block::Attachment {
+                url: "/api/blobs/y".into(),
+                name: "b.pdf".into(),
+                size: None
+            },
+        ]
+    );
+}
+
+fn cell_of(children: Vec<N>) -> N {
+    el(
+        "table",
+        vec![],
+        vec![el(
+            "table_row",
+            vec![],
+            vec![el("table_cell", vec![], children)],
+        )],
+    )
+}
+
+#[test]
+fn diagrams_are_listed_once_in_order() {
+    let w = walk(&build(vec![
+        mermaid("graph TD; A-->B"),
+        mermaid("graph TD; A-->B"),
+        cell_of(vec![board("b1"), board("b1")]),
+    ]));
+    let key = format!("mermaid-{:x}", Sha256::digest(b"graph TD; A-->B"));
+    assert_eq!(
+        diagrams(&w.doc),
+        vec![
+            DiagramRef::Mermaid {
+                key,
+                source: "graph TD; A-->B".into()
+            },
+            DiagramRef::Board {
+                key: "board-b1".into(),
+                board_id: "b1".into(),
+                label: "Diagram".into()
+            },
+        ]
+    );
+}
+
+#[test]
+fn blob_and_user_ids_are_collected_from_nested_blocks() {
+    let w = walk(&build(vec![
+        el(
+            "bullet_list",
+            vec![],
+            vec![el(
+                "list_item",
+                vec![],
+                vec![image(&format!("/api/blobs/{BLOB_B}"))],
+            )],
+        ),
+        image(&format!("/api/blobs/{BLOB_A}")),
+        image(&format!("/api/blobs/{BLOB_B}")),
+        image("https://x/y.png"),
+        cell_of(vec![el(
+            "paragraph",
+            vec![],
+            vec![linked("@u", &format!("knot://user/{USER_ID}"))],
+        )]),
+        el(
+            "paragraph",
+            vec![],
+            vec![linked("@u", &format!("knot://user/{USER_ID}"))],
+        ),
+    ]));
+    assert_eq!(
+        blob_ids(&w.doc),
+        vec![BLOB_B.to_string(), BLOB_A.to_string()]
+    );
+    assert_eq!(user_ids(&w.doc), vec![USER_ID.to_string()]);
+}
+
+#[test]
+fn unknown_block_element_degrades_and_is_reported() {
+    let w = walk(&build(vec![el("callout", vec![], vec![p("hi")])]));
+    assert_eq!(
+        w.doc.blocks,
+        vec![Block::Paragraph(vec![Inline::Run(run("hi"))])]
+    );
+    assert_eq!(w.unknown_elements, vec!["callout".to_string()]);
 }

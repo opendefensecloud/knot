@@ -9,7 +9,8 @@ use yrs::types::text::YChange;
 use yrs::{Any, Out, ReadTxn, Text, Transact, Xml, XmlFragment, XmlOut, XmlTextRef};
 
 use crate::model::{
-    Align, Block, Cell, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, Run, Table,
+    Align, Block, Cell, ExportDoc, ImageSource, Inline, LinkTarget, List, ListItem, Marks, Run,
+    Table,
 };
 use crate::tables::resolve_shares;
 
@@ -239,6 +240,32 @@ fn walk_element<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<
         "bullet_list" => walk_list(el, false, txn, unknown),
         "ordered_list" => walk_list(el, true, txn, unknown),
         "table" => walk_table(el, txn, unknown),
+        "image" => {
+            let src = attr(el, txn, "src").unwrap_or_default();
+            Block::Image {
+                source: classify_image(&src),
+                alt: attr(el, txn, "alt").unwrap_or_default(),
+            }
+        }
+        "excalidraw_board" => {
+            let board_id = attr(el, txn, "board_id").unwrap_or_default();
+            let label = attr(el, txn, "label")
+                .filter(|l| !l.trim().is_empty())
+                .unwrap_or_else(|| "Diagram".to_owned());
+            Block::Board {
+                key: format!("board-{board_id}"),
+                board_id,
+                label,
+            }
+        }
+        "attachment" => Block::Attachment {
+            url: attr(el, txn, "url").unwrap_or_default(),
+            name: attr(el, txn, "name").unwrap_or_default(),
+            size: attr(el, txn, "size")
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|n| n.is_finite() && *n > 0.0)
+                .map(|n| n.round() as u64),
+        },
         _ => {
             unknown.push(tag);
             Block::Paragraph(vec![Inline::Run(Run {
@@ -332,6 +359,18 @@ fn push_text<T: ReadTxn>(
     }
 }
 
+fn classify_image(src: &str) -> ImageSource {
+    if let Some(id) = src.strip_prefix("/api/blobs/")
+        && uuid::Uuid::parse_str(id).is_ok()
+    {
+        return ImageSource::Blob(id.to_owned());
+    }
+    match Url::parse(src) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") => ImageSource::External(src.to_owned()),
+        _ => ImageSource::Unsupported,
+    }
+}
+
 fn classify(href: &str) -> LinkTarget {
     if let Some(rest) = href.strip_prefix("knot://doc/") {
         return if uuid::Uuid::parse_str(rest).is_ok() {
@@ -373,4 +412,117 @@ fn flatten_text<F: XmlFragment, T: ReadTxn>(node: &F, txn: &T) -> String {
         }
     }
     s
+}
+
+/// A diagram the server has to render before writing the document.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiagramRef {
+    Mermaid {
+        key: String,
+        source: String,
+    },
+    Board {
+        key: String,
+        board_id: String,
+        label: String,
+    },
+}
+
+/// Calls `f` for every block, depth first in document order.
+fn visit_blocks<'a>(blocks: &'a [Block], f: &mut impl FnMut(&'a Block)) {
+    for b in blocks {
+        f(b);
+        match b {
+            Block::Quote(inner) => visit_blocks(inner, f),
+            Block::List(list) => {
+                for item in &list.items {
+                    visit_blocks(&item.blocks, f);
+                }
+            }
+            Block::Table(table) => {
+                for cell in table.rows.iter().flatten() {
+                    visit_blocks(&cell.blocks, f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn push_unique(out: &mut Vec<String>, id: &str) {
+    if !out.iter().any(|x| x == id) {
+        out.push(id.to_owned());
+    }
+}
+
+/// Mermaid blocks and boards in document order, once per key.
+pub fn diagrams(doc: &ExportDoc) -> Vec<DiagramRef> {
+    let mut out: Vec<DiagramRef> = Vec::new();
+    visit_blocks(&doc.blocks, &mut |b| {
+        let (r, key) = match b {
+            Block::Mermaid { key, source } => (
+                DiagramRef::Mermaid {
+                    key: key.clone(),
+                    source: source.clone(),
+                },
+                key,
+            ),
+            Block::Board {
+                key,
+                board_id,
+                label,
+            } => (
+                DiagramRef::Board {
+                    key: key.clone(),
+                    board_id: board_id.clone(),
+                    label: label.clone(),
+                },
+                key,
+            ),
+            _ => return,
+        };
+        let seen = out.iter().any(|d| match d {
+            DiagramRef::Mermaid { key: k, .. } | DiagramRef::Board { key: k, .. } => k == key,
+        });
+        if !seen {
+            out.push(r);
+        }
+    });
+    out
+}
+
+/// Blob ids of all images stored in knot, in document order, once each.
+pub fn blob_ids(doc: &ExportDoc) -> Vec<String> {
+    let mut out = Vec::new();
+    visit_blocks(&doc.blocks, &mut |b| {
+        if let Block::Image {
+            source: ImageSource::Blob(id),
+            ..
+        } = b
+        {
+            push_unique(&mut out, id);
+        }
+    });
+    out
+}
+
+/// Ids of all mentioned users, in document order, once each.
+pub fn user_ids(doc: &ExportDoc) -> Vec<String> {
+    let mut out = Vec::new();
+    visit_blocks(&doc.blocks, &mut |b| {
+        let inlines = match b {
+            Block::Paragraph(i) | Block::Heading { content: i, .. } => i,
+            _ => return,
+        };
+        for i in inlines {
+            if let Inline::Link {
+                target: LinkTarget::User(id),
+                ..
+            } = i
+            {
+                push_unique(&mut out, id);
+            }
+        }
+    });
+    out
 }
