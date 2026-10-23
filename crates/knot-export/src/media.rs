@@ -111,3 +111,21 @@ pub fn fit_cm(p: &Picture, max_width_cm: f64) -> (f64, f64) {
     }
     (max_width_cm, nat_h * max_width_cm / nat_w)
 }
+
+/// A base URL without trailing slashes, ready to prefix a path.
+pub(crate) fn base_url(base: &str) -> &str {
+    base.trim_end_matches('/')
+}
+
+/// 48 KB, 1.5 MB: binary units, whole kilobytes.
+pub(crate) fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    match bytes {
+        0..KB => format!("{bytes} B"),
+        KB..MB => format!("{} KB", (bytes + KB / 2) / KB),
+        MB..GB => format!("{:.1} MB", bytes as f64 / MB as f64),
+        _ => format!("{:.1} GB", bytes as f64 / GB as f64),
+    }
+}

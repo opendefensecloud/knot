@@ -3,7 +3,7 @@
 //! links for external images and attachments.
 
 use crate::assets::{ImageAsset, Picture};
-use crate::media::fit_emu;
+use crate::media::{base_url, fit_emu, human_size};
 use crate::model::{ImageSource, Marks};
 use crate::xml::esc_attr;
 
@@ -25,7 +25,7 @@ pub(super) fn image(cx: &mut Ctx, source: &ImageSource, alt: &str, avail_twips: 
                 }
                 Some(ImageAsset::OverBudget) => {
                     cx.fallbacks.image_over_budget += 1;
-                    let url = format!("{}/api/blobs/{id}", base_url(cx));
+                    let url = format!("{}/api/blobs/{id}", base_url(&cx.meta.base_url));
                     caption_link(cx, "[Image too large to include]", &url);
                 }
                 Some(ImageAsset::Unavailable) | None => unavailable(cx, alt),
@@ -81,16 +81,12 @@ pub(super) fn attachment(cx: &mut Ctx, url: &str, name: &str, size: Option<u64>)
     }
     open_paragraph(cx, None);
     if url.starts_with('/') {
-        let target = format!("{}{url}", base_url(cx));
+        let target = format!("{}{url}", base_url(&cx.meta.base_url));
         link_run(cx, &line, &target);
     } else {
         run(cx, &line, &Marks::default(), None);
     }
     cx.xml.push_str("</w:p>");
-}
-
-fn base_url<'a>(cx: &Ctx<'a>) -> &'a str {
-    cx.meta.base_url.trim_end_matches('/')
 }
 
 fn unavailable(cx: &mut Ctx, alt: &str) {
@@ -122,19 +118,6 @@ fn link_run(cx: &mut Ctx, text: &str, url: &str) {
         .push_str(&format!(r#"<w:hyperlink r:id="{id}" w:history="1">"#));
     run(cx, text, &Marks::default(), Some("Hyperlink"));
     cx.xml.push_str("</w:hyperlink>");
-}
-
-/// 48 KB, 1.5 MB: binary units, whole kilobytes.
-fn human_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    match bytes {
-        0..KB => format!("{bytes} B"),
-        KB..MB => format!("{} KB", (bytes + KB / 2) / KB),
-        MB..GB => format!("{:.1} MB", bytes as f64 / MB as f64),
-        _ => format!("{:.1} GB", bytes as f64 / GB as f64),
-    }
 }
 
 /// An inline drawing of `pic` in its own paragraph, at most `avail_twips`

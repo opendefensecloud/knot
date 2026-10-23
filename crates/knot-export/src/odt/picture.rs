@@ -4,7 +4,7 @@
 //! counting match the DOCX writer.
 
 use crate::assets::{ImageAsset, PicFormat, Picture};
-use crate::media::fit_cm;
+use crate::media::{base_url, fit_cm, human_size};
 use crate::model::ImageSource;
 use crate::xml::{esc_attr, esc_text};
 
@@ -26,7 +26,7 @@ pub(super) fn image(cx: &mut Ctx, source: &ImageSource, alt: &str, avail_cm: f64
                 }
                 Some(ImageAsset::OverBudget) => {
                     cx.fallbacks.image_over_budget += 1;
-                    let url = format!("{}/api/blobs/{id}", base_url(cx));
+                    let url = format!("{}/api/blobs/{id}", base_url(&cx.meta.base_url));
                     open_paragraph(cx, "Caption");
                     link(cx, "[Image too large to include]", &url);
                     cx.body.push_str("</text:p>");
@@ -81,17 +81,13 @@ pub(super) fn attachment(cx: &mut Ctx, url: &str, name: &str, size: Option<u64>)
         line.push_str(&format!(" ({})", human_size(size)));
     }
     if url.starts_with('/') {
-        let target = format!("{}{url}", base_url(cx));
+        let target = format!("{}{url}", base_url(&cx.meta.base_url));
         open_paragraph(cx, "Standard");
         link(cx, &line, &target);
         cx.body.push_str("</text:p>");
     } else {
         text_paragraph(cx, "Standard", &line);
     }
-}
-
-fn base_url<'a>(cx: &Ctx<'a>) -> &'a str {
-    cx.meta.base_url.trim_end_matches('/')
 }
 
 fn unavailable(cx: &mut Ctx, alt: &str) {
@@ -112,19 +108,6 @@ fn link(cx: &mut Ctx, text: &str, url: &str) {
         esc_text(text),
     ));
     cx.after_char = true;
-}
-
-/// 48 KB, 1.5 MB: binary units, whole kilobytes.
-fn human_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    match bytes {
-        0..KB => format!("{bytes} B"),
-        KB..MB => format!("{} KB", (bytes + KB / 2) / KB),
-        MB..GB => format!("{:.1} MB", bytes as f64 / MB as f64),
-        _ => format!("{:.1} GB", bytes as f64 / GB as f64),
-    }
 }
 
 /// An as-character frame holding `pic` in its own paragraph, at most
