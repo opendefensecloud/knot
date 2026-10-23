@@ -2,6 +2,7 @@
 //! Fixture tree builder and package readers shared by every knot-export test.
 
 pub mod docx;
+pub mod odt;
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
