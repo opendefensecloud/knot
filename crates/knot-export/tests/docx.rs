@@ -10,11 +10,11 @@ use common::docx::{
     wattr,
 };
 use common::{unzip, xml};
-use knot_export::assets::{Assets, Meta};
+use knot_export::assets::{Assets, Fallbacks, ImageAsset, Meta, PicFormat, Picture};
 use knot_export::docx::{DocxDefaults, write_docx_with};
 use knot_export::{
-    Align, Block, Cell, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, Run, Table,
-    write_docx,
+    Align, Block, Cell, ExportDoc, ImageSource, Inline, LinkTarget, List, ListItem, Marks, Run,
+    Table, write_docx,
 };
 use roxmltree::Node;
 
@@ -1442,4 +1442,366 @@ fn large_page_exports_valid_docx_quickly() {
     let trs = rows(tables(&d)[0]);
     assert_eq!(trs.len(), 50);
     assert!(trs.iter().all(|tr| cells(*tr).len() == 20));
+}
+
+const WP: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+const A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+const PIC: &str = "http://schemas.openxmlformats.org/drawingml/2006/picture";
+
+const BLOB_A: &str = "aaaaaaaa-1111-4222-8333-444444444444";
+const BLOB_B: &str = "bbbbbbbb-1111-4222-8333-444444444444";
+
+fn picture(format: PicFormat, width_px: u32, height_px: u32, scale: u32) -> Picture {
+    Picture {
+        format,
+        bytes: vec![1, 2, 3, width_px as u8],
+        width_px,
+        height_px,
+        scale,
+    }
+}
+
+fn image_block(blob: &str, alt: &str) -> Block {
+    Block::Image {
+        source: ImageSource::Blob(blob.into()),
+        alt: alt.into(),
+    }
+}
+
+/// Every `wp:extent` in the body as (cx, cy).
+fn extents(d: &roxmltree::Document) -> Vec<(u64, u64)> {
+    d.descendants()
+        .filter(|n| n.has_tag_name((WP, "extent")))
+        .map(|n| {
+            (
+                n.attribute("cx").unwrap().parse().unwrap(),
+                n.attribute("cy").unwrap().parse().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn embedded_image_has_media_part_and_unique_docpr() {
+    let mut assets = Assets::default();
+    assets.images.insert(
+        BLOB_A.into(),
+        ImageAsset::Embedded(picture(PicFormat::Png, 100, 50, 1)),
+    );
+    assets.images.insert(
+        BLOB_B.into(),
+        ImageAsset::Embedded(picture(PicFormat::Jpeg, 80, 40, 1)),
+    );
+    let docx = export_with(
+        vec![image_block(BLOB_A, "First <one>"), image_block(BLOB_B, "")],
+        &assets,
+    );
+    assert_eq!(docx.0["word/media/image1.png"], [1, 2, 3, 100]);
+    assert_eq!(docx.0["word/media/image2.jpeg"], [1, 2, 3, 80]);
+
+    let ct = xml(docx.part("[Content_Types].xml"));
+    for (ext, mime) in [
+        ("png", "image/png"),
+        ("jpeg", "image/jpeg"),
+        ("gif", "image/gif"),
+    ] {
+        assert!(ct.descendants().any(|n| n.has_tag_name((CT, "Default"))
+            && n.attribute("Extension") == Some(ext)
+            && n.attribute("ContentType") == Some(mime)));
+    }
+
+    let d = xml(docx.part("word/document.xml"));
+    let root = d.root_element();
+    for (prefix, ns) in [("wp", WP), ("a", A), ("pic", PIC)] {
+        assert_eq!(root.lookup_namespace_uri(Some(prefix)), Some(ns));
+    }
+    let doc_prs: Vec<_> = d
+        .descendants()
+        .filter(|n| n.has_tag_name((WP, "docPr")))
+        .collect();
+    assert_eq!(doc_prs.len(), 2);
+    let ids: HashSet<u32> = doc_prs
+        .iter()
+        .map(|n| n.attribute("id").unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(!ids.contains(&0));
+    assert_eq!(doc_prs[0].attribute("descr"), Some("First <one>"));
+
+    let rels = rels(&docx);
+    let blips: Vec<_> = d
+        .descendants()
+        .filter(|n| n.has_tag_name((A, "blip")))
+        .map(|n| &rels[n.attribute((R, "embed")).unwrap()])
+        .collect();
+    assert_eq!(blips.len(), 2);
+    assert_eq!(blips[0].target, "media/image1.png");
+    assert_eq!(blips[1].target, "media/image2.jpeg");
+    assert!(
+        blips
+            .iter()
+            .all(|r| r.kind == format!("{REL_TYPE}image") && !r.external)
+    );
+    // Word reports corruption without pic:spPr.
+    assert_eq!(
+        d.descendants()
+            .filter(|n| n.has_tag_name((PIC, "spPr")))
+            .count(),
+        2
+    );
+    assert_eq!(extents(&d), [(952_500, 476_250), (762_000, 381_000)]);
+}
+
+#[test]
+fn diagram_picture_is_half_size_and_capped() {
+    let mut assets = Assets::default();
+    assets
+        .diagrams
+        .insert("m1".into(), picture(PicFormat::Png, 400, 200, 2));
+    assets
+        .diagrams
+        .insert("m2".into(), picture(PicFormat::Png, 4000, 1000, 2));
+    let docx = export_with(
+        vec![
+            Block::Mermaid {
+                key: "m1".into(),
+                source: "graph TD".into(),
+            },
+            Block::Mermaid {
+                key: "m2".into(),
+                source: "graph LR".into(),
+            },
+        ],
+        &assets,
+    );
+    let d = xml(docx.part("word/document.xml"));
+    assert_eq!(extents(&d), [(1_905_000, 952_500), (5_760_720, 1_440_180)]);
+    let descr: Vec<_> = d
+        .descendants()
+        .filter(|n| n.has_tag_name((WP, "docPr")))
+        .map(|n| n.attribute("descr").unwrap())
+        .collect();
+    assert_eq!(descr, ["Mermaid diagram", "Mermaid diagram"]);
+}
+
+#[test]
+fn board_picture_is_described_by_its_label() {
+    let mut assets = Assets::default();
+    assets
+        .diagrams
+        .insert("b1".into(), picture(PicFormat::Png, 200, 100, 2));
+    let docx = export_with(
+        vec![Block::Board {
+            key: "b1".into(),
+            board_id: "x".into(),
+            label: "Roadmap".into(),
+        }],
+        &assets,
+    );
+    let d = xml(docx.part("word/document.xml"));
+    let pr = d
+        .descendants()
+        .find(|n| n.has_tag_name((WP, "docPr")))
+        .unwrap();
+    assert_eq!(pr.attribute("descr"), Some("Diagram: Roadmap"));
+}
+
+#[test]
+fn image_in_table_cell_fits_the_cell() {
+    let mut assets = Assets::default();
+    assets.images.insert(
+        BLOB_A.into(),
+        ImageAsset::Embedded(picture(PicFormat::Png, 3000, 1000, 1)),
+    );
+    let cell = Cell {
+        col: 0,
+        colspan: 1,
+        rowspan: 1,
+        header: false,
+        align: Align::Left,
+        blocks: vec![image_block(BLOB_A, "wide")],
+    };
+    let docx = export_with(vec![table(vec![0.5, 0.5], vec![vec![cell]])], &assets);
+    let d = xml(docx.part("word/document.xml"));
+    let max = (4536 - 216) * 635u64;
+    let e = extents(&d);
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].0, max);
+    assert_eq!(e[0].1, max / 3);
+}
+
+#[test]
+fn same_blob_twice_shares_one_media_part() {
+    let mut assets = Assets::default();
+    assets.images.insert(
+        BLOB_A.into(),
+        ImageAsset::Embedded(picture(PicFormat::Gif, 10, 10, 1)),
+    );
+    let docx = export_with(
+        vec![image_block(BLOB_A, "a"), image_block(BLOB_A, "b")],
+        &assets,
+    );
+    let media: Vec<_> = docx
+        .0
+        .keys()
+        .filter(|k| k.starts_with("word/media/"))
+        .collect();
+    assert_eq!(media, ["word/media/image1.gif"]);
+    let d = xml(docx.part("word/document.xml"));
+    let ids: HashSet<_> = d
+        .descendants()
+        .filter(|n| n.has_tag_name((WP, "docPr")))
+        .map(|n| n.attribute("id").unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+}
+
+#[test]
+fn fallbacks_are_rendered_and_counted() {
+    let (doc, assets) = common::fallback_fixture();
+    let out = write_docx(&doc, &meta(), &assets).expect("export");
+    assert_eq!(
+        out.fallbacks,
+        Fallbacks {
+            diagram: 2,
+            image_unavailable: 2,
+            image_over_budget: 1,
+            unknown_element: 0,
+        }
+    );
+    let docx = Docx(unzip(&out.bytes));
+    let d = xml(docx.part("word/document.xml"));
+    let paras: Vec<(Option<&str>, String)> = content(&d)
+        .into_iter()
+        .map(|p| (p_style(p), text(p)))
+        .collect();
+    assert_eq!(
+        paras,
+        [
+            // The line break is a w:br, which text() skips.
+            (Some("Code"), "graph TD  A --> B".to_owned()),
+            (Some("Caption"), "Mermaid diagram (not included)".to_owned()),
+            (
+                Some("Caption"),
+                "Diagram: Roadmap (not included)".to_owned()
+            ),
+            (
+                Some("Caption"),
+                "[Image not available] \u{2014} Org chart".to_owned()
+            ),
+            (Some("Caption"), "[Image too large to include]".to_owned()),
+            (
+                Some("Caption"),
+                "[Image not available] \u{2014} Local file".to_owned()
+            ),
+        ]
+    );
+    // The over-budget placeholder links to the blob.
+    let rels = rels(&docx);
+    let link = d
+        .descendants()
+        .find(|n| n.has_tag_name((W, "hyperlink")))
+        .expect("hyperlink");
+    let rel = &rels[link.attribute((R, "id")).unwrap()];
+    assert_eq!(
+        rel.target,
+        format!(
+            "https://knot.example/api/blobs/{}",
+            common::OVER_BUDGET_BLOB
+        )
+    );
+    assert!(rel.external);
+    assert_eq!(text(link), "[Image too large to include]");
+}
+
+#[test]
+fn absent_and_unlabelled_images_fall_back() {
+    let out = write_docx(
+        &ExportDoc {
+            blocks: vec![
+                image_block(BLOB_A, ""),
+                Block::Image {
+                    source: ImageSource::Unsupported,
+                    alt: String::new(),
+                },
+            ],
+        },
+        &meta(),
+        &Assets::default(),
+    )
+    .expect("export");
+    assert_eq!(out.fallbacks.image_unavailable, 2);
+    let docx = Docx(unzip(&out.bytes));
+    let d = xml(docx.part("word/document.xml"));
+    let texts: Vec<_> = content(&d).into_iter().map(text).collect();
+    assert_eq!(texts, ["[Image not available]", "[Image not available]"]);
+}
+
+#[test]
+fn external_image_is_a_link() {
+    let docx = export(vec![
+        Block::Image {
+            source: ImageSource::External("https://img.example/a.png?x=1&y=2".into()),
+            alt: "Remote".into(),
+        },
+        Block::Image {
+            source: ImageSource::External("https://img.example/b.png".into()),
+            alt: String::new(),
+        },
+    ]);
+    let d = xml(docx.part("word/document.xml"));
+    let rels = rels(&docx);
+    let got: Vec<_> = d
+        .descendants()
+        .filter(|n| n.has_tag_name((W, "hyperlink")))
+        .map(|l| {
+            (
+                text(l),
+                rels[l.attribute((R, "id")).unwrap()].target.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (
+                "Remote".to_owned(),
+                "https://img.example/a.png?x=1&y=2".to_owned()
+            ),
+            (
+                "https://img.example/b.png".to_owned(),
+                "https://img.example/b.png".to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn attachment_line_links_back_to_knot() {
+    let url = "/api/blobs/cccccccc-1111-4222-8333-444444444444";
+    let docx = export(vec![
+        Block::Attachment {
+            url: url.into(),
+            name: "budget.xlsx".into(),
+            size: Some(49152),
+        },
+        Block::Attachment {
+            url: "javascript:alert(1)".into(),
+            name: "odd".into(),
+            size: None,
+        },
+    ]);
+    let d = xml(docx.part("word/document.xml"));
+    let ps = content(&d);
+    assert_eq!(text(ps[0]), "\u{1F4CE} budget.xlsx (48 KB)");
+    assert_eq!(p_style(ps[0]), None);
+    let link = child(ps[0], "hyperlink").expect("hyperlink");
+    let rels = rels(&docx);
+    assert_eq!(
+        rels[link.attribute((R, "id")).unwrap()].target,
+        format!("https://knot.example{url}")
+    );
+    // No size, and no link for a target that isn't a knot path.
+    assert_eq!(text(ps[1]), "\u{1F4CE} odd");
+    assert!(child(ps[1], "hyperlink").is_none());
 }

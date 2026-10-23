@@ -10,7 +10,8 @@ use crate::xml::esc_text;
 
 use super::numbering::{INDENT_TWIPS, LEVELS};
 use super::{
-    Ctx, FOOTER_RID, MARGIN_TWIPS, PAGE_HEIGHT_TWIPS, PAGE_WIDTH_TWIPS, TEXT_WIDTH_TWIPS, table,
+    Ctx, FOOTER_RID, MARGIN_TWIPS, PAGE_HEIGHT_TWIPS, PAGE_WIDTH_TWIPS, TEXT_WIDTH_TWIPS, picture,
+    table,
 };
 
 /// Left indent of the Quote style, in twips.
@@ -20,7 +21,10 @@ pub(super) fn document(cx: &mut Ctx, doc: &ExportDoc) {
     cx.xml.push_str(concat!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
         r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
-        r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#,
+        r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+        r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+        r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+        r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
         "<w:body>",
     ));
     let meta = cx.meta;
@@ -82,11 +86,10 @@ fn block(cx: &mut Ctx, b: &Block, avail_twips: u32) {
         }
         Block::List(l) => list(cx, l, avail_twips),
         Block::Table(t) => table::table(cx, t, avail_twips),
-        // Not written yet: an empty Normal paragraph keeps the document valid.
-        Block::Mermaid { .. }
-        | Block::Image { .. }
-        | Block::Board { .. }
-        | Block::Attachment { .. } => cx.xml.push_str("<w:p/>"),
+        Block::Mermaid { key, source } => picture::mermaid(cx, key, source, avail_twips),
+        Block::Image { source, alt } => picture::image(cx, source, alt, avail_twips),
+        Block::Board { key, label, .. } => picture::board(cx, key, label, avail_twips),
+        Block::Attachment { url, name, size } => picture::attachment(cx, url, name, *size),
     }
 }
 
@@ -99,7 +102,7 @@ fn text_paragraph(cx: &mut Ctx, style: &str, text: &str) {
 
 /// Open a `w:p`, with its paragraph style unless it is Normal, and the
 /// indent of the list item it continues.
-fn open_paragraph(cx: &mut Ctx, style: Option<&str>) {
+pub(super) fn open_paragraph(cx: &mut Ctx, style: Option<&str>) {
     let indent = cx.block_indent;
     open_paragraph_with(cx, style, None, (indent > 0).then_some(indent));
 }
@@ -238,7 +241,7 @@ fn link(cx: &mut Ctx, target: &LinkTarget, runs: &[Run]) {
 /// One `w:r`. Tabs become `w:tab`, line breaks `w:br`, and the text between
 /// them a space-preserving `w:t`. A run takes one character style, so a
 /// link's style wins over inline code.
-fn run(cx: &mut Ctx, text: &str, marks: &Marks, char_style: Option<&str>) {
+pub(super) fn run(cx: &mut Ctx, text: &str, marks: &Marks, char_style: Option<&str>) {
     if text.is_empty() {
         return;
     }

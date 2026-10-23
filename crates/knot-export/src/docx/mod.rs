@@ -5,13 +5,14 @@
 
 mod body;
 mod numbering;
+mod picture;
 mod styles;
 mod table;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::assets::{Assets, ExportError, Fallbacks, Meta, Output};
+use crate::assets::{Assets, ExportError, Fallbacks, Meta, Output, PicFormat, Picture};
 use crate::model::ExportDoc;
 use crate::xml::{ZipOut, esc_attr, esc_text};
 
@@ -83,6 +84,10 @@ pub fn write_docx_with(
     zip.deflated("word/numbering.xml", numbering_xml.as_bytes())?;
     zip.deflated("word/settings.xml", SETTINGS_XML.as_bytes())?;
     zip.deflated("word/footer1.xml", defaults.footer_xml.as_bytes())?;
+    for (path, bytes) in &cx.media {
+        // Images are compressed already.
+        zip.stored(path, bytes)?;
+    }
     Ok(Output {
         bytes: zip.finish()?,
         fallbacks: cx.fallbacks,
@@ -125,6 +130,11 @@ struct Ctx<'a> {
     hyperlinks: HashMap<String, String>,
     /// Last drawing id handed out; ids are document-wide.
     last_doc_pr: u32,
+    /// Media parts as (package path, bytes); `media[i]` is `image{i + 1}`.
+    media: Vec<(String, Vec<u8>)>,
+    /// Picture key to its media number, relationship id and extension, so a
+    /// picture used twice is stored once.
+    media_index: HashMap<String, (usize, String, &'static str)>,
 }
 
 impl<'a> Ctx<'a> {
@@ -152,6 +162,8 @@ impl<'a> Ctx<'a> {
             rels,
             hyperlinks: HashMap::new(),
             last_doc_pr: 0,
+            media: Vec::new(),
+            media_index: HashMap::new(),
         }
     }
 
@@ -183,10 +195,25 @@ impl<'a> Ctx<'a> {
     }
 
     /// The next drawing id (`wp:docPr id`), unique and positive.
-    #[expect(dead_code, reason = "pictures take their drawing ids from here")]
     fn doc_pr_id(&mut self) -> u32 {
         self.last_doc_pr += 1;
         self.last_doc_pr
+    }
+
+    /// The media part of the picture `key`, stored on first use, as
+    /// (number, relationship id, extension).
+    fn media_part(&mut self, key: &str, pic: &Picture) -> (usize, String, &'static str) {
+        if let Some((n, rid, ext)) = self.media_index.get(key) {
+            return (*n, rid.clone(), ext);
+        }
+        let n = self.media.len() + 1;
+        let ext = extension(pic.format);
+        self.media
+            .push((format!("word/media/image{n}.{ext}"), pic.bytes.clone()));
+        let rid = self.add_rel("image", format!("media/image{n}.{ext}"), false);
+        self.media_index
+            .insert(key.to_owned(), (n, rid.clone(), ext));
+        (n, rid, ext)
     }
 
     fn rels_xml(&self) -> String {
@@ -209,6 +236,16 @@ impl<'a> Ctx<'a> {
         }
         s.push_str("</Relationships>");
         s
+    }
+}
+
+/// File extension of a picture's media part. JPEG is `jpeg`, the one
+/// extension `[Content_Types].xml` declares for it.
+fn extension(format: PicFormat) -> &'static str {
+    match format {
+        PicFormat::Png => "png",
+        PicFormat::Jpeg => "jpeg",
+        PicFormat::Gif => "gif",
     }
 }
 
