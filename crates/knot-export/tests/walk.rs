@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use knot_export::{Block, Inline, LinkTarget, Marks, Run, walk};
+use knot_export::{Block, Inline, LinkTarget, List, ListItem, Marks, Run, walk};
 use sha2::{Digest, Sha256};
 use yrs::Any;
 
@@ -225,4 +225,174 @@ fn unknown_block_becomes_paragraph_and_is_reported() {
         vec![Block::Paragraph(vec![Inline::Run(run("kept"))])]
     );
     assert_eq!(w.unknown_elements, vec!["mystery".to_string()]);
+}
+
+fn para(text: &str) -> Block {
+    Block::Paragraph(vec![Inline::Run(run(text))])
+}
+
+fn item(text: &str) -> N {
+    el("list_item", vec![], vec![p(text)])
+}
+
+fn only_list(w: &knot_export::Walked) -> &List {
+    match &w.doc.blocks[..] {
+        [Block::List(l)] => l,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn ordered_list_start_from_number_or_string() {
+    let w = walk(&build(vec![
+        el(
+            "ordered_list",
+            vec![("start", Any::Number(5.0))],
+            vec![item("a")],
+        ),
+        el("ordered_list", vec![("start", "3".into())], vec![item("b")]),
+        el("ordered_list", vec![], vec![item("c")]),
+    ]));
+    let lists: Vec<(bool, u32)> = w
+        .doc
+        .blocks
+        .iter()
+        .map(|b| match b {
+            Block::List(l) => (l.ordered, l.start),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(lists, vec![(true, 5), (true, 3), (true, 1)]);
+}
+
+#[test]
+fn checked_accepts_bool_and_string() {
+    let w = walk(&build(vec![el(
+        "bullet_list",
+        vec![],
+        vec![
+            el(
+                "list_item",
+                vec![("checked", Any::Bool(true))],
+                vec![p("a")],
+            ),
+            el("list_item", vec![("checked", "false".into())], vec![p("b")]),
+            item("c"),
+        ],
+    )]));
+    let l = only_list(&w);
+    assert!(!l.ordered);
+    let checked: Vec<Option<bool>> = l.items.iter().map(|i| i.checked).collect();
+    assert_eq!(checked, vec![Some(true), Some(false), None]);
+}
+
+#[test]
+fn nested_mixed_lists_keep_structure() {
+    let w = walk(&build(vec![el(
+        "bullet_list",
+        vec![],
+        vec![el(
+            "list_item",
+            vec![],
+            vec![
+                p("top"),
+                el(
+                    "ordered_list",
+                    vec![("start", Any::Number(2.0))],
+                    vec![el(
+                        "list_item",
+                        vec![],
+                        vec![
+                            p("mid"),
+                            el(
+                                "bullet_list",
+                                vec![],
+                                vec![
+                                    el("list_item", vec![("checked", "true".into())], vec![p("x")]),
+                                    el("list_item", vec![("checked", "no".into())], vec![p("y")]),
+                                ],
+                            ),
+                        ],
+                    )],
+                ),
+            ],
+        )],
+    )]));
+    assert_eq!(
+        w.doc.blocks,
+        vec![Block::List(List {
+            ordered: false,
+            start: 1,
+            items: vec![ListItem {
+                checked: None,
+                blocks: vec![
+                    para("top"),
+                    Block::List(List {
+                        ordered: true,
+                        start: 2,
+                        items: vec![ListItem {
+                            checked: None,
+                            blocks: vec![
+                                para("mid"),
+                                Block::List(List {
+                                    ordered: false,
+                                    start: 1,
+                                    items: vec![
+                                        ListItem {
+                                            checked: Some(true),
+                                            blocks: vec![para("x")]
+                                        },
+                                        ListItem {
+                                            checked: Some(false),
+                                            blocks: vec![para("y")]
+                                        },
+                                    ],
+                                }),
+                            ],
+                        }],
+                    }),
+                ],
+            }],
+        })]
+    );
+    assert!(w.unknown_elements.is_empty());
+}
+
+#[test]
+fn text_directly_under_list_item_is_wrapped() {
+    let w = walk(&build(vec![el(
+        "bullet_list",
+        vec![],
+        vec![el(
+            "list_item",
+            vec![],
+            vec![t("a"), el("hard_break", vec![], vec![]), t("b")],
+        )],
+    )]));
+    assert_eq!(
+        only_list(&w).items,
+        vec![ListItem {
+            checked: None,
+            blocks: vec![Block::Paragraph(vec![
+                Inline::Run(run("a")),
+                Inline::Break,
+                Inline::Run(run("b")),
+            ])],
+        }]
+    );
+    assert!(w.unknown_elements.is_empty());
+}
+
+#[test]
+fn text_under_blockquote_is_wrapped() {
+    let w = walk(&build(vec![el(
+        "blockquote",
+        vec![],
+        vec![t("loose"), p("real")],
+    )]));
+    assert_eq!(
+        w.doc.blocks,
+        vec![Block::Quote(vec![para("loose"), para("real")])]
+    );
+    assert!(w.unknown_elements.is_empty());
 }

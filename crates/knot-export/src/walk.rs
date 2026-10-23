@@ -8,7 +8,7 @@ use url::Url;
 use yrs::types::text::YChange;
 use yrs::{Any, Out, ReadTxn, Text, Transact, Xml, XmlFragment, XmlOut, XmlTextRef};
 
-use crate::model::{Block, ExportDoc, Inline, LinkTarget, Marks, Run};
+use crate::model::{Block, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, Run};
 
 /// Result of walking a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -37,21 +37,86 @@ fn attr<X: Xml, T: ReadTxn>(el: &X, txn: &T, name: &str) -> Option<String> {
     el.get_attribute(txn, name).map(|v| v.to_string(txn))
 }
 
+/// Walk the children of a block container. Raw text or `hard_break` children
+/// (the import's soft-break shape) are repaired into paragraphs; consecutive
+/// ones share a paragraph.
 fn walk_blocks<F: XmlFragment, T: ReadTxn>(
     parent: &F,
     txn: &T,
     unknown: &mut Vec<String>,
 ) -> Vec<Block> {
     let mut out = Vec::new();
+    let mut stray: Vec<Inline> = Vec::new();
+    let mut last_href: Option<String> = None;
     for i in 0..parent.len(txn) {
         match parent.get(txn, i) {
-            Some(XmlOut::Element(el)) => out.push(walk_element(&el, txn, unknown)),
-            Some(XmlOut::Text(t)) => out.push(Block::Paragraph(text_inlines(&t, txn))),
-            Some(XmlOut::Fragment(f)) => out.extend(walk_blocks(&f, txn, unknown)),
+            Some(XmlOut::Text(t)) => push_text(&mut stray, &mut last_href, &t, txn),
+            Some(XmlOut::Element(el)) if el.tag().as_ref() == "hard_break" => {
+                last_href = None;
+                stray.push(Inline::Break);
+            }
+            Some(XmlOut::Element(el)) => {
+                flush_stray(&mut stray, &mut out);
+                last_href = None;
+                out.push(walk_element(&el, txn, unknown));
+            }
+            Some(XmlOut::Fragment(f)) => {
+                flush_stray(&mut stray, &mut out);
+                last_href = None;
+                out.extend(walk_blocks(&f, txn, unknown));
+            }
             None => {}
         }
     }
+    flush_stray(&mut stray, &mut out);
     out
+}
+
+fn flush_stray(stray: &mut Vec<Inline>, out: &mut Vec<Block>) {
+    if !stray.is_empty() {
+        out.push(Block::Paragraph(std::mem::take(stray)));
+    }
+}
+
+fn walk_list<T: ReadTxn>(
+    el: &yrs::XmlElementRef,
+    ordered: bool,
+    txn: &T,
+    unknown: &mut Vec<String>,
+) -> Block {
+    let start = if ordered {
+        attr(el, txn, "start")
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|n| n.is_finite())
+            .map(|n| n.round().clamp(1.0, f64::from(u32::MAX)) as u32)
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    let mut items = Vec::new();
+    for i in 0..el.len(txn) {
+        match el.get(txn, i) {
+            Some(XmlOut::Element(item)) if item.tag().as_ref() == "list_item" => {
+                items.push(ListItem {
+                    checked: attr(&item, txn, "checked").map(|v| v == "true"),
+                    blocks: walk_blocks(&item, txn, unknown),
+                });
+            }
+            Some(XmlOut::Element(other)) => {
+                // Not a list_item: keep it as an item of its own.
+                items.push(ListItem {
+                    checked: None,
+                    blocks: vec![walk_element(&other, txn, unknown)],
+                });
+            }
+            _ => {}
+        }
+    }
+    Block::List(List {
+        ordered,
+        start,
+        items,
+    })
 }
 
 fn walk_element<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<String>) -> Block {
@@ -80,6 +145,8 @@ fn walk_element<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<
             }
         }
         "horizontal_rule" => Block::Rule,
+        "bullet_list" => walk_list(el, false, txn, unknown),
+        "ordered_list" => walk_list(el, true, txn, unknown),
         _ => {
             unknown.push(tag);
             Block::Paragraph(vec![Inline::Run(Run {
@@ -118,12 +185,6 @@ fn inlines<F: XmlFragment, T: ReadTxn>(parent: &F, txn: &T) -> Vec<Inline> {
             None => {}
         }
     }
-    out
-}
-
-fn text_inlines<T: ReadTxn>(t: &XmlTextRef, txn: &T) -> Vec<Inline> {
-    let mut out = Vec::new();
-    push_text(&mut out, &mut None, t, txn);
     out
 }
 
