@@ -85,6 +85,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY migrations ./migrations
 COPY tools ./tools
+# knot-server compiles the release notes in (include_str!, see release_notes.rs). Builder only:
+# the planner's recipe does not depend on it, so a changelog edit leaves the cook layer cached.
+COPY CHANGELOG.md ./
 # Stamp version/commit into the binary (knot-server build.rs reads these). Defaults match
 # build.rs's own fallbacks so local builds still report dev/unknown; release.yaml passes the
 # real tag + sha. Placed after the dep cook so a new commit recompiles only the workspace

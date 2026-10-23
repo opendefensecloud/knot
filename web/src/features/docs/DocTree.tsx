@@ -37,6 +37,7 @@ import { IconButton } from "../../components/ui/IconButton";
 import { type Doc } from "../../lib/validators";
 import { type ApiError } from "../../lib/api";
 
+import { SidebarVersion } from "../about/SidebarVersion";
 import { WorkspaceHeader } from "../workspace/WorkspaceHeader";
 import { workspaceApi } from "../workspace/workspace.api";
 import { archiveConfirmText, archiveErrorText } from "./archive";
@@ -216,6 +217,7 @@ export function DocTree() {
           </SortableContext>
         </DndContext>
       )}
+      <SidebarVersion />
       {pickerOpen && (
         <NewDocPicker
           onClose={() => setPickerOpen(false)}

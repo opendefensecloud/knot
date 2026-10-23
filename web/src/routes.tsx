@@ -18,6 +18,7 @@ const LibraryReturn = lazy(() => import("./features/boards/LibraryReturn"));
 const TasksPage = lazy(() => import("./features/tasks/TasksPage"));
 const TemplatesPage = lazy(() => import("./features/docs/TemplatesPage"));
 const ArchivePage = lazy(() => import("./features/docs/ArchivePage"));
+const AboutPage = lazy(() => import("./features/about/AboutPage"));
 
 function Lazy({ children }: { children: ReactNode }) {
   return <Suspense fallback={<div style={{ padding: 24 }}>Loading…</div>}>{children}</Suspense>;
@@ -70,6 +71,7 @@ export const router = createBrowserRouter([
           { path: "tasks", element: <Lazy><TasksPage /></Lazy> },
           { path: "templates", element: <Lazy><TemplatesPage /></Lazy> },
           { path: "archive", element: <Lazy><ArchivePage /></Lazy> },
+          { path: "about", element: <Lazy><AboutPage /></Lazy> },
         ],
       },
     ],

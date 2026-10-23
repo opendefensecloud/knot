@@ -127,6 +127,39 @@ const docContributorsSchema = v.object({
 export type DocContributors = v.InferOutput<typeof docContributorsSchema>;
 export const DocContributors = docContributorsSchema;
 
+/**
+ * GET /api/whats-new: the running build, and the releases this user hasn't
+ * seen yet. `dev` is a build without a release version; it never has
+ * unseen releases. `unseen` is newest first.
+ */
+const whatsNewSchema = v.object({
+  version: v.string(),
+  commit: v.string(),
+  released_on: v.nullable(v.string()),
+  dev: v.boolean(),
+  last_seen_version: v.nullable(v.string()),
+  unseen: v.array(v.string()),
+});
+export type WhatsNew = v.InferOutput<typeof whatsNewSchema>;
+export const WhatsNew = whatsNewSchema;
+
+/**
+ * GET /api/release-notes: CHANGELOG.md, newest release first. Each section
+ * is one "###" heading of a release with its body as HTML; text straight
+ * under the release heading comes as a section with an empty title.
+ */
+const releaseNotesSchema = v.object({
+  releases: v.array(
+    v.object({
+      version: v.string(),
+      date: v.nullable(v.string()),
+      sections: v.array(v.object({ title: v.string(), html: v.string() })),
+    }),
+  ),
+});
+export type ReleaseNotes = v.InferOutput<typeof releaseNotesSchema>;
+export const ReleaseNotes = releaseNotesSchema;
+
 export function parse<T>(schema: v.GenericSchema<T>, data: unknown): T {
   return v.parse(schema, data);
 }

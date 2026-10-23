@@ -172,3 +172,62 @@ async fn doc_contributors_migration_backfills_from_doc_updates() {
         "existing docs must get the migration time as contributors_since, got {since}"
     );
 }
+
+/// Users who exist at upgrade time are backfilled to 0.8.1, the last release
+/// without the what's-new card, so they get the card for the release that
+/// ships it. Users created afterwards stay NULL until their first visit.
+#[tokio::test(flavor = "multi_thread")]
+async fn last_seen_version_migration_backfills_existing_users() {
+    use sqlx::migrate::Migrator;
+    use uuid::Uuid;
+
+    const VERSION: i64 = 20261023120000;
+
+    let url = knot_test_support::fresh_db_url().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("connect");
+    let full = sqlx::migrate!("../../migrations");
+    assert!(
+        full.migrations.iter().any(|m| m.version == VERSION),
+        "migration {VERSION} not embedded (cargo clean -p knot-storage?)"
+    );
+    let before = Migrator {
+        migrations: std::borrow::Cow::Owned(
+            full.migrations
+                .iter()
+                .filter(|m| m.version < VERSION)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    };
+    before
+        .run(&pool)
+        .await
+        .expect("migrate to previous version");
+
+    let existing: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, display_name) VALUES ('old@x.test', 'Old') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    full.run(&pool).await.expect("apply user_last_seen_version");
+    let created_after: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, display_name) VALUES ('new@x.test', 'New') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let seen = |id: Uuid| {
+        sqlx::query_scalar::<_, Option<String>>("SELECT last_seen_version FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+    };
+    assert_eq!(seen(existing).await.unwrap().as_deref(), Some("0.8.1"));
+    assert_eq!(seen(created_after).await.unwrap(), None);
+}
