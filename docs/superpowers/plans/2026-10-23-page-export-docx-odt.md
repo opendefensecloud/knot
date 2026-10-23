@@ -224,7 +224,7 @@ pub struct Cell { pub col: usize, pub colspan: usize, pub rowspan: usize, pub he
 #[test] fn text_under_blockquote_is_wrapped() { /* same repair for blockquote */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export walk`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export --test walk`
 - [ ] **Step 3: Implement list walking.**
   - **`checked`:** `"true"` gives `Some(true)`, any other present value gives `Some(false)`, and absent gives `None`.
   - **Repair:** a raw `XmlOut::Text`, or an inline element, directly under a block container (`list_item`, `blockquote`, cells) is wrapped into a `Paragraph`. Consecutive raw inline children share one paragraph.
@@ -265,7 +265,7 @@ pub struct Cell { pub col: usize, pub colspan: usize, pub rowspan: usize, pub he
 #[test] fn empty_table_walks_without_panic() { /* table with no rows, and a table whose only row has no cells → Table{shares:[], rows} with no panic */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export tables`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export --test tables`
 - [ ] **Step 3: Implement `resolve_shares`, the grid build, and `header_rows`.**
   - **Grid width:** the maximum number of columns any row covers, counting rowspans carried down from earlier rows.
   - **Weights:** read from the first grid row. Each column's weight is `colwidth[col - cell.col]` of the cell covering it, and invalid values count as `None`.
@@ -302,7 +302,7 @@ pub struct Cell { pub col: usize, pub colspan: usize, pub rowspan: usize, pub he
 #[test] fn unknown_block_element_degrades_and_is_reported() { /* el("callout",[],[p("hi")]) → Paragraph "hi"; unknown_elements == ["callout"] */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export walk`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export --test walk`
 - [ ] **Step 3: Implement the three node kinds and the three listing functions.** Recursive over all blocks.
 - [ ] **Step 4: Run, expect PASS.** `cargo nextest run -p knot-export`
 - [ ] **Step 5: Commit.**
@@ -368,7 +368,7 @@ pub struct Output { pub bytes: Vec<u8>, pub fallbacks: Fallbacks }
 #[test] fn zip_first_entry_can_be_stored() { /* ZipOut: stored("mimetype"), deflated("a.xml"); read back with zip::ZipArchive: index 0 name "mimetype", compression Stored */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export media`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export --test media`
 - [ ] **Step 3: Implement `assets.rs`, `media.rs` and `xml.rs`** with the signatures above.
 - [ ] **Step 4: Run, expect PASS.**
   - Run: `cargo nextest run -p knot-export`, then `cargo deny check`.
@@ -449,7 +449,7 @@ pub struct Output { pub bytes: Vec<u8>, pub fallbacks: Fallbacks }
 #[test] fn text_with_xml_specials_and_controls_is_well_formed() { /* title and text "Q4 <draft> & \"final\" \u{1}😀 שלום" → every part parses with roxmltree */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export docx`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export --test docx`
 - [ ] **Step 3: Implement `write_docx`** for `Paragraph`, `Heading`, `Quote`, `Code`, `Rule`, and inlines (`Run`, `Link`, `Break`).
   - Other blocks emit an empty `Normal` paragraph for now. Tasks 7–9 fill them in.
   - Hyperlink relationship ids are allocated per unique target.
@@ -481,7 +481,7 @@ pub struct Output { pub bytes: Vec<u8>, pub fallbacks: Fallbacks }
 #[test] fn every_num_id_exists_in_numbering() { /* collect w:numId vals in document.xml → each has a w:num in numbering.xml */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export docx`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export --test docx`
 - [ ] **Step 3: Implement the numbering and list emission** as described above.
 - [ ] **Step 4: Run, expect PASS.** `cargo nextest run -p knot-export`
 - [ ] **Step 5: Commit.**
@@ -521,7 +521,7 @@ pub struct Output { pub bytes: Vec<u8>, pub fallbacks: Fallbacks }
 #[test] fn large_page_exports_valid_docx_quickly() { /* 2000 paragraphs + 50x20 table; Instant elapsed < 5s (debug); parses */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export docx`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export --test docx`
 - [ ] **Step 3: Implement the table emission** as described above.
 - [ ] **Step 4: Run, expect PASS.** `cargo nextest run -p knot-export`
 - [ ] **Step 5: Commit.**
@@ -578,7 +578,7 @@ pub struct Output { pub bytes: Vec<u8>, pub fallbacks: Fallbacks }
 #[test] fn attachment_line_links_back_to_knot() { /* size 49152 → "📎 budget.xlsx (48 KB)"; Target "{base}/api/blobs/<id>" */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export docx`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export --test docx`
 - [ ] **Step 3: Implement the pictures, placeholders, attachments and fallback counting** as described above.
 - [ ] **Step 4: Run, expect PASS.** `cargo nextest run -p knot-export`
 - [ ] **Step 5: Commit.**
@@ -643,7 +643,7 @@ pub struct Output { pub bytes: Vec<u8>, pub fallbacks: Fallbacks }
 #[test] fn text_with_xml_specials_and_controls_is_well_formed_odt() { /* same hostile text as the docx test → all parts parse */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export odt`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export --test odt`
 - [ ] **Step 3: Implement `write_odt`** for all blocks except media. Until Task 11, `Image`, `Mermaid`, `Board` and `Attachment` blocks write an empty `Standard` paragraph (as Task 6 does).
 - [ ] **Step 4: Run, expect PASS.** `cargo nextest run -p knot-export`
 - [ ] **Step 5: Commit.**
@@ -666,7 +666,7 @@ pub struct Output { pub bytes: Vec<u8>, pub fallbacks: Fallbacks }
 #[test] fn odt_fallbacks_match_docx() { /* common::fallback_fixture() → same Fallbacks and caption texts as the DOCX test */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export odt`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-export --test odt`
 - [ ] **Step 3: Implement the ODT pictures and placeholders, and write `examples/kitchen_sink.rs`.**
 - [ ] **Step 4: Run, expect PASS.**
   - Run: `cargo nextest run -p knot-export`, then `cargo run -p knot-export --example kitchen_sink -- target/export-samples`
@@ -741,9 +741,9 @@ pub fn exported_on(now: chrono::DateTime<chrono::Utc>) -> String   // "%-d %b %Y
       - rename isn't possible through the API, so assert the mention resolves to the owner's display name "Olive Owner";
       - the result is non-empty and starts with `PK`.
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-server export`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-server --lib export::`, then `cargo nextest run -p knot-server --test export_integration`
 - [ ] **Step 3: Implement `export.rs` and the AppState fields** with the signatures above.
-- [ ] **Step 4: Run, expect PASS.** `cargo nextest run -p knot-server export`
+- [ ] **Step 4: Run, expect PASS.** `cargo nextest run -p knot-server --lib export::`, then `cargo nextest run -p knot-server --test export_integration`
 - [ ] **Step 5: Commit.**
   - `git commit -am "feat(export): server export service with asset resolution"`
 
@@ -785,14 +785,14 @@ pub fn exported_on(now: chrono::DateTime<chrono::Utc>) -> String   // "%-d %b %Y
 #[tokio::test(flavor = "multi_thread")] async fn filename_is_sanitized_on_both_sides() { /* title "Q4 / Plan" → filename*=UTF-8''Q4%20-%20Plan.docx */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-server export_integration`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-server --test export_integration`
 - [ ] **Step 3: Implement the routes** and update the four docs:
   - **CHANGELOG** `### Added`: Word and OpenDocument export from the page header's download menu, with diagrams as pictures. List `GET /api/docs/{id}/export/diagrams` and `POST /api/docs/{id}/export/{docx|odt}`.
   - **SKILL.md** endpoint table: both routes, plus a curl recipe for `POST` with an empty body.
   - **ARCHITECTURE.md** crate row: `` `knot-export` | Page → DOCX/ODT (pure; walks the Y.Doc) ``.
   - **Helm README** operational note: the proxy body size must allow 10 MiB.
 - [ ] **Step 4: Run, expect PASS.**
-  - Run: `cargo nextest run -p knot-server export`, then `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - Run: `cargo nextest run -p knot-server --lib export::`, `cargo nextest run -p knot-server --test export_integration`, then `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   - Expected: pass, no warnings.
 - [ ] **Step 5: Commit.**
   - `git commit -am "feat(export): docx/odt export routes"`
@@ -829,10 +829,10 @@ pub async fn run(cfg: knot_config::Config) -> anyhow::Result<()>
   - one page holds a mermaid block and an unknown `callout` element, written as a hand-built yrs update;
   - assert `pages == 2`, `failed.is_empty()`, `fallbacks.diagram == 2` (one per format), and `fallbacks.unknown_element == 2`;
   - assert the database's migration count is unchanged.
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-server export_check`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-server --test export_check_integration`
 - [ ] **Step 3: Implement `export_check.rs`** and wire the subcommand.
 - [ ] **Step 4: Run, expect PASS.**
-  - Run: `cargo nextest run -p knot-server export_check`, then `cargo run -q --bin knot-server -- export-check --help`
+  - Run: `cargo nextest run -p knot-server --test export_check_integration`, then `cargo run -q --bin knot-server -- export-check --help`
   - Expected: pass; the help prints.
 - [ ] **Step 5: Commit.**
   - `git commit -am "feat(export): offline export-check command"`
