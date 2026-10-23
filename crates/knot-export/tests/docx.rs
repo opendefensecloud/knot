@@ -1,17 +1,19 @@
 mod common;
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
+use common::docx::{
+    Docx, PKG_REL, SCHEMA_ORDER, W, body, child, content, elements, p_style, r_style, rels, style,
+    style_name, text, val, wattr,
+};
 use common::{unzip, xml};
 use knot_export::assets::{Assets, Meta};
 use knot_export::docx::{DocxDefaults, write_docx_with};
 use knot_export::{Block, ExportDoc, Inline, LinkTarget, Marks, Run, write_docx};
-use roxmltree::{Document, Node};
+use roxmltree::Node;
 
-const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const PKG_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const CT: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
 const DC: &str = "http://purl.org/dc/elements/1.1/";
 const DCTERMS: &str = "http://purl.org/dc/terms/";
@@ -28,41 +30,6 @@ fn meta() -> Meta {
         exported_on: "23 Oct 2026".into(),
         base_url: "https://knot.example".into(),
     }
-}
-
-/// The parts of an exported package.
-struct Docx(HashMap<String, Vec<u8>>);
-
-impl Docx {
-    fn part(&self, name: &str) -> &str {
-        let bytes = self
-            .0
-            .get(name)
-            .unwrap_or_else(|| panic!("missing part {name}"));
-        std::str::from_utf8(bytes).expect("UTF-8 part")
-    }
-}
-
-struct Rel {
-    kind: String,
-    target: String,
-    external: bool,
-}
-
-/// `word/_rels/document.xml.rels` by relationship id.
-fn rels(docx: &Docx) -> HashMap<String, Rel> {
-    let d = xml(docx.part("word/_rels/document.xml.rels"));
-    d.descendants()
-        .filter(|n| n.has_tag_name((PKG_REL, "Relationship")))
-        .map(|n| {
-            let rel = Rel {
-                kind: n.attribute("Type").unwrap().to_owned(),
-                target: n.attribute("Target").unwrap().to_owned(),
-                external: n.attribute("TargetMode") == Some("External"),
-            };
-            (n.attribute("Id").unwrap().to_owned(), rel)
-        })
-        .collect()
 }
 
 fn export_with(blocks: Vec<Block>, assets: &Assets) -> Docx {
@@ -90,68 +57,6 @@ fn link(target: LinkTarget, text: &str) -> Inline {
         target,
         runs: vec![run(text)],
     }
-}
-
-fn elements<'a, 'i>(n: Node<'a, 'i>) -> Vec<Node<'a, 'i>> {
-    n.children().filter(Node::is_element).collect()
-}
-
-/// First `w:` child element with this local name.
-fn child<'a, 'i>(n: Node<'a, 'i>, name: &str) -> Option<Node<'a, 'i>> {
-    n.children().find(|c| c.has_tag_name((W, name)))
-}
-
-fn wattr<'a>(n: Node<'a, '_>, name: &str) -> Option<&'a str> {
-    n.attribute((W, name))
-}
-
-fn val<'a>(n: Node<'a, '_>) -> Option<&'a str> {
-    wattr(n, "val")
-}
-
-fn p_style<'a>(p: Node<'a, '_>) -> Option<&'a str> {
-    child(p, "pPr")
-        .and_then(|ppr| child(ppr, "pStyle"))
-        .and_then(val)
-}
-
-fn r_style<'a>(r: Node<'a, '_>) -> Option<&'a str> {
-    child(r, "rPr")
-        .and_then(|rpr| child(rpr, "rStyle"))
-        .and_then(val)
-}
-
-/// Concatenated `w:t` text below a node.
-fn text(n: Node) -> String {
-    n.descendants()
-        .filter(|d| d.has_tag_name((W, "t")))
-        .filter_map(|t| t.text())
-        .collect()
-}
-
-fn body<'a, 'i>(d: &'a Document<'i>) -> Node<'a, 'i> {
-    d.descendants()
-        .find(|n| n.has_tag_name((W, "body")))
-        .expect("w:body")
-}
-
-/// Body children after the title and subtitle, without the closing `sectPr`.
-fn content<'a, 'i>(d: &'a Document<'i>) -> Vec<Node<'a, 'i>> {
-    let kids = elements(body(d));
-    assert_eq!(kids.last().unwrap().tag_name().name(), "sectPr");
-    kids[2..kids.len() - 1].to_vec()
-}
-
-fn style<'a, 'i>(styles: &'a Document<'i>, id: &str) -> Node<'a, 'i> {
-    styles
-        .descendants()
-        .find(|n| n.has_tag_name((W, "style")) && wattr(*n, "styleId") == Some(id))
-        .unwrap_or_else(|| panic!("no style {id}"))
-}
-
-/// Value of `w:style/w:name`.
-fn style_name<'a>(s: Node<'a, '_>) -> &'a str {
-    child(s, "name").and_then(val).expect("style name")
 }
 
 /// One of every block and inline this task writes.
@@ -414,185 +319,6 @@ fn every_referenced_style_exists() {
         assert!(seen.contains(id), "kitchen sink should use {id}");
     }
 }
-
-/// ECMA-376 (wml.xsd) order of the children Word checks strictly.
-const SCHEMA_ORDER: &[(&str, &[&str])] = &[
-    (
-        "pPr",
-        &[
-            "pStyle",
-            "keepNext",
-            "keepLines",
-            "pageBreakBefore",
-            "framePr",
-            "widowControl",
-            "numPr",
-            "suppressLineNumbers",
-            "pBdr",
-            "shd",
-            "tabs",
-            "suppressAutoHyphens",
-            "kinsoku",
-            "wordWrap",
-            "overflowPunct",
-            "topLinePunct",
-            "autoSpaceDE",
-            "autoSpaceDN",
-            "bidi",
-            "adjustRightInd",
-            "snapToGrid",
-            "spacing",
-            "ind",
-            "contextualSpacing",
-            "mirrorIndents",
-            "suppressOverlap",
-            "jc",
-            "textDirection",
-            "textAlignment",
-            "textboxTightWrap",
-            "outlineLvl",
-            "divId",
-            "cnfStyle",
-            "rPr",
-            "sectPr",
-            "pPrChange",
-        ],
-    ),
-    (
-        "rPr",
-        &[
-            "rStyle",
-            "rFonts",
-            "b",
-            "bCs",
-            "i",
-            "iCs",
-            "caps",
-            "smallCaps",
-            "strike",
-            "dstrike",
-            "outline",
-            "shadow",
-            "emboss",
-            "imprint",
-            "noProof",
-            "snapToGrid",
-            "vanish",
-            "webHidden",
-            "color",
-            "spacing",
-            "w",
-            "kern",
-            "position",
-            "sz",
-            "szCs",
-            "highlight",
-            "u",
-            "effect",
-            "bdr",
-            "shd",
-            "fitText",
-            "vertAlign",
-            "rtl",
-            "cs",
-            "em",
-            "lang",
-            "eastAsianLayout",
-            "specVanish",
-            "oMath",
-        ],
-    ),
-    (
-        "style",
-        &[
-            "name",
-            "aliases",
-            "basedOn",
-            "next",
-            "link",
-            "autoRedefine",
-            "hidden",
-            "uiPriority",
-            "semiHidden",
-            "unhideWhenUsed",
-            "qFormat",
-            "locked",
-            "personal",
-            "personalCompose",
-            "personalReply",
-            "rsid",
-            "pPr",
-            "rPr",
-            "tblPr",
-            "trPr",
-            "tcPr",
-            "tblStylePr",
-        ],
-    ),
-    (
-        "tblPr",
-        &[
-            "tblStyle",
-            "tblpPr",
-            "tblOverlap",
-            "bidiVisual",
-            "tblStyleRowBandSize",
-            "tblStyleColBandSize",
-            "tblW",
-            "jc",
-            "tblCellSpacing",
-            "tblInd",
-            "tblBorders",
-            "shd",
-            "tblLayout",
-            "tblCellMar",
-            "tblLook",
-            "tblCaption",
-            "tblDescription",
-        ],
-    ),
-    (
-        "tblBorders",
-        &[
-            "top", "left", "start", "bottom", "right", "end", "insideH", "insideV",
-        ],
-    ),
-    (
-        "tblCellMar",
-        &["top", "left", "start", "bottom", "right", "end"],
-    ),
-    (
-        "pBdr",
-        &["top", "left", "bottom", "right", "between", "bar"],
-    ),
-    (
-        "sectPr",
-        &[
-            "headerReference",
-            "footerReference",
-            "footnotePr",
-            "endnotePr",
-            "type",
-            "pgSz",
-            "pgMar",
-            "paperSrc",
-            "pgBorders",
-            "lnNumType",
-            "pgNumType",
-            "cols",
-            "formProt",
-            "vAlign",
-            "noEndnote",
-            "titlePg",
-            "textDirection",
-            "bidi",
-            "rtlGutter",
-            "docGrid",
-            "printerSettings",
-            "sectPrChange",
-        ],
-    ),
-];
 
 #[test]
 fn properties_follow_schema_order() {
