@@ -12,17 +12,17 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - One database migration runs on upgrade (the Helm chart's migrate hook
   applies it).
 - Everyone with an account sees the "knot was updated" card once after this
-  upgrade.
+  upgrade. (#45)
 
 ### Added
 - The bottom of the sidebar shows the running version. It opens an About page
   with the version, build commit, release date and the release notes, newest
-  first. `GET /api/release-notes`.
+  first. `GET /api/release-notes`. (#45)
 - After an upgrade, a card names the new version and how many releases you
   missed, with a link to the release notes. Opening the notes or dismissing
   the card hides it until the next upgrade, on every device. New users start
   caught up, and development builds never show it. `GET /api/whats-new`,
-  `POST /api/whats-new/seen`.
+  `POST /api/whats-new/seen`. (#45)
 
 ## [0.8.1] - 2026-10-21
 
