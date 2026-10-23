@@ -14,6 +14,11 @@ use crate::model::{
 };
 use crate::tables::resolve_shares;
 
+/// Maximum nesting of block containers (lists, list items, quotes, tables,
+/// cells, unknown elements). Deeper subtrees are flattened to paragraphs so a
+/// crafted page cannot overflow the stack.
+pub const MAX_DEPTH: usize = 64;
+
 /// Result of walking a document.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Walked {
@@ -26,7 +31,7 @@ pub fn walk(doc: &yrs::Doc) -> Walked {
     let txn = doc.transact();
     let mut unknown = Vec::new();
     let blocks = match txn.get_xml_fragment("default") {
-        Some(frag) => walk_blocks(&frag, &txn, &mut unknown),
+        Some(frag) => walk_blocks(&frag, &txn, &mut unknown, 0),
         None => Vec::new(),
     };
     Walked {
@@ -48,7 +53,12 @@ fn walk_blocks<F: XmlFragment, T: ReadTxn>(
     parent: &F,
     txn: &T,
     unknown: &mut Vec<String>,
+    depth: usize,
 ) -> Vec<Block> {
+    if depth > MAX_DEPTH {
+        unknown.push("depth-limit".to_owned());
+        return capped_paragraphs(parent, txn);
+    }
     let mut out = Vec::new();
     let mut stray: Vec<Inline> = Vec::new();
     let mut last_href: Option<String> = None;
@@ -62,12 +72,12 @@ fn walk_blocks<F: XmlFragment, T: ReadTxn>(
             Some(XmlOut::Element(el)) => {
                 flush_stray(&mut stray, &mut out);
                 last_href = None;
-                out.push(walk_element(&el, txn, unknown));
+                out.push(walk_element(&el, txn, unknown, depth));
             }
             Some(XmlOut::Fragment(f)) => {
                 flush_stray(&mut stray, &mut out);
                 last_href = None;
-                out.extend(walk_blocks(&f, txn, unknown));
+                out.extend(walk_blocks(&f, txn, unknown, depth + 1));
             }
             None => {}
         }
@@ -87,6 +97,7 @@ fn walk_list<T: ReadTxn>(
     ordered: bool,
     txn: &T,
     unknown: &mut Vec<String>,
+    depth: usize,
 ) -> Block {
     let start = if ordered {
         attr(el, txn, "start")
@@ -103,14 +114,14 @@ fn walk_list<T: ReadTxn>(
             Some(XmlOut::Element(item)) if item.tag().as_ref() == "list_item" => {
                 items.push(ListItem {
                     checked: attr(&item, txn, "checked").map(|v| v == "true"),
-                    blocks: walk_blocks(&item, txn, unknown),
+                    blocks: walk_blocks(&item, txn, unknown, depth + 2),
                 });
             }
             Some(XmlOut::Element(other)) => {
                 // Not a list_item: keep it as an item of its own.
                 items.push(ListItem {
                     checked: None,
-                    blocks: vec![walk_element(&other, txn, unknown)],
+                    blocks: vec![walk_element(&other, txn, unknown, depth + 1)],
                 });
             }
             _ => {}
@@ -147,7 +158,12 @@ fn colwidth<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T) -> Vec<Option<f64>> {
     }
 }
 
-fn walk_table<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<String>) -> Block {
+fn walk_table<T: ReadTxn>(
+    el: &yrs::XmlElementRef,
+    txn: &T,
+    unknown: &mut Vec<String>,
+    depth: usize,
+) -> Block {
     // Rows still occupied below the current one, per grid column.
     let mut carry: Vec<usize> = Vec::new();
     let mut width = 0;
@@ -197,7 +213,7 @@ fn walk_table<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<St
                 rowspan,
                 header: c.tag().as_ref() == "table_header",
                 align,
-                blocks: walk_blocks(&c, txn, unknown),
+                blocks: walk_blocks(&c, txn, unknown, depth + 2),
             });
             col += colspan;
         }
@@ -211,21 +227,27 @@ fn walk_table<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<St
     })
 }
 
-fn walk_element<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<String>) -> Block {
+fn walk_element<T: ReadTxn>(
+    el: &yrs::XmlElementRef,
+    txn: &T,
+    unknown: &mut Vec<String>,
+    depth: usize,
+) -> Block {
     let tag = el.tag().to_string();
     match tag.as_str() {
-        "paragraph" => Block::Paragraph(inlines(el, txn)),
+        "paragraph" => Block::Paragraph(inlines(el, txn, depth)),
         "heading" => {
             let level = attr(el, txn, "level")
                 .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|n| n.is_finite())
                 .map(|n| n.round().clamp(1.0, 6.0) as u8)
                 .unwrap_or(1);
             Block::Heading {
                 level,
-                content: inlines(el, txn),
+                content: inlines(el, txn, depth),
             }
         }
-        "blockquote" => Block::Quote(walk_blocks(el, txn, unknown)),
+        "blockquote" => Block::Quote(walk_blocks(el, txn, unknown, depth + 1)),
         "code_block" => {
             let language = attr(el, txn, "language").unwrap_or_default();
             let text = flatten_text(el, txn);
@@ -237,9 +259,9 @@ fn walk_element<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<
             }
         }
         "horizontal_rule" => Block::Rule,
-        "bullet_list" => walk_list(el, false, txn, unknown),
-        "ordered_list" => walk_list(el, true, txn, unknown),
-        "table" => walk_table(el, txn, unknown),
+        "bullet_list" => walk_list(el, false, txn, unknown, depth + 1),
+        "ordered_list" => walk_list(el, true, txn, unknown, depth + 1),
+        "table" => walk_table(el, txn, unknown, depth + 1),
         "image" => {
             let src = attr(el, txn, "src").unwrap_or_default();
             Block::Image {
@@ -277,7 +299,13 @@ fn walk_element<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<
 }
 
 /// Inline content of a textblock. Unknown inline elements keep their text.
-fn inlines<F: XmlFragment, T: ReadTxn>(parent: &F, txn: &T) -> Vec<Inline> {
+fn inlines<F: XmlFragment, T: ReadTxn>(parent: &F, txn: &T, depth: usize) -> Vec<Inline> {
+    if depth > MAX_DEPTH {
+        return vec![Inline::Run(Run {
+            text: flatten_text(parent, txn),
+            marks: Marks::default(),
+        })];
+    }
     let mut out = Vec::new();
     let mut last_href: Option<String> = None;
     for i in 0..parent.len(txn) {
@@ -299,7 +327,7 @@ fn inlines<F: XmlFragment, T: ReadTxn>(parent: &F, txn: &T) -> Vec<Inline> {
             }
             Some(XmlOut::Fragment(f)) => {
                 last_href = None;
-                out.extend(inlines(&f, txn));
+                out.extend(inlines(&f, txn, depth + 1));
             }
             None => {}
         }
@@ -359,11 +387,19 @@ fn push_text<T: ReadTxn>(
     }
 }
 
+/// A UUID in any accepted spelling (hyphenated, simple, braced, urn) as
+/// lower-case hyphenated.
+fn canonical_id(s: &str) -> Option<String> {
+    uuid::Uuid::parse_str(s)
+        .ok()
+        .map(|u| u.hyphenated().to_string())
+}
+
 fn classify_image(src: &str) -> ImageSource {
     if let Some(id) = src.strip_prefix("/api/blobs/")
-        && uuid::Uuid::parse_str(id).is_ok()
+        && let Some(id) = canonical_id(id)
     {
-        return ImageSource::Blob(id.to_owned());
+        return ImageSource::Blob(id);
     }
     match Url::parse(src) {
         Ok(u) if matches!(u.scheme(), "http" | "https") => ImageSource::External(src.to_owned()),
@@ -373,18 +409,10 @@ fn classify_image(src: &str) -> ImageSource {
 
 fn classify(href: &str) -> LinkTarget {
     if let Some(rest) = href.strip_prefix("knot://doc/") {
-        return if uuid::Uuid::parse_str(rest).is_ok() {
-            LinkTarget::Doc(rest.to_owned())
-        } else {
-            LinkTarget::Plain
-        };
+        return canonical_id(rest).map_or(LinkTarget::Plain, LinkTarget::Doc);
     }
     if let Some(rest) = href.strip_prefix("knot://user/") {
-        return if uuid::Uuid::parse_str(rest).is_ok() {
-            LinkTarget::User(rest.to_owned())
-        } else {
-            LinkTarget::Plain
-        };
+        return canonical_id(rest).map_or(LinkTarget::Plain, LinkTarget::User);
     }
     match Url::parse(href) {
         Ok(u) if matches!(u.scheme(), "http" | "https" | "mailto") => {
@@ -394,24 +422,56 @@ fn classify(href: &str) -> LinkTarget {
     }
 }
 
-/// All plain text below `node`, concatenated (mark-free).
-fn flatten_text<F: XmlFragment, T: ReadTxn>(node: &F, txn: &T) -> String {
+/// Text of one `XmlText` node, mark-free.
+fn text_of<T: ReadTxn>(t: &XmlTextRef, txn: &T) -> String {
     let mut s = String::new();
-    for i in 0..node.len(txn) {
-        match node.get(txn, i) {
-            Some(XmlOut::Text(t)) => {
-                for d in t.diff(txn, YChange::identity) {
-                    if let Out::Any(Any::String(x)) = d.insert {
-                        s.push_str(&x);
-                    }
-                }
-            }
-            Some(XmlOut::Element(e)) => s.push_str(&flatten_text(&e, txn)),
-            Some(XmlOut::Fragment(f)) => s.push_str(&flatten_text(&f, txn)),
-            None => {}
+    for d in t.diff(txn, YChange::identity) {
+        if let Out::Any(Any::String(x)) = d.insert {
+            s.push_str(&x);
         }
     }
     s
+}
+
+/// Text nodes below `node` in document order. Iterative (explicit stack), so
+/// it is safe at any depth.
+fn text_nodes<F: XmlFragment, T: ReadTxn>(node: &F, txn: &T) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack: Vec<XmlOut> = (0..node.len(txn))
+        .rev()
+        .filter_map(|i| node.get(txn, i))
+        .collect();
+    while let Some(n) = stack.pop() {
+        match n {
+            XmlOut::Text(t) => out.push(text_of(&t, txn)),
+            XmlOut::Element(e) => {
+                stack.extend((0..e.len(txn)).rev().filter_map(|i| e.get(txn, i)));
+            }
+            XmlOut::Fragment(f) => {
+                stack.extend((0..f.len(txn)).rev().filter_map(|i| f.get(txn, i)));
+            }
+        }
+    }
+    out
+}
+
+/// All plain text below `node`, concatenated (mark-free).
+fn flatten_text<F: XmlFragment, T: ReadTxn>(node: &F, txn: &T) -> String {
+    text_nodes(node, txn).concat()
+}
+
+/// A too-deep subtree as one paragraph per non-empty text node.
+fn capped_paragraphs<F: XmlFragment, T: ReadTxn>(node: &F, txn: &T) -> Vec<Block> {
+    text_nodes(node, txn)
+        .into_iter()
+        .filter(|t| !t.is_empty())
+        .map(|text| {
+            Block::Paragraph(vec![Inline::Run(Run {
+                text,
+                marks: Marks::default(),
+            })])
+        })
+        .collect()
 }
 
 /// A diagram the server has to render before writing the document.

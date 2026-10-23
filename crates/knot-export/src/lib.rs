@@ -9,4 +9,4 @@ pub mod walk;
 pub mod xml;
 
 pub use model::*;
-pub use walk::{DiagramRef, Walked, blob_ids, diagrams, user_ids, walk};
+pub use walk::{DiagramRef, MAX_DEPTH, Walked, blob_ids, diagrams, user_ids, walk};

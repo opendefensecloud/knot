@@ -591,3 +591,109 @@ fn unknown_block_element_degrades_and_is_reported() {
     );
     assert_eq!(w.unknown_elements, vec!["callout".to_string()]);
 }
+
+fn quote_depth(blocks: &[Block]) -> usize {
+    // Iterative on purpose: the model itself may be deep.
+    let mut depth = 0;
+    let mut cur = blocks;
+    while let Some(Block::Quote(inner)) = cur.first() {
+        depth += 1;
+        cur = inner;
+    }
+    depth
+}
+
+fn all_text(blocks: &[Block]) -> String {
+    let mut s = String::new();
+    let mut stack: Vec<&Block> = blocks.iter().rev().collect();
+    while let Some(b) = stack.pop() {
+        match b {
+            Block::Paragraph(inl) => {
+                for i in inl {
+                    if let Inline::Run(r) = i {
+                        s.push_str(&r.text);
+                    }
+                }
+            }
+            Block::Quote(inner) => stack.extend(inner.iter().rev()),
+            _ => {}
+        }
+    }
+    s
+}
+
+#[test]
+fn deep_nesting_is_capped_without_stack_overflow() {
+    use yrs::{Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+    let doc = yrs::Doc::new();
+    {
+        let frag = doc.get_or_insert_xml_fragment("default");
+        let mut txn = doc.transact_mut();
+        let mut cur = frag.push_back(&mut txn, XmlElementPrelim::empty("blockquote"));
+        for _ in 1..5_000 {
+            cur = cur.push_back(&mut txn, XmlElementPrelim::empty("blockquote"));
+        }
+        let para = cur.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+        para.push_back(&mut txn, XmlTextPrelim::new("deep"));
+    }
+    let (text, depth, unknown) = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let w = walk(&doc);
+            let summary = (
+                all_text(&w.doc.blocks),
+                quote_depth(&w.doc.blocks),
+                w.unknown_elements.clone(),
+            );
+            // The capped model is shallow, so dropping it is safe.
+            drop(w);
+            summary
+        })
+        .unwrap()
+        .join()
+        .expect("walk must not overflow the stack");
+    assert!(text.contains("deep"), "{text:?}");
+    assert!(unknown.iter().any(|u| u == "depth-limit"), "{unknown:?}");
+    assert!(depth <= knot_export::MAX_DEPTH + 1, "{depth}");
+}
+
+#[test]
+fn heading_level_non_finite_defaults_to_1() {
+    let w = walk(&build(vec![
+        el("heading", vec![("level", "NaN".into())], vec![t("a")]),
+        el("heading", vec![("level", "inf".into())], vec![t("b")]),
+        el("heading", vec![("level", "-inf".into())], vec![t("c")]),
+    ]));
+    for b in &w.doc.blocks {
+        assert!(matches!(b, Block::Heading { level: 1, .. }), "{b:?}");
+    }
+}
+
+#[test]
+fn ids_are_canonicalised() {
+    let upper = DOC_ID.to_uppercase();
+    assert_eq!(
+        target(&format!("knot://doc/{upper}")),
+        LinkTarget::Doc(DOC_ID.into())
+    );
+    assert_eq!(
+        target(&format!("knot://doc/{}", DOC_ID.replace('-', ""))),
+        LinkTarget::Doc(DOC_ID.into())
+    );
+    assert_eq!(
+        target(&format!("knot://user/{}", USER_ID.to_uppercase())),
+        LinkTarget::User(USER_ID.into())
+    );
+    let img = walk(&build(vec![el(
+        "image",
+        vec![(
+            "src",
+            format!("/api/blobs/{{{}}}", DOC_ID.to_uppercase()).into(),
+        )],
+        vec![],
+    )]));
+    assert!(matches!(
+        &img.doc.blocks[..],
+        [Block::Image { source: ImageSource::Blob(id), .. }] if id == DOC_ID
+    ));
+}
