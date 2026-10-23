@@ -160,6 +160,28 @@ const releaseNotesSchema = v.object({
 export type ReleaseNotes = v.InferOutput<typeof releaseNotesSchema>;
 export const ReleaseNotes = releaseNotesSchema;
 
+const diagramListSchema = v.object({
+  limits: v.object({
+    max_body_bytes: v.number(),
+    max_part_bytes: v.number(),
+    max_parts: v.number(),
+    scale: v.number(),
+  }),
+  diagrams: v.array(
+    v.variant("kind", [
+      v.object({ kind: v.literal("mermaid"), key: v.string(), source: v.string() }),
+      v.object({
+        kind: v.literal("board"),
+        key: v.string(),
+        board_id: v.string(),
+        label: v.string(),
+      }),
+    ]),
+  ),
+});
+export type DiagramList = v.InferOutput<typeof diagramListSchema>;
+export const DiagramList = diagramListSchema;
+
 export function parse<T>(schema: v.GenericSchema<T>, data: unknown): T {
   return v.parse(schema, data);
 }
