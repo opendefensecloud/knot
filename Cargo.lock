@@ -2121,6 +2121,7 @@ dependencies = [
  "knot-config",
  "knot-crdt",
  "knot-docs",
+ "knot-export",
  "knot-markdown",
  "knot-obs",
  "knot-storage",

@@ -70,6 +70,21 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         "Collab socket upgraded -> initial document state queued to the client"
     );
 
+    // Export
+    describe_counter!(
+        "knot_export_total",
+        "Page exports to DOCX/ODT, by format (docx|odt|unknown) and outcome (ok|client_error|busy|server_error)"
+    );
+    describe_histogram!(
+        "knot_export_duration_seconds",
+        Unit::Seconds,
+        "Page export request duration, from the request to the written file"
+    );
+    describe_counter!(
+        "knot_export_fallback_total",
+        "Content an export could not include as-is, by kind (diagram|image_unavailable|image_over_budget|unknown_element)"
+    );
+
     // Storage / pool
     describe_gauge!("knot_db_pool_size", "Total connections in the pool");
     describe_gauge!("knot_db_pool_idle", "Idle connections in the pool");
