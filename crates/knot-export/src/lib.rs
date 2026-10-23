@@ -2,6 +2,7 @@
 //! DOCX and ODT writers consume.
 
 pub mod model;
+pub mod tables;
 pub mod walk;
 
 pub use model::*;

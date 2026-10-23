@@ -8,7 +8,10 @@ use url::Url;
 use yrs::types::text::YChange;
 use yrs::{Any, Out, ReadTxn, Text, Transact, Xml, XmlFragment, XmlOut, XmlTextRef};
 
-use crate::model::{Block, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, Run};
+use crate::model::{
+    Align, Block, Cell, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, Run, Table,
+};
+use crate::tables::resolve_shares;
 
 /// Result of walking a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +122,94 @@ fn walk_list<T: ReadTxn>(
     })
 }
 
+/// A span attribute (`colspan`/`rowspan`): editor number or import string.
+/// Anything missing, non-numeric or below 1 counts as 1.
+fn span<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, name: &str) -> usize {
+    attr(el, txn, name)
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|n| n.is_finite())
+        .map(|n| n.round().clamp(1.0, 1000.0) as usize)
+        .unwrap_or(1)
+}
+
+/// The `colwidth` attribute: an array of numbers and nulls.
+fn colwidth<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T) -> Vec<Option<f64>> {
+    match el.get_attribute(txn, "colwidth") {
+        Some(Out::Any(Any::Array(items))) => items
+            .iter()
+            .map(|a| match a {
+                Any::Number(n) => Some(*n),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn walk_table<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<String>) -> Block {
+    // Rows still occupied below the current one, per grid column.
+    let mut carry: Vec<usize> = Vec::new();
+    let mut width = 0;
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    let mut weights_by_col: Vec<Option<f64>> = Vec::new();
+    for i in 0..el.len(txn) {
+        let Some(XmlOut::Element(row)) = el.get(txn, i) else {
+            continue;
+        };
+        let blocked: Vec<bool> = carry.iter().map(|&n| n > 0).collect();
+        for n in carry.iter_mut() {
+            *n = n.saturating_sub(1);
+        }
+        let first_row = rows.is_empty();
+        let mut col = 0;
+        let mut cells = Vec::new();
+        for j in 0..row.len(txn) {
+            let Some(XmlOut::Element(c)) = row.get(txn, j) else {
+                continue;
+            };
+            while blocked.get(col).copied().unwrap_or(false) {
+                col += 1;
+            }
+            let colspan = span(&c, txn, "colspan");
+            let rowspan = span(&c, txn, "rowspan");
+            if carry.len() < col + colspan {
+                carry.resize(col + colspan, 0);
+            }
+            for n in &mut carry[col..col + colspan] {
+                *n = (*n).max(rowspan - 1);
+            }
+            if first_row {
+                let cw = colwidth(&c, txn);
+                weights_by_col.resize(col + colspan, None);
+                for k in 0..colspan {
+                    weights_by_col[col + k] = cw.get(k).copied().flatten();
+                }
+            }
+            let align = match attr(&c, txn, "align").as_deref() {
+                Some("center") => Align::Center,
+                Some("right") => Align::Right,
+                _ => Align::Left,
+            };
+            cells.push(Cell {
+                col,
+                colspan,
+                rowspan,
+                header: c.tag().as_ref() == "table_header",
+                align,
+                blocks: walk_blocks(&c, txn, unknown),
+            });
+            col += colspan;
+        }
+        width = width.max(col).max(carry.len());
+        rows.push(cells);
+    }
+    weights_by_col.resize(width, None);
+    Block::Table(Table {
+        shares: resolve_shares(&weights_by_col),
+        rows,
+    })
+}
+
 fn walk_element<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<String>) -> Block {
     let tag = el.tag().to_string();
     match tag.as_str() {
@@ -147,6 +238,7 @@ fn walk_element<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, unknown: &mut Vec<
         "horizontal_rule" => Block::Rule,
         "bullet_list" => walk_list(el, false, txn, unknown),
         "ordered_list" => walk_list(el, true, txn, unknown),
+        "table" => walk_table(el, txn, unknown),
         _ => {
             unknown.push(tag);
             Block::Paragraph(vec![Inline::Run(Run {
