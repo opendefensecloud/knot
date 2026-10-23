@@ -19,6 +19,16 @@ use crate::tables::resolve_shares;
 /// crafted page cannot overflow the stack.
 pub const MAX_DEPTH: usize = 64;
 
+/// Widest table (in grid columns) that stays a table.
+pub const MAX_TABLE_COLUMNS: usize = 64;
+
+/// Largest table (grid width times row count) that stays a table. Writers
+/// emit output per grid position, so this bounds their output.
+pub const MAX_TABLE_GRID_CELLS: usize = 50_000;
+
+/// Largest `colspan` or `rowspan`; bigger values are clamped.
+pub const MAX_SPAN: usize = 64;
+
 /// Result of walking a document.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Walked {
@@ -72,7 +82,7 @@ fn walk_blocks<F: XmlFragment, T: ReadTxn>(
             Some(XmlOut::Element(el)) => {
                 flush_stray(&mut stray, &mut out);
                 last_href = None;
-                out.push(walk_element(&el, txn, unknown, depth));
+                out.extend(walk_element(&el, txn, unknown, depth));
             }
             Some(XmlOut::Fragment(f)) => {
                 flush_stray(&mut stray, &mut out);
@@ -121,7 +131,7 @@ fn walk_list<T: ReadTxn>(
                 // Not a list_item: keep it as an item of its own.
                 items.push(ListItem {
                     checked: None,
-                    blocks: vec![walk_element(&other, txn, unknown, depth + 1)],
+                    blocks: walk_element(&other, txn, unknown, depth + 1),
                 });
             }
             _ => {}
@@ -140,7 +150,7 @@ fn span<T: ReadTxn>(el: &yrs::XmlElementRef, txn: &T, name: &str) -> usize {
     attr(el, txn, name)
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|n| n.is_finite())
-        .map(|n| n.round().clamp(1.0, 1000.0) as usize)
+        .map(|n| n.round().clamp(1.0, MAX_SPAN as f64) as usize)
         .unwrap_or(1)
 }
 
@@ -163,7 +173,7 @@ fn walk_table<T: ReadTxn>(
     txn: &T,
     unknown: &mut Vec<String>,
     depth: usize,
-) -> Block {
+) -> Vec<Block> {
     // Rows still occupied below the current one, per grid column.
     let mut carry: Vec<usize> = Vec::new();
     let mut width = 0;
@@ -220,14 +230,67 @@ fn walk_table<T: ReadTxn>(
         width = width.max(col).max(carry.len());
         rows.push(cells);
     }
+    if width > MAX_TABLE_COLUMNS || width.saturating_mul(rows.len()) > MAX_TABLE_GRID_CELLS {
+        // Too big to keep as a table: keep the text, one paragraph per row.
+        unknown.push("table-limit".to_owned());
+        let paragraphs = rows
+            .iter()
+            .map(|cells| {
+                let texts: Vec<String> = cells.iter().map(|c| plain_text(&c.blocks)).collect();
+                Block::Paragraph(vec![Inline::Run(Run {
+                    text: texts.join(" | "),
+                    marks: Marks::default(),
+                })])
+            })
+            .collect();
+        return paragraphs;
+    }
     weights_by_col.resize(width, None);
-    Block::Table(Table {
+    vec![Block::Table(Table {
         shares: resolve_shares(&weights_by_col),
         rows,
-    })
+    })]
 }
 
+/// The text of `blocks`, one space between blocks and breaks.
+fn plain_text(blocks: &[Block]) -> String {
+    fn runs(out: &mut Vec<String>, content: &[Inline]) {
+        let mut s = String::new();
+        for inline in content {
+            match inline {
+                Inline::Run(r) => s.push_str(&r.text),
+                Inline::Link { runs, .. } => runs.iter().for_each(|r| s.push_str(&r.text)),
+                Inline::Break => s.push(' '),
+            }
+        }
+        out.push(s);
+    }
+    let mut parts = Vec::new();
+    visit_blocks(blocks, &mut |b| match b {
+        Block::Paragraph(content) | Block::Heading { content, .. } => runs(&mut parts, content),
+        Block::Code { text, .. } => parts.push(text.clone()),
+        Block::Mermaid { source, .. } => parts.push(source.clone()),
+        _ => {}
+    });
+    parts.retain(|p| !p.is_empty());
+    parts.join(" ")
+}
+
+/// One element as blocks: a table over the size limits becomes several
+/// paragraphs, everything else exactly one block.
 fn walk_element<T: ReadTxn>(
+    el: &yrs::XmlElementRef,
+    txn: &T,
+    unknown: &mut Vec<String>,
+    depth: usize,
+) -> Vec<Block> {
+    if depth <= MAX_DEPTH && el.tag().as_ref() == "table" {
+        return walk_table(el, txn, unknown, depth + 1);
+    }
+    vec![walk_single(el, txn, unknown, depth)]
+}
+
+fn walk_single<T: ReadTxn>(
     el: &yrs::XmlElementRef,
     txn: &T,
     unknown: &mut Vec<String>,
@@ -270,7 +333,6 @@ fn walk_element<T: ReadTxn>(
         "horizontal_rule" => Block::Rule,
         "bullet_list" => walk_list(el, false, txn, unknown, depth + 1),
         "ordered_list" => walk_list(el, true, txn, unknown, depth + 1),
-        "table" => walk_table(el, txn, unknown, depth + 1),
         "image" => {
             let src = attr(el, txn, "src").unwrap_or_default();
             Block::Image {

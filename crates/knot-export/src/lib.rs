@@ -11,4 +11,7 @@ pub mod xml;
 
 pub use docx::write_docx;
 pub use model::*;
-pub use walk::{DiagramRef, MAX_DEPTH, Walked, blob_ids, diagrams, user_ids, walk};
+pub use walk::{
+    DiagramRef, MAX_DEPTH, MAX_SPAN, MAX_TABLE_COLUMNS, MAX_TABLE_GRID_CELLS, Walked, blob_ids,
+    diagrams, user_ids, walk,
+};

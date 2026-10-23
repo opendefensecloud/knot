@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use crate::model::{Align, Cell, Table};
 use crate::tables::header_rows;
 
+use super::body::QUOTE_INDENT_TWIPS;
 use super::{Ctx, body};
 
 /// Left plus right cell margin of the TableNormal style, in twips: what
@@ -38,13 +39,22 @@ pub(super) fn table(cx: &mut Ctx, t: &Table, avail_twips: u32) {
         cx.xml.push_str("<w:p/>");
     }
     let edges = grid_edges(&t.shares, avail_twips);
+    // A table inside a list item or a quote lines up with the text around
+    // it, which `avail_twips` has already lost that indent for.
+    let indent = cx.block_indent + cx.quote_depth * QUOTE_INDENT_TWIPS;
+    let tbl_ind = if indent > 0 {
+        format!(r#"<w:tblInd w:w="{indent}" w:type="dxa"/>"#)
+    } else {
+        String::new()
+    };
     cx.xml.push_str(&format!(
         concat!(
             r#"<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/>"#,
-            r#"<w:tblW w:w="{avail}" w:type="dxa"/><w:tblLayout w:type="fixed"/></w:tblPr>"#,
-            "<w:tblGrid>",
+            r#"<w:tblW w:w="{avail}" w:type="dxa"/>{tbl_ind}"#,
+            r#"<w:tblLayout w:type="fixed"/></w:tblPr><w:tblGrid>"#,
         ),
         avail = avail_twips,
+        tbl_ind = tbl_ind,
     ));
     for col in edges.windows(2) {
         cx.xml

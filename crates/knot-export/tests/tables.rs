@@ -202,3 +202,73 @@ fn align_attribute_is_read() {
     assert_eq!(t.rows[0][1].align, Align::Right);
     assert_eq!(t.rows[0][2].align, Align::Left);
 }
+
+fn texts(w: &knot_export::Walked) -> Vec<String> {
+    w.doc
+        .blocks
+        .iter()
+        .map(|b| match b {
+            Block::Paragraph(inl) => match inl.as_slice() {
+                [knot_export::Inline::Run(r)] => r.text.clone(),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("not a paragraph: {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn spans_are_clamped_to_max_span() {
+    let attrs = vec![
+        ("colspan", Any::Number(1000.)),
+        ("rowspan", Any::Number(1000.)),
+    ];
+    let t = table_of(vec![row(vec![cell("table_cell", attrs, "A")])]);
+    assert_eq!(t.rows[0][0].colspan, knot_export::MAX_SPAN);
+    assert_eq!(t.rows[0][0].rowspan, knot_export::MAX_SPAN);
+    assert_eq!(t.shares.len(), 64);
+}
+
+#[test]
+fn too_wide_table_degrades_to_paragraphs() {
+    let names: Vec<String> = (0..=knot_export::MAX_TABLE_COLUMNS)
+        .map(|i| format!("c{i}"))
+        .collect();
+    let w = walk(&build(vec![
+        el(
+            "table",
+            vec![],
+            vec![
+                row(names.iter().map(|n| td(n)).collect()),
+                row(vec![td("second")]),
+            ],
+        ),
+        p("after"),
+    ]));
+    assert_eq!(w.unknown_elements, ["table-limit"]);
+    assert_eq!(
+        texts(&w),
+        [names.join(" | "), "second".into(), "after".into()]
+    );
+}
+
+#[test]
+fn too_many_grid_cells_degrade() {
+    let table = |n: usize| {
+        let rows = (0..n)
+            .map(|r| row((0..10).map(|c| td(&format!("{r}.{c}"))).collect()))
+            .collect();
+        walk(&build(vec![el("table", vec![], rows)]))
+    };
+    let ok = table(5_000);
+    assert!(ok.unknown_elements.is_empty());
+    assert!(matches!(ok.doc.blocks.as_slice(), [Block::Table(_)]));
+
+    let over = table(5_001);
+    assert_eq!(over.unknown_elements, ["table-limit"]);
+    assert_eq!(over.doc.blocks.len(), 5_001);
+    assert_eq!(
+        texts(&over)[0],
+        "0.0 | 0.1 | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 | 0.8 | 0.9"
+    );
+}

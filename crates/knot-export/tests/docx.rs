@@ -1805,3 +1805,66 @@ fn attachment_line_links_back_to_knot() {
     assert_eq!(text(ps[1]), "\u{1F4CE} odd");
     assert!(child(ps[1], "hyperlink").is_none());
 }
+
+#[test]
+fn table_in_list_item_is_indented() {
+    let docx = export(vec![list(
+        false,
+        1,
+        vec![item(vec![
+            para("lead"),
+            table(even(2), vec![vec![td(0, "a"), td(1, "b")]]),
+        ])],
+    )]);
+    let d = xml(docx.part("word/document.xml"));
+    let tbl = tables(&d)[0];
+    let pr = child(tbl, "tblPr").expect("tblPr");
+    let names: Vec<&str> = elements(pr).iter().map(|n| n.tag_name().name()).collect();
+    assert_eq!(names, ["tblStyle", "tblW", "tblInd", "tblLayout"]);
+    let ind = child(pr, "tblInd").unwrap();
+    assert_eq!(wattr(ind, "w"), Some("720"));
+    assert_eq!(wattr(ind, "type"), Some("dxa"));
+    assert_eq!(tbl_w(tbl), 9072 - 720);
+}
+
+#[test]
+fn table_in_quote_is_indented_and_top_level_is_not() {
+    let docx = export(vec![
+        Block::Quote(vec![table(even(1), vec![vec![td(0, "a")]])]),
+        para("between"),
+        table(even(1), vec![vec![td(0, "b")]]),
+    ]);
+    let d = xml(docx.part("word/document.xml"));
+    let tbls = tables(&d);
+    let ind = child(child(tbls[0], "tblPr").unwrap(), "tblInd").unwrap();
+    assert_eq!(wattr(ind, "w"), Some("567"));
+    assert!(child(child(tbls[1], "tblPr").unwrap(), "tblInd").is_none());
+}
+
+#[test]
+fn amplification_is_bounded() {
+    use common::{build, el, p};
+    use yrs::Any;
+    let span = |n: f64| vec![("colspan", Any::Number(n)), ("rowspan", Any::Number(n))];
+    let mut rows = vec![el(
+        "table_row",
+        vec![],
+        (0..64)
+            .map(|_| el("table_cell", span(1000.), vec![p("x")]))
+            .collect(),
+    )];
+    for _ in 0..63 {
+        rows.push(el(
+            "table_row",
+            vec![],
+            vec![el(
+                "table_cell",
+                vec![("rowspan", Any::Number(1000.))],
+                vec![p("y")],
+            )],
+        ));
+    }
+    let walked = knot_export::walk(&build(vec![el("table", vec![], rows)]));
+    let docx = export(walked.doc.blocks);
+    assert!(docx.part("word/document.xml").len() < 2_000_000);
+}

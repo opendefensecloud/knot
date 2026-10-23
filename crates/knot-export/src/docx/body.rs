@@ -15,7 +15,7 @@ use super::{
 };
 
 /// Left indent of the Quote style, in twips.
-const QUOTE_INDENT_TWIPS: u32 = 567;
+pub(super) const QUOTE_INDENT_TWIPS: u32 = 567;
 
 pub(super) fn document(cx: &mut Ctx, doc: &ExportDoc) {
     cx.xml.push_str(concat!(
