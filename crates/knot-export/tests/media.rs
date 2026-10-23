@@ -120,6 +120,18 @@ fn escaping_drops_invalid_chars() {
 }
 
 #[test]
+fn attribute_escaping_keeps_tabs_and_line_breaks() {
+    let s = "line 1\nline 2\r\n\tend";
+    assert_eq!(esc_attr(s), "line 1&#10;line 2&#13;&#10;&#9;end");
+    // A parser normalises literal whitespace in attributes to spaces; the
+    // character references survive.
+    let doc = format!("<a v=\"{}\"/>", esc_attr(s));
+    let parsed = roxmltree::Document::parse(&doc).unwrap();
+    assert_eq!(parsed.root_element().attribute("v"), Some(s));
+    assert_eq!(esc_text("a\tb\nc"), "a\tb\nc");
+}
+
+#[test]
 fn zip_first_entry_can_be_stored() {
     let mut z = ZipOut::new();
     z.stored("mimetype", b"application/x").unwrap();

@@ -2,11 +2,13 @@
 //! DOCX and ODT writers consume.
 
 pub mod assets;
+pub mod docx;
 pub mod media;
 pub mod model;
 pub mod tables;
 pub mod walk;
 pub mod xml;
 
+pub use docx::write_docx;
 pub use model::*;
 pub use walk::{DiagramRef, MAX_DEPTH, Walked, blob_ids, diagrams, user_ids, walk};

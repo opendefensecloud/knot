@@ -26,6 +26,10 @@ fn esc(s: &str, attr: bool) -> String {
             '>' => out.push_str("&gt;"),
             '"' if attr => out.push_str("&quot;"),
             '\'' if attr => out.push_str("&apos;"),
+            // Attribute-value normalisation would turn these into spaces.
+            '\t' if attr => out.push_str("&#9;"),
+            '\n' if attr => out.push_str("&#10;"),
+            '\r' if attr => out.push_str("&#13;"),
             _ => out.push(c),
         }
     }
@@ -37,7 +41,8 @@ pub fn esc_text(s: &str) -> String {
     esc(s, false)
 }
 
-/// Escape an attribute value, dropping characters XML 1.0 forbids.
+/// Escape an attribute value, dropping characters XML 1.0 forbids. Tabs and
+/// line breaks become character references so they survive parsing.
 pub fn esc_attr(s: &str) -> String {
     esc(s, true)
 }

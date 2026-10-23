@@ -15,3 +15,6 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 image-webp = "0.2"
 png = "0.18"
 imagesize = { version = "0.15", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+[dev-dependencies]
+roxmltree = "0.20"
