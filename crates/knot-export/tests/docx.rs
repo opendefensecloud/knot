@@ -10,7 +10,7 @@ use common::docx::{
 use common::{unzip, xml};
 use knot_export::assets::{Assets, Meta};
 use knot_export::docx::{DocxDefaults, write_docx_with};
-use knot_export::{Block, ExportDoc, Inline, LinkTarget, Marks, Run, write_docx};
+use knot_export::{Block, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, Run, write_docx};
 use roxmltree::Node;
 
 const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -322,9 +322,16 @@ fn every_referenced_style_exists() {
 
 #[test]
 fn properties_follow_schema_order() {
-    let docx = export(kitchen_sink());
+    let mut blocks = kitchen_sink();
+    blocks.push(list(
+        true,
+        1,
+        vec![item(vec![para("a"), code("b")]), check_item(true, "c")],
+    ));
+    let docx = export(blocks);
     for part in [
         "word/document.xml",
+        "word/numbering.xml",
         "word/styles.xml",
         "word/footer1.xml",
         "word/settings.xml",
@@ -664,4 +671,280 @@ fn package_defaults_are_written_as_given() {
     assert_eq!(docx.part("word/footer1.xml"), defaults.footer_xml);
     assert_eq!(docx.part("word/numbering.xml"), defaults.numbering_xml);
     assert!(docx.part("word/styles.xml").contains("Arial"));
+}
+
+fn list(ordered: bool, start: u32, items: Vec<ListItem>) -> Block {
+    Block::List(List {
+        ordered,
+        start,
+        items,
+    })
+}
+
+fn item(blocks: Vec<Block>) -> ListItem {
+    ListItem {
+        checked: None,
+        blocks,
+    }
+}
+
+fn check_item(checked: bool, text: &str) -> ListItem {
+    ListItem {
+        checked: Some(checked),
+        blocks: vec![para(text)],
+    }
+}
+
+fn code(text: &str) -> Block {
+    Block::Code {
+        language: String::new(),
+        text: text.into(),
+    }
+}
+
+/// `(numId, ilvl)` of a paragraph's `w:numPr`.
+fn num_pr(p: Node) -> Option<(String, u32)> {
+    let num_pr = child(child(p, "pPr")?, "numPr")?;
+    let ilvl = child(num_pr, "ilvl").and_then(val)?.parse().unwrap();
+    let id = child(num_pr, "numId").and_then(val)?.to_owned();
+    Some((id, ilvl))
+}
+
+/// The `w:ind w:left` of a paragraph.
+fn ind_left(p: Node) -> Option<u32> {
+    let ind = child(child(p, "pPr")?, "ind")?;
+    wattr(ind, "left").map(|v| v.parse().unwrap())
+}
+
+/// A `w:num` of numbering.xml.
+struct Num {
+    id: String,
+    abstract_id: String,
+    /// `(ilvl, startOverride)`.
+    over: Option<(u32, u32)>,
+}
+
+fn nums(docx: &Docx) -> Vec<Num> {
+    let d = xml(docx.part("word/numbering.xml"));
+    d.descendants()
+        .filter(|n| n.has_tag_name((W, "num")))
+        .map(|n| Num {
+            id: wattr(n, "numId").unwrap().to_owned(),
+            abstract_id: child(n, "abstractNumId").and_then(val).unwrap().to_owned(),
+            over: child(n, "lvlOverride").map(|o| {
+                let start = child(o, "startOverride").and_then(val).unwrap();
+                (
+                    wattr(o, "ilvl").unwrap().parse().unwrap(),
+                    start.parse().unwrap(),
+                )
+            }),
+        })
+        .collect()
+}
+
+#[test]
+fn each_ordered_list_restarts_with_its_start() {
+    let docx = export(vec![
+        list(true, 1, vec![item(vec![para("a")])]),
+        para("between"),
+        list(true, 5, vec![item(vec![para("b")])]),
+    ]);
+    let d = xml(docx.part("word/document.xml"));
+    let ps = content(&d);
+    let (first, _) = num_pr(ps[0]).expect("first list item numbered");
+    let (second, _) = num_pr(ps[2]).expect("second list item numbered");
+    assert_ne!(first, second);
+    let nums = nums(&docx);
+    let find = |id: &str| nums.iter().find(|n| n.id == id).unwrap();
+    assert_eq!(find(&first).abstract_id, "1");
+    assert_eq!(
+        find(&first).over,
+        Some((0, 1)),
+        "start 1 is still overridden"
+    );
+    assert_eq!(find(&second).over, Some((0, 5)));
+}
+
+#[test]
+fn nested_mixed_lists_use_depth_as_ilvl() {
+    let docx = export(vec![list(
+        false,
+        1,
+        vec![item(vec![
+            para("a"),
+            list(
+                true,
+                3,
+                vec![item(vec![
+                    para("b"),
+                    list(false, 1, vec![item(vec![para("c")])]),
+                ])],
+            ),
+        ])],
+    )]);
+    let d = xml(docx.part("word/document.xml"));
+    let ps = content(&d);
+    assert_eq!(ps.len(), 3);
+    let nums = nums(&docx);
+    let abstract_of = |p: Node| {
+        let (id, ilvl) = num_pr(p).expect("numbered");
+        let n = nums.iter().find(|n| n.id == id).unwrap();
+        (n.abstract_id.clone(), ilvl, n.over)
+    };
+    assert_eq!(abstract_of(ps[0]), ("0".into(), 0, None));
+    assert_eq!(abstract_of(ps[1]), ("1".into(), 1, Some((1, 3))));
+    assert_eq!(abstract_of(ps[2]), ("0".into(), 2, None));
+    for p in &ps {
+        assert_eq!(p_style(*p), Some("ListParagraph"));
+    }
+}
+
+#[test]
+fn checklist_items_use_box_characters() {
+    let docx = export(vec![list(
+        false,
+        1,
+        vec![check_item(true, "done"), check_item(false, "todo")],
+    )]);
+    let d = xml(docx.part("word/document.xml"));
+    let ps = content(&d);
+    assert_eq!(ps.len(), 2);
+    assert_eq!(text(ps[0]), "\u{2611} done");
+    assert_eq!(text(ps[1]), "\u{2610} todo");
+    for p in &ps {
+        assert_eq!(num_pr(*p), None);
+        assert_eq!(p_style(*p), Some("ListParagraph"));
+        assert_eq!(ind_left(*p), Some(720));
+    }
+    let first_t = ps[0]
+        .descendants()
+        .find(|n| n.has_tag_name((W, "t")))
+        .unwrap();
+    assert!(first_t.text().unwrap().starts_with("\u{2611} "));
+}
+
+#[test]
+fn nested_checklist_indents_by_depth() {
+    let docx = export(vec![list(
+        false,
+        1,
+        vec![item(vec![
+            para("plain"),
+            list(false, 1, vec![check_item(true, "inner")]),
+        ])],
+    )]);
+    let d = xml(docx.part("word/document.xml"));
+    let ps = content(&d);
+    assert_eq!(ind_left(ps[1]), Some(1440));
+    assert_eq!(num_pr(ps[1]), None);
+}
+
+#[test]
+fn deep_list_clamps_to_level_9() {
+    let mut inner = vec![item(vec![para("leaf")])];
+    for _ in 0..11 {
+        inner = vec![item(vec![para("x"), list(false, 1, inner)])];
+    }
+    let docx = export(vec![list(false, 1, inner)]);
+    let d = xml(docx.part("word/document.xml"));
+    let levels: Vec<u32> = content(&d)
+        .into_iter()
+        .map(|p| num_pr(p).expect("numbered").1)
+        .collect();
+    assert_eq!(levels.len(), 12);
+    assert_eq!(levels.iter().max(), Some(&8));
+    assert_eq!(levels[..9], [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    assert!(levels[9..].iter().all(|l| *l == 8));
+}
+
+#[test]
+fn list_item_with_several_blocks() {
+    let docx = export(vec![list(
+        false,
+        1,
+        vec![item(vec![para("lead"), code("let x = 1;"), para("tail")])],
+    )]);
+    let d = xml(docx.part("word/document.xml"));
+    let ps = content(&d);
+    assert_eq!(ps.len(), 3);
+    assert!(num_pr(ps[0]).is_some());
+    assert_eq!(p_style(ps[1]), Some("Code"));
+    assert_eq!(num_pr(ps[1]), None);
+    assert_eq!(ind_left(ps[1]), Some(720));
+    assert_eq!(p_style(ps[2]), Some("ListParagraph"));
+    assert_eq!(num_pr(ps[2]), None);
+    assert_eq!(ind_left(ps[2]), Some(720));
+}
+
+#[test]
+fn item_without_leading_paragraph_still_has_a_marker() {
+    let docx = export(vec![list(true, 1, vec![item(vec![code("x")])])]);
+    let d = xml(docx.part("word/document.xml"));
+    let ps = content(&d);
+    assert_eq!(ps.len(), 2);
+    assert!(num_pr(ps[0]).is_some());
+    assert_eq!(text(ps[0]), "");
+    assert_eq!(p_style(ps[1]), Some("Code"));
+}
+
+#[test]
+fn every_num_id_exists_in_numbering() {
+    let docx = export(vec![
+        list(
+            false,
+            1,
+            vec![item(vec![
+                para("a"),
+                list(true, 2, vec![item(vec![para("b")])]),
+            ])],
+        ),
+        list(true, 1, vec![item(vec![para("c")])]),
+    ]);
+    let d = xml(docx.part("word/document.xml"));
+    let used: HashSet<String> = d
+        .descendants()
+        .filter(|n| n.has_tag_name((W, "numId")))
+        .filter_map(|n| val(n).map(str::to_owned))
+        .collect();
+    assert_eq!(used.len(), 3);
+    let defined: Vec<String> = nums(&docx).into_iter().map(|n| n.id).collect();
+    let unique: HashSet<&String> = defined.iter().collect();
+    assert_eq!(unique.len(), defined.len(), "numIds are unique");
+    for id in &used {
+        assert!(defined.contains(id), "numId {id} has no w:num");
+    }
+}
+
+#[test]
+fn numbering_defines_both_abstract_nums_before_any_num() {
+    let docx = export(vec![list(true, 1, vec![item(vec![para("a")])])]);
+    let d = xml(docx.part("word/numbering.xml"));
+    let kids = elements(d.root_element());
+    let tags: Vec<&str> = kids.iter().map(|n| n.tag_name().name()).collect();
+    assert_eq!(tags, ["abstractNum", "abstractNum", "num"]);
+    let lvls_of = |abs: Node<'_, '_>| -> Vec<String> {
+        elements(abs)
+            .into_iter()
+            .filter(|n| n.has_tag_name((W, "lvl")))
+            .map(|l| child(l, "lvlText").and_then(val).unwrap().to_owned())
+            .collect()
+    };
+    let bullets = lvls_of(kids[0]);
+    assert_eq!(bullets.len(), 9);
+    assert_eq!(
+        bullets[..4],
+        ["\u{2022}", "\u{25E6}", "\u{25AA}", "\u{2022}"]
+    );
+    let decimals = lvls_of(kids[1]);
+    assert_eq!(decimals.len(), 9);
+    assert_eq!(decimals[0], "%1.");
+    assert_eq!(decimals[8], "%9.");
+    let lvl2 = elements(kids[1])
+        .into_iter()
+        .filter(|n| n.has_tag_name((W, "lvl")))
+        .nth(2)
+        .unwrap();
+    let ind = child(child(lvl2, "pPr").unwrap(), "ind").unwrap();
+    assert_eq!(wattr(ind, "left"), Some("2160"));
+    assert_eq!(wattr(ind, "hanging"), Some("360"));
 }

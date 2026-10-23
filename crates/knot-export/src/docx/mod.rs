@@ -4,6 +4,7 @@
 //! would replace (styles, numbering, footer) come in as [`DocxDefaults`].
 
 mod body;
+mod numbering;
 mod styles;
 
 use std::borrow::Cow;
@@ -46,7 +47,7 @@ impl DocxDefaults {
     pub fn builtin() -> Self {
         Self {
             styles_xml: Cow::Borrowed(styles::STYLES_XML),
-            numbering_xml: Cow::Borrowed(styles::NUMBERING_XML),
+            numbering_xml: Cow::Owned(numbering::builtin_xml()),
             footer_xml: Cow::Borrowed(styles::FOOTER_XML),
         }
     }
@@ -67,6 +68,9 @@ pub fn write_docx_with(
     let mut cx = Ctx::new(meta, assets);
     body::document(&mut cx, doc);
 
+    let numbering_xml = numbering::with_nums(&defaults.numbering_xml, &cx.nums)
+        .ok_or_else(|| ExportError::Io("numbering part has no </w:numbering>".into()))?;
+
     let mut zip = ZipOut::new();
     zip.deflated("[Content_Types].xml", CONTENT_TYPES.as_bytes())?;
     zip.deflated("_rels/.rels", ROOT_RELS.as_bytes())?;
@@ -75,7 +79,7 @@ pub fn write_docx_with(
     zip.deflated("word/document.xml", cx.xml.as_bytes())?;
     zip.deflated("word/_rels/document.xml.rels", cx.rels_xml().as_bytes())?;
     zip.deflated("word/styles.xml", defaults.styles_xml.as_bytes())?;
-    zip.deflated("word/numbering.xml", defaults.numbering_xml.as_bytes())?;
+    zip.deflated("word/numbering.xml", numbering_xml.as_bytes())?;
     zip.deflated("word/settings.xml", SETTINGS_XML.as_bytes())?;
     zip.deflated("word/footer1.xml", defaults.footer_xml.as_bytes())?;
     Ok(Output {
@@ -99,6 +103,15 @@ struct Ctx<'a> {
     fallbacks: Fallbacks,
     /// How many quotes enclose the block being written.
     quote_depth: u32,
+    /// How many lists enclose the block being written.
+    list_depth: u32,
+    /// Left indent, in twips, for the paragraph a list item's non-paragraph
+    /// block opens; 0 outside list items.
+    block_indent: u32,
+    /// The `w:num` elements of every list so far, for `numbering.xml`.
+    nums: String,
+    /// Last `w:numId` handed out.
+    last_num_id: u32,
     /// `rels[i]` has id `rId{i + 1}`.
     rels: Vec<Relationship>,
     /// Hyperlink target to its relationship id.
@@ -123,6 +136,10 @@ impl<'a> Ctx<'a> {
             xml: String::new(),
             fallbacks: Fallbacks::default(),
             quote_depth: 0,
+            list_depth: 0,
+            block_indent: 0,
+            nums: String::new(),
+            last_num_id: 0,
             rels,
             hyperlinks: HashMap::new(),
             last_doc_pr: 0,
@@ -146,6 +163,14 @@ impl<'a> Ctx<'a> {
         let id = self.add_rel("hyperlink", target.to_owned(), true);
         self.hyperlinks.insert(target.to_owned(), id.clone());
         id
+    }
+
+    /// Add a `w:num` for a new list and return its id.
+    fn add_num(&mut self, ordered: bool, ilvl: u32, start: u32) -> u32 {
+        self.last_num_id += 1;
+        self.nums
+            .push_str(&numbering::num(self.last_num_id, ordered, ilvl, start));
+        self.last_num_id
     }
 
     /// The next drawing id (`wp:docPr id`), unique and positive.

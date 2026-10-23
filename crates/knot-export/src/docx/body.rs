@@ -5,9 +5,10 @@
 //! starts at the text width and shrinks inside quotes, list items and table
 //! cells, so tables and pictures can size themselves to it.
 
-use crate::model::{Block, ExportDoc, Inline, LinkTarget, Marks, Run};
+use crate::model::{Block, ExportDoc, Inline, LinkTarget, List, ListItem, Marks, Run};
 use crate::xml::esc_text;
 
+use super::numbering::{INDENT_TWIPS, LEVELS};
 use super::{Ctx, FOOTER_RID, MARGIN_TWIPS, PAGE_HEIGHT_TWIPS, PAGE_WIDTH_TWIPS, TEXT_WIDTH_TWIPS};
 
 /// Left indent of the Quote style, in twips.
@@ -73,9 +74,9 @@ fn block(cx: &mut Ctx, b: &Block, avail_twips: u32) {
             open_paragraph(cx, Some("HorizontalRule"));
             cx.xml.push_str("</w:p>");
         }
+        Block::List(l) => list(cx, l, avail_twips),
         // Not written yet: an empty Normal paragraph keeps the document valid.
-        Block::List(_)
-        | Block::Table(_)
+        Block::Table(_)
         | Block::Mermaid { .. }
         | Block::Image { .. }
         | Block::Board { .. }
@@ -90,13 +91,95 @@ fn text_paragraph(cx: &mut Ctx, style: &str, text: &str) {
     cx.xml.push_str("</w:p>");
 }
 
-/// Open a `w:p`, with its paragraph style unless it is Normal.
+/// Open a `w:p`, with its paragraph style unless it is Normal, and the
+/// indent of the list item it continues.
 fn open_paragraph(cx: &mut Ctx, style: Option<&str>) {
+    let indent = cx.block_indent;
+    open_paragraph_with(cx, style, None, (indent > 0).then_some(indent));
+}
+
+/// Open a `w:p` with optional style, list membership (`numId`, `ilvl`) and
+/// left indent. `w:pPr` children are written in schema order.
+fn open_paragraph_with(
+    cx: &mut Ctx,
+    style: Option<&str>,
+    num: Option<(u32, u32)>,
+    indent: Option<u32>,
+) {
     cx.xml.push_str("<w:p>");
+    if style.is_none() && num.is_none() && indent.is_none() {
+        return;
+    }
+    cx.xml.push_str("<w:pPr>");
     if let Some(style) = style {
-        cx.xml.push_str(r#"<w:pPr><w:pStyle w:val=""#);
+        cx.xml.push_str(r#"<w:pStyle w:val=""#);
         cx.xml.push_str(style);
-        cx.xml.push_str(r#""/></w:pPr>"#);
+        cx.xml.push_str(r#""/>"#);
+    }
+    if let Some((num_id, ilvl)) = num {
+        cx.xml.push_str(&format!(
+            r#"<w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="{num_id}"/></w:numPr>"#
+        ));
+    }
+    if let Some(left) = indent {
+        cx.xml.push_str(&format!(r#"<w:ind w:left="{left}"/>"#));
+    }
+    cx.xml.push_str("</w:pPr>");
+}
+
+/// A list. Every list gets its own `w:num`, so a numbered list restarts at
+/// its `start`. Items are written flat, one paragraph per block; the nesting
+/// depth is the `ilvl`, clamped to the nine levels Word has.
+fn list(cx: &mut Ctx, l: &List, avail_twips: u32) {
+    let ilvl = cx.list_depth.min(LEVELS - 1);
+    let num_id = cx.add_num(l.ordered, ilvl, l.start);
+    let outer_indent = std::mem::take(&mut cx.block_indent);
+    cx.list_depth += 1;
+    let inner = avail_twips.saturating_sub(INDENT_TWIPS);
+    for item in &l.items {
+        list_item(cx, item, (num_id, ilvl), inner);
+    }
+    cx.list_depth -= 1;
+    cx.block_indent = outer_indent;
+}
+
+/// One item. Its first paragraph carries the bullet or number. A checklist
+/// item has no `numPr`: its first run starts with a box character and the
+/// paragraph is indented like a list item instead. Later blocks are
+/// indented to line up with the text and carry no marker.
+fn list_item(cx: &mut Ctx, item: &ListItem, (num_id, ilvl): (u32, u32), avail_twips: u32) {
+    let indent = INDENT_TWIPS * (ilvl + 1);
+    let (lead, tail) = match item.blocks.split_first() {
+        Some((Block::Paragraph(content), tail)) => (content.as_slice(), tail),
+        // No paragraph to hold the marker: write an empty one.
+        _ => (&[][..], &item.blocks[..]),
+    };
+    match item.checked {
+        Some(checked) => {
+            open_paragraph_with(cx, Some("ListParagraph"), None, Some(indent));
+            let marker = if checked { "\u{2611} " } else { "\u{2610} " };
+            run(cx, marker, &Marks::default(), None);
+        }
+        None => open_paragraph_with(cx, Some("ListParagraph"), Some((num_id, ilvl)), None),
+    }
+    inlines(cx, lead);
+    cx.xml.push_str("</w:p>");
+
+    for b in tail {
+        match b {
+            Block::Paragraph(content) => {
+                open_paragraph_with(cx, Some("ListParagraph"), None, Some(indent));
+                inlines(cx, content);
+                cx.xml.push_str("</w:p>");
+            }
+            // A nested list brings its own indent.
+            Block::List(_) => block(cx, b, avail_twips),
+            _ => {
+                cx.block_indent = indent;
+                block(cx, b, avail_twips);
+                cx.block_indent = 0;
+            }
+        }
     }
 }
 

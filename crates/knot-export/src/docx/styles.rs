@@ -1,5 +1,5 @@
-//! The built-in package defaults: style definitions, numbering definitions and
-//! the footer. A company template would replace these parts (spec §10), so
+//! The built-in package defaults: style definitions and the footer (the
+//! numbering definitions are in [`super::numbering`]). A company template would replace these parts (spec §10), so
 //! they live here in one place and reach the writer only through
 //! [`super::DocxDefaults`].
 //!
@@ -106,13 +106,6 @@ pub(super) const STYLES_XML: &str = concat!(
     r#"<w:insideV w:val="single" w:sz="4" w:space="0" w:color="BFBFBF"/>"#,
     r#"</w:tblBorders></w:tblPr></w:style>"#,
     r#"</w:styles>"#,
-);
-
-/// The numbering part, which holds the list definitions (`w:abstractNum`).
-pub(super) const NUMBERING_XML: &str = concat!(
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-    r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
-    r#"</w:numbering>"#,
 );
 
 /// "Page X of Y", centred, with complex `PAGE` / `NUMPAGES` fields.
