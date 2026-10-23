@@ -19,10 +19,13 @@ use knot_export::{
 };
 use knot_server::export::{self, Format};
 use knot_server::{AppState, router_with_state};
-use knot_storage::{PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore, WorkspaceRole};
+use knot_storage::{
+    BlobStore, BlobStoreError, PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore,
+    WorkspaceRole,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tower::ServiceExt;
 use uuid::Uuid;
 use yrs::{Any, ReadTxn, Transact, Xml, XmlElementPrelim, XmlFragment, XmlTextPrelim};
@@ -428,6 +431,36 @@ impl World {
             body,
         )
         .await
+    }
+}
+
+/// A blob store whose reads wait for the gate: each `get` tells `entered`
+/// it started, then waits until `open` has a permit. Holds an export in the
+/// middle of its build for as long as a test needs.
+struct GatedBlobs {
+    inner: Arc<dyn BlobStore>,
+    entered: Arc<Notify>,
+    open: Arc<Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl BlobStore for GatedBlobs {
+    async fn put(&self, id: Uuid, bytes: &[u8], content_type: &str) -> Result<(), BlobStoreError> {
+        self.inner.put(id, bytes, content_type).await
+    }
+
+    async fn get(&self, id: Uuid) -> Result<Vec<u8>, BlobStoreError> {
+        self.entered.notify_one();
+        drop(self.open.acquire().await.expect("gate"));
+        self.inner.get(id).await
+    }
+
+    async fn delete(&self, id: Uuid) -> Result<(), BlobStoreError> {
+        self.inner.delete(id).await
+    }
+
+    fn bytes_deleted_with_metadata(&self) -> bool {
+        self.inner.bytes_deleted_with_metadata()
     }
 }
 
@@ -1036,6 +1069,63 @@ async fn third_concurrent_export_gets_503() {
         let response = world.export(&world.owner, page, "docx", &[]).await;
         assert_eq!(response.status(), StatusCode::OK);
     }
+}
+
+/// A request dropped mid-build (the 30 s request timeout, or the client
+/// going away) must not hand its permit back while the build still runs and
+/// holds the page's images, pictures and output: the permit goes back when
+/// the build ends, so no more than the permitted builds are ever in memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_request_keeps_its_permit_until_the_build_ends() {
+    let entered = Arc::new(Notify::new());
+    let open = Arc::new(Semaphore::new(0));
+    let world = world_with(|s| {
+        s.blob_store = Some(Arc::new(GatedBlobs {
+            inner: s.blob_store.take().unwrap(),
+            entered: entered.clone(),
+            open: open.clone(),
+        }));
+        s.export_permits = Arc::new(Semaphore::new(1));
+        s.export_busy_wait = Duration::from_millis(50);
+    })
+    .await;
+    let page = world.create_doc("Dropped").await;
+    let url = world.upload(page, "image/png", PNG_3X2).await;
+    world.set_markdown(page, &format!("![p]({url})\n")).await;
+
+    // Start the export and drop the request once its build is fetching the
+    // image.
+    {
+        let export = world.export(&world.owner, page, "docx", &[]);
+        tokio::pin!(export);
+        tokio::select! {
+            _ = &mut export => panic!("the export finished while its image read was held"),
+            () = entered.notified() => {}
+        }
+    }
+
+    assert_eq!(
+        world.state.export_permits.available_permits(),
+        0,
+        "the dropped request's build still holds the permit"
+    );
+    let response = world.export(&world.owner, page, "docx", &[]).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error_code(response).await, "export.busy");
+
+    // Let the build finish: the permit comes back, and the next export runs.
+    open.add_permits(1);
+    let permit = tokio::time::timeout(
+        Duration::from_secs(30),
+        world.state.export_permits.acquire(),
+    )
+    .await
+    .expect("the build gives its permit back when it ends")
+    .unwrap();
+    drop(permit);
+    let response = world.export(&world.owner, page, "docx", &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fallbacks_header(&response), NO_FALLBACKS);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -20,6 +20,7 @@ use axum::{
 use knot_export::{DiagramRef, Fallbacks};
 use multer::{Constraints, Multipart, SizeLimit};
 use serde::Serialize;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -181,7 +182,7 @@ async fn export_response(
         state.export_permits.clone().acquire_owned(),
     )
     .await;
-    let _permit = match permit {
+    let permit = match permit {
         Ok(Ok(permit)) => permit,
         Ok(Err(e)) => {
             tracing::error!(error = %e, "export permits closed");
@@ -196,10 +197,29 @@ async fn export_response(
             "10 MiB cap",
         );
     };
-    let built = match export::build(state, user_id, doc_id, format, pictures).await {
-        Ok(built) => built,
-        Err(e) => {
+    // The build runs on its own task, which owns the permit until the build
+    // ends. Dropping this handler (the request timeout, or the client going
+    // away) then can't hand the permit back while the build's blocking walk
+    // and write still hold the images, pictures and output in memory.
+    let build = tokio::spawn(
+        {
+            let state = state.clone();
+            async move {
+                let built = export::build(&state, user_id, doc_id, format, pictures).await;
+                drop(permit);
+                built
+            }
+        }
+        .in_current_span(),
+    );
+    let built = match build.await {
+        Ok(Ok(built)) => built,
+        Ok(Err(e)) => {
             tracing::error!(error = %e, "export");
+            return internal();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "export task");
             return internal();
         }
     };
