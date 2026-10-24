@@ -156,8 +156,8 @@ pub fn extract_tasks(md: &str) -> Vec<Task> {
 /// - `item_index` is the item's position among them, and `checked` whether
 ///   its `checked` attribute reads `"true"`;
 /// - text, assignee and due date are those [`extract_tasks`] finds for the
-///   item's own content ([`task_item_markdown`]), as it always found them;
-///   an item it finds no task in has empty text and neither.
+///   item's own content (`to_markdown::task_item_markdown`), as it always
+///   found them; an item it finds no task in has empty text and neither.
 pub fn extract_tasks_from_doc(doc: &DocHandle) -> Vec<Task> {
     let ydoc = doc.inner();
     let txn = ydoc.transact();
