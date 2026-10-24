@@ -51,3 +51,21 @@ export function resolveSunLocation(typed: LatLon | null, now: Date): ResolvedSun
   if (typed) return { loc: typed, source: { kind: "typed" } };
   return locationForZone(browserTimeZone(), now.getTimezoneOffset());
 }
+
+/** A latitude or longitude as typed: decimal degrees, an optional sign,
+ *  and `.` or `,` as the decimal separator, within ±`limit`. Anything else
+ *  is `null`, exponents (`1e2`) and a second separator included. */
+export function parseCoordinate(raw: string, limit: 90 | 180): number | null {
+  const text = raw.trim();
+  if (!/^[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)$/.test(text)) return null;
+  const n = Number(text.replace(",", "."));
+  return Math.abs(n) <= limit ? n : null;
+}
+
+const hemisphere = (degrees: number, positive: string, negative: string) =>
+  `${Math.abs(degrees).toFixed(2)}° ${degrees < 0 ? negative : positive}`;
+
+/** A location for reading, e.g. `52.52° N, 13.40° E`. */
+export function formatLatLon({ lat, lon }: LatLon): string {
+  return `${hemisphere(lat, "N", "S")}, ${hemisphere(lon, "E", "W")}`;
+}

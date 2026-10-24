@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { browserTimeZone, locationForZone, resolveSunLocation } from "./sunLocation";
+import { browserTimeZone, formatLatLon, locationForZone, parseCoordinate, resolveSunLocation } from "./sunLocation";
 import { TZ_COORDS } from "./tzCoords.generated";
 
 afterEach(() => {
@@ -99,5 +99,29 @@ describe("browserTimeZone", () => {
   it("returns null when the browser reports no zone", () => {
     reportZone("");
     expect(browserTimeZone()).toBeNull();
+  });
+});
+
+describe("parseCoordinate", () => {
+  it("reads decimal degrees with either separator and an optional sign", () => {
+    expect(parseCoordinate("52.52", 90)).toBe(52.52);
+    expect(parseCoordinate(" 52,52 ", 90)).toBe(52.52);
+    expect(parseCoordinate("+13.4", 180)).toBe(13.4);
+    expect(parseCoordinate("-90", 90)).toBe(-90);
+  });
+
+  it("rejects anything that isn't a plain number within the limit", () => {
+    for (const raw of ["1e2", "", "abc", "1.2.3"]) {
+      expect(parseCoordinate(raw, 180), JSON.stringify(raw)).toBeNull();
+    }
+    expect(parseCoordinate("91", 90)).toBeNull();
+    expect(parseCoordinate("-181", 180)).toBeNull();
+  });
+});
+
+describe("formatLatLon", () => {
+  it("names the hemispheres instead of signing the degrees", () => {
+    expect(formatLatLon({ lat: -33.87, lon: -70.5 })).toBe("33.87° S, 70.50° W");
+    expect(formatLatLon({ lat: 52.52, lon: 13.4 })).toBe("52.52° N, 13.40° E");
   });
 });
