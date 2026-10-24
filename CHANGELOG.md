@@ -32,7 +32,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   light skin from sunrise to sunset. knot works out where you are from your
   time zone, or from a location you type in. Nothing leaves the browser, and
   the choice is saved per browser like the skin itself. The skin is now also
-  synced across open tabs, including one picked by hand.
+  synced across open tabs, including one picked by hand. (#49)
 
 ### Security
 - `ctutils` 0.4.5 fixes RUSTSEC-2026-0385: its constant-time helpers could
