@@ -68,7 +68,7 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
         opts.insert(Options::ENABLE_STRIKETHROUGH);
         opts.insert(Options::ENABLE_TASKLISTS);
         opts.insert(Options::ENABLE_TABLES);
-        let parser = Parser::new_ext(src, opts);
+        let parser = TightParagraphs::new(Parser::new_ext(src, opts));
 
         // Per-table alignment carried by `Tag::Table(Vec<Alignment>)`. We
         // stash it on table entry and consume per-cell via a column index.
@@ -282,11 +282,24 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         pending_image = None;
                         paragraph_image = None;
                     }
+                    TagEnd::Item => {
+                        // The schema is `list_item: paragraph block*`, so an
+                        // empty item (`-`, `- [ ]`) or one starting with
+                        // another block (`- # h`, an image) gets an empty
+                        // paragraph first.
+                        if let Some(item) = stack.pop()
+                            && !matches!(
+                                item.get(&txn, 0),
+                                Some(yrs::XmlOut::Element(ref el)) if el.tag().as_ref() == "paragraph"
+                            )
+                        {
+                            item.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
+                        }
+                    }
                     TagEnd::Heading(_)
                     | TagEnd::BlockQuote(_)
                     | TagEnd::CodeBlock
-                    | TagEnd::List(_)
-                    | TagEnd::Item => {
+                    | TagEnd::List(_) => {
                         stack.pop();
                     }
                     TagEnd::Table => {
@@ -359,14 +372,6 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         let text_ref = ensure_text_child(parent, &mut txn);
                         let pos = text_ref.len(&txn);
                         text_ref.insert(&mut txn, pos, &text);
-                    } else if parent_tag == "list_item" {
-                        // Tight list: pulldown-cmark emits Text directly inside Item
-                        // (no paragraph wrapper). Our schema requires list_item → paragraph.
-                        let para = ensure_para_child(parent, &mut txn);
-                        let attrs = attrs_from_marks(&active_marks);
-                        let text_ref = ensure_text_child(&para, &mut txn);
-                        let pos = text_ref.len(&txn);
-                        text_ref.insert_with_attributes(&mut txn, pos, &text, attrs);
                     } else {
                         // Inline text in a paragraph/heading.
                         // Attach current active marks as Attrs.
@@ -383,13 +388,7 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     let mut marks_with_code = active_marks.clone();
                     marks_with_code.push(("code".into(), HashMap::new()));
                     let attrs = attrs_from_marks(&marks_with_code);
-                    // If inside list_item, wrap in paragraph first.
-                    let text_ref = if parent.tag().as_ref() == "list_item" {
-                        let para = ensure_para_child(parent, &mut txn);
-                        ensure_text_child(&para, &mut txn)
-                    } else {
-                        ensure_text_child(parent, &mut txn)
-                    };
+                    let text_ref = ensure_text_child(parent, &mut txn);
                     let pos = text_ref.len(&txn);
                     text_ref.insert_with_attributes(&mut txn, pos, &s, attrs);
                 }
@@ -400,8 +399,9 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     parent.push_back(&mut txn, XmlElementPrelim::empty("hard_break"));
                 }
                 Event::Rule => {
-                    // CommonMark horizontal rule. Always lives at the top level.
-                    frag.push_back(&mut txn, XmlElementPrelim::empty("horizontal_rule"));
+                    // CommonMark horizontal rule, written into its container:
+                    // the top level, a list item or a blockquote.
+                    let _ = push_block(&frag, &stack, &mut txn, "horizontal_rule", &[]);
                 }
                 Event::TaskListMarker(checked) => {
                     // GFM task list. pulldown-cmark emits this just after
@@ -537,18 +537,149 @@ fn push_block(
     el
 }
 
-/// Find the last XmlElement child of `parent` with tag "paragraph", or create one.
-/// Used to wrap tight-list inline content in the required paragraph container.
-fn ensure_para_child(parent: &XmlElementRef, txn: &mut yrs::TransactionMut) -> XmlElementRef {
-    use yrs::XmlOut;
-    let len = parent.len(txn);
-    if len > 0
-        && let Some(XmlOut::Element(el)) = parent.get(txn, len - 1)
-        && el.tag().as_ref() == "paragraph"
-    {
-        return el;
+/// Gives a tight list item's inline content its paragraph back.
+///
+/// pulldown-cmark leaves out the `Paragraph` tags of a tight list item and
+/// emits its inline events straight under `Item`. The schema is
+/// `list_item: paragraph block*`, so this adapter opens a paragraph on the
+/// first inline event directly under an `Item` and closes it before the next
+/// block-level event (a block start or end, `Rule`, `Html`) or `End(Item)`.
+/// `TaskListMarker` passes through, so the item keeps its checkbox. The
+/// importer then sees the same events as for a loose list, image and board
+/// promotion included.
+struct TightParagraphs<'a, I: Iterator<Item = Event<'a>>> {
+    inner: I,
+    /// The open block-level tags, innermost last: `true` for an `Item`.
+    open_blocks: Vec<bool>,
+    /// Whether this adapter has opened a paragraph that is still open.
+    in_paragraph: bool,
+    /// An event held back while the paragraph start or end goes first.
+    held: Option<Event<'a>>,
+}
+
+/// How an event relates to the paragraph structure.
+enum Role {
+    /// Content of a paragraph or heading.
+    Inline,
+    /// A block-level tag opens; `true` for an `Item`.
+    Open(bool),
+    /// A block-level tag closes.
+    Close,
+    /// A block-level event with no children (`Rule`, `Html`).
+    Leaf,
+    /// Passes through untouched.
+    Marker,
+}
+
+impl<'a, I: Iterator<Item = Event<'a>>> TightParagraphs<'a, I> {
+    fn new(inner: I) -> Self {
+        Self {
+            inner,
+            open_blocks: Vec::new(),
+            in_paragraph: false,
+            held: None,
+        }
     }
-    parent.push_back(txn, XmlElementPrelim::empty("paragraph"))
+}
+
+/// Every pulldown-cmark event, tag and tag end is matched by name, so a new
+/// one fails to compile here instead of being misread.
+fn role(event: &Event<'_>) -> Role {
+    match event {
+        Event::Start(tag) => match tag {
+            Tag::Emphasis
+            | Tag::Strong
+            | Tag::Strikethrough
+            | Tag::Superscript
+            | Tag::Subscript
+            | Tag::Link { .. }
+            | Tag::Image { .. } => Role::Inline,
+            Tag::Item => Role::Open(true),
+            Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::BlockQuote(_)
+            | Tag::CodeBlock(_)
+            | Tag::HtmlBlock
+            | Tag::List(_)
+            | Tag::FootnoteDefinition(_)
+            | Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::TableRow
+            | Tag::TableCell
+            | Tag::MetadataBlock(_) => Role::Open(false),
+        },
+        Event::End(end) => match end {
+            TagEnd::Emphasis
+            | TagEnd::Strong
+            | TagEnd::Strikethrough
+            | TagEnd::Superscript
+            | TagEnd::Subscript
+            | TagEnd::Link
+            | TagEnd::Image => Role::Inline,
+            TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(_)
+            | TagEnd::CodeBlock
+            | TagEnd::HtmlBlock
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+            | TagEnd::MetadataBlock(_) => Role::Close,
+        },
+        Event::Text(_)
+        | Event::Code(_)
+        | Event::InlineMath(_)
+        | Event::DisplayMath(_)
+        | Event::InlineHtml(_)
+        | Event::FootnoteReference(_)
+        | Event::SoftBreak
+        | Event::HardBreak => Role::Inline,
+        Event::Html(_) | Event::Rule => Role::Leaf,
+        Event::TaskListMarker(_) => Role::Marker,
+    }
+}
+
+impl<'a, I: Iterator<Item = Event<'a>>> Iterator for TightParagraphs<'a, I> {
+    type Item = Event<'a>;
+
+    fn next(&mut self) -> Option<Event<'a>> {
+        if let Some(event) = self.held.take() {
+            return Some(event);
+        }
+        let event = self.inner.next()?;
+        match role(&event) {
+            Role::Marker => return Some(event),
+            Role::Inline => {
+                if !self.in_paragraph && self.open_blocks.last() == Some(&true) {
+                    self.in_paragraph = true;
+                    self.held = Some(event);
+                    return Some(Event::Start(Tag::Paragraph));
+                }
+                return Some(event);
+            }
+            Role::Open(is_item) => self.open_blocks.push(is_item),
+            Role::Close => {
+                self.open_blocks.pop();
+            }
+            Role::Leaf => {}
+        }
+        if self.in_paragraph {
+            self.in_paragraph = false;
+            self.held = Some(event);
+            return Some(Event::End(TagEnd::Paragraph));
+        }
+        Some(event)
+    }
 }
 
 /// Find the last XmlText child of `parent`, or create one if none.

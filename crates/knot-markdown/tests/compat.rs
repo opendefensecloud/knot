@@ -148,6 +148,67 @@ fn importer_matches_legacy_on_healthy_inputs() {
     );
 }
 
+#[test]
+fn new_import_is_schema_valid_on_every_input() {
+    let mut failures = Vec::new();
+    for (name, md) in corpus::markdown_inputs() {
+        match knot_markdown::from_markdown::parse(&md) {
+            Ok((doc, _)) => {
+                let violations = compat::schema_violations(doc.inner());
+                if !violations.is_empty() {
+                    failures.push(format!(
+                        "{name}: {md:?}\n  {}\n{}",
+                        violations.join("\n  "),
+                        compat::normalised(doc.inner())
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("{name}: {md:?}\n  error {e}")),
+        }
+    }
+    assert_no_failures("new import breaks the schema", &failures);
+}
+
+/// Each import class names the inputs it is about, and leaves alone
+/// neighbouring inputs that import the same way as before.
+#[test]
+fn import_classes_name_their_inputs() {
+    let cases: &[(&str, Option<&str>)] = &[
+        ("\\*not em\\*\n", Some("markdown_escaping")),
+        ("- \\[x\\] not a task\n", Some("markdown_escaping")),
+        ("a &amp; b\n", Some("markdown_escaping")),
+        ("| a |\n| --- |\n| b \\| c |\n", None),
+        ("`\\*`\n", None),
+        ("- first\\\n  second\n", None),
+        ("- \\\n  b\n", Some("leading_hard_break")),
+        ("\\\nb\n", Some("leading_hard_break")),
+        ("*\\\nb*\n", Some("leading_hard_break")),
+        ("![a](x.png)\\\nb\n", Some("leading_hard_break")),
+        ("a  \nb\n", None),
+        ("- # h\n", Some("item_first_child_not_paragraph")),
+        ("- a\n-\n- c\n", Some("item_first_child_not_paragraph")),
+        ("- ![a](x.png)\n", Some("item_first_child_not_paragraph")),
+        ("- a\n  # h\n", None),
+        ("> a\n>\n> ***\n>\n> b\n", Some("rule_in_container")),
+        ("- a\n\n  ***\n\n  b\n", Some("rule_in_container")),
+        ("> a\n\n***\n", None),
+        ("- a\n  <!-- c -->\n  b\n", Some("html_between_item_lines")),
+        ("- a\n  <!-- c -->\n", None),
+        ("- a\n\n  <!-- c -->\n\n  b\n", None),
+        ("<!-- c -->\n\na\n", None),
+        ("- a  \n  b\n", None),
+        ("- a\n  - b\n", None),
+    ];
+    let mut failures = Vec::new();
+    for (md, want) in cases {
+        let got = compat::import_class(md);
+        if got != *want {
+            failures.push(format!("{md:?}: class {got:?}, expected {want:?}"));
+        }
+    }
+    assert_no_failures("import class is wrong", &failures);
+}
+
 /// Every text character, in document order, from every `XmlText`.
 fn doc_text(doc: &DocHandle) -> String {
     fn walk<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {

@@ -3,8 +3,10 @@
 //! guarantees").
 
 use std::fmt::Write as _;
+use std::ops::Range;
 
 use knot_crdt::{DocHandle, YrsEngine};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use yrs::types::Attrs;
 use yrs::types::text::YChange;
 use yrs::{Any, Out, ReadTxn, Text, Transact, Xml, XmlFragment, XmlOut};
@@ -22,7 +24,20 @@ const EXPORT_CLASSES: &[Class<DocHandle>] = &[];
 
 /// Named import bug classes. A healthy Markdown input in one of them may
 /// import differently from the legacy importer (importer rule).
-const IMPORT_CLASSES: &[Class<str>] = &[];
+///
+/// The two classes of text the writer can't express yet (a follow-up) come
+/// first, so `import_class` names them whenever they apply: no round trip of
+/// such an input can be stable.
+const IMPORT_CLASSES: &[Class<str>] = &[
+    ("markdown_escaping", markdown_escaping),
+    ("leading_hard_break", leading_hard_break),
+    (
+        "item_first_child_not_paragraph",
+        item_first_child_not_paragraph,
+    ),
+    ("rule_in_container", rule_in_container),
+    ("html_between_item_lines", html_between_item_lines),
+];
 
 /// The export bug class `doc` falls in, if any.
 pub fn export_class(doc: &DocHandle) -> Option<&'static str> {
@@ -38,6 +53,187 @@ pub fn import_class(md: &str) -> Option<&'static str> {
         .iter()
         .find(|(_, is_in)| is_in(md))
         .map(|(name, _)| *name)
+}
+
+/// The pulldown-cmark events of `md` with their source ranges, read with
+/// the importers' options.
+fn events(md: &str) -> impl Iterator<Item = (Event<'_>, Range<usize>)> {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_TABLES);
+    Parser::new_ext(md, opts).into_offset_iter()
+}
+
+/// Text from a backslash escape (`\*`) or a character reference (`&amp;`)
+/// outside code. The writer doesn't escape text, which is a non-goal and a
+/// follow-up issue, so such text can come back as Markdown syntax. An
+/// escaped `|` in a table cell is not in the class: the writer escapes it.
+fn markdown_escaping(md: &str) -> bool {
+    let mut in_code_block = false;
+    let mut in_cell = false;
+    events(md).any(|(event, range)| {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
+            Event::End(TagEnd::CodeBlock) => in_code_block = false,
+            Event::Start(Tag::TableCell) => in_cell = true,
+            Event::End(TagEnd::TableCell) => in_cell = false,
+            Event::Text(text) if !in_code_block => {
+                let reference = md[range.clone()] != *text;
+                let escape = md[..range.start].ends_with('\\')
+                    && text.starts_with(|c: char| c.is_ascii_punctuation())
+                    && !(in_cell && text.starts_with('|'));
+                return reference || escape;
+            }
+            _ => {}
+        }
+        false
+    })
+}
+
+/// A hard break before any other inline content of its paragraph, heading
+/// or tight list item (`- \` then `b`). The writer's `"  \n"` at the start
+/// of a line is not a hard break: the same follow-up as `markdown_escaping`.
+/// Neither image alt text nor inline HTML counts as content: the importer
+/// drops an image that shares its paragraph, and ignores inline HTML.
+fn leading_hard_break(md: &str) -> bool {
+    let mut at_start = false;
+    let mut image_depth = 0usize;
+    events(md).any(|(event, _)| {
+        match event {
+            Event::Start(Tag::Image { .. }) => image_depth += 1,
+            Event::End(TagEnd::Image) => image_depth -= 1,
+            _ if image_depth > 0 => {}
+            Event::HardBreak => return at_start,
+            Event::Text(_) | Event::Code(_) | Event::SoftBreak => at_start = false,
+            Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. })
+            | Event::End(
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link,
+            )
+            | Event::InlineHtml(_)
+            | Event::TaskListMarker(_) => {}
+            // A block starts or ends: the next inline content starts a
+            // paragraph.
+            _ => at_start = true,
+        }
+        false
+    })
+}
+
+/// A list item the legacy importer stored without its leading paragraph:
+/// an empty item (`-`), one starting with another block (`- # h`), or one
+/// holding only an image or board, which the legacy importer dropped. The
+/// new importer puts an empty paragraph first (A7).
+fn item_first_child_not_paragraph(md: &str) -> bool {
+    fn has_bad_item<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
+        let XmlOut::Element(el) = node else {
+            return false;
+        };
+        let children: Vec<XmlOut> = (0..el.len(txn)).filter_map(|i| el.get(txn, i)).collect();
+        (el.tag().as_ref() == "list_item"
+            && children.first().and_then(tag_of).as_deref() != Some("paragraph"))
+            || children.iter().any(|child| has_bad_item(txn, child))
+    }
+    let Ok((doc, _)) = parse(md) else {
+        return false;
+    };
+    let ydoc = doc.inner();
+    let txn = ydoc.transact();
+    txn.get_xml_fragment("default").is_some_and(|frag| {
+        (0..frag.len(&txn))
+            .filter_map(|i| frag.get(&txn, i))
+            .any(|child| has_bad_item(&txn, &child))
+    })
+}
+
+/// A rule inside a list item or blockquote, which the legacy importer moved
+/// to the top level, after the enclosing container (A9).
+fn rule_in_container(md: &str) -> bool {
+    let mut depth = 0usize;
+    events(md).any(|(event, _)| {
+        match event {
+            Event::Start(Tag::Item | Tag::BlockQuote(_)) => depth += 1,
+            Event::End(TagEnd::Item | TagEnd::BlockQuote(_)) => depth -= 1,
+            Event::Rule => return depth > 0,
+            _ => {}
+        }
+        false
+    })
+}
+
+/// Inline content, an HTML block, then more inline content, all directly in
+/// one tight list item (`- a`, `  <!-- c -->`, `  b`). The legacy importer
+/// appended the later line to the first paragraph, giving `"ab"` (A3); the
+/// new importer keeps two paragraphs.
+fn html_between_item_lines(md: &str) -> bool {
+    /// What was last seen directly in an open list item.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Seen {
+        Nothing,
+        Inline,
+        HtmlAfterInline,
+        Block,
+    }
+    // One entry per open block, innermost last: `Some` for a list item.
+    let mut open: Vec<Option<Seen>> = Vec::new();
+    events(md).any(|(event, _)| {
+        let inline = matches!(
+            event,
+            Event::Text(_)
+                | Event::Code(_)
+                | Event::InlineHtml(_)
+                | Event::SoftBreak
+                | Event::HardBreak
+                | Event::Start(
+                    Tag::Emphasis
+                        | Tag::Strong
+                        | Tag::Strikethrough
+                        | Tag::Link { .. }
+                        | Tag::Image { .. }
+                )
+        );
+        let item = open.last_mut().and_then(Option::as_mut);
+        match event {
+            _ if inline => {
+                if let Some(seen) = item {
+                    if *seen == Seen::HtmlAfterInline {
+                        return true;
+                    }
+                    *seen = Seen::Inline;
+                }
+            }
+            Event::Start(Tag::Item) => open.push(Some(Seen::Nothing)),
+            Event::Start(tag) => {
+                if let Some(seen) = item {
+                    let html_after_inline = matches!(tag, Tag::HtmlBlock)
+                        && matches!(*seen, Seen::Inline | Seen::HtmlAfterInline);
+                    *seen = if html_after_inline {
+                        Seen::HtmlAfterInline
+                    } else {
+                        Seen::Block
+                    };
+                }
+                open.push(None);
+            }
+            Event::End(
+                TagEnd::Emphasis
+                | TagEnd::Strong
+                | TagEnd::Strikethrough
+                | TagEnd::Link
+                | TagEnd::Image,
+            ) => {}
+            Event::End(_) => {
+                open.pop();
+            }
+            Event::Rule => {
+                if let Some(seen) = item {
+                    *seen = Seen::Block;
+                }
+            }
+            _ => {}
+        }
+        false
+    })
 }
 
 /// The legacy export of `doc` when `doc` is healthy: the legacy export
