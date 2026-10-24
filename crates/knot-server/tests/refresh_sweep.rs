@@ -281,7 +281,7 @@ async fn sweep_rerenders_stale_rows_and_reindexes_tasks() {
         .collect();
     h.seed_tasks(broken, &seeded).await;
 
-    // A stale page a room has loaded: the sweep reads that room's state.
+    // A stale page a room has loaded is refreshed too, and its room stays.
     let open = h.page("b", "- [ ] open\n").await;
     h.seed_cache(open, 1, "stale\n").await;
     h.rooms.acquire(open).await.unwrap();
