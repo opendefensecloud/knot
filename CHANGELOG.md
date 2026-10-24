@@ -29,6 +29,15 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   compile to branches on secret values. It reaches knot only through the
   Postgres client's password authentication. knot's own session and CSRF
   signing do not use it. (#45)
+- `tokio` 1.53.3 fixes RUSTSEC-2026-0386: `AsyncFd`'s safe constructors could
+  register a file descriptor knot does not own, leading to a use-after-free
+  when the descriptor number was reused. knot does not call `AsyncFd` itself;
+  it reaches knot only through its dependencies. (#47)
+- RUSTSEC-2026-0387 (`crypto-bigint` 0.5.5, timing side channels) is
+  acknowledged in `deny.toml`. knot was not affected: the crate is used only
+  to verify OIDC ID-token signatures, which involves public values only, and
+  the fix exists only in a major version that `openidconnect` does not yet
+  support. (#47)
 
 ## [0.8.1] - 2026-10-21
 
