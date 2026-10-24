@@ -78,13 +78,45 @@ fn breaks_work_in_ordered_task_nested_and_quoted_lists() {
 fn image_and_board_in_tight_items_are_kept() {
     let board = "![l](knot://board/00000000-0000-0000-0000-000000000001.svg)";
     let board_item = format!("- {board}\n");
+    // As a run of its own after another block in the item, too.
+    let board_after_heading = format!("- a\n  # h\n  {board}\n");
     for (md, kept) in [
         ("- ![a](x.png)\n", "![a](x.png)"),
         (board_item.as_str(), board),
+        ("- a\n  # h\n  ![x](y.png)\n", "![x](y.png)"),
+        (board_after_heading.as_str(), board),
     ] {
         let doc = import(md);
         let out = export(&doc);
         assert!(out.contains(kept), "{md:?} exports {out:?}");
+    }
+}
+
+/// A run directly in a tight item that holds nothing the importer keeps
+/// (inline HTML, an empty link, images that share a line) gets no paragraph
+/// after another block, as with the legacy importer: an empty paragraph there
+/// would export as a blank line that the next import drops.
+#[test]
+fn item_run_without_content_adds_no_paragraph() {
+    for md in [
+        "- a\n  # h\n  <span></span>\n",
+        "- a\n  # h\n  ![x](a.png)![y](b.png)\n",
+        "- a\n  # h\n  [](x)\n",
+    ] {
+        let doc = import(md);
+        assert_eq!(
+            normalised(doc.inner()),
+            concat!(
+                "<bullet_list>\n",
+                "  <list_item>\n",
+                "    <paragraph>\n",
+                "      \"a\"\n",
+                "    <heading level=\"1\">\n",
+                "      \"h\"\n",
+            ),
+            "{md:?}"
+        );
+        assert_eq!(export(&doc), "- a\n  # h\n", "{md:?}");
     }
 }
 
@@ -102,6 +134,34 @@ fn html_comment_between_item_lines_keeps_lines_apart() {
             "      \"b\"\n",
         )
     );
+}
+
+/// pulldown-cmark emits an HTML block's extra indentation as text inside the
+/// block. The importer ignores HTML blocks, so that text is ignored too
+/// instead of landing directly in the item.
+#[test]
+fn indented_html_block_in_item_leaves_no_stray_text() {
+    for (md, want) in [
+        (
+            "- a\n    <!-- c -->\n",
+            concat!(
+                "<bullet_list>\n",
+                "  <list_item>\n",
+                "    <paragraph>\n",
+                "      \"a\"\n",
+            ),
+        ),
+        (
+            "- [ ] <!-- c -->\n    <!-- c -->\n",
+            concat!(
+                "<bullet_list>\n",
+                "  <list_item checked=\"false\">\n",
+                "    <paragraph>\n",
+            ),
+        ),
+    ] {
+        assert_eq!(normalised(import(md).inner()), want, "{md:?}");
+    }
 }
 
 #[test]

@@ -37,6 +37,10 @@ const IMPORT_CLASSES: &[Class<str>] = &[
     ),
     ("rule_in_container", rule_in_container),
     ("html_between_item_lines", html_between_item_lines),
+    (
+        "image_after_block_in_tight_item",
+        image_after_block_in_tight_item,
+    ),
 ];
 
 /// The export bug class `doc` falls in, if any.
@@ -228,6 +232,103 @@ fn html_between_item_lines(md: &str) -> bool {
             Event::Rule => {
                 if let Some(seen) = item {
                     *seen = Seen::Block;
+                }
+            }
+            _ => {}
+        }
+        false
+    })
+}
+
+/// A lone image or board as a run of its own directly in a tight list item,
+/// after another block of the item (`- a`, `  # h`, `  ![x](y.png)`): the
+/// run has exactly one image and no text, code or line break outside its alt
+/// text. The legacy importer dropped it, because promotion needs a paragraph
+/// on the stack (A2); the new importer keeps it as an `image` or
+/// `excalidraw_board` block. A run that also has text imported the same way
+/// before (the image is dropped from a paragraph with text), and so does one
+/// with no image or several (it yields nothing).
+fn image_after_block_in_tight_item(md: &str) -> bool {
+    /// An open list item: whether one of its blocks was seen, and the run
+    /// being read directly in it.
+    #[derive(Default)]
+    struct Item {
+        after_block: bool,
+        images: usize,
+        image_depth: usize,
+        content: bool,
+    }
+    impl Item {
+        /// Ends the run directly in this item: whether it was a lone image
+        /// after a block.
+        fn end_run(&mut self) -> bool {
+            let lone_image = self.after_block && self.images == 1 && !self.content;
+            *self = Self {
+                after_block: true,
+                ..Self::default()
+            };
+            lone_image
+        }
+    }
+    // One entry per open block, innermost last: `Some` for a list item.
+    let mut open: Vec<Option<Item>> = Vec::new();
+    events(md).any(|(event, _)| {
+        let item = open.last_mut().and_then(Option::as_mut);
+        match event {
+            Event::Start(Tag::Image { .. }) => {
+                if let Some(item) = item {
+                    item.images += 1;
+                    item.image_depth += 1;
+                }
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some(item) = item {
+                    item.image_depth = item.image_depth.saturating_sub(1);
+                }
+            }
+            // The importer writes alt text nowhere, but code and line breaks
+            // even inside an image.
+            Event::Text(_) => {
+                if let Some(item) = item
+                    && item.image_depth == 0
+                {
+                    item.content = true;
+                }
+            }
+            Event::Code(_) | Event::SoftBreak | Event::HardBreak => {
+                if let Some(item) = item {
+                    item.content = true;
+                }
+            }
+            Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. })
+            | Event::End(
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link,
+            )
+            | Event::InlineHtml(_)
+            | Event::TaskListMarker(_) => {}
+            // A block of the item starts, or a leaf block sits in it: the
+            // run before it ends.
+            Event::Start(tag) => {
+                if let Some(item) = item
+                    && item.end_run()
+                {
+                    return true;
+                }
+                open.push(matches!(tag, Tag::Item).then(Item::default));
+            }
+            Event::Rule | Event::Html(_) => {
+                if let Some(item) = item
+                    && item.end_run()
+                {
+                    return true;
+                }
+            }
+            // A block ends; at the end of an item, so does its last run.
+            Event::End(_) => {
+                if let Some(Some(mut item)) = open.pop()
+                    && item.end_run()
+                {
+                    return true;
                 }
             }
             _ => {}

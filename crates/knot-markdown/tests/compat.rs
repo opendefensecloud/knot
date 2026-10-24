@@ -198,6 +198,23 @@ fn import_classes_name_their_inputs() {
         ("<!-- c -->\n\na\n", None),
         ("- a  \n  b\n", None),
         ("- a\n  - b\n", None),
+        (
+            "- a\n  # h\n  ![x](y.png)\n",
+            Some("image_after_block_in_tight_item"),
+        ),
+        (
+            "- a\n  # h\n  ![l](knot://board/00000000-0000-0000-0000-000000000001.svg)\n",
+            Some("image_after_block_in_tight_item"),
+        ),
+        (
+            "- a\n  ```\n  c\n  ```\n  *![x](y.png)*\n",
+            Some("image_after_block_in_tight_item"),
+        ),
+        ("- a\n  # h\n  b\n", None),
+        ("- a\n  # h\n  ![x](y.png) b\n", None),
+        ("- a\n  # h\n  ![x](a.png)![y](b.png)\n", None),
+        ("- a\n  # h\n  <span></span>\n", None),
+        ("- a\n\n  # h\n\n  ![x](y.png)\n", None),
     ];
     let mut failures = Vec::new();
     for (md, want) in cases {

@@ -2,7 +2,7 @@
 //!
 //! Targets the v0.1 schema only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use knot_crdt::{DocHandle, Engine, YrsEngine};
@@ -63,6 +63,11 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
         // (we suppress image alt text from the paragraph, so the "paragraph still
         // empty" check alone would incorrectly promote the first sentinel).
         let mut paragraph_image_count: u32 = 0;
+        // Between Tag::HtmlBlock and TagEnd::HtmlBlock. Block-level HTML is
+        // ignored, and so is the text pulldown-cmark emits inside it (the
+        // block's extra indentation), which would otherwise land directly
+        // in the enclosing list item or quote.
+        let mut in_html_block = false;
 
         let mut opts = Options::empty();
         opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -231,6 +236,7 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         }
                         active_marks.push(("link".into(), m));
                     }
+                    Tag::HtmlBlock => in_html_block = true,
                     _ => {}
                 },
                 Event::End(end) => match end {
@@ -339,8 +345,10 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
                         active_marks.pop();
                     }
+                    TagEnd::HtmlBlock => in_html_block = false,
                     _ => {}
                 },
+                Event::Text(_) if in_html_block => {}
                 Event::Text(s) => {
                     let text = s.to_string();
                     // Inside any image: never emit alt text as paragraph content.
@@ -541,26 +549,50 @@ fn push_block(
 ///
 /// pulldown-cmark leaves out the `Paragraph` tags of a tight list item and
 /// emits its inline events straight under `Item`. The schema is
-/// `list_item: paragraph block*`, so this adapter opens a paragraph on the
-/// first inline event directly under an `Item` and closes it before the next
-/// block-level event (a block start or end, `Rule`, `Html`) or `End(Item)`.
-/// `TaskListMarker` passes through, so the item keeps its checkbox. The
-/// importer then sees the same events as for a loose list, image and board
-/// promotion included.
+/// `list_item: paragraph block*`, so this adapter wraps each such *run* of
+/// inline events in a paragraph: it opens one before the run's first event
+/// and closes it before the next block-level event (a block start or end,
+/// `Rule`, `Html`) or `End(Item)`. `TaskListMarker` passes through, so the
+/// item keeps its checkbox. The importer then sees the same events as for a
+/// loose list, image and board promotion included.
+///
+/// A run is wrapped only when it holds something the importer keeps: text,
+/// code or a line break, or a lone image or board, which the importer
+/// promotes to a block (only when it is alone in its paragraph, see
+/// `paragraph_image_count`). A run of only inline HTML, empty links, or
+/// images that share a line yields no paragraph, as with the legacy
+/// importer. Otherwise an empty paragraph would follow the item's earlier
+/// blocks, and its blank line would vanish on the next import. An item left
+/// without a paragraph still gets one at `End(Item)`. Until the run shows
+/// which it is, its events are held back; their order never changes.
 struct TightParagraphs<'a, I: Iterator<Item = Event<'a>>> {
     inner: I,
     /// The open block-level tags, innermost last: `true` for an `Item`.
     open_blocks: Vec<bool>,
     /// Whether this adapter has opened a paragraph that is still open.
     in_paragraph: bool,
-    /// An event held back while the paragraph start or end goes first.
-    held: Option<Event<'a>>,
+    /// The run directly in an `Item` that has no content yet.
+    run: Run<'a>,
+    /// Events ready to be returned, in order.
+    out: VecDeque<Event<'a>>,
+}
+
+/// A run of inline events directly in an `Item`, held back while it has no
+/// content.
+#[derive(Default)]
+struct Run<'a> {
+    events: Vec<Event<'a>>,
+    /// `Start(Image)` events in the run, nested ones included, as the
+    /// importer counts them for promotion.
+    images: usize,
+    /// How many images are open: text inside one is alt text.
+    image_depth: usize,
 }
 
 /// How an event relates to the paragraph structure.
 enum Role {
-    /// Content of a paragraph or heading.
-    Inline,
+    /// Inline content of a paragraph or heading.
+    Inline(Inline),
     /// A block-level tag opens; `true` for an `Item`.
     Open(bool),
     /// A block-level tag closes.
@@ -571,13 +603,48 @@ enum Role {
     Marker,
 }
 
+/// What an inline event leaves in the importer's tree.
+enum Inline {
+    /// Text, unless it is an image's alt text.
+    Text,
+    /// Content wherever it is: code and line breaks, which the importer
+    /// writes even inside an image. Events the importer's options never
+    /// produce (math, footnote references) count as content too, so if they
+    /// are ever enabled, whatever they write lands in a paragraph.
+    Content,
+    /// An image starts: promoted when it is alone in its paragraph.
+    ImageStart,
+    ImageEnd,
+    /// Nothing of its own: a mark opening or closing, and inline HTML,
+    /// which at most opens or closes the underline mark.
+    Nothing,
+}
+
 impl<'a, I: Iterator<Item = Event<'a>>> TightParagraphs<'a, I> {
     fn new(inner: I) -> Self {
         Self {
             inner,
             open_blocks: Vec::new(),
             in_paragraph: false,
-            held: None,
+            run: Run::default(),
+            out: VecDeque::new(),
+        }
+    }
+
+    /// Ends the current run before a block-level event: closes the paragraph
+    /// this adapter opened, or releases the held events, wrapped in a
+    /// paragraph only when they hold a lone image or board.
+    fn end_run(&mut self) {
+        let run = std::mem::take(&mut self.run);
+        if self.in_paragraph {
+            self.in_paragraph = false;
+            self.out.push_back(Event::End(TagEnd::Paragraph));
+        } else if run.images == 1 {
+            self.out.push_back(Event::Start(Tag::Paragraph));
+            self.out.extend(run.events);
+            self.out.push_back(Event::End(TagEnd::Paragraph));
+        } else {
+            self.out.extend(run.events);
         }
     }
 }
@@ -592,8 +659,8 @@ fn role(event: &Event<'_>) -> Role {
             | Tag::Strikethrough
             | Tag::Superscript
             | Tag::Subscript
-            | Tag::Link { .. }
-            | Tag::Image { .. } => Role::Inline,
+            | Tag::Link { .. } => Role::Inline(Inline::Nothing),
+            Tag::Image { .. } => Role::Inline(Inline::ImageStart),
             Tag::Item => Role::Open(true),
             Tag::Paragraph
             | Tag::Heading { .. }
@@ -617,8 +684,8 @@ fn role(event: &Event<'_>) -> Role {
             | TagEnd::Strikethrough
             | TagEnd::Superscript
             | TagEnd::Subscript
-            | TagEnd::Link
-            | TagEnd::Image => Role::Inline,
+            | TagEnd::Link => Role::Inline(Inline::Nothing),
+            TagEnd::Image => Role::Inline(Inline::ImageEnd),
             TagEnd::Paragraph
             | TagEnd::Heading(_)
             | TagEnd::BlockQuote(_)
@@ -636,14 +703,14 @@ fn role(event: &Event<'_>) -> Role {
             | TagEnd::TableCell
             | TagEnd::MetadataBlock(_) => Role::Close,
         },
-        Event::Text(_)
-        | Event::Code(_)
+        Event::Text(_) => Role::Inline(Inline::Text),
+        Event::Code(_)
+        | Event::SoftBreak
+        | Event::HardBreak
         | Event::InlineMath(_)
         | Event::DisplayMath(_)
-        | Event::InlineHtml(_)
-        | Event::FootnoteReference(_)
-        | Event::SoftBreak
-        | Event::HardBreak => Role::Inline,
+        | Event::FootnoteReference(_) => Role::Inline(Inline::Content),
+        Event::InlineHtml(_) => Role::Inline(Inline::Nothing),
         Event::Html(_) | Event::Rule => Role::Leaf,
         Event::TaskListMarker(_) => Role::Marker,
     }
@@ -653,32 +720,64 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for TightParagraphs<'a, I> {
     type Item = Event<'a>;
 
     fn next(&mut self) -> Option<Event<'a>> {
-        if let Some(event) = self.held.take() {
-            return Some(event);
-        }
-        let event = self.inner.next()?;
-        match role(&event) {
-            Role::Marker => return Some(event),
-            Role::Inline => {
-                if !self.in_paragraph && self.open_blocks.last() == Some(&true) {
-                    self.in_paragraph = true;
-                    self.held = Some(event);
-                    return Some(Event::Start(Tag::Paragraph));
-                }
+        loop {
+            if let Some(event) = self.out.pop_front() {
                 return Some(event);
             }
-            Role::Open(is_item) => self.open_blocks.push(is_item),
-            Role::Close => {
-                self.open_blocks.pop();
+            let Some(event) = self.inner.next() else {
+                // pulldown-cmark closes every item, so a run never outlasts
+                // the input; release one defensively all the same.
+                self.end_run();
+                return self.out.pop_front();
+            };
+            match role(&event) {
+                Role::Marker if self.run.events.is_empty() => return Some(event),
+                Role::Marker => self.run.events.push(event),
+                Role::Inline(_) if self.in_paragraph || self.open_blocks.last() != Some(&true) => {
+                    return Some(event);
+                }
+                Role::Inline(inline) => {
+                    let run = &mut self.run;
+                    let content = match inline {
+                        Inline::Text => run.image_depth == 0,
+                        Inline::Content => true,
+                        Inline::ImageStart => {
+                            run.images += 1;
+                            run.image_depth += 1;
+                            false
+                        }
+                        Inline::ImageEnd => {
+                            run.image_depth = run.image_depth.saturating_sub(1);
+                            false
+                        }
+                        Inline::Nothing => false,
+                    };
+                    if content {
+                        let run = std::mem::take(&mut self.run);
+                        self.in_paragraph = true;
+                        self.out.push_back(Event::Start(Tag::Paragraph));
+                        self.out.extend(run.events);
+                        self.out.push_back(event);
+                    } else {
+                        self.run.events.push(event);
+                    }
+                }
+                Role::Open(is_item) => {
+                    self.end_run();
+                    self.open_blocks.push(is_item);
+                    self.out.push_back(event);
+                }
+                Role::Close => {
+                    self.end_run();
+                    self.open_blocks.pop();
+                    self.out.push_back(event);
+                }
+                Role::Leaf => {
+                    self.end_run();
+                    self.out.push_back(event);
+                }
             }
-            Role::Leaf => {}
         }
-        if self.in_paragraph {
-            self.in_paragraph = false;
-            self.held = Some(event);
-            return Some(Event::End(TagEnd::Paragraph));
-        }
-        Some(event)
     }
 }
 
