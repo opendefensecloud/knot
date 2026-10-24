@@ -26,6 +26,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - Word (DOCX) and OpenDocument (ODT) export from the page header's download
   menu, with diagrams as pictures. `GET /api/docs/{id}/export/diagrams`,
   `POST /api/docs/{id}/export/{docx|odt}`. (#46)
+- Skins can switch on their own. In Settings → Appearance, choose Follow
+  system to use your light skin while the operating system is in light mode
+  and your dark skin while it is in dark mode, or Follow the sun to use the
+  light skin from sunrise to sunset. knot works out where you are from your
+  time zone, or from a location you type in. Nothing leaves the browser, and
+  the choice is saved per browser like the skin itself.
 
 ### Security
 - `ctutils` 0.4.5 fixes RUSTSEC-2026-0385: its constant-time helpers could
