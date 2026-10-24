@@ -330,3 +330,17 @@ Times use `new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digi
 - [ ] **Step 3: Add the changelog entry** under `## [Unreleased]` → `### Added`, in the file's plain style: "Skins can switch on their own. In Settings → Appearance, choose Follow system to use your light skin while the operating system is in light mode and your dark skin while it is in dark mode, or Follow the sun to use the light skin from sunrise to sunset. knot works out where you are from your time zone, or from a location you type in. Nothing leaves the browser, and the choice is saved per browser like the skin itself."
 
 - [ ] **Step 4: Commit:** `test(e2e): automatic skin switching` and `docs(changelog): automatic skin switching` (one commit is fine)
+
+---
+
+## Changes after the whole-branch review
+
+The final review (four lenses, each finding independently verified) left no correctness defects. Its Minor findings were fixed in one pass, and a few places in this plan were superseded:
+
+- **Unplaced zones (Task 2):** the longitude **wraps** to the UTC offset's exact meridian (`((-offsetMinutes / 4 + 540) % 360) - 180`) instead of clamping at ±180. For `Etc/GMT-14` that gives −150, not 180, so the "about 06:00 to 18:00" promise holds for UTC+13/+14 as well.
+- **`America/Coral_Harbour` (Task 2):** the generator has a one-entry ICU alias override to `America/Atikokan`. Chrome reports ICU's canonical name for Atikokan, which tzdata's `backward` file links to Panama.
+- **First paint (Task 4):** `main.tsx` stamps the skin the store already resolved (`useUi.getState().skin`). `resolveInitialSkin` is gone, and a fresh-module test covers the store's initial state instead.
+- **Times (Task 6):** they are formatted with `{ timeStyle: "short" }`. The unplaced-zone sentence builds its 06:00 and 18:00 with the same formatter instead of hardcoding them.
+- **Location form (Task 6):** every invalid field is flagged and the first one gets focus. The edit button is described by the times and source lines. U+2212 is accepted as a minus sign.
+- **Forced colours (Task 6):** the segmented control marks the checked segment with `Highlight`, and keyboard focus is an outline, so both survive Windows High Contrast.
+- **Tests (Task 7):** the follow-the-sun flow checks "paper" at 19:00Z, when only the time-zone table puts the sun up in Berlin, and checks `data-theme` after every reload.
