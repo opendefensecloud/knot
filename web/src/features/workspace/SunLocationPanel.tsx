@@ -8,19 +8,21 @@ type Field = keyof LatLon;
 type Draft = Record<Field, string>;
 
 const FIELDS: readonly Field[] = ["lat", "lon"];
+const NONE: readonly Field[] = [];
 const LABELS: Record<Field, string> = { lat: "Latitude", lon: "Longitude" };
 const ERRORS: Record<Field, string> = {
   lat: "Latitude must be a number from -90 to 90.",
   lon: "Longitude must be a number from -180 to 180.",
 };
 
+/** Clock time in the browser's locale, on a 12- or 24-hour clock as it
+ *  prefers. */
+const clockTime = (at: Date) => new Intl.DateTimeFormat(undefined, { timeStyle: "short" }).format(at);
+
 function timesLine(day: SunDay): string {
   switch (day.kind) {
-    case "normal": {
-      // Clock time in the browser's locale.
-      const time = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
-      return `Light from ${time.format(day.sunrise)} to ${time.format(day.sunset)} today.`;
-    }
+    case "normal":
+      return `Light from ${clockTime(day.sunrise)} to ${clockTime(day.sunset)} today.`;
     case "polar-day":
       return "The sun doesn't set today, so knot stays light.";
     case "polar-night":
@@ -28,17 +30,20 @@ function timesLine(day: SunDay): string {
   }
 }
 
-function sourceLine(source: SunLocationSource, loc: LatLon): string {
+function sourceLine(source: SunLocationSource, loc: LatLon, now: Date): string {
   switch (source.kind) {
     case "typed":
       return `Location set to ${formatLatLon(loc)}.`;
     case "zone":
       return `Location from your time zone, ${source.zone}.`;
-    case "unplaced":
+    case "unplaced": {
+      // On the same clock as the times line above.
+      const hour = (h: number) => clockTime(new Date(now.getFullYear(), now.getMonth(), now.getDate(), h));
       return (
         `Your time zone (${source.zone ?? "unknown"}) has no known location, so knot assumes daylight ` +
-        "from about 06:00 to 18:00. Set a location for real sunrise and sunset times."
+        `from about ${hour(6)} to ${hour(18)}. Set a location for real sunrise and sunset times.`
       );
+    }
   }
 }
 
@@ -59,9 +64,15 @@ export function SunLocationPanel() {
   const setSunLocation = useUi((s) => s.setSunLocation);
   // The form's text while it is open, null while it is closed.
   const [draft, setDraft] = useState<Draft | null>(null);
-  const [invalid, setInvalid] = useState<Field | null>(null);
-  const errorId = useId();
+  // The fields the last Save turned down. A new array on every failed Save,
+  // so each one moves focus again.
+  const [invalid, setInvalid] = useState<readonly Field[]>(NONE);
+  const id = useId();
+  const timesId = `${id}-times`;
+  const sourceId = `${id}-source`;
+  const errorId = (field: Field) => `${id}-${field}-error`;
   const editButton = useRef<HTMLButtonElement>(null);
+  const inputs = useRef<Partial<Record<Field, HTMLInputElement | null>>>({});
 
   // Today is the browser's calendar day, and its sun the solar day around
   // local noon, wherever the location is.
@@ -77,9 +88,17 @@ export function SunLocationPanel() {
     wasEditing.current = editing;
   }, [editing]);
 
+  // A failed Save moves focus to the first field it turned down, after the
+  // render that gives the field its message, so a screen reader reads the
+  // message out, even when the same Save fails twice.
+  useEffect(() => {
+    const first = invalid[0];
+    if (first) inputs.current[first]?.focus();
+  }, [invalid]);
+
   function close() {
     setDraft(null);
-    setInvalid(null);
+    setInvalid(NONE);
   }
 
   function save(e: FormEvent) {
@@ -88,7 +107,9 @@ export function SunLocationPanel() {
     const lat = parseCoordinate(draft.lat, 90);
     const lon = parseCoordinate(draft.lon, 180);
     if (lat === null || lon === null) {
-      setInvalid(lat === null ? "lat" : "lon");
+      // Every field that is wrong says so, not just the first.
+      const parsed = { lat, lon };
+      setInvalid(FIELDS.filter((field) => parsed[field] === null));
       return;
     }
     setSunLocation({ lat, lon });
@@ -97,9 +118,11 @@ export function SunLocationPanel() {
 
   return (
     <div>
-      <p data-testid="sun-times" className="text-sm text-fg m-0">{timesLine(day)}</p>
-      <p data-testid="sun-location-source" className="text-[13px] text-fg-muted m-0 mt-0.5">
-        {sourceLine(source, loc)}
+      <p id={timesId} data-testid="sun-times" className="text-sm text-fg m-0">
+        {timesLine(day)}
+      </p>
+      <p id={sourceId} data-testid="sun-location-source" className="text-[13px] text-fg-muted m-0 mt-0.5">
+        {sourceLine(source, loc, now)}
       </p>
       {draft ? (
         <form data-testid="sun-location-form" onSubmit={save} className="grid gap-3 max-w-sm mt-3">
@@ -109,24 +132,34 @@ export function SunLocationPanel() {
                 {LABELS[field]}
                 {/* Plain text, not inputMode="decimal": iOS's decimal pad has no minus sign. */}
                 <input
+                  ref={(el) => {
+                    inputs.current[field] = el;
+                  }}
                   data-testid={`sun-${field}`}
                   type="text"
                   autoComplete="off"
                   spellCheck={false}
                   autoFocus={field === "lat"}
                   value={draft[field]}
-                  onChange={(e) => setDraft({ ...draft, [field]: e.target.value })}
-                  aria-invalid={invalid === field}
-                  aria-describedby={invalid === field ? errorId : undefined}
+                  onChange={(e) => {
+                    const { value } = e.target;
+                    setDraft((d) => d && { ...d, [field]: value });
+                  }}
+                  aria-invalid={invalid.includes(field)}
+                  aria-describedby={invalid.includes(field) ? errorId(field) : undefined}
                   className={inputClass}
                 />
               </label>
             ))}
           </div>
-          {invalid && (
-            <p id={errorId} data-testid="sun-location-error" role="alert" className="text-destructive text-[13px] m-0">
-              {ERRORS[invalid]}
-            </p>
+          {invalid.length > 0 && (
+            <div data-testid="sun-location-error" role="alert" className="grid gap-1 text-destructive text-[13px]">
+              {invalid.map((field) => (
+                <p key={field} id={errorId(field)} className="m-0">
+                  {ERRORS[field]}
+                </p>
+              ))}
+            </div>
           )}
           <div className="flex gap-2">
             <button data-testid="sun-location-save" type="submit" className={primaryButtonClass}>
@@ -143,6 +176,9 @@ export function SunLocationPanel() {
             ref={editButton}
             data-testid="sun-location-edit"
             type="button"
+            // Focus lands here after Save, Cancel and "Use time zone", so
+            // it reads out the times and the location they leave in place.
+            aria-describedby={`${timesId} ${sourceId}`}
             onClick={() => setDraft({ lat: loc.lat.toFixed(2), lon: loc.lon.toFixed(2) })}
             className={secondaryButtonClass}
           >

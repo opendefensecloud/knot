@@ -23,14 +23,21 @@ function reportZone(timeZone: string) {
   vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({ ...real, timeZone });
 }
 
+/** A clock time the way the panel writes it, in the browser's locale. */
+const clockTime = (at: Date) => new Intl.DateTimeFormat(undefined, { timeStyle: "short" }).format(at);
+
+/** `hour` o'clock on the pinned day, in the browser's local time. */
+function today(hour: number): Date {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour);
+}
+
 /** The times line for `loc` on the pinned day, worked out the way the
  *  panel does: the solar day around local noon, in the browser's locale. */
 function expectedTimes(loc: LatLon): string {
-  const now = new Date();
-  const day = sunDay(new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12), loc);
+  const day = sunDay(today(12), loc);
   if (day.kind !== "normal") throw new Error(`expected sunrise and sunset, got ${day.kind}`);
-  const time = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
-  return `Light from ${time.format(day.sunrise)} to ${time.format(day.sunset)} today.`;
+  return `Light from ${clockTime(day.sunrise)} to ${clockTime(day.sunset)} today.`;
 }
 
 function openForm() {
@@ -86,6 +93,7 @@ describe("SunLocationPanel", () => {
     expect(screen.getByLabelText("Longitude")).toBe(lon);
     expect(lat).toHaveValue("52.52");
     expect(lon).toHaveValue("13.40");
+    expect(lat).toHaveFocus();
   });
 
   it("rejects a latitude out of range and keeps the location", () => {
@@ -98,6 +106,7 @@ describe("SunLocationPanel", () => {
     expect(error).toBe(screen.getByTestId("sun-location-error"));
     expect(error).toHaveTextContent("Latitude must be a number from -90 to 90.");
     expect(lat).toHaveAttribute("aria-invalid", "true");
+    expect(lat).toHaveAccessibleDescription("Latitude must be a number from -90 to 90.");
     expect(ui().sunLocation).toEqual(berlin);
     expect(screen.getByTestId("sun-location-form")).toBeInTheDocument();
   });
@@ -105,10 +114,36 @@ describe("SunLocationPanel", () => {
   it("rejects a longitude that isn't a number", () => {
     ui().setSunLocation(berlin);
     render(<SunLocationPanel />);
-    const { lon } = openForm();
+    const { lat, lon } = openForm();
     fireEvent.change(lon, { target: { value: "east" } });
     fireEvent.click(screen.getByTestId("sun-location-save"));
     expect(screen.getByTestId("sun-location-error")).toHaveTextContent("Longitude must be a number from -180 to 180.");
+    expect(lat).toHaveAttribute("aria-invalid", "false");
+    expect(lon).toHaveAttribute("aria-invalid", "true");
+    expect(lon).toHaveFocus();
+    expect(ui().sunLocation).toEqual(berlin);
+  });
+
+  it("marks every field that is wrong and focuses the first", () => {
+    ui().setSunLocation(berlin);
+    render(<SunLocationPanel />);
+    const { lat, lon } = openForm();
+    fireEvent.change(lat, { target: { value: "north" } });
+    fireEvent.change(lon, { target: { value: "200" } });
+    const save = screen.getByTestId("sun-location-save");
+    save.focus();
+    fireEvent.click(save);
+    const error = screen.getByTestId("sun-location-error");
+    expect(error).toHaveTextContent("Latitude must be a number from -90 to 90.");
+    expect(error).toHaveTextContent("Longitude must be a number from -180 to 180.");
+    expect(lat).toHaveAccessibleDescription("Latitude must be a number from -90 to 90.");
+    expect(lon).toHaveAccessibleDescription("Longitude must be a number from -180 to 180.");
+    expect(lat).toHaveFocus();
+
+    // The same failure again moves focus back, so it is read out again.
+    save.focus();
+    fireEvent.click(save);
+    expect(lat).toHaveFocus();
     expect(ui().sunLocation).toEqual(berlin);
   });
 
@@ -122,6 +157,17 @@ describe("SunLocationPanel", () => {
     expect(ui().sunLocation).toEqual({ lat: 48.14, lon: 11.58 });
     expect(screen.queryByTestId("sun-location-form")).toBeNull();
     expect(screen.getByTestId("sun-location-source")).toHaveTextContent("Location set to 48.14° N, 11.58° E.");
+    expect(screen.getByTestId("sun-location-edit")).toHaveFocus();
+  });
+
+  it("describes the edit button with the times and the location", () => {
+    ui().setSunLocation(berlin);
+    render(<SunLocationPanel />);
+    const described = screen.getByTestId("sun-location-edit").getAttribute("aria-describedby")?.split(" ");
+    expect(described).toEqual([screen.getByTestId("sun-times").id, screen.getByTestId("sun-location-source").id]);
+    expect(screen.getByTestId("sun-location-edit")).toHaveAccessibleDescription(
+      `${expectedTimes(berlin)} Location set to 52.52° N, 13.40° E.`,
+    );
   });
 
   it("closes the form on Cancel without saving", () => {
@@ -145,6 +191,7 @@ describe("SunLocationPanel", () => {
     expect(screen.getByTestId("sun-location-source")).toHaveTextContent("Location from your time zone, Europe/Berlin.");
     expect(screen.queryByTestId("sun-location-reset")).toBeNull();
     expect(screen.getByTestId("sun-location-edit")).toHaveTextContent("Set location");
+    expect(screen.getByTestId("sun-location-edit")).toHaveFocus();
     // The form starts at the zone's city, which is what is in use now.
     const { lat, lon } = openForm();
     expect(lat).toHaveValue("52.50");
@@ -155,8 +202,8 @@ describe("SunLocationPanel", () => {
     reportZone("Etc/UTC");
     render(<SunLocationPanel />);
     expect(screen.getByTestId("sun-location-source")).toHaveTextContent(
-      "Your time zone (Etc/UTC) has no known location, so knot assumes daylight from about 06:00 to 18:00. " +
-        "Set a location for real sunrise and sunset times.",
+      `Your time zone (Etc/UTC) has no known location, so knot assumes daylight from about ${clockTime(today(6))} ` +
+        `to ${clockTime(today(18))}. Set a location for real sunrise and sunset times.`,
     );
     expect(screen.getByTestId("sun-location-edit")).toHaveTextContent("Set location");
   });

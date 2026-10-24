@@ -41,7 +41,9 @@ const HINTS: Record<Exclude<SkinMode, "manual">, Record<Scheme, string>> = {
 };
 
 /** Native radios, so the arrow keys move between the modes, styled as a
- *  segmented control. Full width on a phone, where the labels may wrap. */
+ *  segmented control. Full width on a phone, where the labels may wrap.
+ *  Forced colours drop backgrounds and box shadows, so there the chosen
+ *  segment takes the system highlight and the focus ring is an outline. */
 function SkinModeChoice({ mode }: { mode: SkinMode }) {
   const setSkinMode = useUi((s) => s.setSkinMode);
   return (
@@ -59,7 +61,7 @@ function SkinModeChoice({ mode }: { mode: SkinMode }) {
               onChange={() => setSkinMode(option.mode)}
               className="peer sr-only"
             />
-            <span className="flex flex-1 items-center justify-center rounded-sm px-2 sm:px-3 py-1.5 text-center text-sm font-medium leading-tight text-fg-muted cursor-pointer transition-colors hover:bg-muted hover:text-fg peer-checked:bg-accent peer-checked:text-accent-fg peer-focus-visible:ring-2 peer-focus-visible:ring-accent peer-focus-visible:ring-offset-1 peer-focus-visible:ring-offset-bg">
+            <span className="flex flex-1 items-center justify-center rounded-sm px-2 sm:px-3 py-1.5 text-center text-sm font-medium leading-tight text-fg-muted cursor-pointer transition-colors hover:bg-muted hover:text-fg peer-checked:bg-accent peer-checked:text-accent-fg peer-checked:forced-colors:bg-[Highlight] peer-checked:forced-colors:text-[HighlightText] peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-1 peer-focus-visible:outline-accent">
               {option.label}
             </span>
           </label>
