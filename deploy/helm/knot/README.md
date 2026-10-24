@@ -176,6 +176,8 @@ The `pre-upgrade` Job re-runs `knot-server migrate` before the new pods land, so
 
 Before rolling out a release that changes page export, run `knot-server export-check` against a staging copy of the production database: it exports every page to DOCX and ODT offline (no migration, no writes), prints the fallback counts, and exits 1 if any page fails.
 
+Before rolling out a release that changes the Markdown writer, page order keys or the task list, run the real-data compatibility check from a source checkout against a restored backup or staging copy, taken before the upgrade or after it: `KNOT_COMPAT_DATABASE_URL=postgres://… cargo test -p knot-server --test markdown_compat -- --ignored --nocapture`. It connects read-only and runs no migrations. For every live page it compares the Markdown export and the `/tasks` listing of the release before with this one's, and reports the pages that change by bug class, with the first diff of each. It also reports the page-order groups the upgrade migration repairs and how many pages the background refresh renders again. It fails if a page that exported correctly before, or a task that was listed correctly, would change outside the named bug classes.
+
 ## Operational notes
 
 - **Healthchecks** — readiness `/api/readyz`, liveness `/api/healthz`. Disable with `probes.enabled=false` if you want to debug a wedged pod.

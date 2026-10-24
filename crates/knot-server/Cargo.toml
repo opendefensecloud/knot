@@ -86,6 +86,7 @@ http-body-util = "0.1"
 tempfile = "3"
 brotli = "8"
 knot-test-support = { path = "../knot-test-support" }
-# The schema checker and tree dump in `knot_markdown::legacy::compat`, for
-# tests only.
+# The frozen legacy serializer and task extractor, and the classifiers, schema
+# checker and tree dump in `knot_markdown::legacy::compat`, for tests only:
+# among them the real-data compatibility check (`tests/markdown_compat.rs`).
 knot-markdown = { path = "../knot-markdown", features = ["legacy-compat"] }
