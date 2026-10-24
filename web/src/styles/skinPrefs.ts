@@ -27,7 +27,8 @@ export type SkinPrefs = { mode: SkinMode; manual: string; light: string; dark: s
 
 const DEFAULT_SLOT: Record<Scheme, string> = { light: DEFAULT_LIGHT_SKIN_ID, dark: DEFAULT_DARK_SKIN_ID };
 
-const DARK_SCHEME_QUERY = "(prefers-color-scheme: dark)";
+/** Exported for the watcher, which listens for it to change. */
+export const DARK_SCHEME_QUERY = "(prefers-color-scheme: dark)";
 
 /** Anything but a known mode is manual, today's behaviour. */
 export function parseSkinMode(raw: string | null): SkinMode {

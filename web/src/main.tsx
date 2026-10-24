@@ -9,6 +9,7 @@ import { SessionProvider } from "./auth/SessionContext";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { queryClient } from "./lib/queryClient";
 import { router } from "./routes";
+import { watchSkinEnvironment } from "./stores/skinWatcher";
 import { readInitialSidebarWidth, resolveInitialSkin, stampSidebarWidth, stampSkin } from "./stores/ui";
 
 // Stamp data-skin + data-theme before first paint so a dark-skin user
@@ -28,6 +29,9 @@ document.documentElement.setAttribute("data-doc-width", initialDocWidth);
 // And the sidebar width, so a user who dragged the sidebar wider never sees
 // it open at the default 260px first. AppShell keeps it current from here.
 stampSidebarWidth(readInitialSidebarWidth());
+
+// Runs for the whole app lifetime, including the login, setup and share pages.
+watchSkinEnvironment();
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
