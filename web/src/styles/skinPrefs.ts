@@ -43,6 +43,14 @@ export function parseSlot(raw: string | null, scheme: Scheme): string {
 const within = (n: unknown, limit: number): n is number =>
   typeof n === "number" && Number.isFinite(n) && Math.abs(n) <= limit;
 
+/** Whether `value` holds a `lat` and `lon` in decimal degrees, finite and
+ *  within ±90 and ±180: the only locations stored or read back. */
+export function isLatLon(value: unknown): value is LatLon {
+  if (typeof value !== "object" || value === null) return false;
+  const { lat, lon } = value as Record<string, unknown>;
+  return within(lat, 90) && within(lon, 180);
+}
+
 /** A stored `{"lat": number, "lon": number}` in decimal degrees, or `null`
  *  for anything else, so a corrupt value falls back to the time zone. */
 export function parseSunLocation(raw: string | null): LatLon | null {
@@ -53,9 +61,7 @@ export function parseSunLocation(raw: string | null): LatLon | null {
   } catch {
     return null;
   }
-  if (typeof value !== "object" || value === null) return null;
-  const { lat, lon } = value as Record<string, unknown>;
-  return within(lat, 90) && within(lon, 180) ? { lat, lon } : null;
+  return isLatLon(value) ? { lat: value.lat, lon: value.lon } : null;
 }
 
 function readPref(key: string): string | null {

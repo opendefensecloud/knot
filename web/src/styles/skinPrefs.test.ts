@@ -26,6 +26,12 @@ const prefs = (over: Partial<SkinPrefs> = {}): SkinPrefs => ({
 
 const berlin = { lat: 52.52, lon: 13.405 };
 
+/** Makes the browser report `timeZone`, leaving the rest of the options real. */
+function reportZone(timeZone: string) {
+  const real = Intl.DateTimeFormat().resolvedOptions();
+  vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({ ...real, timeZone });
+}
+
 beforeEach(() => {
   localStorage.clear();
 });
@@ -162,6 +168,17 @@ describe("currentSkin", () => {
     const p = prefs({ mode: "sun", location: berlin });
     expect(currentSkin(p, new Date("2026-06-21T11:00:00Z"))).toBe("paper");
     expect(currentSkin(p, new Date("2026-06-21T21:00:00Z"))).toBe("nord");
+  });
+
+  it("places the sun by the browser's time zone, read afresh each time", () => {
+    // 21:00 in Berlin, before its 21:33 sunset; 04:00 in Tokyo, before its
+    // 04:25 sunrise.
+    const at = new Date("2026-06-21T19:00:00Z");
+    const p = prefs({ mode: "sun", location: null });
+    reportZone("Europe/Berlin");
+    expect(currentSkin(p, at)).toBe("paper");
+    reportZone("Asia/Tokyo");
+    expect(currentSkin(p, at)).toBe("nord");
   });
 
   it("asks the system in system mode", () => {

@@ -5,6 +5,7 @@ import {
   SKIN_KEYS,
   currentSkin,
   hasStoredSlot,
+  isLatLon,
   readManualSkin,
   readSkinPrefs,
   writePref,
@@ -96,7 +97,8 @@ type UiState = {
   // Each slot ignores a skin of the other scheme.
   setLightSkin: (id: string) => void;
   setDarkSkin: (id: string) => void;
-  /** A typed location, or null to go back to the time zone's. */
+  /** A typed location, or null to go back to the time zone's. Ignores a
+   *  location out of range. */
   setSunLocation: (loc: LatLon | null) => void;
   /** Re-resolves the skin showing at `now`, for the watcher that follows
    *  the system and the sun. Writes no storage, and touches neither the
@@ -119,12 +121,6 @@ let nextId = 1;
 
 /** The skin picked by hand. Exported for tests. */
 export const readInitialSkin = readManualSkin;
-
-/** The skin to show, resolved from the stored preferences. Exported for
- *  the pre-paint stamp in main.tsx. */
-export function resolveInitialSkin(): string {
-  return currentSkin(readSkinPrefs());
-}
 
 /** Exported for tests: the storage read has to survive a disabled or
  *  throwing Storage, which `readInitialTheme` above does not. */
@@ -228,7 +224,8 @@ function withSkinShowing(s: UiState, change: Partial<SkinPrefsState>): Partial<U
   return { ...change, skin, theme: schemeOf(skin) };
 }
 
-// One read of storage for the whole initial skin state.
+// One read of storage for the whole initial skin state, and the skin it
+// resolves to, which main.tsx stamps before first paint.
 const initialSkinPrefs = readSkinPrefs();
 const initialSkin = currentSkin(initialSkinPrefs);
 
@@ -291,6 +288,9 @@ export const useUi = create<UiState>((set, get) => ({
     set(withSkinShowing(get(), { darkSkin: id }));
   },
   setSunLocation: (loc) => {
+    // Turns away a location storage wouldn't read back, so what shows now
+    // still shows after a reload.
+    if (loc && !isLatLon(loc)) return;
     // Two decimals is about a kilometre, closer than sunrise needs.
     const sunLocation = loc && { lat: round2(loc.lat), lon: round2(loc.lon) };
     writePref(SKIN_KEYS.location, sunLocation && JSON.stringify(sunLocation));

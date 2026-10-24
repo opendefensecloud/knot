@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { resolveInitialSkin, useUi } from "./ui";
+import { useUi } from "./ui";
 
 const berlin = { lat: 52.52, lon: 13.405 };
 // Berlin's sun sets at 19:33 UTC on the June solstice.
@@ -35,6 +35,11 @@ afterEach(() => {
 });
 
 describe("initial state", () => {
+  // Drops the fresh copies, so nothing after this imports one by accident.
+  afterEach(() => {
+    vi.resetModules();
+  });
+
   it("starts from the stored preferences and the skin they resolve to", async () => {
     localStorage.setItem("knot.skinMode", "system");
     localStorage.setItem("knot.skinLight", "sage");
@@ -52,6 +57,19 @@ describe("initial state", () => {
       skin: "gruvbox",
       theme: "dark",
     });
+  });
+
+  it("resolves the skin at load, so sun mode starts dark after sunset", async () => {
+    // main.tsx stamps this skin before first paint.
+    localStorage.setItem("knot.skinMode", "sun");
+    localStorage.setItem("knot.skinLight", "paper");
+    localStorage.setItem("knot.skinDark", "nord");
+    localStorage.setItem("knot.sunLocation", JSON.stringify(berlin));
+    pinClock(BERLIN_NIGHT);
+    vi.resetModules();
+    const fresh = (await import("./ui")).useUi.getState();
+    expect(fresh.skin).toBe("nord");
+    expect(fresh.theme).toBe("dark");
   });
 });
 
@@ -160,6 +178,21 @@ describe("setSunLocation", () => {
     expect(localStorage.getItem("knot.sunLocation")).toBeNull();
   });
 
+  it("ignores a location storage wouldn't read back", () => {
+    ui().setSunLocation(berlin);
+    const before = ui().sunLocation;
+    const stored = localStorage.getItem("knot.sunLocation");
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    const removeItem = vi.spyOn(Storage.prototype, "removeItem");
+    for (const loc of [{ lat: NaN, lon: 0 }, { lat: 91, lon: 0 }]) {
+      ui().setSunLocation(loc);
+      expect(ui().sunLocation, JSON.stringify(loc)).toBe(before);
+    }
+    expect(localStorage.getItem("knot.sunLocation")).toBe(stored);
+    expect(setItem).not.toHaveBeenCalled();
+    expect(removeItem).not.toHaveBeenCalled();
+  });
+
   it("shows the skin for the sun at the new location", () => {
     pinClock(BERLIN_NIGHT); // early morning in Tokyo
     ui().setSunLocation(berlin);
@@ -216,17 +249,5 @@ describe("adoptStoredSkinPrefs", () => {
     expect(html).toHaveAttribute("data-skin", "nord");
     expect(setItem).not.toHaveBeenCalled();
     expect(removeItem).not.toHaveBeenCalled();
-  });
-});
-
-describe("resolveInitialSkin", () => {
-  it("resolves the stored preferences, so sun mode gets the dark slot at night", () => {
-    localStorage.setItem("knot.skinMode", "sun");
-    localStorage.setItem("knot.skinDark", "dracula");
-    localStorage.setItem("knot.sunLocation", JSON.stringify(berlin));
-    pinClock(BERLIN_NIGHT);
-    expect(resolveInitialSkin()).toBe("dracula");
-    vi.setSystemTime(BERLIN_MIDDAY);
-    expect(resolveInitialSkin()).toBe("light");
   });
 });
