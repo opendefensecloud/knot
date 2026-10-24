@@ -286,6 +286,14 @@ fn round_trip_all_fixtures() {
 }
 
 #[test]
+fn list_item_hard_break_serialises() {
+    let (doc, _) = knot_markdown::from_markdown::parse("- first  \n  second\n").unwrap();
+    let got = knot_markdown::to_markdown::serialise(&YrsEngine, &doc).unwrap();
+    assert!(got.starts_with("- first  \n"), "got {got:?}");
+    assert!(got.contains("second"), "got {got:?}");
+}
+
+#[test]
 fn boards_sentinel_parses_to_excalidraw_board() {
     use yrs::XmlOut;
     let raw = fixture("boards.md");

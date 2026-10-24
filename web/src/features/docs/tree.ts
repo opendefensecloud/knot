@@ -116,6 +116,49 @@ export function applyOptimisticMove(
   return out;
 }
 
+export type DropPlan = {
+  overId: string;
+  intent: Parameters<typeof moveArgs>[1];
+  depth: number;
+  args: ReturnType<typeof moveArgs>;
+};
+
+function path(nodes: TreeNode[], id: string): TreeNode[] | null {
+  for (const n of nodes) {
+    if (n.id === id) return [n];
+    const p = path(n.children, id);
+    if (p) return [n, ...p];
+  }
+  return null;
+}
+
+export function resolveDrop(
+  tree: TreeNode[],
+  activeId: string,
+  overId: string,
+  intent: DropPlan["intent"],
+  opts: { pointerX: number; titleX: number; isExpanded: (id: string) => boolean },
+): DropPlan | null {
+  const chain = path(tree, overId);
+  if (!chain || chain.some((n) => n.id === activeId)) return null;
+  let depth = chain.length - 1;
+  const target = chain[depth]!;
+  if (intent !== "after") {
+    return { overId, intent, depth: intent === "into" ? depth + 1 : depth, args: moveArgs(target, intent) };
+  }
+  const kids = target.children.filter((c) => c.id !== activeId);
+  if (kids.length > 0 && opts.isExpanded(target.id)) {
+    return { overId, intent, depth: depth + 1, args: moveArgs(kids[0]!, "before") };
+  }
+  const climb = Math.ceil((opts.titleX - opts.pointerX) / 24);
+  for (let i = 0; i < climb && depth > 0; i++) {
+    const sibs = chain[depth - 1]!.children.filter((c) => c.id !== activeId);
+    if (sibs[sibs.length - 1]?.id !== chain[depth]!.id) break;
+    depth -= 1;
+  }
+  return { overId, intent, depth, args: moveArgs(chain[depth]!, "after") };
+}
+
 /** Map a drop target + drop position to the args expected by
  *  POST /api/docs/:id/move. */
 export function moveArgs(

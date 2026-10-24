@@ -71,7 +71,11 @@ fn decrement(b: &str) -> String {
     for &c in bytes {
         let ch = c as char;
         if ch > MIN {
-            out.push(mid(MIN, ch) as u8);
+            let m = mid(MIN, ch);
+            out.push(m as u8);
+            if m == MIN {
+                out.push(MID as u8);
+            }
             return String::from_utf8(out).unwrap();
         }
         out.push(c);

@@ -14,21 +14,25 @@ import {
 
 import {
   DndContext,
+  DragOverlay,
   PointerSensor,
   KeyboardSensor,
   useSensor,
   useSensors,
   closestCenter,
+  pointerWithin,
+  type CollisionDetection,
   type DragEndEvent,
+  type DragMoveEvent,
   type DragOverEvent,
+  type DragStartEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
   useSortable,
-  verticalListSortingStrategy,
   sortableKeyboardCoordinates,
+  type SortingStrategy,
 } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
 
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { useUi } from "../../stores/ui";
@@ -44,7 +48,22 @@ import { archiveConfirmText, archiveErrorText } from "./archive";
 import { docsApi } from "./docs.api";
 import { markDocEditMode } from "./editMode";
 import { placementParent, type Placement } from "./placement";
-import { buildTree, applyOptimisticMove, descendantIds, dropIntent, moveArgs, type TreeNode } from "./tree";
+import {
+  buildTree,
+  applyOptimisticMove,
+  descendantIds,
+  dropIntent,
+  resolveDrop,
+  type DropPlan,
+  type TreeNode,
+} from "./tree";
+
+const noShift: SortingStrategy = () => null;
+
+const pointerFirst: CollisionDetection = (args) => {
+  const hits = pointerWithin(args);
+  return hits.length > 0 ? hits : closestCenter(args);
+};
 
 export function DocTree() {
   const qc = useQueryClient();
@@ -111,33 +130,75 @@ export function DocTree() {
     [list.data],
   );
 
-  const [drop, setDrop] = useState<{ overId: string; intent: "before" | "after" | "into" } | null>(null);
+  const tree = list.data && "ok" in list.data ? buildTree(list.data.ok) : [];
 
-  function onDragOver(e: DragOverEvent) {
+  const [drop, setDrop] = useState<DropPlan | null>(null);
+  const [dragging, setDragging] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+
+  function toggleCollapsed(id: string) {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function updateDrop(e: DragOverEvent | DragMoveEvent) {
     const over = e.over;
     const activeRect = e.active.rect.current.translated;
-    if (!over || over.id === e.active.id || !activeRect) { setDrop(null); return; }
-    const centerY = activeRect.top + activeRect.height / 2;
-    const intent = dropIntent(centerY, { top: over.rect.top, height: over.rect.height });
-    setDrop({ overId: String(over.id), intent });
+    if (!over || !activeRect) { setDrop(null); return; }
+    const start = e.activatorEvent;
+    const pointer =
+      start instanceof MouseEvent
+        ? { x: start.clientX + e.delta.x, y: start.clientY + e.delta.y }
+        : { x: activeRect.left, y: activeRect.top + activeRect.height / 2 };
+    const intent = dropIntent(pointer.y, { top: over.rect.top, height: over.rect.height });
+    const plan = resolveDrop(tree, String(e.active.id), String(over.id), intent, {
+      pointerX: pointer.x,
+      titleX: document.querySelector(`[data-testid="doc-row-${String(over.id)}"]`)?.getBoundingClientRect().left ?? over.rect.left,
+      isExpanded: (id) => !collapsed.has(id),
+    });
+    setDrop((prev) =>
+      prev && plan && prev.overId === plan.overId && prev.intent === plan.intent && prev.depth === plan.depth
+        ? prev
+        : plan,
+    );
+  }
+
+  function onDragStart(e: DragStartEvent) {
+    setDragging(String(e.active.id));
+  }
+
+  function swallowClickAfterDrag() {
+    const swallow = (ev: MouseEvent) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+    };
+    window.addEventListener("click", swallow, { capture: true, once: true });
+    window.setTimeout(() => window.removeEventListener("click", swallow, { capture: true }), 100);
   }
 
   function onDragEnd(e: DragEndEvent) {
-    const d = drop;
+    swallowClickAfterDrag();
+    const plan = drop;
     setDrop(null);
-    if (!e.over || !d) return;
+    setDragging(null);
     const movedId = String(e.active.id);
-    const targetId = String(e.over.id);
-    if (movedId === targetId) return;
-    const docs = list.data && "ok" in list.data ? list.data.ok : [];
-    const target = docs.find((x) => x.id === targetId) ?? null;
-    if (!target) return;
-    const destParent = d.intent === "into" ? target.id : (target.parent_id ?? null);
-    if (destParent === movedId || (destParent && descendantIds(docs, movedId).has(destParent))) {
-      notify("error", "Can't move a document inside itself");
+    if (!plan) {
+      const docs = list.data && "ok" in list.data ? list.data.ok : [];
+      if (e.over && descendantIds(docs, movedId).has(String(e.over.id))) {
+        notify("error", "Can't move a document inside itself");
+      }
       return;
     }
-    move.mutate({ id: movedId, body: moveArgs(target, d.intent) });
+    move.mutate({ id: movedId, body: plan.args });
+  }
+
+  function onDragCancel() {
+    setDrop(null);
+    setDragging(null);
   }
 
   // Named rather than an inline `async` handler: `onPickTemplate` is typed
@@ -163,7 +224,8 @@ export function DocTree() {
     await nav(`/doc/${created.id}`);
   }
 
-  const tree = list.data && "ok" in list.data ? buildTree(list.data.ok) : [];
+  const draggingTitle =
+    dragging && list.data && "ok" in list.data ? list.data.ok.find((d) => d.id === dragging)?.title : undefined;
 
   return (
     <div data-testid="doc-tree" className="flex flex-col h-full">
@@ -193,8 +255,8 @@ export function DocTree() {
         <p className="px-3 py-2 text-sm text-fg-muted">No documents yet.</p>
       )}
       {list.data && "ok" in list.data && (
-        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragOver={onDragOver} onDragEnd={onDragEnd} onDragCancel={() => setDrop(null)}>
-          <SortableContext items={flatIds} strategy={verticalListSortingStrategy}>
+        <DndContext sensors={sensors} collisionDetection={pointerFirst} onDragStart={onDragStart} onDragOver={updateDrop} onDragMove={updateDrop} onDragEnd={onDragEnd} onDragCancel={onDragCancel}>
+          <SortableContext items={flatIds} strategy={noShift}>
             {/* 12px clear on the right, like the rest of the sidebar: rows
                 are drag targets, and the 8px resize handle on the edge needs
                 that much room around it (WCAG 2.5.8 target spacing). */}
@@ -209,12 +271,22 @@ export function DocTree() {
                   isOwner={isOwner}
                   retentionDays={retentionDays}
                   onNewChild={(pid) => create.mutate(pid)}
-                  dropHint={drop && drop.overId === n.id ? drop.intent : null}
+                  dropHint={drop && drop.overId === n.id ? drop : null}
                   drop={drop}
+                  collapsed={collapsed}
+                  onToggle={toggleCollapsed}
                 />
               ))}
             </ul>
           </SortableContext>
+          <DragOverlay dropAnimation={null}>
+            {draggingTitle !== undefined ? (
+              <div className="pointer-events-none inline-flex max-w-56 items-center gap-1 h-7 px-2 rounded bg-muted text-fg text-[13px] shadow-md">
+                <FileText size={14} aria-hidden className="text-fg-muted shrink-0" />
+                <span className="truncate">{draggingTitle}</span>
+              </div>
+            ) : null}
+          </DragOverlay>
         </DndContext>
       )}
       <SidebarVersion />
@@ -376,6 +448,8 @@ function TreeRow({
   onNewChild,
   dropHint,
   drop,
+  collapsed,
+  onToggle,
 }: {
   node: TreeNode;
   depth: number;
@@ -384,17 +458,19 @@ function TreeRow({
   isOwner: boolean;
   retentionDays: number;
   onNewChild: (parentId: string) => void;
-  dropHint: "before" | "after" | "into" | null;
-  drop: { overId: string; intent: "before" | "after" | "into" } | null;
+  dropHint: DropPlan | null;
+  drop: DropPlan | null;
+  collapsed: Set<string>;
+  onToggle: (id: string) => void;
 }) {
   const qc = useQueryClient();
   const nav = useNavigate();
   const notify = useUi((s) => s.notify);
   const isActive = activeId === node.id;
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
-  const [expanded, setExpanded] = useState(true);
+  const expanded = !collapsed.has(node.id);
 
-  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, isDragging } =
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, isDragging } =
     useSortable({
       id: node.id,
       disabled: !canEdit,
@@ -403,12 +479,11 @@ function TreeRow({
   // the sensor starts a drag (and swallows the key) on Enter/Space anywhere
   // inside the row, so its link and buttons never got the key. Pointer
   // drags still start anywhere in the row.
-  const setRowRef = (el: HTMLLIElement | null) => {
+  const setRowRef = (el: HTMLDivElement | null) => {
     setNodeRef(el);
     setActivatorNodeRef(el);
   };
   const sortableStyle = {
-    transform: CSS.Transform.toString(transform),
     opacity: isDragging ? 0.5 : 1,
   };
 
@@ -446,9 +521,22 @@ function TreeRow({
     await qc.invalidateQueries({ queryKey: ["templates"] });
   }
 
+  async function onDuplicate() {
+    const r = await docsApi.createFromTemplate(node.id, node.parent_id ? { parent_id: node.parent_id } : {});
+    if ("error" in r) {
+      notify("error", "Couldn't duplicate");
+      return;
+    }
+    const copy = r.ok as { id: string };
+    await docsApi.move(copy.id, { parent_id: node.parent_id, after_id: node.id });
+    await qc.invalidateQueries({ queryKey: ["docs"] });
+    await nav(`/doc/${copy.id}`);
+  }
+
   const items: ContextMenuItem[] = [];
   if (canEdit) {
     items.push({ label: "Rename", testId: "ctx-rename", onSelect: () => void onRename() });
+    items.push({ label: "Duplicate", testId: "ctx-duplicate", onSelect: () => void onDuplicate() });
   }
   if (isOwner) {
     items.push({
@@ -467,26 +555,35 @@ function TreeRow({
   }
 
   return (
-    <li ref={setRowRef} style={sortableStyle} {...attributes} {...listeners}>
+    <li style={sortableStyle}>
       <div
+        ref={setRowRef}
+        {...attributes}
+        {...listeners}
         className={`relative group flex items-center gap-1 rounded h-7 pr-1 transition-colors ease-swift duration-150 ${
           isActive
             ? "bg-muted text-fg"
             : "text-fg-muted hover:text-fg hover:bg-muted/60"
-        } ${dropHint === "into" ? "ring-1 ring-accent bg-accent/10" : ""}`}
+        } ${dropHint?.intent === "into" ? "ring-1 ring-accent bg-accent/10" : ""}`}
         style={{ paddingLeft: 4 + depth * 12 }}
       >
-        {dropHint === "before" && (
-          <span className="pointer-events-none absolute left-0 right-1 top-0 h-0.5 bg-accent rounded" />
+        {dropHint?.intent === "before" && (
+          <span
+            className="pointer-events-none absolute right-1 top-0 h-0.5 bg-accent rounded"
+            style={{ left: 4 + dropHint.depth * 12 }}
+          />
         )}
-        {dropHint === "after" && (
-          <span className="pointer-events-none absolute left-0 right-1 bottom-0 h-0.5 bg-accent rounded" />
+        {dropHint?.intent === "after" && (
+          <span
+            className="pointer-events-none absolute right-1 bottom-0 h-0.5 bg-accent rounded"
+            style={{ left: 4 + dropHint.depth * 12 }}
+          />
         )}
         {node.children.length > 0 ? (
           <button
             type="button"
             aria-label={expanded ? "Collapse" : "Expand"}
-            onClick={(e) => { e.preventDefault(); setExpanded((v) => !v); }}
+            onClick={(e) => { e.preventDefault(); onToggle(node.id); }}
             className="h-5 w-5 inline-flex items-center justify-center text-fg-muted hover:text-fg rounded shrink-0"
           >
             <ChevronRight
@@ -551,8 +648,10 @@ function TreeRow({
               isOwner={isOwner}
               retentionDays={retentionDays}
               onNewChild={onNewChild}
-              dropHint={drop && drop.overId === c.id ? drop.intent : null}
+              dropHint={drop && drop.overId === c.id ? drop : null}
               drop={drop}
+              collapsed={collapsed}
+              onToggle={onToggle}
             />
           ))}
         </ul>
