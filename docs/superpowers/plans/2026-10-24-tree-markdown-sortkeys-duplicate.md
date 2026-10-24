@@ -41,6 +41,7 @@
   - `POST /api/docs/{id}/duplicate` with body `{ "include_subpages": bool }` returns `201` and a `DocResponse`;
   - `422 doc.is_template`;
   - `413 doc.duplicate_too_large` above 200 pages or 200 MiB of files;
+  - `409 doc.duplicate_conflict` when the source was moved or archived, or its files changed, while copying;
   - the title is `"<title> (copy)"` for the top page only;
   - subpages are unticked by default.
 - **Copy (exact):**
@@ -116,17 +117,28 @@
   - Its helper is `CREATE OR REPLACE FUNCTION pg_temp.knot_spread_key(...)`. It is always called qualified, and dropped at the end, so re-running the file is a no-op.
   - **What users see:** the sidebar re-sorts siblings on the client by code-unit comparison (`web/src/features/docs/tree.ts:40-42`), which is `COLLATE "C"` order.
   - **The heal** ranks rows by `sort_key COLLATE "C", created_at, id`, which is exactly the order users see. A group is healed when any key is invalid, duplicated, or longer than 64 characters.
+  - **Root list.** The sidebar shows the children of templates at the root, sorted together with the top-level pages (`buildTree`, `tree.ts:9-17`).
+    - The heal treats each workspace's root list as one unit. The root list is the rows with `parent_id IS NULL` plus the rows whose parent is a template, archived ones included.
+    - If any group in it needs healing, the whole root list is respread in one combined C order, so the rendered order is kept. Each group stays unique because all combined keys are distinct.
+    - The runtime rebalance (Task 10) rewrites only the database group. A rebalance of a workspace's top-level group may therefore move template children shown at the root relative to top-level pages. This is an accepted limitation, listed in the PR: template children at the root are an existing quirk, and the rebalance only runs on invalid or over-long keys.
   - After the heal, sibling and list queries order by `sort_key COLLATE "C", id`.
   - **Group rewrites are one statement.** Every rewrite of a group's keys, in the heal and in the rebalance, is a single `UPDATE documents d SET sort_key = v.k FROM (VALUES …) v(id, k) WHERE d.id = v.id AND d.workspace_id = $ws AND d.parent_id IS NOT DISTINCT FROM $parent`.
     - A `DEFERRABLE INITIALLY IMMEDIATE` unique constraint is checked at the end of that statement, so transient duplicates are fine.
     - Never use `SET CONSTRAINTS`.
     - The parent predicate makes the READ COMMITTED re-check skip rows that have meanwhile moved to another group.
+    - If the `moving` doc is in the group being rebalanced, it goes into the same `VALUES` with the provisional key `'~' || id`. That way its old key can't collide with a respread key; the caller's final `UPDATE` overwrites it.
 - **P8. Group lock** (taken inside `placement::place`):
   - Under a parent: `SELECT archived_at IS NOT NULL FROM documents WHERE workspace_id = $1 AND id = $2 FOR NO KEY UPDATE`.
     - In the placed paths it is used *instead of* `lock_live_parent` (`FOR SHARE`, `doc_store.rs:798-818`). Taking both would deadlock two concurrent creates.
     - It returns `Archived` exactly as `lock_live_parent` does. A missing parent is left to the foreign key, as today.
   - At the top level: `pg_advisory_xact_lock(1802399604, hashtext(workspace_id::text))`.
-  - **Order: the target group lock first, then the moved doc's row lock** (parent before child, the order archive and restore use, `doc_store.rs:461`, `:529`), then the cycle check.
+  - **Moves lock the target parent and the moved doc together:**
+    - under a parent, one statement: `SELECT id, archived_at IS NOT NULL FROM documents WHERE workspace_id = $1 AND id = ANY($2) ORDER BY id FOR NO KEY UPDATE`;
+    - at the top level: the advisory lock, then the moved doc `FOR NO KEY UPDATE`.
+
+    Then the cycle check. Two moves that swap nesting (D into P, P into D) therefore serialize: one succeeds and the other gets `409 doc.move_cycle`, with no deadlock. `FOR NO KEY UPDATE` is enough for the moved row: with the deferrable constraint, neither `parent_id` nor `sort_key` is a key column. It still conflicts with archive's `FOR UPDATE`.
+  - **Restore:** when the doc may move to the top level (`expected_parent.is_some()`), it takes `lock_group(None)` first, before its parent lock (`doc_store.rs:547`). Taking it again inside `place` is a no-op.
+  - **Safety net:** `create_placed`, `move_placed`, restore and `apply_duplicate` retry the whole transaction once on SQLSTATE `40P01` (deadlock detected). One example is archive's single stamping `UPDATE` racing a rebalance inside the subtree being archived.
   - The existing explicit-key `create(ws, parent, title, sort_key, user)` and `move_to(.., sort_key)` stay exactly as they are, for the tests that call them. Routes stop using them.
 - **P9. Sensors.** `MouseSensor({ activationConstraint: { distance: 6 } })` plus `TouchSensor({ activationConstraint: { delay: 250, tolerance: 5 } })`, replacing `PointerSensor` and `KeyboardSensor`.
 - **P10. Menu events.** `ContextMenu` also stops `onMouseDown` and `onTouchStart` propagation, because React events bubble through portals to the draggable row.
@@ -152,15 +164,27 @@
 - **P15. Duplicate permissions.** Return `403 acl.editor_required` when `role.0 == WorkspaceRole::Viewer || ctx.role == WorkspaceRole::Viewer`, written the way `move_doc` does it (`docs.rs:351-353`). `WorkspaceRole` has no meaningful `Ord`; never compare it with `>=`.
 - **P16. Files.**
   - **Postgres-stored bytes** (`blobs.bytes_deleted_with_metadata() == true`) are copied inside the transaction: `INSERT INTO blob_bytes SELECT $new, bytes FROM blob_bytes WHERE blob_id = $old`.
+    - It must affect exactly 1 row. Otherwise the source was purged meanwhile, and the transaction aborts with `409 doc.duplicate_conflict`.
   - **Other stores** copy before the transaction through `BlobStore::copy(&self, src: Uuid, dst: Uuid, content_type: &str) -> Result<()>`.
     - The default is `get` + `put`.
-    - S3 overrides it with `copy_object_internal(self.key(src), self.key(dst))`; a non-2xx status is an error.
-  - **Cleanup.** A guard is armed before the first copy, and each copied `dst` is recorded.
-    - On any failure after that (a later copy, the remap, the transaction), a detached cleanup runs.
-    - It deletes each `dst` only if no `blobs` row for it exists. A commit whose acknowledgement was lost must keep its files.
+    - S3 overrides it with `copy_object_internal(self.key(src), self.key(dst))`. A non-2xx status is an error.
+    - S3 CopyObject can answer 200 with an error body, so a `head_object(dst)` whose size isn't `byte_size` is also an error.
+  - **Cleanup is durable** (migration `20261024120200_blob_copy_pending.sql`: `blob_copy_pending(blob_id uuid PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT now())`).
+    - Before the first copy, every planned non-DB `dst` id is inserted into `blob_copy_pending` and committed. It is recorded *before* copying, so a copy whose response was lost is still covered.
+    - `apply_duplicate` deletes those entries inside its transaction.
+    - Nothing is deleted on the request path. A commit whose acknowledgement was lost, or one not yet visible (synchronous replication), must keep its files.
+    - The hourly purge job (`archive.rs`, under `PURGE_LOCK_KEY`) also handles entries older than 1 hour:
+      - no `blobs` row: delete the object (a missing object is fine), then the entry;
+      - otherwise: just the entry.
+
+      This also covers a process killed mid-duplicate.
+  - **Final placement conflicts.** If the final placement returns `BadAnchor` or `Archived` (the source was moved or archived meanwhile), the duplicate returns `409 doc.duplicate_conflict`.
   - **Dropped requests.** The route runs the whole duplicate inside `tokio::spawn` and awaits the handle (as `routes/api/export.rs:232-246` does), so the 30 s `TimeoutLayer` or a client disconnect can't cancel it halfway.
 - **P17. One-time derived-data refresh.**
-  - **Migration:** `doc_markdown_cache.renderer_version int NOT NULL DEFAULT 1`, plus a `BEFORE INSERT OR UPDATE` trigger that sets `NEW.renderer_version := COALESCE(NULLIF(current_setting('knot.renderer_version', true), '')::int, 1)`.
+  - **Migration:** `doc_markdown_cache.renderer_version int NOT NULL DEFAULT 1`, plus a `BEFORE INSERT OR UPDATE` trigger. With `v := NULLIF(current_setting('knot.renderer_version', true), '')`:
+    - if `v` is set, `NEW.renderer_version := v::int`;
+    - otherwise, on UPDATE, `NEW.renderer_version := 1`;
+    - otherwise, on INSERT, the value is kept (the column default 1 when not given). Raw-SQL test seeds can therefore insert version-2 rows.
   - **New renders:** `put_rendered` runs `SELECT set_config('knot.renderer_version', $v::text, true)` and the upsert in one transaction, so new renders get 2.
     - Its upsert has `ON CONFLICT (doc_id) DO UPDATE … WHERE doc_markdown_cache.rendered_at_seq <= EXCLUDED.rendered_at_seq`, so a late render never overwrites a newer one.
     - It returns `bool`: whether a row was written. When nothing was written, the caller skips the task reindex.
@@ -168,10 +192,10 @@
   - **Stale** means a live doc (`archived_at IS NULL`) with no cache row at all, or with `renderer_version < RENDERER_VERSION`. Pages damaged at creation never rendered, so they have no row.
   - **Sweep:** `reindex::spawn_with_sweep(state, rx)` (called from `main.rs`) runs it; `reindex::spawn(state, rx)` stays unchanged without it.
     - On each tick, *before* the empty-pending check, it asks for up to 10 stale ids after a cursor and adds them to `pending`.
-    - The cursor is `Option<(timestamp, Uuid)>` over `(COALESCE(c.updated_at, d.created_at), d.id)`. `None` means no lower bound (never a minimum timestamp, which Postgres rejects).
+    - **Cursor:** `Option<Uuid>` on `d.id` alone (`($after IS NULL OR d.id > $after) ORDER BY d.id LIMIT 10`). It walks `documents_pkey` and probes the cache by primary key, so no new index is needed.
     - The cursor advances, so docs whose refresh fails can't stall it.
     - After an empty result, the cursor resets to `None` and the next query waits 10 minutes. This catches legacy rows written later by old pods and docs restored from the archive, at negligible cost.
-    - Only one replica sweeps at a time, using the advisory-lock pattern of the purge job (`archive.rs:196`).
+    - **One sweeper:** only one replica sweeps at a time. The sweeper takes `pg_try_advisory_lock(SWEEP_LOCK_KEY)` on one dedicated connection, detached from the pool, and holds it for a whole pass: from the first query until the empty result, so the refreshes of the queued ids run under it too. Other replicas skip while it is held. This follows the purge job (`archive.rs:196`).
     - The sweep keeps its ids in its own set, so their flush takes the quiet path. An id that is also dirty from an edit takes the edit path.
     - Sweep refreshes write tasks with `TaskStore::sync_for_doc_quiet`, which writes only rows whose values changed. A healthy page's `doc_tasks.updated_at` stays as it is, and `/tasks` (ordered by `updated_at DESC`) doesn't reshuffle. Edits keep using `upsert_for_doc` unchanged.
 - **P18. Snapshots without booting rooms.**
@@ -208,7 +232,7 @@
    - Legacy cache writes are re-swept. Test: Task 6's `legacy_put_marks_row_stale`.
 3. **Concurrent sidebar actions.** Two users create pages at the same level at once. Test: Task 10's `concurrent_first_creates_get_distinct_keys` (20 tasks, under a parent and at the top level, no 500s).
 4. **Keyboard users on Windows/Linux pressing Alt+←/→.** That is browser Back/Forward, and it must be intercepted. Test: Task 15's e2e `alt_arrow_indents_without_navigating` asserts that the URL is unchanged.
-5. **A Duplicate request dropped or failed mid-flight.** No orphaned rows or S3 objects may remain. Test: Task 18's `duplicate_failure_leaves_no_rows_or_objects`, using a recording blob-store double that forces the transaction to fail after the copies.
+5. **A Duplicate request dropped or failed mid-flight.** No rows may remain, and every copied object must be recorded for cleanup and removed by the purge job. Test: Task 18's `duplicate_failure_leaves_no_rows_or_objects`, using a recording blob-store double that forces the transaction to fail after the copies.
 
 ---
 
@@ -230,7 +254,7 @@ crates/knot-markdown/tests/
 └── round_trip.rs           + round_trip_fixture_directory (Task 1)
 crates/knot-crdt/src/{tasks.rs (NEW: task_items, patch_task_checked), room.rs, registry.rs (get_active)}
 crates/knot-storage/src/{lexorank.rs, lib.rs, placement.rs (NEW), duplicate.rs (NEW), markdown_cache.rs, doc_store.rs, blobs.rs, blobs/s3.rs, audit.rs}
-migrations/20261024120000_heal_sort_keys.sql, 20261024120100_markdown_renderer_version.sql
+migrations/20261024120000_heal_sort_keys.sql, 20261024120100_markdown_renderer_version.sql, 20261024120200_blob_copy_pending.sql
 crates/knot-server/src/{reindex.rs, main.rs, lib.rs, duplicate.rs (NEW), routes/api/{docs.rs, markdown.rs, export_import.rs}}
 crates/knot-server/tests/{markdown_compat.rs, tasks_lockstep.rs, refresh_sweep.rs, placement_integration.rs, workspace_import_integration.rs, duplicate_integration.rs} (all NEW)
 web/src/features/docs/{tree.ts, DocTree.tsx, TreeRow.tsx (NEW), DuplicateDialog.tsx (NEW), docs.api.ts}
@@ -478,16 +502,16 @@ e2e/flows/{tree-helpers.ts (NEW), tree-reorder.spec.ts (rewritten), tree-moves.s
 
 **Interfaces:**
 - `MarkdownCacheStore::put_rendered(doc_id, rendered_at_seq: i64, markdown: &str, renderer_version: i32) -> Result<bool>` (P17: seq guard; returns whether a row was written). `put` stays and now yields version 1 through the trigger.
-- `MarkdownCacheStore::stale_ids(current: i32, after: Option<(timestamp, Uuid)>, limit: i64) -> Result<Vec<(Uuid, timestamp)>>`.
-  - `FROM documents d LEFT JOIN doc_markdown_cache c ON c.doc_id = d.id WHERE d.archived_at IS NULL AND (c.doc_id IS NULL OR c.renderer_version < $current)`.
-  - Key `(COALESCE(c.updated_at, d.created_at), d.id)`, filtered by `> after` when `after` is `Some`, and ordered by that key. Every column is qualified.
-  - "timestamp" is the crate's existing timestamp type.
+- `MarkdownCacheStore::stale_ids(current: i32, after: Option<Uuid>, limit: i64) -> Result<Vec<Uuid>>`.
+  - `FROM documents d LEFT JOIN doc_markdown_cache c ON c.doc_id = d.id WHERE d.archived_at IS NULL AND (c.doc_id IS NULL OR c.renderer_version < $current) AND ($after IS NULL OR d.id > $after) ORDER BY d.id LIMIT $limit`.
+  - Every column is qualified.
 - `TaskStore::sync_for_doc_quiet(doc_id, tasks)`: like `upsert_for_doc`, but it inserts, updates and deletes only the rows whose values changed.
 - `current_snapshot` (P18), used by `refresh_markdown_inner`.
 
 - [ ] **Step 1: Write the failing tests:**
   - `stale_ids_returns_old_renders_only_and_pages_by_cursor`;
   - `legacy_put_marks_row_stale`: `put_rendered(.., 2)` then `put` gives version 1;
+  - `trigger_keeps_explicit_insert_version`: a raw `INSERT` with version 2 keeps 2, and a raw `UPDATE` without the setting gives 1;
   - `sweep_rerenders_stale_rows_and_reindexes_tasks`:
     - seed a cache row with `renderer_version = 1` and broken nested-checklist Markdown;
     - within a deadline, the row has version 2, healed Markdown and correct task rows;
@@ -550,9 +574,13 @@ e2e/flows/{tree-helpers.ts (NEW), tree-reorder.spec.ts (rewritten), tree-moves.s
   - for `i = 1..=n`: `floor(i * 36^w / (n+1))`, written as a `w`-digit base-36 string left-padded with `'0'`, then trailing `'0'`s stripped.
   - Task 9's SQL implements the same formula.
 
-- [ ] **Step 1: Write the failing tests** (in `lexorank.rs` `mod tests`; existing tests get the mechanical `.unwrap()`, P6).
-  - The collision and ordering tests call `crate::sort_key_between`, which returns `String` both on main and after P5. They compile against main's code, so the RED run shows the failing assertion.
-  - Only the `Result`/`spread` tests are new API, so their RED is a compile failure.
+- [ ] **Step 1a: Write the behaviour tests and show their RED on main.**
+  - Put them in a new integration file, `crates/knot-storage/tests/sort_key_props.rs`: `top_inserts_never_collide`, `inserting_after_the_same_key_never_collides`, `prefix_family_stays_inside`, `exhaustive_small_alphabet`, `simulation_2000_seeds` and `appends_grow_slowly`.
+  - They use only `knot_storage::sort_key_between`, which returns `String` on main and after P5, plus a local `fn valid(k: &str) -> bool` for `^[0-9a-z]*[1-9a-z]$`.
+  - So they compile against main's code, and the RED run shows the failing assertion (e.g. a="m", b="m01" gives "m0h").
+- [ ] **Step 1b: Write the new-API tests** in `lexorank.rs` `mod tests`: `invalid_inputs_are_errors_not_panics` and `spread_is_sorted_valid_distinct`, plus the mechanical `.unwrap()` on existing tests (P6). Their RED is a compile failure.
+
+  The bodies of all these tests are sketched below. Each one lives in the file given by Step 1a or 1b.
 
   **Server tests** in `placement_integration.rs`, all failing on main:
   - `ten_new_pages_under_a_parent_all_succeed_in_order` (on main #8 returns 409);
@@ -570,7 +598,7 @@ e2e/flows/{tree-helpers.ts (NEW), tree-reorder.spec.ts (rewritten), tree-moves.s
 #[test] fn appends_grow_slowly() { /* 1000 × between(last, None) ≤ 210 chars */ }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-storage --lib lexorank`, then `cargo nextest run -p knot-server --test placement_integration`
+- [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-storage --test sort_key_props`, then `cargo nextest run -p knot-storage --lib lexorank`, then `cargo nextest run -p knot-server --test placement_integration`
 - [ ] **Step 3: Implement the generator** (midpoint over `[0-9a-z]`, common prefix with `a` padded by `'0'`, no trailing `'0'`).
 - [ ] **Step 4: Run, expect PASS** for `cargo nextest run -p knot-storage`, then `cargo nextest run -p knot-server --test placement_integration --test docs_integration`, then `cargo check --workspace --all-targets --all-features` (existing callers unchanged).
 - [ ] **Step 5: Commit** `fix(sort-keys): generator that always finds a key between two neighbours`.
@@ -590,6 +618,7 @@ e2e/flows/{tree-helpers.ts (NEW), tree-reorder.spec.ts (rewritten), tree-moves.s
   - `heal_sort_keys_leaves_healthy_groups_untouched`: keys and `updated_at` byte for byte;
   - `heal_sort_keys_preserves_order_and_fixes_bad_groups`: seeds `"0"`, `"00"`, `"m0"`, `"M"`, a 70-character key, top-level duplicates and archived rows. Each group's order before (`sort_key COLLATE "C"`, `created_at`, `id`) equals its order after, and all keys are valid and distinct;
   - `heal_assigns_exactly_lexorank_spread_keys`: a bad group of n rows, for n in {1, 2, 10, 35, 36, 100}, gets exactly `lexorank::spread(n)`;
+  - `heal_keeps_rendered_root_order_with_template_children`: a bad top-level group interleaved, by key, with the children of a template keeps the combined C order of the root list (P7).
   - `heal_sort_keys_is_idempotent`: re-running the whole SQL file (`sqlx::raw_sql(include_str!(…))`) changes nothing;
   - `top_level_duplicates_are_rejected_after_migration`.
 - [ ] **Step 2: Run, expect FAIL** (migration missing). `cargo nextest run -p knot-storage --test migrations_apply`
@@ -630,7 +659,7 @@ async fn move_placed(&self, ws: Uuid, doc_id: Uuid, actor: Uuid, parent: Option<
   6. Return the key.
 - **Callers:**
   - `create_placed`: `place`, then insert.
-  - `move_placed`: `lock_group` on the target group, then the doc row lock, then the cycle check, then `place`, then update (P8 order).
+  - `move_placed`: the combined lock of the target parent and the moved doc (P8), then the cycle check, then `place`, then update.
   - Both keep audit and invalidation as today.
 - **Route mapping:**
   - create: no `after_id` → `First`; `after_id` → `After`;
@@ -640,9 +669,15 @@ async fn move_placed(&self, ws: Uuid, doc_id: Uuid, actor: Uuid, parent: Option<
 
 - [ ] **Step 1: Write the failing tests:**
   - `placement_rebalances_invalid_neighbours` (raw SQL seeds `"0"`, `"00"`, `"m0"`, `"M"` and a 70-character key in one group; creates and moves around them succeed, keys end up valid, and order is preserved). Before this task, the `expect` in `sort_key_between` panics, giving a 500;
-  - `archived_sibling_between_neighbours_does_not_collide`;
+  - `archived_sibling_between_neighbours_does_not_collide` (a regression guard: `siblings()` already includes archived rows);
   - `concurrent_first_creates_get_distinct_keys` (20 `tokio::spawn`, under a parent and at the top level; every request succeeds);
   - `rebalance_concurrent_with_sibling_move_both_succeed` (a rebalance triggered by a seeded `"0"` key, while another task moves a sibling of that group into another parent);
+  - `rebalance_with_the_moved_page_in_its_group`:
+    - start from `spread(11)` with `"1"` and `"0"` inserted in front;
+    - move the last page to the top;
+    - it succeeds, and all keys stay valid and distinct (P7 provisional key);
+  - `swapping_nesting_moves_do_not_deadlock` (move D into P and P into D concurrently: one 200, one `409 doc.move_cycle`, no 500);
+  - `restore_concurrent_with_top_level_rebalance_both_succeed` (restore a child whose parent is archived, so it goes to the top level, while a top-level rebalance runs);
   - `move_with_non_sibling_anchor_is_422`;
   - `move_with_self_anchor_is_422`;
   - change `move_with_unknown_anchor_falls_to_end` to expect 422 (P6).
@@ -849,10 +884,10 @@ export function describeMove(flat: FlatRow[], id: string, args: MoveArgs): strin
 ### Task 17: Storage for Duplicate
 
 **Files:**
-- Create: `crates/knot-storage/src/duplicate.rs`.
+- Create: `crates/knot-storage/src/duplicate.rs`, `migrations/20261024120200_blob_copy_pending.sql` (P16).
 - Modify:
   - `blobs.rs`: `BlobStore::copy(&self, src, dst, content_type) -> Result<()>`, defaulting to `get` + `put` (P16);
-  - `blobs/s3.rs`: the override;
+  - `blobs/s3.rs`: the override, with the `head_object` size check;
   - `doc_store.rs`: `live_subtree(ws, root) -> Vec<SubtreeRow { id, parent_id, title, icon, sort_key }>`;
   - `audit.rs`: `record_in_tx_with_data` (data as `sqlx::types::JsonValue`; the crate has no `serde_json`).
 - Test: `crates/knot-storage/tests/duplicate.rs`.
@@ -866,7 +901,9 @@ pub struct BoardCopy { pub new_id: Uuid, pub new_doc_id: Uuid, pub label: Option
 pub struct BlobCopy { pub new_id: Uuid, pub new_doc_id: Uuid, pub source: BlobMetadata, pub bytes_in_db: bool }
 pub struct DuplicatePlan { pub ws: Uuid, pub actor: Uuid, pub source_id: Uuid, pub top: PageCopy, pub pages: Vec<PageCopy>, pub boards: Vec<BoardCopy>, pub blobs: Vec<BlobCopy> }
 pub struct DuplicateOutcome { pub top: Document, pub pages: Vec<(Uuid, i64)> /* (page, first update seq) */ }
-pub async fn apply_duplicate(pool: &PgPool, plan: &DuplicatePlan) -> Result<DuplicateOutcome, DocStoreError>;
+pub async fn apply_duplicate(pool: &PgPool, plan: &DuplicatePlan) -> Result<DuplicateOutcome, DocStoreError>; // DocStoreError gains DuplicateConflict
+pub async fn record_pending_copies(pool: &PgPool, ids: &[Uuid]) -> Result<(), DocStoreError>;
+pub async fn purge_stale_copies(pool: &PgPool, blobs: &dyn BlobStore, older_than: std::time::Duration) -> Result<usize, DocStoreError>;
 ```
 
 - **One transaction.** The group lock is taken only at the end, so the heavy inserts don't block other creates and moves in the source's group:
@@ -874,15 +911,17 @@ pub async fn apply_duplicate(pool: &PgPool, plan: &DuplicatePlan) -> Result<Dupl
   2. Insert the subpages in source order. Each new parent group gets `spread` keys.
   3. For each page: one `doc_updates` row with the actor, plus `doc_contributors` (the SQL from `insert_batch`).
   4. Boards: one row each, plus one `board_updates` row and `svg_cached`.
-  5. Blob rows. For `bytes_in_db`, also `INSERT INTO blob_bytes SELECT $new, bytes FROM blob_bytes WHERE blob_id = $old`.
+  5. Blob rows. For `bytes_in_db`, also `INSERT INTO blob_bytes SELECT $new, bytes FROM blob_bytes WHERE blob_id = $old`, which must affect exactly 1 row, else `DuplicateConflict`. Delete this plan's `blob_copy_pending` entries.
   6. Audit `doc.duplicate` with `{"source_id": …}`, and the invalidations as for create.
-  7. Last: `place(conn, ws, plan.top.parent, Placement::After(plan.source_id), Some(plan.top.new_id))` (Task 10), then `UPDATE` the top page's key, then commit.
+  7. Last: `place(conn, ws, plan.top.parent, Placement::After(plan.source_id), Some(plan.top.new_id))` (Task 10), then `UPDATE` the top page's key, then commit. A `BadAnchor` or `Archived` here becomes `DuplicateConflict`.
 
 - [ ] **Step 1: Write the failing tests:**
   - `apply_duplicate_inserts_everything_atomically`;
   - `no_partial_rows_on_failure` (a forced unique conflict leaves no rows);
   - `live_subtree_skips_archived_and_template_subtrees`;
-  - `copy_default_impl_copies_bytes` (an in-memory `BlobStore` test double; PG-stored bytes are copied by SQL instead).
+  - `copy_default_impl_copies_bytes` (an in-memory `BlobStore` test double; PG-stored bytes are copied by SQL instead);
+  - `db_bytes_missing_is_a_conflict` (source `blob_bytes` deleted after planning gives `DuplicateConflict` and no rows);
+  - `purge_stale_copies_deletes_unreferenced_objects_only` (one pending entry with a `blobs` row, one without; with `older_than = 0`, only the second object is deleted, and both entries go).
 - [ ] **Step 2: Run, expect FAIL.** `cargo nextest run -p knot-storage --test duplicate`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run, expect PASS.**
@@ -892,7 +931,9 @@ pub async fn apply_duplicate(pool: &PgPool, plan: &DuplicatePlan) -> Result<Dupl
 
 **Files:**
 - Create: `crates/knot-server/src/duplicate.rs`; add `pub mod duplicate;` to `crates/knot-server/src/lib.rs`.
-- Modify: `routes/api/docs.rs`: register `POST /api/docs/{id}/duplicate` in `doc_id_routes`. The handler lives in `docs.rs`, so it can use the private `to_response`.
+- Modify:
+  - `routes/api/docs.rs`: register `POST /api/docs/{id}/duplicate` in `doc_id_routes`. The handler lives in `docs.rs`, so it can use the private `to_response`;
+  - `crates/knot-server/src/archive.rs`: `run_purge_once` also calls `purge_stale_copies(.., 1 h)` (P16).
 - Test: `crates/knot-server/tests/duplicate_integration.rs`.
   - Base it on the `export_integration.rs` harness (`world_with`, `set_content`, `upload`, `archive`, `member`).
   - Add a helper that creates a page under a parent, like `archive_integration`'s `create_doc(&who, title, parent)`.
@@ -900,7 +941,7 @@ pub async fn apply_duplicate(pool: &PgPool, plan: &DuplicatePlan) -> Result<Dupl
 **Interfaces:**
 - `pub async fn run(state: AppState, ctx: …, source_id: Uuid, include_subpages: bool) -> Result<Document, DuplicateError>` in `duplicate.rs`.
   - The handler calls it through `tokio::spawn(...).await` (P16).
-  - It maps `DuplicateError` to 403, 404, 409, 413 and 422 JSON errors, and returns `201` with `to_response(&top)`.
+  - It maps `DuplicateError` to 403, 404, 409 (`doc.archived`, `doc.duplicate_conflict`), 413 and 422 JSON errors, and returns `201` with `to_response(&top)`.
 - **`run` steps:**
   1. Roles (P15).
   2. Refuse a template source (422) and an archived source (409).
@@ -908,9 +949,9 @@ pub async fn apply_duplicate(pool: &PgPool, plan: &DuplicatePlan) -> Result<Dupl
   4. For each page, `current_snapshot` (P18, no room acquired) into a transient doc, then `references`.
   5. Choose the boards and readable blobs (P19). Caps: bytes (413).
   6. Allocate new ids for pages, boards and blobs.
-  7. Arm the cleanup guard (P16), then copy non-DB blob objects with `BlobStore::copy`, recording each `dst`.
+  7. `record_pending_copies` for every planned non-DB `dst` (P16), then copy those blob objects with `BlobStore::copy`.
   8. `remap_refs` on each transient doc, then `encode_state_as_update`. For boards, merge snapshot and updates and encode once.
-  9. `apply_duplicate`, then disarm the guard on success. Any failure from step 7 on triggers the detached cleanup, which deletes only the `dst`s that have no `blobs` row.
+  9. `apply_duplicate`. On failure, nothing is deleted on the request path: the pending entries leave cleanup to the purge job.
   10. After commit, best effort for each copy: `serialise` + `put_rendered`, and task extraction from the transient doc.
 
 - [ ] **Step 1: Write the failing tests:**
@@ -927,9 +968,11 @@ pub async fn apply_duplicate(pool: &PgPool, plan: &DuplicatePlan) -> Result<Dupl
   - `template_is_422`;
   - `too_large_is_413` (201 pages);
   - `duplicate_failure_leaves_no_rows_or_objects` (Review Focus 5):
-    - a test double `RecordingBlobStore` overrides `copy` (records `dst`) and `delete` (records), and returns `false` from `bytes_deleted_with_metadata()`;
-    - on its first `copy` it archives the source through the pool, so placement fails;
-    - assert a non-2xx response, then `expect`-poll that deleted == copied, and that no new documents, blobs or boards rows exist;
+    - a test double `RecordingBlobStore` returns `false` from `bytes_deleted_with_metadata()`. Its `copy` only records `dst` and returns `Ok(())`, with no delegation. Its `delete` records;
+    - on its first `copy` it archives the source through the pool, so the final placement fails;
+    - assert `409 doc.duplicate_conflict`, which proves `apply_duplicate` ran;
+    - assert no new documents, blobs or boards rows, and a `blob_copy_pending` entry for every copied `dst`;
+    - then run `purge_stale_copies(.., 0)` and assert deleted == copied and the pending table is empty;
   - `byline_credits_the_duplicating_user`;
   - `copied_tasks_are_indexed`.
 - [ ] **Step 2: Run, expect FAIL** (404). `cargo nextest run -p knot-server --test duplicate_integration`
