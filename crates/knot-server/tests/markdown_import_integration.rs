@@ -7,6 +7,7 @@
 //! transaction). The append-duplicates test is not aspirational — it locks
 //! in the default so `from_template` keeps working.
 
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +15,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
-use knot_crdt::{Rooms, SnapshotPolicy, YrsEngine};
+use knot_crdt::{DocHandle, Engine, Rooms, SnapshotPolicy, YrsEngine};
+use knot_markdown::legacy::compat;
 use knot_server::{AppState, router_with_state};
 use knot_storage::{PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore, WorkspaceRole};
 use sqlx::PgPool;
@@ -403,4 +405,260 @@ async fn non_utf8_body_is_rejected() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(code, "markdown.not_utf8");
+}
+
+// ---------------------------------------------------------------------------
+// Nested checklists and list line breaks survive every route that rebuilds a
+// page from its own Markdown (spec A4, A10): GET markdown, history restore,
+// from-template and workspace import.
+// ---------------------------------------------------------------------------
+
+/// A checklist nested three deep, indented by the list marker's width.
+const NESTED_CHECKLIST: &str = "- [ ] a\n  - [x] b\n    - [ ] c\n";
+
+/// POST `body` to `uri`, returning the status and the response body.
+async fn post_raw(
+    app: &axum::Router,
+    sid: &str,
+    csrf: &str,
+    uri: &str,
+    content_type: &str,
+    body: impl Into<Body>,
+) -> (StatusCode, Vec<u8>) {
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", content_type)
+                .header("cookie", format!("{sid}; csrf={csrf}"))
+                .header("x-csrf-token", csrf)
+                .body(body.into())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = r.status();
+    let bytes = r.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec())
+}
+
+/// The page as stored: every update of `doc_id`, applied in order.
+async fn stored_doc(pool: &PgPool, doc_id: Uuid) -> DocHandle {
+    let updates: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT update_bytes FROM doc_updates WHERE doc_id = $1 ORDER BY seq")
+            .bind(doc_id)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let doc = YrsEngine.new_doc();
+    for update in updates {
+        YrsEngine.apply_update(&doc, &update).unwrap();
+    }
+    doc
+}
+
+fn assert_schema_valid(doc: &DocHandle) {
+    assert_eq!(
+        compat::schema_violations(doc.inner()),
+        Vec::<String>::new(),
+        "the stored page breaks the schema:\n{}",
+        compat::normalised(doc.inner())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn markdown_of_nested_checklist_uses_marker_indent() {
+    let f = fixture().await;
+    let (sid, csrf) = login(&f.app, "alice@example.com").await;
+
+    assert_eq!(
+        import(
+            &f.app,
+            &sid,
+            &csrf,
+            f.doc_id,
+            Some("replace"),
+            NESTED_CHECKLIST
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        export(&f.app, &sid, &csrf, f.doc_id).await,
+        NESTED_CHECKLIST
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_restore_keeps_nested_checklists() {
+    let f = fixture().await;
+    let (sid, csrf) = login(&f.app, "alice@example.com").await;
+
+    // Different current content, then a history snapshot holding the nested
+    // checklist. The snapshot goes in once the room runs, so the room never
+    // loads it as its base state.
+    assert_eq!(
+        import(
+            &f.app,
+            &sid,
+            &csrf,
+            f.doc_id,
+            Some("replace"),
+            "# Current\n"
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let (snapshot, _) = knot_markdown::from_markdown::parse(NESTED_CHECKLIST).unwrap();
+    let state_bytes = YrsEngine.encode_state_as_update(&snapshot, None).unwrap();
+    let state_vector = YrsEngine.encode_state_vector(&snapshot).unwrap();
+    PgSnapshotStore::new(f.pool.clone())
+        .insert(f.doc_id, 1, &state_bytes, &state_vector)
+        .await
+        .unwrap();
+
+    let (status, body) = post_raw(
+        &f.app,
+        &sid,
+        &csrf,
+        &format!("/api/docs/{}/history/1/restore", f.doc_id),
+        "application/json",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "restore: {}",
+        String::from_utf8_lossy(&body)
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        export(&f.app, &sid, &csrf, f.doc_id).await,
+        NESTED_CHECKLIST
+    );
+    let stored = stored_doc(&f.pool, f.doc_id).await;
+    assert_schema_valid(&stored);
+    assert_eq!(
+        compat::normalised(stored.inner()),
+        compat::normalised(snapshot.inner()),
+        "the restore changed the checklist's structure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn from_template_keeps_nested_checklists() {
+    let f = fixture().await;
+    let (sid, csrf) = login(&f.app, "alice@example.com").await;
+
+    assert_eq!(
+        import(
+            &f.app,
+            &sid,
+            &csrf,
+            f.doc_id,
+            Some("replace"),
+            NESTED_CHECKLIST
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = post_raw(
+        &f.app,
+        &sid,
+        &csrf,
+        &format!("/api/docs/{}/template", f.doc_id),
+        "application/json",
+        r#"{"is_template":true}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "set template: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = post_raw(
+        &f.app,
+        &sid,
+        &csrf,
+        &format!("/api/docs/from-template/{}", f.doc_id),
+        "application/json",
+        "{}",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "from-template: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let new_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(export(&f.app, &sid, &csrf, new_id).await, NESTED_CHECKLIST);
+    assert_schema_valid(&stored_doc(&f.pool, new_id).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_import_keeps_list_line_breaks_and_nested_checklists() {
+    let f = fixture().await;
+    let (sid, csrf) = login(&f.app, "alice@example.com").await;
+
+    let md = concat!(
+        "# Notes\n\n",
+        "- a  \n  b\n\n",
+        "## Tasks\n\n",
+        "- [ ] parent\n  - [x] child\n    - [ ] grandchild\n",
+    );
+    let manifest = serde_json::json!({
+        "knot_export_version": "2",
+        "docs": [{
+            "id": Uuid::new_v4().to_string(),
+            "parent_id": null,
+            "title": "Imported lists",
+            "sort_key": "n",
+            "path": "docs/Imported-lists.md",
+        }],
+        "attachments": [],
+        "boards": [],
+    });
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    zip.start_file("index.json", opts).unwrap();
+    zip.write_all(manifest.to_string().as_bytes()).unwrap();
+    zip.start_file("docs/Imported-lists.md", opts).unwrap();
+    zip.write_all(md.as_bytes()).unwrap();
+    let bytes = zip.finish().unwrap().into_inner();
+
+    let (status, body) = post_raw(
+        &f.app,
+        &sid,
+        &csrf,
+        "/api/workspace/import",
+        "application/zip",
+        bytes,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "workspace import: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let imported: Uuid = sqlx::query_scalar("SELECT id FROM documents WHERE title = $1")
+        .bind("Imported lists")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(export(&f.app, &sid, &csrf, imported).await, md);
+    assert_schema_valid(&stored_doc(&f.pool, imported).await);
 }

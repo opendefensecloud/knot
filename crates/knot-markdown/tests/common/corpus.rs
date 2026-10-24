@@ -471,9 +471,15 @@ impl Gen {
     }
 
     /// The blocks combined in pairs, at the top level and in containers.
+    /// `p-hard-break` is an editor line break (Shift+Enter), the healthy
+    /// shape of spec A1, so it sits in every container too.
     fn pair_blocks(&self) -> Vec<(&'static str, N)> {
         vec![
             ("p", p("para")),
+            (
+                "p-hard-break",
+                el("paragraph", vec![text("line"), hard_break(), text("break")]),
+            ),
             ("empty-p", el("paragraph", Vec::new())),
             ("heading", self.heading(2, vec![text("head")])),
             ("code", self.code(Some("sh"), "ls")),

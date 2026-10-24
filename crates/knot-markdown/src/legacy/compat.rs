@@ -9,7 +9,10 @@ use knot_crdt::{DocHandle, YrsEngine};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use yrs::types::Attrs;
 use yrs::types::text::YChange;
-use yrs::{Any, Out, ReadTxn, Text, Transact, Xml, XmlFragment, XmlOut};
+use yrs::{
+    Any, GetString, Out, ReadTxn, Text, Transact, Transaction, Xml, XmlElementRef, XmlFragment,
+    XmlOut,
+};
 
 use super::{parse, serialise};
 
@@ -20,17 +23,21 @@ type Class<T> = (&'static str, fn(&T) -> bool);
 /// differently from the legacy serializer (serializer rule 1); every other
 /// healthy document must export byte for byte as before. Each entry is a bug
 /// from the spec, and the first entry that matches names the class.
-const EXPORT_CLASSES: &[Class<DocHandle>] = &[];
+///
+/// A table cell is joined onto one line, where nothing reads back as block
+/// structure, so cells keep the legacy layout: only `ordered_checkbox` looks
+/// inside them.
+const EXPORT_CLASSES: &[Class<DocHandle>] = &[
+    ("nested_tasklist", nested_tasklist),
+    ("multi_block_item", multi_block_item),
+    ("quote_block_sequence", quote_block_sequence),
+    ("ordered_checkbox", ordered_checkbox),
+    ("rule_in_container", rule_under_line_in_container),
+];
 
 /// Named import bug classes. A healthy Markdown input in one of them may
 /// import differently from the legacy importer (importer rule).
-///
-/// The two classes of text the writer can't express yet (a follow-up) come
-/// first, so `import_class` names them whenever they apply: no round trip of
-/// such an input can be stable.
 const IMPORT_CLASSES: &[Class<str>] = &[
-    ("markdown_escaping", markdown_escaping),
-    ("leading_hard_break", leading_hard_break),
     (
         "item_first_child_not_paragraph",
         item_first_child_not_paragraph,
@@ -54,6 +61,24 @@ pub fn export_class(doc: &DocHandle) -> Option<&'static str> {
 /// The import bug class `md` falls in, if any.
 pub fn import_class(md: &str) -> Option<&'static str> {
     IMPORT_CLASSES
+        .iter()
+        .find(|(_, is_in)| is_in(md))
+        .map(|(name, _)| *name)
+}
+
+/// Markdown with text the writer can't write back yet, a follow-up: no
+/// round trip of its import can be stable. They import as they always did,
+/// so they aren't import classes; only the stability property leaves them
+/// out.
+const STABILITY_EXEMPT: &[Class<str>] = &[
+    ("markdown_escaping", markdown_escaping),
+    ("leading_hard_break", leading_hard_break),
+];
+
+/// Why the import of `md` can't survive an export and a re-import yet, if
+/// it can't.
+pub fn stability_exempt(md: &str) -> Option<&'static str> {
+    STABILITY_EXEMPT
         .iter()
         .find(|(_, is_in)| is_in(md))
         .map(|(name, _)| *name)
@@ -335,6 +360,247 @@ fn image_after_block_in_tight_item(md: &str) -> bool {
         }
         false
     })
+}
+
+/// The elements of `doc`, with whether each sits in a table cell, for
+/// `is_in` to test until one matches.
+fn any_element(
+    doc: &DocHandle,
+    is_in: &dyn Fn(&Transaction, &XmlElementRef, bool) -> bool,
+) -> bool {
+    fn walk(
+        txn: &Transaction,
+        node: &XmlOut,
+        in_cell: bool,
+        is_in: &dyn Fn(&Transaction, &XmlElementRef, bool) -> bool,
+    ) -> bool {
+        let XmlOut::Element(el) = node else {
+            return false;
+        };
+        let in_cell = in_cell || matches!(el.tag().as_ref(), "table_cell" | "table_header");
+        is_in(txn, el, in_cell)
+            || children(txn, el)
+                .iter()
+                .any(|child| walk(txn, child, in_cell, is_in))
+    }
+    let ydoc = doc.inner();
+    let txn = ydoc.transact();
+    let Some(frag) = txn.get_xml_fragment("default") else {
+        return false;
+    };
+    (0..frag.len(&txn))
+        .filter_map(|i| frag.get(&txn, i))
+        .any(|child| walk(&txn, &child, false, is_in))
+}
+
+fn children<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> Vec<XmlOut> {
+    (0..el.len(txn)).filter_map(|i| el.get(txn, i)).collect()
+}
+
+/// A task item of a bullet list, outside table cells, that is more than one
+/// line of text: a nested checklist above all, a second block, a line
+/// break, a first block other than a paragraph or attachment, or no block
+/// at all. Legacy indented the lines after the checkbox's by the width of
+/// `- [ ] ` instead of the marker's, and wrote any first block right after
+/// the checkbox, so Markdown read them as more text of the checkbox's line
+/// (A4); an item without blocks it left out.
+fn nested_tasklist(doc: &DocHandle) -> bool {
+    any_element(doc, &|txn, el, in_cell| {
+        !in_cell
+            && el.tag().as_ref() == "bullet_list"
+            && children(txn, el).iter().any(|item| {
+                let XmlOut::Element(item) = item else {
+                    return false;
+                };
+                item.get_attribute(txn, "checked").is_some()
+                    && match children(txn, item).as_slice() {
+                        [XmlOut::Element(only)] => match only.tag().as_ref() {
+                            "paragraph" => has_line_break(txn, only),
+                            "attachment" => false,
+                            _ => true,
+                        },
+                        _ => true,
+                    }
+            })
+    })
+}
+
+/// Whether `paragraph` is written on more than one line.
+fn has_line_break<T: ReadTxn>(txn: &T, paragraph: &XmlElementRef) -> bool {
+    children(txn, paragraph).iter().any(|inline| match inline {
+        XmlOut::Element(e) => e.tag().as_ref() == "hard_break",
+        XmlOut::Text(t) => t.get_string(txn).contains('\n'),
+        XmlOut::Fragment(_) => false,
+    })
+}
+
+/// An item of an ordered list with a checkbox (a `checked` attribute).
+/// Legacy wrote no checkbox there, so the page lost it on export, while
+/// `/tasks` toggles still counted the item (A8).
+fn ordered_checkbox(doc: &DocHandle) -> bool {
+    any_element(doc, &|txn, el, _| {
+        el.tag().as_ref() == "ordered_list"
+            && children(txn, el).iter().any(
+                |item| matches!(item, XmlOut::Element(item) if item.get_attribute(txn, "checked").is_some()),
+            )
+    })
+}
+
+/// A list item, outside table cells, with a block that legacy wrote on the
+/// line right below the block before it, where Markdown reads it as part of
+/// that block (A5): a second paragraph runs on into the first, an image or
+/// board joins the paragraph above and is dropped, a list that can't
+/// interrupt a paragraph (`3.`, an empty first item) turns into its text or
+/// a heading, and a paragraph, image or table after a nested list, quote or
+/// table continues it. A rule under a paragraph is `rule_in_container`.
+fn multi_block_item(doc: &DocHandle) -> bool {
+    any_element(doc, &|txn, el, in_cell| {
+        !in_cell && el.tag().as_ref() == "list_item" && runs_on(txn, el, false)
+    })
+}
+
+/// A blockquote, outside table cells, with a block that legacy wrote on the
+/// line right below the block before it, where Markdown reads it as part of
+/// that block (A6): a paragraph, image or table after a list, quote or
+/// table, a `3.` list after a paragraph, a quote after a quote, a paragraph
+/// after an image. A paragraph followed by a paragraph, image, board or
+/// attachment is not in it: the importer reads every line of a quote's
+/// paragraph as a paragraph of its own, so those round-trip as they are
+/// (P2). A rule under a paragraph is `rule_in_container`.
+fn quote_block_sequence(doc: &DocHandle) -> bool {
+    any_element(doc, &|txn, el, in_cell| {
+        !in_cell && el.tag().as_ref() == "blockquote" && runs_on(txn, el, true)
+    })
+}
+
+/// A rule right below a paragraph, image, board or attachment in a list item
+/// or blockquote, outside table cells. Legacy wrote it on the next line,
+/// where `---` under a line makes that line a level-2 heading (A9).
+fn rule_under_line_in_container(doc: &DocHandle) -> bool {
+    any_element(doc, &|txn, el, in_cell| {
+        !in_cell
+            && matches!(el.tag().as_ref(), "list_item" | "blockquote")
+            && children(txn, el).windows(2).any(|pair| {
+                matches!(written(txn, &pair[0]), Some(Written::Line { .. }))
+                    && written(txn, &pair[1]) == Some(Written::Rule)
+            })
+    })
+}
+
+/// Whether a block of `container` (a list item, or a blockquote when
+/// `in_quote`) other than a rule reads as part of the block before it when
+/// written on the next line.
+fn runs_on<T: ReadTxn>(txn: &T, container: &XmlElementRef, in_quote: bool) -> bool {
+    children(txn, container).windows(2).any(|pair| {
+        match (written(txn, &pair[0]), written(txn, &pair[1])) {
+            (Some(prev), Some(next)) => next != Written::Rule && read_into(prev, next, in_quote),
+            _ => false,
+        }
+    })
+}
+
+/// A block as Markdown writes it, for what the line right below it can do
+/// to it, and what its own first line does right below another block.
+#[derive(Clone, Copy, PartialEq)]
+enum Written {
+    /// A heading or code block. It ends on its own last line, and its first
+    /// line ends a paragraph above it.
+    Closed,
+    /// A rule. It ends on its own line, but makes a paragraph line right
+    /// above it a heading.
+    Rule,
+    /// A paragraph without content, written as a blank line.
+    Blank,
+    /// A paragraph line: a paragraph, an attachment (a link) or, when
+    /// `image`, an image or board, which the importer keeps only when it is
+    /// alone in its paragraph.
+    Line {
+        image: bool,
+    },
+    /// A list. Its first line `interrupts` a paragraph above it when its
+    /// first item has content and, if ordered, is numbered 1.
+    List {
+        interrupts: bool,
+    },
+    Quote,
+    Table,
+}
+
+fn written<T: ReadTxn>(txn: &T, block: &XmlOut) -> Option<Written> {
+    let XmlOut::Element(el) = block else {
+        return None;
+    };
+    Some(match el.tag().as_ref() {
+        "heading" | "code_block" => Written::Closed,
+        "horizontal_rule" => Written::Rule,
+        "paragraph" if !has_content(txn, el) => Written::Blank,
+        "paragraph" | "attachment" => Written::Line { image: false },
+        "image" | "excalidraw_board" => Written::Line { image: true },
+        "bullet_list" => Written::List {
+            interrupts: first_item_has_content(txn, el),
+        },
+        // Numbered from `start`, 1 when it is missing or not a number.
+        "ordered_list" => Written::List {
+            interrupts: first_item_has_content(txn, el)
+                && el
+                    .get_attribute(txn, "start")
+                    .and_then(|start| start.to_string(txn).parse::<u64>().ok())
+                    .is_none_or(|start| start == 1),
+        },
+        "blockquote" => Written::Quote,
+        "table" => Written::Table,
+        _ => return None,
+    })
+}
+
+/// Whether `paragraph` holds text or a line break.
+fn has_content<T: ReadTxn>(txn: &T, paragraph: &XmlElementRef) -> bool {
+    children(txn, paragraph).iter().any(|inline| match inline {
+        XmlOut::Text(t) => !t.get_string(txn).is_empty(),
+        XmlOut::Element(_) | XmlOut::Fragment(_) => true,
+    })
+}
+
+/// Whether the first line of `list` has content after its marker: a
+/// checkbox, or a first block other than an empty paragraph.
+fn first_item_has_content<T: ReadTxn>(txn: &T, list: &XmlElementRef) -> bool {
+    let Some(XmlOut::Element(item)) = list.get(txn, 0) else {
+        return false;
+    };
+    item.get_attribute(txn, "checked").is_some()
+        || match item.get(txn, 0) {
+            Some(XmlOut::Element(first)) if first.tag().as_ref() == "paragraph" => {
+                has_content(txn, &first)
+            }
+            Some(_) => true,
+            None => false,
+        }
+}
+
+/// Whether `next`, written on the line right below `prev`, reads as part of
+/// `prev`.
+fn read_into(prev: Written, next: Written, in_quote: bool) -> bool {
+    use Written::{Blank, Closed, Line, List, Quote, Rule, Table};
+    match (prev, next) {
+        // Nothing goes on after a heading, code block or rule, and an empty
+        // paragraph is a blank line already.
+        (Closed | Rule | Blank, _) | (_, Blank) => false,
+        (Line { .. }, Rule) => true,
+        // The importer reads each line of a quote's paragraph as a
+        // paragraph of its own, but drops an image that isn't alone in its
+        // paragraph.
+        (Line { image: false }, Line { .. }) if in_quote => false,
+        (Line { .. }, Line { .. }) => true,
+        (Line { .. }, List { interrupts }) => !interrupts,
+        (Line { .. }, Closed | Quote | Table) => false,
+        // A paragraph line or a table goes on a list or quote as a lazy
+        // continuation line, or on a table as rows, and a quote right below
+        // a quote joins it. Any other block start ends them, a list
+        // starting at any number included.
+        (List { .. } | Quote | Table, Line { .. } | Table) => true,
+        (Quote, Quote) => true,
+        (List { .. } | Quote | Table, Closed | Rule | Quote | List { .. }) => false,
+    }
 }
 
 /// The legacy export of `doc` when `doc` is healthy: the legacy export

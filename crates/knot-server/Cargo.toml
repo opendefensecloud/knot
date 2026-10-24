@@ -86,3 +86,6 @@ http-body-util = "0.1"
 tempfile = "3"
 brotli = "8"
 knot-test-support = { path = "../knot-test-support" }
+# The schema checker and tree dump in `knot_markdown::legacy::compat`, for
+# tests only.
+knot-markdown = { path = "../knot-markdown", features = ["legacy-compat"] }

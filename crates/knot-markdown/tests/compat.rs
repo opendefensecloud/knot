@@ -25,12 +25,15 @@ const RANDOM_DOCS_PER_SEED: usize = 200;
 
 /// Lower bounds on how much each differential compares, so a broken corpus
 /// can't make the harness pass by comparing nothing. Far below today's counts
-/// (about 5600 healthy documents, 2700 healthy inputs of which 27 are files,
-/// 16800 exports), leaving room for the documents bug classes exclude.
+/// (about 5000 healthy documents outside the classes, 2800 healthy inputs of
+/// which 27 are files, 17300 exports, 6600 stability inputs, 600 healthy
+/// classed documents), leaving room for the documents bug classes exclude.
 const MIN_HEALTHY_DOCS: usize = 1_000;
 const MIN_HEALTHY_INPUTS: usize = 500;
 const MIN_HEALTHY_FILE_INPUTS: usize = 15;
 const MIN_EXPORTED_DOCS: usize = 5_000;
+const MIN_STABLE_INPUTS: usize = 3_000;
+const MIN_CLASSED_DOCS: usize = 200;
 
 /// How many failures a test prints before the total.
 const SHOWN_FAILURES: usize = 10;
@@ -169,10 +172,380 @@ fn new_import_is_schema_valid_on_every_input() {
     assert_no_failures("new import breaks the schema", &failures);
 }
 
-/// Each import class names the inputs it is about, and leaves alone
-/// neighbouring inputs that import the same way as before.
+/// Generated documents whose export loses content on import for reasons
+/// outside the writing of lists and quotes, both follow-ups: an image or
+/// board in a table cell, which the cell's single line puts next to text so
+/// that the importer drops it, and a quote of empty paragraphs, which
+/// imports as an empty blockquote and then exports as nothing.
+fn loses_content_outside_lists(doc: &DocHandle) -> bool {
+    fn walk<T: ReadTxn>(txn: &T, node: &XmlOut, in_cell: bool) -> bool {
+        let XmlOut::Element(el) = node else {
+            return false;
+        };
+        let tag = el.tag();
+        let children: Vec<XmlOut> = (0..el.len(txn)).filter_map(|i| el.get(txn, i)).collect();
+        let empty_quote = tag.as_ref() == "blockquote"
+            && children.iter().all(|child| match child {
+                XmlOut::Element(p) => p.tag().as_ref() == "paragraph" && p.len(txn) == 0,
+                _ => false,
+            });
+        let in_cell = in_cell || matches!(tag.as_ref(), "table_cell" | "table_header");
+        (in_cell && matches!(tag.as_ref(), "image" | "excalidraw_board"))
+            || empty_quote
+            || children.iter().any(|child| walk(txn, child, in_cell))
+    }
+    let ydoc = doc.inner();
+    let txn = ydoc.transact();
+    txn.get_xml_fragment("default").is_some_and(|frag| {
+        (0..frag.len(&txn))
+            .filter_map(|i| frag.get(&txn, i))
+            .any(|child| walk(&txn, &child, false))
+    })
+}
+
+/// Structural idempotence (spec "Testing"): the import of the export of an
+/// import is the first import again, `parse(serialise(parse(md))) ==
+/// parse(md)` under `normalised`.
+///
+/// The inputs are the fixtures and probes, the legacy and the new export of
+/// every healthy corpus document (the Markdown the product writes today and
+/// from now on), and the new export of every generated document, which
+/// holds the nested checklists and multi-block items legacy damaged. Left
+/// out are inputs with text the writer can't write back yet
+/// (`compat::stability_exempt`, a follow-up), generated documents that lose
+/// content outside lists and quotes (`loses_content_outside_lists`), and the
+/// random corpus, whose text is full of Markdown syntax: the same follow-up.
 #[test]
-fn import_classes_name_their_inputs() {
+fn import_export_import_is_stable() {
+    let file_inputs = corpus::markdown_inputs();
+    let file_count = file_inputs.len();
+    let mut inputs = file_inputs;
+    for case in corpus_docs() {
+        if let Some(legacy_md) = compat::healthy(&case.doc) {
+            inputs.push((format!("legacy export of {}", case.name), legacy_md));
+            if let Ok(md) = knot_markdown::serialise(&YrsEngine, &case.doc) {
+                inputs.push((format!("export of healthy {}", case.name), md));
+            }
+        }
+    }
+    for case in corpus::generated() {
+        if !loses_content_outside_lists(&case.doc)
+            && let Ok(md) = knot_markdown::serialise(&YrsEngine, &case.doc)
+        {
+            inputs.push((format!("export of {}", case.name), md));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut checked = 0;
+    let mut checked_files = 0;
+    let mut failures = Vec::new();
+    for (i, (name, md)) in inputs.iter().enumerate() {
+        if !seen.insert(md.as_str()) || compat::stability_exempt(md).is_some() {
+            continue;
+        }
+        checked += 1;
+        if i < file_count {
+            checked_files += 1;
+        }
+        let (first, _) = knot_markdown::from_markdown::parse(md).expect("parse");
+        let want = compat::normalised(first.inner());
+        let again = match knot_markdown::serialise(&YrsEngine, &first) {
+            Ok(again) => again,
+            Err(e) => {
+                failures.push(format!("{name}: {md:?}\n  its import doesn't export: {e}"));
+                continue;
+            }
+        };
+        let (second, _) = knot_markdown::from_markdown::parse(&again).expect("parse");
+        let got = compat::normalised(second.inner());
+        if got != want {
+            failures.push(format!(
+                "{name}: {md:?}\n  exports as {again:?}\n  first import:\n{want}\n  import of the export:\n{got}"
+            ));
+        }
+    }
+    assert_no_failures("import of the export differs from the import", &failures);
+    assert_at_least("inputs", checked, MIN_STABLE_INPUTS);
+    assert_at_least(
+        "fixture and probe inputs",
+        checked_files,
+        MIN_HEALTHY_FILE_INPUTS,
+    );
+}
+
+/// Each export class holds the fixed-point property under the new code: a
+/// healthy, schema-valid generated document in a class exports to Markdown
+/// that the new importer and serializer give back unchanged. Documents
+/// outside the schema (an item without its leading paragraph, which the
+/// importer adds back) are the damaged shapes of the tolerant export.
+#[test]
+fn export_classes_hold_the_fixed_point() {
+    let mut compared = 0;
+    let mut failures = Vec::new();
+    for case in corpus::generated() {
+        let Some(class) = compat::export_class(&case.doc) else {
+            continue;
+        };
+        if compat::healthy(&case.doc).is_none()
+            || !compat::schema_violations(case.doc.inner()).is_empty()
+        {
+            continue;
+        }
+        compared += 1;
+        let md = knot_markdown::serialise(&YrsEngine, &case.doc).expect("serialise");
+        let (back, _) = knot_markdown::from_markdown::parse(&md).expect("parse");
+        let again = knot_markdown::serialise(&YrsEngine, &back).expect("serialise");
+        if again != md {
+            failures.push(format!(
+                "{} ({class})\n  export:    {md:?}\n  re-export: {again:?}",
+                case.name
+            ));
+        }
+    }
+    assert_no_failures("export class export is not a fixed point", &failures);
+    assert_at_least("classed healthy documents", compared, MIN_CLASSED_DOCS);
+}
+
+/// Each export class names the documents whose export it changes, and
+/// leaves alone neighbouring documents, which export byte for byte as
+/// before.
+#[test]
+fn export_classes_name_their_documents() {
+    let task =
+        |checked: bool, kids: Vec<N>| ela("list_item", vec![("checked", Any::Bool(checked))], kids);
+    let item = |kids: Vec<N>| el("list_item", kids);
+    let bullets = |items: Vec<N>| el("bullet_list", items);
+    let ordered = |start: i64, items: Vec<N>| {
+        ela(
+            "ordered_list",
+            vec![("start", Any::Number(start as f64))],
+            items,
+        )
+    };
+    let quote = |kids: Vec<N>| el("blockquote", kids);
+    let cell = |kids: Vec<N>| {
+        el(
+            "table",
+            vec![
+                el("table_row", vec![el("table_header", vec![p("h")])]),
+                el("table_row", vec![el("table_cell", kids)]),
+            ],
+        )
+    };
+    let image = || {
+        ela(
+            "image",
+            vec![("src", Any::from("x.png")), ("alt", Any::from("x"))],
+            Vec::new(),
+        )
+    };
+    let attachment = || {
+        ela(
+            "attachment",
+            vec![("url", Any::from("/api/blobs/1")), ("name", Any::from("f"))],
+            Vec::new(),
+        )
+    };
+    let rule = || el("horizontal_rule", Vec::new());
+    let heading = || ela("heading", vec![("level", Any::from("2"))], vec![text("h")]);
+    let code = || el("code_block", vec![text("c")]);
+    let line_break = || el("paragraph", vec![text("a"), hard_break(), text("b")]);
+    let nested = |inner: N| vec![p("a"), bullets(vec![inner])];
+
+    let cases: Vec<(&str, Vec<N>, Option<&str>)> = vec![
+        (
+            "nested checklist",
+            vec![bullets(vec![task(false, nested(task(true, vec![p("b")])))])],
+            Some("nested_tasklist"),
+        ),
+        (
+            "task item with a line break",
+            vec![bullets(vec![task(false, vec![line_break()])])],
+            Some("nested_tasklist"),
+        ),
+        (
+            "task item starting with a heading",
+            vec![bullets(vec![task(true, vec![heading()])])],
+            Some("nested_tasklist"),
+        ),
+        (
+            "task item without blocks",
+            vec![bullets(vec![task(true, Vec::new())])],
+            Some("nested_tasklist"),
+        ),
+        (
+            "one-line task items",
+            vec![bullets(vec![
+                task(false, vec![p("a")]),
+                task(true, vec![p("b")]),
+            ])],
+            None,
+        ),
+        (
+            "task item holding an attachment",
+            vec![bullets(vec![task(true, vec![attachment()])])],
+            None,
+        ),
+        (
+            "bullet with a nested bullet",
+            vec![bullets(vec![item(nested(item(vec![p("b")])))])],
+            None,
+        ),
+        (
+            "nested checklist in a table cell",
+            vec![cell(vec![bullets(vec![task(
+                false,
+                nested(task(true, vec![p("b")])),
+            )])])],
+            None,
+        ),
+        (
+            "two paragraphs in an item",
+            vec![bullets(vec![item(vec![p("a"), p("b")])])],
+            Some("multi_block_item"),
+        ),
+        (
+            "a paragraph and an image in an item",
+            vec![bullets(vec![item(vec![p("a"), image()])])],
+            Some("multi_block_item"),
+        ),
+        (
+            "a paragraph and a list at 3 in an item",
+            vec![ordered(
+                2,
+                vec![item(vec![p("a"), ordered(3, vec![item(vec![p("o")])])])],
+            )],
+            Some("multi_block_item"),
+        ),
+        (
+            "a paragraph after a nested list",
+            vec![bullets(vec![item(vec![
+                p("a"),
+                bullets(vec![item(vec![p("b")])]),
+                p("c"),
+            ])])],
+            Some("multi_block_item"),
+        ),
+        (
+            "a paragraph after a quote in an item",
+            vec![bullets(vec![item(vec![
+                p("a"),
+                quote(vec![p("q")]),
+                p("c"),
+            ])])],
+            Some("multi_block_item"),
+        ),
+        (
+            "blocks that end or interrupt the block above in an item",
+            vec![bullets(vec![item(vec![
+                p("a"),
+                code(),
+                p("b"),
+                ordered(1, vec![item(vec![p("o")])]),
+                ordered(3, vec![item(vec![p("t")])]),
+                heading(),
+                p("c"),
+                cell(vec![p("d")]),
+            ])])],
+            None,
+        ),
+        (
+            "two paragraphs in a table cell's item",
+            vec![cell(vec![bullets(vec![item(vec![p("a"), p("b")])])])],
+            None,
+        ),
+        (
+            "a list then a paragraph in a quote",
+            vec![quote(vec![bullets(vec![item(vec![p("a")])]), p("b")])],
+            Some("quote_block_sequence"),
+        ),
+        (
+            "a paragraph then a list at 3 in a quote",
+            vec![quote(vec![p("a"), ordered(3, vec![item(vec![p("o")])])])],
+            Some("quote_block_sequence"),
+        ),
+        (
+            "two quotes in a quote",
+            vec![quote(vec![quote(vec![p("a")]), quote(vec![p("b")])])],
+            Some("quote_block_sequence"),
+        ),
+        (
+            "an image then a paragraph in a quote",
+            vec![quote(vec![image(), p("b")])],
+            Some("quote_block_sequence"),
+        ),
+        (
+            "paragraphs, an image and an attachment in a quote",
+            vec![
+                quote(vec![p("a"), p("b"), image()]),
+                quote(vec![p("a"), attachment(), p("c")]),
+            ],
+            None,
+        ),
+        (
+            "an ordered task item",
+            vec![ordered(1, vec![task(true, vec![p("a")])])],
+            Some("ordered_checkbox"),
+        ),
+        (
+            "an ordered task item in a table cell",
+            vec![cell(vec![ordered(1, vec![task(false, vec![p("a")])])])],
+            Some("ordered_checkbox"),
+        ),
+        (
+            "an ordered list",
+            vec![ordered(1, vec![item(vec![p("a")]), item(vec![p("b")])])],
+            None,
+        ),
+        (
+            "a rule under a paragraph in an item",
+            vec![bullets(vec![item(vec![p("a"), rule()])])],
+            Some("rule_in_container"),
+        ),
+        (
+            "a rule under an image in a quote",
+            vec![quote(vec![image(), rule()])],
+            Some("rule_in_container"),
+        ),
+        (
+            "rules after a heading, a list and a quote",
+            vec![
+                quote(vec![heading(), rule()]),
+                bullets(vec![item(vec![
+                    p("a"),
+                    bullets(vec![item(vec![p("b")])]),
+                    rule(),
+                    quote(vec![p("q")]),
+                    rule(),
+                ])]),
+            ],
+            None,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (what, blocks, want) in cases {
+        let doc = build(&blocks);
+        let got = compat::export_class(&doc);
+        if got != want {
+            failures.push(format!("{what}: class {got:?}, expected {want:?}"));
+        }
+        let legacy_md = legacy::serialise(&YrsEngine, &doc).expect("legacy serialise");
+        let md = knot_markdown::serialise(&YrsEngine, &doc).expect("serialise");
+        if (md != legacy_md) != want.is_some() {
+            failures.push(format!(
+                "{what}: class {want:?}, but the export changed: {}\n  legacy: {legacy_md:?}\n  new:    {md:?}",
+                md != legacy_md
+            ));
+        }
+    }
+    assert_no_failures("export class is wrong", &failures);
+}
+
+/// The stability exemptions name the inputs they are about, and none of them
+/// is an import class: those inputs import as they always did.
+#[test]
+fn stability_exemptions_name_their_inputs() {
     let cases: &[(&str, Option<&str>)] = &[
         ("\\*not em\\*\n", Some("markdown_escaping")),
         ("- \\[x\\] not a task\n", Some("markdown_escaping")),
@@ -185,6 +558,27 @@ fn import_classes_name_their_inputs() {
         ("*\\\nb*\n", Some("leading_hard_break")),
         ("![a](x.png)\\\nb\n", Some("leading_hard_break")),
         ("a  \nb\n", None),
+    ];
+    let mut failures = Vec::new();
+    for (md, want) in cases {
+        let got = compat::stability_exempt(md);
+        if got != *want {
+            failures.push(format!("{md:?}: exemption {got:?}, expected {want:?}"));
+        }
+        if let Some(class) = compat::import_class(md)
+            && matches!(class, "markdown_escaping" | "leading_hard_break")
+        {
+            failures.push(format!("{md:?}: import class {class}"));
+        }
+    }
+    assert_no_failures("stability exemption is wrong", &failures);
+}
+
+/// Each import class names the inputs it is about, and leaves alone
+/// neighbouring inputs that import the same way as before.
+#[test]
+fn import_classes_name_their_inputs() {
+    let cases: &[(&str, Option<&str>)] = &[
         ("- # h\n", Some("item_first_child_not_paragraph")),
         ("- a\n-\n- c\n", Some("item_first_child_not_paragraph")),
         ("- ![a](x.png)\n", Some("item_first_child_not_paragraph")),
