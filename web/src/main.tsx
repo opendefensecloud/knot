@@ -9,11 +9,13 @@ import { SessionProvider } from "./auth/SessionContext";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { queryClient } from "./lib/queryClient";
 import { router } from "./routes";
-import { readInitialSidebarWidth, readInitialSkin, stampSidebarWidth, stampSkin } from "./stores/ui";
+import { readInitialSidebarWidth, resolveInitialSkin, stampSidebarWidth, stampSkin } from "./stores/ui";
 
 // Stamp data-skin + data-theme before first paint so a dark-skin user
-// never sees the light palette flash in before React hydrates.
-stampSkin(readInitialSkin());
+// never sees the light palette flash in before React hydrates. The stamp
+// is the resolved skin, not just the one picked by hand, so a sun-mode
+// user opening a laptop after dark gets the dark skin at first paint.
+stampSkin(resolveInitialSkin());
 
 // Stamped before first paint, like the theme above, so a wide-mode user
 // never sees the narrow column flash in before React hydrates.
