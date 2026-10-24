@@ -103,7 +103,7 @@ export const TZ_COORDS: Readonly<Record<string, readonly [number, number]>> = {
   "America/Chicago": [41.85, -87.65],
   "America/Chihuahua": [28.63, -106.08],
   "America/Ciudad_Juarez": [31.73, -106.48],
-  "America/Coral_Harbour": [8.97, -79.53],
+  "America/Coral_Harbour": [48.76, -91.62],
   "America/Cordoba": [-31.4, -64.18],
   "America/Costa_Rica": [9.93, -84.08],
   "America/Coyhaique": [-45.57, -72.07],

@@ -36,10 +36,12 @@ export function locationForZone(zone: string | null, offsetMinutes: number): Res
     const [lat, lon] = TZ_COORDS[zone]!;
     return { loc: { lat, lon }, source: { kind: "zone", zone } };
   }
-  // The earth turns a degree every four minutes. An offset past twelve
-  // hours (Kiribati keeps UTC+14) would cross the antimeridian, so it is
-  // clamped, and `+ 0` turns the -0 of a zero offset into 0.
-  const lon = Math.min(180, Math.max(-180, -offsetMinutes / 4)) + 0;
+  // Only zones the table doesn't know get here: Etc/GMT±N, UTC, and zones
+  // newer than the bundled tzdata. The earth turns a degree every four
+  // minutes, so the offset names a meridian. One past twelve hours lies
+  // beyond the antimeridian and wraps round to it from the west (UTC+14 is
+  // 150° W), and `+ 0` keeps a -0 out.
+  const lon = ((-offsetMinutes / 4 + 540) % 360) - 180 + 0;
   return { loc: { lat: 0, lon }, source: { kind: "unplaced", zone } };
 }
 
@@ -53,10 +55,12 @@ export function resolveSunLocation(typed: LatLon | null, now: Date): ResolvedSun
 }
 
 /** A latitude or longitude as typed: decimal degrees, an optional sign,
- *  and `.` or `,` as the decimal separator, within ±`limit`. Anything else
- *  is `null`, exponents (`1e2`) and a second separator included. */
+ *  and `.` or `,` as the decimal separator, within ±`limit`. The minus
+ *  sign (`−`, U+2212), which some keyboards and pasted text use, counts as
+ *  `-`. Anything else is `null`, exponents (`1e2`) and a second separator
+ *  included. */
 export function parseCoordinate(raw: string, limit: 90 | 180): number | null {
-  const text = raw.trim();
+  const text = raw.trim().replace("\u2212", "-");
   if (!/^[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)$/.test(text)) return null;
   const n = Number(text.replace(",", "."));
   return Math.abs(n) <= limit ? n : null;

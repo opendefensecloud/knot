@@ -8,6 +8,7 @@
 // zone.tab gives each zone the coordinates of its principal city. `backward`
 // adds the names zones were renamed or merged from, which browsers still
 // report: Chrome follows ICU, which keeps `Asia/Calcutta` and `Europe/Kiev`.
+// A few names ICU uses differently from `backward` are fixed by hand.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -78,6 +79,18 @@ for (const name of links.keys()) {
   const at = locate(name);
   // Links into Etc/* have nowhere to point, and are left out.
   if (at) table.set(name, at);
+}
+
+// Names ICU reports for a zone whose `backward` link leads somewhere else,
+// mapped to the zone they stand for, overriding the link. ICU keeps
+// America/Coral_Harbour as the canonical name for Atikokan, Ontario, but
+// `backward` links it to America/Panama, which would put a browser in
+// Ontario at the Panama Canal. zone.tab lists Atikokan at +484531-0913718
+// with the comment "ON (Atikokan), NU (Coral H)".
+const ICU_ALIASES = { "America/Coral_Harbour": "America/Atikokan" };
+for (const [alias, zone] of Object.entries(ICU_ALIASES)) {
+  if (!coords.has(zone)) throw new Error(`zone.tab: no coordinates for ${zone}, which ${alias} stands for`);
+  table.set(alias, coords.get(zone));
 }
 
 const version = read("version").trim();

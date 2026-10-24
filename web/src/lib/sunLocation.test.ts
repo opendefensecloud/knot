@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -32,8 +33,24 @@ describe("TZ_COORDS", () => {
     }
   });
 
+  it("follows a link's nearer target first", () => {
+    // `backward` points Africa/Asmera at Nairobi, with Asmara as its #= target.
+    expect(TZ_COORDS["Africa/Asmera"]).toEqual(TZ_COORDS["Africa/Asmara"]);
+  });
+
+  it("keeps zone.tab's own coordinates for a zone that is also a link", () => {
+    expect(TZ_COORDS["Africa/Accra"]).not.toEqual(TZ_COORDS["Africa/Abidjan"]);
+  });
+
+  it("places ICU's name for Atikokan at Atikokan, not Panama", () => {
+    expect(TZ_COORDS["America/Coral_Harbour"]).toEqual(TZ_COORDS["America/Atikokan"]);
+  });
+
   it("stays under 10 KB gzipped", () => {
-    expect(gzipSync(readFileSync("src/lib/tzCoords.generated.ts")).length).toBeLessThan(10_240);
+    // Next to this file, wherever vitest runs from. Not `new URL("…",
+    // import.meta.url)`, which Vite rewrites into an http asset URL.
+    const table = readFileSync(join(import.meta.dirname, "tzCoords.generated.ts"));
+    expect(gzipSync(table).length).toBeLessThan(10_240);
   });
 });
 
@@ -62,9 +79,10 @@ describe("locationForZone", () => {
     expect(locationForZone("constructor", 0).source).toEqual({ kind: "unplaced", zone: "constructor" });
   });
 
-  it("clamps an offset past the antimeridian", () => {
-    // UTC+14 implies 210 degrees east.
-    expect(locationForZone("Etc/GMT-14", -840).loc.lon).toBe(180);
+  it("wraps an offset past the antimeridian round to its meridian", () => {
+    // UTC+14 implies 210 degrees east, which is 150 west; UTC+13, 165 west.
+    expect(locationForZone("Etc/GMT-14", -840).loc.lon).toBe(-150);
+    expect(locationForZone("Etc/GMT-13", -780).loc.lon).toBe(-165);
   });
 });
 
@@ -108,6 +126,10 @@ describe("parseCoordinate", () => {
     expect(parseCoordinate(" 52,52 ", 90)).toBe(52.52);
     expect(parseCoordinate("+13.4", 180)).toBe(13.4);
     expect(parseCoordinate("-90", 90)).toBe(-90);
+  });
+
+  it("takes the minus sign for a hyphen", () => {
+    expect(parseCoordinate("\u221233.87", 90)).toBe(-33.87);
   });
 
   it("rejects anything that isn't a plain number within the limit", () => {
