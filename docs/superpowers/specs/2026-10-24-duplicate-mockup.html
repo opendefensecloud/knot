@@ -1,0 +1,105 @@
+<title>knot Duplicate Page</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+  /* Layout: two steps side by side (stacking on phones): the context menu, then the duplicate dialog. */
+  :root {
+    --page: #f3f3f0; --ink: #1c1c1a; --ink-muted: #6d6d65;
+    --app-bg: #fbfbf9; --surface: #ffffff; --muted: #ececE6; --border: #dcdcd5;
+    --accent: #2f6fdf; --accent-fg: #ffffff; --accent-soft: #e3ecfd;
+    --shadow: 0 10px 28px rgba(0,0,0,0.12); --scrim: rgba(20,20,18,0.28);
+    --font: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --page:#151514; --ink:#ecece7; --ink-muted:#9a9a91; --app-bg:#1e1e1c; --surface:#262624; --muted:#31312e; --border:#3b3b37;
+    --accent:#6b9cf0; --accent-fg:#10131a; --accent-soft:#24324d; --shadow:0 10px 28px rgba(0,0,0,.5); --scrim:rgba(0,0,0,.5); color-scheme: dark; } }
+  :root[data-theme="dark"] {
+    --page:#151514; --ink:#ecece7; --ink-muted:#9a9a91; --app-bg:#1e1e1c; --surface:#262624; --muted:#31312e; --border:#3b3b37;
+    --accent:#6b9cf0; --accent-fg:#10131a; --accent-soft:#24324d; --shadow:0 10px 28px rgba(0,0,0,.5); --scrim:rgba(0,0,0,.5); color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { background: var(--page); color: var(--ink); font-family: var(--font); line-height: 1.45;
+    padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 24px 40px; }
+  .wrap { max-width: 860px; margin: 0 auto; display: grid; gap: 24px; }
+  h1 { font-size: 1.35rem; margin: 0 0 4px; text-wrap: balance; }
+  header p { margin: 0; color: var(--ink-muted); font-size: .95rem; }
+  .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+  .step h2 { font-size: .95rem; margin: 0 0 8px; }
+  .frame { position: relative; border: 1px solid var(--border); border-radius: 10px; background: var(--app-bg); height: 300px; overflow: hidden; font-size: 13px; }
+  .side { position: absolute; inset: 0 auto 0 0; width: 190px; border-right: 1px solid var(--border); padding: 10px 8px; }
+  .row { padding: 4px 6px; border-radius: 5px; color: var(--ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row.l1 { padding-left: 20px; } .row.on { background: var(--muted); color: var(--ink); }
+  .row.new { background: var(--accent-soft); color: var(--ink); }
+  .menu { position: absolute; left: 120px; top: 74px; width: 170px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); padding: 4px; }
+  .mi { padding: 6px 8px; border-radius: 5px; color: var(--ink); }
+  .mi.hl { background: var(--accent-soft); }
+  .mi.danger { color: #c2410c; }
+  .scrim { position: absolute; inset: 0; background: var(--scrim); display: grid; place-items: center; padding: 12px; }
+  .dialog { width: min(320px, 100%); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); padding: 16px; display: grid; gap: 12px; }
+  .dialog h3 { margin: 0; font-size: 15px; }
+  .check { display: flex; gap: 8px; align-items: flex-start; }
+  .box { width: 16px; height: 16px; border: 1.5px solid var(--ink-muted); border-radius: 3px; flex: none; margin-top: 2px; }
+  .hint { color: var(--ink-muted); font-size: 12px; }
+  .btns { display: flex; justify-content: flex-end; gap: 8px; }
+  .btn { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--ink); }
+  .btn.p { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+  footer { color: var(--ink-muted); font-size: .9rem; }
+</style>
+<div class="wrap">
+  <header>
+    <h1>Duplicating a page</h1>
+    <p>Sketch for discussion. The copy appears right below the original and opens.</p>
+  </header>
+  <div class="steps">
+    <section class="step">
+      <h2>1 · Right-click the page in the sidebar</h2>
+      <div class="frame">
+        <div class="side">
+          <div class="row">Team handbook</div>
+          <div class="row on">Q4 planning</div>
+          <div class="row l1">Milestones</div>
+          <div class="row l1">Budget</div>
+          <div class="row l1">Retro notes</div>
+          <div class="row">Meeting notes</div>
+        </div>
+        <div class="menu">
+          <div class="mi">Rename</div>
+          <div class="mi hl">Duplicate…</div>
+          <div class="mi">Move to archive</div>
+        </div>
+      </div>
+    </section>
+    <section class="step">
+      <h2>2 · Choose whether subpages come along</h2>
+      <div class="frame">
+        <div class="side">
+          <div class="row">Team handbook</div>
+          <div class="row on">Q4 planning</div>
+          <div class="row l1">Milestones</div>
+        </div>
+        <div class="scrim">
+          <div class="dialog" role="dialog" aria-label="Duplicate page">
+            <h3>Duplicate “Q4 planning”</h3>
+            <div class="check"><span class="box" aria-hidden="true"></span>
+              <div>Include its 3 subpages<div class="hint">Every subpage is copied with all its content, drawings and files.</div></div></div>
+            <div class="hint">The copy gets its own drawings and files, so it keeps working if the original is archived.</div>
+            <div class="btns"><span class="btn">Cancel</span><span class="btn p">Duplicate</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="step">
+      <h2>3 · The copy lands right below and opens</h2>
+      <div class="frame">
+        <div class="side">
+          <div class="row">Team handbook</div>
+          <div class="row">Q4 planning</div>
+          <div class="row l1">Milestones</div>
+          <div class="row l1">Budget</div>
+          <div class="row l1">Retro notes</div>
+          <div class="row new">Q4 planning (copy)</div>
+          <div class="row">Meeting notes</div>
+        </div>
+      </div>
+    </section>
+  </div>
+  <footer>Pages without subpages skip the question and duplicate straight away. Reply in the chat with what's wrong or missing.</footer>
+</div>
