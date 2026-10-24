@@ -662,3 +662,156 @@ async fn workspace_import_keeps_list_line_breaks_and_nested_checklists() {
     assert_eq!(export(&f.app, &sid, &csrf, imported).await, md);
     assert_schema_valid(&stored_doc(&f.pool, imported).await);
 }
+
+// ---------------------------------------------------------------------------
+// Pages the old importer damaged export healed, and the routes that rebuild a
+// page from its own Markdown heal it (spec A10, "Tolerant export").
+// ---------------------------------------------------------------------------
+
+/// The Markdown the old importer split: a list item with a line break.
+const LINE_BREAK_ITEM: &str = "- first  \n  second\n";
+
+/// The page the old importer stored for [`LINE_BREAK_ITEM`]: its list item
+/// holds `paragraph, hard_break, paragraph`, which the schema forbids and
+/// which failed every export.
+fn damaged_page() -> DocHandle {
+    let (doc, _) = knot_markdown::legacy::parse(LINE_BREAK_ITEM).unwrap();
+    assert!(
+        !compat::schema_violations(doc.inner()).is_empty(),
+        "the old importer's page is not damaged"
+    );
+    doc
+}
+
+/// Stores `doc` as the page's content before any room has loaded it.
+async fn seed(f: &Fixture, doc: &DocHandle) {
+    let bytes = YrsEngine.encode_state_as_update(doc, None).unwrap();
+    PgUpdatesStore::new(f.pool.clone())
+        .insert_batch(f.doc_id, &[(Some(f.owner_id), bytes)])
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn markdown_of_damaged_page_is_healed() {
+    let f = fixture().await;
+    let (sid, csrf) = login(&f.app, "alice@example.com").await;
+
+    // The damaged list item, and a node no version of the schema has.
+    let doc = damaged_page();
+    {
+        use yrs::{Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+        let ydoc = doc.inner();
+        let frag = ydoc.get_or_insert_xml_fragment("default");
+        let mut txn = ydoc.transact_mut();
+        let callout = frag.push_back(&mut txn, XmlElementPrelim::empty("callout"));
+        let para = callout.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+        para.push_back(&mut txn, XmlTextPrelim::new("note"));
+    }
+    seed(&f, &doc).await;
+
+    assert_eq!(
+        export(&f.app, &sid, &csrf, f.doc_id).await,
+        format!("{LINE_BREAK_ITEM}\nnote\n")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_restore_heals_a_damaged_page() {
+    let f = fixture().await;
+    let (sid, csrf) = login(&f.app, "alice@example.com").await;
+
+    // As in `history_restore_keeps_nested_checklists`: other current content,
+    // then the damaged page as a history snapshot once the room runs.
+    assert_eq!(
+        import(
+            &f.app,
+            &sid,
+            &csrf,
+            f.doc_id,
+            Some("replace"),
+            "# Current\n"
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let snapshot = damaged_page();
+    let state_bytes = YrsEngine.encode_state_as_update(&snapshot, None).unwrap();
+    let state_vector = YrsEngine.encode_state_vector(&snapshot).unwrap();
+    PgSnapshotStore::new(f.pool.clone())
+        .insert(f.doc_id, 1, &state_bytes, &state_vector)
+        .await
+        .unwrap();
+
+    let (status, body) = post_raw(
+        &f.app,
+        &sid,
+        &csrf,
+        &format!("/api/docs/{}/history/1/restore", f.doc_id),
+        "application/json",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "restore: {}",
+        String::from_utf8_lossy(&body)
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(export(&f.app, &sid, &csrf, f.doc_id).await, LINE_BREAK_ITEM);
+    let stored = stored_doc(&f.pool, f.doc_id).await;
+    assert_schema_valid(&stored);
+    let (healed, _) = knot_markdown::from_markdown::parse(LINE_BREAK_ITEM).unwrap();
+    assert_eq!(
+        compat::normalised(stored.inner()),
+        compat::normalised(healed.inner()),
+        "the restore didn't store the healed line break"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn from_template_heals_a_damaged_template() {
+    let f = fixture().await;
+    let (sid, csrf) = login(&f.app, "alice@example.com").await;
+
+    seed(&f, &damaged_page()).await;
+    let (status, body) = post_raw(
+        &f.app,
+        &sid,
+        &csrf,
+        &format!("/api/docs/{}/template", f.doc_id),
+        "application/json",
+        r#"{"is_template":true}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "set template: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = post_raw(
+        &f.app,
+        &sid,
+        &csrf,
+        &format!("/api/docs/from-template/{}", f.doc_id),
+        "application/json",
+        "{}",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "from-template: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let new_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(export(&f.app, &sid, &csrf, new_id).await, LINE_BREAK_ITEM);
+    assert_schema_valid(&stored_doc(&f.pool, new_id).await);
+}

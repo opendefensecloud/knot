@@ -1,4 +1,12 @@
 //! Walks the canonical "default" XmlFragment of a Y.Doc and emits Markdown.
+//!
+//! The export is tolerant: it writes every page, whatever it holds (spec
+//! "Tolerant export").
+//! - Text and hard breaks the old importer left directly in a block
+//!   container are written as the paragraphs it split them from
+//!   ([`crate::normalise`], P3).
+//! - A node the schema doesn't name is written as its text (P4).
+//!   [`serialise_with_report`] names them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,11 +15,18 @@ use knot_crdt::{DocHandle, YrsEngine};
 use thiserror::Error;
 use yrs::types::text::YChange;
 use yrs::{
-    Any, GetString, Out, ReadTxn, Text, Transact, Xml, XmlElementRef, XmlFragment, XmlTextRef,
+    Any, GetString, Out, ReadTxn, Text, Transact, Xml, XmlElementRef, XmlFragment, XmlOut,
+    XmlTextRef,
 };
+
+use crate::normalise::{Child, block_children};
+use crate::schema::{MarkKind, mark_serialization};
 
 /// Per-run formatting attributes: `mark_name → Any value`.
 type RunAttrs = HashMap<Arc<str>, Any>;
+
+/// The tags of the unknown nodes written so far, in document order.
+type Unknown = Vec<String>;
 
 /// Read an XML attribute as a plain `String`.
 ///
@@ -28,26 +43,35 @@ fn attr<X: Xml, T: ReadTxn>(el: &X, txn: &T, name: &str) -> Option<String> {
 pub enum SerError {
     #[error("yrs read: {0}")]
     Yrs(String),
+    /// No longer returned: an unknown node is written as its text (P4).
     #[error("unsupported node: {0}")]
     UnsupportedNode(String),
 }
 
-pub fn serialise(_engine: &YrsEngine, doc: &DocHandle) -> Result<String, SerError> {
+pub fn serialise(engine: &YrsEngine, doc: &DocHandle) -> Result<String, SerError> {
+    serialise_with_report(engine, doc).map(|(md, _)| md)
+}
+
+/// [`serialise`], with the tags of the nodes it wrote as their text because
+/// the schema doesn't name them there, in document order (P4).
+pub fn serialise_with_report(
+    _engine: &YrsEngine,
+    doc: &DocHandle,
+) -> Result<(String, Vec<String>), SerError> {
     let yrs_doc = doc.inner();
     let txn = yrs_doc.transact();
+    let mut unknown = Unknown::new();
 
     let frag = match txn.get_xml_fragment("default") {
         Some(f) => f,
-        None => return Ok("\n".to_string()),
+        None => return Ok(("\n".to_string(), unknown)),
     };
 
     let mut buf = String::new();
-    let len = frag.len(&txn);
-    for i in 0..len {
-        let child = frag
-            .get(&txn, i)
-            .ok_or_else(|| SerError::Yrs("child missing".into()))?;
-        write_block(&mut buf, &txn, &child)?;
+    let children = written_children(&txn, &frag);
+    let len = children.len();
+    for (i, child) in children.iter().enumerate() {
+        write_child(&mut buf, &txn, child, &mut unknown)?;
         if i + 1 < len {
             buf.push('\n');
         }
@@ -55,23 +79,63 @@ pub fn serialise(_engine: &YrsEngine, doc: &DocHandle) -> Result<String, SerErro
     if !buf.ends_with('\n') {
         buf.push('\n');
     }
-    Ok(buf)
+    Ok((buf, unknown))
 }
 
-fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Result<(), SerError> {
-    use yrs::XmlOut;
-    let el = match node {
-        XmlOut::Element(el) => el,
-        _ => {
-            return Err(SerError::UnsupportedNode(
-                "non-element at block level".into(),
-            ));
-        }
+/// The blocks of `parent`, a block container, as they are written: its
+/// children repaired ([`block_children`]), without the runs that hold no
+/// text, only hard breaks. Written without them ([`write_inlines`]), such a
+/// paragraph would be an empty line between two blocks, which Markdown reads
+/// as nothing. A container of nothing but such runs keeps one, as an empty
+/// paragraph, so that it is written as one (an empty item `- `, a quote `>`).
+fn written_children<T: ReadTxn, F: XmlFragment>(txn: &T, parent: &F) -> Vec<Child> {
+    let mut children = block_children(txn, parent);
+    let textless = |child: &Child| match child {
+        Child::Para(inlines) => inlines.iter().all(|inline| match inline {
+            XmlOut::Text(t) => t.len(txn) == 0,
+            XmlOut::Element(el) => el.tag().as_ref() == "hard_break",
+            XmlOut::Fragment(_) => false,
+        }),
+        Child::Block(_) => false,
     };
+    if children.iter().all(textless) {
+        children.truncate(1);
+    } else {
+        children.retain(|child| !textless(child));
+    }
+    children
+}
+
+/// Writes `child`, a block of a block container.
+fn write_child<T: ReadTxn>(
+    buf: &mut String,
+    txn: &T,
+    child: &Child,
+    unknown: &mut Unknown,
+) -> Result<(), SerError> {
+    match child {
+        Child::Block(el) => write_block(buf, txn, el, unknown),
+        Child::Para(inlines) => {
+            write_inlines(buf, txn, inlines, true, unknown);
+            buf.push('\n');
+            Ok(())
+        }
+    }
+}
+
+/// Writes `el`, an element of a block container. One the schema doesn't name
+/// there (a node it doesn't know, or a list item, row or cell out of place)
+/// is written as its text, a paragraph, as knot-export does (P4).
+fn write_block<T: ReadTxn>(
+    buf: &mut String,
+    txn: &T,
+    el: &XmlElementRef,
+    unknown: &mut Unknown,
+) -> Result<(), SerError> {
     let tag = el.tag().to_string();
     match tag.as_str() {
         "paragraph" => {
-            write_inlines(buf, txn, el)?;
+            write_inlines(buf, txn, &children(txn, el), false, unknown);
             buf.push('\n');
         }
         "heading" => {
@@ -83,12 +147,12 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
                 buf.push('#');
             }
             buf.push(' ');
-            write_inlines(buf, txn, el)?;
+            write_inlines(buf, txn, &children(txn, el), false, unknown);
             buf.push('\n');
         }
         "blockquote" => {
             let mut lines = Vec::new();
-            write_quote(&mut lines, txn, el)?;
+            write_quote(&mut lines, txn, el, unknown)?;
             write_lines(buf, lines);
         }
         "code_block" => {
@@ -136,14 +200,10 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
                     // Serialise cell content. Cells contain `block+` but for GFM
                     // we collapse to a single inline line: write each block then
                     // strip newlines and join with a space.
-                    let clen = cell_el.len(txn);
                     let mut text = String::new();
-                    for k in 0..clen {
-                        let child = cell_el
-                            .get(txn, k)
-                            .ok_or_else(|| SerError::Yrs("cell child".into()))?;
+                    for child in written_children(txn, &cell_el) {
                         let mut inner = String::new();
-                        write_cell_block(&mut inner, txn, &child)?;
+                        write_cell_block(&mut inner, txn, &child, unknown)?;
                         let inline = inner.replace('|', "\\|").replace('\n', " ");
                         let inline = inline.trim();
                         if !text.is_empty() && !inline.is_empty() {
@@ -239,13 +299,78 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
         "bullet_list" | "ordered_list" => {
             let mut lines = Vec::new();
             for (item, marker) in list_items(txn, el)? {
-                write_list_item(&mut lines, txn, &item, &marker)?;
+                write_list_item(&mut lines, txn, &item, &marker, unknown)?;
             }
             write_lines(buf, lines);
         }
-        other => return Err(SerError::UnsupportedNode(other.into())),
+        _ => {
+            unknown.push(tag);
+            buf.push_str(&flatten_text(txn, el));
+            buf.push('\n');
+        }
     }
     Ok(())
+}
+
+/// The block group of `tools/schema.json`.
+const BLOCKS: &[&str] = &[
+    "paragraph",
+    "heading",
+    "blockquote",
+    "code_block",
+    "horizontal_rule",
+    "bullet_list",
+    "ordered_list",
+    "excalidraw_board",
+    "image",
+    "attachment",
+    "table",
+];
+
+fn children<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> Vec<XmlOut> {
+    (0..el.len(txn)).filter_map(|i| el.get(txn, i)).collect()
+}
+
+/// Whether `el` is a paragraph written as no text: it holds no text, line
+/// break or unknown node with text.
+fn is_empty_paragraph<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> bool {
+    el.tag().as_ref() == "paragraph"
+        && children(txn, el).iter().all(|inline| match inline {
+            XmlOut::Text(t) => t.len(txn) == 0,
+            XmlOut::Element(el) => {
+                el.tag().as_ref() != "hard_break" && flatten_text(txn, el).is_empty()
+            }
+            XmlOut::Fragment(_) => false,
+        })
+}
+
+/// All text below `el`, in document order and without marks, as knot-export
+/// keeps an element it doesn't know.
+fn flatten_text<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> String {
+    fn walk<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
+        match node {
+            XmlOut::Text(t) => {
+                for (text, _) in yrs_text_chunks(t, txn) {
+                    out.push_str(&text);
+                }
+            }
+            XmlOut::Element(el) => {
+                for child in children(txn, el) {
+                    walk(txn, &child, out);
+                }
+            }
+            XmlOut::Fragment(f) => {
+                for child in (0..f.len(txn)).filter_map(|i| f.get(txn, i)) {
+                    walk(txn, &child, out);
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    for child in children(txn, el) {
+        walk(txn, &child, &mut out);
+    }
+    out
 }
 
 /// The items of `list`, a bullet or an ordered list, each with the marker it
@@ -311,20 +436,18 @@ fn checkbox<T: ReadTxn>(item: &XmlElementRef, txn: &T) -> &'static str {
 fn write_cell_block<T: ReadTxn>(
     buf: &mut String,
     txn: &T,
-    node: &yrs::XmlOut,
+    child: &Child,
+    unknown: &mut Unknown,
 ) -> Result<(), SerError> {
-    let yrs::XmlOut::Element(el) = node else {
-        return write_block(buf, txn, node);
+    let Child::Block(el) = child else {
+        return write_child(buf, txn, child, unknown);
     };
     let tag = el.tag().to_string();
     match tag.as_str() {
         "blockquote" => {
-            for i in 0..el.len(txn) {
-                let child = el
-                    .get(txn, i)
-                    .ok_or_else(|| SerError::Yrs("bq child missing".into()))?;
+            for child in written_children(txn, el) {
                 let mut inner = String::new();
-                write_cell_block(&mut inner, txn, &child)?;
+                write_cell_block(&mut inner, txn, &child, unknown)?;
                 for line in inner.trim_end_matches('\n').split('\n') {
                     if line.is_empty() {
                         buf.push_str(">\n");
@@ -340,12 +463,9 @@ fn write_cell_block<T: ReadTxn>(
             for (item, marker) in list_items(txn, el)? {
                 let prefix = format!("{marker}{}", checkbox(&item, txn));
                 let pad = " ".repeat(prefix.chars().count());
-                for k in 0..item.len(txn) {
-                    let child = item
-                        .get(txn, k)
-                        .ok_or_else(|| SerError::Yrs("li body missing".into()))?;
+                for (k, child) in written_children(txn, &item).iter().enumerate() {
                     let mut inner = String::new();
-                    write_cell_block(&mut inner, txn, &child)?;
+                    write_cell_block(&mut inner, txn, child, unknown)?;
                     for (j, line) in inner.trim_end_matches('\n').split('\n').enumerate() {
                         buf.push_str(if k == 0 && j == 0 { &prefix } else { &pad });
                         buf.push_str(line);
@@ -354,7 +474,7 @@ fn write_cell_block<T: ReadTxn>(
                 }
             }
         }
-        _ => write_block(buf, txn, node)?,
+        _ => write_block(buf, txn, el, unknown)?,
     }
     Ok(())
 }
@@ -371,11 +491,16 @@ fn write_cell_block<T: ReadTxn>(
 /// an empty first paragraph (A7). Only the old importer stored such items.
 ///
 /// The same goes for an item without its first paragraph whose content has
-/// a blank line between two of its lines: the marker goes on a line of its
-/// own, as the empty paragraph the importer adds back writes it, so the
-/// export is a fixed point. Legacy wrote no empty line inside an item (it
-/// indented every line), so such an item never exported as before anyway;
-/// one without blank lines (`- ## h`) keeps its bytes.
+/// a blank line between two of its lines, or that starts with a rule (`- ---`
+/// is a rule, not an item): the marker goes on a line of its own, as the
+/// empty paragraph the importer adds back writes it, so the export is a fixed
+/// point. Legacy wrote no empty line inside an item (it indented every line),
+/// and its `- ---` read back as a rule, so such an item never exported as
+/// before anyway; one without blank lines (`- ## h`) keeps its bytes.
+///
+/// That empty paragraph, in front of a block the item could start with, is
+/// written as the item without it is, for the same reason: an item read back
+/// from `- ## h` holds it (A7), and must export as `- ## h` again.
 ///
 /// An empty item keeps its trailing space (`- `, `- [ ] `, `2. `, P2), and
 /// an item without children or checkbox writes nothing, as before.
@@ -384,22 +509,35 @@ fn write_list_item<T: ReadTxn>(
     txn: &T,
     item: &XmlElementRef,
     marker: &str,
+    unknown: &mut Unknown,
 ) -> Result<(), SerError> {
     let pad = " ".repeat(marker.chars().count());
     let checkbox = checkbox(item, txn);
+    let mut children = written_children(txn, item);
+    if let [Child::Block(first), Child::Block(second), ..] = children.as_slice()
+        && is_empty_paragraph(txn, first)
+        && !matches!(second.tag().as_ref(), "paragraph" | "attachment")
+        && BLOCKS.contains(&second.tag().as_ref())
+    {
+        children.remove(0);
+    }
     let mut lines = Vec::new();
-    write_container(&mut lines, txn, item, false)?;
-    let starts_with_text = matches!(
-        item.get(txn, 0),
-        Some(yrs::XmlOut::Element(first))
-            if matches!(first.tag().as_ref(), "paragraph" | "attachment")
-    );
-    if !starts_with_text {
+    write_container(&mut lines, txn, &children, false, unknown)?;
+    // A node the schema doesn't name is written as a paragraph of its text.
+    let first_tag = match children.first() {
+        Some(Child::Block(first)) if BLOCKS.contains(&first.tag().as_ref()) => {
+            Some(first.tag().to_string())
+        }
+        Some(_) => Some("paragraph".to_string()),
+        None => None,
+    };
+    if !matches!(first_tag.as_deref(), Some("paragraph" | "attachment")) {
         let blank_between = matches!(lines.first(), Some(Line::Text { .. }))
             && lines
                 .windows(2)
                 .any(|pair| matches!(pair, [Line::Blank, Line::Text { .. }]));
-        if !checkbox.is_empty() || blank_between {
+        let rule_first = first_tag.as_deref() == Some("horizontal_rule");
+        if !checkbox.is_empty() || blank_between || rule_first {
             lines.insert(0, Line::Blank);
         }
     }
@@ -430,9 +568,11 @@ fn write_quote<T: ReadTxn>(
     buf: &mut Vec<Line>,
     txn: &T,
     quote: &XmlElementRef,
+    unknown: &mut Unknown,
 ) -> Result<(), SerError> {
     let mut lines = Vec::new();
-    write_container(&mut lines, txn, quote, true)?;
+    let children = written_children(txn, quote);
+    write_container(&mut lines, txn, &children, true, unknown)?;
     buf.extend(lines.into_iter().map(|line| match line {
         Line::Text { text, open } if !text.is_empty() => Line::Text {
             text: format!("> {text}"),
@@ -464,9 +604,9 @@ enum Line {
     Blank,
 }
 
-/// Writes the child blocks of a list item or, when `in_quote`, a blockquote
-/// into `buf`, for the caller to put the item's indent or the quote's `> `
-/// in front of each line.
+/// Writes `children`, the blocks of a list item or, when `in_quote`, a
+/// blockquote ([`block_children`]), into `buf`, for the caller to put the
+/// item's indent or the quote's `> ` in front of each line.
 ///
 /// Legacy wrote the blocks one right below the other, where Markdown reads
 /// some of them as part of the block above (A5, A6, A9): a paragraph runs on
@@ -479,15 +619,13 @@ enum Line {
 fn write_container<T: ReadTxn>(
     buf: &mut Vec<Line>,
     txn: &T,
-    parent: &XmlElementRef,
+    children: &[Child],
     in_quote: bool,
+    unknown: &mut Unknown,
 ) -> Result<(), SerError> {
     let mut prev: Option<Block> = None;
-    for i in 0..parent.len(txn) {
-        let child = parent
-            .get(txn, i)
-            .ok_or_else(|| SerError::Yrs("container child missing".into()))?;
-        let (block, lines) = block_lines(txn, &child)?;
+    for child in children {
+        let (block, lines) = block_lines(txn, child, unknown)?;
         if prev.is_some_and(|prev| prev.needs_blank_line_before(block, in_quote)) {
             buf.push(Line::Blank);
         }
@@ -497,25 +635,29 @@ fn write_container<T: ReadTxn>(
     Ok(())
 }
 
-/// `node`, a block of a list item or blockquote, as lines without the blank
+/// `child`, a block of a list item or blockquote, as lines without the blank
 /// lines it ends with, and as a [`Block`]. A block written as nothing is one
 /// blank line.
-fn block_lines<T: ReadTxn>(txn: &T, node: &yrs::XmlOut) -> Result<(Block, Vec<Line>), SerError> {
-    let tag = match node {
-        yrs::XmlOut::Element(el) => el.tag().to_string(),
-        _ => String::new(),
+fn block_lines<T: ReadTxn>(
+    txn: &T,
+    child: &Child,
+    unknown: &mut Unknown,
+) -> Result<(Block, Vec<Line>), SerError> {
+    let tag = match child {
+        Child::Block(el) => el.tag().to_string(),
+        Child::Para(_) => "paragraph".to_string(),
     };
     let mut lines = Vec::new();
-    match (node, tag.as_str()) {
-        (yrs::XmlOut::Element(el), "blockquote") => write_quote(&mut lines, txn, el)?,
-        (yrs::XmlOut::Element(el), "bullet_list" | "ordered_list") => {
+    match (child, tag.as_str()) {
+        (Child::Block(el), "blockquote") => write_quote(&mut lines, txn, el, unknown)?,
+        (Child::Block(el), "bullet_list" | "ordered_list") => {
             for (item, marker) in list_items(txn, el)? {
-                write_list_item(&mut lines, txn, &item, &marker)?;
+                write_list_item(&mut lines, txn, &item, &marker, unknown)?;
             }
         }
         _ => {
             let mut text = String::new();
-            write_block(&mut text, txn, node)?;
+            write_child(&mut text, txn, child, unknown)?;
             let code = tag == "code_block";
             let open = !matches!(tag.as_str(), "heading" | "code_block" | "horizontal_rule");
             for line in text.trim_end_matches('\n').split('\n') {
@@ -554,7 +696,8 @@ enum Block {
     Rule,
     /// A paragraph written as no text: a blank line.
     Blank,
-    /// A paragraph, or an attachment, written as a paragraph of one link.
+    /// A paragraph, an attachment, written as a paragraph of one link, or a
+    /// node the schema doesn't name, written as its text (P4).
     Text,
     /// An image or board, written as a paragraph of one image, which the
     /// importer turns back into a block only when nothing else is in its
@@ -573,21 +716,17 @@ enum Block {
         ends_open: bool,
     },
     Table,
-    /// A block the schema doesn't name.
-    Other,
 }
 
 impl Block {
-    /// A block with tag `tag` (empty for a node that is no element), written
-    /// as `lines`.
+    /// A block with tag `tag`, written as `lines`. A tag the schema doesn't
+    /// name was written as its text, a paragraph.
     fn of(tag: &str, lines: &[Line]) -> Self {
         let ends_open = matches!(lines.last(), Some(Line::Text { open: true, .. }));
         match tag {
             "heading" => Block::Heading,
             "code_block" => Block::Code,
             "horizontal_rule" => Block::Rule,
-            "paragraph" if matches!(lines, [Line::Blank]) => Block::Blank,
-            "paragraph" | "attachment" => Block::Text,
             "image" | "excalidraw_board" => Block::Image,
             "bullet_list" | "ordered_list" => Block::List {
                 interrupts: list_interrupts(lines, tag == "ordered_list"),
@@ -595,14 +734,15 @@ impl Block {
             },
             "blockquote" => Block::Quote { ends_open },
             "table" => Block::Table,
-            _ => Block::Other,
+            _ if matches!(lines, [Line::Blank]) => Block::Blank,
+            _ => Block::Text,
         }
     }
 
     /// Whether `next`, written on the line right below this block, would be
     /// read as part of it, so that a blank line must go between them.
     fn needs_blank_line_before(self, next: Block, in_quote: bool) -> bool {
-        use Block::{Blank, Code, Heading, Image, List, Other, Quote, Rule, Table, Text};
+        use Block::{Blank, Code, Heading, Image, List, Quote, Rule, Table, Text};
         match (self, next) {
             // Nothing goes on after a heading, code block or rule, and an
             // empty paragraph is a blank line already.
@@ -638,11 +778,10 @@ impl Block {
                 }
                 | Quote { ends_open: true }
                 | Table,
-                Text | Image | Table | Other,
+                Text | Image | Table,
             )
             | (Quote { .. }, Quote { .. }) => true,
             (List { .. } | Quote { .. } | Table, _) => false,
-            (Other, _) => true,
         }
     }
 }
@@ -659,35 +798,90 @@ fn list_interrupts(lines: &[Line], ordered: bool) -> bool {
     !content.trim().is_empty() && (!ordered || marker == "1.")
 }
 
+/// A piece of inline content as it is written: text with its marks, or a
+/// line break.
+enum Piece {
+    Text(String, Marks),
+    Break,
+}
+
+/// Writes `inlines`, the inline nodes of a paragraph or heading. An element
+/// other than a hard break is written as its text (P4).
+///
+/// With `repaired`, the content of a [`Child::Para`] that the repair put
+/// together (P3), two things are written as the importer would have stored
+/// them:
+/// - adjacent text that is written with the same marks is one run, so
+///   `**a**** ****b**` is never written: the paragraphs and runs of a glued
+///   line are separate `XmlText`s;
+/// - a hard break before the first text or after the last is left out: it
+///   would write an empty line, which ends the paragraph, and Markdown has no
+///   line break at either end of one.
+///
+/// Stored paragraphs are written as before, piece by piece: merging their
+/// runs would change pages that round-trip today.
 fn write_inlines<T: ReadTxn>(
     buf: &mut String,
     txn: &T,
-    parent: &XmlElementRef,
-) -> Result<(), SerError> {
-    use yrs::XmlOut;
-    let len = parent.len(txn);
-    for i in 0..len {
-        let child = parent
-            .get(txn, i)
-            .ok_or_else(|| SerError::Yrs("inline missing".into()))?;
-        match child {
-            XmlOut::Text(t) => {
-                let chunks = yrs_text_chunks(t, txn);
-                for (text, attrs) in chunks {
-                    write_run(buf, &text, attrs.as_ref());
-                }
-            }
-            XmlOut::Element(el) => {
-                let tag = el.tag().as_ref();
-                match tag {
-                    "hard_break" => buf.push_str("  \n"),
-                    other => return Err(SerError::UnsupportedNode(format!("inline {other}"))),
-                }
-            }
-            _ => return Err(SerError::UnsupportedNode("inline".into())),
+    inlines: &[XmlOut],
+    repaired: bool,
+    unknown: &mut Unknown,
+) {
+    let mut pieces = Vec::new();
+    inline_pieces(txn, inlines, repaired, unknown, &mut pieces);
+    if repaired {
+        let is_text = |piece: &Piece| matches!(piece, Piece::Text(text, _) if !text.is_empty());
+        let first = pieces.iter().position(is_text).unwrap_or(pieces.len());
+        let last = pieces.iter().rposition(is_text).unwrap_or(0);
+        pieces = pieces
+            .into_iter()
+            .enumerate()
+            .filter(|(i, piece)| !matches!(piece, Piece::Break) || (first < *i && *i < last))
+            .map(|(_, piece)| piece)
+            .collect();
+    }
+    for piece in pieces {
+        match piece {
+            Piece::Text(text, marks) => write_run(buf, &text, &marks),
+            Piece::Break => buf.push_str("  \n"),
         }
     }
-    Ok(())
+}
+
+/// Appends the pieces of `inlines` to `out`. With `merge`, adjacent text of
+/// equal marks is one piece, and empty text none.
+fn inline_pieces<T: ReadTxn>(
+    txn: &T,
+    inlines: &[XmlOut],
+    merge: bool,
+    unknown: &mut Unknown,
+    out: &mut Vec<Piece>,
+) {
+    let push = |out: &mut Vec<Piece>, text: String, marks: Marks| match out.last_mut() {
+        _ if merge && text.is_empty() => {}
+        Some(Piece::Text(prev, prev_marks)) if merge && *prev_marks == marks => {
+            prev.push_str(&text)
+        }
+        _ => out.push(Piece::Text(text, marks)),
+    };
+    for node in inlines {
+        match node {
+            XmlOut::Text(t) => {
+                for (text, attrs) in yrs_text_chunks(t, txn) {
+                    push(out, text, Marks::of(attrs.as_ref()));
+                }
+            }
+            XmlOut::Element(el) if el.tag().as_ref() == "hard_break" => out.push(Piece::Break),
+            XmlOut::Element(el) => {
+                unknown.push(el.tag().to_string());
+                push(out, flatten_text(txn, el), Marks::default());
+            }
+            XmlOut::Fragment(f) => {
+                let nested: Vec<XmlOut> = (0..f.len(txn)).filter_map(|i| f.get(txn, i)).collect();
+                inline_pieces(txn, &nested, merge, unknown, out);
+            }
+        }
+    }
 }
 
 /// Iterate a `XmlTextRef` using `diff` and return `(text_chunk, Option<attrs>)` pairs.
@@ -696,7 +890,7 @@ fn write_inlines<T: ReadTxn>(
 ///   `text.diff(&txn, YChange::identity)` → `Vec<Diff<YChange>>`
 ///   `Diff.insert: Out`  (typically `Out::Any(Any::String(_))` for plain text)
 ///   `Diff.attributes: Option<Box<Attrs>>`   where `Attrs = HashMap<Arc<str>, Any>`
-fn yrs_text_chunks<T: ReadTxn>(t: XmlTextRef, txn: &T) -> Vec<(String, Option<RunAttrs>)> {
+fn yrs_text_chunks<T: ReadTxn>(t: &XmlTextRef, txn: &T) -> Vec<(String, Option<RunAttrs>)> {
     t.diff(txn, YChange::identity)
         .into_iter()
         .filter_map(|d| {
@@ -711,41 +905,56 @@ fn yrs_text_chunks<T: ReadTxn>(t: XmlTextRef, txn: &T) -> Vec<(String, Option<Ru
         .collect()
 }
 
-fn write_run(buf: &mut String, text: &str, attrs: Option<&RunAttrs>) {
-    use crate::schema::{MarkKind, mark_serialization};
+/// The marks of a run as they are written: the delimited ones in the order
+/// they open, and a link's target and title. Runs with equal `Marks` are
+/// written alike, whether a mark is stored as `{}` or as `true`.
+#[derive(Default, PartialEq)]
+struct Marks {
+    non_link: Vec<MarkKind>,
+    link_href: Option<String>,
+    link_title: Option<String>,
+}
 
-    let mut non_link: Vec<MarkKind> = Vec::new();
-    let mut link_href: Option<String> = None;
-    let mut link_title: Option<String> = None;
-
-    if let Some(map) = attrs {
-        for (k, v) in map.iter() {
-            match k.as_ref() {
-                "bold" => non_link.push(MarkKind::Bold),
-                "italic" => non_link.push(MarkKind::Italic),
-                "code" => non_link.push(MarkKind::Code),
-                "strike" => non_link.push(MarkKind::Strike),
-                "underline" => non_link.push(MarkKind::Underline),
-                "link" => {
-                    if let Any::Map(m) = v {
-                        if let Some(Any::String(s)) = m.get("href") {
-                            link_href = Some(s.to_string());
-                        }
-                        if let Some(Any::String(s)) = m.get("title") {
-                            link_title = Some(s.to_string());
+impl Marks {
+    fn of(attrs: Option<&RunAttrs>) -> Self {
+        let mut marks = Marks::default();
+        if let Some(map) = attrs {
+            for (k, v) in map.iter() {
+                match k.as_ref() {
+                    "bold" => marks.non_link.push(MarkKind::Bold),
+                    "italic" => marks.non_link.push(MarkKind::Italic),
+                    "code" => marks.non_link.push(MarkKind::Code),
+                    "strike" => marks.non_link.push(MarkKind::Strike),
+                    "underline" => marks.non_link.push(MarkKind::Underline),
+                    "link" => {
+                        if let Any::Map(m) = v {
+                            if let Some(Any::String(s)) = m.get("href") {
+                                marks.link_href = Some(s.to_string());
+                            }
+                            if let Some(Any::String(s)) = m.get("title") {
+                                marks.link_title = Some(s.to_string());
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
+        // Sort marks alphabetically by kind name for deterministic output.
+        marks.non_link.sort_by_key(|k| k.as_str());
+        marks
     }
+}
 
-    // Sort marks alphabetically by kind name for deterministic output.
-    non_link.sort_by_key(|k| k.as_str());
+fn write_run(buf: &mut String, text: &str, marks: &Marks) {
+    let Marks {
+        non_link,
+        link_href,
+        link_title,
+    } = marks;
 
     // Opening delimiters / tags.
-    for kind in &non_link {
+    for kind in non_link {
         let meta = mark_serialization(*kind);
         if !meta.open_tag.is_empty() {
             buf.push_str(meta.open_tag);

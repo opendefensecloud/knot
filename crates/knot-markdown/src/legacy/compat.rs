@@ -25,9 +25,10 @@ type Class<T> = (&'static str, fn(&T) -> bool);
 /// from the spec, and the first entry that matches names the class.
 ///
 /// A table cell is joined onto one line, where nothing reads back as block
-/// structure, so cells keep the legacy layout: only `ordered_checkbox` looks
-/// inside them.
+/// structure, so cells keep the legacy layout: only `ordered_checkbox` and
+/// `damaged_shape` look inside them.
 const EXPORT_CLASSES: &[Class<DocHandle>] = &[
+    ("damaged_shape", damaged_shape),
     ("nested_tasklist", nested_tasklist),
     ("multi_block_item", multi_block_item),
     ("quote_block_sequence", quote_block_sequence),
@@ -395,6 +396,39 @@ fn any_element(
 
 fn children<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> Vec<XmlOut> {
     (0..el.len(txn)).filter_map(|i| el.get(txn, i)).collect()
+}
+
+/// Text or a hard break directly in a block container (the top level, a list
+/// item, a blockquote, a table cell): the shape the old importer stored for a
+/// line break or soft break in a tight list item (A1), which restore,
+/// from-template and zip import then created again (A10). Legacy can't
+/// export such a page at all; the new export glues the split line back
+/// together (P3).
+fn damaged_shape(doc: &DocHandle) -> bool {
+    fn stray(children: &[XmlOut]) -> bool {
+        children.iter().any(|child| match child {
+            XmlOut::Text(_) => true,
+            XmlOut::Element(el) => el.tag().as_ref() == "hard_break",
+            XmlOut::Fragment(_) => false,
+        })
+    }
+    let top_level = {
+        let ydoc = doc.inner();
+        let txn = ydoc.transact();
+        txn.get_xml_fragment("default").is_some_and(|frag| {
+            let children: Vec<XmlOut> = (0..frag.len(&txn))
+                .filter_map(|i| frag.get(&txn, i))
+                .collect();
+            stray(&children)
+        })
+    };
+    top_level
+        || any_element(doc, &|txn, el, _| {
+            matches!(
+                el.tag().as_ref(),
+                "list_item" | "blockquote" | "table_cell" | "table_header"
+            ) && stray(&children(txn, el))
+        })
 }
 
 /// A task item of a bullet list, outside table cells, that is more than one

@@ -150,8 +150,11 @@ async fn refresh_markdown_inner(
     reindex_tasks: bool,
 ) -> Result<String, RefreshError> {
     let (transient, seq) = live_snapshot(state, doc_id).await?;
-    let text = match knot_markdown::to_markdown::serialise(&YrsEngine, &transient) {
-        Ok(md) => md,
+    let text = match knot_markdown::serialise_with_report(&YrsEngine, &transient) {
+        Ok((md, unknown)) => {
+            record_unknown_nodes(doc_id, &unknown);
+            md
+        }
         Err(e) => return Err(RefreshError::Serialise(format!("{e:?}"))),
     };
     if let Some(cache) = state.markdown_cache.clone()
@@ -184,6 +187,26 @@ async fn refresh_markdown_inner(
         }
     }
     Ok(text)
+}
+
+/// Warns about and counts the nodes a page's export wrote as their text
+/// because the schema doesn't name them (`unknown`, their tags, from
+/// `serialise_with_report`). The tags are page content, so they go to the
+/// log, not into metric labels.
+fn record_unknown_nodes(doc_id: Uuid, unknown: &[String]) {
+    if unknown.is_empty() {
+        return;
+    }
+    metrics::counter!("knot_markdown_unknown_nodes_total").increment(unknown.len() as u64);
+    let mut tags = unknown.to_vec();
+    tags.sort();
+    tags.dedup();
+    tracing::warn!(
+        %doc_id,
+        count = unknown.len(),
+        ?tags,
+        "markdown export wrote unknown nodes as text"
+    );
 }
 
 pub(super) async fn export_inline(
@@ -332,4 +355,89 @@ pub(super) async fn import_inline(
 
 fn internal() -> Response {
     json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// A counter's running total.
+    #[derive(Default)]
+    struct Total(AtomicU64);
+
+    impl metrics::CounterFn for Total {
+        fn increment(&self, value: u64) {
+            self.0.fetch_add(value, Ordering::Relaxed);
+        }
+        fn absolute(&self, value: u64) {
+            self.0.store(value, Ordering::Relaxed);
+        }
+    }
+
+    /// Remembers the name of every counter registered with it, and adds up
+    /// what they count.
+    #[derive(Default)]
+    struct Counters {
+        names: Mutex<Vec<String>>,
+        total: Arc<Total>,
+    }
+
+    impl metrics::Recorder for Counters {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            self.names.lock().unwrap().push(key.name().to_owned());
+            metrics::Counter::from_arc(self.total.clone())
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn unknown_nodes_are_counted() {
+        let counters = Counters::default();
+        metrics::with_local_recorder(&counters, || {
+            record_unknown_nodes(Uuid::nil(), &[]);
+            record_unknown_nodes(Uuid::nil(), &["callout".to_owned(), "mention".to_owned()]);
+        });
+        assert_eq!(
+            *counters.names.lock().unwrap(),
+            ["knot_markdown_unknown_nodes_total"]
+        );
+        assert_eq!(counters.total.0.load(Ordering::Relaxed), 2);
+    }
 }

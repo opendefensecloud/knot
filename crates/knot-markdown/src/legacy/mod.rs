@@ -7,14 +7,32 @@
 //! change to the real modules is measured against them. `compat` holds the
 //! classifiers the harness and the real-data check share.
 //!
+//! The reference is fully frozen: the copies call no live code of this
+//! crate. The helpers they used from it are snapshotted here as they were at
+//! 3d09071: the mark table in `schema.rs`, and below the board sentinel
+//! constants and URL builder that `lib.rs` defines.
+//!
 //! Compiled only with the `legacy-compat` feature, which production builds
 //! don't enable.
 
 pub mod compat;
 pub mod from_markdown;
+mod schema;
 pub mod tasks;
 pub mod to_markdown;
 
 pub use from_markdown::{ParseError, parse};
 pub use tasks::{Task, extract_tasks};
 pub use to_markdown::{SerError, serialise};
+
+/// Snapshot of `crate::BOARD_URL_PREFIX`.
+const BOARD_URL_PREFIX: &str = "knot://board/";
+/// Snapshot of `crate::BOARD_URL_SUFFIX`.
+const BOARD_URL_SUFFIX: &str = ".svg";
+/// Snapshot of `crate::DEFAULT_BOARD_LABEL`.
+const DEFAULT_BOARD_LABEL: &str = "Diagram";
+
+/// Snapshot of `crate::board_sentinel_url`: `knot://board/<id>.svg`.
+fn board_sentinel_url(id: &str) -> String {
+    format!("{BOARD_URL_PREFIX}{id}{BOARD_URL_SUFFIX}")
+}

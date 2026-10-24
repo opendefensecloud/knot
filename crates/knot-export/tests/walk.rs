@@ -731,3 +731,140 @@ fn ids_are_canonicalised() {
         [Block::Image { source: ImageSource::Blob(id), .. }] if id == DOC_ID
     ));
 }
+
+/// The glue rule's test vectors (P3), shared with knot-markdown's
+/// `block_children_glue_vectors`: `t` is stray text, `hb` a stray hard
+/// break, `p` a paragraph, and the number is how many paragraphs the
+/// container holds after the repair. A chain `paragraph (run paragraph)+` is
+/// one paragraph (the line the old importer split); any other run is a
+/// paragraph of its own.
+const GLUE_VECTORS: &[(&[&str], usize)] = &[
+    (&["t", "p"], 2),
+    (&["p", "t", "p"], 1),
+    (&["p", "hb", "p", "hb", "p"], 1),
+    (&["t"], 1),
+    (&["p", "t"], 2),
+    (&["p", "t", "hb", "p"], 1),
+];
+
+fn vector_nodes(vector: &[&str]) -> Vec<N> {
+    vector
+        .iter()
+        .map(|node| match *node {
+            "t" => t("t"),
+            "hb" => el("hard_break", vec![], vec![]),
+            "p" => p("p"),
+            other => panic!("unknown vector node {other}"),
+        })
+        .collect()
+}
+
+/// The text of `blocks`' paragraphs, a break as `|`, which must be all there
+/// is.
+fn paragraph_texts(blocks: &[Block]) -> Vec<String> {
+    blocks
+        .iter()
+        .map(|b| match b {
+            Block::Paragraph(inl) => inl
+                .iter()
+                .map(|i| match i {
+                    Inline::Run(r) => r.text.clone(),
+                    Inline::Break => "|".to_owned(),
+                    other => panic!("{other:?}"),
+                })
+                .collect(),
+            other => panic!("not a paragraph: {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn walk_glue_vectors() {
+    for (vector, want) in GLUE_VECTORS {
+        let nodes = || vector_nodes(vector);
+        let top = walk(&build(nodes()));
+        let item = walk(&build(vec![el(
+            "bullet_list",
+            vec![],
+            vec![el("list_item", vec![], nodes())],
+        )]));
+        let quote = walk(&build(vec![el("blockquote", vec![], nodes())]));
+        let cell = walk(&build(vec![cell_of(nodes())]));
+        let containers: [(&str, &[Block]); 4] = [
+            ("the top level", &top.doc.blocks),
+            ("a list item", &only_list(&item).items[0].blocks),
+            (
+                "a blockquote",
+                match &quote.doc.blocks[..] {
+                    [Block::Quote(inner)] => inner,
+                    other => panic!("{other:?}"),
+                },
+            ),
+            (
+                "a table cell",
+                match &cell.doc.blocks[..] {
+                    [Block::Table(table)] => &table.rows[0][0].blocks,
+                    other => panic!("{other:?}"),
+                },
+            ),
+        ];
+        for (what, blocks) in containers {
+            let texts = paragraph_texts(blocks);
+            assert_eq!(texts.len(), *want, "{vector:?} in {what}: {texts:?}");
+            // Nothing is lost or reordered.
+            let want_text: String = vector
+                .iter()
+                .map(|n| if *n == "hb" { "|" } else { n })
+                .collect();
+            assert_eq!(texts.concat(), want_text, "{vector:?} in {what}");
+        }
+        for w in [&top, &item, &quote, &cell] {
+            assert!(w.unknown_elements.is_empty(), "{vector:?}");
+        }
+    }
+}
+
+/// Glued text with equal marks is one run, so the writers don't format a
+/// glued line run by run.
+#[test]
+fn walk_glue_merges_equal_marks() {
+    let bold = |s: &str| marked(s, &["bold"]);
+    let item_of = |kids: Vec<N>| {
+        walk(&build(vec![el(
+            "bullet_list",
+            vec![],
+            vec![el("list_item", vec![], kids)],
+        )]))
+    };
+    let bold_run = |s: &str| {
+        Inline::Run(Run {
+            text: s.into(),
+            marks: Marks {
+                bold: true,
+                ..Marks::default()
+            },
+        })
+    };
+    let w = item_of(vec![
+        el("paragraph", vec![], vec![bold("bold")]),
+        bold(" "),
+        el("paragraph", vec![], vec![bold("more")]),
+    ]);
+    assert_eq!(
+        only_list(&w).items[0].blocks,
+        vec![Block::Paragraph(vec![bold_run("bold more")])]
+    );
+    let w = item_of(vec![
+        el("paragraph", vec![], vec![bold("bold")]),
+        t(" "),
+        el("paragraph", vec![], vec![bold("more")]),
+    ]);
+    assert_eq!(
+        only_list(&w).items[0].blocks,
+        vec![Block::Paragraph(vec![
+            bold_run("bold"),
+            Inline::Run(run(" ")),
+            bold_run("more"),
+        ])]
+    );
+}

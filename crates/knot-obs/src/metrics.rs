@@ -85,6 +85,12 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         "Content an export could not include as-is, by kind (diagram|image_unavailable|image_over_budget|unknown_element)"
     );
 
+    // Markdown
+    describe_counter!(
+        "knot_markdown_unknown_nodes_total",
+        "Nodes the schema doesn't name that a page's Markdown export (cache, search, tasks, GET markdown) wrote as their text"
+    );
+
     // Storage / pool
     describe_gauge!("knot_db_pool_size", "Total connections in the pool");
     describe_gauge!("knot_db_pool_idle", "Idle connections in the pool");

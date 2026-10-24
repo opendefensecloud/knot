@@ -15,7 +15,7 @@ use yrs::{
     XmlTextRef,
 };
 
-use crate::{BOARD_URL_PREFIX, BOARD_URL_SUFFIX, DEFAULT_BOARD_LABEL};
+use super::{BOARD_URL_PREFIX, BOARD_URL_SUFFIX, DEFAULT_BOARD_LABEL};
 
 #[derive(Debug, Error)]
 pub enum ParseError {

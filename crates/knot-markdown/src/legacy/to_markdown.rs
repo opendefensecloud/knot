@@ -245,9 +245,9 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
             let label = attr(el, txn, "label");
             let display = match label.as_deref() {
                 Some(s) if !s.is_empty() => s,
-                _ => crate::DEFAULT_BOARD_LABEL,
+                _ => super::DEFAULT_BOARD_LABEL,
             };
-            let url = crate::board_sentinel_url(&board_id);
+            let url = super::board_sentinel_url(&board_id);
             buf.push_str(&format!("![{display}]({url})\n"));
         }
         "bullet_list" => {
@@ -371,7 +371,7 @@ fn yrs_text_chunks<T: ReadTxn>(t: XmlTextRef, txn: &T) -> Vec<(String, Option<Ru
 }
 
 fn write_run(buf: &mut String, text: &str, attrs: Option<&RunAttrs>) {
-    use crate::schema::{MarkKind, mark_serialization};
+    use super::schema::{MarkKind, mark_serialization};
 
     let mut non_link: Vec<MarkKind> = Vec::new();
     let mut link_href: Option<String> = None;

@@ -3,11 +3,12 @@
 pub mod from_markdown;
 #[cfg(feature = "legacy-compat")]
 pub mod legacy;
+pub mod normalise;
 pub mod schema;
 pub mod tasks;
 pub mod to_markdown;
 
-pub use to_markdown::{SerError, serialise};
+pub use to_markdown::{SerError, serialise, serialise_with_report};
 
 /// Sentinel URL prefix for embedded Excalidraw boards in Markdown.
 pub const BOARD_URL_PREFIX: &str = "knot://board/";
