@@ -511,9 +511,21 @@ fn write_list_item<T: ReadTxn>(
     marker: &str,
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
+    let children = written_children(txn, item);
+    write_item(buf, txn, marker, checkbox(item, txn), children, unknown)
+}
+
+/// Writes a list item of `children` after `marker` and `checkbox` (`""` for
+/// none), as [`write_list_item`] describes.
+fn write_item<T: ReadTxn>(
+    buf: &mut Vec<Line>,
+    txn: &T,
+    marker: &str,
+    checkbox: &str,
+    mut children: Vec<Child>,
+    unknown: &mut Unknown,
+) -> Result<(), SerError> {
     let pad = " ".repeat(marker.chars().count());
-    let checkbox = checkbox(item, txn);
-    let mut children = written_children(txn, item);
     if let [Child::Block(first), Child::Block(second), ..] = children.as_slice()
         && is_empty_paragraph(txn, first)
         && !matches!(second.tag().as_ref(), "paragraph" | "attachment")
@@ -560,6 +572,48 @@ fn write_list_item<T: ReadTxn>(
         });
     }
     Ok(())
+}
+
+/// The Markdown `/tasks` reads a task item's text, assignee and due date
+/// from (planning decision P1): `- [ ] ` and the item's own blocks, written
+/// as the item writes them. A block that is, or holds, a list item is left
+/// out: a nested list, or a table or quote holding a checklist. Its items
+/// are tasks of their own, or plain bullets, and none of their content is
+/// the item's.
+pub(crate) fn task_item_markdown<T: ReadTxn>(txn: &T, item: &XmlElementRef) -> String {
+    let children: Vec<Child> = written_children(txn, item)
+        .into_iter()
+        .filter(|child| !holds_list_item(txn, child))
+        .collect();
+    let mut lines = Vec::new();
+    // Writing fails only on a child that vanishes during the read, which one
+    // transaction rules out; the item is then listed without text.
+    if write_item(&mut lines, txn, "- ", "[ ] ", children, &mut Unknown::new()).is_err() {
+        return "- [ ] \n".to_string();
+    }
+    let mut buf = String::new();
+    write_lines(&mut buf, lines);
+    buf
+}
+
+/// Whether `child`, a block of a block container, is or holds a list item.
+fn holds_list_item<T: ReadTxn>(txn: &T, child: &Child) -> bool {
+    fn holds<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
+        match node {
+            XmlOut::Element(el) => {
+                el.tag().as_ref() == "list_item"
+                    || children(txn, el).iter().any(|child| holds(txn, child))
+            }
+            XmlOut::Fragment(f) => (0..f.len(txn))
+                .filter_map(|i| f.get(txn, i))
+                .any(|child| holds(txn, &child)),
+            XmlOut::Text(_) => false,
+        }
+    }
+    match child {
+        Child::Block(el) => holds(txn, &XmlOut::Element(el.clone())),
+        Child::Para(inlines) => inlines.iter().any(|inline| holds(txn, inline)),
+    }
 }
 
 /// Writes a blockquote: each line of its blocks after `> `, and a blank line

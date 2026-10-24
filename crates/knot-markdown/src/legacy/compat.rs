@@ -93,6 +93,178 @@ pub fn stability_exempt(md: &str) -> Option<&'static str> {
         .map(|(name, _)| *name)
 }
 
+/// A named task bug class: its name, and whether a task item, read in a
+/// transaction, is in it.
+type TaskClass = (&'static str, fn(&Transaction, &XmlElementRef) -> bool);
+
+/// Named task bug classes (planning decision P1). On a page where the legacy
+/// listing agrees with the room, a task item in one of them may be listed
+/// with other text than legacy listed it, and with another assignee or due
+/// date where legacy's came from content that isn't the item's own, or where
+/// legacy found none. Each entry is a bug from the spec in how legacy wrote
+/// the item, and the first entry that matches names the class.
+const TASK_CLASSES: &[TaskClass] = &[
+    ("task_with_nested_list", task_with_nested_list),
+    ("task_block_syntax_as_text", task_block_syntax_as_text),
+    ("task_lines_read_as_code", task_lines_read_as_code),
+    ("block_read_into_task", block_read_into_task),
+];
+
+/// The task bug class `item`, a task item of a page read in `txn`, falls in,
+/// if any.
+pub fn task_class(txn: &Transaction, item: &XmlElementRef) -> Option<&'static str> {
+    TASK_CLASSES
+        .iter()
+        .find(|(_, is_in)| is_in(txn, item))
+        .map(|(name, _)| *name)
+}
+
+/// A task item with a block that is, or holds, a list item: a nested list,
+/// or a table or quote holding one. The listing leaves such blocks out of
+/// the item's text (P1): their items are tasks of their own, or plain
+/// bullets. Legacy wrote them as more lines of the item's first paragraph
+/// (A4), so it took their text, and their first mention or date when the
+/// item had none of its own, as the item's.
+fn task_with_nested_list(txn: &Transaction, item: &XmlElementRef) -> bool {
+    children(txn, item)
+        .iter()
+        .any(|child| holds_list_item(txn, child))
+}
+
+/// A task item of a bullet list, outside table cells, with a block that
+/// legacy wrote as text of the checkbox's paragraph (A4): a first block
+/// other than a paragraph, attachment, image or board, written right after
+/// the checkbox, or a later heading, blockquote, code block, rule or table,
+/// indented as more lines of that paragraph. Their Markdown syntax (`## `,
+/// `> `, a code fence, `---`, table pipes) was read as text.
+fn task_block_syntax_as_text(txn: &Transaction, item: &XmlElementRef) -> bool {
+    let blocks = children(txn, item);
+    let Some(XmlOut::Element(first)) = blocks.first() else {
+        return false;
+    };
+    in_bullet_list_outside_cells(item)
+        && (!matches!(
+            first.tag().as_ref(),
+            "paragraph" | "attachment" | "image" | "excalidraw_board"
+        ) || blocks[1..].iter().any(|block| {
+            matches!(block, XmlOut::Element(el) if matches!(
+                el.tag().as_ref(),
+                "heading" | "blockquote" | "code_block" | "horizontal_rule" | "table"
+            ))
+        }))
+}
+
+/// A task item of a bullet list, outside table cells, that legacy wrote with
+/// a blank line before another of its lines (A4): an empty paragraph, or a
+/// paragraph line without text, the checkbox's line included. Legacy
+/// indented the lines below it by the width of `- [ ] `, which makes them an
+/// indented code block: raw Markdown, its links not read as links.
+fn task_lines_read_as_code(txn: &Transaction, item: &XmlElementRef) -> bool {
+    let mut blank = Vec::new();
+    for block in children(txn, item) {
+        match &block {
+            XmlOut::Element(el) if el.tag().as_ref() == "paragraph" => {
+                blank.extend(blank_lines(txn, el));
+            }
+            _ => blank.push(false),
+        }
+    }
+    in_bullet_list_outside_cells(item)
+        && blank
+            .split_last()
+            .is_some_and(|(_, before_last)| before_last.contains(&true))
+}
+
+/// For each line `paragraph` is written on, whether it has no text.
+fn blank_lines<T: ReadTxn>(txn: &T, paragraph: &XmlElementRef) -> Vec<bool> {
+    let mut lines = vec![true];
+    for inline in children(txn, paragraph) {
+        match inline {
+            XmlOut::Element(e) if e.tag().as_ref() == "hard_break" => lines.push(true),
+            XmlOut::Text(t) => {
+                for (i, line) in t.get_string(txn).split('\n').enumerate() {
+                    if i > 0 {
+                        lines.push(true);
+                    }
+                    if !line.trim().is_empty() {
+                        *lines.last_mut().expect("a line") = false;
+                    }
+                }
+            }
+            XmlOut::Element(_) | XmlOut::Fragment(_) => {
+                *lines.last_mut().expect("a line") = false;
+            }
+        }
+    }
+    lines
+}
+
+/// Whether `item` sits in a bullet list outside table cells, where legacy
+/// wrote its checkbox and kept the item's lines apart from the cell's.
+fn in_bullet_list_outside_cells(item: &XmlElementRef) -> bool {
+    let Some(XmlOut::Element(list)) = item.parent() else {
+        return false;
+    };
+    let mut node = list.clone();
+    while let Some(XmlOut::Element(parent)) = node.parent() {
+        if matches!(parent.tag().as_ref(), "table_cell" | "table_header") {
+            return false;
+        }
+        node = parent;
+    }
+    list.tag().as_ref() == "bullet_list"
+}
+
+/// A task item that ends the list it sits in, at any depth, where the block
+/// legacy wrote on the line right below that list, in a list item or
+/// blockquote outside table cells, reads as part of the item's last
+/// paragraph (A5, A6, as `multi_block_item` and `quote_block_sequence`
+/// name the pages): a lazy continuation line, or table rows. Legacy listed
+/// that block's text as the item's.
+fn block_read_into_task(txn: &Transaction, item: &XmlElementRef) -> bool {
+    if !in_bullet_list_outside_cells(item) {
+        return false;
+    }
+    let mut node = item.clone();
+    while let Some(XmlOut::Element(parent)) = node.parent() {
+        let siblings = children(txn, &parent);
+        let Some(pos) = siblings
+            .iter()
+            .position(|sibling| matches!(sibling, XmlOut::Element(el) if *el == node))
+        else {
+            return false;
+        };
+        if let Some(next) = siblings.get(pos + 1) {
+            let in_quote = parent.tag().as_ref() == "blockquote";
+            return matches!(parent.tag().as_ref(), "list_item" | "blockquote")
+                && match (written(txn, &siblings[pos]), written(txn, next)) {
+                    (Some(prev), Some(next)) => {
+                        next != Written::Rule && read_into(prev, next, in_quote)
+                    }
+                    _ => false,
+                };
+        }
+        node = parent;
+    }
+    false
+}
+
+/// Whether `node` is, or holds, a list item.
+fn holds_list_item<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
+    match node {
+        XmlOut::Element(el) => {
+            el.tag().as_ref() == "list_item"
+                || children(txn, el)
+                    .iter()
+                    .any(|child| holds_list_item(txn, child))
+        }
+        XmlOut::Fragment(f) => (0..f.len(txn))
+            .filter_map(|i| f.get(txn, i))
+            .any(|child| holds_list_item(txn, &child)),
+        XmlOut::Text(_) => false,
+    }
+}
+
 /// The pulldown-cmark events of `md` with their source ranges, read with
 /// the importers' options.
 fn events(md: &str) -> impl Iterator<Item = (Event<'_>, Range<usize>)> {

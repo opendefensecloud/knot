@@ -163,7 +163,9 @@ async fn refresh_markdown_inner(
         tracing::warn!(error=?e, "md cache put failed");
     }
     if reindex_tasks && let (Some(tasks), Some(docs)) = (state.tasks.clone(), state.docs.clone()) {
-        let extracted = knot_markdown::tasks::extract_tasks(&text);
+        // From the page itself, so that listing index k is the item the
+        // `/tasks` toggle with index k flips (spec A11, A12).
+        let extracted = knot_markdown::tasks::extract_tasks_from_doc(&transient);
         let inputs: Vec<knot_storage::DocTaskInput> = extracted
             .into_iter()
             .map(|t| knot_storage::DocTaskInput {

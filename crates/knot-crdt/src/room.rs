@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::bus::{Bus, Subscription};
 use crate::engine::{DocHandle, Engine, EngineError};
 use crate::protocol::wrap_sync_update;
+use crate::tasks::patch_task_checked;
 
 pub type ConnId = Uuid;
 
@@ -117,10 +118,10 @@ pub enum Event {
     },
     /// Flip the `checked` attribute on the Nth task `list_item` in the doc.
     /// `item_index` counts list_item nodes with a `checked` attr in
-    /// document order — matches the index produced by
-    /// `knot_markdown::tasks::extract_tasks`. The mutation happens
-    /// directly on the live doc; the resulting update is persisted and
-    /// fanned out via the same pipeline as `ApplyUpdate`.
+    /// document order ([`crate::tasks::task_items`]) — the index
+    /// `knot_markdown::tasks::extract_tasks_from_doc` lists. The mutation
+    /// happens directly on the live doc; the resulting update is persisted
+    /// and fanned out via the same pipeline as `ApplyUpdate`.
     PatchTaskChecked {
         item_index: i32,
         checked: bool,
@@ -666,54 +667,6 @@ impl Room {
             tracing::error!(error=?e, "persist channel closed; dropping update");
         }
     }
-}
-
-/// Walk a fragment in document order, find the Nth `list_item` element that
-/// carries a `checked` attribute, and update that attribute. Returns the
-/// number of matching items walked (so callers can distinguish "no match"
-/// from a successful patch).
-fn patch_task_checked(
-    frag: &yrs::XmlFragmentRef,
-    txn: &mut yrs::TransactionMut,
-    target_index: i32,
-    checked: bool,
-) -> Result<(), String> {
-    use yrs::{Xml, XmlFragment, XmlOut};
-    if target_index < 0 {
-        return Err("negative item_index".into());
-    }
-    let mut counter: i32 = 0;
-    let mut found: Option<yrs::XmlElementRef> = None;
-    // Iterative DFS to avoid recursion + lifetime juggling on the txn.
-    let mut stack: Vec<yrs::XmlElementRef> = Vec::new();
-    // Seed with top-level children.
-    let top_len = frag.len(txn);
-    for i in (0..top_len).rev() {
-        if let Some(XmlOut::Element(el)) = frag.get(txn, i) {
-            stack.push(el);
-        }
-    }
-    while let Some(el) = stack.pop() {
-        if el.tag().as_ref() == "list_item" && el.get_attribute(txn, "checked").is_some() {
-            if counter == target_index {
-                found = Some(el);
-                break;
-            }
-            counter += 1;
-        }
-        // Push children (in reverse so document order is preserved on pop).
-        let n = el.len(txn);
-        for i in (0..n).rev() {
-            if let Some(XmlOut::Element(child)) = el.get(txn, i) {
-                stack.push(child);
-            }
-        }
-    }
-    let Some(el) = found else {
-        return Err(format!("no task at index {target_index}"));
-    };
-    el.insert_attribute(txn, "checked", if checked { "true" } else { "false" });
-    Ok(())
 }
 
 #[cfg(test)]

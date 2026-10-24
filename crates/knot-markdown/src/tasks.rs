@@ -1,13 +1,19 @@
-//! Extract GFM checklist items from a markdown source. Used by the
-//! workspace todo view's indexer.
+//! Extract GFM checklist items from a markdown source, and a page's task
+//! items from its Y.Doc ([`extract_tasks_from_doc`], which the workspace
+//! todo view's indexer uses).
 //!
 //! A task item's assignee is detected when the item's first inline content
 //! is a link whose href matches the mention sentinel `knot://user/<uuid>`
 //! (see `MentionExtension` on the editor side).
 
 use chrono::{DateTime, Utc};
+use knot_crdt::DocHandle;
+use knot_crdt::tasks::task_items;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use uuid::Uuid;
+use yrs::{ReadTxn, Transact, Xml};
+
+use crate::to_markdown::task_item_markdown;
 
 const USER_HREF_PREFIX: &str = "knot://user/";
 const TIME_HREF_PREFIX: &str = "knot://time/";
@@ -143,6 +149,41 @@ pub fn extract_tasks(md: &str) -> Vec<Task> {
         }
     }
     out
+}
+
+/// The page's tasks, one per task item of its Y.Doc ([`task_items`]), the
+/// items `/tasks` toggles flip (spec A11, A12; planning decision P1):
+/// - `item_index` is the item's position among them, and `checked` whether
+///   its `checked` attribute reads `"true"`;
+/// - text, assignee and due date are those [`extract_tasks`] finds for the
+///   item's own content ([`task_item_markdown`]), as it always found them;
+///   an item it finds no task in has empty text and neither.
+pub fn extract_tasks_from_doc(doc: &DocHandle) -> Vec<Task> {
+    let ydoc = doc.inner();
+    let txn = ydoc.transact();
+    let Some(frag) = txn.get_xml_fragment("default") else {
+        return Vec::new();
+    };
+    task_items(&frag, &txn)
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let (text, assignee_user_id, due_at) = extract_tasks(&task_item_markdown(&txn, item))
+                .into_iter()
+                .next()
+                .map(|t| (t.text, t.assignee_user_id, t.due_at))
+                .unwrap_or_default();
+            Task {
+                item_index: index as i32,
+                text,
+                assignee_user_id,
+                checked: item
+                    .get_attribute(&txn, "checked")
+                    .is_some_and(|v| v.to_string(&txn) == "true"),
+                due_at,
+            }
+        })
+        .collect()
 }
 
 #[derive(Default)]
