@@ -29,6 +29,9 @@ enum Cmd {
     Admin(admin::AdminArgs),
     /// Run pending Postgres migrations and exit.
     Migrate,
+    /// Export every page offline to DOCX and ODT and report failures and
+    /// fallbacks. Does not migrate; meant for a staging copy.
+    ExportCheck,
 }
 
 #[tokio::main]
@@ -55,6 +58,12 @@ async fn main() {
                 process::exit(1);
             }
         },
+        Cmd::ExportCheck => {
+            if let Err(e) = knot_server::export_check::run(cfg).await {
+                eprintln!("export-check: {e}");
+                process::exit(1);
+            }
+        }
         Cmd::Migrate => {
             if cfg.database_url.is_empty() {
                 eprintln!("migrate: KNOT_DATABASE_URL must be set");

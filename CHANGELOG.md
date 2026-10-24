@@ -23,12 +23,24 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   the card hides it until the next upgrade, on every device. New users start
   caught up, and development builds never show it. `GET /api/whats-new`,
   `POST /api/whats-new/seen`. (#45)
+- Word (DOCX) and OpenDocument (ODT) export from the page header's download
+  menu, with diagrams as pictures. `GET /api/docs/{id}/export/diagrams`,
+  `POST /api/docs/{id}/export/{docx|odt}`. (#46)
 
 ### Security
 - `ctutils` 0.4.5 fixes RUSTSEC-2026-0385: its constant-time helpers could
   compile to branches on secret values. It reaches knot only through the
   Postgres client's password authentication. knot's own session and CSRF
   signing do not use it. (#45)
+- `tokio` 1.53.3 fixes RUSTSEC-2026-0386: `AsyncFd`'s safe constructors could
+  register a file descriptor knot does not own, leading to a use-after-free
+  when the descriptor number was reused. knot does not call `AsyncFd` itself;
+  it reaches knot only through its dependencies. (#47)
+- RUSTSEC-2026-0387 (`crypto-bigint` 0.5.5, timing side channels) is
+  acknowledged in `deny.toml`. knot was not affected: the crate is used only
+  to verify OIDC ID-token signatures, which involves public values only, and
+  the fix exists only in a major version that `openidconnect` does not yet
+  support. (#47)
 
 ## [0.8.1] - 2026-10-21
 

@@ -24,6 +24,19 @@ ignore = [
     # Drop when: rsa 0.10.0 final ships AND openidconnect widens to ^0.10.
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack; direct dep of openidconnect 4.0.1; verification-only path; no stable fix published" },
 
+    # crypto-bigint < 0.7.6 has secret-dependent branches in operations meant
+    # to be constant-time. Path: openidconnect 4.0.1 (the current latest) ->
+    # p256 0.13 / p384 0.13 -> ecdsa 0.16 / elliptic-curve 0.13 ->
+    # crypto-bigint ^0.5. The fix exists only in 0.7.6; no 0.5.x patch is
+    # published and elliptic-curve 0.13 cannot reach 0.7.
+    # Reachability: ES256/ES384 ID-token signature VERIFICATION only. knot
+    # authenticates to the provider with a client secret and holds no EC
+    # private key, so the affected arithmetic only ever sees public values
+    # (public keys, signatures, hashes); a timing leak reveals nothing secret.
+    # Drop when: openidconnect moves to elliptic-curve 0.14 (crypto-bigint
+    # >= 0.7.6).
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint timing branches; via openidconnect 4.0.1 -> p256/p384 0.13; verification-only on public values; fix only in 0.7.6" },
+
     # quick-xml < 0.41 parses S3 API responses (two DoS advisories: quadratic
     # duplicate-attribute scanning and unbounded namespace allocation).
     # Path: rust-s3 0.37.2 -> quick-xml ^0.38, and aws-creds 0.39.1 -> ^0.38.

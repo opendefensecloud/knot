@@ -64,6 +64,8 @@ Keep the password in an env var, never in argv/history. Failed logins are thrott
 | Workspace export | `GET /api/workspace/export` → zip (markdown + manifest) |
 | Workspace import | `POST /api/workspace/import` (multipart zip upload) |
 | Single-doc export | `GET /api/docs/{id}/export` |
+| **Export doc as Word / OpenDocument** | `POST /api/docs/{id}/export/docx` or `…/export/odt` → the file; body empty, or multipart with one PNG per diagram key (≤ 10 MiB total, ≤ 2 MiB and ≤ 100 parts). Header `X-Knot-Export-Fallbacks: diagrams=…, images=…, unknown=…` counts what was left out. Viewer+ |
+| Diagrams to render for that export | `GET /api/docs/{id}/export/diagrams` → `{"limits":{…}, "diagrams":[{"key","kind":"mermaid","source"} \| {"key","kind":"board","board_id","label"}]}` |
 | Upload attachment | `POST /api/docs/{id}/blobs` · fetch: `GET /api/blobs/{id}` |
 | Workspace info | `GET /api/workspace` · templates: `GET /api/workspace/templates` |
 
@@ -90,6 +92,11 @@ kmut -X PATCH "$KNOT/api/docs/$DOC_ID/tasks/2" \
 
 # Full workspace backup
 kget /api/workspace/export > knot-backup.zip
+
+# Export a doc as Word (or …/export/odt). An empty body means no diagram
+# pictures: Mermaid blocks and boards become "(not included)" placeholders.
+kmut -X POST "$KNOT/api/docs/$DOC_ID/export/docx" -D headers.txt -o page.docx
+grep -i '^x-knot-export-fallbacks' headers.txt
 ```
 
 ## Gotchas
@@ -99,5 +106,6 @@ kget /api/workspace/export > knot-backup.zip
 - `403 {"code":"auth.csrf","message":"missing or mismatched CSRF token"}` on POST/PUT/PATCH/DELETE → `X-CSRF-Token` header missing or ≠ `csrf` cookie value.
 - `403 {"code":"acl.editor_required"}` → the user is a workspace Viewer; writes need Editor+.
 - Search returns `{"results":[]}` silently for queries < 2 chars; `limit` is clamped to 20 server-side.
+- Word/OpenDocument export: `503 export.busy` (with `Retry-After: 5`) when two exports already run on that pod — wait and retry; `413 export.too_large` when the multipart body passes 10 MiB — resend with smaller or no pictures. A picture part over 2 MiB, past the 100th part, or named after no diagram on the page is ignored, not an error.
 - Real-time editing runs over a WebSocket CRDT protocol (yrs) — not curl territory; use the markdown endpoints instead.
 - First-run bootstrap / break-glass admin (no HTTP): `knot-server admin create --email … --display-name …` (password via stdin) directly against the DB (`KNOT_DATABASE_URL`).

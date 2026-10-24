@@ -449,6 +449,15 @@ impl Peer {
 
     /// A local edit, sent as SYNC_UPDATE frames like `handleDocUpdate`.
     async fn edit(&mut self, f: impl FnOnce(&XmlFragmentRef, &mut TransactionMut)) {
+        self.try_edit(f).await.expect("send update");
+    }
+
+    /// Like `edit`, but reports a failed send instead of panicking: a peer
+    /// whose socket the server is closing may find it already reset.
+    async fn try_edit(
+        &mut self,
+        f: impl FnOnce(&XmlFragmentRef, &mut TransactionMut),
+    ) -> Result<(), tungstenite::Error> {
         // Root ref BEFORE the transaction: `get_or_insert_*` takes its own
         // write lock and would deadlock against an open `TransactionMut`.
         let frag = self.doc.get_or_insert_xml_fragment("default");
@@ -466,9 +475,9 @@ impl Peer {
         let ws = self.ws.as_mut().unwrap();
         for u in updates {
             ws.send(tungstenite::Message::Binary(sync_frame(2, &u).into()))
-                .await
-                .unwrap();
+                .await?;
         }
+        Ok(())
     }
 
     /// Append a paragraph holding `s`.
@@ -478,6 +487,15 @@ impl Peer {
             paragraph_text(frag, txn, &s);
         })
         .await;
+    }
+
+    /// Append a paragraph holding `s`, tolerating a failed send.
+    async fn try_type_paragraph(&mut self, s: &str) -> Result<(), tungstenite::Error> {
+        let s = s.to_string();
+        self.try_edit(move |frag, txn| {
+            paragraph_text(frag, txn, &s);
+        })
+        .await
     }
 
     async fn handle(&mut self, bytes: &[u8]) {
@@ -1011,6 +1029,10 @@ async fn close_code(peer: &mut Peer) -> u16 {
 async fn revoked_editor_is_closed_with_4403_and_its_edits_are_dropped() {
     let fx = fixture().await;
     let mut bob = Peer::join(&fx, &fx.bob).await;
+    // Carol stays silent after the revoke, so her socket reliably delivers the
+    // close frame. Bob's may not: if the server has already closed it, his
+    // write is answered with a TCP reset, which can discard the frame.
+    let mut carol = Peer::join(&fx, &fx.carol).await;
 
     fx.state
         .rooms_v2
@@ -1018,9 +1040,13 @@ async fn revoked_editor_is_closed_with_4403_and_its_edits_are_dropped() {
         .expect("fixture wires rooms")
         .revoke_all_for_doc(fx.doc_id)
         .await;
-    // Bob's editor has not seen the close yet and keeps typing.
-    bob.type_paragraph("after the revoke").await;
-    assert_eq!(close_code(&mut bob).await, 4403);
+    // Bob's editor has not seen the close yet and keeps typing. The edit
+    // reaches the server after the revoke, or not at all if the socket is
+    // already gone; either way it must not land.
+    let _ = bob.try_type_paragraph("after the revoke").await;
+    assert_eq!(close_code(&mut carol).await, 4403);
+    drop(bob);
+    drop(carol);
 
     // Sentinel: once Carol's later edit is durable, an accepted edit of
     // Bob's would be too.

@@ -81,4 +81,17 @@ test("mobile: the document header fits the viewport", async ({ page }) => {
   for (const id of ["toggle-edit-mode", "toggle-markdown", "doc-export", "toggle-template", "open-comments"]) {
     await expect(page.getByTestId(id)).toBeInViewport();
   }
+
+  // The wrapped row puts the export trigger near the left edge; its menu
+  // still opens fully on screen. The drawer, still open over the left of
+  // the page, goes first.
+  const backdrop = page.getByTestId("sidebar-backdrop");
+  if ((await backdrop.count()) > 0) await backdrop.click({ position: { x: 350, y: 300 } });
+  await expect(backdrop).toHaveCount(0);
+  await page.getByTestId("doc-export").click();
+  for (const id of ["export-docx", "export-odt", "export-md", "export-md-subtree"]) {
+    await expect(page.getByTestId(id)).toBeInViewport({ ratio: 1 });
+  }
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("menu")).toHaveCount(0);
 });

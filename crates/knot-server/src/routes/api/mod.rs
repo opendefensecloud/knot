@@ -10,6 +10,7 @@ pub mod boards;
 pub mod comments;
 pub mod contributors;
 pub mod docs;
+pub mod export;
 pub mod export_import;
 pub mod grants;
 pub mod history;

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, Eye, FileCode, History, LayoutTemplate, MessageSquare, Pencil, Share2 } from "lucide-react";
+import { Eye, FileCode, History, LayoutTemplate, MessageSquare, Pencil, Share2 } from "lucide-react";
 import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties } from "react";
 import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
 
@@ -10,6 +10,7 @@ import { useUi } from "../../stores/ui";
 
 import { CommentSidebar } from "../comments/CommentSidebar";
 import { MarkdownView } from "../editor/MarkdownView";
+import { ExportMenu } from "../export/ExportMenu";
 import { purgeConfirmText } from "./archive";
 import { ArchivedBanner } from "./ArchivedBanner";
 import { Breadcrumb } from "./Breadcrumb";
@@ -323,24 +324,15 @@ export default function DocPage() {
           {canEditDoc && (
             <ImportMarkdownButton docId={id} docTitle={meta.title} />
           )}
-          {/* The zip export reads live docs only; restore to export. */}
+          {/* Export reads live docs only; restore to export. */}
           {!archived && (
-            <IconButton
-              data-testid="doc-export"
-              label="Export doc (shift-click for subtree)"
-              onClick={(e) => {
-                // Default: just this doc. Shift-click pulls the whole
-                // subtree — a power-user shortcut without cluttering the
-                // header with a separate button.
-                const descendants = e.shiftKey;
-                const a = document.createElement("a");
-                a.href = `/api/docs/${id}/export?descendants=${descendants ? "true" : "false"}`;
-                a.download = `${meta.title || "doc"}.zip`;
-                a.click();
-              }}
-            >
-              <Download size={16} aria-hidden />
-            </IconButton>
+            <ExportMenu
+              docId={id}
+              title={meta.title}
+              isTemplate={meta.is_template}
+              status={status}
+              pendingBytes={pendingBytes}
+            />
           )}
           {isDocOwner && (
             <IconButton

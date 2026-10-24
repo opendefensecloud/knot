@@ -6,6 +6,7 @@ members = [
     "crates/knot-config",
     "crates/knot-crdt",
     "crates/knot-docs",
+    "crates/knot-export",
     "crates/knot-markdown",
     "crates/knot-obs",
     "crates/knot-storage",
