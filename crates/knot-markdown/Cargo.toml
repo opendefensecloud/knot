@@ -12,3 +12,12 @@ thiserror.workspace = true
 pulldown-cmark.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+
+[features]
+# The frozen pre-fix serializer, importer and task extractor, and the
+# compatibility classifiers (`knot_markdown::legacy`). Tests only.
+legacy-compat = []
+
+[dev-dependencies]
+# Enables `legacy-compat` for this crate's own tests.
+knot-markdown = { path = ".", features = ["legacy-compat"] }
