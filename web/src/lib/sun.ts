@@ -90,7 +90,9 @@ function solarNoon(day: number, lon: number): number {
 
 /** The sunrise or sunset of the solar day whose noon is `noon`, refined
  *  from noon outwards because the declination drifts over the day. A sun
- *  that never reaches the sunrise altitude makes the whole day polar. */
+ *  that never crosses the sunrise altitude makes the day polar: polar day
+ *  when it stays above, polar night when it stays below. sunDay checks
+ *  sunrise's verdict first, and a polar one there settles the day. */
 function sunEvent(day: number, noon: number, loc: LatLon, which: "sunrise" | "sunset"): number | Polar {
   let t = noon;
   for (let i = 0; i < 4; i++) {
