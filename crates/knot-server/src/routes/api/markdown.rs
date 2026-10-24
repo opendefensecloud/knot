@@ -54,6 +54,73 @@ pub enum RefreshError {
     Serialise(String),
 }
 
+/// Why [`live_snapshot`] could not copy a page's live state.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SnapshotError {
+    #[error("server state missing rooms registry")]
+    NoRooms,
+    #[error("room acquire failed for {doc_id}: {source}")]
+    Acquire {
+        doc_id: Uuid,
+        source: knot_crdt::AcquireError,
+    },
+    #[error("room actor unreachable for {0}")]
+    RoomUnreachable(Uuid),
+    #[error("room actor: {0}")]
+    Actor(knot_crdt::EngineError),
+    #[error(transparent)]
+    Apply(knot_crdt::EngineError),
+}
+
+/// Keeps `RefreshError`'s variants and messages as they were before the
+/// snapshot step was shared (Debug-formatted engine errors, no acquire cause).
+impl From<SnapshotError> for RefreshError {
+    fn from(e: SnapshotError) -> Self {
+        match e {
+            SnapshotError::NoRooms => Self::NoRooms,
+            SnapshotError::Acquire { doc_id, .. } => Self::Acquire(doc_id),
+            SnapshotError::RoomUnreachable(doc_id) => Self::RoomUnreachable(doc_id),
+            SnapshotError::Actor(e) => Self::Actor(format!("{e:?}")),
+            SnapshotError::Apply(e) => Self::Apply(format!("{e:?}")),
+        }
+    }
+}
+
+/// Copy the page's live state into a transient doc, with the room's seq at
+/// the time of the copy. The room actor only encodes its state
+/// (`Event::ExportState`), so it keeps serving editors while the caller
+/// reads the copy. Shared by the markdown refresh and the DOCX/ODT export.
+pub(crate) async fn live_snapshot(
+    state: &AppState,
+    doc_id: Uuid,
+) -> Result<(knot_crdt::DocHandle, i64), SnapshotError> {
+    let rooms = state.rooms_v2.clone().ok_or(SnapshotError::NoRooms)?;
+    let room = rooms
+        .acquire(doc_id)
+        .await
+        .map_err(|source| SnapshotError::Acquire { doc_id, source })?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if room
+        .tx
+        .send(knot_crdt::Event::ExportState(tx))
+        .await
+        .is_err()
+    {
+        return Err(SnapshotError::RoomUnreachable(doc_id));
+    }
+    let (state_bytes, seq) = match rx.await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(SnapshotError::Actor(e)),
+        Err(_) => return Err(SnapshotError::RoomUnreachable(doc_id)),
+    };
+    let engine = YrsEngine;
+    let transient = engine.new_doc();
+    engine
+        .apply_update(&transient, &state_bytes)
+        .map_err(SnapshotError::Apply)?;
+    Ok((transient, seq))
+}
+
 /// Re-render markdown from the live doc state, write to the cache, and
 /// re-run the task indexer. Used after any mutation that should be
 /// reflected on `/tasks` (markdown export, full-doc import via
@@ -82,31 +149,8 @@ async fn refresh_markdown_inner(
     doc_id: Uuid,
     reindex_tasks: bool,
 ) -> Result<String, RefreshError> {
-    let rooms = state.rooms_v2.clone().ok_or(RefreshError::NoRooms)?;
-    let room = rooms
-        .acquire(doc_id)
-        .await
-        .map_err(|_| RefreshError::Acquire(doc_id))?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if room
-        .tx
-        .send(knot_crdt::Event::ExportState(tx))
-        .await
-        .is_err()
-    {
-        return Err(RefreshError::RoomUnreachable(doc_id));
-    }
-    let (state_bytes, seq) = match rx.await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(RefreshError::Actor(format!("{e:?}"))),
-        Err(_) => return Err(RefreshError::RoomUnreachable(doc_id)),
-    };
-    let engine = YrsEngine;
-    let transient = engine.new_doc();
-    if let Err(e) = engine.apply_update(&transient, &state_bytes) {
-        return Err(RefreshError::Apply(format!("{e:?}")));
-    }
-    let text = match knot_markdown::to_markdown::serialise(&engine, &transient) {
+    let (transient, seq) = live_snapshot(state, doc_id).await?;
+    let text = match knot_markdown::to_markdown::serialise(&YrsEngine, &transient) {
         Ok(md) => md,
         Err(e) => return Err(RefreshError::Serialise(format!("{e:?}"))),
     };

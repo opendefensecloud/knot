@@ -40,7 +40,7 @@ function json(body: unknown, status = 200) {
   );
 }
 
-type Role = "owner" | "editor";
+type Role = "owner" | "editor" | "viewer";
 
 function docBody(id: string, title: string, role: Role, archive: Record<string, unknown> | null) {
   return {
@@ -207,5 +207,14 @@ describe("DocPage — revoked connection", () => {
     renderDoc("d1");
 
     expect(await screen.findByText("home")).toBeInTheDocument();
+  });
+});
+
+describe("DocPage — export menu", () => {
+  it("readers see the export menu", async () => {
+    vi.stubGlobal("fetch", server("viewer", { d1: [docBody("d1", "Runbook", "viewer", null)] }));
+    renderDoc("d1");
+
+    expect(await screen.findByTestId("doc-export")).toHaveAttribute("aria-haspopup", "menu");
   });
 });

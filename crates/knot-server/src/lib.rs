@@ -28,6 +28,8 @@ pub mod archive;
 pub mod auth;
 pub mod board_room_shim;
 pub mod comments_listener;
+pub mod export;
+pub mod export_check;
 pub mod http_error;
 pub mod metrics;
 pub mod protocol;
@@ -79,6 +81,10 @@ pub struct AppState {
     /// 1001 Close and the process can drain within the grace period instead
     /// of being SIGKILLed mid-rollout.
     pub shutdown: tokio_util::sync::CancellationToken,
+    /// Page exports (DOCX/ODT) running at once in this process.
+    pub export_permits: Arc<tokio::sync::Semaphore>,
+    /// How long an export waits for a permit before it is refused as busy.
+    pub export_busy_wait: std::time::Duration,
 }
 
 impl AppState {
@@ -114,6 +120,8 @@ impl AppState {
             config: Arc::new(Config::default()),
             build_version: env!("KNOT_BUILD_VERSION"),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            export_permits: Arc::new(tokio::sync::Semaphore::new(export::MAX_CONCURRENT_EXPORTS)),
+            export_busy_wait: export::BUSY_WAIT,
         }
     }
 
@@ -179,6 +187,8 @@ impl AppState {
             config: Arc::new(Config::default()),
             build_version: env!("KNOT_BUILD_VERSION"),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            export_permits: Arc::new(tokio::sync::Semaphore::new(export::MAX_CONCURRENT_EXPORTS)),
+            export_busy_wait: export::BUSY_WAIT,
         }
     }
 
