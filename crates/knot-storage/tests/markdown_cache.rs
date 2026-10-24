@@ -201,3 +201,23 @@ async fn late_render_does_not_overwrite_a_newer_one() {
     assert_eq!(got.markdown_text, "six again");
     assert_eq!(p.version(doc).await, 2);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_stale_makes_a_current_row_stale_again() {
+    let p = Pages::new().await;
+    let doc = p.page("a").await;
+    assert!(p.cache.put_rendered(doc, 3, "three", 2).await.unwrap());
+    let written = p.cache.get(doc).await.unwrap().unwrap();
+
+    p.cache.mark_stale(doc).await.unwrap();
+
+    assert_eq!(p.version(doc).await, 1);
+    assert_eq!(p.cache.stale_ids(2, None, 10).await.unwrap(), [doc]);
+    // The render itself stays as it was.
+    assert_eq!(p.cache.get(doc).await.unwrap().unwrap(), written);
+
+    // A page without a row is stale already, and keeps no row.
+    let unrendered = p.page("b").await;
+    p.cache.mark_stale(unrendered).await.unwrap();
+    assert!(p.cache.get(unrendered).await.unwrap().is_none());
+}

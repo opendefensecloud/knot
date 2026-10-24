@@ -22,7 +22,8 @@
 //! and dropped. The next dirty notification for the same doc will
 //! re-attempt; the task index is best-effort already (see
 //! `routes::api::markdown`). A stale page whose refresh fails is tried
-//! again on the sweep's next pass.
+//! again on the sweep's next pass. That includes a refresh that wrote the
+//! Markdown but not the task rows: it marks the cache row stale again.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -110,6 +111,12 @@ struct Sweep {
     /// for the whole pass, so the refreshes of the pages it queues run
     /// under the lock too. The lock belongs to the session: it goes when
     /// the connection closes, also when this process dies mid-pass.
+    ///
+    /// The database can end the session too (a restart, a failover), so
+    /// each tick checks the connection and ends the pass when it is gone.
+    /// Until that check, another replica may start a pass alongside this
+    /// one. That does no harm: a refresh writes the same result however
+    /// often it runs, and never replaces a newer render (the seq guard).
     lock: Option<sqlx::PgConnection>,
     /// The last page this pass queued: the next query starts after it, so
     /// pages whose refresh fails can't hold the pass up.
@@ -128,12 +135,19 @@ impl Sweep {
     }
 
     /// The stale pages to refresh on this tick, starting a pass when one is
-    /// due and this replica gets the lock.
+    /// due and this replica gets the lock, and ending it when the lock's
+    /// connection is gone.
     async fn next(&mut self, state: &AppState) -> Vec<Uuid> {
         let (Some(cache), Some(pool)) = (state.markdown_cache.as_ref(), state.pool.as_ref()) else {
             return Vec::new();
         };
-        if self.lock.is_none() {
+        if let Some(conn) = self.lock.as_mut() {
+            if let Err(e) = conn.ping().await {
+                tracing::warn!(error = %e, "reindex sweep: lock connection lost, pass ended");
+                self.rest().await;
+                return Vec::new();
+            }
+        } else {
             if Instant::now() < self.next_pass {
                 return Vec::new();
             }

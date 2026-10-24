@@ -8,6 +8,12 @@ use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 
+/// The renderer version of a row that [`MarkdownCacheStore::put`], an old
+/// release or [`MarkdownCacheStore::mark_stale`] wrote: what the row's
+/// trigger gives a write that doesn't name a version. Every renderer since
+/// is newer, so the refresh sweep renders such a row again.
+pub const STALE_RENDERER_VERSION: i32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownCacheEntry {
     pub doc_id: Uuid,
@@ -38,8 +44,9 @@ pub trait MarkdownCacheStore: Send + Sync + 'static {
     async fn get(&self, doc_id: Uuid) -> Result<Option<MarkdownCacheEntry>, MarkdownCacheError>;
 
     /// Write a render unconditionally. The row is marked as written by
-    /// renderer version 1, so the refresh sweep renders it again: this is
-    /// what releases before `renderer_version` wrote.
+    /// renderer version 1 ([`STALE_RENDERER_VERSION`]), so the refresh sweep
+    /// renders it again: this is what releases before `renderer_version`
+    /// wrote.
     async fn put(
         &self,
         doc_id: Uuid,
@@ -68,6 +75,14 @@ pub trait MarkdownCacheStore: Send + Sync + 'static {
         after: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<Uuid>, MarkdownCacheError>;
+
+    /// Mark the page's cached render as an old renderer's
+    /// ([`STALE_RENDERER_VERSION`]), so the refresh sweep renders it and
+    /// reindexes its tasks again: for a refresh whose task write failed
+    /// after [`put_rendered`](Self::put_rendered) marked the row current.
+    /// The render, its seq and `updated_at` stay. A page without a row is
+    /// stale already and is left as it is.
+    async fn mark_stale(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError>;
 
     /// Invalidate (delete) the cached row for a doc.
     async fn invalidate(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError>;
@@ -189,6 +204,13 @@ impl MarkdownCacheStore for PgMarkdownCache {
     ) -> Result<Vec<Uuid>, MarkdownCacheError> {
         // Walks documents_pkey and probes the cache by its primary key, so
         // it needs no index of its own.
+        //
+        // Not a prepared statement: Postgres may switch a prepared one to a
+        // generic plan after five runs, and in that plan `$2 IS NULL OR
+        // d.id > $2` is no index condition, so every tick scans the pkey
+        // from the lowest id (15.8 ms against 4.8 ms per tick at 50k
+        // pages). An unnamed statement is planned with the cursor's value
+        // each time, so the scan starts at the cursor.
         let ids = sqlx::query_scalar(
             "SELECT d.id
              FROM documents d
@@ -199,12 +221,24 @@ impl MarkdownCacheStore for PgMarkdownCache {
              ORDER BY d.id
              LIMIT $3",
         )
+        .persistent(false)
         .bind(current)
         .bind(after)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(ids)
+    }
+
+    async fn mark_stale(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError> {
+        // The trigger gives the update this version anyway: nothing sets
+        // one in its transaction.
+        sqlx::query("UPDATE doc_markdown_cache SET renderer_version = $2 WHERE doc_id = $1")
+            .bind(doc_id)
+            .bind(STALE_RENDERER_VERSION)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn invalidate(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError> {

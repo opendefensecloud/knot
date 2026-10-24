@@ -31,6 +31,7 @@ pub use grant_store::{Grant, GrantStore, GrantStoreError, PgGrantStore};
 pub use lexorank::between as sort_key_between;
 pub use markdown_cache::{
     MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore, PgMarkdownCache,
+    STALE_RENDERER_VERSION,
 };
 pub use pool::{Pool, PoolError, begin, connect};
 pub use search::{PgSearchStore, SearchHit, SearchStore, SearchStoreError};
