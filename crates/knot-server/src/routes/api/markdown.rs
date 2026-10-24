@@ -52,9 +52,12 @@ pub enum RefreshError {
     Apply(String),
     #[error("markdown serialise: {0}")]
     Serialise(String),
+    #[error("reading stored state: {0}")]
+    Storage(String),
 }
 
-/// Why [`live_snapshot`] could not copy a page's live state.
+/// Why [`live_snapshot`] or [`current_snapshot`] could not copy a page's
+/// state.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SnapshotError {
     #[error("server state missing rooms registry")]
@@ -70,6 +73,8 @@ pub(crate) enum SnapshotError {
     Actor(knot_crdt::EngineError),
     #[error(transparent)]
     Apply(knot_crdt::EngineError),
+    #[error("reading stored state: {0}")]
+    Storage(String),
 }
 
 /// Keeps `RefreshError`'s variants and messages as they were before the
@@ -82,6 +87,7 @@ impl From<SnapshotError> for RefreshError {
             SnapshotError::RoomUnreachable(doc_id) => Self::RoomUnreachable(doc_id),
             SnapshotError::Actor(e) => Self::Actor(format!("{e:?}")),
             SnapshotError::Apply(e) => Self::Apply(format!("{e:?}")),
+            SnapshotError::Storage(e) => Self::Storage(e),
         }
     }
 }
@@ -89,7 +95,7 @@ impl From<SnapshotError> for RefreshError {
 /// Copy the page's live state into a transient doc, with the room's seq at
 /// the time of the copy. The room actor only encodes its state
 /// (`Event::ExportState`), so it keeps serving editors while the caller
-/// reads the copy. Shared by the markdown refresh and the DOCX/ODT export.
+/// reads the copy. Used by the DOCX/ODT export, which opens the room.
 pub(crate) async fn live_snapshot(
     state: &AppState,
     doc_id: Uuid,
@@ -99,6 +105,72 @@ pub(crate) async fn live_snapshot(
         .acquire(doc_id)
         .await
         .map_err(|source| SnapshotError::Acquire { doc_id, source })?;
+    room_snapshot(&room, doc_id).await
+}
+
+/// The page's current state in a transient doc, with its seq, without
+/// booting a room: rooms are never evicted when idle, so a reader that
+/// booted them would keep every page it read in memory (P18).
+///
+/// - If a room is running here, its state, as [`live_snapshot`] copies it.
+/// - Otherwise the stored state, loaded the way a room loads it (latest
+///   snapshot, then the updates after it), with the latest seq applied.
+///
+/// Used by the markdown refresh, and so by its background sweep.
+pub(crate) async fn current_snapshot(
+    state: &AppState,
+    doc_id: Uuid,
+) -> Result<(knot_crdt::DocHandle, i64), SnapshotError> {
+    if let Some(room) = state.rooms_v2.as_ref().and_then(|r| r.get_active(doc_id)) {
+        return room_snapshot(&room, doc_id).await;
+    }
+    stored_snapshot(state, doc_id).await
+}
+
+/// The stored state of a page no room here has loaded. Read errors fail
+/// the snapshot instead of leaving content out, so a refresh never caches
+/// a page with part of it missing.
+async fn stored_snapshot(
+    state: &AppState,
+    doc_id: Uuid,
+) -> Result<(knot_crdt::DocHandle, i64), SnapshotError> {
+    use knot_storage::{SnapshotStore, UpdatesStore};
+
+    let pool = state
+        .pool
+        .clone()
+        .ok_or_else(|| SnapshotError::Storage("database pool not configured".into()))?;
+    let engine = YrsEngine;
+    let doc = engine.new_doc();
+    let mut seq = 0;
+    let latest = knot_storage::PgSnapshotStore::new(pool.clone())
+        .latest(doc_id)
+        .await
+        .map_err(|e| SnapshotError::Storage(e.to_string()))?;
+    if let Some(snap) = latest {
+        engine
+            .apply_update(&doc, &snap.state_bytes)
+            .map_err(SnapshotError::Apply)?;
+        seq = snap.snapshot_seq;
+    }
+    let updates = knot_storage::PgUpdatesStore::new(pool)
+        .since(doc_id, seq)
+        .await
+        .map_err(|e| SnapshotError::Storage(e.to_string()))?;
+    for update in updates {
+        engine
+            .apply_update(&doc, &update.update_bytes)
+            .map_err(SnapshotError::Apply)?;
+        seq = seq.max(update.seq);
+    }
+    Ok((doc, seq))
+}
+
+/// Copy a running room's state into a transient doc, with its seq.
+async fn room_snapshot(
+    room: &knot_crdt::RoomHandle,
+    doc_id: Uuid,
+) -> Result<(knot_crdt::DocHandle, i64), SnapshotError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     if room
         .tx
@@ -121,10 +193,10 @@ pub(crate) async fn live_snapshot(
     Ok((transient, seq))
 }
 
-/// Re-render markdown from the live doc state, write to the cache, and
-/// re-run the task indexer. Used after any mutation that should be
-/// reflected on `/tasks` (markdown export, full-doc import via
-/// ApplyUpdate/ReplaceWithMarkdown, individual task patch).
+/// Re-render markdown from the doc's current state ([`current_snapshot`]),
+/// write to the cache, and re-run the task indexer. Used after any mutation
+/// that should be reflected on `/tasks` (markdown export, full-doc import
+/// via ApplyUpdate/ReplaceWithMarkdown, individual task patch).
 ///
 /// Best-effort: cache-put + indexer failures are logged but never
 /// propagated. The Result reports only the steps before the cache write
@@ -134,22 +206,43 @@ pub async fn refresh_markdown_and_index(
     state: &AppState,
     doc_id: Uuid,
 ) -> Result<String, RefreshError> {
-    refresh_markdown_inner(state, doc_id, true).await
+    refresh_markdown_inner(state, doc_id, TaskIndex::Edit).await
 }
 
 /// Export the doc to markdown WITHOUT re-running the task indexer.
 /// Used by the from-template flow so cloning a template doesn't
 /// trigger a write to the template's own task rows.
 pub async fn export_markdown_only(state: &AppState, doc_id: Uuid) -> Result<String, RefreshError> {
-    refresh_markdown_inner(state, doc_id, false).await
+    refresh_markdown_inner(state, doc_id, TaskIndex::Skip).await
+}
+
+/// [`refresh_markdown_and_index`] for a page nobody edited: the refresh
+/// sweep's. It writes only the task rows whose values change, so a healthy
+/// page's tasks keep their `updated_at` and `/tasks` doesn't reshuffle.
+pub(crate) async fn refresh_markdown_quietly(
+    state: &AppState,
+    doc_id: Uuid,
+) -> Result<String, RefreshError> {
+    refresh_markdown_inner(state, doc_id, TaskIndex::Quiet).await
+}
+
+/// What a refresh does with the page's task rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskIndex {
+    /// Leaves them as they are.
+    Skip,
+    /// Rewrites them all, as after an edit (`upsert_for_doc`).
+    Edit,
+    /// Writes only the rows whose values change (`sync_for_doc_quiet`).
+    Quiet,
 }
 
 async fn refresh_markdown_inner(
     state: &AppState,
     doc_id: Uuid,
-    reindex_tasks: bool,
+    task_index: TaskIndex,
 ) -> Result<String, RefreshError> {
-    let (transient, seq) = live_snapshot(state, doc_id).await?;
+    let (transient, seq) = current_snapshot(state, doc_id).await?;
     let text = match knot_markdown::serialise_with_report(&YrsEngine, &transient) {
         Ok((md, unknown)) => {
             record_unknown_nodes(doc_id, &unknown);
@@ -157,12 +250,23 @@ async fn refresh_markdown_inner(
         }
         Err(e) => return Err(RefreshError::Serialise(format!("{e:?}"))),
     };
-    if let Some(cache) = state.markdown_cache.clone()
-        && let Err(e) = cache.put(doc_id, seq, &text).await
+    // A render of an older seq than the cached one writes nothing, and its
+    // tasks would be older too, so the reindex is skipped. When the write
+    // fails, whether it is older is unknown: reindex, as before the guard.
+    let newest = match state.markdown_cache.clone() {
+        Some(cache) => cache
+            .put_rendered(doc_id, seq, &text, knot_markdown::RENDERER_VERSION)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error=?e, "md cache put failed");
+                true
+            }),
+        None => true,
+    };
+    if newest
+        && task_index != TaskIndex::Skip
+        && let (Some(tasks), Some(docs)) = (state.tasks.clone(), state.docs.clone())
     {
-        tracing::warn!(error=?e, "md cache put failed");
-    }
-    if reindex_tasks && let (Some(tasks), Some(docs)) = (state.tasks.clone(), state.docs.clone()) {
         // From the page itself, so that listing index k is the item the
         // `/tasks` toggle with index k flips (spec A11, A12).
         let extracted = knot_markdown::tasks::extract_tasks_from_doc(&transient);
@@ -178,10 +282,16 @@ async fn refresh_markdown_inner(
             .collect();
         match docs.get(doc_id).await {
             Ok(Some(doc)) => {
-                if let Err(e) = tasks
-                    .upsert_for_doc(doc.workspace_id, doc_id, &inputs)
-                    .await
-                {
+                let written = if task_index == TaskIndex::Quiet {
+                    tasks
+                        .sync_for_doc_quiet(doc.workspace_id, doc_id, &inputs)
+                        .await
+                } else {
+                    tasks
+                        .upsert_for_doc(doc.workspace_id, doc_id, &inputs)
+                        .await
+                };
+                if let Err(e) = written {
                     tracing::warn!(error=?e, "task reindex failed");
                 }
             }

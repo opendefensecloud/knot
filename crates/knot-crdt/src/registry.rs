@@ -114,6 +114,13 @@ impl Rooms {
         Ok(arc)
     }
 
+    /// The room for `doc_id` if one is already running here. Never boots
+    /// one: rooms are not evicted when idle, so a background reader that
+    /// acquired them would keep every page it read in memory.
+    pub fn get_active(&self, doc_id: Uuid) -> Option<Arc<RoomHandle>> {
+        self.map.get(&doc_id).map(|h| h.clone())
+    }
+
     /// Send a revoke event to the room (if active). The room drops all
     /// conns; the WS shim's writer detects the closed channel and emits
     /// a 4403 close frame to each client.

@@ -10,6 +10,13 @@ pub mod to_markdown;
 
 pub use to_markdown::{SerError, serialise, serialise_with_report};
 
+/// The version of the Markdown this crate writes, stored with each cached
+/// render (`doc_markdown_cache.renderer_version`). Raising it makes the
+/// server re-render, once and in the background, every row an older version
+/// wrote, and reindex the tasks of those pages. Version 1 is everything
+/// written before versions were recorded.
+pub const RENDERER_VERSION: i32 = 2;
+
 /// Sentinel URL prefix for embedded Excalidraw boards in Markdown.
 pub const BOARD_URL_PREFIX: &str = "knot://board/";
 /// Sentinel URL suffix for embedded Excalidraw boards in Markdown.
