@@ -97,12 +97,16 @@ pub fn stability_exempt(md: &str) -> Option<&'static str> {
 /// transaction, is in it.
 type TaskClass = (&'static str, fn(&Transaction, &XmlElementRef) -> bool);
 
-/// Named task bug classes (planning decision P1). On a page where the legacy
-/// listing agrees with the room, a task item in one of them may be listed
-/// with other text than legacy listed it, and with another assignee or due
-/// date where legacy's came from content that isn't the item's own, or where
-/// legacy found none. Each entry is a bug from the spec in how legacy wrote
-/// the item, and the first entry that matches names the class.
+/// Named task bug classes (planning decision P1, and A4, A5 and A6 by
+/// controller ruling). On a page where the legacy listing agrees with the
+/// room, a task item in one of them may be listed with other text than
+/// legacy listed it. Its assignee and due date may differ only where
+/// legacy's came from content that isn't the item's own, or where legacy
+/// found none and the new one is a link in the item's own content. Each
+/// entry is a bug from the spec in how legacy wrote the item, and the first
+/// entry that matches names the class. A classed task is listed otherwise
+/// only where legacy damaged it: the legacy export of its page reads back
+/// under legacy with the item changed (`tests/tasks_compat.rs` checks it).
 const TASK_CLASSES: &[TaskClass] = &[
     ("task_with_nested_list", task_with_nested_list),
     ("task_block_syntax_as_text", task_block_syntax_as_text),
@@ -249,8 +253,9 @@ fn block_read_into_task(txn: &Transaction, item: &XmlElementRef) -> bool {
     false
 }
 
-/// Whether `node` is, or holds, a list item.
-fn holds_list_item<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
+/// Whether `node` is, or holds, a list item: a block of a task item that
+/// isn't the item's own content (P1).
+pub fn holds_list_item<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
     match node {
         XmlOut::Element(el) => {
             el.tag().as_ref() == "list_item"
@@ -1213,6 +1218,14 @@ pub fn normalised(doc: &yrs::Doc) -> String {
             }
         }
     }
+    out
+}
+
+/// One node of a document read in `txn` and all below it, as [`normalised`]
+/// writes it.
+pub fn normalised_node<T: ReadTxn>(txn: &T, node: &XmlOut) -> String {
+    let mut out = String::new();
+    dump(txn, node, 0, &mut out);
     out
 }
 

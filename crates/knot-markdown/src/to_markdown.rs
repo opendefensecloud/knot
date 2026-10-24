@@ -152,23 +152,10 @@ fn write_block<T: ReadTxn>(
         }
         "blockquote" => {
             let mut lines = Vec::new();
-            write_quote(&mut lines, txn, el, unknown)?;
+            write_quote(&mut lines, txn, el, Purpose::Export, unknown)?;
             write_lines(buf, lines);
         }
-        "code_block" => {
-            let lang = attr(el, txn, "language").unwrap_or_default();
-            buf.push_str("```");
-            buf.push_str(&lang);
-            buf.push('\n');
-            let len = el.len(txn);
-            for i in 0..len {
-                if let Some(XmlOut::Text(t)) = el.get(txn, i) {
-                    let s = t.get_string(txn);
-                    buf.push_str(&s);
-                }
-            }
-            buf.push_str("\n```\n");
-        }
+        "code_block" => write_code_block(buf, txn, el, "```"),
         "horizontal_rule" => {
             buf.push_str("---\n");
         }
@@ -310,6 +297,29 @@ fn write_block<T: ReadTxn>(
         }
     }
     Ok(())
+}
+
+/// Writes `el`, a code block, between two `fence`s.
+fn write_code_block<T: ReadTxn>(buf: &mut String, txn: &T, el: &XmlElementRef, fence: &str) {
+    let lang = attr(el, txn, "language").unwrap_or_default();
+    buf.push_str(fence);
+    buf.push_str(&lang);
+    buf.push('\n');
+    buf.push_str(&code_text(txn, el));
+    buf.push('\n');
+    buf.push_str(fence);
+    buf.push('\n');
+}
+
+/// The code of `el`, a code block.
+fn code_text<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> String {
+    let mut code = String::new();
+    for i in 0..el.len(txn) {
+        if let Some(XmlOut::Text(t)) = el.get(txn, i) {
+            code.push_str(&t.get_string(txn));
+        }
+    }
+    code
 }
 
 /// The block group of `tools/schema.json`.
@@ -512,17 +522,27 @@ fn write_list_item<T: ReadTxn>(
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
     let children = written_children(txn, item);
-    write_item(buf, txn, marker, checkbox(item, txn), children, unknown)
+    let checkbox = checkbox(item, txn);
+    write_item(
+        buf,
+        txn,
+        marker,
+        checkbox,
+        children,
+        Purpose::Export,
+        unknown,
+    )
 }
 
 /// Writes a list item of `children` after `marker` and `checkbox` (`""` for
-/// none), as [`write_list_item`] describes.
+/// none), as [`write_list_item`] describes, for `purpose`.
 fn write_item<T: ReadTxn>(
     buf: &mut Vec<Line>,
     txn: &T,
     marker: &str,
     checkbox: &str,
     mut children: Vec<Child>,
+    purpose: Purpose,
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
     let pad = " ".repeat(marker.chars().count());
@@ -534,7 +554,7 @@ fn write_item<T: ReadTxn>(
         children.remove(0);
     }
     let mut lines = Vec::new();
-    write_container(&mut lines, txn, &children, false, unknown)?;
+    write_container(&mut lines, txn, &children, false, purpose, unknown)?;
     // A node the schema doesn't name is written as a paragraph of its text.
     let first_tag = match children.first() {
         Some(Child::Block(first)) if BLOCKS.contains(&first.tag().as_ref()) => {
@@ -552,6 +572,12 @@ fn write_item<T: ReadTxn>(
         if !checkbox.is_empty() || blank_between || rule_first {
             lines.insert(0, Line::Blank);
         }
+    }
+    // An item whose first line holds no text ends at a blank line right
+    // below it, which would leave the rest of a task's text outside it.
+    if purpose == Purpose::TaskText && lines.first().is_some_and(Line::is_blank) {
+        let blanks = lines[1..].iter().take_while(|line| line.is_blank()).count();
+        lines.drain(1..1 + blanks);
     }
     for (i, line) in lines.into_iter().enumerate() {
         buf.push(match line {
@@ -580,6 +606,12 @@ fn write_item<T: ReadTxn>(
 /// out: a nested list, or a table or quote holding a checklist. Its items
 /// are tasks of their own, or plain bullets, and none of their content is
 /// the item's.
+///
+/// Its text is written so that it reads as the text it is, never as block
+/// syntax ([`Purpose::TaskText`]): a line `- milk` or `1. slides` would
+/// otherwise start a nested list, whose item takes the place of the task,
+/// so that the task would be listed without its text, assignee and due date.
+/// This Markdown is never stored or exported, so the escaping costs nothing.
 pub(crate) fn task_item_markdown<T: ReadTxn>(txn: &T, item: &XmlElementRef) -> String {
     let children: Vec<Child> = written_children(txn, item)
         .into_iter()
@@ -588,7 +620,16 @@ pub(crate) fn task_item_markdown<T: ReadTxn>(txn: &T, item: &XmlElementRef) -> S
     let mut lines = Vec::new();
     // Writing fails only on a child that vanishes during the read, which one
     // transaction rules out; the item is then listed without text.
-    if write_item(&mut lines, txn, "- ", "[ ] ", children, &mut Unknown::new()).is_err() {
+    let written = write_item(
+        &mut lines,
+        txn,
+        "- ",
+        "[ ] ",
+        children,
+        Purpose::TaskText,
+        &mut Unknown::new(),
+    );
+    if written.is_err() {
         return "- [ ] \n".to_string();
     }
     let mut buf = String::new();
@@ -616,17 +657,18 @@ fn holds_list_item<T: ReadTxn>(txn: &T, child: &Child) -> bool {
     }
 }
 
-/// Writes a blockquote: each line of its blocks after `> `, and a blank line
-/// or an empty line of a code block as `>`.
+/// Writes a blockquote for `purpose`: each line of its blocks after `> `,
+/// and a blank line or an empty line of a code block as `>`.
 fn write_quote<T: ReadTxn>(
     buf: &mut Vec<Line>,
     txn: &T,
     quote: &XmlElementRef,
+    purpose: Purpose,
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
     let mut lines = Vec::new();
     let children = written_children(txn, quote);
-    write_container(&mut lines, txn, &children, true, unknown)?;
+    write_container(&mut lines, txn, &children, true, purpose, unknown)?;
     buf.extend(lines.into_iter().map(|line| match line {
         Line::Text { text, open } if !text.is_empty() => Line::Text {
             text: format!("> {text}"),
@@ -658,6 +700,17 @@ enum Line {
     Blank,
 }
 
+impl Line {
+    /// Whether Markdown reads the line as a blank line: it is one, or holds
+    /// nothing but blanks.
+    fn is_blank(&self) -> bool {
+        match self {
+            Line::Text { text, .. } => text.trim().is_empty(),
+            Line::Blank => true,
+        }
+    }
+}
+
 /// Writes `children`, the blocks of a list item or, when `in_quote`, a
 /// blockquote ([`block_children`]), into `buf`, for the caller to put the
 /// item's indent or the quote's `> ` in front of each line.
@@ -670,31 +723,149 @@ enum Line {
 /// line now goes between two blocks exactly where the second would be read
 /// that way ([`Block::needs_blank_line_before`]); everywhere else the output
 /// is as before.
+///
+/// For [`Purpose::TaskText`], the lines of text are written as
+/// [`task_text_line`] says, and a paragraph, image or board right below
+/// another goes on as more lines of it: no blank line goes between them.
+/// Lines of text are those of a paragraph, and those of a heading but its
+/// first: a line break in a heading starts a paragraph below it.
 fn write_container<T: ReadTxn>(
     buf: &mut Vec<Line>,
     txn: &T,
     children: &[Child],
     in_quote: bool,
+    purpose: Purpose,
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
+    let task_text = purpose == Purpose::TaskText;
     let mut prev: Option<Block> = None;
     for child in children {
-        let (block, lines) = block_lines(txn, child, unknown)?;
-        if prev.is_some_and(|prev| prev.needs_blank_line_before(block, in_quote)) {
+        let (block, lines) = block_lines(txn, child, purpose, unknown)?;
+        let goes_on = task_text && block.is_text() && prev.is_some_and(Block::is_text);
+        if !goes_on && prev.is_some_and(|prev| prev.needs_blank_line_before(block, in_quote)) {
             buf.push(Line::Blank);
         }
-        buf.extend(lines);
+        let text_from = match block {
+            _ if !task_text => None,
+            Block::Text | Block::Image => Some(0),
+            Block::Heading => Some(1),
+            _ => None,
+        };
+        for (i, line) in lines.into_iter().enumerate() {
+            let line = match text_from {
+                Some(from) if i >= from => {
+                    // An item's first line follows its checkbox.
+                    let after_checkbox = !in_quote && buf.is_empty();
+                    task_text_line(buf.last(), line, after_checkbox)
+                }
+                _ => line,
+            };
+            buf.push(line);
+        }
         prev = Some(block);
     }
     Ok(())
 }
 
+/// What a list item's or blockquote's blocks are written for.
+#[derive(Clone, Copy, PartialEq)]
+enum Purpose {
+    /// The export: Markdown that reads back as the page.
+    Export,
+    /// The Markdown `/tasks` reads a task item's text from
+    /// ([`task_item_markdown`]): only the text it reads as matters, and that
+    /// must be the item's text as it is ([`task_text_line`]).
+    TaskText,
+}
+
+/// `line`, a line of a paragraph, or of an image, board or attachment
+/// written as one, written for [`Purpose::TaskText`] so that it reads as the
+/// text it is, never as the start of another block:
+/// - right below a line of text, it goes on that paragraph, indented by four
+///   more spaces: a line indented that far starts no block. Legacy wrote
+///   every line of an item but its first so, which is why a task's text
+///   reads as it always did;
+/// - right after the item's checkbox (`after_checkbox`), it is as it is:
+///   nothing there starts a block, and neither does a line of nothing but
+///   blanks;
+/// - elsewhere it starts a paragraph ([`escape_block_start`]).
+fn task_text_line(prev: Option<&Line>, line: Line, after_checkbox: bool) -> Line {
+    let Line::Text { text, open } = line else {
+        return line;
+    };
+    let goes_on = matches!(prev, Some(Line::Text { text, open: true }) if !text.trim().is_empty());
+    let text = if text.trim().is_empty() || after_checkbox {
+        text
+    } else if goes_on {
+        format!("    {text}")
+    } else {
+        escape_block_start(&text)
+    };
+    Line::Text { text, open }
+}
+
+/// `text`, the first line of a paragraph, without the blanks it starts with
+/// (four would make it code, and Markdown drops them anyway), and with a
+/// backslash before the character that would make it the start of a list
+/// item, heading, blockquote, code fence, rule, HTML block or link reference
+/// definition: `\- milk`, `1\. slides`, `\# h`, `\<u>`. Markdown reads
+/// `1\. slides` as two pieces of text, which `/tasks` lists as `1 . slides`;
+/// a paragraph starts below other text only after a heading, code block,
+/// rule, table or blockquote, or in a blockquote, or after a blank line.
+fn escape_block_start(text: &str) -> String {
+    let text = text.trim_start_matches([' ', '\t']);
+    // A marker ends the line, or a blank follows it.
+    let ends_marker = |rest: &str| rest.is_empty() || rest.starts_with([' ', '\t']);
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    let number = &text[digits..];
+    // `[label]: target`.
+    let definition = text.starts_with('[')
+        && text
+            .find(']')
+            .is_some_and(|end| text[end + 1..].starts_with(':'));
+    // An HTML block runs on to the next blank line.
+    let html = text
+        .strip_prefix('<')
+        .is_some_and(|tag| tag.starts_with(|c: char| c.is_ascii_alphabetic() || "/!?".contains(c)));
+    let at =
+        if (1..=9).contains(&digits) && number.starts_with(['.', ')']) && ends_marker(&number[1..])
+        {
+            Some(digits)
+        } else if (text.starts_with(['-', '+', '*']) && ends_marker(&text[1..]))
+            || text.starts_with(['#', '>'])
+            || text.starts_with("```")
+            || text.starts_with("~~~")
+            || is_rule(text)
+            || definition
+            || html
+        {
+            Some(0)
+        } else {
+            None
+        };
+    match at {
+        Some(at) => format!("{}\\{}", &text[..at], &text[at..]),
+        None => text.to_string(),
+    }
+}
+
+/// Whether `text` is a rule: three or more `*`, `-` or `_`, and nothing else
+/// but blanks.
+fn is_rule(text: &str) -> bool {
+    let Some(mark) = text.chars().next().filter(|c| matches!(c, '*' | '-' | '_')) else {
+        return false;
+    };
+    text.chars().all(|c| c == mark || c == ' ' || c == '\t')
+        && text.chars().filter(|&c| c == mark).count() >= 3
+}
+
 /// `child`, a block of a list item or blockquote, as lines without the blank
 /// lines it ends with, and as a [`Block`]. A block written as nothing is one
-/// blank line.
+/// blank line. A blockquote is written for `purpose`.
 fn block_lines<T: ReadTxn>(
     txn: &T,
     child: &Child,
+    purpose: Purpose,
     unknown: &mut Unknown,
 ) -> Result<(Block, Vec<Line>), SerError> {
     let tag = match child {
@@ -703,11 +874,27 @@ fn block_lines<T: ReadTxn>(
     };
     let mut lines = Vec::new();
     match (child, tag.as_str()) {
-        (Child::Block(el), "blockquote") => write_quote(&mut lines, txn, el, unknown)?,
+        (Child::Block(el), "blockquote") => write_quote(&mut lines, txn, el, purpose, unknown)?,
         (Child::Block(el), "bullet_list" | "ordered_list") => {
             for (item, marker) in list_items(txn, el)? {
                 write_list_item(&mut lines, txn, &item, &marker, unknown)?;
             }
+        }
+        // A line of the code that is a fence would end the block early.
+        (Child::Block(el), "code_block") if purpose == Purpose::TaskText => {
+            let code = code_text(txn, el);
+            let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+            let fence = "`".repeat(longest.max(2) + 1);
+            let mut text = String::new();
+            write_code_block(&mut text, txn, el, &fence);
+            lines.extend(
+                text.trim_end_matches('\n')
+                    .split('\n')
+                    .map(|line| Line::Text {
+                        text: line.to_string(),
+                        open: false,
+                    }),
+            );
         }
         _ => {
             let mut text = String::new();
@@ -773,6 +960,12 @@ enum Block {
 }
 
 impl Block {
+    /// Whether the block is written as a paragraph of text: a paragraph, an
+    /// attachment, an image or board, or a node the schema doesn't name.
+    fn is_text(self) -> bool {
+        matches!(self, Block::Text | Block::Image)
+    }
+
     /// A block with tag `tag`, written as `lines`. A tag the schema doesn't
     /// name was written as its text, a paragraph.
     fn of(tag: &str, lines: &[Line]) -> Self {

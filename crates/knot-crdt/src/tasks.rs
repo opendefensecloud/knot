@@ -93,7 +93,11 @@ mod tests {
             // an ordered list with a checkbox
             let ordered = push(&frag, &mut txn, "ordered_list", None);
             let d = push(&ordered, &mut txn, "list_item", Some("false"));
-            want.extend([a, b, c, d]);
+            // a blockquote holding a checklist
+            let quote = push(&frag, &mut txn, "blockquote", None);
+            let quote_list = push(&quote, &mut txn, "bullet_list", None);
+            let e = push(&quote_list, &mut txn, "list_item", Some("true"));
+            want.extend([a, b, c, d, e]);
         }
         let txn = doc.transact();
         assert_eq!(task_items(&frag, &txn), want);
