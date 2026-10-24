@@ -60,7 +60,7 @@
   - web: `pnpm tsc`, `pnpm lint`, `pnpm test`;
   - e2e: Playwright.
   - Rust integration tests use `KNOT_TEST_DATABASE_URL=postgres://knot:knot@127.0.0.1:5434/knot`.
-- **Commits:** Conventional Commits with the scopes `markdown`, `tasks`, `sort-keys`, `tree` and `duplicate`. Signed if 1Password is available; otherwise `git -c commit.gpgsign=false commit`. The owner authorized this before, and the branch is re-signed before push.
+- **Commits:** Conventional Commits with the scopes `markdown`, `tasks`, `sort-keys`, `tree` and `duplicate`. Commits are signed (1Password SSH agent). If signing fails, retry once after 30 s, then stop and report it. Never commit unsigned on this branch: the owner chose signed commits for it on 2026-10-24.
 - **Docs:**
   - CHANGELOG:
     - Upgrading:
