@@ -206,6 +206,195 @@ fn list_item_with_several_blocks_round_trips() {
     }
 }
 
+/// A paragraph, image or table right below a list or quote goes on it only
+/// when its last line is a paragraph's or a table row. After one ending in
+/// a heading or code block nothing is open, so legacy's output reads back
+/// as written and stays byte for byte as it was.
+#[test]
+fn lists_and_quotes_ending_in_a_closed_block_keep_their_bytes() {
+    for level in [Any::from("2"), Any::Number(2.0)] {
+        let heading = || ela("heading", vec![("level", level.clone())], vec![text("h")]);
+        let code = || el("code_block", vec![text("c")]);
+        let table = || {
+            el(
+                "table",
+                vec![
+                    el("table_row", vec![el("table_header", vec![p("h")])]),
+                    el("table_row", vec![el("table_cell", vec![p("c")])]),
+                ],
+            )
+        };
+        let list_ending_in_code = || bullets(vec![item(vec![p("b"), code()])]);
+        for (what, blocks, want) in [
+            (
+                "a paragraph after a list ending in a code block, in a quote",
+                vec![quote(vec![list_ending_in_code(), p("para")])],
+                "> - b\n>   ```\n>   c\n>   ```\n> para\n",
+            ),
+            (
+                "a paragraph after a list ending in a code block, in an item",
+                vec![bullets(vec![item(vec![
+                    p("x"),
+                    list_ending_in_code(),
+                    p("para"),
+                ])])],
+                "- x\n  - b\n    ```\n    c\n    ```\n  para\n",
+            ),
+            (
+                "a paragraph after a quoted heading, in a quote",
+                vec![quote(vec![quote(vec![heading()]), p("para")])],
+                "> > ## h\n> para\n",
+            ),
+            (
+                "a paragraph after a quote ending in a code block, in a quote",
+                vec![quote(vec![quote(vec![p("q"), code()]), p("para")])],
+                "> > q\n> > ```\n> > c\n> > ```\n> para\n",
+            ),
+            (
+                "a paragraph after a quote ending in a code block, in an item",
+                vec![bullets(vec![item(vec![
+                    p("x"),
+                    quote(vec![p("q"), code()]),
+                    p("para"),
+                ])])],
+                "- x\n  > q\n  > ```\n  > c\n  > ```\n  para\n",
+            ),
+            (
+                "a paragraph after a list ending in a heading, in an item",
+                vec![bullets(vec![item(vec![
+                    p("x"),
+                    bullets(vec![item(vec![p("b"), heading()])]),
+                    p("para"),
+                ])])],
+                "- x\n  - b\n    ## h\n  para\n",
+            ),
+            (
+                "an image after a list ending in a code block, in a quote",
+                vec![quote(vec![list_ending_in_code(), image("u", "x")])],
+                "> - b\n>   ```\n>   c\n>   ```\n> ![x](u)\n",
+            ),
+            (
+                "a table after a quoted heading, in an item",
+                vec![bullets(vec![item(vec![
+                    p("x"),
+                    quote(vec![heading()]),
+                    table(),
+                ])])],
+                "- x\n  > ## h\n  | h |\n  | --- |\n  | c |\n",
+            ),
+        ] {
+            let doc = build(&blocks);
+            let legacy_md = legacy::serialise(&YrsEngine, &doc).expect("legacy");
+            assert_eq!(legacy_md, want, "{what}: legacy");
+            assert_eq!(assert_round_trips(what, &doc), want, "{what}");
+        }
+    }
+}
+
+/// The blank lines a list ends with are left out of it, so a nested list
+/// whose last item ends in an empty paragraph ends on that item's last
+/// paragraph line, and a paragraph after it gets its blank line.
+#[test]
+fn a_paragraph_after_a_list_ending_in_an_empty_paragraph_stays_apart() {
+    let empty = || el("paragraph", Vec::new());
+    let doc = build(&[bullets(vec![item(vec![
+        p("x"),
+        bullets(vec![item(vec![p("b"), empty()])]),
+        p("para"),
+    ])])]);
+    let md = export(&doc);
+    assert_eq!(md, "- x\n  - b\n\n  para\n");
+    // The importer drops an empty paragraph at the end of an item, as
+    // before; the paragraph after the list stays a block of its own.
+    let without_empty = build(&[bullets(vec![item(vec![
+        p("x"),
+        bullets(vec![item(vec![p("b")])]),
+        p("para"),
+    ])])]);
+    assert_eq!(
+        normalised(import(&md).inner()),
+        normalised(without_empty.inner())
+    );
+    assert_eq!(
+        assert_round_trips("the list without its empty paragraph", &without_empty),
+        md
+    );
+}
+
+/// The importer gives an item the old importer stored without its first
+/// paragraph an empty one first (A7). When such an item's export changes
+/// anyway (a blank line goes between two of its lines), its marker goes on a
+/// line of its own, as that empty paragraph writes it, so the export is a
+/// fixed point. One without blank lines keeps legacy's bytes.
+#[test]
+fn item_without_its_first_paragraph_gets_an_empty_first_line_before_blank_lines() {
+    let empty = || el("paragraph", Vec::new());
+    let table = || {
+        el(
+            "table",
+            vec![
+                el("table_row", vec![el("table_header", vec![p("h")])]),
+                el("table_row", vec![el("table_cell", vec![p("c")])]),
+            ],
+        )
+    };
+    for (what, kids, bullet_md, ordered_md) in [
+        (
+            "two quotes",
+            vec![quote(vec![p("q")]), quote(vec![p("q")])],
+            "- \n  > q\n\n  > q\n",
+            "3. \n   > q\n\n   > q\n",
+        ),
+        (
+            "two tables",
+            vec![table(), table()],
+            "- \n  | h |\n  | --- |\n  | c |\n\n  | h |\n  | --- |\n  | c |\n",
+            "3. \n   | h |\n   | --- |\n   | c |\n\n   | h |\n   | --- |\n   | c |\n",
+        ),
+    ] {
+        let healed_kids = [vec![empty()], kids.clone()].concat();
+        for (list, doc, healed, want) in [
+            (
+                "bullet",
+                build(&[bullets(vec![item(kids.clone())])]),
+                build(&[bullets(vec![item(healed_kids.clone())])]),
+                bullet_md,
+            ),
+            (
+                "ordered",
+                build(&[ordered(3, vec![item(kids.clone())])]),
+                build(&[ordered(3, vec![item(healed_kids.clone())])]),
+                ordered_md,
+            ),
+        ] {
+            let what = format!("{list} item of {what}");
+            let md = export(&doc);
+            assert_eq!(md, want, "{what}");
+            assert_eq!(
+                normalised(import(&md).inner()),
+                normalised(healed.inner()),
+                "{what}: {md:?} reads back as a different tree"
+            );
+            assert_eq!(assert_round_trips(&what, &healed), md, "{what}");
+        }
+    }
+
+    let heading = || ela("heading", vec![("level", Any::from("2"))], vec![text("h")]);
+    for (what, kids, want) in [
+        ("a heading", vec![heading()], "- ## h\n"),
+        (
+            "a heading and a paragraph",
+            vec![heading(), p("para")],
+            "- ## h\n  para\n",
+        ),
+    ] {
+        let doc = build(&[bullets(vec![item(kids)])]);
+        let legacy_md = legacy::serialise(&YrsEngine, &doc).expect("legacy");
+        assert_eq!(legacy_md, want, "{what}: legacy");
+        assert_eq!(export(&doc), want, "{what}");
+    }
+}
+
 #[test]
 fn blockquote_list_then_paragraph_round_trips() {
     let doc = build(&[quote(vec![bullets(vec![item(vec![p("a")])]), p("b")])]);

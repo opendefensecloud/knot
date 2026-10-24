@@ -451,8 +451,10 @@ fn ordered_checkbox(doc: &DocHandle) -> bool {
 /// that block (A5): a second paragraph runs on into the first, an image or
 /// board joins the paragraph above and is dropped, a list that can't
 /// interrupt a paragraph (`3.`, an empty first item) turns into its text or
-/// a heading, and a paragraph, image or table after a nested list, quote or
-/// table continues it. A rule under a paragraph is `rule_in_container`.
+/// a heading, and a paragraph, image or table continues a nested table, or a
+/// nested list or quote whose last line is a paragraph's or a table row (not
+/// one ending in a heading or code block). A rule under a paragraph is
+/// `rule_in_container`.
 fn multi_block_item(doc: &DocHandle) -> bool {
     any_element(doc, &|txn, el, in_cell| {
         !in_cell && el.tag().as_ref() == "list_item" && runs_on(txn, el, false)
@@ -461,9 +463,10 @@ fn multi_block_item(doc: &DocHandle) -> bool {
 
 /// A blockquote, outside table cells, with a block that legacy wrote on the
 /// line right below the block before it, where Markdown reads it as part of
-/// that block (A6): a paragraph, image or table after a list, quote or
-/// table, a `3.` list after a paragraph, a quote after a quote, a paragraph
-/// after an image. A paragraph followed by a paragraph, image, board or
+/// that block (A6): a paragraph, image or table after a table or after a
+/// list or quote whose last line is a paragraph's or a table row, a `3.`
+/// list after a paragraph, a quote after a quote, a paragraph after an
+/// image. A paragraph followed by a paragraph, image, board or
 /// attachment is not in it: the importer reads every line of a quote's
 /// paragraph as a paragraph of its own, so those round-trip as they are
 /// (P2). A rule under a paragraph is `rule_in_container`.
@@ -518,11 +521,17 @@ enum Written {
         image: bool,
     },
     /// A list. Its first line `interrupts` a paragraph above it when its
-    /// first item has content and, if ordered, is numbered 1.
+    /// first item has content and, if ordered, is numbered 1. It
+    /// `ends_open` when its last line is a line of a paragraph or a table
+    /// row, which the line right below it goes on.
     List {
         interrupts: bool,
+        ends_open: bool,
     },
-    Quote,
+    /// A blockquote, which `ends_open` as a list does.
+    Quote {
+        ends_open: bool,
+    },
     Table,
 }
 
@@ -536,18 +545,13 @@ fn written<T: ReadTxn>(txn: &T, block: &XmlOut) -> Option<Written> {
         "paragraph" if !has_content(txn, el) => Written::Blank,
         "paragraph" | "attachment" => Written::Line { image: false },
         "image" | "excalidraw_board" => Written::Line { image: true },
-        "bullet_list" => Written::List {
-            interrupts: first_item_has_content(txn, el),
+        "bullet_list" | "ordered_list" => Written::List {
+            interrupts: list_interrupts(txn, el),
+            ends_open: ends_open(txn, block),
         },
-        // Numbered from `start`, 1 when it is missing or not a number.
-        "ordered_list" => Written::List {
-            interrupts: first_item_has_content(txn, el)
-                && el
-                    .get_attribute(txn, "start")
-                    .and_then(|start| start.to_string(txn).parse::<u64>().ok())
-                    .is_none_or(|start| start == 1),
+        "blockquote" => Written::Quote {
+            ends_open: ends_open(txn, block),
         },
-        "blockquote" => Written::Quote,
         "table" => Written::Table,
         _ => return None,
     })
@@ -561,20 +565,83 @@ fn has_content<T: ReadTxn>(txn: &T, paragraph: &XmlElementRef) -> bool {
     })
 }
 
-/// Whether the first line of `list` has content after its marker: a
-/// checkbox, or a first block other than an empty paragraph.
-fn first_item_has_content<T: ReadTxn>(txn: &T, list: &XmlElementRef) -> bool {
-    let Some(XmlOut::Element(item)) = list.get(txn, 0) else {
+/// Whether `item` is written on a line at all: one without blocks or
+/// checkbox is written as nothing.
+fn is_written<T: ReadTxn>(txn: &T, item: &XmlElementRef) -> bool {
+    item.len(txn) > 0 || item.get_attribute(txn, "checked").is_some()
+}
+
+/// Whether the first line of `list` can interrupt a paragraph above it. That
+/// line is its first item's that is written at all ([`is_written`]), and
+/// it can when it has content after the marker, a checkbox or a first block
+/// other than an empty paragraph, and, in an ordered list, is numbered 1
+/// (the list numbered from `start`, 1 when it is missing or not a number).
+fn list_interrupts<T: ReadTxn>(txn: &T, list: &XmlElementRef) -> bool {
+    let items: Vec<XmlElementRef> = children(txn, list)
+        .into_iter()
+        .filter_map(|item| match item {
+            XmlOut::Element(item) => Some(item),
+            _ => None,
+        })
+        .collect();
+    let Some((index, item)) = items
+        .iter()
+        .enumerate()
+        .find(|(_, item)| is_written(txn, item))
+    else {
         return false;
     };
-    item.get_attribute(txn, "checked").is_some()
+    let has_content = item.get_attribute(txn, "checked").is_some()
         || match item.get(txn, 0) {
             Some(XmlOut::Element(first)) if first.tag().as_ref() == "paragraph" => {
                 has_content(txn, &first)
             }
             Some(_) => true,
             None => false,
-        }
+        };
+    let start = list
+        .get_attribute(txn, "start")
+        .and_then(|start| start.to_string(txn).parse::<u64>().ok())
+        .unwrap_or(1);
+    has_content
+        && (list.tag().as_ref() == "bullet_list" || start.checked_add(index as u64) == Some(1))
+}
+
+/// Whether the last line `block` is written on, in a list item or
+/// blockquote, is a line of a paragraph (an attachment, image or board is
+/// written as one) or a table row, which the line right below it goes on as
+/// a lazy continuation line or another row. A heading, code block or rule
+/// ends on its own line, and so do a marker without content (`- `,
+/// `- [x] `) and a quote's blank line (`>`), the last line of a quote that
+/// ends in an empty paragraph. A list's last line is its last written item's
+/// ([`is_written`]), and an item's that of its last block other than an
+/// empty paragraph: the blank lines at the end of a list are left out.
+fn ends_open<T: ReadTxn>(txn: &T, block: &XmlOut) -> bool {
+    let XmlOut::Element(el) = block else {
+        return false;
+    };
+    match el.tag().as_ref() {
+        "paragraph" => has_content(txn, el),
+        "attachment" | "image" | "excalidraw_board" | "table" => true,
+        "bullet_list" | "ordered_list" => children(txn, el)
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                XmlOut::Element(item) if is_written(txn, item) => Some(
+                    children(txn, item)
+                        .iter()
+                        .rev()
+                        .find(|child| written(txn, child) != Some(Written::Blank))
+                        .is_some_and(|last| ends_open(txn, last)),
+                ),
+                _ => None,
+            })
+            .unwrap_or(false),
+        "blockquote" => children(txn, el)
+            .last()
+            .is_some_and(|last| ends_open(txn, last)),
+        _ => false,
+    }
 }
 
 /// Whether `next`, written on the line right below `prev`, reads as part of
@@ -591,15 +658,25 @@ fn read_into(prev: Written, next: Written, in_quote: bool) -> bool {
         // paragraph.
         (Line { image: false }, Line { .. }) if in_quote => false,
         (Line { .. }, Line { .. }) => true,
-        (Line { .. }, List { interrupts }) => !interrupts,
-        (Line { .. }, Closed | Quote | Table) => false,
-        // A paragraph line or a table goes on a list or quote as a lazy
-        // continuation line, or on a table as rows, and a quote right below
-        // a quote joins it. Any other block start ends them, a list
-        // starting at any number included.
-        (List { .. } | Quote | Table, Line { .. } | Table) => true,
-        (Quote, Quote) => true,
-        (List { .. } | Quote | Table, Closed | Rule | Quote | List { .. }) => false,
+        (Line { .. }, List { interrupts, .. }) => !interrupts,
+        (Line { .. }, Closed | Quote { .. } | Table) => false,
+        // A paragraph line or a table goes on a list or quote that ends on
+        // an open paragraph as a lazy continuation line, or on a table as
+        // rows, and a quote right below a quote joins it. Any other block
+        // start ends them, a list starting at any number included, and
+        // after a list or quote whose last line isn't open (a heading, code
+        // block or rule, an empty item, a quote's blank line) no paragraph
+        // is left to go on.
+        (
+            List {
+                ends_open: true, ..
+            }
+            | Quote { ends_open: true }
+            | Table,
+            Line { .. } | Table,
+        ) => true,
+        (Quote { .. }, Quote { .. }) => true,
+        (List { .. } | Quote { .. } | Table, _) => false,
     }
 }
 

@@ -25,9 +25,10 @@ const RANDOM_DOCS_PER_SEED: usize = 200;
 
 /// Lower bounds on how much each differential compares, so a broken corpus
 /// can't make the harness pass by comparing nothing. Far below today's counts
-/// (about 5000 healthy documents outside the classes, 2800 healthy inputs of
-/// which 27 are files, 17300 exports, 6600 stability inputs, 600 healthy
-/// classed documents), leaving room for the documents bug classes exclude.
+/// (about 6200 healthy documents outside the classes, 3200 healthy inputs of
+/// which 27 are files, 21300 exports, 8500 stability inputs, 1060 healthy
+/// classed generated documents and 1090 healthy classed documents in all),
+/// leaving room for the documents bug classes exclude.
 const MIN_HEALTHY_DOCS: usize = 1_000;
 const MIN_HEALTHY_INPUTS: usize = 500;
 const MIN_HEALTHY_FILE_INPUTS: usize = 15;
@@ -275,10 +276,10 @@ fn import_export_import_is_stable() {
 }
 
 /// Each export class holds the fixed-point property under the new code: a
-/// healthy, schema-valid generated document in a class exports to Markdown
-/// that the new importer and serializer give back unchanged. Documents
-/// outside the schema (an item without its leading paragraph, which the
-/// importer adds back) are the damaged shapes of the tolerant export.
+/// healthy generated document in a class exports to Markdown that the new
+/// importer and serializer give back unchanged. That includes items the old
+/// importer stored without their leading paragraph, which the importer adds
+/// back: their export already starts with it.
 #[test]
 fn export_classes_hold_the_fixed_point() {
     let mut compared = 0;
@@ -287,9 +288,7 @@ fn export_classes_hold_the_fixed_point() {
         let Some(class) = compat::export_class(&case.doc) else {
             continue;
         };
-        if compat::healthy(&case.doc).is_none()
-            || !compat::schema_violations(case.doc.inner()).is_empty()
-        {
+        if compat::healthy(&case.doc).is_none() {
             continue;
         }
         compared += 1;
@@ -307,11 +306,10 @@ fn export_classes_hold_the_fixed_point() {
     assert_at_least("classed healthy documents", compared, MIN_CLASSED_DOCS);
 }
 
-/// Each export class names the documents whose export it changes, and
-/// leaves alone neighbouring documents, which export byte for byte as
-/// before.
-#[test]
-fn export_classes_name_their_documents() {
+/// Hand-built documents with the export class each falls in: the documents
+/// whose export a class changes, and neighbouring documents that export byte
+/// for byte as before.
+fn class_cases() -> Vec<(&'static str, Vec<N>, Option<&'static str>)> {
     let task =
         |checked: bool, kids: Vec<N>| ela("list_item", vec![("checked", Any::Bool(checked))], kids);
     let item = |kids: Vec<N>| el("list_item", kids);
@@ -352,8 +350,9 @@ fn export_classes_name_their_documents() {
     let code = || el("code_block", vec![text("c")]);
     let line_break = || el("paragraph", vec![text("a"), hard_break(), text("b")]);
     let nested = |inner: N| vec![p("a"), bullets(vec![inner])];
+    let code_in = |lead: &str| vec![p(lead), code()];
 
-    let cases: Vec<(&str, Vec<N>, Option<&str>)> = vec![
+    vec![
         (
             "nested checklist",
             vec![bullets(vec![task(false, nested(task(true, vec![p("b")])))])],
@@ -522,9 +521,109 @@ fn export_classes_name_their_documents() {
             ],
             None,
         ),
-    ];
+        // A paragraph, image or table right below a list or quote whose last
+        // line is a heading's or a code block's has no paragraph to go on:
+        // legacy's output reads back as written.
+        (
+            "a paragraph after a list ending in a code block, in a quote",
+            vec![quote(vec![bullets(vec![item(code_in("b"))]), p("para")])],
+            None,
+        ),
+        (
+            "a paragraph after a list ending in a code block, in an item",
+            vec![bullets(vec![item(vec![
+                p("x"),
+                bullets(vec![item(code_in("b"))]),
+                p("para"),
+            ])])],
+            None,
+        ),
+        (
+            "a paragraph after a quoted heading, in a quote",
+            vec![quote(vec![quote(vec![heading()]), p("para")])],
+            None,
+        ),
+        (
+            "a paragraph after a quote ending in a code block, in a quote",
+            vec![quote(vec![quote(code_in("q")), p("para")])],
+            None,
+        ),
+        (
+            "a paragraph after a quote ending in a code block, in an item",
+            vec![bullets(vec![item(vec![
+                p("x"),
+                quote(code_in("q")),
+                p("para"),
+            ])])],
+            None,
+        ),
+        (
+            "a paragraph after a list ending in a heading, in an item",
+            vec![bullets(vec![item(vec![
+                p("x"),
+                bullets(vec![item(vec![p("b"), heading()])]),
+                p("para"),
+            ])])],
+            None,
+        ),
+        (
+            "an image after a list ending in a code block, in a quote",
+            vec![quote(vec![bullets(vec![item(code_in("b"))]), image()])],
+            None,
+        ),
+        (
+            "a table after a quoted heading, in an item",
+            vec![bullets(vec![item(vec![
+                p("x"),
+                quote(vec![heading()]),
+                cell(vec![p("c")]),
+            ])])],
+            None,
+        ),
+        (
+            "a paragraph after a list ending in a paragraph, in a quote",
+            vec![quote(vec![
+                bullets(vec![item(vec![p("b"), code(), p("c")])]),
+                p("para"),
+            ])],
+            Some("quote_block_sequence"),
+        ),
+        // A list's first line is its first item that is written at all: an
+        // item without blocks or checkbox is written as nothing.
+        (
+            "a nested list starting with an item without blocks",
+            vec![bullets(vec![item(vec![
+                p("x"),
+                bullets(vec![item(Vec::new()), item(vec![p("b")])]),
+            ])])],
+            None,
+        ),
+        (
+            "a nested list at 0 starting with an item without blocks",
+            vec![bullets(vec![item(vec![
+                p("x"),
+                ordered(0, vec![item(Vec::new()), item(vec![p("b")])]),
+            ])])],
+            None,
+        ),
+        (
+            "a nested list at 1 starting with an item without blocks",
+            vec![bullets(vec![item(vec![
+                p("x"),
+                ordered(1, vec![item(Vec::new()), item(vec![p("b")])]),
+            ])])],
+            Some("multi_block_item"),
+        ),
+    ]
+}
+
+/// Each export class names the documents whose export it changes, and
+/// leaves alone neighbouring documents, which export byte for byte as
+/// before.
+#[test]
+fn export_classes_name_their_documents() {
     let mut failures = Vec::new();
-    for (what, blocks, want) in cases {
+    for (what, blocks, want) in class_cases() {
         let doc = build(&blocks);
         let got = compat::export_class(&doc);
         if got != want {
@@ -540,6 +639,53 @@ fn export_classes_name_their_documents() {
         }
     }
     assert_no_failures("export class is wrong", &failures);
+}
+
+/// Every healthy document an export class names is one legacy damaged: its
+/// legacy export reads back under legacy as another tree, or reads back
+/// under the new importer as another tree than the new export does. The
+/// byte-identity differential skips classed documents, so a class that also
+/// named a document legacy wrote losslessly would let the writer change that
+/// healthy page's bytes unseen.
+#[test]
+fn export_classes_name_only_damaged_documents() {
+    let import = |md: &str| {
+        let (doc, _) = knot_markdown::from_markdown::parse(md).expect("parse");
+        compat::normalised(doc.inner())
+    };
+    let mut docs: Vec<(String, DocHandle)> = corpus_docs()
+        .into_iter()
+        .map(|case| (case.name, case.doc))
+        .collect();
+    docs.extend(
+        class_cases()
+            .into_iter()
+            .map(|(what, blocks, _)| (format!("case: {what}"), build(&blocks))),
+    );
+    let mut compared = 0;
+    let mut failures = Vec::new();
+    for (name, doc) in docs {
+        let Some(class) = compat::export_class(&doc) else {
+            continue;
+        };
+        let Some(legacy_md) = compat::healthy(&doc) else {
+            continue;
+        };
+        compared += 1;
+        let (legacy_back, _) = legacy::parse(&legacy_md).expect("legacy parse");
+        if compat::normalised(legacy_back.inner()) != compat::normalised(doc.inner()) {
+            continue;
+        }
+        let md = knot_markdown::serialise(&YrsEngine, &doc).expect("serialise");
+        if import(&legacy_md) != import(&md) {
+            continue;
+        }
+        failures.push(format!(
+            "{name} ({class}): legacy's {legacy_md:?} reads back as written, and the new {md:?} reads back the same"
+        ));
+    }
+    assert_no_failures("export class names a lossless document", &failures);
+    assert_at_least("classed healthy documents", compared, MIN_CLASSED_DOCS);
 }
 
 /// The stability exemptions name the inputs they are about, and none of them

@@ -88,17 +88,8 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
         }
         "blockquote" => {
             let mut lines = Vec::new();
-            write_container(&mut lines, txn, el, true)?;
-            for line in lines {
-                match line {
-                    Line::Text(text) if !text.is_empty() => {
-                        buf.push_str("> ");
-                        buf.push_str(&text);
-                    }
-                    Line::Text(_) | Line::Blank => buf.push('>'),
-                }
-                buf.push('\n');
-            }
+            write_quote(&mut lines, txn, el)?;
+            write_lines(buf, lines);
         }
         "code_block" => {
             let lang = attr(el, txn, "language").unwrap_or_default();
@@ -245,37 +236,60 @@ fn write_block<T: ReadTxn>(buf: &mut String, txn: &T, node: &yrs::XmlOut) -> Res
             let url = crate::board_sentinel_url(&board_id);
             buf.push_str(&format!("![{display}]({url})\n"));
         }
-        "bullet_list" => {
-            let len = el.len(txn);
-            for i in 0..len {
-                let item = el
-                    .get(txn, i)
-                    .ok_or_else(|| SerError::Yrs("li missing".into()))?;
-                let XmlOut::Element(item_el) = item else {
-                    continue;
-                };
-                write_list_item(buf, txn, &item_el, "- ")?;
+        "bullet_list" | "ordered_list" => {
+            let mut lines = Vec::new();
+            for (item, marker) in list_items(txn, el)? {
+                write_list_item(&mut lines, txn, &item, &marker)?;
             }
-        }
-        "ordered_list" => {
-            let mut idx: u64 = attr(el, txn, "start")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1);
-            let len = el.len(txn);
-            for i in 0..len {
-                let item = el
-                    .get(txn, i)
-                    .ok_or_else(|| SerError::Yrs("li missing".into()))?;
-                let XmlOut::Element(item_el) = item else {
-                    continue;
-                };
-                write_list_item(buf, txn, &item_el, &format!("{idx}. "))?;
-                idx += 1;
-            }
+            write_lines(buf, lines);
         }
         other => return Err(SerError::UnsupportedNode(other.into())),
     }
     Ok(())
+}
+
+/// The items of `list`, a bullet or an ordered list, each with the marker it
+/// is written after: `- `, or its number and `. `, counted from `start` (1
+/// when it is missing or not a number).
+fn list_items<T: ReadTxn>(
+    txn: &T,
+    list: &XmlElementRef,
+) -> Result<Vec<(XmlElementRef, String)>, SerError> {
+    let ordered = list.tag().as_ref() == "ordered_list";
+    let mut number: u64 = if ordered {
+        attr(list, txn, "start")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    let mut items = Vec::new();
+    for i in 0..list.len(txn) {
+        let item = list
+            .get(txn, i)
+            .ok_or_else(|| SerError::Yrs("li missing".into()))?;
+        let yrs::XmlOut::Element(item) = item else {
+            continue;
+        };
+        let marker = if ordered {
+            format!("{number}. ")
+        } else {
+            "- ".to_string()
+        };
+        items.push((item, marker));
+        number += 1;
+    }
+    Ok(items)
+}
+
+/// Writes `lines`, each ended by a newline.
+fn write_lines(buf: &mut String, lines: Vec<Line>) {
+    for line in lines {
+        if let Line::Text { text, .. } = line {
+            buf.push_str(&text);
+        }
+        buf.push('\n');
+    }
 }
 
 /// The checkbox that starts the content of a GFM task-list item, from its
@@ -323,21 +337,7 @@ fn write_cell_block<T: ReadTxn>(
             }
         }
         "bullet_list" | "ordered_list" => {
-            let mut idx: u64 = attr(el, txn, "start")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1);
-            for i in 0..el.len(txn) {
-                let item = el
-                    .get(txn, i)
-                    .ok_or_else(|| SerError::Yrs("li missing".into()))?;
-                let yrs::XmlOut::Element(item) = item else {
-                    continue;
-                };
-                let marker = if tag == "ordered_list" {
-                    format!("{idx}. ")
-                } else {
-                    "- ".to_string()
-                };
+            for (item, marker) in list_items(txn, el)? {
                 let prefix = format!("{marker}{}", checkbox(&item, txn));
                 let pad = " ".repeat(prefix.chars().count());
                 for k in 0..item.len(txn) {
@@ -352,7 +352,6 @@ fn write_cell_block<T: ReadTxn>(
                         buf.push('\n');
                     }
                 }
-                idx += 1;
             }
         }
         _ => write_block(buf, txn, node)?,
@@ -370,10 +369,18 @@ fn write_cell_block<T: ReadTxn>(
 /// doesn't start with a paragraph or an attachment (written as a paragraph
 /// of one link) gets its checkbox on a line of its own, which reads back as
 /// an empty first paragraph (A7). Only the old importer stored such items.
+///
+/// The same goes for an item without its first paragraph whose content has
+/// a blank line between two of its lines: the marker goes on a line of its
+/// own, as the empty paragraph the importer adds back writes it, so the
+/// export is a fixed point. Legacy wrote no empty line inside an item (it
+/// indented every line), so such an item never exported as before anyway;
+/// one without blank lines (`- ## h`) keeps its bytes.
+///
 /// An empty item keeps its trailing space (`- `, `- [ ] `, `2. `, P2), and
 /// an item without children or checkbox writes nothing, as before.
 fn write_list_item<T: ReadTxn>(
-    buf: &mut String,
+    buf: &mut Vec<Line>,
     txn: &T,
     item: &XmlElementRef,
     marker: &str,
@@ -381,42 +388,77 @@ fn write_list_item<T: ReadTxn>(
     let pad = " ".repeat(marker.chars().count());
     let checkbox = checkbox(item, txn);
     let mut lines = Vec::new();
+    write_container(&mut lines, txn, item, false)?;
     let starts_with_text = matches!(
         item.get(txn, 0),
         Some(yrs::XmlOut::Element(first))
             if matches!(first.tag().as_ref(), "paragraph" | "attachment")
     );
-    if !checkbox.is_empty() && !starts_with_text {
-        lines.push(Line::Blank);
-    }
-    write_container(&mut lines, txn, item, false)?;
-    for (i, line) in lines.into_iter().enumerate() {
-        match line {
-            _ if i == 0 => {
-                buf.push_str(marker);
-                buf.push_str(checkbox);
-                if let Line::Text(text) = line {
-                    buf.push_str(&text);
-                }
-            }
-            Line::Text(text) => {
-                buf.push_str(&pad);
-                buf.push_str(&text);
-            }
-            Line::Blank => {}
+    if !starts_with_text {
+        let blank_between = matches!(lines.first(), Some(Line::Text { .. }))
+            && lines
+                .windows(2)
+                .any(|pair| matches!(pair, [Line::Blank, Line::Text { .. }]));
+        if !checkbox.is_empty() || blank_between {
+            lines.insert(0, Line::Blank);
         }
-        buf.push('\n');
+    }
+    for (i, line) in lines.into_iter().enumerate() {
+        buf.push(match line {
+            Line::Text { text, open } if i == 0 => Line::Text {
+                text: format!("{marker}{checkbox}{text}"),
+                open,
+            },
+            // The marker alone, or with a checkbox, opens no paragraph.
+            Line::Blank if i == 0 => Line::Text {
+                text: format!("{marker}{checkbox}"),
+                open: false,
+            },
+            Line::Text { text, open } => Line::Text {
+                text: format!("{pad}{text}"),
+                open,
+            },
+            Line::Blank => Line::Blank,
+        });
     }
     Ok(())
 }
 
-/// A line of a list item's or blockquote's content, before the item's indent
-/// or the quote's `> ` goes in front of it.
+/// Writes a blockquote: each line of its blocks after `> `, and a blank line
+/// or an empty line of a code block as `>`.
+fn write_quote<T: ReadTxn>(
+    buf: &mut Vec<Line>,
+    txn: &T,
+    quote: &XmlElementRef,
+) -> Result<(), SerError> {
+    let mut lines = Vec::new();
+    write_container(&mut lines, txn, quote, true)?;
+    buf.extend(lines.into_iter().map(|line| match line {
+        Line::Text { text, open } if !text.is_empty() => Line::Text {
+            text: format!("> {text}"),
+            open,
+        },
+        // A blank line of the quote: no paragraph goes on after it.
+        Line::Text { .. } | Line::Blank => Line::Text {
+            text: ">".to_string(),
+            open: false,
+        },
+    }));
+    Ok(())
+}
+
+/// A line of a list or blockquote, or of a list item's or blockquote's
+/// content before the item's indent or the quote's `> ` goes in front of it.
 enum Line {
     /// A line of one of its blocks. Every line of a code block is one, an
     /// empty one too: its indent is part of the code block, as it always
-    /// was.
-    Text(String),
+    /// was. It is `open` when it is a line of a paragraph (an attachment,
+    /// image or board is written as one) or a table row: a line right below
+    /// it goes on that paragraph as a lazy continuation line, or on the
+    /// table as another row. A heading, code block or rule ends on its own
+    /// line, and so do a marker without content (`- `, `- [x] `) and a
+    /// quote's blank line (`>`).
+    Text { text: String, open: bool },
     /// A blank line: between two blocks, or an empty line outside a code
     /// block. An item writes it without indent, a quote as `>`.
     Blank,
@@ -429,11 +471,11 @@ enum Line {
 /// Legacy wrote the blocks one right below the other, where Markdown reads
 /// some of them as part of the block above (A5, A6, A9): a paragraph runs on
 /// into the next paragraph, image or `3.` list, `---` makes the paragraph
-/// above it a heading, and a paragraph after a nested list or quote becomes
-/// a lazy continuation line of it. A blank line now goes between two blocks
-/// exactly where the second would be read that way
-/// ([`Block::needs_blank_line_before`]); everywhere else the output is as
-/// before.
+/// above it a heading, and a paragraph after a nested list or quote that
+/// ends on an open paragraph becomes a lazy continuation line of it. A blank
+/// line now goes between two blocks exactly where the second would be read
+/// that way ([`Block::needs_blank_line_before`]); everywhere else the output
+/// is as before.
 fn write_container<T: ReadTxn>(
     buf: &mut Vec<Line>,
     txn: &T,
@@ -445,23 +487,56 @@ fn write_container<T: ReadTxn>(
         let child = parent
             .get(txn, i)
             .ok_or_else(|| SerError::Yrs("container child missing".into()))?;
-        let mut inner = String::new();
-        write_block(&mut inner, txn, &child)?;
-        let text = inner.trim_end_matches('\n');
-        let block = Block::of(&child, text);
+        let (block, lines) = block_lines(txn, &child)?;
         if prev.is_some_and(|prev| prev.needs_blank_line_before(block, in_quote)) {
             buf.push(Line::Blank);
         }
-        for line in text.split('\n') {
-            buf.push(if line.is_empty() && block != Block::Code {
-                Line::Blank
-            } else {
-                Line::Text(line.to_string())
-            });
-        }
+        buf.extend(lines);
         prev = Some(block);
     }
     Ok(())
+}
+
+/// `node`, a block of a list item or blockquote, as lines without the blank
+/// lines it ends with, and as a [`Block`]. A block written as nothing is one
+/// blank line.
+fn block_lines<T: ReadTxn>(txn: &T, node: &yrs::XmlOut) -> Result<(Block, Vec<Line>), SerError> {
+    let tag = match node {
+        yrs::XmlOut::Element(el) => el.tag().to_string(),
+        _ => String::new(),
+    };
+    let mut lines = Vec::new();
+    match (node, tag.as_str()) {
+        (yrs::XmlOut::Element(el), "blockquote") => write_quote(&mut lines, txn, el)?,
+        (yrs::XmlOut::Element(el), "bullet_list" | "ordered_list") => {
+            for (item, marker) in list_items(txn, el)? {
+                write_list_item(&mut lines, txn, &item, &marker)?;
+            }
+        }
+        _ => {
+            let mut text = String::new();
+            write_block(&mut text, txn, node)?;
+            let code = tag == "code_block";
+            let open = !matches!(tag.as_str(), "heading" | "code_block" | "horizontal_rule");
+            for line in text.trim_end_matches('\n').split('\n') {
+                lines.push(if line.is_empty() && !code {
+                    Line::Blank
+                } else {
+                    Line::Text {
+                        text: line.to_string(),
+                        open,
+                    }
+                });
+            }
+        }
+    }
+    while matches!(lines.last(), Some(Line::Blank)) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        lines.push(Line::Blank);
+    }
+    Ok((Block::of(&tag, &lines), lines))
 }
 
 /// A child block of a list item or blockquote as written, for what the line
@@ -487,35 +562,38 @@ enum Block {
     Image,
     /// A list. Its first line `interrupts` a paragraph above it when its
     /// first item has content and, if ordered, is numbered 1 (CommonMark).
+    /// It `ends_open` when its last line is a line of an open paragraph or a
+    /// table row ([`Line::Text`]).
     List {
         interrupts: bool,
+        ends_open: bool,
     },
-    Quote,
+    /// A blockquote, which `ends_open` as a list does.
+    Quote {
+        ends_open: bool,
+    },
     Table,
     /// A block the schema doesn't name.
     Other,
 }
 
 impl Block {
-    /// `node`, written as `text`.
-    fn of(node: &yrs::XmlOut, text: &str) -> Self {
-        let yrs::XmlOut::Element(el) = node else {
-            return Block::Other;
-        };
-        match el.tag().as_ref() {
+    /// A block with tag `tag` (empty for a node that is no element), written
+    /// as `lines`.
+    fn of(tag: &str, lines: &[Line]) -> Self {
+        let ends_open = matches!(lines.last(), Some(Line::Text { open: true, .. }));
+        match tag {
             "heading" => Block::Heading,
             "code_block" => Block::Code,
             "horizontal_rule" => Block::Rule,
-            "paragraph" if text.is_empty() => Block::Blank,
+            "paragraph" if matches!(lines, [Line::Blank]) => Block::Blank,
             "paragraph" | "attachment" => Block::Text,
             "image" | "excalidraw_board" => Block::Image,
-            "bullet_list" => Block::List {
-                interrupts: list_interrupts(text, false),
+            "bullet_list" | "ordered_list" => Block::List {
+                interrupts: list_interrupts(lines, tag == "ordered_list"),
+                ends_open,
             },
-            "ordered_list" => Block::List {
-                interrupts: list_interrupts(text, true),
-            },
-            "blockquote" => Block::Quote,
+            "blockquote" => Block::Quote { ends_open },
             "table" => Block::Table,
             _ => Block::Other,
         }
@@ -536,23 +614,45 @@ impl Block {
             // A paragraph line goes on with the next line unless that line
             // starts a block that can interrupt a paragraph, as a table can
             // (GFM). A rule can't.
-            (Text | Image, Heading | Code | Quote | Table | List { interrupts: true }) => false,
+            (
+                Text | Image,
+                Heading
+                | Code
+                | Quote { .. }
+                | Table
+                | List {
+                    interrupts: true, ..
+                },
+            ) => false,
             (Text | Image, _) => true,
-            // A paragraph line or a table goes on a list or quote as a lazy
-            // continuation line, or on a table as rows, and a quote right
-            // below a quote joins it. Any other block start ends them, a list
-            // starting at any number included.
-            (List { .. } | Quote | Table, Text | Image | Table | Other) | (Quote, Quote) => true,
-            (List { .. } | Quote | Table, _) => false,
+            // A paragraph line or a table goes on a list or quote that ends
+            // on an open paragraph as a lazy continuation line, or on a table
+            // as rows, and a quote right below a quote joins it. Any other
+            // block start ends them, a list starting at any number included,
+            // and after a list or quote whose last line isn't open (a
+            // heading, code block or rule, an empty item, a quote's blank
+            // line) there is no paragraph to go on.
+            (
+                List {
+                    ends_open: true, ..
+                }
+                | Quote { ends_open: true }
+                | Table,
+                Text | Image | Table | Other,
+            )
+            | (Quote { .. }, Quote { .. }) => true,
+            (List { .. } | Quote { .. } | Table, _) => false,
             (Other, _) => true,
         }
     }
 }
 
-/// Whether a list written as `text` can interrupt a paragraph: CommonMark
+/// Whether a list written as `lines` can interrupt a paragraph: CommonMark
 /// lets it when its first item has content and, if ordered, is numbered 1.
-fn list_interrupts(text: &str, ordered: bool) -> bool {
-    let first = text.split('\n').next().unwrap_or("");
+fn list_interrupts(lines: &[Line], ordered: bool) -> bool {
+    let Some(Line::Text { text: first, .. }) = lines.first() else {
+        return false;
+    };
     let Some((marker, content)) = first.split_once(' ') else {
         return false;
     };

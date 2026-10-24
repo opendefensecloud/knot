@@ -495,6 +495,53 @@ impl Gen {
         ]
     }
 
+    /// Lists and quotes with another block at their end, two levels deep,
+    /// for `pair_blocks` to follow in a container (`pair_blocks` nests only
+    /// one level). A paragraph, image or table right below one of them goes
+    /// on it only when its last line is a paragraph's or a table row: after
+    /// a heading or code block, or a quote's blank `>` line, it doesn't, and
+    /// the blank lines a list ends with are left out.
+    fn nested_endings(&self) -> Vec<(&'static str, N)> {
+        let code = || self.code(Some("sh"), "ls");
+        let heading = || self.heading(2, vec![text("head")]);
+        let empty = || el("paragraph", Vec::new());
+        vec![
+            ("bullets-code", bullets(vec![item(vec![p("b"), code()])])),
+            (
+                "bullets-heading",
+                bullets(vec![item(vec![p("b"), heading()])]),
+            ),
+            (
+                "ordered-3-code",
+                self.ordered(3, vec![item(vec![p("o"), code()])]),
+            ),
+            (
+                "tasks-code",
+                bullets(vec![self.task(false, vec![p("t"), code()])]),
+            ),
+            (
+                "bullets-bullets",
+                bullets(vec![item(vec![p("b"), bullets(vec![item(vec![p("c")])])])]),
+            ),
+            (
+                "bullets-empty-p",
+                bullets(vec![item(vec![p("b"), empty()])]),
+            ),
+            ("quote-heading", quote(vec![heading()])),
+            ("quote-code", quote(vec![p("q"), code()])),
+            ("quote-quote", quote(vec![quote(vec![p("q")])])),
+            ("quote-empty-p", quote(vec![p("q"), empty()])),
+            (
+                "quote-bullets-code",
+                quote(vec![bullets(vec![item(vec![p("b"), code()])])]),
+            ),
+            (
+                "bullets-quote-heading",
+                bullets(vec![item(vec![p("b"), quote(vec![heading()])])]),
+            ),
+        ]
+    }
+
     /// `container` holding `children` directly (a list holds them in its
     /// only item).
     fn wrap(&self, container: Container, depth: usize, children: Vec<N>) -> N {
@@ -794,6 +841,20 @@ impl Gen {
                     format!("in-{}/p+{a_name}+p", c.name()),
                     vec![self.wrap(c, 0, vec![p("before"), a.clone(), p("after")])],
                 ));
+            }
+        }
+        for (end_name, end) in self.nested_endings() {
+            for (b_name, b) in &pairs {
+                for c in CONTAINERS {
+                    out.push((
+                        format!("ending-in-{}/{end_name}+{b_name}", c.name()),
+                        vec![self.wrap(c, 0, vec![end.clone(), b.clone()])],
+                    ));
+                    out.push((
+                        format!("ending-in-{}/p+{end_name}+{b_name}", c.name()),
+                        vec![self.wrap(c, 0, vec![p("before"), end.clone(), b.clone()])],
+                    ));
+                }
             }
         }
         let inners: [(&str, Vec<N>); 2] = [
