@@ -1,5 +1,6 @@
 import { create } from "zustand";
 
+import { readManualSkin } from "../styles/skinPrefs";
 import { DEFAULT_SKIN_ID, findSkin, schemeOf } from "../styles/skins";
 
 export type Toast = {
@@ -83,19 +84,8 @@ type UiState = {
 
 let nextId = 1;
 
-/** Exported for tests and for the pre-paint stamp in main.tsx. Falls
- *  back to the default skin for anything unknown, and honours the old
- *  `knot.theme = "dark"` preference from before skins existed. */
-export function readInitialSkin(): string {
-  try {
-    const stored = localStorage.getItem("knot.skin");
-    if (findSkin(stored)) return stored!;
-    if (localStorage.getItem("knot.theme") === "dark") return "dark";
-  } catch {
-    /* storage unavailable */
-  }
-  return DEFAULT_SKIN_ID;
-}
+/** Exported for tests and for the pre-paint stamp in main.tsx. */
+export const readInitialSkin = readManualSkin;
 
 /** Exported for tests: the storage read has to survive a disabled or
  *  throwing Storage, which `readInitialTheme` above does not. */
