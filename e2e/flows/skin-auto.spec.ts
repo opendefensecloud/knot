@@ -32,6 +32,7 @@ test("follow system switches with the OS appearance", async ({ page }) => {
 
   await page.reload();
   await expect(html).toHaveAttribute("data-skin", "nord");
+  await expect(html).toHaveAttribute("data-theme", "dark");
 
   await page.emulateMedia({ colorScheme: "light" });
   await expect(html).toHaveAttribute("data-skin", "paper");
@@ -51,14 +52,17 @@ test.describe("follow the sun", () => {
   test.use({ timezoneId: "Europe/Berlin" });
 
   test("light by day, dark after sunset, dark from first paint", async ({ page }) => {
-    // Midday in Berlin on the longest day; the sun sets at about 19:33 UTC.
-    await page.clock.install({ time: new Date("2026-06-21T10:00:00Z") });
+    // 21:00 in Berlin on the longest day, half an hour before its sunset at
+    // about 19:33 UTC. Only the time zone's table entry puts the sun up then:
+    // the fallback for a zone it can't place would already be in the night.
+    await page.clock.install({ time: new Date("2026-06-21T19:00:00Z") });
     await page.goto("/login");
     await storeSunPrefs(page);
     await page.reload();
 
     const html = page.locator("html");
     await expect(html).toHaveAttribute("data-skin", "paper");
+    await expect(html).toHaveAttribute("data-theme", "light");
 
     // Past sunset, the minute re-check switches the skin without a reload.
     await page.clock.setSystemTime(new Date("2026-06-21T19:40:00Z"));
@@ -67,6 +71,7 @@ test.describe("follow the sun", () => {
 
     await page.reload();
     await expect(html).toHaveAttribute("data-skin", "nord");
+    await expect(html).toHaveAttribute("data-theme", "dark");
   });
 
   test("a typed location wins over the time zone", async ({ page }) => {
@@ -76,6 +81,8 @@ test.describe("follow the sun", () => {
     await storeSunPrefs(page, { "knot.sunLocation": '{"lat":69.65,"lon":18.96}' });
     await page.reload();
 
-    await expect(page.locator("html")).toHaveAttribute("data-skin", "nord");
+    const html = page.locator("html");
+    await expect(html).toHaveAttribute("data-skin", "nord");
+    await expect(html).toHaveAttribute("data-theme", "dark");
   });
 });
