@@ -26,9 +26,10 @@ const RANDOM_DOCS_PER_SEED: usize = 200;
 /// Lower bounds on how much each differential compares, so a broken corpus
 /// can't make the harness pass by comparing nothing. Far below today's counts
 /// (about 6200 healthy documents outside the classes, 3200 healthy inputs of
-/// which 27 are files, 21300 exports, 8500 stability inputs, 1060 healthy
-/// classed generated documents and 1090 healthy classed documents in all),
-/// leaving room for the documents bug classes exclude.
+/// which 27 are files, 23700 exports (every corpus document), 13000 of them
+/// fixed points, 8500 stability inputs, 1060 healthy classed generated
+/// documents and 1090 healthy classed documents in all), leaving room for the
+/// documents bug classes exclude.
 const MIN_HEALTHY_DOCS: usize = 1_000;
 const MIN_HEALTHY_INPUTS: usize = 500;
 const MIN_HEALTHY_FILE_INPUTS: usize = 15;
