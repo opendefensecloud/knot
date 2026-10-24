@@ -49,6 +49,14 @@ const IMPORT_CLASSES: &[Class<str>] = &[
         "image_after_block_in_tight_item",
         image_after_block_in_tight_item,
     ),
+    // Legacy dropped the line breaks between the pieces of a code block's text.
+    ("code_block_line_breaks", code_block_line_breaks),
+    // Legacy stored a blockquote without blocks, which the schema forbids.
+    ("empty_blockquote", empty_blockquote),
+    // Legacy gave a paragraph a table cell's image in place of its own.
+    ("cell_image_candidate_leak", cell_image_candidate_leak),
+    // Legacy dropped every image and board in a table cell.
+    ("image_in_cell", image_in_cell),
 ];
 
 /// The export bug class `doc` falls in, if any.
@@ -361,6 +369,135 @@ fn image_after_block_in_tight_item(md: &str) -> bool {
         }
         false
     })
+}
+
+/// A code block whose text pulldown-cmark emits in pieces, one of them
+/// before the last ending in a line break: it emits the text line by line in
+/// a list item or blockquote, and in an indented block. The legacy importer
+/// stripped a line break from the end of every piece, not only from the end
+/// of the text (the one before the closing fence), so `x\n\ny` read back as
+/// `xy`; the new importer keeps them.
+fn code_block_line_breaks(md: &str) -> bool {
+    let mut pieces: Option<Vec<String>> = None;
+    events(md).any(|(event, _)| {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => pieces = Some(Vec::new()),
+            Event::Text(text) => {
+                if let Some(pieces) = pieces.as_mut() {
+                    pieces.push(text.to_string());
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                let pieces = pieces.take().unwrap_or_default();
+                let legacy: String = pieces
+                    .iter()
+                    .map(|piece| piece.strip_suffix('\n').unwrap_or(piece))
+                    .collect();
+                let text = pieces.concat();
+                return legacy != text.strip_suffix('\n').unwrap_or(&text);
+            }
+            _ => {}
+        }
+        false
+    })
+}
+
+/// A blockquote the legacy importer stored without blocks, which the schema
+/// (`blockquote: block+`) forbids: a lone `>`, or a quote of only an HTML
+/// block, which the importer drops. The new importer gives it an empty
+/// paragraph, which is written as `>` again.
+fn empty_blockquote(md: &str) -> bool {
+    parse(md).is_ok_and(|(doc, _)| {
+        any_element(&doc, &|txn, el, _| {
+            el.tag().as_ref() == "blockquote" && el.len(txn) == 0
+        })
+    })
+}
+
+/// A paragraph of one image or board and nothing else, the first paragraph
+/// to end after a table cell whose line starts with an image or board. The
+/// legacy importer kept that image of the cell as the candidate for
+/// promotion to a block, and a cell ends no paragraph, so the candidate was
+/// left for the next paragraph to end: a lone image or board there was
+/// replaced by the cell's, unless the cell left only an image and the
+/// paragraph's own was a board. The new importer makes each image of a cell
+/// a block of the cell, and leaves nothing behind.
+fn cell_image_candidate_leak(md: &str) -> bool {
+    /// The paragraph being read: its images, whether the last of them is a
+    /// board, and whether it has text, code or a line break outside them.
+    #[derive(Default)]
+    struct Para {
+        images: usize,
+        board: bool,
+        content: bool,
+    }
+    // The candidates cells left: an image, a board.
+    let (mut left_image, mut left_board) = (false, false);
+    // In a table cell: whether text or code is on its line yet.
+    let mut cell_written: Option<bool> = None;
+    let mut para: Option<Para> = None;
+    let mut image_depth = 0usize;
+    events(md).any(|(event, _)| {
+        match event {
+            Event::Start(Tag::TableCell) => cell_written = Some(false),
+            Event::End(TagEnd::TableCell) => cell_written = None,
+            Event::Start(Tag::Paragraph) => para = Some(Para::default()),
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                image_depth += 1;
+                let board = is_board_sentinel(&dest_url);
+                if cell_written == Some(false) {
+                    left_board |= board;
+                    left_image |= !board;
+                } else if let Some(para) = para.as_mut() {
+                    para.images += 1;
+                    para.board = board;
+                }
+            }
+            Event::End(TagEnd::Image) => image_depth = image_depth.saturating_sub(1),
+            Event::Text(_) if image_depth > 0 => {}
+            Event::Text(_) | Event::Code(_) | Event::SoftBreak | Event::HardBreak => {
+                if let Some(written) = cell_written.as_mut() {
+                    *written = true;
+                }
+                if let Some(para) = para.as_mut() {
+                    para.content = true;
+                }
+            }
+            Event::End(TagEnd::Paragraph) => {
+                let para = para.take().unwrap_or_default();
+                let lone = para.images == 1 && !para.content;
+                let leak = lone && (left_board || (left_image && !para.board));
+                (left_image, left_board) = (false, false);
+                return leak;
+            }
+            _ => {}
+        }
+        false
+    })
+}
+
+/// An image or board in a table cell. A GFM cell is one line, onto which the
+/// serializer joins the cell's blocks with a space; the legacy importer
+/// dropped every image there, alone or next to text. The new importer splits
+/// the line back into blocks at each image.
+fn image_in_cell(md: &str) -> bool {
+    let mut in_cell = false;
+    events(md).any(|(event, _)| {
+        match event {
+            Event::Start(Tag::TableCell) => in_cell = true,
+            Event::End(TagEnd::TableCell) => in_cell = false,
+            Event::Start(Tag::Image { .. }) => return in_cell,
+            _ => {}
+        }
+        false
+    })
+}
+
+/// Whether `url` is a board sentinel, `knot://board/<uuid>.svg`.
+fn is_board_sentinel(url: &str) -> bool {
+    url.strip_prefix(super::BOARD_URL_PREFIX)
+        .and_then(|rest| rest.strip_suffix(super::BOARD_URL_SUFFIX))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 
 /// The elements of `doc`, with whether each sits in a table cell, for

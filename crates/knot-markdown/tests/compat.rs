@@ -26,8 +26,8 @@ const RANDOM_DOCS_PER_SEED: usize = 200;
 /// Lower bounds on how much each differential compares, so a broken corpus
 /// can't make the harness pass by comparing nothing. Far below today's counts
 /// (about 6200 healthy documents outside the classes, 3200 healthy inputs of
-/// which 27 are files, 23700 exports (every corpus document), 13000 of them
-/// fixed points, 8500 stability inputs, 1060 healthy classed generated
+/// which 28 are files, 23700 exports (every corpus document), 14900 of them
+/// fixed points, 8600 stability inputs, 1060 healthy classed generated
 /// documents and 1090 healthy classed documents in all), leaving room for the
 /// documents bug classes exclude.
 const MIN_HEALTHY_DOCS: usize = 1_000;
@@ -164,16 +164,8 @@ fn importer_matches_legacy_on_healthy_inputs() {
     );
 }
 
-/// Whether `violation` is one a pre-existing importer bug still produces, to
-/// go when the bug is fixed: a lone `>` line imports as a blockquote without
-/// blocks (Task 4b).
-fn known_violation(violation: &str) -> bool {
-    violation.ends_with(": empty blockquote")
-}
-
 /// The new import of every fixture and probe, and of the legacy export of
-/// every corpus document (the Markdown the product wrote), is schema-valid,
-/// but for [`known_violation`]s, each of which must still occur.
+/// every corpus document (the Markdown the product wrote), is schema-valid.
 #[test]
 fn new_import_is_schema_valid_on_every_input() {
     let mut inputs = corpus::markdown_inputs();
@@ -182,16 +174,11 @@ fn new_import_is_schema_valid_on_every_input() {
             inputs.push((format!("legacy export of {}", case.name), md));
         }
     }
-    let mut known = 0;
     let mut failures = Vec::new();
     for (name, md) in inputs {
         match knot_markdown::from_markdown::parse(&md) {
             Ok((doc, _)) => {
-                let (old, violations): (Vec<String>, Vec<String>) =
-                    compat::schema_violations(doc.inner())
-                        .into_iter()
-                        .partition(|v| known_violation(v));
-                known += old.len();
+                let violations = compat::schema_violations(doc.inner());
                 if !violations.is_empty() {
                     failures.push(format!(
                         "{name}: {md:?}\n  {}\n{}",
@@ -204,41 +191,6 @@ fn new_import_is_schema_valid_on_every_input() {
         }
     }
     assert_no_failures("new import breaks the schema", &failures);
-    assert!(
-        known > 0,
-        "no known violation occurs any more: remove `known_violation`"
-    );
-}
-
-/// Generated documents whose export loses content on import for reasons
-/// outside the writing of lists and quotes, both follow-ups: an image or
-/// board in a table cell, which the cell's single line puts next to text so
-/// that the importer drops it, and a quote of empty paragraphs, which
-/// imports as an empty blockquote and then exports as nothing.
-fn loses_content_outside_lists(doc: &DocHandle) -> bool {
-    fn walk<T: ReadTxn>(txn: &T, node: &XmlOut, in_cell: bool) -> bool {
-        let XmlOut::Element(el) = node else {
-            return false;
-        };
-        let tag = el.tag();
-        let children: Vec<XmlOut> = (0..el.len(txn)).filter_map(|i| el.get(txn, i)).collect();
-        let empty_quote = tag.as_ref() == "blockquote"
-            && children.iter().all(|child| match child {
-                XmlOut::Element(p) => p.tag().as_ref() == "paragraph" && p.len(txn) == 0,
-                _ => false,
-            });
-        let in_cell = in_cell || matches!(tag.as_ref(), "table_cell" | "table_header");
-        (in_cell && matches!(tag.as_ref(), "image" | "excalidraw_board"))
-            || empty_quote
-            || children.iter().any(|child| walk(txn, child, in_cell))
-    }
-    let ydoc = doc.inner();
-    let txn = ydoc.transact();
-    txn.get_xml_fragment("default").is_some_and(|frag| {
-        (0..frag.len(&txn))
-            .filter_map(|i| frag.get(&txn, i))
-            .any(|child| walk(&txn, &child, false))
-    })
 }
 
 /// Structural idempotence (spec "Testing"): the import of the export of an
@@ -248,11 +200,11 @@ fn loses_content_outside_lists(doc: &DocHandle) -> bool {
 /// The inputs are the fixtures and probes, the legacy and the new export of
 /// every healthy corpus document (the Markdown the product writes today and
 /// from now on), and the new export of every generated document, which
-/// holds the nested checklists and multi-block items legacy damaged. Left
-/// out are inputs with text the writer can't write back yet
-/// (`compat::stability_exempt`, a follow-up), generated documents that lose
-/// content outside lists and quotes (`loses_content_outside_lists`), and the
-/// random corpus, whose text is full of Markdown syntax: the same follow-up.
+/// holds the nested checklists and multi-block items legacy damaged, and the
+/// images in cells and empty quotes the importer lost (Task 4b). Left out
+/// are inputs with text the writer can't write back yet
+/// (`compat::stability_exempt`, a follow-up), and the random corpus, whose
+/// text is full of Markdown syntax: the same follow-up.
 #[test]
 fn import_export_import_is_stable() {
     let file_inputs = corpus::markdown_inputs();
@@ -267,9 +219,7 @@ fn import_export_import_is_stable() {
         }
     }
     for case in corpus::generated() {
-        if !loses_content_outside_lists(&case.doc)
-            && let Ok(md) = knot_markdown::serialise(&YrsEngine, &case.doc)
-        {
+        if let Ok(md) = knot_markdown::serialise(&YrsEngine, &case.doc) {
             inputs.push((format!("export of {}", case.name), md));
         }
     }
@@ -348,28 +298,28 @@ fn export_classes_hold_the_fixed_point() {
 // ---------------------------------------------------------------------------
 
 /// Why the new export of a document may not be a fixed point yet: a limit of
-/// Markdown, of the writer (a follow-up) or of the importer (Task 4b), each
-/// with the repair that takes that cause out of the document. The repairs
-/// apply one after the other, in this order, and a document whose export
-/// isn't a fixed point must become one on the way; it counts for the class
-/// whose repair got it there. So the classes explain every such document
-/// together, by their causes, and any other cause fails the test.
+/// Markdown or of the writer (a follow-up), each with the repair that takes
+/// that cause out of the document. The repairs apply one after the other, in
+/// this order, and a document whose export isn't a fixed point must become
+/// one on the way; it counts for the class whose repair got it there. So the
+/// classes explain every such document together, by their causes, and any
+/// other cause fails the test.
 ///
-/// Measured over `corpus_docs()`: 23,699 documents, 13,011 of them fixed
-/// points as they are. Then, per class: code_block_in_container 1,608,
-/// code_block_in_cell 1,849, image_in_cell 268, table_in_cell 101,
-/// hard_break_in_heading 176, edge_hard_break 788, empty_blockquote 50,
-/// empty_paragraph 1,626, unwritten_item 15, adjacent_lists 73,
-/// empty_last_item_in_quote 0 (it is needed, before markdown_escaping, by
-/// one document), markdown_escaping 3,429, mark_delimiters 705.
+/// Measured over `corpus_docs()`: 23,705 documents, 14,861 of them fixed
+/// points as they are. Then, per class: code_block_in_cell 1,904,
+/// indented_image_in_cell 10, table_in_cell 101, hard_break_in_heading 177,
+/// edge_hard_break 799, empty_paragraph 1,630, unwritten_item 15,
+/// adjacent_lists 73, empty_last_item_in_quote 0 (it is needed, before
+/// markdown_escaping, by one document), markdown_escaping 3,430,
+/// mark_delimiters 705. The importer's own causes are gone (Task 4b): code
+/// blocks in containers, images in cells and empty quotes read back as
+/// written.
 const FIXED_POINT_CLASSES: &[(&str, Repair)] = &[
-    ("code_block_in_container", code_block_in_container),
     ("code_block_in_cell", code_block_in_cell),
-    ("image_in_cell", image_in_cell),
+    ("indented_image_in_cell", indented_image_in_cell),
     ("table_in_cell", table_in_cell),
     ("hard_break_in_heading", hard_break_in_heading),
     ("edge_hard_break", edge_hard_break),
-    ("empty_blockquote", empty_blockquote),
     ("empty_paragraph", empty_paragraph),
     ("unwritten_item", unwritten_item),
     ("adjacent_lists", adjacent_lists),
@@ -497,27 +447,6 @@ fn as_written(blocks: &[N]) -> Vec<N> {
     })
 }
 
-/// A multi-line code block in a list item or blockquote: its import joins
-/// the lines (a pre-existing importer bug, fixed by Task 4b).
-fn code_block_in_container(blocks: &[N]) -> Vec<N> {
-    rewrite(blocks, &|node, ancestors| match node {
-        N::El("code_block", attrs, children)
-            if ancestors
-                .iter()
-                .any(|a| matches!(*a, "list_item" | "blockquote"))
-                && !ancestors.iter().any(|a| CELLS.contains(a)) =>
-        {
-            let code = children.iter().map(text_of).collect::<String>();
-            vec![N::El(
-                "code_block",
-                attrs,
-                vec![text(&code.replace('\n', " "))],
-            )]
-        }
-        node => vec![node],
-    })
-}
-
 /// A code block in a table cell: a GFM cell is one line, so its fences and
 /// lines are joined onto it and read back as inline code.
 fn code_block_in_cell(blocks: &[N]) -> Vec<N> {
@@ -529,12 +458,18 @@ fn code_block_in_cell(blocks: &[N]) -> Vec<N> {
     })
 }
 
-/// An image or board in a table cell: the importer drops it (a pre-existing
-/// importer bug, fixed by Task 4b).
-fn image_in_cell(blocks: &[N]) -> Vec<N> {
+/// An image or board in a list item in a table cell: a GFM cell is one line,
+/// so the item's lines join it with their indentation, a run of spaces before
+/// or after the image, and the importer, which splits the line into blocks at
+/// the image, reads that run as the one space the blocks are joined with.
+fn indented_image_in_cell(blocks: &[N]) -> Vec<N> {
     rewrite(blocks, &|node, ancestors| {
         let image = is_tag(&node, "image") || is_tag(&node, "excalidraw_board");
-        if image && ancestors.iter().any(|a| CELLS.contains(a)) {
+        let in_cell_item = ancestors
+            .iter()
+            .position(|a| CELLS.contains(a))
+            .is_some_and(|cell| ancestors[cell..].contains(&"list_item"));
+        if image && in_cell_item {
             Vec::new()
         } else {
             vec![node]
@@ -594,19 +529,10 @@ fn edge_hard_break(blocks: &[N]) -> Vec<N> {
     })
 }
 
-/// A blockquote of blocks written as no text: written as `>` lines, it
-/// imports as an empty blockquote (a pre-existing importer bug, fixed by Task
-/// 4b), which exports as nothing.
-fn empty_blockquote(blocks: &[N]) -> Vec<N> {
-    rewrite(blocks, &|node, _| match node {
-        N::El("blockquote", _, ref children) if children.iter().all(writes_nothing) => Vec::new(),
-        node => vec![node],
-    })
-}
-
 /// A block written as no text, an empty paragraph above all: it leaves a
 /// blank line, which Markdown reads as nothing, so the blocks around it close
-/// up. Markdown has no empty paragraph.
+/// up. Markdown has no empty paragraph. A container of nothing else reads
+/// back as one empty paragraph: an empty item `- `, a quote `>`.
 fn empty_paragraph(blocks: &[N]) -> Vec<N> {
     rewrite_containers(blocks, &|children, container| {
         let had = !children.is_empty();
@@ -614,7 +540,7 @@ fn empty_paragraph(blocks: &[N]) -> Vec<N> {
             .into_iter()
             .filter(|c| !writes_nothing(c))
             .collect();
-        if had && kept.is_empty() && container.is_some_and(|c| c != "blockquote") {
+        if had && kept.is_empty() && container.is_some() {
             kept.push(el("paragraph", Vec::new()));
         }
         kept
@@ -1347,6 +1273,60 @@ fn import_classes_name_their_inputs() {
         ("- a\n  # h\n  ![x](a.png)![y](b.png)\n", None),
         ("- a\n  # h\n  <span></span>\n", None),
         ("- a\n\n  # h\n\n  ![x](y.png)\n", None),
+        (
+            "- a\n  ```\n  x\n  y\n  ```\n",
+            Some("code_block_line_breaks"),
+        ),
+        (
+            "> ```\n> x\n>\n> y\n> ```\n",
+            Some("code_block_line_breaks"),
+        ),
+        ("    x\n    y\n", Some("code_block_line_breaks")),
+        (
+            "- a\n  ```\n  x\n  \n  ```\n",
+            Some("code_block_line_breaks"),
+        ),
+        ("- a\n  ```\n  x\n  ```\n", None),
+        ("```\nx\n\ny\n```\n", None),
+        ("```\nx\r\ny\r\n```\n", None),
+        ("    x\n", None),
+        (">\n", Some("empty_blockquote")),
+        ("> <!-- c -->\n", Some("empty_blockquote")),
+        ("> >\n", Some("empty_blockquote")),
+        ("> a\n>\n", None),
+        (
+            "| h | i |\n| --- | --- |\n| ![x](x.png) | b |\n\n![z](z.png)\n",
+            Some("cell_image_candidate_leak"),
+        ),
+        (
+            "| ![x](x.png) b |\n| --- |\n\n> ![z](z.png)\n",
+            Some("cell_image_candidate_leak"),
+        ),
+        (
+            "| ![l](knot://board/00000000-0000-0000-0000-000000000001.svg) |\n| --- |\n\n![z](z.png)\n",
+            Some("cell_image_candidate_leak"),
+        ),
+        // An image left by a cell loses to the paragraph's own board, and
+        // any candidate goes when a paragraph ends.
+        (
+            "| ![x](x.png) |\n| --- |\n\n![l](knot://board/00000000-0000-0000-0000-000000000001.svg)\n",
+            Some("image_in_cell"),
+        ),
+        (
+            "| ![x](x.png) |\n| --- |\n\na\n\n![z](z.png)\n",
+            Some("image_in_cell"),
+        ),
+        // Text before the image: the cell leaves no candidate.
+        (
+            "| a ![x](x.png) |\n| --- |\n\n![z](z.png)\n",
+            Some("image_in_cell"),
+        ),
+        ("| h |\n| --- |\n| a ![x](x.png) |\n", Some("image_in_cell")),
+        (
+            "| ![l](knot://board/00000000-0000-0000-0000-000000000001.svg) b |\n| --- |\n",
+            Some("image_in_cell"),
+        ),
+        ("| h |\n| --- |\n| a |\n\n![x](x.png)\n", None),
     ];
     let mut failures = Vec::new();
     for (md, want) in cases {

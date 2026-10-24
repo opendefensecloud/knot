@@ -10,9 +10,10 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Par
 use thiserror::Error;
 use uuid::Uuid;
 use yrs::types::Attrs;
+use yrs::types::text::YChange;
 use yrs::{
-    Any, Text, Transact, Xml, XmlElementPrelim, XmlElementRef, XmlFragment, XmlTextPrelim,
-    XmlTextRef,
+    Any, Out, ReadTxn, Text, Transact, TransactionMut, Xml, XmlElementPrelim, XmlElementRef,
+    XmlFragment, XmlOut, XmlTextPrelim, XmlTextRef,
 };
 
 use crate::{BOARD_URL_PREFIX, BOARD_URL_SUFFIX, DEFAULT_BOARD_LABEL};
@@ -63,6 +64,12 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
         // (we suppress image alt text from the paragraph, so the "paragraph still
         // empty" check alone would incorrectly promote the first sentinel).
         let mut paragraph_image_count: u32 = 0;
+        // Between Tag::Image and TagEnd::Image for an image or board in a
+        // table cell, which becomes a block of the cell (`split_cell`).
+        let mut cell_image: Option<ImageBlock> = None;
+        // Whether the current paragraph of a table cell follows an image or
+        // board of the cell.
+        let mut cell_after_image = false;
         // Between Tag::HtmlBlock and TagEnd::HtmlBlock. Block-level HTML is
         // ignored, and so is the text pulldown-cmark emits inside it (the
         // block's extra indentation), which would otherwise land directly
@@ -147,13 +154,22 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     Tag::Image {
                         dest_url, title, ..
                     } => {
+                        // In a table cell, an image or board becomes a block of the
+                        // cell, wherever it is on the cell's line; an image in its
+                        // alt text is alt text. Nothing there is a candidate for
+                        // promotion at TagEnd::Paragraph, which a cell never sees.
+                        let in_cell = in_cell_paragraph(&stack);
+                        if in_cell && image_depth == 0 {
+                            cell_image = Some(ImageBlock::new(&dest_url, &title));
+                        }
                         // Track every image (sentinel or not) so we can suppress its
                         // alt-text Text events from leaking into the paragraph.
                         image_depth = image_depth.saturating_add(1);
                         paragraph_image_count = paragraph_image_count.saturating_add(1);
                         // Sentinel branch: capture board id + alt buffer when the URL
                         // matches and the paragraph is currently empty.
-                        if pending_board.is_none()
+                        if !in_cell
+                            && pending_board.is_none()
                             && paragraph_sentinel.is_none()
                             && let Some(id) = match_board_sentinel(&dest_url)
                             && let Some(para) = stack.last()
@@ -161,7 +177,8 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                             && para.len(&txn) == 0
                         {
                             pending_board = Some((id, String::new()));
-                        } else if pending_image.is_none()
+                        } else if !in_cell
+                            && pending_image.is_none()
                             && paragraph_image.is_none()
                             && match_board_sentinel(&dest_url).is_none()
                             && let Some(para) = stack.last()
@@ -215,6 +232,12 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                             Alignment::None => {}
                         }
                         table_col_idx += 1;
+                        // A cell is no paragraph: no promotion candidate goes in
+                        // or out of it.
+                        paragraph_image_count = 0;
+                        paragraph_image = None;
+                        paragraph_sentinel = None;
+                        cell_after_image = false;
                         let el = push_block(&frag, &stack, &mut txn, kind, &attrs);
                         stack.push(el);
                         // Tiptap/PM expects block content in a cell; pulldown sends
@@ -254,16 +277,8 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         {
                             // Remove the just-popped (empty) paragraph from its parent.
                             remove_last_child(&frag, &stack, &mut txn);
-                            let label = match alt.as_str() {
-                                "" => None,
-                                s if s == DEFAULT_BOARD_LABEL => None,
-                                other => Some(other.to_string()),
-                            };
-                            let mut attrs: Vec<(&str, String)> = vec![("board_id", board_id)];
-                            if let Some(l) = label {
-                                attrs.push(("label", l));
-                            }
-                            let _ = push_block(&frag, &stack, &mut txn, "excalidraw_board", &attrs);
+                            let (tag, attrs) = ImageBlock::Board { board_id, alt }.block();
+                            let _ = push_block(&frag, &stack, &mut txn, tag, &attrs);
                         }
                         // If the board branch didn't fire, try the regular-image branch.
                         else if let Some((src, alt, title)) = paragraph_image.take()
@@ -272,14 +287,8 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                             && paragraph_image_count == 1
                         {
                             remove_last_child(&frag, &stack, &mut txn);
-                            let mut attrs: Vec<(&str, String)> = vec![("src", src)];
-                            if !alt.is_empty() {
-                                attrs.push(("alt", alt));
-                            }
-                            if let Some(t) = title {
-                                attrs.push(("title", t));
-                            }
-                            let _ = push_block(&frag, &stack, &mut txn, "image", &attrs);
+                            let (tag, attrs) = ImageBlock::Image { src, alt, title }.block();
+                            let _ = push_block(&frag, &stack, &mut txn, tag, &attrs);
                         }
                         // Defensive: if we somehow exited the paragraph still holding
                         // an unfinished pending_board/pending_image (e.g. malformed
@@ -302,10 +311,31 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                             item.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
                         }
                     }
-                    TagEnd::Heading(_)
-                    | TagEnd::BlockQuote(_)
-                    | TagEnd::CodeBlock
-                    | TagEnd::List(_) => {
+                    TagEnd::BlockQuote(_) => {
+                        // The schema is `blockquote: block+`, so a quote without
+                        // blocks (a lone `>`, or one holding only an HTML block,
+                        // which is dropped) gets an empty paragraph, written as `>`.
+                        if let Some(quote) = stack.pop()
+                            && quote.len(&txn) == 0
+                        {
+                            quote.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+                        }
+                    }
+                    TagEnd::CodeBlock => {
+                        // The text ends with the line break before the closing
+                        // fence, which the serializer writes back itself. In a list
+                        // item or blockquote, and in an indented block, pulldown-cmark
+                        // emits the text line by line, so only the end of the whole
+                        // text is the fence's.
+                        if let Some(code) = stack.pop()
+                            && let Some(XmlOut::Text(t)) = code.get(&txn, 0)
+                            && plain_text(&t, &txn).ends_with('\n')
+                        {
+                            let len = t.len(&txn);
+                            t.remove_range(&mut txn, len - 1, 1);
+                        }
+                    }
+                    TagEnd::Heading(_) | TagEnd::List(_) => {
                         stack.pop();
                     }
                     TagEnd::Table => {
@@ -316,12 +346,28 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         stack.pop();
                     }
                     TagEnd::TableCell => {
-                        // Pop the implicit paragraph then the cell.
+                        // Pop the cell's last paragraph, then the cell.
+                        if let Some(paragraph) = stack.pop()
+                            && let Some(cell) = stack.last()
+                        {
+                            end_cell_paragraph(cell, &paragraph, &mut txn, cell_after_image, false);
+                        }
                         stack.pop();
-                        stack.pop();
+                        // Nothing of the cell is left for a later paragraph.
+                        cell_image = None;
+                        cell_after_image = false;
+                        paragraph_image_count = 0;
+                        paragraph_image = None;
+                        paragraph_sentinel = None;
                     }
                     TagEnd::Image => {
                         image_depth = image_depth.saturating_sub(1);
+                        if image_depth == 0
+                            && let Some(image) = cell_image.take()
+                        {
+                            split_cell(&mut stack, &mut txn, image, cell_after_image);
+                            cell_after_image = true;
+                        }
                         // Promote a captured sentinel to a paragraph-level candidate.
                         // If a second sentinel image appears in the same paragraph, the
                         // `is_none()` guards in Tag::Image and here ensure we don't
@@ -361,6 +407,9 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         if let Some((_, alt, _)) = pending_image.as_mut() {
                             alt.push_str(&text);
                         }
+                        if let Some(image) = cell_image.as_mut() {
+                            image.alt_mut().push_str(&text);
+                        }
                         continue;
                     }
                     // Defensive: pulldown can emit Text events outside any
@@ -371,12 +420,10 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     };
                     let parent_tag = parent.tag().to_string();
 
-                    // Code block bodies have no marks; append as plain text.
+                    // Code block bodies have no marks; append as plain text. The
+                    // line break before the closing fence goes at
+                    // TagEnd::CodeBlock.
                     if parent_tag == "code_block" {
-                        // pulldown-cmark includes a trailing newline in the code text;
-                        // the to_markdown serializer adds its own newline before ```.
-                        // Strip the trailing newline to avoid double-newline.
-                        let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
                         let text_ref = ensure_text_child(parent, &mut txn);
                         let pos = text_ref.len(&txn);
                         text_ref.insert(&mut txn, pos, &text);
@@ -390,6 +437,11 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                     }
                 }
                 Event::Code(s) => {
+                    // Code in the alt text of a table cell's image is alt text.
+                    if let Some(image) = cell_image.as_mut() {
+                        image.alt_mut().push_str(&s);
+                        continue;
+                    }
                     let Some(parent) = stack.last() else {
                         continue;
                     };
@@ -501,7 +553,6 @@ fn remove_last_child(
     stack: &[XmlElementRef],
     txn: &mut yrs::TransactionMut,
 ) {
-    use yrs::XmlOut;
     match stack.last() {
         Some(parent) => {
             let len = parent.len(txn);
@@ -543,6 +594,157 @@ fn push_block(
         el.insert_attribute(txn, *k, v.clone());
     }
     el
+}
+
+/// An image or board sentinel the importer writes as a block of its own.
+enum ImageBlock {
+    /// An `excalidraw_board`: the board id, and the alt text, its label.
+    Board { board_id: String, alt: String },
+    /// An `image`.
+    Image {
+        src: String,
+        alt: String,
+        title: Option<String>,
+    },
+}
+
+impl ImageBlock {
+    /// The block for the image `Tag::Image` opens, its alt text still to
+    /// come.
+    fn new(dest_url: &str, title: &str) -> Self {
+        match match_board_sentinel(dest_url) {
+            Some(board_id) => ImageBlock::Board {
+                board_id,
+                alt: String::new(),
+            },
+            None => ImageBlock::Image {
+                src: dest_url.to_string(),
+                alt: String::new(),
+                title: (!title.is_empty()).then(|| title.to_string()),
+            },
+        }
+    }
+
+    fn alt_mut(&mut self) -> &mut String {
+        match self {
+            ImageBlock::Board { alt, .. } | ImageBlock::Image { alt, .. } => alt,
+        }
+    }
+
+    /// The block's tag and attributes. An empty alt text is left out, and so
+    /// is a board's default label, which the serializer writes for a board
+    /// without one.
+    fn block(self) -> (&'static str, Vec<(&'static str, String)>) {
+        match self {
+            ImageBlock::Board { board_id, alt } => {
+                let mut attrs = vec![("board_id", board_id)];
+                if !alt.is_empty() && alt != DEFAULT_BOARD_LABEL {
+                    attrs.push(("label", alt));
+                }
+                ("excalidraw_board", attrs)
+            }
+            ImageBlock::Image { src, alt, title } => {
+                let mut attrs = vec![("src", src)];
+                if !alt.is_empty() {
+                    attrs.push(("alt", alt));
+                }
+                if let Some(t) = title {
+                    attrs.push(("title", t));
+                }
+                ("image", attrs)
+            }
+        }
+    }
+}
+
+/// Whether the innermost open block is the paragraph of a table cell.
+fn in_cell_paragraph(stack: &[XmlElementRef]) -> bool {
+    matches!(
+        stack,
+        [.., cell, paragraph]
+            if paragraph.tag().as_ref() == "paragraph"
+                && matches!(cell.tag().as_ref(), "table_cell" | "table_header")
+    )
+}
+
+/// Splits the line of a table cell at `image`, one of its images or boards.
+/// A GFM cell is one line, onto which the serializer joins the cell's blocks
+/// with a space, so its images are blocks of their own: the cell's current
+/// paragraph ends ([`end_cell_paragraph`]; `after_image` when it follows
+/// another image), `image` becomes a block of the cell, and a new paragraph
+/// opens for the rest of the line.
+fn split_cell(
+    stack: &mut Vec<XmlElementRef>,
+    txn: &mut TransactionMut,
+    image: ImageBlock,
+    after_image: bool,
+) {
+    if !in_cell_paragraph(stack) {
+        return;
+    }
+    let Some(paragraph) = stack.pop() else {
+        return;
+    };
+    let Some(cell) = stack.last() else {
+        return;
+    };
+    end_cell_paragraph(cell, &paragraph, txn, after_image, true);
+    let (tag, attrs) = image.block();
+    let el = cell.push_back(txn, XmlElementPrelim::empty(tag));
+    for (k, v) in attrs {
+        el.insert_attribute(txn, k, v);
+    }
+    let next = cell.push_back(txn, XmlElementPrelim::empty("paragraph"));
+    stack.push(next);
+}
+
+/// Ends `paragraph`, the last block of table cell `cell`. Next to an image or
+/// board of the cell, at its start when it follows one (`after_image`) and at
+/// its end when one follows (`before_image`), the spaces and tabs are the
+/// serializer's join and go, and the paragraph goes when no text is left. A
+/// cell without images keeps its one paragraph as it is.
+fn end_cell_paragraph(
+    cell: &XmlElementRef,
+    paragraph: &XmlElementRef,
+    txn: &mut TransactionMut,
+    after_image: bool,
+    before_image: bool,
+) {
+    const BLANK: [char; 2] = [' ', '\t'];
+    if after_image && let Some(XmlOut::Text(t)) = paragraph.get(txn, 0) {
+        let text = plain_text(&t, txn);
+        let n = (text.len() - text.trim_start_matches(BLANK).len()) as u32;
+        if n > 0 {
+            t.remove_range(txn, 0, n);
+        }
+    }
+    if before_image
+        && let Some(XmlOut::Text(t)) = paragraph.get(txn, paragraph.len(txn).saturating_sub(1))
+    {
+        let text = plain_text(&t, txn);
+        let n = (text.len() - text.trim_end_matches(BLANK).len()) as u32;
+        if n > 0 {
+            let len = t.len(txn);
+            t.remove_range(txn, len - n, n);
+        }
+    }
+    let no_text = (0..paragraph.len(txn))
+        .all(|i| matches!(paragraph.get(txn, i), Some(XmlOut::Text(t)) if t.len(txn) == 0));
+    if no_text && (after_image || before_image) {
+        let len = cell.len(txn);
+        cell.remove_range(txn, len - 1, 1);
+    }
+}
+
+/// The text of `t` without its marks.
+fn plain_text<T: ReadTxn>(t: &XmlTextRef, txn: &T) -> String {
+    t.diff(txn, YChange::identity)
+        .into_iter()
+        .filter_map(|chunk| match chunk.insert {
+            Out::Any(Any::String(s)) => Some(s.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Gives a tight list item's inline content its paragraph back.
@@ -784,7 +986,6 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for TightParagraphs<'a, I> {
 /// Find the last XmlText child of `parent`, or create one if none.
 /// Subsequent calls always return the same single XmlText so we can append.
 fn ensure_text_child(parent: &XmlElementRef, txn: &mut yrs::TransactionMut) -> XmlTextRef {
-    use yrs::XmlOut;
     let len = parent.len(txn);
     if len > 0
         && let Some(XmlOut::Text(t)) = parent.get(txn, len - 1)
