@@ -10,11 +10,11 @@
 -- tried again on the next pass. A render that panicked, or a process that
 -- died during it, leaves the attempt. The sweep skips a page the current
 -- renderer started twice without finishing (once may be a deploy stopping the
--- process). An edit still refreshes such a page, and a newer renderer tries it
--- afresh.
+-- process). An edit still refreshes such a page, and any render of it that
+-- finishes, an edit's too, deletes its attempts, so the sweep takes it again.
+-- A newer renderer tries it afresh.
 CREATE TABLE doc_markdown_sweep_attempts (
     doc_id           uuid PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
     renderer_version int NOT NULL,
-    attempts         int NOT NULL,
-    attempted_at     timestamptz NOT NULL DEFAULT now()
+    attempts         int NOT NULL
 );

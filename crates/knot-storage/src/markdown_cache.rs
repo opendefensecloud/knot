@@ -58,6 +58,13 @@ pub trait MarkdownCacheStore: Send + Sync + 'static {
     /// render of a later seq. Returns whether a row was written; when it
     /// wasn't, this render is older than the cached one, and the caller
     /// skips the task reindex too.
+    ///
+    /// Either way the render returned, so the refresh sweep's unfinished
+    /// attempts at the page by this renderer, or an older one, are cleared
+    /// ([`start_sweep_attempt`](Self::start_sweep_attempt)): a page whose
+    /// sweep renders were cut short by no fault of its own (deploys, a
+    /// shutdown) is swept again once any render of it, an edit's too,
+    /// finishes.
     async fn put_rendered(
         &self,
         doc_id: Uuid,
@@ -90,10 +97,12 @@ pub trait MarkdownCacheStore: Send + Sync + 'static {
     /// Records that the refresh sweep starts rendering `doc_id` with
     /// `renderer_version`, and returns whether it should: not when that
     /// renderer started the page `max_attempts` times already without
-    /// finishing ([`finish_sweep_attempt`](Self::finish_sweep_attempt)). A
-    /// render that never finishes panicked, or the process died during it,
-    /// as on a page that overflows the stack: skipping the page after a
-    /// restart keeps it from killing every replica in turn, on every boot.
+    /// finishing ([`finish_sweep_attempt`](Self::finish_sweep_attempt), or
+    /// any render of the page that [`put_rendered`](Self::put_rendered)
+    /// writes). A render that never finishes panicked, or the process died
+    /// during it, as on a page that overflows the stack: skipping the page
+    /// after a restart keeps it from killing every replica in turn, on every
+    /// boot.
     async fn start_sweep_attempt(
         &self,
         doc_id: Uuid,
@@ -211,6 +220,14 @@ impl MarkdownCacheStore for PgMarkdownCache {
         .await?
         .rows_affected()
             > 0;
+        sqlx::query(
+            "DELETE FROM doc_markdown_sweep_attempts
+             WHERE doc_id = $1 AND renderer_version <= $2",
+        )
+        .bind(doc_id)
+        .bind(renderer_version)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(written)
     }
@@ -282,8 +299,7 @@ impl MarkdownCacheStore for PgMarkdownCache {
              ON CONFLICT (doc_id) DO UPDATE
              SET attempts = CASE WHEN a.renderer_version = EXCLUDED.renderer_version
                                  THEN a.attempts + 1 ELSE 1 END,
-                 renderer_version = EXCLUDED.renderer_version,
-                 attempted_at = now()
+                 renderer_version = EXCLUDED.renderer_version
              WHERE a.renderer_version <> EXCLUDED.renderer_version OR a.attempts < $3
              RETURNING a.attempts",
         )

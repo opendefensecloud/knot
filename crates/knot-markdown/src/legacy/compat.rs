@@ -64,7 +64,12 @@ const EXPORT_CLASSES: &[Class<DocHandle>] = &[
 
 /// Named import bug classes. A healthy Markdown input in one of them may
 /// import differently from the legacy importer (importer rule).
+///
+/// `depth_limit` comes first: the other classes, and legacy, recurse once
+/// per element of the imported page, so on an input in it they could
+/// overflow the stack.
 const IMPORT_CLASSES: &[Class<str>] = &[
+    ("depth_limit", import_depth_limit),
     (
         "item_first_child_not_paragraph",
         item_first_child_not_paragraph,
@@ -995,6 +1000,31 @@ pub fn depth_limit(doc: &DocHandle) -> bool {
             return true;
         }
         stack.extend(nested.into_iter().map(|child| (child, outer + 1)));
+    }
+    false
+}
+
+/// Markdown that nests a blockquote, list or table [`MAX_DEPTH`] block
+/// containers deep (blockquotes, list items, table cells): legacy stored it
+/// as deep as it nests, which overflowed the stack when the page was
+/// replaced, restored or deleted (F1 review). The importer stores such a
+/// container as a paragraph of its text, as the writer writes it. Read event
+/// by event, so that no nesting can overflow it.
+fn import_depth_limit(md: &str) -> bool {
+    let mut depth = 0usize;
+    for (event, _) in events(md) {
+        match event {
+            Event::Start(Tag::BlockQuote(_) | Tag::List(_) | Tag::Table(_))
+                if depth >= MAX_DEPTH =>
+            {
+                return true;
+            }
+            Event::Start(Tag::BlockQuote(_) | Tag::Item | Tag::TableCell) => depth += 1,
+            Event::End(TagEnd::BlockQuote(_) | TagEnd::Item | TagEnd::TableCell) => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
     }
     false
 }

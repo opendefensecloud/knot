@@ -1,6 +1,15 @@
 //! CommonMark → Y.Doc via pulldown-cmark.
 //!
 //! Targets the v0.1 schema only.
+//!
+//! The importer follows Markdown only [`MAX_DEPTH`] block containers deep,
+//! as the writer does ([`crate::to_markdown::MAX_DEPTH`]): a blockquote,
+//! list or table nested that deep or deeper is stored as one paragraph of
+//! its text ([`Flattened`]). yrs deletes a nested type by recursing once per
+//! level, so a page stored from `>` repeated 100,000 times overflowed the
+//! stack, and aborted the server, when it was replaced, restored or deleted
+//! (F1 review). Every import goes through [`parse`]: the doc page's import,
+//! from-template, the workspace import and history restore.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -16,6 +25,7 @@ use yrs::{
     XmlFragment, XmlOut, XmlTextPrelim, XmlTextRef,
 };
 
+use crate::to_markdown::MAX_DEPTH;
 use crate::{BOARD_URL_PREFIX, BOARD_URL_SUFFIX, DEFAULT_BOARD_LABEL};
 
 #[derive(Debug, Error)]
@@ -75,6 +85,9 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
         // block's extra indentation), which would otherwise land directly
         // in the enclosing list item or quote.
         let mut in_html_block = false;
+        // Between the start and the end of a container nested `MAX_DEPTH`
+        // deep, which is read as its text.
+        let mut flattened: Option<Flattened> = None;
 
         let mut opts = Options::empty();
         opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -89,6 +102,24 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
         let mut table_col_idx: usize = 0;
 
         for event in parser {
+            if let Some(container) = flattened.as_mut() {
+                if let Some(text) = container.read(&event) {
+                    flattened = None;
+                    if !text.is_empty() {
+                        let p = push_block(&frag, &stack, &mut txn, "paragraph", &[]);
+                        p.push_back(&mut txn, XmlTextPrelim::new(text));
+                    }
+                }
+                continue;
+            }
+            if matches!(
+                event,
+                Event::Start(Tag::BlockQuote(_) | Tag::List(_) | Tag::Table(_))
+            ) && container_depth(&stack) >= MAX_DEPTH
+            {
+                flattened = Some(Flattened::default());
+                continue;
+            }
             match event {
                 Event::Start(tag) => match tag {
                     Tag::Paragraph => {
@@ -535,6 +566,69 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
         .encode_state_as_update(&doc, None)
         .map_err(|e| ParseError::Encode(format!("{e:?}")))?;
     Ok((doc, initial))
+}
+
+/// How many block containers (blockquotes, list items, table cells) the
+/// innermost open block sits in, or is: the depth at which a block opening
+/// now sits, as the writer counts it.
+fn container_depth(stack: &[XmlElementRef]) -> usize {
+    stack
+        .iter()
+        .filter(|el| {
+            matches!(
+                el.tag().as_ref(),
+                "blockquote" | "list_item" | "table_cell" | "table_header"
+            )
+        })
+        .count()
+}
+
+/// A container nested [`MAX_DEPTH`] deep, read from its start to its end as
+/// the paragraph of its text that the writer writes for such a container
+/// (`capped_text`): its words in order, one space between each two, on one
+/// line. Every character of its text is kept but its blanks: the text of
+/// every block in it, code, and the alt text of images. Its structure,
+/// marks, links' targets, rules, checkboxes and HTML go, as HTML does
+/// elsewhere.
+#[derive(Default)]
+struct Flattened {
+    /// The tags opened in the container and still open.
+    open: usize,
+    /// Between the start and the end of an HTML block, whose text is HTML.
+    in_html_block: bool,
+    text: String,
+}
+
+impl Flattened {
+    /// Reads `event`, the next event in the container. Returns its text once
+    /// the event ends the container.
+    fn read(&mut self, event: &Event<'_>) -> Option<String> {
+        // A block starts or ends, or a line breaks: the words on either side
+        // are two.
+        if matches!(role(event), Role::Open(_) | Role::Close | Role::Leaf)
+            || matches!(event, Event::SoftBreak | Event::HardBreak)
+        {
+            self.text.push(' ');
+        }
+        match event {
+            Event::Start(tag) => {
+                self.in_html_block |= matches!(tag, Tag::HtmlBlock);
+                self.open += 1;
+            }
+            Event::End(end) => {
+                self.in_html_block &= !matches!(end, TagEnd::HtmlBlock);
+                if self.open == 0 {
+                    let words: Vec<&str> = self.text.split_whitespace().collect();
+                    return Some(words.join(" "));
+                }
+                self.open -= 1;
+            }
+            Event::Text(text) if !self.in_html_block => self.text.push_str(text),
+            Event::Code(code) => self.text.push_str(code),
+            _ => {}
+        }
+        None
+    }
 }
 
 /// Match `knot://board/<uuid>.svg` and return the captured UUID string.

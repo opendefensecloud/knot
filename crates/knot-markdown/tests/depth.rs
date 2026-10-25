@@ -6,14 +6,20 @@
 //! deeper as its text, and the other walks of the export and of the task
 //! listing, and `compat::depth_limit`, read a page with an explicit stack.
 //!
+//! yrs deletes a nested type by recursing once per level, so a page that
+//! deep could not be replaced, restored or deleted either (F1 review). The
+//! importer stops at the same depth, and stores what lies deeper as a
+//! paragraph of its text.
+//!
 //! Each test runs on a thread with the stack of a tokio worker, 2 MiB, where
 //! the server renders pages. This file is a test binary of its own, so that
 //! an overflow can abort only these tests.
 
 use knot_crdt::{DocHandle, Engine, YrsEngine};
+use knot_markdown::from_markdown::parse;
 use knot_markdown::legacy::compat;
 use knot_markdown::tasks::{Task, extract_tasks_from_doc};
-use knot_markdown::to_markdown::MAX_DEPTH;
+use knot_markdown::to_markdown::{MAX_DEPTH, Report};
 use yrs::types::xml::XmlIn;
 use yrs::{
     Transact, TransactionMut, Xml, XmlElementPrelim, XmlElementRef, XmlFragment, XmlFragmentPrelim,
@@ -278,5 +284,173 @@ fn fragment<P: XmlFragment>(parent: &P, txn: &mut TransactionMut) -> XmlFragment
     match parent.push_back(txn, XmlIn::Fragment(XmlFragmentPrelim::default())) {
         XmlOut::Fragment(f) => f,
         other => panic!("not a fragment: {other:?}"),
+    }
+}
+
+/// A list item whose first block nests too deep, written as a paragraph of
+/// its text, is laid out as an item that starts with a paragraph: the text
+/// right after the checkbox, not on a line of its own (F1 review).
+#[test]
+fn an_item_whose_first_block_is_written_as_text_starts_with_it() {
+    let Read { md, lost, .. } = read_deep(|| {
+        page(|frag, txn| {
+            // The list in the innermost quote is the last container the
+            // writer follows; the quote in its item is one too deep.
+            let mut quote = child(frag, txn, "blockquote");
+            for _ in 1..MAX_DEPTH - 1 {
+                quote = child(&quote, txn, "blockquote");
+            }
+            let list = child(&quote, txn, "bullet_list");
+            let item = child(&list, txn, "list_item");
+            item.insert_attribute(txn, "checked", "false");
+            let inner = child(&item, txn, "blockquote");
+            paragraph(&inner, txn, "deep");
+        })
+    });
+    assert_eq!(md, format!("{}- [ ] deep\n", "> ".repeat(MAX_DEPTH - 1)));
+    assert_eq!(lost, None);
+}
+
+/// A container written as its text because it nests too deep is counted on
+/// its own, not as a node the schema doesn't name (F1 review): the server
+/// warns about, and counts, each apart.
+#[test]
+fn a_deep_page_reports_its_depth_limit_apart_from_unknown_nodes() {
+    let (unknown, report) = on_worker_stack(|| {
+        let doc = page(|frag, txn| {
+            let mut quote = child(frag, txn, "blockquote");
+            for _ in 1..DEEP {
+                quote = child(&quote, txn, "blockquote");
+            }
+            paragraph(&quote, txn, "deep");
+        });
+        let (_, unknown) =
+            knot_markdown::serialise_with_report(&YrsEngine, &doc).expect("serialise");
+        let (_, report) = knot_markdown::serialise_reporting(&YrsEngine, &doc).expect("serialise");
+        (unknown, report)
+    });
+    assert_eq!(unknown, Vec::<String>::new());
+    assert_eq!(
+        report,
+        Report {
+            unknown: Vec::new(),
+            depth_limited: 1,
+        }
+    );
+}
+
+/// The Markdown `prefix` repeated [`DEEP`] times, then `rest`.
+fn nested_markdown(prefix: &str, rest: &str) -> String {
+    format!("{}{rest}", prefix.repeat(DEEP))
+}
+
+/// What importing `md` stores, read on a [`STACK`]-sized stack: its export,
+/// whether the import kept every character of `text` (`None`), and that the
+/// page can be deleted there, as a replace, a restore or the editor delete
+/// it.
+fn import_deep(md: String, text: &'static str) -> (String, Option<(usize, char)>) {
+    on_worker_stack(move || {
+        let (doc, _) = parse(&md).expect("parse");
+        let exported = knot_markdown::serialise(&YrsEngine, &doc).expect("serialise");
+        let lost = compat::first_lost_char(text, &compat::doc_text(&doc));
+        let ydoc = doc.inner();
+        let frag = ydoc.get_or_insert_xml_fragment("default");
+        let mut txn = ydoc.transact_mut();
+        let len = frag.len(&txn);
+        frag.remove_range(&mut txn, 0, len);
+        drop(txn);
+        (exported, lost)
+    })
+}
+
+/// `>` repeated [`DEEP`] times imports as the quotes the writer follows,
+/// the innermost holding the text, and the page can be deleted.
+#[test]
+fn deeply_nested_quotes_import_to_the_depth_limit() {
+    let (md, lost) = import_deep(nested_markdown(">", " deep"), "deep");
+    assert_eq!(md, format!("{}deep\n", "> ".repeat(MAX_DEPTH)));
+    assert_eq!(lost, None);
+    assert_eq!(
+        compat::import_class(&nested_markdown(">", " deep")),
+        Some("depth_limit")
+    );
+}
+
+/// Lists nested [`DEEP`] deep, each in the item of the one before, import
+/// as the lists the writer follows, the rest as a paragraph of its text in
+/// the last item. An item that starts with a list is written on one line
+/// with it.
+#[test]
+fn deeply_nested_lists_import_to_the_depth_limit() {
+    let (md, lost) = import_deep(nested_markdown("- ", "deep"), "deep");
+    assert_eq!(md, format!("{}deep\n", "- ".repeat(MAX_DEPTH)));
+    assert_eq!(lost, None);
+}
+
+/// What nests past the limit keeps its text, every block of it, in order:
+/// paragraphs, items, code, headings, a table, and the alt text of an image.
+#[test]
+fn text_nested_past_the_limit_is_imported_in_order() {
+    let deep = ">".repeat(MAX_DEPTH + 2);
+    let md = [
+        format!("{deep} one *two*\n"),
+        format!("{deep}\n"),
+        format!("{deep} - [ ] three `four`\n"),
+        format!("{deep}   five\n"),
+        format!("{deep}\n"),
+        format!("{deep} # six\n"),
+        format!("{deep}\n"),
+        format!("{deep} | seven | eight |\n"),
+        format!("{deep} | --- | --- |\n"),
+        format!("{deep} | nine | ![ten](x.png) |\n"),
+        format!("{deep}\n"),
+        format!("{deep} ```\n"),
+        format!("{deep} eleven\n"),
+        format!("{deep} ```\n"),
+    ]
+    .concat();
+    let (exported, lost) = import_deep(
+        md,
+        "one two three four five six seven eight nine ten eleven",
+    );
+    assert_eq!(
+        exported,
+        format!(
+            "{}one two three four five six seven eight nine ten eleven\n",
+            "> ".repeat(MAX_DEPTH)
+        )
+    );
+    assert_eq!(lost, None);
+}
+
+/// Markdown nested just under the limit imports as before, and isn't in the
+/// class; one level more is.
+#[test]
+fn the_depth_limit_import_class_starts_at_the_limit() {
+    let quotes = |n: usize| format!("{} x\n", ">".repeat(n));
+    // `n` lists, each in an item of the one before, after its text.
+    let lists =
+        |n: usize| -> String { (0..n).map(|k| format!("{}- x\n", "  ".repeat(k))).collect() };
+    let table = |n: usize| format!("{} | a |\n{} | --- |\n", ">".repeat(n), ">".repeat(n));
+    for (md, want) in [
+        (quotes(MAX_DEPTH), None),
+        (quotes(MAX_DEPTH + 1), Some("depth_limit")),
+        (lists(MAX_DEPTH), None),
+        (lists(MAX_DEPTH + 1), Some("depth_limit")),
+        (table(MAX_DEPTH - 1), None),
+        (table(MAX_DEPTH), Some("depth_limit")),
+    ] {
+        let class = compat::import_class(&md);
+        assert_eq!(class, want, "{md:?}");
+        // Under the limit, the import is the legacy one.
+        if class.is_none() {
+            let (new, _) = parse(&md).expect("parse");
+            let (old, _) = knot_markdown::legacy::parse(&md).expect("legacy parse");
+            assert_eq!(
+                compat::normalised(new.inner()),
+                compat::normalised(old.inner()),
+                "{md:?}"
+            );
+        }
     }
 }

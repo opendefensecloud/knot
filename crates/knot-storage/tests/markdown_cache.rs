@@ -242,3 +242,29 @@ async fn sweep_attempts_run_out_unless_a_render_finishes() {
     assert!(start(3).await.unwrap());
     assert!(!start(3).await.unwrap());
 }
+
+/// Any render of a page that finishes clears the sweep's attempts at it by
+/// that renderer or an older one, an edit's too (F1 review): a page whose
+/// sweep renders two deploys cut short is swept again once it renders.
+#[tokio::test]
+async fn a_finished_render_clears_the_sweeps_attempts() {
+    let p = Pages::new().await;
+    let doc = p.page("a").await;
+    let start = |version| p.cache.start_sweep_attempt(doc, version, 2);
+    assert!(start(2).await.unwrap());
+    assert!(start(2).await.unwrap());
+    assert!(!start(2).await.unwrap());
+
+    // An older renderer's render says nothing about this one's.
+    p.cache.put_rendered(doc, 1, "old\n", 1).await.unwrap();
+    assert!(!start(2).await.unwrap());
+
+    p.cache.put_rendered(doc, 2, "new\n", 2).await.unwrap();
+    assert!(start(2).await.unwrap(), "the render finished");
+
+    // A render older than the cached one writes nothing, but finished too.
+    assert!(start(2).await.unwrap());
+    assert!(!start(2).await.unwrap());
+    assert!(!p.cache.put_rendered(doc, 1, "older\n", 2).await.unwrap());
+    assert!(start(2).await.unwrap());
+}

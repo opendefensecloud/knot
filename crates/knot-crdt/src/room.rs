@@ -43,6 +43,11 @@ pub struct ConnHandle {
     /// the whole session) and no frame value is free to mean it (an empty
     /// frame is already the presence-clearing message).
     pub revoked: CancellationToken,
+    /// Cancelled by the room when it refuses an update the connection sent,
+    /// one that would nest the page too deep ([`crate::nesting`]); the WS
+    /// shim then closes the socket with 4422. The room no longer holds the
+    /// connection, so nothing more it sends is applied.
+    pub refused: CancellationToken,
 }
 
 impl ConnHandle {
@@ -50,6 +55,7 @@ impl ConnHandle {
         Self {
             tx,
             revoked: CancellationToken::new(),
+            refused: CancellationToken::new(),
         }
     }
 }
@@ -620,6 +626,25 @@ impl Room {
         // is torn down; its access ended when it left `conns`.
         if !self.conns.contains_key(&m.from) {
             tracing::debug!(conn = %m.from, "dropping update from a connection the room no longer holds");
+            return;
+        }
+        // Before anything of it is applied: yrs overflows the stack applying
+        // an update that inserts a deep subtree and deletes it again, and
+        // deleting a deep subtree later would too. Nothing of it is applied,
+        // persisted or fanned out, and the sender is closed: its own copy of
+        // the page now holds what the room refused.
+        if let Err(too_deep) = crate::nesting::check_update(&self.doc, &m.bytes) {
+            tracing::warn!(
+                doc_id = %self.doc_id,
+                conn = %m.from,
+                depth = too_deep.depth,
+                limit = crate::nesting::MAX_NESTING,
+                "refused an update that nests the page too deep; closing its connection"
+            );
+            metrics::counter!("knot_room_updates_refused_total").increment(1);
+            if let Some(conn) = self.conns.remove(&m.from) {
+                conn.refused.cancel();
+            }
             return;
         }
         match self.engine.apply_update_changed(&self.doc, &m.bytes) {

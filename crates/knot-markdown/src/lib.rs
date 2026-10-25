@@ -9,7 +9,7 @@ pub mod schema;
 pub mod tasks;
 pub mod to_markdown;
 
-pub use to_markdown::{SerError, serialise, serialise_with_report};
+pub use to_markdown::{SerError, serialise, serialise_reporting, serialise_with_report};
 
 /// The version of the Markdown this crate writes, stored with each cached
 /// render (`doc_markdown_cache.renderer_version`). Raising it makes the

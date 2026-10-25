@@ -964,6 +964,9 @@ async fn sweep_skips_a_page_whose_render_never_finished_twice() {
     for i in 0..4 {
         pages.push(h.page(&format!("k{i}"), "- [ ] one\n").await);
     }
+    // In the sweep's order, so that its turn at the page it skips comes
+    // before the renders the test waits for.
+    pages.sort();
     let (killer, once, older, fresh) = (pages[0], pages[1], pages[2], pages[3]);
     h.seed_attempts(killer, RENDERER_VERSION, 2).await;
     h.seed_attempts(once, RENDERER_VERSION, 1).await;
@@ -979,6 +982,31 @@ async fn sweep_skips_a_page_whose_render_never_finished_twice() {
     assert!(h.cache_row(killer).await.is_none());
     assert!(h.tasks(killer).await.is_empty());
     assert_eq!(h.attempts(killer).await, Some((RENDERER_VERSION, 2)));
+}
+
+/// A page the sweep gave up on (two of its renders were cut short, by
+/// deploys say) is swept again once a render of it finishes, an edit's too,
+/// and it goes stale again (F1 review).
+#[tokio::test(flavor = "multi_thread")]
+async fn sweep_takes_a_page_again_once_a_render_of_it_finishes() {
+    let mut h = Harness::new().await;
+    let doc = h.page("a", "- [ ] one\n").await;
+    h.seed_attempts(doc, RENDERER_VERSION, 2).await;
+
+    refresh_markdown_and_index(&h.state, doc).await.unwrap();
+    assert_eq!(h.attempts(doc).await, None, "the edit's render finished");
+
+    // Stale again, as after a failed task write or an old pod's render.
+    h.state
+        .markdown_cache
+        .as_ref()
+        .unwrap()
+        .mark_stale(doc)
+        .await
+        .unwrap();
+    h.start_sweep();
+    h.wait_until_rendered(&[doc]).await;
+    h.wait_until_attempts(doc, None).await;
 }
 
 /// A render that panics ends neither the worker nor the sweep's pass: the

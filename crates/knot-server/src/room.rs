@@ -41,9 +41,13 @@ pub async fn serve(
     // Cancelled by the room when an ACL change revokes this connection; the
     // writer then closes the socket with 4403.
     let revoked = CancellationToken::new();
+    // Cancelled by the room when it refuses an update this connection sent
+    // (it nests the page too deep); the writer then closes with 4422.
+    let refused = CancellationToken::new();
     let conn_handle = || ConnHandle {
         tx: out_tx.clone(),
         revoked: revoked.clone(),
+        refused: refused.clone(),
     };
 
     // Join — receive hydrated state as bytes; wrap in sync_step_2 frame.
@@ -95,6 +99,7 @@ pub async fn serve(
         out_rx,
         shutdown.clone(),
         revoked.clone(),
+        refused.clone(),
         done.clone(),
     ));
 

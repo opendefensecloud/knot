@@ -17,6 +17,9 @@ use tokio_util::sync::CancellationToken;
 /// - `shutdown` (server draining): close with 1001 so the client reconnects
 ///   elsewhere.
 /// - `revoked` (the room revoked this connection's access): close with 4403.
+/// - `refused` (the room refused an update this connection sent, one that
+///   would nest the page too deep): close with 4422, so the client stops
+///   sending on a session whose state the room no longer shares.
 /// - `done` (the read half ended — the client went away): stop. Without it
 ///   this task would wait on the still-open channel forever, leaking itself
 ///   and the socket for every disconnect.
@@ -25,6 +28,7 @@ pub(crate) async fn run<S>(
     mut out_rx: mpsc::Receiver<Vec<u8>>,
     shutdown: CancellationToken,
     revoked: CancellationToken,
+    refused: CancellationToken,
     done: CancellationToken,
 ) where
     S: Sink<Message> + Unpin,
@@ -38,6 +42,10 @@ pub(crate) async fn run<S>(
             }
             _ = revoked.cancelled() => {
                 close(&mut sink, 4403, "acl.revoked").await;
+                break;
+            }
+            _ = refused.cancelled() => {
+                close(&mut sink, 4422, "doc.nesting_too_deep").await;
                 break;
             }
             _ = done.cancelled() => break,
@@ -78,6 +86,7 @@ mod tests {
         sent: futures::channel::mpsc::UnboundedReceiver<Message>,
         shutdown: CancellationToken,
         revoked: CancellationToken,
+        refused: CancellationToken,
         done: CancellationToken,
         task: tokio::task::JoinHandle<()>,
     }
@@ -85,7 +94,8 @@ mod tests {
     fn start() -> Harness {
         let (sink, sent) = futures::channel::mpsc::unbounded::<Message>();
         let (out_tx, out_rx) = mpsc::channel(8);
-        let (shutdown, revoked, done) = (
+        let (shutdown, revoked, refused, done) = (
+            CancellationToken::new(),
             CancellationToken::new(),
             CancellationToken::new(),
             CancellationToken::new(),
@@ -95,6 +105,7 @@ mod tests {
             out_rx,
             shutdown.clone(),
             revoked.clone(),
+            refused.clone(),
             done.clone(),
         ));
         Harness {
@@ -102,6 +113,7 @@ mod tests {
             sent,
             shutdown,
             revoked,
+            refused,
             done,
             task,
         }
@@ -156,6 +168,16 @@ mod tests {
         finished(h.task).await;
         let m = h.sent.next().await.expect("no close frame sent");
         assert_eq!(close_code(&m), Some(4403));
+        assert!(h.done.is_cancelled(), "the read half must be told to stop");
+    }
+
+    #[tokio::test]
+    async fn refused_update_closes_with_4422_and_ends_the_session() {
+        let mut h = start();
+        h.refused.cancel();
+        finished(h.task).await;
+        let m = h.sent.next().await.expect("no close frame sent");
+        assert_eq!(close_code(&m), Some(4422));
         assert!(h.done.is_cancelled(), "the read half must be told to stop");
     }
 

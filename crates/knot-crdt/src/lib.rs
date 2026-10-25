@@ -5,6 +5,7 @@ pub mod bus_mem;
 pub mod bus_pg;
 pub mod engine;
 pub mod gc;
+pub mod nesting;
 pub mod presence;
 pub mod protocol;
 pub mod registry;

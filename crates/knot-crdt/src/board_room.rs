@@ -228,6 +228,20 @@ impl BoardRoom {
 
     #[tracing::instrument(skip(self, m), fields(board_id = %self.board_id, bytes = m.bytes.len()))]
     async fn on_inbound(&mut self, m: InMsg) {
+        // As in `Room::on_inbound`: nothing of an update that nests too deep
+        // is applied, persisted or fanned out. A board connection has no
+        // close signal of its own; the board editor never nests types.
+        if let Err(too_deep) = crate::nesting::check_update(&self.doc, &m.bytes) {
+            tracing::warn!(
+                board_id = %self.board_id,
+                conn = %m.from,
+                depth = too_deep.depth,
+                limit = crate::nesting::MAX_NESTING,
+                "refused a board update that nests too deep"
+            );
+            metrics::counter!("knot_room_updates_refused_total").increment(1);
+            return;
+        }
         match self.engine.apply_update_changed(&self.doc, &m.bytes) {
             Ok(true) => {}
             // Nothing new — the usual answer to the server's SyncStep1 from a
@@ -350,6 +364,71 @@ mod tests {
         let h = BoardRoom::spawn(board_id, engine, store, bus, sub)
             .await
             .unwrap();
+        h.shutdown.cancel();
+    }
+
+    /// An update nesting a board's types deeper than a room accepts is
+    /// neither applied nor fanned out (`crate::nesting`); the next one is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn board_room_refuses_a_deeply_nested_update() {
+        use yrs::{Map, MapPrelim, ReadTxn, StateVector, Transact};
+
+        let board_id = Uuid::new_v4();
+        let bus = Arc::new(MemBus::new());
+        let sub = bus.subscribe(board_id).await.unwrap();
+        let store: Arc<dyn knot_storage::BoardStore> = Arc::new(NoopBoardStore);
+        let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
+        let h = BoardRoom::spawn(board_id, engine, store, bus, sub)
+            .await
+            .unwrap();
+        let mut conns = Vec::new();
+        for _ in 0..2 {
+            let conn_id = Uuid::new_v4();
+            let (tx, rx) = mpsc::channel(64);
+            let (reply, joined) = oneshot::channel();
+            h.tx.send(Event::Join {
+                conn_id,
+                handle: ConnHandle { tx },
+                reply,
+            })
+            .await
+            .unwrap();
+            joined.await.unwrap().unwrap();
+            conns.push((conn_id, rx));
+        }
+        let update = |depth: usize| {
+            let doc = yrs::Doc::new();
+            let map = doc.get_or_insert_map("elements");
+            {
+                let mut txn = doc.transact_mut();
+                let mut inner = map.insert(&mut txn, "k", MapPrelim::default());
+                for _ in 1..depth {
+                    inner = inner.insert(&mut txn, "k", MapPrelim::default());
+                }
+            }
+            doc.transact()
+                .encode_state_as_update_v1(&StateVector::default())
+        };
+        let (sender, _) = &conns[0];
+        let sender = *sender;
+        let shallow = update(1);
+        for bytes in [update(crate::nesting::MAX_NESTING + 1), shallow.clone()] {
+            h.tx.send(Event::Inbound(InMsg {
+                from: sender,
+                bytes,
+            }))
+            .await
+            .unwrap();
+        }
+        let fanned = tokio::time::timeout(std::time::Duration::from_secs(10), conns[1].1.recv())
+            .await
+            .expect("the room stopped fanning out")
+            .expect("peer channel closed");
+        assert_eq!(
+            fanned,
+            wrap_sync_update(&shallow),
+            "the refused update was fanned out"
+        );
         h.shutdown.cancel();
     }
 }

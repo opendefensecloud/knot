@@ -1189,6 +1189,12 @@ fn export_classes_name_their_documents() {
 /// byte-identity differential skips classed documents, so a class that also
 /// named a document legacy wrote losslessly would let the writer change that
 /// healthy page's bytes unseen.
+///
+/// `depth_limit` is the one class that names no damage: legacy wrote such a
+/// page in full, and the writer and the importer stop at the depth limit so
+/// that no page can overflow the stack (F1). `export_classes_name_their_
+/// documents` holds its cases on either side of the limit, and
+/// `tests/depth.rs` what it writes past it.
 #[test]
 fn export_classes_name_only_damaged_documents() {
     let import = |md: &str| {
@@ -1210,6 +1216,9 @@ fn export_classes_name_only_damaged_documents() {
         let Some(class) = compat::export_class(&doc) else {
             continue;
         };
+        if class == "depth_limit" {
+            continue;
+        }
         let Some(legacy_md) = compat::healthy(&doc) else {
             continue;
         };

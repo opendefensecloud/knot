@@ -275,9 +275,9 @@ async fn render_and_index(
     seq: i64,
     task_index: TaskIndex,
 ) -> Result<String, RefreshError> {
-    let text = match knot_markdown::serialise_with_report(&YrsEngine, transient) {
-        Ok((md, unknown)) => {
-            record_unknown_nodes(doc_id, &unknown);
+    let text = match knot_markdown::serialise_reporting(&YrsEngine, transient) {
+        Ok((md, report)) => {
+            record_export_report(doc_id, &report);
             md
         }
         Err(e) => return Err(RefreshError::Serialise(format!("{e:?}"))),
@@ -367,6 +367,24 @@ async fn index_tasks(
             tracing::warn!(error=?e, %doc_id, "task reindex failed");
             false
         }
+    }
+}
+
+/// Warns about and counts what a page's export wrote as text where the page
+/// has something else (`serialise_reporting`): the nodes the schema doesn't
+/// name ([`record_unknown_nodes`]), and the containers nested past the
+/// writer's depth limit, each with a warning and a counter of its own.
+fn record_export_report(doc_id: Uuid, report: &knot_markdown::to_markdown::Report) {
+    record_unknown_nodes(doc_id, &report.unknown);
+    if report.depth_limited > 0 {
+        metrics::counter!("knot_markdown_depth_limited_total")
+            .increment(report.depth_limited as u64);
+        tracing::warn!(
+            %doc_id,
+            count = report.depth_limited,
+            limit = knot_markdown::to_markdown::MAX_DEPTH,
+            "markdown export wrote containers nested past the depth limit as text"
+        );
     }
 }
 
@@ -620,5 +638,33 @@ mod tests {
             ["knot_markdown_unknown_nodes_total"]
         );
         assert_eq!(counters.total.0.load(Ordering::Relaxed), 2);
+    }
+
+    /// A page nested past the writer's depth limit counts under a counter
+    /// of its own, not as unknown nodes (F1 review).
+    #[test]
+    fn a_deep_page_counts_its_depth_limit_apart_from_unknown_nodes() {
+        use yrs::{Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+
+        let doc = YrsEngine.new_doc();
+        {
+            let ydoc = doc.inner();
+            let frag = ydoc.get_or_insert_xml_fragment("default");
+            let mut txn = ydoc.transact_mut();
+            let mut quote = frag.push_back(&mut txn, XmlElementPrelim::empty("blockquote"));
+            for _ in 0..knot_markdown::to_markdown::MAX_DEPTH {
+                quote = quote.push_back(&mut txn, XmlElementPrelim::empty("blockquote"));
+            }
+            let p = quote.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new("deep"));
+        }
+        let (_, report) = knot_markdown::serialise_reporting(&YrsEngine, &doc).unwrap();
+        let counters = Counters::default();
+        metrics::with_local_recorder(&counters, || record_export_report(Uuid::nil(), &report));
+        assert_eq!(
+            *counters.names.lock().unwrap(),
+            ["knot_markdown_depth_limited_total"]
+        );
+        assert_eq!(counters.total.0.load(Ordering::Relaxed), 1);
     }
 }

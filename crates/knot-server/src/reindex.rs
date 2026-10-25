@@ -31,8 +31,9 @@
 //! page again on every boot, on every replica. So the sweep records an
 //! attempt before it renders a page (`doc_markdown_sweep_attempts`), clears
 //! it when the render returns, and skips a page the current renderer
-//! started twice without finishing (`SWEEP_ATTEMPTS`). The debug log names
-//! each page before its render.
+//! started twice without finishing (`SWEEP_ATTEMPTS`), until a render of
+//! the page finishes, an edit's too (`put_rendered` clears the attempts).
+//! The debug log names each page before its render.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -68,7 +69,8 @@ pub const SWEEP_LOCK_KEY: i64 = 0x6b6e_6f74_7377_6570;
 /// How many times the sweep starts rendering a page with the current
 /// renderer without the render returning (it panicked, or the process died
 /// during it) before it skips the page. One such render may be a deploy
-/// stopping the process; two are taken to be the page's fault.
+/// stopping the process; two are taken to be the page's fault, until a
+/// render of the page finishes after all.
 const SWEEP_ATTEMPTS: i32 = 2;
 
 /// Spawn the reindex worker. Returns immediately; the worker exits

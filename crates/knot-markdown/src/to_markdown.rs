@@ -8,7 +8,8 @@
 //! - A node the schema doesn't name is written as its text (P4).
 //!   [`serialise_with_report`] names them.
 //! - A container nested [`MAX_DEPTH`] deep is written as its text too, so
-//!   that no page can overflow the stack.
+//!   that no page can overflow the stack. [`serialise_reporting`] counts
+//!   them, apart from the unknown nodes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,8 +28,17 @@ use crate::schema::{MarkKind, mark_serialization};
 /// Per-run formatting attributes: `mark_name → Any value`.
 type RunAttrs = HashMap<Arc<str>, Any>;
 
-/// The tags of the unknown nodes written so far, in document order.
-type Unknown = Vec<String>;
+/// What the writer wrote as text, where the page has something else
+/// ([`serialise_reporting`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// The tags of the nodes the schema doesn't name where they are, written
+    /// as their text, in document order (P4).
+    pub unknown: Vec<String>,
+    /// How many blockquotes, lists and tables nested [`MAX_DEPTH`] deep were
+    /// written as their text.
+    pub depth_limited: usize,
+}
 
 /// How many block containers (blockquotes, list items, table cells) deep the
 /// writer follows a page. A block's depth is the number of containers it
@@ -36,15 +46,14 @@ type Unknown = Vec<String>;
 /// frames per container, and a stack overflow aborts the whole process, so
 /// a blockquote, list or table at this depth or deeper is written as its
 /// text, one paragraph (`capped_text`), as knot-export caps its walk
-/// (`MAX_DEPTH` in `crates/knot-export/src/walk.rs`). No page the editor
-/// makes nests this deep; an import of `>` repeated, or a crafted Yjs
-/// update, can. Every other walk over a page here uses an explicit stack.
-pub const MAX_DEPTH: usize = 128;
-
-/// What [`serialise_with_report`] reports, with the unknown nodes, for each
-/// container it wrote as its text because it nests [`MAX_DEPTH`] deep, as
-/// knot-export reports it.
-pub const DEPTH_LIMIT_TAG: &str = "depth-limit";
+/// (`MAX_DEPTH` in `crates/knot-export/src/walk.rs`). The importer stops at
+/// the same depth ([`crate::from_markdown`]). No page the editor makes nests
+/// this deep; an import of `>` repeated, or a crafted Yjs update, can. Every
+/// other walk over a page here uses an explicit stack.
+///
+/// It is the rooms' limit too (`knot_crdt::nesting::MAX_BLOCK_DEPTH`): a
+/// room refuses an update that nests the page's types four times as deep.
+pub const MAX_DEPTH: usize = knot_crdt::nesting::MAX_BLOCK_DEPTH;
 
 /// Read an XML attribute as a plain `String`.
 ///
@@ -67,31 +76,39 @@ pub enum SerError {
 }
 
 pub fn serialise(engine: &YrsEngine, doc: &DocHandle) -> Result<String, SerError> {
-    serialise_with_report(engine, doc).map(|(md, _)| md)
+    serialise_reporting(engine, doc).map(|(md, _)| md)
 }
 
 /// [`serialise`], with the tags of the nodes it wrote as their text because
-/// the schema doesn't name them there, in document order (P4), and a
-/// [`DEPTH_LIMIT_TAG`] for each container it wrote as its text because it
-/// nests [`MAX_DEPTH`] deep.
+/// the schema doesn't name them there, in document order (P4).
 pub fn serialise_with_report(
-    _engine: &YrsEngine,
+    engine: &YrsEngine,
     doc: &DocHandle,
 ) -> Result<(String, Vec<String>), SerError> {
+    serialise_reporting(engine, doc).map(|(md, report)| (md, report.unknown))
+}
+
+/// [`serialise`], with what it wrote as text where the page has something
+/// else: the nodes the schema doesn't name there, and the containers nested
+/// [`MAX_DEPTH`] deep.
+pub fn serialise_reporting(
+    _engine: &YrsEngine,
+    doc: &DocHandle,
+) -> Result<(String, Report), SerError> {
     let yrs_doc = doc.inner();
     let txn = yrs_doc.transact();
-    let mut unknown = Unknown::new();
+    let mut report = Report::default();
 
     let frag = match txn.get_xml_fragment("default") {
         Some(f) => f,
-        None => return Ok(("\n".to_string(), unknown)),
+        None => return Ok(("\n".to_string(), report)),
     };
 
     let mut buf = String::new();
     let children = written_children(&txn, &frag);
     let len = children.len();
     for (i, child) in children.iter().enumerate() {
-        write_child(&mut buf, &txn, child, 0, &mut unknown)?;
+        write_child(&mut buf, &txn, child, 0, &mut report)?;
         if i + 1 < len {
             buf.push('\n');
         }
@@ -99,7 +116,7 @@ pub fn serialise_with_report(
     if !buf.ends_with('\n') {
         buf.push('\n');
     }
-    Ok((buf, unknown))
+    Ok((buf, report))
 }
 
 /// The blocks of `parent`, a block container, as they are written: its
@@ -132,12 +149,12 @@ fn write_child<T: ReadTxn>(
     txn: &T,
     child: &Child,
     depth: usize,
-    unknown: &mut Unknown,
+    report: &mut Report,
 ) -> Result<(), SerError> {
     match child {
-        Child::Block(el) => write_block(buf, txn, el, depth, unknown),
+        Child::Block(el) => write_block(buf, txn, el, depth, report),
         Child::Para(inlines) => {
-            write_inlines(buf, txn, inlines, true, unknown);
+            write_inlines(buf, txn, inlines, true, report);
             buf.push('\n');
             Ok(())
         }
@@ -153,10 +170,10 @@ fn write_block<T: ReadTxn>(
     txn: &T,
     el: &XmlElementRef,
     depth: usize,
-    unknown: &mut Unknown,
+    report: &mut Report,
 ) -> Result<(), SerError> {
     if too_deep(el, depth) {
-        unknown.push(DEPTH_LIMIT_TAG.to_string());
+        report.depth_limited += 1;
         buf.push_str(&capped_text(txn, el));
         buf.push('\n');
         return Ok(());
@@ -164,7 +181,7 @@ fn write_block<T: ReadTxn>(
     let tag = el.tag().to_string();
     match tag.as_str() {
         "paragraph" => {
-            write_inlines(buf, txn, &children(txn, el), false, unknown);
+            write_inlines(buf, txn, &children(txn, el), false, report);
             buf.push('\n');
         }
         "heading" => {
@@ -176,12 +193,12 @@ fn write_block<T: ReadTxn>(
                 buf.push('#');
             }
             buf.push(' ');
-            write_inlines(buf, txn, &children(txn, el), false, unknown);
+            write_inlines(buf, txn, &children(txn, el), false, report);
             buf.push('\n');
         }
         "blockquote" => {
             let mut lines = Vec::new();
-            write_quote(&mut lines, txn, el, depth, Purpose::Export, unknown)?;
+            write_quote(&mut lines, txn, el, depth, Purpose::Export, report)?;
             write_lines(buf, lines);
         }
         "code_block" => write_code_block(buf, txn, el, "```"),
@@ -219,7 +236,7 @@ fn write_block<T: ReadTxn>(
                     let mut text = String::new();
                     for child in written_children(txn, &cell_el) {
                         let mut inner = String::new();
-                        write_cell_block(&mut inner, txn, &child, depth + 1, unknown)?;
+                        write_cell_block(&mut inner, txn, &child, depth + 1, report)?;
                         let inline = inner.replace('|', "\\|").replace('\n', " ");
                         let inline = inline.trim();
                         if !text.is_empty() && !inline.is_empty() {
@@ -315,12 +332,12 @@ fn write_block<T: ReadTxn>(
         "bullet_list" | "ordered_list" => {
             let mut lines = Vec::new();
             for (item, marker) in list_items(txn, el)? {
-                write_list_item(&mut lines, txn, &item, &marker, depth, unknown)?;
+                write_list_item(&mut lines, txn, &item, &marker, depth, report)?;
             }
             write_lines(buf, lines);
         }
         _ => {
-            unknown.push(tag);
+            report.unknown.push(tag);
             buf.push_str(&flatten_text(txn, el));
             buf.push('\n');
         }
@@ -409,6 +426,16 @@ fn capped_text<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> String {
         .collect();
     let joined = texts.join(" ");
     joined.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The tag of `child`, a block at `depth` of a block container, as it is
+/// written: a run of inline nodes, and a container nested too deep
+/// ([`too_deep`]), are written as a paragraph.
+fn written_tag(child: &Child, depth: usize) -> String {
+    match child {
+        Child::Block(el) if !too_deep(el, depth) => el.tag().to_string(),
+        Child::Block(_) | Child::Para(_) => "paragraph".to_string(),
+    }
 }
 
 /// Whether `el`, a block at `depth`, is a container the writer doesn't
@@ -503,18 +530,18 @@ fn write_cell_block<T: ReadTxn>(
     txn: &T,
     child: &Child,
     depth: usize,
-    unknown: &mut Unknown,
+    report: &mut Report,
 ) -> Result<(), SerError> {
     let Child::Block(el) = child else {
-        return write_child(buf, txn, child, depth, unknown);
+        return write_child(buf, txn, child, depth, report);
     };
     let tag = el.tag().to_string();
     match tag.as_str() {
-        _ if too_deep(el, depth) => write_block(buf, txn, el, depth, unknown)?,
+        _ if too_deep(el, depth) => write_block(buf, txn, el, depth, report)?,
         "blockquote" => {
             for child in written_children(txn, el) {
                 let mut inner = String::new();
-                write_cell_block(&mut inner, txn, &child, depth + 1, unknown)?;
+                write_cell_block(&mut inner, txn, &child, depth + 1, report)?;
                 for line in inner.trim_end_matches('\n').split('\n') {
                     if line.is_empty() {
                         buf.push_str(">\n");
@@ -532,7 +559,7 @@ fn write_cell_block<T: ReadTxn>(
                 let pad = " ".repeat(prefix.chars().count());
                 for (k, child) in written_children(txn, &item).iter().enumerate() {
                     let mut inner = String::new();
-                    write_cell_block(&mut inner, txn, child, depth + 1, unknown)?;
+                    write_cell_block(&mut inner, txn, child, depth + 1, report)?;
                     for (j, line) in inner.trim_end_matches('\n').split('\n').enumerate() {
                         buf.push_str(if k == 0 && j == 0 { &prefix } else { &pad });
                         buf.push_str(line);
@@ -541,7 +568,7 @@ fn write_cell_block<T: ReadTxn>(
                 }
             }
         }
-        _ => write_block(buf, txn, el, depth, unknown)?,
+        _ => write_block(buf, txn, el, depth, report)?,
     }
     Ok(())
 }
@@ -579,7 +606,7 @@ fn write_list_item<T: ReadTxn>(
     item: &XmlElementRef,
     marker: &str,
     depth: usize,
-    unknown: &mut Unknown,
+    report: &mut Report,
 ) -> Result<(), SerError> {
     let children = written_children(txn, item);
     let checkbox = checkbox(item, txn);
@@ -590,7 +617,7 @@ fn write_list_item<T: ReadTxn>(
         children,
         depth + 1,
         Purpose::Export,
-        unknown,
+        report,
     )
 }
 
@@ -604,7 +631,7 @@ fn write_item<T: ReadTxn>(
     mut children: Vec<Child>,
     depth: usize,
     purpose: Purpose,
-    unknown: &mut Unknown,
+    report: &mut Report,
 ) -> Result<(), SerError> {
     let pad = " ".repeat(marker.chars().count());
     if let [Child::Block(first), Child::Block(second), ..] = children.as_slice()
@@ -615,15 +642,17 @@ fn write_item<T: ReadTxn>(
         children.remove(0);
     }
     let mut lines = Vec::new();
-    write_container(&mut lines, txn, &children, false, depth, purpose, unknown)?;
-    // A node the schema doesn't name is written as a paragraph of its text.
-    let first_tag = match children.first() {
-        Some(Child::Block(first)) if BLOCKS.contains(&first.tag().as_ref()) => {
-            Some(first.tag().to_string())
+    write_container(&mut lines, txn, &children, false, depth, purpose, report)?;
+    // A node the schema doesn't name is written as a paragraph of its text,
+    // and so is a container nested too deep.
+    let first_tag = children.first().map(|first| {
+        let tag = written_tag(first, depth);
+        if BLOCKS.contains(&tag.as_str()) {
+            tag
+        } else {
+            "paragraph".to_string()
         }
-        Some(_) => Some("paragraph".to_string()),
-        None => None,
-    };
+    });
     if !matches!(first_tag.as_deref(), Some("paragraph" | "attachment")) {
         let blank_between = matches!(lines.first(), Some(Line::Text { .. }))
             && lines
@@ -699,7 +728,7 @@ pub(crate) fn task_item_markdown<T: ReadTxn>(txn: &T, item: &XmlElementRef) -> S
         children,
         1,
         Purpose::TaskText,
-        &mut Unknown::new(),
+        &mut Report::default(),
     );
     if written.is_err() {
         return "- [ ] \n".to_string();
@@ -736,19 +765,11 @@ fn write_quote<T: ReadTxn>(
     quote: &XmlElementRef,
     depth: usize,
     purpose: Purpose,
-    unknown: &mut Unknown,
+    report: &mut Report,
 ) -> Result<(), SerError> {
     let mut lines = Vec::new();
     let children = written_children(txn, quote);
-    write_container(
-        &mut lines,
-        txn,
-        &children,
-        true,
-        depth + 1,
-        purpose,
-        unknown,
-    )?;
+    write_container(&mut lines, txn, &children, true, depth + 1, purpose, report)?;
     buf.extend(lines.into_iter().map(|line| match line {
         Line::Text { text, open } if !text.is_empty() => Line::Text {
             text: format!("> {text}"),
@@ -817,12 +838,12 @@ fn write_container<T: ReadTxn>(
     in_quote: bool,
     depth: usize,
     purpose: Purpose,
-    unknown: &mut Unknown,
+    report: &mut Report,
 ) -> Result<(), SerError> {
     let task_text = purpose == Purpose::TaskText;
     let mut prev: Option<Block> = None;
     for child in children {
-        let (block, lines) = block_lines(txn, child, depth, purpose, unknown)?;
+        let (block, lines) = block_lines(txn, child, depth, purpose, report)?;
         let goes_on = task_text && block.is_text() && prev.is_some_and(Block::is_text);
         if !goes_on && prev.is_some_and(|prev| prev.needs_blank_line_before(block, in_quote)) {
             buf.push(Line::Blank);
@@ -955,22 +976,17 @@ fn block_lines<T: ReadTxn>(
     child: &Child,
     depth: usize,
     purpose: Purpose,
-    unknown: &mut Unknown,
+    report: &mut Report,
 ) -> Result<(Block, Vec<Line>), SerError> {
-    let tag = match child {
-        // Written as a paragraph of its text.
-        Child::Block(el) if too_deep(el, depth) => "paragraph".to_string(),
-        Child::Block(el) => el.tag().to_string(),
-        Child::Para(_) => "paragraph".to_string(),
-    };
+    let tag = written_tag(child, depth);
     let mut lines = Vec::new();
     match (child, tag.as_str()) {
         (Child::Block(el), "blockquote") => {
-            write_quote(&mut lines, txn, el, depth, purpose, unknown)?;
+            write_quote(&mut lines, txn, el, depth, purpose, report)?;
         }
         (Child::Block(el), "bullet_list" | "ordered_list") => {
             for (item, marker) in list_items(txn, el)? {
-                write_list_item(&mut lines, txn, &item, &marker, depth, unknown)?;
+                write_list_item(&mut lines, txn, &item, &marker, depth, report)?;
             }
         }
         // A line of the code that is a fence would end the block early.
@@ -991,7 +1007,7 @@ fn block_lines<T: ReadTxn>(
         }
         _ => {
             let mut text = String::new();
-            write_child(&mut text, txn, child, depth, unknown)?;
+            write_child(&mut text, txn, child, depth, report)?;
             let code = tag == "code_block";
             let open = !matches!(tag.as_str(), "heading" | "code_block" | "horizontal_rule");
             for line in text.trim_end_matches('\n').split('\n') {
@@ -1165,10 +1181,10 @@ fn write_inlines<T: ReadTxn>(
     txn: &T,
     inlines: &[XmlOut],
     repaired: bool,
-    unknown: &mut Unknown,
+    report: &mut Report,
 ) {
     let mut pieces = Vec::new();
-    inline_pieces(txn, inlines, repaired, unknown, &mut pieces);
+    inline_pieces(txn, inlines, repaired, report, &mut pieces);
     if repaired {
         let is_text = |piece: &Piece| matches!(piece, Piece::Text(text, _) if !text.is_empty());
         let first = pieces.iter().position(is_text).unwrap_or(pieces.len());
@@ -1196,7 +1212,7 @@ fn inline_pieces<T: ReadTxn>(
     txn: &T,
     inlines: &[XmlOut],
     merge: bool,
-    unknown: &mut Unknown,
+    report: &mut Report,
     out: &mut Vec<Piece>,
 ) {
     let push = |out: &mut Vec<Piece>, text: String, marks: Marks| match out.last_mut() {
@@ -1216,7 +1232,7 @@ fn inline_pieces<T: ReadTxn>(
             }
             XmlOut::Element(el) if el.tag().as_ref() == "hard_break" => out.push(Piece::Break),
             XmlOut::Element(el) => {
-                unknown.push(el.tag().to_string());
+                report.unknown.push(el.tag().to_string());
                 push(out, flatten_text(txn, &el), Marks::default());
             }
             XmlOut::Fragment(f) => {

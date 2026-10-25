@@ -31,6 +31,14 @@
 //! The report lists every page of each outcome but `unchanged` and
 //! `no_tasks`.
 //!
+//! It also lists, without failing on them, the pages nested deeper than
+//! this release follows: those whose export writes a blockquote, list or
+//! table past the writer's depth limit as text, and those whose types nest
+//! past the rooms' limit (`knot_crdt::nesting::MAX_NESTING`). Rooms refuse
+//! edits that nest a page that deep, and the importer stops at the depth
+//! limit, but a page stored before is as it is: deleting its deep part (an
+//! edit, a replace, a restore) can overflow the server's stack.
+//!
 //! It also reports the sort-key groups the heal migration would rewrite
 //! (P7), how many pages the refresh sweep would render again (P17), and
 //! how many pages have a parent in another workspace, which the upgrade
@@ -170,6 +178,13 @@ pub struct CompatReport {
     pub not_fixed_point: Vec<Uuid>,
     /// How the first of those changes when imported and exported again.
     pub first_not_fixed_point: Option<String>,
+    /// The pages whose export writes a blockquote, list or table nested past
+    /// the writer's depth limit as text, in id order. Reported only.
+    pub past_depth_limit: Vec<Uuid>,
+    /// The pages whose types nest deeper than a room accepts, in id order.
+    /// Reported only: rooms refuse edits that nest a page that deep, but
+    /// deleting the deep part of one stored before can overflow the stack.
+    pub past_nesting_limit: Vec<Uuid>,
 }
 
 impl CompatReport {
@@ -313,6 +328,14 @@ async fn compat_report_with(pool: &PgPool, serialise: Export) -> CompatReport {
                 let exported = guarded(|| export_outcome(&doc, serialise), ExportCheck::panicked);
                 let listed = guarded(|| task_outcome(&doc), |why| (PANICKED, Some(why)));
                 report.add_page(id, exported, listed);
+                let (past_depth_limit, past_nesting_limit) =
+                    guarded(|| depth(&doc), |_| (false, false));
+                if past_depth_limit {
+                    report.past_depth_limit.push(id);
+                }
+                if past_nesting_limit {
+                    report.past_nesting_limit.push(id);
+                }
             }
             Err(e) => {
                 let why = format!("{e:#}");
@@ -333,6 +356,17 @@ async fn compat_report_with(pool: &PgPool, serialise: Export) -> CompatReport {
         report.cross_workspace_examples,
     ) = cross_workspace_parents(pool).await;
     report
+}
+
+/// Whether `doc`'s export writes a container nested past the writer's depth
+/// limit as text, and whether its types nest past the rooms' limit. Both
+/// read the page with an explicit stack.
+fn depth(doc: &DocHandle) -> (bool, bool) {
+    let past_depth_limit = knot_markdown::serialise_reporting(&YrsEngine, doc)
+        .is_ok_and(|(_, report)| report.depth_limited > 0);
+    let past_nesting_limit =
+        knot_crdt::nesting::nests_deeper_than(doc, knot_crdt::nesting::MAX_NESTING);
+    (past_depth_limit, past_nesting_limit)
 }
 
 /// What `check` returns, or, when it panics, what `panicked` makes of the
@@ -680,6 +714,29 @@ impl fmt::Display for CompatReport {
         }
         for id in &self.not_fixed_point {
             writeln!(f, "  page {id}")?;
+        }
+
+        writeln!(
+            f,
+            "\nDeep pages (reported only; the check doesn't fail on them):\n  {} pages \
+             nest a blockquote, list or table past the writer's depth limit ({} \
+             containers), which their export writes as text",
+            self.past_depth_limit.len(),
+            knot_markdown::to_markdown::MAX_DEPTH
+        )?;
+        for id in &self.past_depth_limit {
+            writeln!(f, "    page {id}")?;
+        }
+        writeln!(
+            f,
+            "  {} pages nest their types past the rooms' limit ({}): rooms refuse edits \
+             that nest a page that deep, but deleting the deep part of these (an edit, a \
+             replace, a restore) can overflow the server's stack",
+            self.past_nesting_limit.len(),
+            knot_crdt::nesting::MAX_NESTING
+        )?;
+        for id in &self.past_nesting_limit {
+            writeln!(f, "    page {id}")?;
         }
 
         let rows: i64 = self.sort_key_groups.iter().map(|g| g.rows).sum();
@@ -1469,34 +1526,56 @@ async fn a_classed_task_is_counted_under_its_class() {
     assert_eq!(report.violations(), 0);
 }
 
-/// A page nested far deeper than the editor makes one, as an import of `>`
-/// repeated stores it, is checked without legacy: legacy, and the classes
-/// after `depth_limit`, recurse once per element, and a stack overflow
-/// would abort the check without a report. Its export and its listing count
-/// under `depth_limit`; its export keeps its text, so the check passes.
+/// A page nested far deeper than the editor makes one, as the importer
+/// stored an import of `>` repeated before this release, is checked without
+/// legacy: legacy, and the classes after `depth_limit`, recurse once per
+/// element, and a stack overflow would abort the check without a report.
+/// Its export and its listing count under `depth_limit`; its export keeps
+/// its text, so the check passes. The report lists it among the pages past
+/// the writer's depth limit and past the rooms' limit (F1 review), and a
+/// page just past the depth limit among the first only.
 #[tokio::test]
 async fn real_data_compat_reads_a_deeply_nested_page() {
     let db = knot_test_support::fresh_db().await;
     let seed = Seed::new(&db.pool).await;
-    let (deep, _) =
-        knot_markdown::from_markdown::parse(&format!("{} x\n", ">".repeat(100_000))).unwrap();
+    let quotes = |n: usize| {
+        let (doc, _) = knot_markdown::legacy::parse(&format!("{} x\n", ">".repeat(n))).unwrap();
+        doc
+    };
     let (healthy, _) = knot_markdown::from_markdown::parse(HEALTHY).unwrap();
-    let deep_id = seed.page(None, "a", Some(&deep)).await;
-    seed.page(None, "b", Some(&healthy)).await;
+    let max = knot_markdown::to_markdown::MAX_DEPTH;
+    let mut ids = [
+        seed.page(None, "a", Some(&quotes(100_000))).await,
+        seed.page(None, "b", Some(&quotes(max + 1))).await,
+    ];
+    let [deep_id, just_past_id] = ids;
+    // Within the limits: the importer's own page of `>` repeated.
+    let (capped, _) =
+        knot_markdown::from_markdown::parse(&format!("{} x\n", ">".repeat(100_000))).unwrap();
+    seed.page(None, "c", Some(&capped)).await;
+    seed.page(None, "d", Some(&healthy)).await;
 
     let report = compat_report(&read_only_pool(&db.url).await).await;
     println!("{report}");
     assert_eq!(
         report.export.counts(),
-        &BTreeMap::from([(UNCHANGED, 1), ("depth_limit", 1)])
+        &BTreeMap::from([(UNCHANGED, 1), ("depth_limit", 3)])
     );
     assert_eq!(
         report.tasks.counts(),
-        &BTreeMap::from([(UNCHANGED, 1), (DEPTH_LIMIT, 1)])
+        &BTreeMap::from([(UNCHANGED, 1), (DEPTH_LIMIT, 3)])
     );
-    assert_eq!(report.export.pages("depth_limit"), [deep_id]);
+    assert!(report.export.pages("depth_limit").contains(&deep_id));
     assert!(report.not_fixed_point.is_empty());
     assert_eq!(report.violations(), 0);
+
+    ids.sort();
+    assert_eq!(report.past_depth_limit, ids);
+    assert_eq!(report.past_nesting_limit, [deep_id]);
+    let shown = report.to_string();
+    for id in [deep_id, just_past_id] {
+        assert!(shown.contains(&format!("    page {id}")), "{shown}");
+    }
 }
 
 /// A page in an export class: a task with a nested checklist.

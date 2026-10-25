@@ -58,6 +58,10 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         "knot_room_updates_total",
         "CRDT updates applied to rooms, by source (local|peer)"
     );
+    describe_counter!(
+        "knot_room_updates_refused_total",
+        "Inbound CRDT updates a page or board room refused, unapplied, because they would nest the document's types deeper than the room accepts (knot_crdt::nesting::MAX_NESTING)"
+    );
     describe_counter!("knot_room_snapshots_total", "Snapshots written to storage");
     describe_histogram!(
         "knot_room_hydrate_seconds",
@@ -89,6 +93,10 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     describe_counter!(
         "knot_markdown_unknown_nodes_total",
         "Nodes the schema doesn't name that a page's Markdown export (cache, search, tasks, GET markdown) wrote as their text"
+    );
+    describe_counter!(
+        "knot_markdown_depth_limited_total",
+        "Blockquotes, lists and tables nested past the Markdown writer's depth limit (128 block containers) that a page's Markdown export (cache, search, tasks, GET markdown) wrote as their text"
     );
 
     // Storage / pool

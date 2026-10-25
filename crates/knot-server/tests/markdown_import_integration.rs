@@ -816,32 +816,120 @@ async fn from_template_heals_a_damaged_template() {
     assert_schema_valid(&stored_doc(&f.pool, new_id).await);
 }
 
+/// `>` repeated 100,000 times: a page nested far deeper than the editor
+/// makes one, which any editor can import.
+fn deep_markdown() -> String {
+    format!("{} x\n", ">".repeat(100_000))
+}
+
+/// What the export of [`deep_markdown`]'s import is: the quotes the importer
+/// and the writer follow (`to_markdown::MAX_DEPTH`), the innermost holding
+/// the text.
+fn degraded() -> String {
+    format!("{}x\n", "> ".repeat(knot_markdown::to_markdown::MAX_DEPTH))
+}
+
 /// A page nested far deeper than the editor makes one: `>` repeated 100,000
-/// times, which any editor can import. The refresh after the import renders
-/// it, and a writer that recursed once per quote overflowed the stack, which
-/// aborts the whole server (final review md-1). The import succeeds, and the
-/// server goes on serving the page: the export writes the quotes the writer
-/// follows (`to_markdown::MAX_DEPTH`) and the rest as its text, and the page
-/// takes more content.
+/// times. The refresh after the import renders it, and a writer that
+/// recursed once per quote overflowed the stack, which aborts the whole
+/// server (final review md-1). Replacing the page, as the doc page's import
+/// does, deleted the 100,000 nested quotes, and yrs recursed once per quote
+/// there too (F1 review). The importer stores only the quotes the writer
+/// follows, so the import succeeds, and the server goes on serving the page.
 #[tokio::test(flavor = "multi_thread")]
 async fn deeply_nested_import_keeps_the_server_serving() {
     let f = fixture().await;
     let (sid, csrf) = login(&f.app, "alice@example.com").await;
-    let deep = format!("{} x\n", ">".repeat(100_000));
 
-    let status = import(&f.app, &sid, &csrf, f.doc_id, None, deep).await;
+    let status = import(&f.app, &sid, &csrf, f.doc_id, None, deep_markdown()).await;
     assert!(status.is_success(), "import answered {status}");
+    assert_eq!(export(&f.app, &sid, &csrf, f.doc_id).await, degraded());
 
-    let degraded = format!("{}x\n", "> ".repeat(knot_markdown::to_markdown::MAX_DEPTH));
-    assert_eq!(export(&f.app, &sid, &csrf, f.doc_id).await, degraded);
-    // Append merges the two, in an order of Yjs's choosing.
     assert_eq!(
-        import(&f.app, &sid, &csrf, f.doc_id, None, "# After\n").await,
+        import(&f.app, &sid, &csrf, f.doc_id, Some("replace"), "# After\n").await,
         StatusCode::NO_CONTENT
     );
-    let both = export(&f.app, &sid, &csrf, f.doc_id).await;
-    assert!(
-        both.contains(&degraded) && both.contains("# After\n"),
-        "{both:?}"
+    assert_eq!(export(&f.app, &sid, &csrf, f.doc_id).await, "# After\n");
+}
+
+/// The doc page's import of a deeply nested page, twice: the second replaces
+/// what the first stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn deeply_nested_import_replaced_twice_keeps_the_server_serving() {
+    let f = fixture().await;
+    let (sid, csrf) = login(&f.app, "alice@example.com").await;
+
+    for _ in 0..2 {
+        assert_eq!(
+            import(
+                &f.app,
+                &sid,
+                &csrf,
+                f.doc_id,
+                Some("replace"),
+                deep_markdown()
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(export(&f.app, &sid, &csrf, f.doc_id).await, degraded());
+    }
+    let stored = stored_doc(&f.pool, f.doc_id).await;
+    assert!(!knot_crdt::nesting::nests_deeper_than(
+        &stored,
+        knot_crdt::nesting::MAX_NESTING
+    ));
+}
+
+/// A history version of a deeply nested import, restored over the page
+/// while it holds such an import: the restore replaces it.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_restore_of_a_deeply_nested_version_keeps_the_server_serving() {
+    let f = fixture().await;
+    let (sid, csrf) = login(&f.app, "alice@example.com").await;
+
+    assert_eq!(
+        import(
+            &f.app,
+            &sid,
+            &csrf,
+            f.doc_id,
+            Some("replace"),
+            deep_markdown()
+        )
+        .await,
+        StatusCode::NO_CONTENT
     );
+    // The version, as the room snapshots the page after the import. It goes
+    // in once the room runs, so the room never loads it as its base state.
+    let (version, _) = knot_markdown::from_markdown::parse(&deep_markdown()).unwrap();
+    let state_bytes = YrsEngine.encode_state_as_update(&version, None).unwrap();
+    let state_vector = YrsEngine.encode_state_vector(&version).unwrap();
+    PgSnapshotStore::new(f.pool.clone())
+        .insert(f.doc_id, 1, &state_bytes, &state_vector)
+        .await
+        .unwrap();
+
+    let (status, body) = post_raw(
+        &f.app,
+        &sid,
+        &csrf,
+        &format!("/api/docs/{}/history/1/restore", f.doc_id),
+        "application/json",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "restore: {}",
+        String::from_utf8_lossy(&body)
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(export(&f.app, &sid, &csrf, f.doc_id).await, degraded());
+    assert_eq!(
+        import(&f.app, &sid, &csrf, f.doc_id, Some("replace"), "# After\n").await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(export(&f.app, &sid, &csrf, f.doc_id).await, "# After\n");
 }
