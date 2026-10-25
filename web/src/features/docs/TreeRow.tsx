@@ -1,7 +1,7 @@
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
 import { ChevronRight, FileText, MoreHorizontal, Plus } from "lucide-react";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
 import { ContextMenu, type ContextMenuItem } from "../../components/ContextMenu";
@@ -15,6 +15,8 @@ import {
   INDENT,
   rowDescription,
   type FlatRow,
+  type keyboardMove,
+  type MoveArgs,
   type Projection,
   type TreeNode,
   type Zone,
@@ -22,6 +24,25 @@ import {
 
 /** The row the pointer is over, the part of it, and where a drop puts the page. */
 export type Drop = { overId: string; zone: Zone; projection: Projection };
+
+/** A move by the row menu or by Alt+arrow. */
+export type MoveCmd = Parameters<typeof keyboardMove>[3];
+
+/** The row menu's move items, in menu order. */
+const MOVE_ITEMS: { cmd: MoveCmd; label: string; testId: string }[] = [
+  { cmd: "up", label: "Move up", testId: "ctx-move-up" },
+  { cmd: "down", label: "Move down", testId: "ctx-move-down" },
+  { cmd: "indent", label: "Indent", testId: "ctx-indent" },
+  { cmd: "outdent", label: "Outdent", testId: "ctx-outdent" },
+];
+
+/** The move each arrow key makes with Alt held. */
+const ALT_ARROWS: Partial<Record<string, MoveCmd>> = {
+  ArrowUp: "up",
+  ArrowDown: "down",
+  ArrowRight: "indent",
+  ArrowLeft: "outdent",
+};
 
 /** What every row of the sidebar tree shares. */
 export type TreeState = {
@@ -38,6 +59,10 @@ export type TreeState = {
   /** The page being dragged. Its subtree isn't rendered meanwhile. */
   draggingId: string | null;
   drop: Drop | null;
+  /** Where a menu or Alt+arrow move would put the page, or null when it can't move that way. */
+  planMove: (id: string, cmd: MoveCmd) => MoveArgs | null;
+  /** Makes a menu or Alt+arrow move. */
+  onMove: (id: string, cmd: MoveCmd) => void;
 };
 
 export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; tree: TreeState }) {
@@ -45,7 +70,9 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
   const nav = useNavigate();
   const notify = useUi((s) => s.notify);
   const { canEdit, isOwner } = tree;
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  // Opened from the keyboard, the menu gives focus back to the link when it closes.
+  const [menu, setMenu] = useState<{ x: number; y: number; byKeyboard?: boolean } | null>(null);
+  const linkRef = useRef<HTMLAnchorElement | null>(null);
 
   const { attributes, listeners, setNodeRef: setDragNode, isDragging } = useDraggable({
     id: node.id,
@@ -102,6 +129,15 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
   const items: ContextMenuItem[] = [];
   if (canEdit) {
     items.push({ label: "Rename", testId: "ctx-rename", onSelect: () => void onRename() });
+    for (const m of MOVE_ITEMS) {
+      items.push({
+        label: m.label,
+        testId: m.testId,
+        // Worked out only while the menu shows: it walks the whole tree.
+        disabled: menu !== null && tree.planMove(node.id, m.cmd) === null,
+        onSelect: () => tree.onMove(node.id, m.cmd),
+      });
+    }
   }
   if (isOwner) {
     items.push({
@@ -167,6 +203,7 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
         )}
         <FileText size={14} aria-hidden className="text-fg-muted shrink-0" />
         <Link
+          ref={linkRef}
           data-testid={`doc-row-${node.id}`}
           to={`/doc/${node.id}`}
           // Viewers can't move pages, so they don't hear how to drag one.
@@ -175,6 +212,23 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
             e.preventDefault();
             if (items.length === 0) return;
             setMenu({ x: e.clientX, y: e.clientY });
+          }}
+          onKeyDown={(e) => {
+            const cmd = ALT_ARROWS[e.key];
+            const altOnly = e.altKey && !e.shiftKey && !e.ctrlKey && !e.metaKey;
+            const shiftOnly = e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey;
+            if (cmd && canEdit && altOnly) {
+              // Cancelled even when the page can't move that way: Alt+← and
+              // Alt+→ are Back and Forward in Windows and Linux browsers.
+              e.preventDefault();
+              tree.onMove(node.id, cmd);
+            } else if ((e.key === "F10" && shiftOnly) || e.key === "ContextMenu") {
+              // The keyboard's way to the row menu, which opens below the link.
+              e.preventDefault();
+              if (items.length === 0) return;
+              const r = e.currentTarget.getBoundingClientRect();
+              setMenu({ x: r.left, y: r.bottom, byKeyboard: true });
+            }
           }}
           className="flex-1 min-w-0 truncate text-[13px] no-underline text-inherit py-1"
         >
@@ -209,7 +263,15 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
         )}
       </div>
       {menu && (
-        <ContextMenu x={menu.x} y={menu.y} items={items} onClose={() => setMenu(null)} />
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          items={items}
+          onClose={() => {
+            setMenu(null);
+            if (menu.byKeyboard) linkRef.current?.focus();
+          }}
+        />
       )}
       {/* While this page is dragged its subtree is unmounted, not hidden,
           so no row of it can become a drop target. */}

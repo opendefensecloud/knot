@@ -37,12 +37,13 @@ import {
   describeMove,
   dropZone,
   flattenVisible,
+  keyboardMove,
   projectDrop,
   INDENT,
   type FlatRow,
   type MoveArgs,
 } from "./tree";
-import { TreeRow, type Drop, type TreeState } from "./TreeRow";
+import { TreeRow, type Drop, type MoveCmd, type TreeState } from "./TreeRow";
 
 const SCREEN_READER_INSTRUCTIONS = {
   draggable: "Drag to move. Use the row menu or Alt with the arrow keys to move by keyboard.",
@@ -95,7 +96,12 @@ export function DocTree() {
   });
 
   const move = useMutation({
-    mutationFn: async (a: { id: string; body: MoveArgs }) => docsApi.move(a.id, a.body),
+    mutationFn: async (a: { id: string; body: MoveArgs }) => {
+      const r = await docsApi.move(a.id, a.body);
+      // Thrown, so a refused move (409, 422) is rolled back like a failed request.
+      if ("error" in r) throw new Error(r.error.code);
+      return r.ok;
+    },
     onMutate: async (a) => {
       await qc.cancelQueries({ queryKey: ["docs"] });
       const prev = qc.getQueryData<{ ok: Doc[] } | { error: ApiError }>(["docs"]);
@@ -182,6 +188,33 @@ export function DocTree() {
   const [clicks] = useState(clickSwallower);
   useEffect(() => () => clicks.release(), [clicks]);
 
+  // What the last menu or Alt+arrow move did, for the live region.
+  const [moveSaid, setMoveSaid] = useState("");
+  // The page a menu or Alt+arrow move keeps focus on, until the move and the
+  // refetch after it have rendered. Focus is lost when the menu the move came
+  // from closes, and when the page's row remounts, its link with it: under
+  // another parent, or back under the old one when the move fails.
+  const refocus = useRef<string | null>(null);
+
+  function moveBy(id: string, cmd: MoveCmd) {
+    const args = keyboardMove(flat, docs, id, cmd);
+    if (!args) return;
+    // Indenting into a collapsed page opens it: the page stays in view, with focus.
+    if (args.parent_id !== null && collapsed.has(args.parent_id)) toggle(args.parent_id);
+    setMoveSaid(describeMove(flat, id, args));
+    refocus.current = id;
+    move.mutate({ id, body: args });
+  }
+
+  useEffect(() => {
+    const id = refocus.current;
+    if (id === null) return;
+    // Only focus that was lost: never take it from where the user put it.
+    const lost = document.activeElement === null || document.activeElement === document.body;
+    if (lost) rowLink(treeRef.current, id)?.focus();
+    if (!move.isPending && !list.isFetching) refocus.current = null;
+  });
+
   function endDrag() {
     hitRef.current = null;
     showDrop(null);
@@ -223,6 +256,8 @@ export function DocTree() {
     onNewChild: (pid) => create.mutate(pid),
     draggingId,
     drop,
+    planMove: (id, cmd) => keyboardMove(flat, docs, id, cmd),
+    onMove: moveBy,
   };
   const dragged = draggingId === null ? undefined : rows.get(draggingId);
 
@@ -294,6 +329,9 @@ export function DocTree() {
           </DragOverlay>
         </DndContext>
       )}
+      <div data-testid="tree-live" role="status" aria-live="polite" className="sr-only">
+        {moveSaid}
+      </div>
       <SidebarVersion />
       {pickerOpen && (
         <NewDocPicker
@@ -370,6 +408,11 @@ function rowAtPointer({
   // Above the list, `best` is the first row: its height is the band's.
   if (!best || p.y < area.top - best.rect.height) return null;
   return { id: best.id, rect: best.rect, pointerY: p.y };
+}
+
+/** A page's row link in the tree, found by the page's id. */
+function rowLink(tree: HTMLElement | null, id: string): HTMLElement | null {
+  return tree?.querySelector<HTMLElement>(`[data-testid="doc-row-${id}"]`) ?? null;
 }
 
 function sameDrop(a: Drop | null, b: Drop | null): boolean {
