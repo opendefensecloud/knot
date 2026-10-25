@@ -297,7 +297,11 @@ Image and HTML were missed.
   - It rewrites only (workspace_id, parent_id) groups that contain an invalid
     key (empty, outside `[0-9a-z]`, trailing `'0'`), a duplicate, or a key
     over 64 characters.
-  - It preserves the order `sort_key COLLATE "C", created_at, id`.
+  - It preserves the order `sort_key COLLATE "C", parent_id NULLS FIRST,
+    created_at, id`: the sidebar's own order, which lists top-level pages
+    before template children on a key tie. `parent_id` is the same within a
+    group, so it only decides between the groups of a root list. (Amended in
+    Task 9; this first read `sort_key COLLATE "C", created_at, id`.)
   - Archived rows are included. It is idempotent and a no-op on healthy data.
   - Then it swaps the constraint to `UNIQUE NULLS NOT DISTINCT (workspace_id,
     parent_id, sort_key)`.
@@ -462,8 +466,15 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
    **same final position** as before. The unit table compares resulting
    orders, not request bodies.
    - "Into" still appends as the last child.
-   - The one intentional change: the gap directly under an expanded parent now
-     means "first child". It wasn't reachable before.
+   - Two intentional changes:
+     - the gap directly under an expanded parent now means "first child". It
+       wasn't reachable before;
+     - a child dropped on the bottom gap of the next top-level page, without
+       moving left, now nests under that page: the drop depth follows the
+       pointer's x, and the drop line shows it before release. On main the
+       same release put it at the top level after that page, reached only by
+       luck of mouse speed (C.1). Moving one level left puts it there now.
+       (Ratified in Task 15.)
 6. **Existing suites stay green unchanged:** all Rust, web and e2e tests. Any
    change to an existing test must be justified in the PR as a bug the old
    test encoded.

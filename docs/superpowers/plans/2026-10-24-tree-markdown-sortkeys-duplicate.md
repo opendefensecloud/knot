@@ -101,6 +101,7 @@
   - `crates/knot-storage/src/lexorank.rs` in-module tests: mechanical `.unwrap()` on `between` results (Task 8). `is_base36` may be replaced by `is_valid`.
   - `docs_integration.rs` `move_with_unknown_anchor_falls_to_end`: asserts `422 doc.bad_anchor` (Task 10).
   - `e2e/flows/tree-reorder.spec.ts` is rewritten, and `e2e/flows/tree-dnd.spec.ts` deleted (Task 15). They encoded the bug: a teleported pointer, and "no toast" as the only check.
+  - `e2e/flows/sidebar-resize.spec.ts` (Task 13, amended during execution): `:215` waits for `[data-testid^='tree-row-']` instead of `li[role='button']`, which Task 13 removes (C.7), and `:227`'s target selector gains `[data-testid^='tree-row-']`, so the row div, still a drag target, keeps counting for the WCAG 2.5.8 clearance check. The test encoded the `role="button"` misuse. The comment at `DocTree.archive.test.tsx:113` is reworded only (it no longer names a dnd-kit sortable or keyboard sensor).
   - These insert duplicate top-level keys and switch to distinct keys (Task 9):
     - `knot-storage/tests/documents.rs` `templates_flow_set_and_list`;
     - `shares_integration.rs` `cross_doc_revoke_returns_404_and_token_stays_valid` and `public_board_svg_404_for_cross_doc_board`;
@@ -116,7 +117,7 @@
     4. `ADD CONSTRAINT documents_sort_key_unique UNIQUE NULLS NOT DISTINCT (workspace_id, parent_id, sort_key) DEFERRABLE INITIALLY IMMEDIATE`.
   - Its helper is `CREATE OR REPLACE FUNCTION pg_temp.knot_spread_key(...)`. It is always called qualified, and dropped at the end, so re-running the file is a no-op.
   - **What users see:** the sidebar re-sorts siblings on the client by code-unit comparison (`web/src/features/docs/tree.ts:40-42`), which is `COLLATE "C"` order.
-  - **The heal** ranks rows by `sort_key COLLATE "C", created_at, id`, which is exactly the order users see. A group is healed when any key is invalid, duplicated, or longer than 64 characters.
+  - **The heal** ranks rows by `sort_key COLLATE "C", parent_id NULLS FIRST, created_at, id`, which is exactly the order users see: `list_alive` orders `parent_id NULLS FIRST`, so the sidebar lists top-level pages before template children, and `buildTree`'s stable sort by key keeps that order on a key tie. `parent_id` is the same within a group, so it only decides between the groups of a root list. (Amended in Task 9 from `sort_key COLLATE "C", created_at, id`; Task 7's real-data `SELECT` uses the same order.) A group is healed when any key is invalid, duplicated, or longer than 64 characters.
   - **Root list.** The sidebar shows the children of templates at the root, sorted together with the top-level pages (`buildTree`, `tree.ts:9-17`).
     - The heal treats each workspace's root list as one unit. The root list is the rows with `parent_id IS NULL` plus the rows whose parent is a template, archived ones included.
     - If any group in it needs healing, the whole root list is respread in one combined C order, so the rendered order is kept. Each group stays unique because all combined keys are distinct.
@@ -156,6 +157,7 @@
   - `onContextMenu` on the Link;
   - `data-testid="doc-row-<id>"` on the Link of real rows only, never on the drag ghost or any other element.
   - New row containers use `data-testid="tree-row-<id>"`. Existing specs count `[data-testid^='doc-row-']`.
+  - Missed here and amended during execution (Task 13): `e2e/flows/sidebar-resize.spec.ts` waited for `li[role='button']` rows and measured them as drag targets. It now selects `[data-testid^='tree-row-']` (see P6).
 - **P14. Duplicate remap** lives in `knot-markdown` (`pub mod remap`). It rewrites:
   - element attributes `board_id`, `src` and `url`;
   - link-mark hrefs (`knot://doc/<id>`, `/api/blobs/<id>`) through `XmlText::diff` plus `format` (`use yrs::Text`).
