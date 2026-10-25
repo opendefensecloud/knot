@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use s3::Bucket;
 use s3::Region;
 use s3::creds::Credentials;
+use s3::error::S3Error;
 use uuid::Uuid;
 
 use super::{BlobStore, BlobStoreError, Result};
@@ -74,22 +75,63 @@ impl S3Store {
     }
 
     /// The size of the object at `key` (`None` when the store doesn't say),
-    /// read with `HeadObject`. `NotFound` when there is no such object.
+    /// read with `HeadObject`. `NotFound` only for a 404 (see `head_size`).
     async fn size(&self, key: &str) -> Result<Option<i64>> {
-        let (head, status) = self.bucket.head_object(key).await.map_err(|e| {
-            if format!("{e}").contains("404") {
-                BlobStoreError::NotFound
-            } else {
-                BlobStoreError::Backend(format!("s3 head {key}: {e}"))
-            }
-        })?;
-        match status {
-            200..=299 => Ok(head.content_length),
-            404 => Err(BlobStoreError::NotFound),
-            status => Err(BlobStoreError::Backend(format!(
-                "s3 head {key}: status {status}"
-            ))),
-        }
+        let head = self.bucket.head_object(key).await;
+        head_size(
+            key,
+            head.map(|(head, status)| (head.content_length, status)),
+        )
+    }
+}
+
+/// What a `HeadObject` of `key` answered: its `Content-Length` and status,
+/// or a request that failed.
+///
+/// Only a 404 status means the object is missing. Without rust-s3's
+/// `fail-on-err` feature (off here), every status arrives as `Ok`, so an
+/// `Err` is a transport or signing failure. Its text holds the URL, whose
+/// key can contain "404", so it is never read as `NotFound`.
+fn head_size(
+    key: &str,
+    head: std::result::Result<(Option<i64>, u16), S3Error>,
+) -> Result<Option<i64>> {
+    let (size, status) =
+        head.map_err(|e| BlobStoreError::Backend(format!("s3 head {key}: {e}")))?;
+    match status {
+        200..=299 => Ok(size),
+        404 => Err(BlobStoreError::NotFound),
+        status => Err(BlobStoreError::Backend(format!(
+            "s3 head {key}: status {status}"
+        ))),
+    }
+}
+
+/// Whether the copy of `from` (`size` bytes, by its HEAD) arrived at `to`,
+/// given the HEAD of `to`. Only two sizes that are known and equal count:
+/// without them, a failed copy can't be told from a good one.
+fn copied(from: &str, to: &str, size: Option<i64>, head: Result<Option<i64>>) -> Result<()> {
+    match (size, head) {
+        (Some(size), Ok(Some(copied))) if copied == size => Ok(()),
+        (_, Err(BlobStoreError::NotFound)) => Err(BlobStoreError::Backend(format!(
+            "s3 copy {from} to {to}: no object after the copy"
+        ))),
+        (_, Err(e)) => Err(e),
+        (size, Ok(copied)) => Err(BlobStoreError::Backend(format!(
+            "s3 copy {from} to {to}: {copied:?} bytes, expected {size:?}"
+        ))),
+    }
+}
+
+/// What a `DeleteObject` status means. A 404 is fine: the object is gone
+/// either way. Anything else that isn't 2xx (a 403, a 5xx) is a refusal, so
+/// the caller keeps its record of the object and tries again later.
+fn deleted(key: &str, status: u16) -> Result<()> {
+    match status {
+        200..=299 | 404 => Ok(()),
+        status => Err(BlobStoreError::Backend(format!(
+            "s3 delete {key}: status {status}"
+        ))),
     }
 }
 
@@ -125,17 +167,18 @@ impl BlobStore for S3Store {
 
     async fn delete(&self, id: Uuid) -> Result<()> {
         let key = self.key(id);
-        self.bucket
+        let resp = self
+            .bucket
             .delete_object(&key)
             .await
             .map_err(|e| BlobStoreError::Backend(format!("s3 delete {key}: {e}")))?;
-        Ok(())
+        deleted(&key, resp.status_code())
     }
 
     /// A server-side `CopyObject`, so the bytes never pass through knot.
     /// The content type travels with the object. CopyObject can answer 200
-    /// with an error in its body, so the copy only counts once `dst` exists
-    /// with the size of `src`.
+    /// with an error in its body, so the copy only counts once the HEADs of
+    /// `src` and `dst` report the same size (`copied`).
     async fn copy(&self, src: Uuid, dst: Uuid, _content_type: &str) -> Result<()> {
         let (from, to) = (self.key(src), self.key(dst));
         let size = self.size(&from).await?;
@@ -149,19 +192,78 @@ impl BlobStore for S3Store {
                 "s3 copy {from} to {to}: status {status}"
             )));
         }
-        let copied = match self.size(&to).await {
-            Err(BlobStoreError::NotFound) => {
-                return Err(BlobStoreError::Backend(format!(
-                    "s3 copy {from} to {to}: no object after the copy"
-                )));
-            }
-            copied => copied?,
-        };
-        if copied != size {
-            return Err(BlobStoreError::Backend(format!(
-                "s3 copy {from} to {to}: {copied:?} bytes, expected {size:?}"
-            )));
+        copied(&from, &to, size, self.size(&to).await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "knot/bf404a1e-0c4d-4b1e-9f3a-2d6e8c7b5a40";
+
+    fn is_backend<T: std::fmt::Debug>(result: &Result<T>) -> bool {
+        matches!(result, Err(BlobStoreError::Backend(_)))
+    }
+
+    fn is_not_found<T: std::fmt::Debug>(result: &Result<T>) -> bool {
+        matches!(result, Err(BlobStoreError::NotFound))
+    }
+
+    /// A request that failed carries its URL in its text, and a key's UUID
+    /// contains "404" now and then (as `KEY` does). It says nothing about
+    /// the object.
+    #[test]
+    fn a_failed_head_request_is_a_backend_error() {
+        for text in [
+            format!("error sending request for url (https://s3.example/{KEY}): connection reset"),
+            "operation timed out".to_string(),
+        ] {
+            let failed = Err(S3Error::Io(std::io::Error::other(text.clone())));
+            let result = head_size(KEY, failed);
+            assert!(is_backend(&result), "{text}: {result:?}");
         }
-        Ok(())
+    }
+
+    #[test]
+    fn head_status_decides_the_size() {
+        assert!(matches!(head_size(KEY, Ok((Some(5), 200))), Ok(Some(5))));
+        assert!(matches!(head_size(KEY, Ok((None, 200))), Ok(None)));
+        assert!(is_not_found(&head_size(KEY, Ok((None, 404)))));
+        for status in [301, 403, 500, 503] {
+            let result = head_size(KEY, Ok((Some(5), status)));
+            assert!(is_backend(&result), "{status}: {result:?}");
+        }
+    }
+
+    /// The copy counts only when both HEADs report the same size.
+    #[test]
+    fn a_copy_counts_only_with_two_equal_known_sizes() {
+        assert!(copied("a", "b", Some(5), Ok(Some(5))).is_ok());
+        for (size, head) in [
+            (None, Ok(None)),
+            (Some(5), Ok(None)),
+            (None, Ok(Some(5))),
+            (Some(5), Ok(Some(4))),
+            (Some(5), Err(BlobStoreError::NotFound)),
+            (Some(5), Err(BlobStoreError::Backend("timeout".into()))),
+        ] {
+            let shown = format!("{size:?}, {head:?}");
+            let result = copied("a", "b", size, head);
+            assert!(is_backend(&result), "{shown}: {result:?}");
+        }
+    }
+
+    /// A refused delete is an error, so the purge keeps the entry and tries
+    /// again; an object already gone is fine.
+    #[test]
+    fn delete_status_decides_the_result() {
+        for status in [200, 204, 404] {
+            assert!(deleted(KEY, status).is_ok(), "{status}");
+        }
+        for status in [301, 400, 403, 409, 500, 503] {
+            let result = deleted(KEY, status);
+            assert!(is_backend(&result), "{status}: {result:?}");
+        }
     }
 }

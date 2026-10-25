@@ -3,7 +3,9 @@
 //! for a duplicate that never committed. Against a fresh database per test.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -306,16 +308,26 @@ async fn apply_duplicate_inserts_everything_atomically() {
         assert_eq!(contributors, [w.actor]);
     }
 
-    // Boards: a row each, with the state as one update and the SVG.
-    for b in &plan.boards {
-        let row: (Uuid, Uuid, Option<String>, Option<Vec<u8>>) = sqlx::query_as(
-            "SELECT doc_id, created_by, label, svg_cached FROM boards WHERE id = $1",
+    // Boards: a row each, with the state as one update and the SVG, as if
+    // uploaded once (`svg_seq` 1), or no SVG yet (0).
+    for (b, svg_seq) in plan.boards.iter().zip([1_i64, 0]) {
+        let row: (Uuid, Uuid, Option<String>, Option<Vec<u8>>, i64) = sqlx::query_as(
+            "SELECT doc_id, created_by, label, svg_cached, svg_seq FROM boards WHERE id = $1",
         )
         .bind(b.new_id)
         .fetch_one(&w.pool)
         .await
         .unwrap();
-        assert_eq!(row, (b.new_doc_id, w.actor, b.label.clone(), b.svg.clone()));
+        assert_eq!(
+            row,
+            (
+                b.new_doc_id,
+                w.actor,
+                b.label.clone(),
+                b.svg.clone(),
+                svg_seq
+            )
+        );
         let updates: Vec<Vec<u8>> =
             sqlx::query_scalar("SELECT bytes FROM board_updates WHERE board_id = $1")
                 .bind(b.new_id)
@@ -511,6 +523,257 @@ async fn source_moved_or_archived_meanwhile_is_a_conflict() {
     }
 }
 
+/// A copy of a page under a parent goes right between it and its next
+/// sibling, and no other key in the group changes. The first insert's
+/// foreign key check takes `FOR KEY SHARE` on the parent, and the group's
+/// lock at the end takes `FOR NO KEY UPDATE` on the same row, in the same
+/// transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_under_a_parent_goes_right_after_the_source() {
+    let w = world().await;
+    let p = w.seed(None, "P", "g").await;
+    w.seed(Some(p), "A", "a").await;
+    let s = w.seed(Some(p), "S", "g").await;
+    w.seed(Some(p), "T", "m").await;
+    w.seed(Some(s), "C", "m").await;
+    let mut plan = plan_for(&w, s, Some(p));
+    plan.pages = vec![page(Some(plan.top.new_id), "C", b"c")];
+
+    let outcome = apply_duplicate(&w.pool, &plan).await.unwrap();
+
+    assert_eq!(outcome.top.id, plan.top.new_id);
+    assert_eq!(outcome.top.parent_id, Some(p));
+    let key = outcome.top.sort_key.clone();
+    assert!(lexorank::is_valid(&key), "{key:?}");
+    assert_eq!(
+        w.group(Some(p)).await,
+        [
+            ("A".to_string(), "a".to_string()),
+            ("S".to_string(), "g".to_string()),
+            ("S (copy)".to_string(), key),
+            ("T".to_string(), "m".to_string()),
+        ]
+    );
+    assert_eq!(
+        w.group(Some(plan.top.new_id)).await,
+        [("C".to_string(), lexorank::spread(1)[0].clone())]
+    );
+    assert_eq!(w.group(None).await, [("P".to_string(), "g".to_string())]);
+}
+
+/// A copy of the last page of its group goes last, next to the source, and
+/// the group isn't respread. `place` must leave the copy's own row out of the
+/// group it reads: its provisional key `~<id>` sorts after every valid key,
+/// so the slot after the source would sit next to a key `between` rejects.
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_of_the_last_page_goes_last() {
+    for nested in [false, true] {
+        let w = world().await;
+        let parent = if nested {
+            Some(w.seed(None, "P", "g").await)
+        } else {
+            None
+        };
+        w.seed(parent, "A", "g").await;
+        let s = w.seed(parent, "S", "m").await;
+        let plan = plan_for(&w, s, parent);
+
+        let outcome = apply_duplicate(&w.pool, &plan).await.unwrap();
+
+        let last = lexorank::between(Some("m"), None).unwrap();
+        assert_eq!(outcome.top.sort_key, last, "nested: {nested}");
+        assert_eq!(
+            w.group(parent).await,
+            [
+                ("A".to_string(), "g".to_string()),
+                ("S".to_string(), "m".to_string()),
+                ("S (copy)".to_string(), last),
+            ],
+            "nested: {nested}"
+        );
+    }
+}
+
+/// The first half of the top-level group's advisory lock key (P8), `"knot"` in
+/// ASCII. The second half is `hashtext(workspace_id::text)`.
+const TOP_LEVEL_LOCK: i32 = 1_802_399_604;
+
+/// Waits until `n` sessions on this test's database are waiting for a lock.
+/// (The same helper as in tests/placement.rs.)
+async fn wait_for_lock_waits(pool: &PgPool, n: i64) {
+    for _ in 0..500 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{n} sessions never waited for a lock together");
+}
+
+/// Runs `op`, which takes the top-level lock first and later must update
+/// `blocker`, a top-level row with a bad key, to respread the group. A
+/// stand-in transaction holds `blocker` and waits for the top-level lock: a
+/// deadlock. Postgres aborts `op` with 40P01, and `op` must succeed by
+/// running its transaction once more.
+///
+/// This is Task 11b's harness from tests/placement.rs (`deadlocks_once`),
+/// with the same code. Postgres checks a lock wait for a deadlock once,
+/// `deadlock_timeout` (1 s) after the wait starts, and aborts the session
+/// whose check finds the cycle. Two things make that `op`, even on a loaded
+/// machine:
+///
+/// - `op`'s wait for `blocker` starts last. A gate transaction holds the
+///   top-level lock until `op` and then the stand-in queue for it. `op`,
+///   first in the queue, gets it when the gate ends and goes on to wait for
+///   `blocker`, with the stand-in already waiting.
+/// - The stand-in's own check comes a minute after its wait starts, long
+///   after `op`'s. Setting `deadlock_timeout` needs a superuser, which the
+///   test databases' role is (CI and the dev stack).
+async fn deadlocks_once<T, F>(w: &World, blocker: Uuid, op: F) -> T
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, DocStoreError>> + Send + 'static,
+{
+    const TAKE_TOP_LEVEL_LOCK: &str = "SELECT pg_advisory_xact_lock($1, hashtext($2::uuid::text))";
+    let mut stand_in = w.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL deadlock_timeout = '1min'")
+        .execute(&mut *stand_in)
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1 FROM documents WHERE id = $1 FOR UPDATE")
+        .bind(blocker)
+        .execute(&mut *stand_in)
+        .await
+        .unwrap();
+    let mut gate = w.pool.begin().await.unwrap();
+    sqlx::query(TAKE_TOP_LEVEL_LOCK)
+        .bind(TOP_LEVEL_LOCK)
+        .bind(w.ws)
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+
+    let op = tokio::spawn(op);
+    wait_for_lock_waits(&w.pool, 1).await;
+    let ws = w.ws;
+    let stand_in = tokio::spawn(async move {
+        let queued = sqlx::query(TAKE_TOP_LEVEL_LOCK)
+            .bind(TOP_LEVEL_LOCK)
+            .bind(ws)
+            .execute(&mut *stand_in)
+            .await;
+        stand_in.rollback().await.unwrap();
+        queued
+    });
+    wait_for_lock_waits(&w.pool, 2).await;
+    gate.rollback().await.unwrap();
+
+    stand_in
+        .await
+        .unwrap()
+        .expect("Postgres aborts the operation, not the stand-in");
+    op.await.unwrap().expect("one retry after the deadlock")
+}
+
+/// `apply_duplicate` runs its transaction once more when Postgres aborts it
+/// to break a deadlock (P8). Its last step places the copy after the source,
+/// next to a key `between` rejects, so it respreads the top level and must
+/// update the row the stand-in holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_duplicate_retries_once_after_a_deadlock() {
+    let w = world().await;
+    let s = w.seed(None, "S", "g").await;
+    let blocker = w.seed(None, "z zero", "z0").await;
+    let plan = plan_for(&w, s, None);
+    let (pool, attempt) = (w.pool.clone(), plan.clone());
+
+    let outcome = deadlocks_once(&w, blocker, async move {
+        apply_duplicate(&pool, &attempt).await
+    })
+    .await;
+
+    assert_eq!(outcome.top.id, plan.top.new_id);
+    let group = w.group(None).await;
+    let titles: Vec<&str> = group.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(titles, ["S", "S (copy)", "z zero"]);
+    assert!(
+        group.iter().all(|(_, key)| lexorank::is_valid(key))
+            && group
+                .windows(2)
+                .all(|p| p[0].1.as_bytes() < p[1].1.as_bytes()),
+        "{group:?}"
+    );
+    // The aborted attempt left nothing behind: one update, one audit entry.
+    let written: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM doc_updates WHERE doc_id = $1),
+                (SELECT count(*) FROM audit_events WHERE target_id = $1)",
+    )
+    .bind(plan.top.new_id)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(written, (1, 1));
+}
+
+/// A writer that skips the group's lock (an old release during a rolling
+/// upgrade) takes the copy's key between `place`'s read of the group and the
+/// final `UPDATE`. The duplicate fails with `Conflict`, as create, move and
+/// restore do, rather than with a database error, and writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn racing_an_unlocked_writer_for_the_key_is_a_conflict() {
+    let w = world().await;
+    let s = w.seed(None, "S", "g").await;
+    let plan = plan_for(&w, s, None);
+    let before = w.counts().await;
+
+    // The key the copy gets: last at the top level, after "g". The old pod
+    // hasn't committed, so `place`'s read of the group doesn't see it.
+    let last = lexorank::between(Some("g"), None).unwrap();
+    let mut old_pod = w.pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+         VALUES ($1, NULL, 'Old pod', $2, $3)",
+    )
+    .bind(w.ws)
+    .bind(&last)
+    .bind(w.owner)
+    .execute(&mut *old_pod)
+    .await
+    .unwrap();
+    let duplicate = {
+        let (pool, plan) = (w.pool.clone(), plan.clone());
+        tokio::spawn(async move { apply_duplicate(&pool, &plan).await })
+    };
+    // The final UPDATE waits for the old pod's row with the same key.
+    wait_for_lock_waits(&w.pool, 1).await;
+    old_pod.commit().await.unwrap();
+
+    let result = duplicate.await.unwrap();
+    assert!(
+        matches!(result, Err(DocStoreError::Conflict)),
+        "{:?}",
+        result.map(|o| o.top)
+    );
+    let mut expected = before;
+    assert_eq!(expected[0].0, "documents");
+    expected[0].1 += 1; // the old pod's page
+    assert_eq!(w.counts().await, expected);
+    assert_eq!(
+        w.group(None).await,
+        [
+            ("S".to_string(), "g".to_string()),
+            ("Old pod".to_string(), last),
+        ]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn live_subtree_skips_archived_and_template_subtrees() {
     let w = world().await;
@@ -574,6 +837,8 @@ async fn live_subtree_skips_archived_and_template_subtrees() {
 struct MemoryBlobs {
     objects: Mutex<HashMap<Uuid, (Vec<u8>, String)>>,
     deleted: Mutex<Vec<Uuid>>,
+    /// Deletes fail as a store answering 403 or 5xx does.
+    refuse_deletes: AtomicBool,
 }
 
 #[async_trait]
@@ -593,6 +858,9 @@ impl BlobStore for MemoryBlobs {
     }
 
     async fn delete(&self, id: Uuid) -> BlobResult<()> {
+        if self.refuse_deletes.load(Ordering::SeqCst) {
+            return Err(BlobStoreError::Backend("status 403".into()));
+        }
         self.objects
             .lock()
             .unwrap()
@@ -657,6 +925,34 @@ async fn purge_stale_copies_deletes_unreferenced_objects_only() {
     assert_eq!(removed, 2, "the orphan, and the copy that never arrived");
     assert_eq!(*store.deleted.lock().unwrap(), [orphan]);
     assert!(store.objects.lock().unwrap().contains_key(&referenced));
+    assert_eq!(pending(&w.pool).await, 0);
+}
+
+/// A delete the store refuses (a 403 or 5xx from S3) doesn't count: the
+/// entry stays, and the next run deletes the object.
+#[tokio::test(flavor = "multi_thread")]
+async fn purge_stale_copies_keeps_the_entry_of_a_refused_delete() {
+    let w = world().await;
+    let store = MemoryBlobs::default();
+    let orphan = Uuid::new_v4();
+    store.put(orphan, b"orphan", "image/png").await.unwrap();
+    record_pending_copies(&w.pool, &[orphan]).await.unwrap();
+    store.refuse_deletes.store(true, Ordering::SeqCst);
+
+    let removed = purge_stale_copies(&w.pool, &store, Duration::ZERO)
+        .await
+        .unwrap();
+
+    assert_eq!(removed, 0);
+    assert_eq!(pending(&w.pool).await, 1);
+    assert!(store.objects.lock().unwrap().contains_key(&orphan));
+
+    store.refuse_deletes.store(false, Ordering::SeqCst);
+    let removed = purge_stale_copies(&w.pool, &store, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+    assert_eq!(*store.deleted.lock().unwrap(), [orphan]);
     assert_eq!(pending(&w.pool).await, 0);
 }
 
