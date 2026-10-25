@@ -246,13 +246,36 @@ enum TaskIndex {
     Quiet,
 }
 
+/// [`refresh_markdown_and_index`] for a page whose state the caller already
+/// holds, `page` at `seq`: a copy Duplicate just stored.
+pub(crate) async fn refresh_markdown_from(
+    state: &AppState,
+    doc_id: Uuid,
+    page: &knot_crdt::DocHandle,
+    seq: i64,
+) -> Result<String, RefreshError> {
+    render_and_index(state, doc_id, page, seq, TaskIndex::Edit).await
+}
+
 async fn refresh_markdown_inner(
     state: &AppState,
     doc_id: Uuid,
     task_index: TaskIndex,
 ) -> Result<String, RefreshError> {
     let (transient, seq) = current_snapshot(state, doc_id).await?;
-    let text = match knot_markdown::serialise_with_report(&YrsEngine, &transient) {
+    render_and_index(state, doc_id, &transient, seq, task_index).await
+}
+
+/// The refresh after the snapshot: render `transient`, the page's state at
+/// `seq`, cache it, and write its task rows as `task_index` says.
+async fn render_and_index(
+    state: &AppState,
+    doc_id: Uuid,
+    transient: &knot_crdt::DocHandle,
+    seq: i64,
+    task_index: TaskIndex,
+) -> Result<String, RefreshError> {
+    let text = match knot_markdown::serialise_with_report(&YrsEngine, transient) {
         Ok((md, unknown)) => {
             record_unknown_nodes(doc_id, &unknown);
             md
@@ -289,7 +312,7 @@ async fn refresh_markdown_inner(
     // When the task rows weren't written, the row says the current renderer
     // wrote the page while its task rows are older: mark it stale again, so
     // the sweep tries the page again.
-    if !index_tasks(tasks, docs, doc_id, &transient, task_index).await
+    if !index_tasks(tasks, docs, doc_id, transient, task_index).await
         && let Some(cache) = state.markdown_cache.as_ref()
         && let Err(e) = cache.mark_stale(doc_id).await
     {

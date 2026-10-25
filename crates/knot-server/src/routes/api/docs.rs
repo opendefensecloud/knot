@@ -4,6 +4,7 @@
 //! - GET    /api/docs/{id}        metadata + effective_role (+ archive state)
 //! - PATCH  /api/docs/{id}        rename / icon
 //! - POST   /api/docs/{id}/move   reparent / reorder
+//! - POST   /api/docs/{id}/duplicate  body: {include_subpages?}; copy right after it (editor+)
 //! - DELETE /api/docs/{id}        move to the archive, with its subtree (editor+)
 //! - POST   /api/docs/{id}/restore  bring an archive root back (editor+)
 //! - POST   /api/docs/{id}/purge  delete an archive root for good (owner)
@@ -19,11 +20,13 @@ use axum::{
 };
 use knot_storage::{Document, PersonRef, Placement, WorkspaceRole};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::AppState;
 use crate::archive::{PurgeError, PurgeTrigger};
 use crate::auth::{AuthContext, DocArchived, EffectiveDocRole, require_doc_role_mw};
+use crate::duplicate::DuplicateError;
 use crate::http_error::{doc_archived, json_err};
 
 #[derive(Serialize)]
@@ -57,6 +60,7 @@ pub fn router(state: AppState) -> Router<AppState> {
     let doc_id_routes: Router<AppState> = Router::new()
         .route("/api/docs/{id}", get(get_one).patch(rename).delete(archive))
         .route("/api/docs/{id}/move", post(move_doc))
+        .route("/api/docs/{id}/duplicate", post(duplicate))
         .route(crate::auth::ARCHIVE_RESTORE_ROUTE, post(restore))
         .route(crate::auth::ARCHIVE_PURGE_ROUTE, post(purge))
         .route(
@@ -381,6 +385,74 @@ async fn move_doc(
         Err(knot_storage::DocStoreError::BadAnchor) => bad_anchor(),
         Err(e) => {
             tracing::error!(error=?e, "move");
+            internal()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DuplicateRequest {
+    /// Copy the page's live subpages too. Off unless asked for.
+    #[serde(default)]
+    include_subpages: bool,
+}
+
+/// Copy a page right after it, with its subpages when asked (spec D). See
+/// `crate::duplicate`.
+#[tracing::instrument(skip_all, name = "docs.duplicate")]
+async fn duplicate(
+    State(state): State<AppState>,
+    Path(doc_id): Path<Uuid>,
+    req: Request,
+) -> Response {
+    let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
+        return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
+    };
+    let Some(role) = req.extensions().get::<EffectiveDocRole>().copied() else {
+        return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
+    };
+    let Ok(body) = read_json::<DuplicateRequest>(req).await else {
+        return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
+    };
+    // On a task of its own (P16): dropping this handler, on the request
+    // timeout or when the client goes away, can't stop a duplicate halfway.
+    let task = tokio::spawn(
+        crate::duplicate::run(state, ctx, role.0, doc_id, body.include_subpages).in_current_span(),
+    );
+    match task.await {
+        Ok(Ok(top)) => (StatusCode::CREATED, Json(to_response(&top))).into_response(),
+        Ok(Err(e)) => duplicate_error(e),
+        Err(e) => {
+            tracing::error!(error = %e, "duplicate task");
+            internal()
+        }
+    }
+}
+
+fn duplicate_error(e: DuplicateError) -> Response {
+    match e {
+        DuplicateError::EditorRequired => {
+            json_err(StatusCode::FORBIDDEN, "acl.editor_required", "")
+        }
+        DuplicateError::NotFound => json_err(StatusCode::NOT_FOUND, "doc.not_found", ""),
+        DuplicateError::IsTemplate => {
+            json_err(StatusCode::UNPROCESSABLE_ENTITY, "doc.is_template", "")
+        }
+        DuplicateError::Archived => doc_archived(),
+        DuplicateError::TooLarge => json_err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "doc.duplicate_too_large",
+            "over 200 pages or 200 MiB of files",
+        ),
+        // `DocStoreError::DuplicateConflict` and a file object missing from
+        // the store: the source was moved or archived, or a file it shows
+        // was purged or lost, while it was copied.
+        DuplicateError::Conflict => json_err(StatusCode::CONFLICT, "doc.duplicate_conflict", ""),
+        DuplicateError::SortKeyConflict => {
+            json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "")
+        }
+        DuplicateError::Internal(e) => {
+            tracing::error!(error = %e, "duplicate");
             internal()
         }
     }
