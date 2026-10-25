@@ -734,3 +734,32 @@ async fn rebalance_keeps_the_sidebar_order_under_a_locale_collation() {
         ["new", "B", "M", "a", "m"]
     );
 }
+
+/// Both creates, placed and with an explicit key, end in `commit_create`,
+/// which records one `doc.create` audit event for the new page and its
+/// creator in the create's transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn creates_record_a_doc_create_audit_event() {
+    let w = world().await;
+    let placed = w.page("Placed").await;
+    let explicit = w
+        .store
+        .create(w.ws, None, "Explicit", "t", w.user)
+        .await
+        .unwrap()
+        .id;
+    for id in [placed, explicit] {
+        let events: Vec<(Uuid, Option<Uuid>, String, String)> = sqlx::query_as(
+            "SELECT workspace_id, actor_id, action, target_kind FROM audit_events
+              WHERE target_id = $1",
+        )
+        .bind(id)
+        .fetch_all(&w.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            events,
+            [(w.ws, Some(w.user), "doc.create".into(), "doc".into())]
+        );
+    }
+}

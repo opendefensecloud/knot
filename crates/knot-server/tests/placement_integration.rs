@@ -737,3 +737,33 @@ async fn restore_racing_a_move_of_the_page_is_409() {
     );
     assert_eq!(archived_under(&w, &page).await, (true, Some(elsewhere)));
 }
+
+/// A writer that skips the group's lock takes the key a move picked, between
+/// the move's read of the group and its write. The unique violation is 409
+/// `doc.sort_key_conflict`, as for restore, and the page stays where it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn move_racing_an_unlocked_writer_for_its_key_is_409() {
+    let w = world().await;
+    let folder = w.seed(None, "Folder", "m").await;
+    w.seed(Some(&folder), "Inside", "m").await;
+    let page = w.seed(None, "Page", "t").await;
+    // The key the move picks: last under Folder, after "m".
+    let key = lexorank::between(Some("m"), None).unwrap();
+    let old_pod = uncommitted_page(&w, Some(&folder), &key).await;
+
+    let request = {
+        let (w, page, body) = (w.clone(), page.clone(), json!({ "parent_id": folder }));
+        tokio::spawn(async move { w.move_doc(&page, body).await })
+    };
+    // The move's write waits for the old pod's row with the same key.
+    wait_for_lock_waits(&w.pool, 1).await;
+    old_pod.commit().await.unwrap();
+
+    let (status, body) = request.await.unwrap();
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::CONFLICT, "doc.sort_key_conflict"),
+        "{body}"
+    );
+    assert_eq!(parent_of(&w, &page).await, None, "the page didn't move");
+}
