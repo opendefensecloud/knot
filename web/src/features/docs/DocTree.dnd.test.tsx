@@ -1,0 +1,353 @@
+import type { Active, Over } from "@dnd-kit/core";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { SessionProvider } from "../../auth/SessionContext";
+
+import { DocTree, makeAnnouncements } from "./DocTree";
+import type { FlatRow } from "./tree";
+
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+const INSTRUCTIONS = "Drag to move. Use the row menu or Alt with the arrow keys to move by keyboard.";
+
+function json(body: unknown, status = 200) {
+  return Promise.resolve(
+    new Response(status === 204 ? null : JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+}
+
+function doc(id: string, title: string, parent_id: string | null) {
+  return {
+    id,
+    workspace_id: "w1",
+    parent_id,
+    title,
+    sort_key: "m",
+    icon: null,
+    created_by: "u1",
+    archived: false,
+    is_template: false,
+    archived_at: null,
+    archive_root_id: null,
+  };
+}
+
+/** A workspace with Folder > Child > Grandchild. */
+function server(role: "owner" | "editor" | "viewer") {
+  return vi.fn((url: string, init?: RequestInit) => {
+    if (url === "/auth/session") {
+      return json({ user_id: "u1", email: "a@x.test", display_name: "A", workspace_id: "w1", role });
+    }
+    if (url === "/api/workspace") {
+      return json({ id: "w1", slug: "default", name: "W", role, archive_retention_days: 14 });
+    }
+    if (url === "/api/docs" && (!init?.method || init.method === "GET")) {
+      return json([
+        doc("folder", "Folder", null),
+        doc("child", "Child", "folder"),
+        doc("grandchild", "Grandchild", "child"),
+      ]);
+    }
+    if (url.endsWith("/move") && init?.method === "POST") return json({});
+    return json({ error: { code: "not_found", message: url, details: {} } }, 404);
+  });
+}
+
+/** The moves the tree sent: page id and request body. */
+function moves(fetchMock: ReturnType<typeof server>) {
+  return fetchMock.mock.calls
+    .filter(([url, init]) => url.endsWith("/move") && init?.method === "POST")
+    .map(([url, init]) => ({ id: url.split("/")[3], body: JSON.parse(init?.body as string) as unknown }));
+}
+
+const ROW_H = 28;
+const TREE_W = 260;
+
+/** jsdom has no layout. Give the tree's list and its rows the boxes a real
+ *  sidebar would: rows 28px high, top to bottom in DOM order. */
+function layOut() {
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+    const rows = Array.from(document.querySelectorAll("[data-testid^='tree-row-']"));
+    const i = rows.indexOf(this);
+    const box =
+      i >= 0 ? { left: 0, top: i * ROW_H, width: TREE_W, height: ROW_H }
+      : this.matches("[data-testid='doc-tree'] > ul") ? { left: 0, top: 0, width: TREE_W, height: 400 }
+      : { left: 0, top: 0, width: 0, height: 0 };
+    const { left, top, width, height } = box;
+    return { ...box, x: left, y: top, right: left + width, bottom: top + height, toJSON: () => box };
+  });
+}
+
+/** Let the move mutation run (it starts after an awaited cancelQueries). */
+async function settle() {
+  await act(() => new Promise((r) => setTimeout(r, 30)));
+}
+
+/** Where the router is: a click that reaches a row link navigates there. */
+function Location() {
+  return <output data-testid="location">{useLocation().pathname}</output>;
+}
+
+function renderTree(role: "owner" | "editor" | "viewer" = "editor") {
+  const fetchMock = server(role);
+  vi.stubGlobal("fetch", fetchMock);
+  render(
+    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <SessionProvider>
+        <MemoryRouter>
+          <DocTree />
+          <Location />
+        </MemoryRouter>
+      </SessionProvider>
+    </QueryClientProvider>,
+  );
+  return fetchMock;
+}
+
+/** Rows for editors: the session has loaded once every row has its "More" button. */
+async function editorRows() {
+  await waitFor(() => expect(screen.getAllByRole("button", { name: "More" })).toHaveLength(3));
+}
+
+/** The inline left padding of the nearest ancestor that has one: e2e's depth probe. */
+function indentOf(el: HTMLElement): number {
+  for (let cur: HTMLElement | null = el; cur; cur = cur.parentElement) {
+    const pl = cur.style.paddingLeft;
+    if (pl && pl !== "0px") return parseFloat(pl);
+  }
+  return 0;
+}
+
+/** The text of every element `el`'s aria-describedby names. */
+function descriptions(el: HTMLElement): string[] {
+  return (el.getAttribute("aria-describedby") ?? "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((id) => document.getElementById(id)?.textContent ?? `(no element #${id})`);
+}
+
+/** Press on a row link and move far enough for the mouse sensor to start a drag. */
+function startDrag(link: HTMLElement) {
+  fireEvent.mouseDown(link, { button: 0, clientX: 400, clientY: 300 });
+  fireEvent.mouseMove(document, { clientX: 400, clientY: 320 });
+}
+
+function endDrag() {
+  fireEvent.mouseUp(document, { clientX: 400, clientY: 320 });
+}
+
+describe("DocTree — rows", () => {
+  it("gives rows no button role and no extra tab stop; the link takes focus", async () => {
+    renderTree();
+    await editorRows();
+    for (const id of ["folder", "child", "grandchild"]) {
+      const link = screen.getByTestId(`doc-row-${id}`);
+      const li = link.closest("li")!;
+      const row = link.closest(`[data-testid="tree-row-${id}"]`);
+      for (const el of [li, row]) {
+        expect(el).not.toBeNull();
+        expect(el).not.toHaveAttribute("role");
+        expect(el).not.toHaveAttribute("tabindex");
+        expect(el).not.toHaveAttribute("aria-roledescription");
+      }
+      link.focus();
+      expect(link).toHaveFocus();
+    }
+  });
+
+  // P13: the e2e specs find a row's depth through the inline paddingLeft of
+  // an ancestor of its link, open its menu by right-clicking the link, and
+  // count `doc-row-` testids.
+  it("keeps the link's indent, its context menu and one doc-row testid per page", async () => {
+    renderTree();
+    await editorRows();
+    expect(indentOf(screen.getByTestId("doc-row-folder"))).toBe(4);
+    expect(indentOf(screen.getByTestId("doc-row-child"))).toBe(16);
+    expect(indentOf(screen.getByTestId("doc-row-grandchild"))).toBe(28);
+    expect(document.querySelectorAll("[data-testid^='doc-row-']")).toHaveLength(3);
+
+    const notCancelled = fireEvent.contextMenu(screen.getByTestId("doc-row-child"));
+    expect(notCancelled).toBe(false);
+    expect(screen.getByTestId("context-menu")).toBeInTheDocument();
+  });
+
+  it("describes each row's level and subpages to screen readers", async () => {
+    renderTree();
+    await editorRows();
+    const folder = descriptions(screen.getByTestId("doc-row-folder"));
+    expect(folder).toContain("level 1, 2 subpages");
+    expect(folder).toContain(INSTRUCTIONS);
+    expect(descriptions(screen.getByTestId("doc-row-child"))).toContain("level 2, 1 subpage");
+    expect(descriptions(screen.getByTestId("doc-row-grandchild"))).toContain("level 3");
+  });
+
+  it("doesn't tell viewers, who can't move pages, how to drag them", async () => {
+    renderTree("viewer");
+    await screen.findByText("a@x.test");
+    expect(descriptions(screen.getByTestId("doc-row-folder"))).toEqual(["level 1, 2 subpages"]);
+  });
+});
+
+describe("DocTree — dragging", () => {
+  it("announces drags by title, never by id", () => {
+    const rows: FlatRow[] = [
+      { id: "0b6c3d0e-1f2a-4b5c-8d9e-0a1b2c3d4e5f", parentId: null, depth: 0, title: "Roadmap", descendantCount: 1 },
+      {
+        id: "5f1e2a9c-3b4d-4e6f-9a0b-1c2d3e4f5a6b",
+        parentId: "0b6c3d0e-1f2a-4b5c-8d9e-0a1b2c3d4e5f",
+        depth: 1,
+        title: "Q3 goals",
+        descendantCount: 0,
+      },
+    ];
+    const say = makeAnnouncements(() => rows);
+    const active = { id: rows[1]!.id } as unknown as Active;
+    const over = { id: rows[0]!.id } as unknown as Over;
+    const messages = [
+      say.onDragStart({ active }),
+      say.onDragOver({ active, over }),
+      say.onDragOver({ active, over: null }),
+      say.onDragEnd({ active, over }),
+      say.onDragEnd({ active, over: null }),
+      say.onDragCancel({ active, over }),
+    ];
+    for (const m of messages) {
+      expect(m).toContain("“Q3 goals”");
+      for (const r of rows) expect(m).not.toContain(r.id);
+    }
+    expect(say.onDragOver({ active, over })).toContain("“Roadmap”");
+    expect(say.onDragEnd({ active, over })).toContain("“Roadmap”");
+  });
+
+  // A drag released on a row link ends in a click on it. dnd-kit only stops
+  // that click's propagation, so the browser still followed the href: a full
+  // page load.
+  it("swallows the click that ends a drag, and only that one", async () => {
+    renderTree();
+    await editorRows();
+    const link = screen.getByTestId("doc-row-child");
+    vi.useFakeTimers();
+
+    startDrag(link);
+    // The dragged row's subtree is unmounted, so it can never be a target;
+    // the drag ghost carries no row testid.
+    expect(screen.queryByTestId("doc-row-grandchild")).toBeNull();
+    expect(screen.queryByTestId("tree-row-grandchild")).toBeNull();
+    expect(document.querySelectorAll("[data-testid^='doc-row-']")).toHaveLength(2);
+    expect(document.querySelectorAll("[data-testid^='tree-row-']")).toHaveLength(2);
+    endDrag();
+    expect(screen.getByTestId("doc-row-grandchild")).toBeInTheDocument();
+
+    expect(fireEvent.click(link)).toBe(false);
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+
+    // dnd-kit drops its own click listener after 50 ms. Ours went with the
+    // first click, well before its 100 ms timeout.
+    act(() => void vi.advanceTimersByTime(60));
+    fireEvent.click(link);
+    expect(screen.getByTestId("location")).toHaveTextContent("/doc/child");
+  });
+
+  it("stops swallowing clicks 100 ms after a drag ends", async () => {
+    renderTree();
+    await editorRows();
+    const link = screen.getByTestId("doc-row-child");
+    vi.useFakeTimers();
+
+    startDrag(link);
+    endDrag();
+    act(() => void vi.advanceTimersByTime(60));
+    expect(fireEvent.click(link)).toBe(false);
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+
+    startDrag(link);
+    endDrag();
+    act(() => void vi.advanceTimersByTime(100));
+    // Seen on the link itself, before the router handles it.
+    const seen: boolean[] = [];
+    link.addEventListener("click", (e) => seen.push(e.defaultPrevented));
+    fireEvent.click(link);
+    expect(seen).toEqual([false]);
+    expect(screen.getByTestId("location")).toHaveTextContent("/doc/child");
+  });
+});
+
+// Folder (0-28), Child (28-56), Grandchild (56-84); the tree is 260px wide.
+describe("DocTree — drops", () => {
+  it("un-nests a page dragged one level left on its own row", async () => {
+    const fetchMock = renderTree();
+    await editorRows();
+    layOut();
+    fireEvent.mouseDown(screen.getByTestId("doc-row-grandchild"), { button: 0, clientX: 100, clientY: 70 });
+    fireEvent.mouseMove(document, { clientX: 92, clientY: 70 }); // past 6px: the drag starts
+    fireEvent.mouseMove(document, { clientX: 86, clientY: 70 }); // one INDENT left, rounded
+    const row = screen.getByTestId("tree-row-grandchild");
+    expect(row).toHaveAttribute("data-drop-zone", "below");
+    expect(row).toHaveAttribute("data-drop-depth", "1");
+    fireEvent.mouseUp(document, { clientX: 86, clientY: 70 });
+
+    await waitFor(() =>
+      expect(moves(fetchMock)).toEqual([
+        { id: "grandchild", body: { parent_id: "folder", after_id: "child" } },
+      ]),
+    );
+  });
+
+  it("nests a page dropped on the middle of another row", async () => {
+    const fetchMock = renderTree();
+    await editorRows();
+    layOut();
+    fireEvent.mouseDown(screen.getByTestId("doc-row-grandchild"), { button: 0, clientX: 100, clientY: 70 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 62 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 14 });
+    const folder = screen.getByTestId("tree-row-folder");
+    expect(folder).toHaveAttribute("data-drop-zone", "into");
+    expect(folder).toHaveAttribute("data-drop-depth", "1");
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 14 });
+
+    await waitFor(() => expect(moves(fetchMock)).toEqual([{ id: "grandchild", body: { parent_id: "folder" } }]));
+  });
+
+  it("sends nothing for a drop in place", async () => {
+    const fetchMock = renderTree();
+    await editorRows();
+    layOut();
+    fireEvent.mouseDown(screen.getByTestId("doc-row-child"), { button: 0, clientX: 100, clientY: 42 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 50 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 50 });
+    // The drag is on (Child's subtree is unmounted), but there's nothing to show.
+    expect(screen.queryByTestId("doc-row-grandchild")).toBeNull();
+    expect(document.querySelector("[data-drop-zone]")).toBeNull();
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 50 });
+
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+  });
+
+  it("cancels a drop outside the tree", async () => {
+    const fetchMock = renderTree();
+    await editorRows();
+    layOut();
+    fireEvent.mouseDown(screen.getByTestId("doc-row-child"), { button: 0, clientX: 100, clientY: 42 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 34 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 3 }); // above Folder: a real move
+    expect(screen.getByTestId("tree-row-folder")).toHaveAttribute("data-drop-zone", "above");
+    fireEvent.mouseMove(document, { clientX: 400, clientY: 3 }); // right of the sidebar
+    expect(document.querySelector("[data-drop-zone]")).toBeNull();
+    fireEvent.mouseUp(document, { clientX: 400, clientY: 3 });
+
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+  });
+});

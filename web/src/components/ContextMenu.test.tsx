@@ -47,6 +47,28 @@ describe("ContextMenu", () => {
     expect(rowPointerDown).not.toHaveBeenCalled();
   });
 
+  // The sidebar's rows start a drag on mousedown and touchstart (dnd-kit's
+  // mouse and touch sensors), and the menu's React events bubble to them.
+  it("keeps mouse and touch presses from reaching the component that opened it", () => {
+    const rowMouseDown = vi.fn();
+    const rowTouchStart = vi.fn();
+    render(
+      <div onMouseDown={rowMouseDown} onTouchStart={rowTouchStart}>
+        <ContextMenu
+          x={0}
+          y={0}
+          onClose={() => {}}
+          items={[{ label: "Rename", testId: "ctx-rename", onSelect: () => {} }]}
+        />
+      </div>,
+    );
+    const item = screen.getByTestId("ctx-rename");
+    fireEvent.mouseDown(item);
+    fireEvent.touchStart(item);
+    expect(rowMouseDown).not.toHaveBeenCalled();
+    expect(rowTouchStart).not.toHaveBeenCalled();
+  });
+
   it("takes focus when it opens, so keyboard users can reach its items", () => {
     render(
       <ContextMenu

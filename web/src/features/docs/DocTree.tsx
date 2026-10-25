@@ -1,38 +1,26 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate, useParams } from "react-router-dom";
-import { useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 
-import {
-  ChevronRight,
-  FileText,
-  FilePlus,
-  LayoutTemplate,
-  MoreHorizontal,
-  Plus,
-  X,
-} from "lucide-react";
+import { FileText, FilePlus, LayoutTemplate, Plus, X } from "lucide-react";
 
 import {
   DndContext,
-  PointerSensor,
-  KeyboardSensor,
+  DragOverlay,
+  MeasuringStrategy,
+  MouseSensor,
+  TouchSensor,
+  useDroppable,
   useSensor,
   useSensors,
-  closestCenter,
-  type DragEndEvent,
-  type DragOverEvent,
+  type Announcements,
+  type ClientRect,
+  type CollisionDetection,
+  type UniqueIdentifier,
 } from "@dnd-kit/core";
-import {
-  SortableContext,
-  useSortable,
-  verticalListSortingStrategy,
-  sortableKeyboardCoordinates,
-} from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
 
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { useUi } from "../../stores/ui";
-import { ContextMenu, type ContextMenuItem } from "../../components/ContextMenu";
 import { IconButton } from "../../components/ui/IconButton";
 import { type Doc } from "../../lib/validators";
 import { type ApiError } from "../../lib/api";
@@ -40,25 +28,41 @@ import { type ApiError } from "../../lib/api";
 import { SidebarVersion } from "../about/SidebarVersion";
 import { WorkspaceHeader } from "../workspace/WorkspaceHeader";
 import { workspaceApi } from "../workspace/workspace.api";
-import { archiveConfirmText, archiveErrorText } from "./archive";
 import { docsApi } from "./docs.api";
 import { markDocEditMode } from "./editMode";
 import { placementParent, type Placement } from "./placement";
 import {
   buildTree,
   applyOptimisticMove,
-  countDescendants,
-  descendantIds,
-  dropIntent,
-  moveArgs,
-  type TreeNode,
+  dropZone,
+  flattenVisible,
+  projectDrop,
+  INDENT,
+  type FlatRow,
+  type MoveArgs,
 } from "./tree";
+import { TreeRow, type Drop, type TreeState } from "./TreeRow";
+
+const SCREEN_READER_INSTRUCTIONS = {
+  draggable: "Drag to move. Use the row menu or Alt with the arrow keys to move by keyboard.",
+};
+
+/** Rows are measured while dragging too: the dragged page's subtree unmounts
+ *  when the drag starts, and the rows below it move up. */
+const MEASURING = { droppable: { strategy: MeasuringStrategy.Always } };
+
+/** The droppable id of the tree's list. Doc ids are UUIDs, so it can't clash. */
+const TREE_AREA = ":tree";
+
+/** The row the collision detection found under the pointer, measured in the
+ *  same pass, so the drop zone and dnd-kit's `over` always agree. */
+type Hit = { id: string; rect: ClientRect; pointerY: number };
 
 export function DocTree() {
   const qc = useQueryClient();
   const nav = useNavigate();
   const notify = useUi((s) => s.notify);
-  const { id: activeId } = useParams();
+  const { id: openId } = useParams();
 
   const { workspace } = useEffectiveRole();
   const canEdit = workspace === "owner" || workspace === "editor";
@@ -90,8 +94,7 @@ export function DocTree() {
   });
 
   const move = useMutation({
-    mutationFn: async (a: { id: string; body: { parent_id?: string | null; before_id?: string; after_id?: string } }) =>
-      docsApi.move(a.id, a.body),
+    mutationFn: async (a: { id: string; body: MoveArgs }) => docsApi.move(a.id, a.body),
     onMutate: async (a) => {
       await qc.cancelQueries({ queryKey: ["docs"] });
       const prev = qc.getQueryData<{ ok: Doc[] } | { error: ApiError }>(["docs"]);
@@ -109,43 +112,76 @@ export function DocTree() {
     onSettled: () => { void qc.invalidateQueries({ queryKey: ["docs"] }); },
   });
 
+  // No KeyboardSensor: moving by keyboard is a set of explicit commands, not
+  // a keyboard drag. On touch a drag needs a press and hold, so a swipe still
+  // scrolls the sidebar.
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } }),
   );
 
-  const flatIds = useMemo(
-    () => (list.data && "ok" in list.data ? list.data.ok.map((d) => d.id) : []),
-    [list.data],
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set());
+  const toggle = useCallback((id: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  }, []);
+
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const docs = useMemo(() => (list.data && "ok" in list.data ? list.data.ok : []), [list.data]);
+  const tree = useMemo(() => buildTree(docs), [docs]);
+  const flat = useMemo(
+    () => flattenVisible(tree, collapsed, draggingId ?? undefined),
+    [tree, collapsed, draggingId],
+  );
+  const rows = useMemo(() => new Map(flat.map((r) => [r.id, r])), [flat]);
+  const accessibility = useMemo(
+    () => ({ announcements: makeAnnouncements(() => flat), screenReaderInstructions: SCREEN_READER_INSTRUCTIONS }),
+    [flat],
   );
 
-  const [drop, setDrop] = useState<{ overId: string; intent: "before" | "after" | "into" } | null>(null);
+  const treeRef = useRef<HTMLUListElement | null>(null);
+  const hitRef = useRef<Hit | null>(null);
+  const collisionDetection = useCallback<CollisionDetection>((args) => {
+    hitRef.current = rowAtPointer(args);
+    return hitRef.current ? [{ id: hitRef.current.id }] : [];
+  }, []);
 
-  function onDragOver(e: DragOverEvent) {
-    const over = e.over;
-    const activeRect = e.active.rect.current.translated;
-    if (!over || over.id === e.active.id || !activeRect) { setDrop(null); return; }
-    const centerY = activeRect.top + activeRect.height / 2;
-    const intent = dropIntent(centerY, { top: over.rect.top, height: over.rect.height });
-    setDrop({ overId: String(over.id), intent });
+  // The projection shown (the drop line and the row's data-drop-* attributes)
+  // and sent on drop. Kept in a ref too: drag events can come before the
+  // re-render that the last update asked for.
+  const [drop, setDrop] = useState<Drop | null>(null);
+  const dropRef = useRef<Drop | null>(null);
+  function showDrop(next: Drop | null) {
+    if (sameDrop(dropRef.current, next)) return;
+    dropRef.current = next;
+    setDrop(next);
   }
 
-  function onDragEnd(e: DragEndEvent) {
-    const d = drop;
-    setDrop(null);
-    if (!e.over || !d) return;
-    const movedId = String(e.active.id);
-    const targetId = String(e.over.id);
-    if (movedId === targetId) return;
-    const docs = list.data && "ok" in list.data ? list.data.ok : [];
-    const target = docs.find((x) => x.id === targetId) ?? null;
-    if (!target) return;
-    const destParent = d.intent === "into" ? target.id : (target.parent_id ?? null);
-    if (destParent === movedId || (destParent && descendantIds(docs, movedId).has(destParent))) {
-      notify("error", "Can't move a document inside itself");
+  /** Re-project from the latest hit: the pointer's height picks the gap,
+   *  the horizontal drag the depth. */
+  function track(activeId: UniqueIdentifier, deltaX: number) {
+    const hit = hitRef.current;
+    if (!hit) {
+      showDrop(null);
       return;
     }
-    move.mutate({ id: movedId, body: moveArgs(target, d.intent) });
+    const id = String(activeId);
+    const zone = dropZone(hit.pointerY, hit.rect, hit.id === id);
+    const projection = projectDrop(flat, docs, id, hit.id, zone, Math.round(deltaX / INDENT));
+    showDrop(projection && { overId: hit.id, zone, projection });
+  }
+
+  const [clicks] = useState(clickSwallower);
+  useEffect(() => () => clicks.release(), [clicks]);
+
+  function endDrag() {
+    hitRef.current = null;
+    showDrop(null);
+    setDraggingId(null);
+    clicks.releaseSoon();
   }
 
   // Named rather than an inline `async` handler: `onPickTemplate` is typed
@@ -171,7 +207,19 @@ export function DocTree() {
     await nav(`/doc/${created.id}`);
   }
 
-  const tree = list.data && "ok" in list.data ? buildTree(list.data.ok) : [];
+  const state: TreeState = {
+    openId,
+    canEdit,
+    isOwner,
+    retentionDays,
+    rows,
+    collapsed,
+    onToggle: toggle,
+    onNewChild: (pid) => create.mutate(pid),
+    draggingId,
+    drop,
+  };
+  const dragged = draggingId === null ? undefined : rows.get(draggingId);
 
   return (
     <div data-testid="doc-tree" className="flex flex-col h-full">
@@ -201,28 +249,43 @@ export function DocTree() {
         <p className="px-3 py-2 text-sm text-fg-muted">No documents yet.</p>
       )}
       {list.data && "ok" in list.data && (
-        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragOver={onDragOver} onDragEnd={onDragEnd} onDragCancel={() => setDrop(null)}>
-          <SortableContext items={flatIds} strategy={verticalListSortingStrategy}>
-            {/* 12px clear on the right, like the rest of the sidebar: rows
-                are drag targets, and the 8px resize handle on the edge needs
-                that much room around it (WCAG 2.5.8 target spacing). */}
-            <ul className="pl-2 pr-3 pb-3 list-none m-0 flex-1">
-              {tree.map((n) => (
-                <TreeRow
-                  key={n.id}
-                  node={n}
-                  depth={0}
-                  activeId={activeId}
-                  canEdit={canEdit}
-                  isOwner={isOwner}
-                  retentionDays={retentionDays}
-                  onNewChild={(pid) => create.mutate(pid)}
-                  dropHint={drop && drop.overId === n.id ? drop.intent : null}
-                  drop={drop}
-                />
-              ))}
-            </ul>
-          </SortableContext>
+        <DndContext
+          sensors={sensors}
+          collisionDetection={collisionDetection}
+          measuring={MEASURING}
+          accessibility={accessibility}
+          onDragStart={(e) => {
+            hitRef.current = null;
+            showDrop(null);
+            setDraggingId(String(e.active.id));
+            clicks.arm(() => treeRef.current);
+          }}
+          onDragMove={(e) => track(e.active.id, e.delta.x)}
+          onDragOver={(e) => track(e.active.id, e.delta.x)}
+          onDragEnd={(e) => {
+            const d = dropRef.current;
+            endDrag();
+            // No projection: a drop in place, a no-op or outside the tree.
+            if (d) move.mutate({ id: String(e.active.id), body: d.projection.args });
+          }}
+          onDragCancel={endDrag}
+        >
+          <TreeList listRef={treeRef} disabled={!canEdit}>
+            {tree.map((n) => (
+              <TreeRow key={n.id} node={n} depth={0} tree={state} />
+            ))}
+          </TreeList>
+          <DragOverlay dropAnimation={null}>
+            {dragged && (
+              <div
+                aria-hidden
+                className="flex items-center gap-1 h-7 px-2 rounded bg-surface border border-border shadow-lg text-[13px] text-fg cursor-grabbing"
+              >
+                <FileText size={14} aria-hidden className="text-fg-muted shrink-0" />
+                <span className="truncate">{dragged.title}</span>
+              </div>
+            )}
+          </DragOverlay>
         </DndContext>
       )}
       <SidebarVersion />
@@ -230,8 +293,7 @@ export function DocTree() {
         <NewDocPicker
           onClose={() => setPickerOpen(false)}
           current={(() => {
-            const docs = list.data && "ok" in list.data ? list.data.ok : [];
-            const c = activeId ? docs.find((d) => d.id === activeId) : undefined;
+            const c = openId ? docs.find((d) => d.id === openId) : undefined;
             return c ? { id: c.id, parent_id: c.parent_id, title: c.title } : null;
           })()}
           onPickBlank={(parentId) => {
@@ -245,6 +307,137 @@ export function DocTree() {
       )}
     </div>
   );
+}
+
+/** The tree's list. It is a droppable only so that dnd-kit measures it with
+ *  the rows (scroll-adjusted, with no DOM reads of ours during a drag): the
+ *  collision detection takes the tree's bounds from it and never returns it. */
+function TreeList({
+  listRef,
+  disabled,
+  children,
+}: {
+  listRef: RefObject<HTMLUListElement | null>;
+  disabled: boolean;
+  children: ReactNode;
+}) {
+  const { setNodeRef } = useDroppable({ id: TREE_AREA, disabled });
+  const setList = useCallback(
+    (el: HTMLUListElement | null) => {
+      setNodeRef(el);
+      listRef.current = el;
+    },
+    [setNodeRef, listRef],
+  );
+  return (
+    // 12px clear on the right, like the rest of the sidebar: rows are drag
+    // targets, and the 8px resize handle on the edge needs that much room
+    // around it (WCAG 2.5.8 target spacing).
+    <ul ref={setList} className="pl-2 pr-3 pb-3 list-none m-0 flex-1">
+      {children}
+    </ul>
+  );
+}
+
+/** Collision detection by pointer, not by the drag ghost: the row under the
+ *  pointer, else the row whose vertical centre is closest. Nothing when the
+ *  pointer is outside the tree, so a drop there cancels. */
+function rowAtPointer({
+  droppableContainers,
+  droppableRects,
+  pointerCoordinates: p,
+}: Parameters<CollisionDetection>[0]): Hit | null {
+  const area = droppableRects.get(TREE_AREA);
+  if (!p || !area || p.x < area.left || p.x > area.right || p.y < area.top || p.y > area.bottom) {
+    return null;
+  }
+  let best: (Hit & { dist: number }) | null = null;
+  for (const { id } of droppableContainers) {
+    const rect = id === TREE_AREA ? undefined : droppableRects.get(id);
+    if (!rect) continue;
+    const hit = { id: String(id), rect, pointerY: p.y };
+    if (p.y >= rect.top && p.y < rect.bottom) return hit;
+    const dist = Math.abs(rect.top + rect.height / 2 - p.y);
+    if (!best || dist < best.dist) best = { ...hit, dist };
+  }
+  return best && { id: best.id, rect: best.rect, pointerY: p.y };
+}
+
+function sameDrop(a: Drop | null, b: Drop | null): boolean {
+  if (a === null || b === null) return a === b;
+  const [p, q] = [a.projection, b.projection];
+  return (
+    a.overId === b.overId &&
+    a.zone === b.zone &&
+    p.depth === q.depth &&
+    p.minDepth === q.minDepth &&
+    p.maxDepth === q.maxDepth &&
+    p.args.parent_id === q.args.parent_id &&
+    p.args.before_id === q.args.before_id &&
+    p.args.after_id === q.args.after_id
+  );
+}
+
+/** Swallows the click that ends a pointer drag when it lands in the tree.
+ *  Released on a row link, that click would follow the href (a full page
+ *  load): dnd-kit only stops its propagation. The listener is on `window` in
+ *  the capture phase, because dnd-kit's own capture listener on `document`
+ *  stops the click before anything in the tree could see it. It goes after
+ *  the first click, or 100 ms after the drag ends. */
+function clickSwallower() {
+  let within: () => Element | null = () => null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const swallow = (e: MouseEvent) => {
+    if (within()?.contains(e.target as Node)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    release();
+  };
+  function release() {
+    window.removeEventListener("click", swallow, { capture: true });
+    clearTimeout(timer);
+    timer = undefined;
+  }
+  return {
+    /** From drag start on. */
+    arm(tree: () => Element | null) {
+      release();
+      within = tree;
+      window.addEventListener("click", swallow, { capture: true });
+    },
+    /** At drag end or cancel. */
+    releaseSoon() {
+      clearTimeout(timer);
+      timer = setTimeout(release, 100);
+    },
+    release,
+  };
+}
+
+/** dnd-kit's live-region messages, by title: an id means nothing to a
+ *  listener. `getFlat` returns the rows on screen. */
+export function makeAnnouncements(getFlat: () => FlatRow[]): Announcements {
+  const name = (id: UniqueIdentifier) => {
+    const title = getFlat().find((r) => r.id === String(id))?.title;
+    return title === undefined ? "a page" : `“${title}”`;
+  };
+  return {
+    onDragStart: ({ active }) => `Picked up ${name(active.id)}.`,
+    onDragOver: ({ active, over }) =>
+      !over
+        ? `${name(active.id)} is no longer over a page.`
+        : over.id === active.id
+          ? `${name(active.id)} is over its own row.`
+          : `${name(active.id)} is over ${name(over.id)}.`,
+    onDragEnd: ({ active, over }) =>
+      !over
+        ? `${name(active.id)} was dropped outside the tree. It didn't move.`
+        : over.id === active.id
+          ? `${name(active.id)} was dropped on its own row.`
+          : `${name(active.id)} was dropped over ${name(over.id)}.`,
+    onDragCancel: ({ active }) => `Moving ${name(active.id)} was cancelled. It didn't move.`,
+  };
 }
 
 /** Modal for "New document": choose Blank or one of the workspace templates. */
@@ -366,200 +559,5 @@ export function NewDocPicker({
         </div>
       </div>
     </div>
-  );
-}
-
-function TreeRow({
-  node,
-  depth,
-  activeId,
-  canEdit,
-  isOwner,
-  retentionDays,
-  onNewChild,
-  dropHint,
-  drop,
-}: {
-  node: TreeNode;
-  depth: number;
-  activeId?: string;
-  canEdit: boolean;
-  isOwner: boolean;
-  retentionDays: number;
-  onNewChild: (parentId: string) => void;
-  dropHint: "before" | "after" | "into" | null;
-  drop: { overId: string; intent: "before" | "after" | "into" } | null;
-}) {
-  const qc = useQueryClient();
-  const nav = useNavigate();
-  const notify = useUi((s) => s.notify);
-  const isActive = activeId === node.id;
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
-  const [expanded, setExpanded] = useState(true);
-
-  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, isDragging } =
-    useSortable({
-      id: node.id,
-      disabled: !canEdit,
-    });
-  // The row itself is the keyboard drag handle. Without an activator node
-  // the sensor starts a drag (and swallows the key) on Enter/Space anywhere
-  // inside the row, so its link and buttons never got the key. Pointer
-  // drags still start anywhere in the row.
-  const setRowRef = (el: HTMLLIElement | null) => {
-    setNodeRef(el);
-    setActivatorNodeRef(el);
-  };
-  const sortableStyle = {
-    transform: CSS.Transform.toString(transform),
-    opacity: isDragging ? 0.5 : 1,
-  };
-
-  async function onRename() {
-    const next = window.prompt("Rename to:", node.title);
-    if (!next || next === node.title) return;
-    const r = await docsApi.patch(node.id, { title: next });
-    if ("error" in r) notify("error", "Rename failed");
-    else await qc.invalidateQueries({ queryKey: ["docs"] });
-  }
-
-  async function onArchive() {
-    if (!window.confirm(archiveConfirmText(node.title, countDescendants(node), retentionDays))) return;
-    const r = await docsApi.archive(node.id);
-    if ("error" in r) {
-      notify("error", archiveErrorText(r.error.code));
-      return;
-    }
-    notify("info", "Moved to archive");
-    await qc.invalidateQueries({ queryKey: ["docs"] });
-    await qc.invalidateQueries({ queryKey: ["archive"] });
-    // An open page in the moved subtree switches to its archived view.
-    await qc.invalidateQueries({ queryKey: ["doc"] });
-  }
-
-  async function onToggleTemplate() {
-    const next = !node.is_template;
-    const r = await docsApi.setTemplate(node.id, next);
-    if ("error" in r) {
-      notify("error", next ? "Couldn't save as template" : "Couldn't remove template");
-      return;
-    }
-    notify("info", next ? "Saved as template" : "Removed from templates");
-    await qc.invalidateQueries({ queryKey: ["docs"] });
-    await qc.invalidateQueries({ queryKey: ["templates"] });
-  }
-
-  const items: ContextMenuItem[] = [];
-  if (canEdit) {
-    items.push({ label: "Rename", testId: "ctx-rename", onSelect: () => void onRename() });
-  }
-  if (isOwner) {
-    items.push({
-      label: "Permissions…",
-      testId: "ctx-permissions",
-      onSelect: () => void nav(`/doc/${node.id}/permissions`),
-    });
-    items.push({
-      label: node.is_template ? "Remove from templates" : "Save as template",
-      testId: "ctx-template",
-      onSelect: () => void onToggleTemplate(),
-    });
-  }
-  if (canEdit) {
-    items.push({ label: "Move to archive", testId: "ctx-delete", destructive: true, onSelect: () => void onArchive() });
-  }
-
-  return (
-    <li ref={setRowRef} style={sortableStyle} {...attributes} {...listeners}>
-      <div
-        className={`relative group flex items-center gap-1 rounded h-7 pr-1 transition-colors ease-swift duration-150 ${
-          isActive
-            ? "bg-muted text-fg"
-            : "text-fg-muted hover:text-fg hover:bg-muted/60"
-        } ${dropHint === "into" ? "ring-1 ring-accent bg-accent/10" : ""}`}
-        style={{ paddingLeft: 4 + depth * 12 }}
-      >
-        {dropHint === "before" && (
-          <span className="pointer-events-none absolute left-0 right-1 top-0 h-0.5 bg-accent rounded" />
-        )}
-        {dropHint === "after" && (
-          <span className="pointer-events-none absolute left-0 right-1 bottom-0 h-0.5 bg-accent rounded" />
-        )}
-        {node.children.length > 0 ? (
-          <button
-            type="button"
-            aria-label={expanded ? "Collapse" : "Expand"}
-            onClick={(e) => { e.preventDefault(); setExpanded((v) => !v); }}
-            className="h-5 w-5 inline-flex items-center justify-center text-fg-muted hover:text-fg rounded shrink-0"
-          >
-            <ChevronRight
-              size={12}
-              aria-hidden
-              className={`transition-transform duration-150 ${expanded ? "rotate-90" : ""}`}
-            />
-          </button>
-        ) : (
-          <span className="h-5 w-5 shrink-0" aria-hidden />
-        )}
-        <FileText size={14} aria-hidden className="text-fg-muted shrink-0" />
-        <Link
-          data-testid={`doc-row-${node.id}`}
-          to={`/doc/${node.id}`}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            if (items.length === 0) return;
-            setMenu({ x: e.clientX, y: e.clientY });
-          }}
-          className="flex-1 min-w-0 truncate text-[13px] no-underline text-inherit py-1"
-        >
-          {node.title}
-        </Link>
-        {canEdit && (
-          <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5">
-            <IconButton
-              label="More"
-              size="sm"
-              onClick={(e) => {
-                e.preventDefault();
-                setMenu({ x: e.clientX, y: e.clientY });
-              }}
-            >
-              <MoreHorizontal size={14} aria-hidden />
-            </IconButton>
-            <IconButton
-              label="Add subpage"
-              size="sm"
-              onClick={(e) => {
-                e.preventDefault();
-                onNewChild(node.id);
-              }}
-            >
-              <Plus size={14} aria-hidden />
-            </IconButton>
-          </div>
-        )}
-      </div>
-      {menu && (
-        <ContextMenu x={menu.x} y={menu.y} items={items} onClose={() => setMenu(null)} />
-      )}
-      {expanded && node.children.length > 0 && (
-        <ul className="list-none p-0 m-0">
-          {node.children.map((c) => (
-            <TreeRow
-              key={c.id}
-              node={c}
-              depth={depth + 1}
-              activeId={activeId}
-              canEdit={canEdit}
-              isOwner={isOwner}
-              retentionDays={retentionDays}
-              onNewChild={onNewChild}
-              dropHint={drop && drop.overId === c.id ? drop.intent : null}
-              drop={drop}
-            />
-          ))}
-        </ul>
-      )}
-    </li>
   );
 }

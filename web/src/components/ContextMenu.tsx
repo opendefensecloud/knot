@@ -61,10 +61,10 @@ export function ContextMenu({
       style={{ top: y, left: x }}
       // The portal moves the menu in the DOM, not in the React tree: its
       // events still bubble to the component that rendered it. In the
-      // sidebar that is a sortable row whose keyboard sensor takes
-      // Enter/Space (and calls preventDefault), so no item could be chosen
-      // by keyboard. Stopping here also stops the native event at the
-      // portal container, before the document listener above, so Escape is
+      // sidebar that is a draggable row, whose sensors start a drag on
+      // mousedown and touchstart, and whose keys must not be taken from
+      // the menu. Stopping here also stops the native event at the portal
+      // container, before the document listeners above, so Escape is
       // handled here too.
       onKeyDown={(e) => {
         if (e.key === "Escape") onClose();
@@ -75,6 +75,8 @@ export function ContextMenu({
         e.stopPropagation();
       }}
       onPointerDown={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onTouchStart={(e) => e.stopPropagation()}
     >
       {items.map((it) => (
         <button
