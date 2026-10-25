@@ -291,14 +291,14 @@ impl PgDocStore {
         if expected_parent.is_some() {
             placement::lock_group(&mut tx, workspace_id, None).await?;
         }
+        // In any workspace, unlike `lock_parent`: the schema doesn't keep a
+        // parent in its child's workspace, and an archived parent elsewhere
+        // must still send the doc to the top level rather than leave it
+        // live under that parent.
         let parent_archived = match expected_parent {
-            Some(parent_id) => sqlx::query_scalar::<_, bool>(
-                "SELECT archived_at IS NOT NULL FROM documents WHERE id = $1 FOR SHARE",
-            )
-            .bind(parent_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .unwrap_or(false),
+            Some(parent_id) => lock_parent_row(&mut tx, None, parent_id, ParentLock::Share)
+                .await?
+                .unwrap_or(false),
             None => false,
         };
         let row: Option<(Option<Uuid>, Option<Uuid>, bool)> = sqlx::query_as(
@@ -858,10 +858,11 @@ async fn lock_live_parent(
     }
 }
 
-/// How `lock_parent` locks the parent's row.
+/// How `lock_parent_row` locks the parent's row.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ParentLock {
-    /// `FOR SHARE`, for the explicit-key `create` and `move_to`.
+    /// `FOR SHARE`, for the explicit-key `create` and `move_to`, and for
+    /// restore, which reads the parent before locking the doc.
     Share,
     /// `FOR NO KEY UPDATE`, for the group lock of placement, which also
     /// keeps placements under the parent one after the other.
@@ -877,25 +878,37 @@ pub(crate) async fn lock_parent(
     parent_id: Uuid,
     lock: ParentLock,
 ) -> Result<(), DocStoreError> {
-    let sql = match lock {
-        ParentLock::Share => {
-            "SELECT archived_at IS NOT NULL FROM documents
-              WHERE workspace_id = $1 AND id = $2 FOR SHARE"
-        }
-        ParentLock::NoKeyUpdate => {
-            "SELECT archived_at IS NOT NULL FROM documents
-              WHERE workspace_id = $1 AND id = $2 FOR NO KEY UPDATE"
-        }
-    };
-    let archived: Option<bool> = sqlx::query_scalar(sql)
-        .bind(workspace_id)
-        .bind(parent_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    if archived == Some(true) {
+    if lock_parent_row(tx, Some(workspace_id), parent_id, lock).await? == Some(true) {
         return Err(DocStoreError::Archived);
     }
     Ok(())
+}
+
+/// Locks the row of `parent_id` with `lock` until the transaction ends, and
+/// returns whether it is in the archive; `None` when there is no such row.
+/// With `workspace_id`, only a row in that workspace counts; without, the
+/// row is read wherever it is.
+async fn lock_parent_row(
+    tx: &mut sqlx::PgConnection,
+    workspace_id: Option<Uuid>,
+    parent_id: Uuid,
+    lock: ParentLock,
+) -> Result<Option<bool>, sqlx::Error> {
+    let sql = match lock {
+        ParentLock::Share => {
+            "SELECT archived_at IS NOT NULL FROM documents
+              WHERE id = $2 AND ($1::uuid IS NULL OR workspace_id = $1) FOR SHARE"
+        }
+        ParentLock::NoKeyUpdate => {
+            "SELECT archived_at IS NOT NULL FROM documents
+              WHERE id = $2 AND ($1::uuid IS NULL OR workspace_id = $1) FOR NO KEY UPDATE"
+        }
+    };
+    sqlx::query_scalar(sql)
+        .bind(workspace_id)
+        .bind(parent_id)
+        .fetch_optional(&mut *tx)
+        .await
 }
 
 /// Fails with `Cycle` when moving `doc_id` under `parent_id` would create a

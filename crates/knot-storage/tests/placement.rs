@@ -658,6 +658,38 @@ async fn restore_next_to_an_invalid_last_key_goes_last() {
     );
 }
 
+/// The schema doesn't keep a parent in its child's workspace. Restore reads
+/// the parent wherever it is, so a page whose parent is archived in another
+/// workspace still goes to the top level of its own, instead of coming back
+/// live under an archived parent, where purging that parent deletes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_under_a_parent_archived_in_another_workspace_goes_to_the_top_level() {
+    let w = world().await;
+    let other_ws = PgWorkspaceStore::new(w.pool.clone())
+        .create("other", "O")
+        .await
+        .unwrap()
+        .id;
+    let parent: Uuid = sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+         VALUES ($1, NULL, 'Elsewhere', 'm', $2) RETURNING id",
+    )
+    .bind(other_ws)
+    .bind(w.user)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    let page = w.seed(Some(parent), "Page", "m").await;
+    w.store.archive(w.ws, page, w.user).await.unwrap();
+    w.store.archive(other_ws, parent, w.user).await.unwrap();
+
+    let restored = w.store.restore(w.ws, page, w.user).await.unwrap();
+
+    assert_eq!(restored, [page]);
+    assert_eq!(w.parent_of(page).await, None, "its parent is archived");
+    assert_eq!(healthy_titles(&w.group(None).await), ["Page"]);
+}
+
 /// A writer that doesn't take the group's lock (an old release during a
 /// rolling upgrade) takes the key restore picked, between restore's read of
 /// the group and its write. Restore then fails with `Conflict`, as create
