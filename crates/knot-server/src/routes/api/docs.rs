@@ -164,6 +164,10 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
         }
         // The parent is in the archive.
         Err(knot_storage::DocStoreError::Archived) => doc_archived(),
+        // The parent is not a page of this workspace.
+        Err(knot_storage::DocStoreError::NotFound) => {
+            json_err(StatusCode::NOT_FOUND, "doc.not_found", "")
+        }
         Err(knot_storage::DocStoreError::BadAnchor) => bad_anchor(),
         Err(e) => {
             tracing::error!(error=?e, "create");
@@ -348,8 +352,9 @@ async fn move_doc(
     // Spec §6.1: `parent_id` in the request body is the *target* parent. An
     // explicit `null` (or omitted field, since serde collapses both to
     // `None`) moves the doc to the workspace root. `move_placed` will surface
-    // `DocStoreError::NotFound` if the document doesn't exist, so we skip a
-    // pre-flight existence check here.
+    // `DocStoreError::NotFound` if the document doesn't exist, or if the
+    // target parent is not a page of this workspace, so we skip a pre-flight
+    // existence check here.
     let new_parent = body.parent_id;
     let placement = match (body.after_id, body.before_id) {
         (Some(after), _) => Placement::After(after),
@@ -686,6 +691,10 @@ async fn create_from_template_inline(
             return json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "");
         }
         Err(knot_storage::DocStoreError::Archived) => return doc_archived(),
+        // The parent is not a page of this workspace.
+        Err(knot_storage::DocStoreError::NotFound) => {
+            return json_err(StatusCode::NOT_FOUND, "doc.not_found", "");
+        }
         Err(e) => {
             tracing::error!(error=?e, "from_template create");
             return internal();

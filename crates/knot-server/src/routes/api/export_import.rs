@@ -50,7 +50,8 @@ struct ExportDocQuery {
 struct ImportQuery {
     /// Optional target parent. Imported root docs (manifest entries with
     /// `parent_id = None`) are placed under this parent instead of the
-    /// workspace root. The caller still needs editor+ on that parent;
+    /// workspace root. It must be a page of the caller's workspace (else
+    /// 404 `doc.not_found`), and the caller still needs editor+ on it;
     /// owner-only on the workspace otherwise applies.
     #[serde(default)]
     parent_id: Option<Uuid>,
@@ -454,6 +455,9 @@ async fn import(
     let Some(acl) = state.acl.clone() else {
         return internal();
     };
+    let Some(docs) = state.docs.clone() else {
+        return internal();
+    };
     // ACL: with no parent_id, owner on the workspace is required.
     // With a parent_id, editor+ on that parent is sufficient.
     match q.parent_id {
@@ -467,6 +471,16 @@ async fn import(
             }
         }
         Some(parent) => {
+            // As for create and move: a page of another workspace is no
+            // parent here, and is refused like an id no page has.
+            match docs.get(parent).await {
+                Ok(Some(doc)) if doc.workspace_id == ctx.workspace_id => {}
+                Ok(_) => return json_err(StatusCode::NOT_FOUND, "doc.not_found", ""),
+                Err(e) => {
+                    tracing::error!(error=?e, "import: read parent");
+                    return internal();
+                }
+            }
             match acl
                 .effective_role(ctx.workspace_id, parent, ctx.user_id)
                 .await
@@ -482,9 +496,6 @@ async fn import(
             }
         }
     }
-    let Some(docs) = state.docs.clone() else {
-        return internal();
-    };
     let Some(blob_meta) = state.blob_meta.clone() else {
         return internal();
     };

@@ -45,7 +45,7 @@ const MAX_KEY_LEN: usize = 64;
 /// - Under a parent: the parent's row, `FOR NO KEY UPDATE`. It conflicts
 ///   with archive's `FOR UPDATE` and with the stamping `UPDATE`, so a page
 ///   can't slip under a parent that is being archived. An archived parent
-///   gives `Archived`; a missing one is left to the foreign key.
+///   gives `Archived`; one that is not a page of `ws` gives `NotFound`.
 pub(crate) async fn lock_group(
     conn: &mut PgConnection,
     ws: Uuid,
@@ -71,8 +71,9 @@ pub(crate) async fn lock_group(
 ///   check sees the first's result.
 /// - At the top level, the group's advisory lock first, then the row.
 ///
-/// `NotFound` when the doc is missing; `Archived` when it or the parent is
-/// in the archive.
+/// `NotFound` when the doc or the parent is not a page of `ws`, before the
+/// caller's cycle check can say anything about a page elsewhere; `Archived`
+/// when either is in the archive.
 pub(crate) async fn lock_move(
     conn: &mut PgConnection,
     ws: Uuid,
@@ -103,7 +104,8 @@ pub(crate) async fn lock_move(
             .await?
         }
     };
-    if !rows.iter().any(|(id, _)| *id == doc) {
+    let locked = |id: Uuid| rows.iter().any(|(row, _)| *row == id);
+    if !locked(doc) || parent.is_some_and(|parent| !locked(parent)) {
         return Err(DocStoreError::NotFound);
     }
     if rows.iter().any(|(_, archived)| *archived) {

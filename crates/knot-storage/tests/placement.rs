@@ -690,6 +690,114 @@ async fn restore_under_a_parent_archived_in_another_workspace_goes_to_the_top_le
     assert_eq!(healthy_titles(&w.group(None).await), ["Page"]);
 }
 
+/// A page of another workspace is not a parent, live or archived, and
+/// neither is an id no page has: creates and moves under one fail with
+/// `NotFound`, as for an unknown id, and write nothing. The foreign key only
+/// proves the row exists, so they used to put the page under another
+/// workspace's page (and failed on the foreign key for an unknown id). The
+/// explicit-key `create` and `move_to` read the parent the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_under_a_parent_outside_the_workspace_are_not_found() {
+    let w = world().await;
+    let other_ws = PgWorkspaceStore::new(w.pool.clone())
+        .create("other", "O")
+        .await
+        .unwrap()
+        .id;
+    let foreign = async |title| {
+        w.store
+            .create_placed(other_ws, None, title, Placement::Last, w.user)
+            .await
+            .unwrap()
+            .id
+    };
+    let live = foreign("Elsewhere").await;
+    let archived = foreign("Archived elsewhere").await;
+    w.store.archive(other_ws, archived, w.user).await.unwrap();
+    let mover = w.page("Mover").await;
+    let documents = async || -> Vec<(Uuid, Uuid, Option<Uuid>, String, String, String)> {
+        sqlx::query_as(
+            "SELECT id, workspace_id, parent_id, title, sort_key, updated_at::text
+               FROM documents ORDER BY id",
+        )
+        .fetch_all(&w.pool)
+        .await
+        .unwrap()
+    };
+    let before = documents().await;
+
+    let mut wrong = Vec::new();
+    for (parent, name) in [
+        (live, "a live page of another workspace"),
+        (archived, "an archived page of another workspace"),
+        (Uuid::new_v4(), "an unknown id"),
+    ] {
+        let results = [
+            w.store
+                .create_placed(w.ws, Some(parent), "Stray", Placement::Last, w.user)
+                .await
+                .map(drop),
+            w.store
+                .move_placed(w.ws, mover, w.user, Some(parent), Placement::Last)
+                .await
+                .map(drop),
+            w.store
+                .create(w.ws, Some(parent), "Stray", "m", w.user)
+                .await
+                .map(drop),
+            w.store
+                .move_to(w.ws, mover, w.user, Some(parent), "m")
+                .await
+                .map(drop),
+        ];
+        for (op, result) in ["create_placed", "move_placed", "create", "move_to"]
+            .into_iter()
+            .zip(results)
+        {
+            if !matches!(result, Err(DocStoreError::NotFound)) {
+                wrong.push(format!("{op} under {name}: {result:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "not NotFound:\n{}", wrong.join("\n"));
+    assert_eq!(documents().await, before, "nothing was written");
+}
+
+/// A page of another workspace under the moved page, as that bug could
+/// leave one: a move into it is refused as for any foreign parent, before
+/// the cycle check, whose `Cycle` would tell that the page exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn move_into_a_foreign_page_under_the_moved_page_is_not_found() {
+    let w = world().await;
+    let other_ws = PgWorkspaceStore::new(w.pool.clone())
+        .create("other", "O")
+        .await
+        .unwrap()
+        .id;
+    let mover = w.page("Mover").await;
+    let foreign_child: Uuid = sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+         VALUES ($1, $2, 'Foreign child', 'm', $3) RETURNING id",
+    )
+    .bind(other_ws)
+    .bind(mover)
+    .bind(w.user)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+
+    let moved = w
+        .store
+        .move_placed(w.ws, mover, w.user, Some(foreign_child), Placement::Last)
+        .await;
+
+    assert!(
+        matches!(moved, Err(DocStoreError::NotFound)),
+        "got {moved:?}"
+    );
+    assert_eq!(w.parent_of(mover).await, None);
+}
+
 /// A writer that doesn't take the group's lock (an old release during a
 /// rolling upgrade) takes the key restore picked, between restore's read of
 /// the group and its write. Restore then fails with `Conflict`, as create

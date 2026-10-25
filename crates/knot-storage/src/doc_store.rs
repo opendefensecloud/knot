@@ -118,7 +118,8 @@ pub trait DocStore: Send + Sync + 'static {
     /// top level when `None`). The key is chosen in the same transaction,
     /// under the group's lock (see `placement`). `BadAnchor` when the anchor
     /// is not a live, non-template page under `parent_id`; `Archived` when
-    /// the parent is in the archive.
+    /// the parent is in the archive; `NotFound` when it is not a page of
+    /// the workspace.
     async fn create_placed(
         &self,
         workspace_id: Uuid,
@@ -131,7 +132,8 @@ pub trait DocStore: Send + Sync + 'static {
     /// level when `None`), choosing its key in the same transaction. `Cycle`
     /// when `parent_id` is the page or one of its descendants; `BadAnchor`
     /// as for `create_placed`, and also when the anchor is the page itself;
-    /// `Archived` when the page or the parent is in the archive.
+    /// `Archived` when the page or the parent is in the archive; `NotFound`
+    /// when either is not a page of the workspace.
     async fn move_placed(
         &self,
         workspace_id: Uuid,
@@ -845,8 +847,8 @@ async fn lock_archive_root(
 /// Fails with `Archived` when the parent a doc is about to go under is in
 /// the archive. `FOR SHARE` blocks behind an archive's row lock on that
 /// parent and then re-reads the committed row, so a child cannot slip into
-/// a subtree while it is being archived. A missing parent is left to the
-/// foreign key, as before.
+/// a subtree while it is being archived. `NotFound` when the parent is not
+/// a page of the workspace (see `lock_parent`).
 async fn lock_live_parent(
     tx: &mut sqlx::PgConnection,
     workspace_id: Uuid,
@@ -871,17 +873,19 @@ pub(crate) enum ParentLock {
 
 /// Locks the row of `parent_id`, the parent a page is about to go under,
 /// until the transaction ends, and fails with `Archived` when it is in the
-/// archive. A missing parent is left to the foreign key.
+/// archive. `NotFound` when it is not a page of `workspace_id`, as for an
+/// id no page has: the foreign key would accept another workspace's page.
 pub(crate) async fn lock_parent(
     tx: &mut sqlx::PgConnection,
     workspace_id: Uuid,
     parent_id: Uuid,
     lock: ParentLock,
 ) -> Result<(), DocStoreError> {
-    if lock_parent_row(tx, Some(workspace_id), parent_id, lock).await? == Some(true) {
-        return Err(DocStoreError::Archived);
+    match lock_parent_row(tx, Some(workspace_id), parent_id, lock).await? {
+        None => Err(DocStoreError::NotFound),
+        Some(true) => Err(DocStoreError::Archived),
+        Some(false) => Ok(()),
     }
-    Ok(())
 }
 
 /// Locks the row of `parent_id` with `lock` until the transaction ends, and
