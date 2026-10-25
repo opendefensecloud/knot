@@ -7,7 +7,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionProvider } from "../../auth/SessionContext";
 
 import { DocTree, makeAnnouncements } from "./DocTree";
-import type { FlatRow } from "./tree";
+import type { FlatRow, Projection } from "./tree";
+import type { Drop } from "./TreeRow";
 
 afterEach(() => {
   cleanup();
@@ -147,6 +148,16 @@ function endDrag() {
   fireEvent.mouseUp(document, { clientX: 400, clientY: 320 });
 }
 
+/** A drop that makes the page a top-level page right after `id`. */
+function topLevelAfter(id: string): Projection {
+  return { depth: 0, minDepth: 0, maxDepth: 1, args: { parent_id: null, after_id: id } };
+}
+
+/** What dnd-kit's live region last announced. */
+function announced(): string {
+  return document.querySelector("[id^='DndLiveRegion']")?.textContent ?? "(no live region)";
+}
+
 describe("DocTree — rows", () => {
   it("gives rows no button role and no extra tab stop; the link takes focus", async () => {
     renderTree();
@@ -211,7 +222,8 @@ describe("DocTree — dragging", () => {
         descendantCount: 0,
       },
     ];
-    const say = makeAnnouncements(() => rows);
+    let drop: Drop | null = null;
+    const say = makeAnnouncements(() => rows, () => drop);
     const active = { id: rows[1]!.id } as unknown as Active;
     const over = { id: rows[0]!.id } as unknown as Over;
     const messages = [
@@ -222,12 +234,34 @@ describe("DocTree — dragging", () => {
       say.onDragEnd({ active, over: null }),
       say.onDragCancel({ active, over }),
     ];
+    drop = { overId: rows[0]!.id, zone: "below", projection: topLevelAfter(rows[0]!.id) };
+    messages.push(say.onDragEnd({ active, over }));
     for (const m of messages) {
       expect(m).toContain("“Q3 goals”");
       for (const r of rows) expect(m).not.toContain(r.id);
     }
     expect(say.onDragOver({ active, over })).toContain("“Roadmap”");
-    expect(say.onDragEnd({ active, over })).toContain("“Roadmap”");
+  });
+
+  // The drop is what moved, not the row it ended over: an un-nest on one's
+  // own row moves the page, and a drop over another row can leave it where
+  // it was.
+  it("announces where a drop put the page, or that it didn't move", () => {
+    const rows: FlatRow[] = [
+      { id: "roadmap", parentId: null, depth: 0, title: "Roadmap", descendantCount: 1 },
+      { id: "goals", parentId: "roadmap", depth: 1, title: "Q3 goals", descendantCount: 0 },
+    ];
+    let drop: Drop | null = { overId: "goals", zone: "below", projection: topLevelAfter("roadmap") };
+    const say = makeAnnouncements(() => rows, () => drop);
+    const active = { id: "goals" } as unknown as Active;
+    const own = { id: "goals" } as unknown as Over;
+    const other = { id: "roadmap" } as unknown as Over;
+
+    expect(say.onDragEnd({ active, over: own })).toBe("Moved “Q3 goals” to the top level, position 2 of 2");
+    drop = null;
+    expect(say.onDragEnd({ active, over: own })).toBe("“Q3 goals” was dropped. It didn't move.");
+    expect(say.onDragEnd({ active, over: other })).toBe("“Q3 goals” was dropped. It didn't move.");
+    expect(say.onDragEnd({ active, over: null })).toBe("“Q3 goals” was dropped outside the tree. It didn't move.");
   });
 
   // A drag released on a row link ends in a click on it. dnd-kit only stops
@@ -283,7 +317,8 @@ describe("DocTree — dragging", () => {
   });
 });
 
-// Folder (0-28), Child (28-56), Grandchild (56-84); the tree is 260px wide.
+// Folder (0-28), Child (28-56), Grandchild (56-84), in a list 260px wide
+// whose top is at y=0. The 28px above it count as the gap above Folder.
 describe("DocTree — drops", () => {
   it("un-nests a page dragged one level left on its own row", async () => {
     const fetchMock = renderTree();
@@ -296,6 +331,8 @@ describe("DocTree — drops", () => {
     expect(row).toHaveAttribute("data-drop-zone", "below");
     expect(row).toHaveAttribute("data-drop-depth", "1");
     fireEvent.mouseUp(document, { clientX: 86, clientY: 70 });
+    // Dropped on its own row, and still moved.
+    expect(announced()).toBe("Moved “Grandchild” into “Folder”, position 2 of 2");
 
     await waitFor(() =>
       expect(moves(fetchMock)).toEqual([
@@ -330,6 +367,7 @@ describe("DocTree — drops", () => {
     expect(screen.queryByTestId("doc-row-grandchild")).toBeNull();
     expect(document.querySelector("[data-drop-zone]")).toBeNull();
     fireEvent.mouseUp(document, { clientX: 100, clientY: 50 });
+    expect(announced()).toBe("“Child” was dropped. It didn't move.");
 
     await settle();
     expect(moves(fetchMock)).toEqual([]);
@@ -346,6 +384,40 @@ describe("DocTree — drops", () => {
     fireEvent.mouseMove(document, { clientX: 400, clientY: 3 }); // right of the sidebar
     expect(document.querySelector("[data-drop-zone]")).toBeNull();
     fireEvent.mouseUp(document, { clientX: 400, clientY: 3 });
+
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+  });
+
+  it("moves a page to the very top when dropped a few px above the first row", async () => {
+    const fetchMock = renderTree();
+    await editorRows();
+    layOut();
+    fireEvent.mouseDown(screen.getByTestId("doc-row-child"), { button: 0, clientX: 100, clientY: 42 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 34 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: -5 }); // above the list, in the band
+    const folder = screen.getByTestId("tree-row-folder");
+    expect(folder).toHaveAttribute("data-drop-zone", "above");
+    expect(folder).toHaveAttribute("data-drop-depth", "0");
+    fireEvent.mouseUp(document, { clientX: 100, clientY: -5 });
+
+    await waitFor(() =>
+      expect(moves(fetchMock)).toEqual([{ id: "child", body: { parent_id: null, before_id: "folder" } }]),
+    );
+  });
+
+  it("still cancels a drop more than a row height above the list", async () => {
+    const fetchMock = renderTree();
+    await editorRows();
+    layOut();
+    fireEvent.mouseDown(screen.getByTestId("doc-row-child"), { button: 0, clientX: 100, clientY: 42 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 34 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: -27 }); // still in the 28px band
+    expect(screen.getByTestId("tree-row-folder")).toHaveAttribute("data-drop-zone", "above");
+    fireEvent.mouseMove(document, { clientX: 100, clientY: -29 }); // past it
+    expect(document.querySelector("[data-drop-zone]")).toBeNull();
+    fireEvent.mouseUp(document, { clientX: 100, clientY: -29 });
+    expect(announced()).toBe("“Child” was dropped outside the tree. It didn't move.");
 
     await settle();
     expect(moves(fetchMock)).toEqual([]);

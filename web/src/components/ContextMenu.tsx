@@ -60,12 +60,14 @@ export function ContextMenu({
       className="fixed z-50 min-w-[160px] py-1 rounded-md bg-surface border border-border shadow-lg"
       style={{ top: y, left: x }}
       // The portal moves the menu in the DOM, not in the React tree: its
-      // events still bubble to the component that rendered it. In the
-      // sidebar that is a draggable row, whose sensors start a drag on
-      // mousedown and touchstart, and whose keys must not be taken from
-      // the menu. Stopping here also stops the native event at the portal
-      // container, before the document listeners above, so Escape is
-      // handled here too.
+      // events still bubble through the components that rendered it. The
+      // sidebar renders it next to its draggable row, not inside it, so they
+      // reach the row's bare <li> and what encloses it, never the row's drag
+      // listeners. The stops are defensive: rendered inside a drag source, a
+      // mousedown or touchstart would start a drag, and a key handler there
+      // could take the menu's keys. Stopping here also stops the native
+      // event at the portal container, before the document listeners above,
+      // so Escape is handled here too.
       onKeyDown={(e) => {
         if (e.key === "Escape") onClose();
         if (e.key === "ArrowDown" || e.key === "ArrowUp") {

@@ -110,9 +110,9 @@ describe("DocTree — move to archive", () => {
     expect(screen.queryByTestId("sidebar-archive")).toBeNull();
   });
 
-  // The row is a dnd-kit sortable whose keyboard sensor starts a drag on
-  // Enter/Space (and cancels the key's default). It must only do that on
-  // the row itself, or the row's own buttons and link never get the key.
+  // The row is a drag source, but a drag starts only from a mouse or touch
+  // press: no key handler on the row may take Enter (or cancel its default)
+  // from the row's own buttons and link, or keyboard users couldn't use them.
   it("lets Enter reach the row's buttons instead of starting a drag", async () => {
     vi.stubGlobal("fetch", server("editor"));
     renderTree();

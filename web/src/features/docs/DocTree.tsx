@@ -34,6 +34,7 @@ import { placementParent, type Placement } from "./placement";
 import {
   buildTree,
   applyOptimisticMove,
+  describeMove,
   dropZone,
   flattenVisible,
   projectDrop,
@@ -137,9 +138,13 @@ export function DocTree() {
     [tree, collapsed, draggingId],
   );
   const rows = useMemo(() => new Map(flat.map((r) => [r.id, r])), [flat]);
+  const [dropped] = useState(lastDrop);
   const accessibility = useMemo(
-    () => ({ announcements: makeAnnouncements(() => flat), screenReaderInstructions: SCREEN_READER_INSTRUCTIONS }),
-    [flat],
+    () => ({
+      announcements: makeAnnouncements(() => flat, dropped.get),
+      screenReaderInstructions: SCREEN_READER_INSTRUCTIONS,
+    }),
+    [flat, dropped],
   );
 
   const treeRef = useRef<HTMLUListElement | null>(null);
@@ -264,6 +269,7 @@ export function DocTree() {
           onDragOver={(e) => track(e.active.id, e.delta.x)}
           onDragEnd={(e) => {
             const d = dropRef.current;
+            dropped.set(d);
             endDrag();
             // No projection: a drop in place, a no-op or outside the tree.
             if (d) move.mutate({ id: String(e.active.id), body: d.projection.args });
@@ -341,16 +347,17 @@ function TreeList({
 
 /** Collision detection by pointer, not by the drag ghost: the row under the
  *  pointer, else the row whose vertical centre is closest. Nothing when the
- *  pointer is outside the tree, so a drop there cancels. */
+ *  pointer is outside the tree, so a drop there cancels. A band one row high
+ *  above the list counts as inside and means the gap above the first row (the
+ *  closest one there), so moving a page to the very top isn't a 7px target
+ *  (that row's top quarter) with a cancel just above it. */
 function rowAtPointer({
   droppableContainers,
   droppableRects,
   pointerCoordinates: p,
 }: Parameters<CollisionDetection>[0]): Hit | null {
   const area = droppableRects.get(TREE_AREA);
-  if (!p || !area || p.x < area.left || p.x > area.right || p.y < area.top || p.y > area.bottom) {
-    return null;
-  }
+  if (!p || !area || p.x < area.left || p.x > area.right || p.y > area.bottom) return null;
   let best: (Hit & { dist: number }) | null = null;
   for (const { id } of droppableContainers) {
     const rect = id === TREE_AREA ? undefined : droppableRects.get(id);
@@ -360,7 +367,9 @@ function rowAtPointer({
     const dist = Math.abs(rect.top + rect.height / 2 - p.y);
     if (!best || dist < best.dist) best = { ...hit, dist };
   }
-  return best && { id: best.id, rect: best.rect, pointerY: p.y };
+  // Above the list, `best` is the first row: its height is the band's.
+  if (!best || p.y < area.top - best.rect.height) return null;
+  return { id: best.id, rect: best.rect, pointerY: p.y };
 }
 
 function sameDrop(a: Drop | null, b: Drop | null): boolean {
@@ -415,9 +424,25 @@ function clickSwallower() {
   };
 }
 
+/** The drop the last drag ended with, for its announcement: dnd-kit
+ *  announces the end of a drag after `onDragEnd`, which has cleared the
+ *  shown drop by then. */
+function lastDrop() {
+  let drop: Drop | null = null;
+  return {
+    get: (): Drop | null => drop,
+    set(d: Drop | null) {
+      drop = d;
+    },
+  };
+}
+
 /** dnd-kit's live-region messages, by title: an id means nothing to a
- *  listener. `getFlat` returns the rows on screen. */
-export function makeAnnouncements(getFlat: () => FlatRow[]): Announcements {
+ *  listener. `getFlat` returns the rows on screen, `getDrop` the drop the
+ *  drag ended with. The end says what the drop did, not which row it was
+ *  over: an un-nest on one's own row moves the page, and a drop over
+ *  another row may leave it where it was. */
+export function makeAnnouncements(getFlat: () => FlatRow[], getDrop: () => Drop | null): Announcements {
   const name = (id: UniqueIdentifier) => {
     const title = getFlat().find((r) => r.id === String(id))?.title;
     return title === undefined ? "a page" : `“${title}”`;
@@ -430,12 +455,13 @@ export function makeAnnouncements(getFlat: () => FlatRow[]): Announcements {
         : over.id === active.id
           ? `${name(active.id)} is over its own row.`
           : `${name(active.id)} is over ${name(over.id)}.`,
-    onDragEnd: ({ active, over }) =>
-      !over
+    onDragEnd: ({ active, over }) => {
+      const drop = getDrop();
+      if (drop) return describeMove(getFlat(), String(active.id), drop.projection.args);
+      return !over
         ? `${name(active.id)} was dropped outside the tree. It didn't move.`
-        : over.id === active.id
-          ? `${name(active.id)} was dropped on its own row.`
-          : `${name(active.id)} was dropped over ${name(over.id)}.`,
+        : `${name(active.id)} was dropped. It didn't move.`;
+    },
     onDragCancel: ({ active }) => `Moving ${name(active.id)} was cancelled. It didn't move.`,
   };
 }
