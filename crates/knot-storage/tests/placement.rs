@@ -763,9 +763,10 @@ async fn writes_under_a_parent_outside_the_workspace_are_not_found() {
     assert_eq!(documents().await, before, "nothing was written");
 }
 
-/// A page of another workspace under the moved page, as that bug could
-/// leave one: a move into it is refused as for any foreign parent, before
-/// the cycle check, whose `Cycle` would tell that the page exists.
+/// A page of another workspace under the moved page, which a create under a
+/// foreign parent could leave before such creates were refused: a move into
+/// it is refused as for any foreign parent, before the cycle check, whose
+/// `Cycle` would tell that the page exists.
 #[tokio::test(flavor = "multi_thread")]
 async fn move_into_a_foreign_page_under_the_moved_page_is_not_found() {
     let w = world().await;
