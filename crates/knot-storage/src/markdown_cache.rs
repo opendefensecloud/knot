@@ -86,6 +86,25 @@ pub trait MarkdownCacheStore: Send + Sync + 'static {
 
     /// Invalidate (delete) the cached row for a doc.
     async fn invalidate(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError>;
+
+    /// Records that the refresh sweep starts rendering `doc_id` with
+    /// `renderer_version`, and returns whether it should: not when that
+    /// renderer started the page `max_attempts` times already without
+    /// finishing ([`finish_sweep_attempt`](Self::finish_sweep_attempt)). A
+    /// render that never finishes panicked, or the process died during it,
+    /// as on a page that overflows the stack: skipping the page after a
+    /// restart keeps it from killing every replica in turn, on every boot.
+    async fn start_sweep_attempt(
+        &self,
+        doc_id: Uuid,
+        renderer_version: i32,
+        max_attempts: i32,
+    ) -> Result<bool, MarkdownCacheError>;
+
+    /// Records that the refresh sweep's render of `doc_id` returned, whether
+    /// it succeeded or failed: a page still stale is tried again on the
+    /// sweep's next pass.
+    async fn finish_sweep_attempt(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError>;
 }
 
 #[derive(Clone)]
@@ -243,6 +262,41 @@ impl MarkdownCacheStore for PgMarkdownCache {
 
     async fn invalidate(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError> {
         sqlx::query("DELETE FROM doc_markdown_cache WHERE doc_id = $1")
+            .bind(doc_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn start_sweep_attempt(
+        &self,
+        doc_id: Uuid,
+        renderer_version: i32,
+        max_attempts: i32,
+    ) -> Result<bool, MarkdownCacheError> {
+        // One more attempt, unless this renderer is out of them: then no row
+        // comes back. An older renderer's attempts don't count.
+        let started = sqlx::query_scalar::<_, i32>(
+            "INSERT INTO doc_markdown_sweep_attempts AS a (doc_id, renderer_version, attempts)
+             VALUES ($1, $2, 1)
+             ON CONFLICT (doc_id) DO UPDATE
+             SET attempts = CASE WHEN a.renderer_version = EXCLUDED.renderer_version
+                                 THEN a.attempts + 1 ELSE 1 END,
+                 renderer_version = EXCLUDED.renderer_version,
+                 attempted_at = now()
+             WHERE a.renderer_version <> EXCLUDED.renderer_version OR a.attempts < $3
+             RETURNING a.attempts",
+        )
+        .bind(doc_id)
+        .bind(renderer_version)
+        .bind(max_attempts)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(started.is_some())
+    }
+
+    async fn finish_sweep_attempt(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError> {
+        sqlx::query("DELETE FROM doc_markdown_sweep_attempts WHERE doc_id = $1")
             .bind(doc_id)
             .execute(&self.pool)
             .await?;

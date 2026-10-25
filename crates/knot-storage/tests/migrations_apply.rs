@@ -41,6 +41,7 @@ async fn migrations_apply_cleanly() {
         "comments",
         "doc_contributors",
         "doc_markdown_cache",
+        "doc_markdown_sweep_attempts",
         "doc_snapshots",
         "doc_tasks",
         "doc_updates",

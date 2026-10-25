@@ -24,6 +24,15 @@
 //! `routes::api::markdown`). A stale page whose refresh fails is tried
 //! again on the sweep's next pass. That includes a refresh that wrote the
 //! Markdown but not the task rows: it marks the cache row stale again.
+//!
+//! Each refresh runs in a task of its own, so a panic in it is logged and
+//! ends that refresh only, not the worker. A render can also kill the whole
+//! process (a stack overflow aborts it), and the sweep would meet such a
+//! page again on every boot, on every replica. So the sweep records an
+//! attempt before it renders a page (`doc_markdown_sweep_attempts`), clears
+//! it when the render returns, and skips a page the current renderer
+//! started [`SWEEP_ATTEMPTS`] times without finishing. The debug log names
+//! each page before its render.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -34,7 +43,9 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::routes::api::markdown::{refresh_markdown_and_index, refresh_markdown_quietly};
+use crate::routes::api::markdown::{
+    RefreshError, refresh_markdown_and_index, refresh_markdown_quietly,
+};
 
 /// Flush dirty doc-ids every `FLUSH_INTERVAL`. Snappy enough that the
 /// `/tasks` page feels live, infrequent enough that a heavy typist
@@ -53,6 +64,12 @@ const SWEEP_IDLE: Duration = Duration::from_secs(10 * 60);
 /// Advisory-lock key that keeps the sweep to one replica at a time
 /// ("knotswep" in ASCII).
 pub const SWEEP_LOCK_KEY: i64 = 0x6b6e_6f74_7377_6570;
+
+/// How many times the sweep starts rendering a page with the current
+/// renderer without the render returning (it panicked, or the process died
+/// during it) before it skips the page. One such render may be a deploy
+/// stopping the process; two are taken to be the page's fault.
+const SWEEP_ATTEMPTS: i32 = 2;
 
 /// Spawn the reindex worker. Returns immediately; the worker exits
 /// when `rx` closes (i.e. the `Rooms` registry is dropped).
@@ -89,20 +106,90 @@ async fn run(state: AppState, mut rx: mpsc::Receiver<Uuid>, mut sweep: Option<Sw
                 }
                 let to_flush = std::mem::take(&mut pending);
                 for doc_id in &to_flush {
-                    if let Err(e) = refresh_markdown_and_index(&state, *doc_id).await {
+                    if let Some(Err(e)) = refresh_caught(&state, *doc_id, Refresh::Edit).await {
                         tracing::warn!(error=?e, %doc_id, "reindex worker: refresh failed");
                     }
                 }
                 // A page that was also edited has just been refreshed.
                 for doc_id in swept.into_iter().filter(|id| !to_flush.contains(id)) {
-                    if let Err(e) = refresh_markdown_quietly(&state, doc_id).await {
-                        tracing::warn!(error=?e, %doc_id, "reindex sweep: refresh failed");
-                    }
+                    sweep_page(&state, doc_id).await;
                 }
             }
         }
     }
     tracing::info!("reindex worker stopped");
+}
+
+/// Which refresh a page gets.
+#[derive(Clone, Copy)]
+enum Refresh {
+    /// An edited page's: [`refresh_markdown_and_index`].
+    Edit,
+    /// A stale page's: [`refresh_markdown_quietly`].
+    Sweep,
+}
+
+/// `refresh` of `doc_id`, run in a task of its own, so that a panic in it
+/// ends that task, not the worker: `None` when it panicked, which this logs.
+async fn refresh_caught(
+    state: &AppState,
+    doc_id: Uuid,
+    refresh: Refresh,
+) -> Option<Result<String, RefreshError>> {
+    let state = state.clone();
+    let task = tokio::spawn(async move {
+        match refresh {
+            Refresh::Edit => refresh_markdown_and_index(&state, doc_id).await,
+            Refresh::Sweep => refresh_markdown_quietly(&state, doc_id).await,
+        }
+    });
+    match task.await {
+        Ok(refreshed) => Some(refreshed),
+        Err(e) => {
+            tracing::error!(error = %e, %doc_id, "reindex worker: refresh panicked");
+            None
+        }
+    }
+}
+
+/// The sweep's refresh of `doc_id`, a stale page, between a recorded
+/// attempt and its end ([`SWEEP_ATTEMPTS`]). A page whose renders never
+/// finished is skipped, and so is one whose attempt can't be recorded:
+/// unrecorded, it couldn't be skipped after a crash. The sweep's next pass
+/// finds it again.
+async fn sweep_page(state: &AppState, doc_id: Uuid) {
+    let Some(cache) = state.markdown_cache.as_ref() else {
+        return;
+    };
+    match cache
+        .start_sweep_attempt(doc_id, knot_markdown::RENDERER_VERSION, SWEEP_ATTEMPTS)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                %doc_id,
+                attempts = SWEEP_ATTEMPTS,
+                "reindex sweep: skipped a page whose render never finished; an edit refreshes it"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, %doc_id, "reindex sweep: recording the attempt failed");
+            return;
+        }
+    }
+    tracing::debug!(%doc_id, "reindex sweep: rendering");
+    match refresh_caught(state, doc_id, Refresh::Sweep).await {
+        // The attempt stays recorded: the page is tried once more, then
+        // skipped.
+        None => return,
+        Some(Ok(_)) => {}
+        Some(Err(e)) => tracing::warn!(error=?e, %doc_id, "reindex sweep: refresh failed"),
+    }
+    if let Err(e) = cache.finish_sweep_attempt(doc_id).await {
+        tracing::warn!(error = %e, %doc_id, "reindex sweep: ending the attempt failed");
+    }
 }
 
 /// Where the sweep is: between passes, or in one, holding the sweep lock.

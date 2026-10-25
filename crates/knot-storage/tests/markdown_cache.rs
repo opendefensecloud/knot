@@ -221,3 +221,24 @@ async fn mark_stale_makes_a_current_row_stale_again() {
     p.cache.mark_stale(unrendered).await.unwrap();
     assert!(p.cache.get(unrendered).await.unwrap().is_none());
 }
+
+/// The sweep may start a page's render as often as a renderer has attempts
+/// left: each start that never finishes uses one up, a finished render gives
+/// them back, and a newer renderer starts with all of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn sweep_attempts_run_out_unless_a_render_finishes() {
+    let p = Pages::new().await;
+    let doc = p.page("a").await;
+    let start = |version| p.cache.start_sweep_attempt(doc, version, 2);
+
+    assert!(start(2).await.unwrap());
+    assert!(start(2).await.unwrap());
+    assert!(!start(2).await.unwrap(), "a third start");
+    assert!(!start(2).await.unwrap(), "and a fourth");
+
+    assert!(start(3).await.unwrap(), "a newer renderer");
+    p.cache.finish_sweep_attempt(doc).await.unwrap();
+    assert!(start(3).await.unwrap());
+    assert!(start(3).await.unwrap());
+    assert!(!start(3).await.unwrap());
+}

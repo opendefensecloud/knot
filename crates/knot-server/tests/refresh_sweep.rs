@@ -17,7 +17,8 @@ use knot_markdown::RENDERER_VERSION;
 use knot_server::AppState;
 use knot_server::routes::api::markdown::{export_markdown_only, refresh_markdown_and_index};
 use knot_storage::{
-    DocTask, DocTaskInput, PgSnapshotStore, PgTaskStore, PgUpdatesStore, SnapshotStore, TaskStore,
+    DocTask, DocTaskInput, MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore,
+    PgMarkdownCache, PgSnapshotStore, PgTaskStore, PgUpdatesStore, SnapshotStore, TaskStore,
     TaskStoreError, UpdatesStore, WorkspaceRole,
 };
 use sqlx::PgPool;
@@ -253,9 +254,71 @@ impl Harness {
         tasks
     }
 
+    /// Replaces the markdown cache with one whose write of `doc`'s render
+    /// panics. Call before [`Self::start_sweep`], which copies the state.
+    fn panicky_cache(&mut self, doc: Uuid) -> Arc<PanickyCache> {
+        let cache = Arc::new(PanickyCache {
+            inner: PgMarkdownCache::new(self.pool().clone()),
+            panics_on: doc,
+            panicked: AtomicUsize::new(0),
+        });
+        self.state.markdown_cache = Some(cache.clone());
+        cache
+    }
+
     fn start_sweep(&mut self) {
         let rx = self.dirty_rx.take().expect("sweep already started");
         knot_server::reindex::spawn_with_sweep(self.state.clone(), rx);
+    }
+
+    /// The reindex worker without the sweep: it refreshes edited pages only.
+    fn start_worker(&mut self) {
+        let rx = self.dirty_rx.take().expect("worker already started");
+        knot_server::reindex::spawn(self.state.clone(), rx);
+    }
+
+    /// An unfinished render of `doc` by the sweep, as an earlier process
+    /// left it: `attempts` renders by renderer `version` that never
+    /// returned, because they panicked or the process died during them.
+    async fn seed_attempts(&self, doc: Uuid, version: i32, attempts: i32) {
+        sqlx::query(
+            "INSERT INTO doc_markdown_sweep_attempts (doc_id, renderer_version, attempts)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(doc)
+        .bind(version)
+        .bind(attempts)
+        .execute(self.pool())
+        .await
+        .unwrap();
+    }
+
+    /// The sweep's unfinished renders of `doc`: renderer version and count.
+    async fn attempts(&self, doc: Uuid) -> Option<(i32, i32)> {
+        sqlx::query_as(
+            "SELECT renderer_version, attempts FROM doc_markdown_sweep_attempts
+             WHERE doc_id = $1",
+        )
+        .bind(doc)
+        .fetch_optional(self.pool())
+        .await
+        .unwrap()
+    }
+
+    /// Waits until the sweep's unfinished renders of `doc` are `expected`.
+    async fn wait_until_attempts(&self, doc: Uuid, expected: Option<(i32, i32)>) {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let got = self.attempts(doc).await;
+            if got == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sweep's attempts at {doc} are {got:?}, not {expected:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// The page's cache row: renderer version, Markdown and last write.
@@ -404,6 +467,93 @@ impl TaskStore for FlakyTasks {
 
     async fn list_for_doc(&self, doc_id: Uuid) -> Result<Vec<DocTask>, TaskStoreError> {
         self.inner.list_for_doc(doc_id).await
+    }
+}
+
+/// The markdown cache, except that writing one page's render panics, as a bug
+/// in a writer would.
+struct PanickyCache {
+    inner: PgMarkdownCache,
+    panics_on: Uuid,
+    panicked: AtomicUsize,
+}
+
+impl PanickyCache {
+    /// How many writes panicked so far.
+    fn panicked(&self) -> usize {
+        self.panicked.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl MarkdownCacheStore for PanickyCache {
+    async fn get_if_fresh(
+        &self,
+        doc_id: Uuid,
+        current_seq: i64,
+    ) -> Result<Option<MarkdownCacheEntry>, MarkdownCacheError> {
+        self.inner.get_if_fresh(doc_id, current_seq).await
+    }
+
+    async fn get(&self, doc_id: Uuid) -> Result<Option<MarkdownCacheEntry>, MarkdownCacheError> {
+        self.inner.get(doc_id).await
+    }
+
+    async fn put(
+        &self,
+        doc_id: Uuid,
+        rendered_at_seq: i64,
+        markdown: &str,
+    ) -> Result<(), MarkdownCacheError> {
+        self.inner.put(doc_id, rendered_at_seq, markdown).await
+    }
+
+    async fn put_rendered(
+        &self,
+        doc_id: Uuid,
+        rendered_at_seq: i64,
+        markdown: &str,
+        renderer_version: i32,
+    ) -> Result<bool, MarkdownCacheError> {
+        if doc_id == self.panics_on {
+            self.panicked.fetch_add(1, Ordering::SeqCst);
+            panic!("a render of {doc_id} panicked");
+        }
+        self.inner
+            .put_rendered(doc_id, rendered_at_seq, markdown, renderer_version)
+            .await
+    }
+
+    async fn stale_ids(
+        &self,
+        current: i32,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<Uuid>, MarkdownCacheError> {
+        self.inner.stale_ids(current, after, limit).await
+    }
+
+    async fn mark_stale(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError> {
+        self.inner.mark_stale(doc_id).await
+    }
+
+    async fn invalidate(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError> {
+        self.inner.invalidate(doc_id).await
+    }
+
+    async fn start_sweep_attempt(
+        &self,
+        doc_id: Uuid,
+        renderer_version: i32,
+        max_attempts: i32,
+    ) -> Result<bool, MarkdownCacheError> {
+        self.inner
+            .start_sweep_attempt(doc_id, renderer_version, max_attempts)
+            .await
+    }
+
+    async fn finish_sweep_attempt(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError> {
+        self.inner.finish_sweep_attempt(doc_id).await
     }
 }
 
@@ -798,4 +948,83 @@ async fn sweep_renders_a_deeply_nested_page_degraded_and_moves_on() {
     assert_eq!(h.cache_row(deep).await.unwrap().1, degraded);
     assert_eq!(h.cache_row(after).await.unwrap().1, "- [ ] after\n");
     h.wait_until_tasks(after, &[(0, "after", false)]).await;
+}
+
+/// A page whose render killed the process (a stack overflow aborts it) is
+/// skipped after a restart, so that it can't kill every replica in turn, on
+/// every boot. The sweep records an attempt before it renders a page, and
+/// clears it when the render returns; it skips a page the current renderer
+/// started twice without finishing. A page started once (a deploy may have
+/// stopped the process) is tried again, and so is one only an older renderer
+/// never finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn sweep_skips_a_page_whose_render_never_finished_twice() {
+    let mut h = Harness::new().await;
+    let mut pages = Vec::new();
+    for i in 0..4 {
+        pages.push(h.page(&format!("k{i}"), "- [ ] one\n").await);
+    }
+    let (killer, once, older, fresh) = (pages[0], pages[1], pages[2], pages[3]);
+    h.seed_attempts(killer, RENDERER_VERSION, 2).await;
+    h.seed_attempts(once, RENDERER_VERSION, 1).await;
+    h.seed_attempts(older, STALE, 2).await;
+
+    h.start_sweep();
+    h.wait_until_rendered(&[once, older, fresh]).await;
+    for doc in [once, older, fresh] {
+        h.wait_until_attempts(doc, None).await;
+        h.wait_until_tasks(doc, &[(0, "one", false)]).await;
+    }
+
+    assert!(h.cache_row(killer).await.is_none());
+    assert!(h.tasks(killer).await.is_empty());
+    assert_eq!(h.attempts(killer).await, Some((RENDERER_VERSION, 2)));
+}
+
+/// A render that panics ends neither the worker nor the sweep's pass: the
+/// sweep renders the pages after it. The page stays stale, and its attempt
+/// stays recorded, so the sweep tries it once more on its next pass and
+/// then skips it.
+#[tokio::test(flavor = "multi_thread")]
+async fn sweep_moves_on_past_a_render_that_panics() {
+    let mut h = Harness::new().await;
+    let mut pages = [h.empty_page("a").await, h.empty_page("b").await];
+    pages.sort();
+    let [panics, after] = pages;
+    h.fill(panics, "- [ ] boom\n").await;
+    h.fill(after, "- [ ] after\n").await;
+    let cache = h.panicky_cache(panics);
+
+    h.start_sweep();
+    h.wait_until_rendered(&[after]).await;
+    h.wait_until_tasks(after, &[(0, "after", false)]).await;
+
+    assert_eq!(cache.panicked(), 1);
+    assert!(h.cache_row(panics).await.is_none());
+    h.wait_until_attempts(panics, Some((RENDERER_VERSION, 1)))
+        .await;
+}
+
+/// An edit whose refresh panics doesn't stop the reindex worker: it goes on
+/// refreshing the pages edited after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_goes_on_after_a_refresh_panics() {
+    let mut h = Harness::new().await;
+    let panics = h.page("a", "- [ ] boom\n").await;
+    let edited = h.page("b", "- [ ] edited\n").await;
+    let cache = h.panicky_cache(panics);
+
+    h.start_worker();
+    h.dirty_tx.send(panics).await.unwrap();
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while cache.panicked() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "no refresh ran");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    h.dirty_tx
+        .send(edited)
+        .await
+        .expect("the reindex worker stopped");
+    h.wait_until_rendered(&[edited]).await;
+    h.wait_until_tasks(edited, &[(0, "edited", false)]).await;
 }
