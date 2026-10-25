@@ -329,6 +329,48 @@ async fn importing_the_same_export_twice_at_top_level_keeps_every_doc() {
     w.assert_keys_fresh().await;
 }
 
+/// A page that is its own parent in the manifest: the walk that orders pages
+/// parents first recursed through it without end, so the stack overflowed and
+/// aborted the whole server process. It imports as a root under the import
+/// target (here the top level), as the sidebar shows a page in a parent
+/// cycle, and its child stays under it.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_with_self_parent_does_not_crash() {
+    let w = world().await;
+    w.create("Home").await;
+    let mut ouroboros = Page::new(None, "Ouroboros", "m");
+    ouroboros.parent = Some(ouroboros.id);
+    let tail = Page::new(Some(ouroboros.id), "Tail", "m");
+
+    w.import(None, export(&[tail, ouroboros]), 2).await;
+
+    assert_eq!(w.outline(None).await, ["Home", "Ouroboros", "  Tail"]);
+    w.assert_keys_fresh().await;
+}
+
+/// Two pages that are each other's parent crashed the server the same way.
+/// Both import as roots under the import target, ordered by key among its
+/// other new children, and a child of one of them stays under it.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_with_parent_cycle_does_not_crash() {
+    let w = world().await;
+    let target = w.create("Target").await;
+    let mut ping = Page::new(None, "Ping", "a");
+    let pong = Page::new(Some(ping.id), "Pong", "b");
+    ping.parent = Some(pong.id);
+    let echo = Page::new(Some(pong.id), "Echo", "m");
+    let after = Page::new(None, "After", "c");
+
+    w.import(Some(target), export(&[echo, pong, ping, after]), 4)
+        .await;
+
+    assert_eq!(
+        w.outline(Some(target)).await,
+        ["Ping", "Pong", "  Echo", "After"]
+    );
+    w.assert_keys_fresh().await;
+}
+
 /// Siblings keep the export's order: by key, byte by byte (`"M"` before
 /// `"c"`), ties in manifest order, whatever order the manifest lists them in,
 /// and with a child listed before its parent.

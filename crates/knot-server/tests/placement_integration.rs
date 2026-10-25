@@ -595,3 +595,145 @@ async fn create_with_non_sibling_anchor_is_422() {
     );
     assert!(w.level(Some(&folder)).await.is_empty(), "nothing created");
 }
+
+/// Waits until `n` sessions on this test's database are waiting for a lock.
+async fn wait_for_lock_waits(pool: &PgPool, n: i64) {
+    for _ in 0..500 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("{n} sessions never waited for a lock together");
+}
+
+/// `DELETE /api/docs/{id}`, asserting 204: `id` goes to the archive.
+async fn archive(w: &World, id: &str) {
+    let (status, body) = w.send("DELETE", &format!("/api/docs/{id}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "archive {id}: {body}");
+}
+
+/// Whether `id` is in the archive, and its parent, read from the database.
+async fn archived_under(w: &World, id: &str) -> (bool, Option<Uuid>) {
+    sqlx::query_as("SELECT archived_at IS NOT NULL, parent_id FROM documents WHERE id = $1")
+        .bind(Uuid::parse_str(id).unwrap())
+        .fetch_one(&w.pool)
+        .await
+        .unwrap()
+}
+
+/// Inserts a page under `parent` with `key` in a transaction it leaves open,
+/// as a writer that skips the group's lock (an old release during a rolling
+/// upgrade) would. A placement's read of the group doesn't see the row, and
+/// its write waits for this transaction.
+async fn uncommitted_page(
+    w: &World,
+    parent: Option<&str>,
+    key: &str,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut old_pod = w.pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+         VALUES ($1, $2, 'Old pod', $3, $4)",
+    )
+    .bind(w.workspace)
+    .bind(parent.map(|p| Uuid::parse_str(p).unwrap()))
+    .bind(key)
+    .bind(w.owner)
+    .execute(&mut *old_pod)
+    .await
+    .unwrap();
+    old_pod
+}
+
+/// A writer that skips the group's lock takes the key restore picked, between
+/// restore's read of the group and its write: a page whose parent is
+/// archived goes last at the top level, and the writer takes that key first.
+/// The route sent the unique violation to a 500; it is 409
+/// `doc.sort_key_conflict` now, which the client can retry, and nothing is
+/// restored.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_racing_an_unlocked_writer_for_its_key_is_409() {
+    let w = world().await;
+    let parent = w.seed(None, "Parent", "m").await;
+    let child = w.seed(Some(&parent), "Child", "m").await;
+    archive(&w, &child).await;
+    archive(&w, &parent).await;
+    // The key restore picks: last at the top level, after "m".
+    let key = lexorank::between(Some("m"), None).unwrap();
+    let old_pod = uncommitted_page(&w, None, &key).await;
+
+    let request = {
+        let (w, uri) = (w.clone(), format!("/api/docs/{child}/restore"));
+        tokio::spawn(async move { w.send("POST", &uri, None).await })
+    };
+    // Restore's write waits for the old pod's row with the same key.
+    wait_for_lock_waits(&w.pool, 1).await;
+    old_pod.commit().await.unwrap();
+
+    let (status, body) = request.await.unwrap();
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::CONFLICT, "doc.sort_key_conflict"),
+        "{body}"
+    );
+    let parent = Uuid::parse_str(&parent).unwrap();
+    assert_eq!(
+        archived_under(&w, &child).await,
+        (true, Some(parent)),
+        "nothing was restored"
+    );
+}
+
+/// Restore reads the page's parent, then locks the parent's row, then the
+/// page's. When the page was restored, moved and archived again in between,
+/// it is no longer where restore looked, and restore stops. The route sent
+/// that to a 500 as well; it is 409 `doc.restore_conflict` now, a code of its
+/// own because no key collided, and the page stays where the move put it.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_racing_a_move_of_the_page_is_409() {
+    let w = world().await;
+    let parent = w.seed(None, "Parent", "m").await;
+    let elsewhere = w.seed(None, "Elsewhere", "t").await;
+    let page = w.seed(Some(&parent), "Page", "m").await;
+    archive(&w, &page).await;
+    // Hold the parent's row, so restore waits for it after reading where
+    // the page is.
+    let mut other = w.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM documents WHERE id = $1 FOR UPDATE")
+        .bind(Uuid::parse_str(&parent).unwrap())
+        .execute(&mut *other)
+        .await
+        .unwrap();
+
+    let request = {
+        let (w, uri) = (w.clone(), format!("/api/docs/{page}/restore"));
+        tokio::spawn(async move { w.send("POST", &uri, None).await })
+    };
+    wait_for_lock_waits(&w.pool, 1).await;
+    // What restoring the page, moving it under Elsewhere and archiving it
+    // again leaves behind: an archive root under another parent.
+    let elsewhere = Uuid::parse_str(&elsewhere).unwrap();
+    sqlx::query("UPDATE documents SET parent_id = $2 WHERE id = $1")
+        .bind(Uuid::parse_str(&page).unwrap())
+        .bind(elsewhere)
+        .execute(&mut *other)
+        .await
+        .unwrap();
+    other.commit().await.unwrap();
+
+    let (status, body) = request.await.unwrap();
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::CONFLICT, "doc.restore_conflict"),
+        "{body}"
+    );
+    assert_eq!(archived_under(&w, &page).await, (true, Some(elsewhere)));
+}

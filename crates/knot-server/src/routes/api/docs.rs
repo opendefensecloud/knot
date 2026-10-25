@@ -450,6 +450,17 @@ async fn restore(
         Err(knot_storage::DocStoreError::Purging) => {
             json_err(StatusCode::CONFLICT, "doc.purging", "")
         }
+        // The key it would get at the top level was taken by a writer
+        // outside placement, such as an older release during an upgrade.
+        // Retrying can succeed.
+        Err(knot_storage::DocStoreError::Conflict) => {
+            json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "")
+        }
+        // It was restored, moved and archived again while this ran.
+        // Retrying can succeed.
+        Err(knot_storage::DocStoreError::RestoreConflict) => {
+            json_err(StatusCode::CONFLICT, "doc.restore_conflict", "")
+        }
         Err(e) => {
             tracing::error!(error=?e, "restore");
             internal()

@@ -75,6 +75,11 @@ pub enum DocStoreError {
     /// A purge of this doc has started; it can no longer be restored.
     #[error("purging")]
     Purging,
+    /// Restore found the doc under another parent than the one it read
+    /// first: it was restored, moved and archived again meanwhile. Trying
+    /// again can succeed.
+    #[error("restore conflict")]
+    RestoreConflict,
     /// A placement's anchor is not a live, non-template page under the
     /// target parent, or it is the page being moved.
     #[error("bad anchor")]
@@ -146,7 +151,9 @@ pub trait DocStore: Send + Sync + 'static {
     ) -> Result<Vec<Uuid>, DocStoreError>;
     /// Bring an archive root and everything archived with it back. Returns
     /// the ids restored. If the root's parent is still archived, the root
-    /// goes to the top level instead.
+    /// goes to the top level instead. `Conflict` when the key it gets there
+    /// was taken by a writer that skips the group's lock; `RestoreConflict`
+    /// when the root was restored, moved and archived again meanwhile.
     async fn restore(
         &self,
         workspace_id: Uuid,
@@ -312,7 +319,7 @@ impl PgDocStore {
             // Archived docs can't move, so this only trips if the doc was
             // restored, moved and archived again between the two reads.
             Some((Some(_), parent_id, _)) if parent_id != expected_parent => {
-                return Err(DocStoreError::Conflict);
+                return Err(DocStoreError::RestoreConflict);
             }
             Some(_) => {}
         }

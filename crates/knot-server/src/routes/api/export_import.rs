@@ -11,7 +11,7 @@
 //! arrive empty with the exported SVG as their preview; reopening the
 //! board modal lets the user keep editing from there.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 
 use axum::{
@@ -825,39 +825,77 @@ fn read_zip_entry<R: Read + std::io::Seek>(
 /// appended to its new siblings, so this order is the order they keep.
 /// Inputs without a known parent (or with a non-workspace parent) end up as
 /// roots.
+///
+/// The manifest is untrusted, so its parents may form a cycle. A doc that is
+/// its own ancestor comes back without its parent and imports as a root
+/// under the import target, the way the sidebar shows such a doc
+/// (`buildTree`) and the way `heal_doc_cycles` repaired them. A doc below a
+/// cycle keeps its parent.
 fn creation_order(entries: &[DocEntry]) -> Vec<DocEntry> {
+    #[derive(Clone, Copy)]
+    enum Mark {
+        /// On the current climb, at this index.
+        Climbing(usize),
+        /// Depth in the manifest's tree; 0 for a root.
+        Depth(usize),
+    }
     let mut by_id: HashMap<&str, &DocEntry> = HashMap::new();
     for e in entries {
         by_id.insert(e.id.as_str(), e);
     }
-    let mut depth = HashMap::<String, usize>::new();
-    fn compute<'a>(
-        id: &str,
-        by_id: &HashMap<&'a str, &'a DocEntry>,
-        depth: &mut HashMap<String, usize>,
-    ) -> usize {
-        if let Some(d) = depth.get(id) {
-            return *d;
-        }
-        let d = match by_id
+    // The parent of `id`, when it is in the manifest too.
+    let parent = |id: &str| {
+        by_id
             .get(id)
-            .and_then(|e| e.parent_id.as_ref())
-            .filter(|p| by_id.contains_key(p.as_str()))
-        {
-            Some(p) => compute(p.as_str(), by_id, depth) + 1,
-            None => 0,
-        };
-        depth.insert(id.to_string(), d);
-        d
-    }
+            .and_then(|e| e.parent_id.as_deref())
+            .filter(|p| by_id.contains_key(p))
+    };
+    let mut marks: HashMap<&str, Mark> = HashMap::new();
+    let mut in_cycle: HashSet<&str> = HashSet::new();
     for e in entries {
-        compute(&e.id, &by_id, &mut depth);
+        // Climb from `e` through its ancestors, marking each, until a doc
+        // whose depth is known, a root, or a doc already on this climb (a
+        // cycle). A loop, not a recursion: the chain can be deeper than the
+        // stack.
+        let mut climb: Vec<&str> = Vec::new();
+        let mut id = e.id.as_str();
+        // The depth of the last doc left on `climb`.
+        let top = loop {
+            match marks.get(id).copied() {
+                Some(Mark::Depth(d)) => break d + 1,
+                Some(Mark::Climbing(i)) => {
+                    for member in climb.drain(i..) {
+                        marks.insert(member, Mark::Depth(0));
+                        in_cycle.insert(member);
+                    }
+                    break 1;
+                }
+                None => {}
+            }
+            marks.insert(id, Mark::Climbing(climb.len()));
+            climb.push(id);
+            match parent(id) {
+                Some(p) => id = p,
+                None => break 0,
+            }
+        };
+        for (above, id) in climb.into_iter().rev().enumerate() {
+            marks.insert(id, Mark::Depth(top + above));
+        }
     }
+    let depth_of = |e: &DocEntry| match marks.get(e.id.as_str()) {
+        Some(Mark::Depth(d)) => *d,
+        _ => 0,
+    };
     let mut out: Vec<DocEntry> = entries
         .iter()
         .map(|e| DocEntry {
             id: e.id.clone(),
-            parent_id: e.parent_id.clone(),
+            parent_id: if in_cycle.contains(e.id.as_str()) {
+                None
+            } else {
+                e.parent_id.clone()
+            },
             title: e.title.clone(),
             sort_key: e.sort_key.clone(),
             path: e.path.clone(),
@@ -865,7 +903,6 @@ fn creation_order(entries: &[DocEntry]) -> Vec<DocEntry> {
         .collect();
     // Stable, so equal keys keep their manifest order.
     out.sort_by(|a, b| {
-        let depth_of = |e: &DocEntry| *depth.get(&e.id).unwrap_or(&0);
         depth_of(a)
             .cmp(&depth_of(b))
             .then_with(|| a.sort_key.cmp(&b.sort_key))
@@ -1360,5 +1397,70 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(imported, format!("[other](knot://doc/{new_doc})\n"));
+    }
+
+    /// A manifest page with `id`, its parent's id and its order key.
+    fn entry(id: &str, parent: Option<&str>, key: &str) -> DocEntry {
+        DocEntry {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            title: id.to_string(),
+            sort_key: key.to_string(),
+            path: format!("docs/{id}.md"),
+        }
+    }
+
+    /// `(id, parent_id)` of each entry `creation_order` returns, in order.
+    fn ordered(entries: &[DocEntry]) -> Vec<(String, Option<String>)> {
+        creation_order(entries)
+            .into_iter()
+            .map(|e| (e.id, e.parent_id))
+            .collect()
+    }
+
+    /// Pages that are their own ancestor, `a` and `b` each other's parent
+    /// and `s` its own, lose their parent and are ordered as roots, by key
+    /// among the other roots. A page under a cycle member keeps it as its
+    /// parent. The walk used to recurse through the cycle without end.
+    #[test]
+    fn creation_order_makes_cycle_members_roots() {
+        let entries = [
+            entry("c", Some("a"), "c"),
+            entry("a", Some("b"), "a"),
+            entry("b", Some("a"), "b"),
+            entry("s", Some("s"), "s"),
+            entry("r", None, "r"),
+        ];
+        let some = |p: &str| Some(p.to_string());
+        assert_eq!(
+            ordered(&entries),
+            [
+                ("a".to_string(), None),
+                ("b".to_string(), None),
+                ("r".to_string(), None),
+                ("s".to_string(), None),
+                ("c".to_string(), some("a")),
+            ]
+        );
+    }
+
+    /// A chain of parents far deeper than a thread's stack, listed deepest
+    /// first so the walk from the first entry climbs all of it. Recursing
+    /// once per level overflowed the stack and aborted the process.
+    #[test]
+    fn creation_order_walks_a_chain_deeper_than_the_stack() {
+        let n = 200_000;
+        let entries: Vec<DocEntry> = (0..n)
+            .rev()
+            .map(|i| {
+                let parent = (i > 0).then(|| (i - 1).to_string());
+                entry(&i.to_string(), parent.as_deref(), "m")
+            })
+            .collect();
+        let ids: Vec<usize> = creation_order(&entries)
+            .iter()
+            .map(|e| e.id.parse().unwrap())
+            .collect();
+        assert!(ids.into_iter().eq(0..n), "parents before children");
     }
 }
