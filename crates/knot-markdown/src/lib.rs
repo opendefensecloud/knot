@@ -4,6 +4,7 @@ pub mod from_markdown;
 #[cfg(feature = "legacy-compat")]
 pub mod legacy;
 pub mod normalise;
+pub mod remap;
 pub mod schema;
 pub mod tasks;
 pub mod to_markdown;
