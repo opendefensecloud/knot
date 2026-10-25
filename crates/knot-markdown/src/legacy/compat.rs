@@ -4,14 +4,21 @@
 //! This module sorts documents and Markdown inputs into the named bug
 //! classes, where the new code may export, import or list a task otherwise
 //! than legacy did. It also decides whether a document is healthy, checks a
-//! document against the schema, and writes a canonical dump of a document
-//! for comparing imports. And it holds the task differential: the rule by
-//! which a page's new `/tasks` listing is judged against its legacy one.
+//! document against the schema, writes a canonical dump of a document for
+//! comparing imports, and finds the text an export lost. And it holds the
+//! task differential: the rule by which a page's new `/tasks` listing is
+//! judged against its legacy one.
 //!
-//! Two harnesses use it. The differential harness runs it over a generated
-//! corpus (`tests/compat.rs` and `tests/tasks_compat.rs` in this crate).
-//! The real-data check runs it over every page of a database
-//! (`knot-server/tests/markdown_compat.rs`).
+//! Its users:
+//! - the differential harness, which runs it over a generated corpus:
+//!   `tests/compat.rs` and `tests/tasks_compat.rs` in this crate;
+//! - the real-data check, which runs it over every page of a database:
+//!   `knot-server/tests/markdown_compat.rs`;
+//! - tests of the importer and the writer that use its schema check,
+//!   canonical dump or classes: `tests/depth.rs`, `tests/export_lists.rs`,
+//!   `tests/export_tolerant.rs`, `tests/import_containers.rs` and
+//!   `tests/import_lists.rs` in this crate, and
+//!   `knot-server/tests/markdown_import_integration.rs`.
 
 use std::fmt::Write as _;
 use std::ops::Range;

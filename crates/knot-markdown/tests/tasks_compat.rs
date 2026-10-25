@@ -925,11 +925,12 @@ fn task_with_text_of_its_own_is_listed_with_text() {
 }
 
 /// Lower bounds on what the corpus tests compare, so a broken corpus can't
-/// make them pass by comparing nothing. Far below today's counts:
+/// make them pass by comparing nothing. Far below today's counts, which
+/// `KNOT_COMPAT_REPORT=1` prints (`common::report`):
 /// - 21,452 toggles;
 /// - on the pages where legacy agrees with the room, 1,834 tasks listed as
 ///   before and 2,444 classed ones: task_with_nested_list 1,116,
-///   task_block_syntax_as_text 1,073, task_lines_read_as_code 197 and
+///   task_block_syntax_as_text 1,074, task_lines_read_as_code 197 and
 ///   block_read_into_task 57;
 /// - 2,384 classed tasks listed otherwise than legacy listed them, 10 of
 ///   them from `task_class_cases`, every one an item legacy damaged;
