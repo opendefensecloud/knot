@@ -8,21 +8,24 @@
 //!   damaged it;
 //! - an item with text of its own is never listed without text: no line of
 //!   it is read as a nested list item.
+//!
+//! The differential itself (the listings, the agreement rule, the verdict
+//! per task) lives in `knot_markdown::legacy::compat`. The real-data check
+//! (`knot-server/tests/markdown_compat.rs`) runs the same one, so both judge
+//! a page by one rule.
 
 mod common;
 
-use chrono::{DateTime, Utc};
 use common::corpus::{self, Case, Shape};
 use common::{N, build, el, ela, hard_break, p, run, text};
-use knot_crdt::tasks::{patch_task_checked, task_items};
-use knot_crdt::{DocHandle, Engine, YrsEngine};
-use knot_markdown::legacy::{self, compat};
-use knot_markdown::tasks::{Task, extract_tasks_from_doc};
-use uuid::Uuid;
-use yrs::types::text::YChange;
-use yrs::{
-    Any, Out, ReadTxn, Text, Transact, Transaction, Xml, XmlElementRef, XmlFragment, XmlOut,
+use knot_crdt::tasks::task_items;
+use knot_crdt::{DocHandle, YrsEngine};
+use knot_markdown::legacy;
+use knot_markdown::legacy::compat::{
+    self, Listed, TIME_PREFIX, TaskVerdict as Verdict, USER_PREFIX, flipped, item_count,
+    legacy_listing, listing, own_runs, with_flipped,
 };
+use yrs::{ReadTxn, Transact, Transaction, XmlElementRef, XmlOut};
 
 /// Seeds of the random corpus, and documents per seed: the corpus of
 /// `tests/compat.rs`.
@@ -74,110 +77,6 @@ fn assert_at_least(what: &str, got: usize, min: usize) {
         got >= min,
         "only {got} {what} compared, expected at least {min}"
     );
-}
-
-/// A listed task, from the new or the legacy extractor.
-#[derive(Clone, Debug, PartialEq)]
-struct Listed {
-    index: i32,
-    text: String,
-    assignee: Option<Uuid>,
-    checked: bool,
-    due: Option<DateTime<Utc>>,
-}
-
-impl From<Task> for Listed {
-    fn from(t: Task) -> Self {
-        Listed {
-            index: t.item_index,
-            text: t.text,
-            assignee: t.assignee_user_id,
-            checked: t.checked,
-            due: t.due_at,
-        }
-    }
-}
-
-impl From<legacy::Task> for Listed {
-    fn from(t: legacy::Task) -> Self {
-        Listed {
-            index: t.item_index,
-            text: t.text,
-            assignee: t.assignee_user_id,
-            checked: t.checked,
-            due: t.due_at,
-        }
-    }
-}
-
-/// The new listing of `doc`.
-fn listing(doc: &DocHandle) -> Vec<Listed> {
-    extract_tasks_from_doc(doc)
-        .into_iter()
-        .map(Listed::from)
-        .collect()
-}
-
-/// The legacy listing of `doc`, when the legacy export of `doc` succeeds.
-fn legacy_listing(doc: &DocHandle) -> Option<Vec<Listed>> {
-    let md = legacy::serialise(&YrsEngine, doc).ok()?;
-    Some(
-        legacy::extract_tasks(&md)
-            .into_iter()
-            .map(Listed::from)
-            .collect(),
-    )
-}
-
-/// How many task items the room counts in `doc`.
-fn item_count(doc: &DocHandle) -> usize {
-    let ydoc = doc.inner();
-    let txn = ydoc.transact();
-    txn.get_xml_fragment("default")
-        .map_or(0, |frag| task_items(&frag, &txn).len())
-}
-
-/// A copy of `doc` with task item `k` flipped by `patch_task_checked`, the
-/// room's toggle. The copy goes through an update, because `yrs::Doc::clone`
-/// shares its store.
-fn flipped(doc: &DocHandle, k: usize) -> DocHandle {
-    let engine = YrsEngine;
-    let update = engine.encode_state_as_update(doc, None).expect("encode");
-    let copy = engine.new_doc();
-    engine.apply_update(&copy, &update).expect("apply");
-    {
-        let ydoc = copy.inner();
-        let frag = ydoc.get_or_insert_xml_fragment("default");
-        let mut txn = ydoc.transact_mut();
-        let checked = task_items(&frag, &txn)[k]
-            .get_attribute(&txn, "checked")
-            .is_some_and(|v| v.to_string(&txn) == "true");
-        patch_task_checked(&frag, &mut txn, k as i32, !checked).expect("patch");
-    }
-    copy
-}
-
-/// `tasks` with task `k`'s `checked` flipped.
-fn with_flipped(tasks: &[Listed], k: usize) -> Vec<Listed> {
-    let mut want = tasks.to_vec();
-    want[k].checked = !want[k].checked;
-    want
-}
-
-/// The legacy listing of `doc` when it agrees with the room: it has as many
-/// tasks as the room has task items, and flipping item `k` with the room's
-/// toggle changes legacy task `k`'s `checked` and nothing else.
-fn agreeing_legacy_listing(doc: &DocHandle) -> Option<Vec<Listed>> {
-    let tasks = legacy_listing(doc)?;
-    if tasks.len() != item_count(doc) {
-        return None;
-    }
-    for k in 0..tasks.len() {
-        if legacy_listing(&flipped(doc, k))? != with_flipped(&tasks, k) {
-            return None;
-        }
-    }
-    Some(tasks)
 }
 
 /// `(item_index, text)` of each task listed for `doc`.
@@ -652,117 +551,13 @@ fn listing_and_toggles_hit_the_same_item() {
     assert_at_least("toggles", toggles, MIN_TOGGLES);
 }
 
-/// How the new listing lists a task of a page where the legacy listing
-/// agrees with the room.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Verdict {
-    /// As legacy listed it.
-    Same,
-    /// Its item falls in this `task_class`, and the listing differs from
-    /// legacy's no further than the class allows.
-    Exempt(&'static str),
-    /// Otherwise.
-    Differs,
-}
-
 /// The legacy and the new listing of `doc`, with a verdict per task, when
 /// the legacy listing agrees with the room.
 fn verdicts(doc: &DocHandle) -> Option<Vec<(Listed, Listed, Verdict)>> {
-    let old = agreeing_legacy_listing(doc)?;
-    let new = listing(doc);
-    let ydoc = doc.inner();
-    let txn = ydoc.transact();
-    let items = txn
-        .get_xml_fragment("default")
-        .map(|frag| task_items(&frag, &txn))
-        .unwrap_or_default();
-    assert_eq!(new.len(), items.len(), "the lockstep property");
-    Some(
-        old.into_iter()
-            .zip(new)
-            .zip(&items)
-            .map(|((old, new), item)| {
-                let verdict = match compat::task_class(&txn, item) {
-                    None if old == new => Verdict::Same,
-                    Some(class) if within_class(&txn, item, &old, &new) => Verdict::Exempt(class),
-                    _ => Verdict::Differs,
-                };
-                (old, new, verdict)
-            })
-            .collect(),
-    )
-}
-
-/// Whether `new` differs from `old`, both a listing of the classed task
-/// item `item`, no further than the classes allow: in its text, and in its
-/// assignee and due date where legacy's came from content that isn't the
-/// item's own (it holds no such link), or where legacy found none (it read
-/// the link as text or code) and the new one is a link of the item's own.
-fn within_class(txn: &Transaction, item: &XmlElementRef, old: &Listed, new: &Listed) -> bool {
-    let own = own_links(txn, item);
-    let own_user = |user: &Uuid| own.contains(&format!("{USER_PREFIX}{user}"));
-    let own_due = |due: &DateTime<Utc>| {
-        own.iter().any(|href| {
-            href.strip_prefix(TIME_PREFIX)
-                .and_then(|ts| DateTime::parse_from_rfc3339(ts.trim_end_matches('/')).ok())
-                .is_some_and(|ts| ts == *due)
-        })
-    };
-    old.index == new.index
-        && old.checked == new.checked
-        && (old.assignee == new.assignee
-            || (!old.assignee.as_ref().is_some_and(own_user)
-                && new.assignee.as_ref().is_none_or(own_user)))
-        && (old.due == new.due
-            || (!old.due.as_ref().is_some_and(own_due) && new.due.as_ref().is_none_or(own_due)))
-}
-
-const USER_PREFIX: &str = "knot://user/";
-const TIME_PREFIX: &str = "knot://time/";
-
-/// The text runs of the item's own content, its blocks other than those
-/// that are, or hold, a list item (P1), each with its link target, if any.
-fn own_runs(txn: &Transaction, item: &XmlElementRef) -> Vec<(String, Option<String>)> {
-    fn runs(txn: &Transaction, node: &XmlOut, out: &mut Vec<(String, Option<String>)>) {
-        match node {
-            XmlOut::Element(el) => {
-                for child in (0..el.len(txn)).filter_map(|i| el.get(txn, i)) {
-                    runs(txn, &child, out);
-                }
-            }
-            XmlOut::Text(t) => {
-                for chunk in t.diff(txn, YChange::identity) {
-                    let Out::Any(Any::String(text)) = chunk.insert else {
-                        continue;
-                    };
-                    let href = match chunk.attributes.as_ref().and_then(|a| a.get("link")) {
-                        Some(Any::Map(link)) => match link.get("href") {
-                            Some(Any::String(href)) => Some(href.to_string()),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    out.push((text.to_string(), href));
-                }
-            }
-            XmlOut::Fragment(_) => {}
-        }
-    }
-    let mut out = Vec::new();
-    for child in (0..item.len(txn)).filter_map(|i| item.get(txn, i)) {
-        if !compat::holds_list_item(txn, &child) {
-            runs(txn, &child, &mut out);
-        }
-    }
-    out
-}
-
-/// The link targets in the item's own content.
-fn own_links(txn: &Transaction, item: &XmlElementRef) -> Vec<String> {
-    own_runs(txn, item)
-        .into_iter()
-        .filter_map(|(_, href)| href)
-        .collect()
+    Some(compat::task_verdicts(
+        doc,
+        compat::agreeing_legacy_listing(doc)?,
+    ))
 }
 
 /// The text of the item's own content outside mention and date chips, whose

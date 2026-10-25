@@ -1,12 +1,17 @@
 //! Classifiers shared by the differential compatibility harness
-//! (`tests/compat.rs`) and the real-data check (spec "Compatibility
-//! guarantees").
+//! (`tests/compat.rs`, `tests/tasks_compat.rs`) and the real-data check
+//! (`knot-server/tests/markdown_compat.rs`; spec "Compatibility
+//! guarantees"), and the task differential both run: the rule by which a
+//! page's new `/tasks` listing is judged against its legacy one.
 
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use knot_crdt::{DocHandle, YrsEngine};
+use chrono::{DateTime, Utc};
+use knot_crdt::tasks::{patch_task_checked, task_items};
+use knot_crdt::{DocHandle, Engine, YrsEngine};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use uuid::Uuid;
 use yrs::types::Attrs;
 use yrs::types::text::YChange;
 use yrs::{
@@ -14,7 +19,7 @@ use yrs::{
     XmlOut,
 };
 
-use super::{parse, serialise};
+use super::{extract_tasks, parse, serialise};
 
 /// A named bug class: its name, and whether a document or input is in it.
 type Class<T> = (&'static str, fn(&T) -> bool);
@@ -268,6 +273,233 @@ pub fn holds_list_item<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
             .any(|child| holds_list_item(txn, &child)),
         XmlOut::Text(_) => false,
     }
+}
+
+// The task differential (spec "Compatibility guarantees", Tasks): the new
+// listing, the Y-walk, against the legacy one, the legacy export read by
+// legacy `extract_tasks`. `tests/tasks_compat.rs` proves it over the corpus
+// and the real-data check applies it to every page of a database, so both
+// judge a page by this one rule.
+
+/// The href prefix of a mention.
+pub const USER_PREFIX: &str = "knot://user/";
+/// The href prefix of a date.
+pub const TIME_PREFIX: &str = crate::TIME_URL_PREFIX;
+
+/// A listed task, from the new or the legacy extractor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Listed {
+    pub index: i32,
+    pub text: String,
+    pub assignee: Option<Uuid>,
+    pub checked: bool,
+    pub due: Option<DateTime<Utc>>,
+}
+
+impl From<crate::tasks::Task> for Listed {
+    fn from(t: crate::tasks::Task) -> Self {
+        Listed {
+            index: t.item_index,
+            text: t.text,
+            assignee: t.assignee_user_id,
+            checked: t.checked,
+            due: t.due_at,
+        }
+    }
+}
+
+impl From<super::Task> for Listed {
+    fn from(t: super::Task) -> Self {
+        Listed {
+            index: t.item_index,
+            text: t.text,
+            assignee: t.assignee_user_id,
+            checked: t.checked,
+            due: t.due_at,
+        }
+    }
+}
+
+/// The new listing of `doc`.
+pub fn listing(doc: &DocHandle) -> Vec<Listed> {
+    crate::tasks::extract_tasks_from_doc(doc)
+        .into_iter()
+        .map(Listed::from)
+        .collect()
+}
+
+/// The legacy listing of `doc`, when the legacy export of `doc` succeeds:
+/// what the refresh listed before this release.
+pub fn legacy_listing(doc: &DocHandle) -> Option<Vec<Listed>> {
+    let md = serialise(&YrsEngine, doc).ok()?;
+    Some(extract_tasks(&md).into_iter().map(Listed::from).collect())
+}
+
+/// How many task items the room counts in `doc`.
+pub fn item_count(doc: &DocHandle) -> usize {
+    let ydoc = doc.inner();
+    let txn = ydoc.transact();
+    txn.get_xml_fragment("default")
+        .map_or(0, |frag| task_items(&frag, &txn).len())
+}
+
+/// A copy of `doc` with task item `k` flipped by `patch_task_checked`, the
+/// room's toggle. The copy goes through an update, because `yrs::Doc::clone`
+/// shares its store.
+///
+/// # Panics
+///
+/// When `doc` has no task item `k`.
+pub fn flipped(doc: &DocHandle, k: usize) -> DocHandle {
+    let engine = YrsEngine;
+    let update = engine.encode_state_as_update(doc, None).expect("encode");
+    let copy = engine.new_doc();
+    engine.apply_update(&copy, &update).expect("apply");
+    {
+        let ydoc = copy.inner();
+        let frag = ydoc.get_or_insert_xml_fragment("default");
+        let mut txn = ydoc.transact_mut();
+        let checked = task_items(&frag, &txn)[k]
+            .get_attribute(&txn, "checked")
+            .is_some_and(|v| v.to_string(&txn) == "true");
+        patch_task_checked(&frag, &mut txn, k as i32, !checked).expect("patch");
+    }
+    copy
+}
+
+/// `tasks` with task `k`'s `checked` flipped.
+pub fn with_flipped(tasks: &[Listed], k: usize) -> Vec<Listed> {
+    let mut want = tasks.to_vec();
+    want[k].checked = !want[k].checked;
+    want
+}
+
+/// Whether `legacy`, the legacy listing of `doc`, agrees with the room: it
+/// has as many tasks as the room has task items, and flipping item `k` with
+/// the room's toggle changes legacy task `k`'s `checked` and nothing else.
+pub fn agrees_with_room(doc: &DocHandle, legacy: &[Listed]) -> bool {
+    legacy.len() == item_count(doc)
+        && (0..legacy.len())
+            .all(|k| legacy_listing(&flipped(doc, k)) == Some(with_flipped(legacy, k)))
+}
+
+/// The legacy listing of `doc` when it agrees with the room.
+pub fn agreeing_legacy_listing(doc: &DocHandle) -> Option<Vec<Listed>> {
+    legacy_listing(doc).filter(|tasks| agrees_with_room(doc, tasks))
+}
+
+/// How the new listing lists a task of a page where the legacy listing
+/// agrees with the room.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TaskVerdict {
+    /// As legacy listed it.
+    Same,
+    /// Its item falls in this `task_class`, and the listing differs from
+    /// legacy's no further than the class allows.
+    Exempt(&'static str),
+    /// Otherwise.
+    Differs,
+}
+
+/// The legacy and the new listing of each task of `doc`, with its verdict.
+/// `legacy` is the legacy listing of `doc`, and agrees with the room
+/// ([`agrees_with_room`]).
+///
+/// # Panics
+///
+/// When the new listing breaks the lockstep property: it lists another
+/// number of tasks than the room has task items.
+pub fn task_verdicts(doc: &DocHandle, legacy: Vec<Listed>) -> Vec<(Listed, Listed, TaskVerdict)> {
+    let new = listing(doc);
+    let ydoc = doc.inner();
+    let txn = ydoc.transact();
+    let items = txn
+        .get_xml_fragment("default")
+        .map(|frag| task_items(&frag, &txn))
+        .unwrap_or_default();
+    assert_eq!(new.len(), items.len(), "the lockstep property");
+    legacy
+        .into_iter()
+        .zip(new)
+        .zip(&items)
+        .map(|((old, new), item)| {
+            let verdict = match task_class(&txn, item) {
+                None if old == new => TaskVerdict::Same,
+                Some(class) if within_class(&txn, item, &old, &new) => TaskVerdict::Exempt(class),
+                _ => TaskVerdict::Differs,
+            };
+            (old, new, verdict)
+        })
+        .collect()
+}
+
+/// Whether `new` differs from `old`, both a listing of the classed task
+/// item `item`, no further than the classes allow: in its text, and in its
+/// assignee and due date where legacy's came from content that isn't the
+/// item's own (it holds no such link), or where legacy found none (it read
+/// the link as text or code) and the new one is a link of the item's own.
+fn within_class(txn: &Transaction, item: &XmlElementRef, old: &Listed, new: &Listed) -> bool {
+    let own = own_links(txn, item);
+    let own_user = |user: &Uuid| own.contains(&format!("{USER_PREFIX}{user}"));
+    let own_due = |due: &DateTime<Utc>| {
+        own.iter().any(|href| {
+            href.strip_prefix(TIME_PREFIX)
+                .and_then(|ts| DateTime::parse_from_rfc3339(ts.trim_end_matches('/')).ok())
+                .is_some_and(|ts| ts == *due)
+        })
+    };
+    old.index == new.index
+        && old.checked == new.checked
+        && (old.assignee == new.assignee
+            || (!old.assignee.as_ref().is_some_and(own_user)
+                && new.assignee.as_ref().is_none_or(own_user)))
+        && (old.due == new.due
+            || (!old.due.as_ref().is_some_and(own_due) && new.due.as_ref().is_none_or(own_due)))
+}
+
+/// The text runs of the item's own content, its blocks other than those
+/// that are, or hold, a list item (P1), each with its link target, if any.
+pub fn own_runs(txn: &Transaction, item: &XmlElementRef) -> Vec<(String, Option<String>)> {
+    fn runs(txn: &Transaction, node: &XmlOut, out: &mut Vec<(String, Option<String>)>) {
+        match node {
+            XmlOut::Element(el) => {
+                for child in children(txn, el) {
+                    runs(txn, &child, out);
+                }
+            }
+            XmlOut::Text(t) => {
+                for chunk in t.diff(txn, YChange::identity) {
+                    let Out::Any(Any::String(text)) = chunk.insert else {
+                        continue;
+                    };
+                    let href = match chunk.attributes.as_ref().and_then(|a| a.get("link")) {
+                        Some(Any::Map(link)) => match link.get("href") {
+                            Some(Any::String(href)) => Some(href.to_string()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    out.push((text.to_string(), href));
+                }
+            }
+            XmlOut::Fragment(_) => {}
+        }
+    }
+    let mut out = Vec::new();
+    for child in children(txn, item) {
+        if !holds_list_item(txn, &child) {
+            runs(txn, &child, &mut out);
+        }
+    }
+    out
+}
+
+/// The link targets in the item's own content.
+fn own_links(txn: &Transaction, item: &XmlElementRef) -> Vec<String> {
+    own_runs(txn, item)
+        .into_iter()
+        .filter_map(|(_, href)| href)
+        .collect()
 }
 
 /// The pulldown-cmark events of `md` with their source ranges, read with

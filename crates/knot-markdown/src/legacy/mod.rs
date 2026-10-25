@@ -5,7 +5,8 @@
 //! serializer, importer and task extractor as they were before the PR #42
 //! fixes (commit 3d09071), without their test modules. Never edit them: every
 //! change to the real modules is measured against them. `compat` holds the
-//! classifiers the harness and the real-data check share.
+//! classifiers and the task differential the harness and the real-data
+//! check share.
 //!
 //! The reference is fully frozen: the copies call no live code of this
 //! crate. The helpers they used from it are snapshotted here as they were at

@@ -11,7 +11,9 @@
 //! - its `/tasks` listing by legacy (the legacy export, then
 //!   `extract_tasks`) and by the new Y-walk (`extract_tasks_from_doc`).
 //!   Where the legacy listing agrees with the room, a task outside the
-//!   named task classes must be listed as before.
+//!   named task classes must be listed as before. The rule is the task
+//!   differential of `knot_markdown::legacy::compat`, the one
+//!   `knot-markdown/tests/tasks_compat.rs` proves over the corpus.
 //!
 //! It also reports the sort-key groups the heal migration would rewrite
 //! (P7), and how many pages the refresh sweep would render again (P17).
@@ -25,7 +27,8 @@
 //! ```
 //!
 //! It connects read-only and runs no migrations. It prints the report and
-//! fails if a healthy page or task outside the named classes would change.
+//! fails if a healthy page or task outside the named classes would change,
+//! or if a page can't be read, so wasn't compared.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -33,21 +36,15 @@ use std::fmt::{self, Write as _};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
-use knot_crdt::tasks::{patch_task_checked, task_items};
 use knot_crdt::{DocHandle, Engine, YrsEngine};
-use knot_markdown::legacy::{self, compat};
-use knot_markdown::tasks::extract_tasks_from_doc;
-use knot_markdown::{RENDERER_VERSION, TIME_URL_PREFIX};
+use knot_markdown::RENDERER_VERSION;
+use knot_markdown::legacy;
+use knot_markdown::legacy::compat::{self, TaskVerdict};
 use knot_storage::{MarkdownCacheStore, PgMarkdownCache};
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use uuid::Uuid;
-use yrs::types::text::YChange;
-use yrs::{
-    Any, Out, ReadTxn, Text, Transact, Transaction, Xml, XmlElementRef, XmlFragment, XmlOut,
-};
 
 // Outcomes of a page's export, besides the export classes.
 
@@ -59,7 +56,9 @@ const NOT_HEALTHY: &str = "not_healthy";
 /// A healthy page outside the export classes exports otherwise. Fails the
 /// check.
 const HEALTHY_CHANGED: &str = "healthy_changed";
-/// Its stored state doesn't load.
+/// Its stored state doesn't load: it doesn't decode, or the database can't
+/// be read (a missing privilege or column). The page wasn't compared, so
+/// this fails the check, as it fails `knot-server export-check`.
 const LOAD_FAILED: &str = "load_failed";
 /// A writer, or the check itself, panicked on the page. Fails the check.
 const PANICKED: &str = "panicked";
@@ -79,9 +78,11 @@ const LEGACY_DISAGREES: &str = "legacy_disagrees_with_room";
 const LISTED_DIFFERENTLY: &str = "listed_differently";
 
 /// The outcomes that fail the check.
-const FAILING: &[&str] = &[HEALTHY_CHANGED, LISTED_DIFFERENTLY, PANICKED];
+const FAILING: &[&str] = &[HEALTHY_CHANGED, LISTED_DIFFERENTLY, LOAD_FAILED, PANICKED];
 
-/// How many sort-key groups, and lines of a diff's side, the report shows.
+/// How many failing pages, sort-key groups, and lines of a diff's side, the
+/// report shows.
+const SHOWN_PAGES: usize = 20;
 const SHOWN_GROUPS: usize = 20;
 const SHOWN_LINES: usize = 20;
 /// Lines of context around a diff.
@@ -96,6 +97,8 @@ pub struct CompatReport {
     pub export: Outcomes,
     /// Pages by how their task listing changes.
     pub tasks: Outcomes,
+    /// The pages with an outcome that fails the check, in id order.
+    pub failing_pages: Vec<Uuid>,
     /// The sort-key groups the heal migration would rewrite.
     pub sort_key_groups: Vec<SortKeyGroup>,
     /// The live pages the refresh sweep would render again.
@@ -106,12 +109,9 @@ pub struct CompatReport {
 }
 
 impl CompatReport {
-    /// The pages with an outcome that fails the check.
+    /// How many pages have an outcome that fails the check.
     pub fn violations(&self) -> usize {
-        FAILING
-            .iter()
-            .map(|outcome| self.export.count(outcome) + self.tasks.count(outcome))
-            .sum()
+        self.failing_pages.len()
     }
 }
 
@@ -137,11 +137,6 @@ impl Outcomes {
     /// How many pages had each outcome.
     pub fn counts(&self) -> &BTreeMap<&'static str, usize> {
         &self.counts
-    }
-
-    /// How many pages had `outcome`.
-    pub fn count(&self, outcome: &str) -> usize {
-        self.counts.get(outcome).copied().unwrap_or(0)
     }
 
     /// How the first page with `outcome` changes.
@@ -173,20 +168,26 @@ pub async fn compat_report(pool: &PgPool) -> CompatReport {
             .expect("list the live pages");
     let mut export = Outcomes::default();
     let mut tasks = Outcomes::default();
+    let mut failing_pages = Vec::new();
     for &id in &ids {
         let page = |example: String| format!("page {id}\n{example}");
-        match knot_server::export_check::hydrate(pool, id).await {
+        let outcomes = match knot_server::export_check::hydrate(pool, id).await {
             Ok(doc) => {
-                let (outcome, example) = guarded(|| export_outcome(&doc));
-                export.add(outcome, || example.map(page));
-                let (outcome, example) = guarded(|| task_outcome(&doc));
-                tasks.add(outcome, || example.map(page));
+                let (exported, example) = guarded(|| export_outcome(&doc));
+                export.add(exported, || example.map(page));
+                let (listed, example) = guarded(|| task_outcome(&doc));
+                tasks.add(listed, || example.map(page));
+                [exported, listed]
             }
             Err(e) => {
                 let why = page(format!("{e:#}"));
                 export.add(LOAD_FAILED, || Some(why.clone()));
                 tasks.add(LOAD_FAILED, || Some(why));
+                [LOAD_FAILED; 2]
             }
+        };
+        if outcomes.iter().any(|outcome| FAILING.contains(outcome)) {
+            failing_pages.push(id);
         }
     }
     let renderer_version_column = has_renderer_version(pool).await;
@@ -194,6 +195,7 @@ pub async fn compat_report(pool: &PgPool) -> CompatReport {
         pages: ids.len(),
         export,
         tasks,
+        failing_pages,
         sort_key_groups: sort_key_groups(pool).await,
         stale_pages: stale_pages(pool, renderer_version_column).await,
         renderer_version_column,
@@ -272,193 +274,39 @@ fn line_diff(old: &str, new: &str) -> String {
     out
 }
 
-/// A listed task, from the new or the legacy extractor.
-#[derive(Clone, Debug, PartialEq)]
-struct Listed {
-    index: i32,
-    text: String,
-    assignee: Option<Uuid>,
-    checked: bool,
-    due: Option<DateTime<Utc>>,
-}
-
-impl From<knot_markdown::tasks::Task> for Listed {
-    fn from(t: knot_markdown::tasks::Task) -> Self {
-        Listed {
-            index: t.item_index,
-            text: t.text,
-            assignee: t.assignee_user_id,
-            checked: t.checked,
-            due: t.due_at,
-        }
-    }
-}
-
-impl From<legacy::Task> for Listed {
-    fn from(t: legacy::Task) -> Self {
-        Listed {
-            index: t.item_index,
-            text: t.text,
-            assignee: t.assignee_user_id,
-            checked: t.checked,
-            due: t.due_at,
-        }
-    }
-}
-
-/// How `doc`'s task listing changes, and the first task that does.
+/// How `doc`'s task listing changes, and the first task that does. Pages
+/// whose legacy listing agrees with the room are judged by the task
+/// differential `knot-markdown/tests/tasks_compat.rs` proves over the
+/// corpus (`compat::task_verdicts`). A listing that breaks the lockstep
+/// property there panics, which fails the check as [`PANICKED`].
 fn task_outcome(doc: &DocHandle) -> (&'static str, Option<String>) {
-    let new: Vec<Listed> = extract_tasks_from_doc(doc)
-        .into_iter()
-        .map(Listed::from)
-        .collect();
-    let old = legacy_listing(doc);
+    let new = compat::listing(doc);
+    let old = compat::legacy_listing(doc);
     if new.is_empty() && old.as_ref().is_none_or(Vec::is_empty) {
         return (NO_TASKS, None);
     }
     let Some(old) = old else {
         return (NO_LEGACY_LISTING, Some(format!("new: {new:?}")));
     };
-    if !agrees_with_room(doc, &old) {
+    if !compat::agrees_with_room(doc, &old) {
         let listings = format!("legacy: {old:?}\nnew:    {new:?}");
         return (LEGACY_DISAGREES, Some(listings));
     }
-    let ydoc = doc.inner();
-    let txn = ydoc.transact();
-    let items = txn
-        .get_xml_fragment("default")
-        .map(|frag| task_items(&frag, &txn))
-        .unwrap_or_default();
     let mut outcome = (UNCHANGED, None);
-    for (k, ((old, new), item)) in old.iter().zip(&new).zip(&items).enumerate() {
-        if old == new {
-            continue;
-        }
-        let example = Some(format!("task {k}\n  legacy: {old:?}\n  new:    {new:?}"));
-        match compat::task_class(&txn, item) {
-            Some(class) if within_class(&txn, item, old, new) => {
+    for (k, (old, new, verdict)) in compat::task_verdicts(doc, old).into_iter().enumerate() {
+        let example = || Some(format!("task {k}\n  legacy: {old:?}\n  new:    {new:?}"));
+        match verdict {
+            TaskVerdict::Same => {}
+            TaskVerdict::Exempt(_) if old == new => {}
+            TaskVerdict::Exempt(class) => {
                 if outcome.0 == UNCHANGED {
-                    outcome = (class, example);
+                    outcome = (class, example());
                 }
             }
-            _ => return (LISTED_DIFFERENTLY, example),
+            TaskVerdict::Differs => return (LISTED_DIFFERENTLY, example()),
         }
     }
     outcome
-}
-
-/// The legacy listing of `doc`, when the legacy export of `doc` succeeds:
-/// what the refresh listed before this release.
-fn legacy_listing(doc: &DocHandle) -> Option<Vec<Listed>> {
-    let md = legacy::serialise(&YrsEngine, doc).ok()?;
-    Some(
-        legacy::extract_tasks(&md)
-            .into_iter()
-            .map(Listed::from)
-            .collect(),
-    )
-}
-
-/// Whether `old`, the legacy listing of `doc`, agrees with the room: it has
-/// a task per task item, and flipping item `k` with the room's toggle
-/// changes legacy task `k`'s `checked` and nothing else.
-fn agrees_with_room(doc: &DocHandle, old: &[Listed]) -> bool {
-    let ydoc = doc.inner();
-    let items = {
-        let txn = ydoc.transact();
-        txn.get_xml_fragment("default")
-            .map_or(0, |frag| task_items(&frag, &txn).len())
-    };
-    old.len() == items
-        && (0..old.len()).all(|k| {
-            let mut want = old.to_vec();
-            want[k].checked = !want[k].checked;
-            legacy_listing(&flipped(doc, k)) == Some(want)
-        })
-}
-
-/// A copy of `doc` with task item `k` flipped by `patch_task_checked`, the
-/// room's toggle. The copy goes through an update, because `yrs::Doc::clone`
-/// shares its store.
-fn flipped(doc: &DocHandle, k: usize) -> DocHandle {
-    let engine = YrsEngine;
-    let update = engine.encode_state_as_update(doc, None).expect("encode");
-    let copy = engine.new_doc();
-    engine.apply_update(&copy, &update).expect("apply");
-    {
-        let ydoc = copy.inner();
-        let frag = ydoc.get_or_insert_xml_fragment("default");
-        let mut txn = ydoc.transact_mut();
-        let checked = task_items(&frag, &txn)[k]
-            .get_attribute(&txn, "checked")
-            .is_some_and(|v| v.to_string(&txn) == "true");
-        patch_task_checked(&frag, &mut txn, k as i32, !checked).expect("patch");
-    }
-    copy
-}
-
-/// Whether `new` differs from `old`, both a listing of the classed task
-/// item `item`, no further than the task classes allow (as
-/// `knot-markdown/tests/tasks_compat.rs` checks them): in its text, and in
-/// its assignee and due date where legacy's came from content that isn't
-/// the item's own, or where legacy found none and the new one is a link of
-/// the item's own.
-fn within_class(txn: &Transaction, item: &XmlElementRef, old: &Listed, new: &Listed) -> bool {
-    let own = own_links(txn, item);
-    let own_user = |user: &Uuid| own.contains(&format!("{USER_PREFIX}{user}"));
-    let own_due = |due: &DateTime<Utc>| {
-        own.iter().any(|href| {
-            href.strip_prefix(TIME_URL_PREFIX)
-                .and_then(|ts| DateTime::parse_from_rfc3339(ts.trim_end_matches('/')).ok())
-                .is_some_and(|ts| ts == *due)
-        })
-    };
-    old.index == new.index
-        && old.checked == new.checked
-        && (old.assignee == new.assignee
-            || (!old.assignee.as_ref().is_some_and(own_user)
-                && new.assignee.as_ref().is_none_or(own_user)))
-        && (old.due == new.due
-            || (!old.due.as_ref().is_some_and(own_due) && new.due.as_ref().is_none_or(own_due)))
-}
-
-/// The href prefix of a mention.
-const USER_PREFIX: &str = "knot://user/";
-
-/// The link targets in the item's own content: its blocks other than those
-/// that are, or hold, a list item (P1).
-fn own_links(txn: &Transaction, item: &XmlElementRef) -> Vec<String> {
-    fn links(txn: &Transaction, node: &XmlOut, out: &mut Vec<String>) {
-        match node {
-            XmlOut::Element(el) => {
-                for child in (0..el.len(txn)).filter_map(|i| el.get(txn, i)) {
-                    links(txn, &child, out);
-                }
-            }
-            XmlOut::Text(t) => {
-                for chunk in t.diff(txn, YChange::identity) {
-                    let (Out::Any(Any::String(_)), Some(attrs)) =
-                        (&chunk.insert, &chunk.attributes)
-                    else {
-                        continue;
-                    };
-                    if let Some(Any::Map(link)) = attrs.get("link")
-                        && let Some(Any::String(href)) = link.get("href")
-                    {
-                        out.push(href.to_string());
-                    }
-                }
-            }
-            XmlOut::Fragment(_) => {}
-        }
-    }
-    let mut out = Vec::new();
-    for child in (0..item.len(txn)).filter_map(|i| item.get(txn, i)) {
-        if !compat::holds_list_item(txn, &child) {
-            links(txn, &child, &mut out);
-        }
-    }
-    out
 }
 
 /// The sibling groups the heal migration rewrites (P7), in a `SELECT` that
@@ -586,6 +434,15 @@ impl fmt::Display for CompatReport {
                  upgrade, where every live page is stale)"
             )?;
         }
+
+        writeln!(f, "\nThe check fails on {} pages", self.failing_pages.len())?;
+        for id in self.failing_pages.iter().take(SHOWN_PAGES) {
+            writeln!(f, "  page {id}")?;
+        }
+        if self.failing_pages.len() > SHOWN_PAGES {
+            let more = self.failing_pages.len() - SHOWN_PAGES;
+            writeln!(f, "  … {more} more pages")?;
+        }
         Ok(())
     }
 }
@@ -634,7 +491,8 @@ async fn real_data_compat() {
     assert_eq!(
         report.violations(),
         0,
-        "pages that would change outside the named classes; see the report above"
+        "pages that would change outside the named classes, or can't be read; see the \
+         report above"
     );
 }
 
@@ -677,18 +535,23 @@ impl Seed {
     ) -> Uuid {
         let id = self.row(parent, sort_key, false, false).await;
         if let Some(doc) = content {
-            let update = YrsEngine.encode_state_as_update(doc, None).unwrap();
-            sqlx::query(
-                "INSERT INTO doc_updates (doc_id, update_bytes, by_user_id) VALUES ($1, $2, $3)",
-            )
-            .bind(id)
-            .bind(update)
-            .bind(self.user)
-            .execute(&self.pool)
-            .await
-            .unwrap();
+            self.update(id, YrsEngine.encode_state_as_update(doc, None).unwrap())
+                .await;
         }
         id
+    }
+
+    /// Stores `bytes` as an update of `doc`.
+    async fn update(&self, doc: Uuid, bytes: Vec<u8>) {
+        sqlx::query(
+            "INSERT INTO doc_updates (doc_id, update_bytes, by_user_id) VALUES ($1, $2, $3)",
+        )
+        .bind(doc)
+        .bind(bytes)
+        .bind(self.user)
+        .execute(&self.pool)
+        .await
+        .unwrap();
     }
 
     /// An empty top-level template, keyed `sort_key`.
@@ -812,6 +675,78 @@ async fn real_data_compat_runs_on_a_seeded_db() {
         Some("25006"),
         "not a read-only transaction: {write}"
     );
+}
+
+/// A task with a nested list, which legacy listed with the list's text as
+/// its own (A4): a task class.
+const NESTED: &str = "- [ ] parent\n  - child\n";
+
+/// A task listed otherwise, in a task class, is counted under the class by
+/// the task differential `knot-markdown/tests/tasks_compat.rs` runs, and
+/// doesn't fail the check.
+#[tokio::test]
+async fn a_classed_task_is_counted_under_its_class() {
+    let db = knot_test_support::fresh_db().await;
+    let seed = Seed::new(&db.pool).await;
+    let (nested, _) = knot_markdown::from_markdown::parse(NESTED).unwrap();
+    let id = seed.page(None, "a", Some(&nested)).await;
+
+    let report = compat_report(&read_only_pool(&db.url).await).await;
+    println!("{report}");
+    assert_eq!(
+        report.tasks.counts(),
+        &BTreeMap::from([("task_with_nested_list", 1)])
+    );
+    let example = report.tasks.first("task_with_nested_list").expect("a task");
+    assert!(
+        example.contains(&id.to_string()) && example.contains("text: \"parent\""),
+        "names the page and the new listing: {example}"
+    );
+    assert_eq!(report.violations(), 0);
+}
+
+/// A page the check can't read is a page it didn't compare, so it fails the
+/// check, as `knot-server export-check` does: whether its stored state
+/// doesn't decode, or the database can't be read the way the check reads it
+/// (here a column it reads is missing; on staging, say, a role without
+/// `SELECT` on `doc_updates`).
+#[tokio::test]
+async fn a_page_that_does_not_load_fails_the_check() {
+    let db = knot_test_support::fresh_db().await;
+    let seed = Seed::new(&db.pool).await;
+    let (healthy, _) = knot_markdown::from_markdown::parse(HEALTHY).unwrap();
+    let healthy_id = seed.page(None, "a", Some(&healthy)).await;
+    let broken = seed.page(None, "b", None).await;
+    // Bytes no update decodes from.
+    seed.update(broken, vec![0xff; 4]).await;
+
+    let pool = read_only_pool(&db.url).await;
+    let report = compat_report(&pool).await;
+    println!("{report}");
+    let counts = BTreeMap::from([(UNCHANGED, 1), (LOAD_FAILED, 1)]);
+    assert_eq!(report.export.counts(), &counts);
+    assert_eq!(report.tasks.counts(), &counts);
+    let why = report.export.first(LOAD_FAILED).expect("the load error");
+    assert!(why.contains(&broken.to_string()), "names the page: {why}");
+    assert_eq!(report.failing_pages, vec![broken]);
+    assert_eq!(report.violations(), 1);
+
+    sqlx::query("ALTER TABLE doc_updates RENAME COLUMN by_user_id TO by_user")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let report = compat_report(&pool).await;
+    println!("{report}");
+    assert_eq!(report.export.counts(), &BTreeMap::from([(LOAD_FAILED, 2)]));
+    let why = report.export.first(LOAD_FAILED).expect("the load error");
+    assert!(
+        why.contains("reading stored state"),
+        "a storage error: {why}"
+    );
+    let mut both = vec![healthy_id, broken];
+    both.sort();
+    assert_eq!(report.failing_pages, both);
+    assert_eq!(report.violations(), 2);
 }
 
 /// The first migration of this release. A database migrated up to the one
