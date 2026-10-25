@@ -1368,62 +1368,9 @@ fn import_classes_name_their_inputs() {
     assert_no_failures("import class is wrong", &failures);
 }
 
-/// Every text character, in document order, from every `XmlText`.
-fn doc_text(doc: &DocHandle) -> String {
-    fn walk<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
-        match node {
-            XmlOut::Element(el) => {
-                for i in 0..el.len(txn) {
-                    if let Some(child) = el.get(txn, i) {
-                        walk(txn, &child, out);
-                    }
-                }
-            }
-            XmlOut::Text(t) => {
-                for chunk in t.diff(txn, YChange::identity) {
-                    if let Out::Any(Any::String(s)) = chunk.insert {
-                        out.push_str(&s);
-                    }
-                }
-            }
-            XmlOut::Fragment(f) => {
-                for i in 0..f.len(txn) {
-                    if let Some(child) = f.get(txn, i) {
-                        walk(txn, &child, out);
-                    }
-                }
-            }
-        }
-    }
-    let ydoc = doc.inner();
-    let txn = ydoc.transact();
-    let mut out = String::new();
-    if let Some(frag) = txn.get_xml_fragment("default") {
-        for i in 0..frag.len(&txn) {
-            if let Some(child) = frag.get(&txn, i) {
-                walk(&txn, &child, &mut out);
-            }
-        }
-    }
-    out
-}
-
-/// The first non-whitespace character of `text` that `md` doesn't contain in
-/// order, with its char index. Whitespace is skipped: exports legitimately
-/// rewrite it (soft breaks, table cells joined onto one line).
-fn first_lost_char(text: &str, md: &str) -> Option<(usize, char)> {
-    let mut rest = md.chars();
-    for (i, c) in text.chars().enumerate() {
-        if c.is_whitespace() {
-            continue;
-        }
-        if !rest.any(|m| m == c) {
-            return Some((i, c));
-        }
-    }
-    None
-}
-
+/// Serializer rule 2: no export loses a text character of its page
+/// (`compat::doc_text`, `compat::first_lost_char`, which the real-data
+/// check applies too).
 #[test]
 fn no_text_is_lost() {
     let mut exported = 0;
@@ -1439,8 +1386,8 @@ fn no_text_is_lost() {
             }
         };
         exported += 1;
-        let text = doc_text(&case.doc);
-        if let Some((i, c)) = first_lost_char(&text, &md) {
+        let text = compat::doc_text(&case.doc);
+        if let Some((i, c)) = compat::first_lost_char(&text, &md) {
             failures.push(format!(
                 "{}: {c:?} (char {i} of the text) is missing\n  text:   {text:?}\n  export: {md:?}",
                 case.name

@@ -965,8 +965,9 @@ fn children<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> Vec<XmlOut> {
 /// that no page can overflow the stack (final review md-1). This counts every
 /// element and fragment, where the writer counts only blockquotes, list items
 /// and table cells, so it names every page the limit changes, and a few the
-/// writer still writes in full. Read with an explicit stack.
-fn depth_limit(doc: &DocHandle) -> bool {
+/// writer still writes in full. Read with an explicit stack, so a check can
+/// ask first, and leave legacy out on such a page.
+pub fn depth_limit(doc: &DocHandle) -> bool {
     let ydoc = doc.inner();
     let txn = ydoc.transact();
     let Some(frag) = txn.get_xml_fragment("default") else {
@@ -1313,6 +1314,54 @@ fn read_into(prev: Written, next: Written, in_quote: bool) -> bool {
         (Quote { .. }, Quote { .. }) => true,
         (List { .. } | Quote { .. } | Table, _) => false,
     }
+}
+
+/// Every text character of `doc`, in document order, from every `XmlText`.
+/// Read with an explicit stack, so that no nesting can overflow it.
+pub fn doc_text(doc: &DocHandle) -> String {
+    let ydoc = doc.inner();
+    let txn = ydoc.transact();
+    let mut out = String::new();
+    let Some(frag) = txn.get_xml_fragment("default") else {
+        return out;
+    };
+    let mut stack: Vec<XmlOut> = (0..frag.len(&txn))
+        .rev()
+        .filter_map(|i| frag.get(&txn, i))
+        .collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            XmlOut::Element(el) => stack.extend(children(&txn, &el).into_iter().rev()),
+            XmlOut::Fragment(f) => {
+                stack.extend((0..f.len(&txn)).rev().filter_map(|i| f.get(&txn, i)));
+            }
+            XmlOut::Text(t) => {
+                for chunk in t.diff(&txn, YChange::identity) {
+                    if let Out::Any(Any::String(s)) = chunk.insert {
+                        out.push_str(&s);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The first non-whitespace character of `text` that `md` doesn't contain in
+/// order, with its char index: text an export of a page holding `text`
+/// ([`doc_text`]) lost (serializer rule 2). Whitespace is skipped: exports
+/// legitimately rewrite it (soft breaks, table cells joined onto one line).
+pub fn first_lost_char(text: &str, md: &str) -> Option<(usize, char)> {
+    let mut rest = md.chars();
+    for (i, c) in text.chars().enumerate() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if !rest.any(|m| m == c) {
+            return Some((i, c));
+        }
+    }
+    None
 }
 
 /// The legacy export of `doc` when `doc` is healthy: the legacy export
