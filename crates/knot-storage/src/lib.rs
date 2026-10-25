@@ -10,6 +10,7 @@ pub mod grant_store;
 pub mod invalidations;
 pub mod lexorank;
 pub mod markdown_cache;
+pub mod placement;
 pub mod pool;
 pub mod search;
 pub mod session_store;
@@ -32,6 +33,7 @@ pub use markdown_cache::{
     MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore, PgMarkdownCache,
     STALE_RENDERER_VERSION,
 };
+pub use placement::Placement;
 pub use pool::{Pool, PoolError, begin, connect};
 pub use search::{PgSearchStore, SearchHit, SearchStore, SearchStoreError};
 pub use session_store::{PgSessionStore, Session, SessionStore, SessionStoreError};

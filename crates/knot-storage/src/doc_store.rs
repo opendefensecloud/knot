@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::audit;
 use crate::invalidations;
+use crate::placement::{self, Placement};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
@@ -74,6 +75,10 @@ pub enum DocStoreError {
     /// A purge of this doc has started; it can no longer be restored.
     #[error("purging")]
     Purging,
+    /// A placement's anchor is not a live, non-template page under the
+    /// target parent, or it is the page being moved.
+    #[error("bad anchor")]
+    BadAnchor,
 }
 
 #[async_trait]
@@ -103,6 +108,32 @@ pub trait DocStore: Send + Sync + 'static {
         actor: Uuid,
         parent_id: Option<Uuid>,
         sort_key: &str,
+    ) -> Result<Document, DocStoreError>;
+    /// Create a page at `placement` among the children of `parent_id` (the
+    /// top level when `None`). The key is chosen in the same transaction,
+    /// under the group's lock (see `placement`). `BadAnchor` when the anchor
+    /// is not a live, non-template page under `parent_id`; `Archived` when
+    /// the parent is in the archive.
+    async fn create_placed(
+        &self,
+        workspace_id: Uuid,
+        parent_id: Option<Uuid>,
+        title: &str,
+        placement: Placement,
+        created_by: Uuid,
+    ) -> Result<Document, DocStoreError>;
+    /// Move a page to `placement` among the children of `parent_id` (the top
+    /// level when `None`), choosing its key in the same transaction. `Cycle`
+    /// when `parent_id` is the page or one of its descendants; `BadAnchor`
+    /// as for `create_placed`, and also when the anchor is the page itself;
+    /// `Archived` when the page or the parent is in the archive.
+    async fn move_placed(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        actor: Uuid,
+        parent_id: Option<Uuid>,
+        placement: Placement,
     ) -> Result<Document, DocStoreError>;
     /// Move the doc and its live subtree to the archive. Returns the ids
     /// stamped, the doc first. Descendants already archived on their own
@@ -184,6 +215,208 @@ pub struct PgDocStore {
 impl PgDocStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// One attempt of `create_placed`.
+    async fn create_placed_once(
+        &self,
+        workspace_id: Uuid,
+        parent_id: Option<Uuid>,
+        title: &str,
+        placement: Placement,
+        created_by: Uuid,
+    ) -> Result<Document, DocStoreError> {
+        let mut tx = crate::begin(&self.pool).await?;
+        // The group lock also refuses an archived parent, in place of
+        // `lock_live_parent`: taking both would deadlock two creates.
+        let sort_key = placement::place(&mut tx, workspace_id, parent_id, placement, None).await?;
+        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
+            "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING {COLS}"
+        )))
+        .bind(workspace_id)
+        .bind(parent_id)
+        .bind(title)
+        .bind(&sort_key)
+        .bind(created_by)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_unique)?;
+        let doc = doc_from_row(row);
+        audit::record_in_tx(
+            &mut tx,
+            workspace_id,
+            Some(created_by),
+            "doc.create",
+            "doc",
+            doc.id,
+        )
+        .await?;
+        invalidations::record_in_tx(&mut tx, workspace_id, doc.id, "create").await?;
+        tx.commit().await?;
+        Ok(doc)
+    }
+
+    /// One attempt of `move_placed`.
+    async fn move_placed_once(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        actor: Uuid,
+        parent_id: Option<Uuid>,
+        placement: Placement,
+    ) -> Result<Document, DocStoreError> {
+        let mut tx = crate::begin(&self.pool).await?;
+        placement::lock_move(&mut tx, workspace_id, doc_id, parent_id).await?;
+        // With both rows locked, a concurrent move that would close a cycle
+        // with this one has committed or waits for this transaction.
+        if let Some(p) = parent_id {
+            let creates_cycle: bool = sqlx::query_scalar(
+                "WITH RECURSIVE sub AS (
+                     SELECT id FROM documents WHERE id = $1
+                     UNION ALL
+                     SELECT d.id FROM documents d JOIN sub s ON d.parent_id = s.id
+                 )
+                 SELECT EXISTS(SELECT 1 FROM sub WHERE id = $2)",
+            )
+            .bind(doc_id)
+            .bind(p)
+            .fetch_one(&mut *tx)
+            .await?;
+            if creates_cycle {
+                return Err(DocStoreError::Cycle);
+            }
+        }
+        let sort_key =
+            placement::place(&mut tx, workspace_id, parent_id, placement, Some(doc_id)).await?;
+        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
+            "UPDATE documents SET parent_id = $3, sort_key = $4, updated_at = now()
+             WHERE workspace_id = $1 AND id = $2
+             RETURNING {COLS}"
+        )))
+        .bind(workspace_id)
+        .bind(doc_id)
+        .bind(parent_id)
+        .bind(&sort_key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_unique)?
+        .ok_or(DocStoreError::NotFound)?;
+        let doc = doc_from_row(row);
+        audit::record_in_tx(
+            &mut tx,
+            workspace_id,
+            Some(actor),
+            "doc.move",
+            "doc",
+            doc.id,
+        )
+        .await?;
+        invalidations::record_in_tx(&mut tx, workspace_id, doc.id, "tree-move").await?;
+        tx.commit().await?;
+        Ok(doc)
+    }
+
+    /// One attempt of `restore`.
+    async fn restore_once(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        actor: Uuid,
+    ) -> Result<Vec<Uuid>, DocStoreError> {
+        let mut tx = crate::begin(&self.pool).await?;
+        // Lock the parent before the doc, the order archive uses. A
+        // concurrent archive of the parent then either commits first (and
+        // the doc goes to the top level below) or waits for this restore
+        // (and stamps the restored doc along with the parent). Reading the
+        // parent without the lock could leave the doc live under an
+        // archived parent, where purging the parent would delete it.
+        let expected_parent: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT parent_id FROM documents WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(workspace_id)
+        .bind(doc_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(expected_parent) = expected_parent else {
+            return Err(DocStoreError::NotFound);
+        };
+        // A doc under a parent may go to the top level below, so take the
+        // top level's group lock now, before the parent's row: a top-level
+        // respread takes them in that order (it rewrites the parent's key
+        // too when the parent is at the top level). `place` takes it again,
+        // which is a no-op.
+        if expected_parent.is_some() {
+            placement::lock_group(&mut tx, workspace_id, None).await?;
+        }
+        let parent_archived = match expected_parent {
+            Some(parent_id) => sqlx::query_scalar::<_, bool>(
+                "SELECT archived_at IS NOT NULL FROM documents WHERE id = $1 FOR SHARE",
+            )
+            .bind(parent_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(false),
+            None => false,
+        };
+        let row: Option<(Option<Uuid>, Option<Uuid>, bool)> = sqlx::query_as(
+            "SELECT archive_root_id, parent_id, purge_requested_at IS NOT NULL FROM documents
+             WHERE workspace_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(workspace_id)
+        .bind(doc_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match row {
+            None | Some((None, _, _)) => return Err(DocStoreError::NotFound),
+            Some((Some(root), _, _)) if root != doc_id => {
+                return Err(DocStoreError::NotArchiveRoot);
+            }
+            // Its attachments may already be partly gone.
+            Some((_, _, true)) => return Err(DocStoreError::Purging),
+            // Archived docs can't move, so this only trips if the doc was
+            // restored, moved and archived again between the two reads.
+            Some((Some(_), parent_id, _)) if parent_id != expected_parent => {
+                return Err(DocStoreError::Conflict);
+            }
+            Some(_) => {}
+        }
+        let restored: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE documents
+                SET archived_at = NULL, archived_by = NULL,
+                    archive_root_id = NULL, updated_at = now()
+              WHERE workspace_id = $1 AND archive_root_id = $2
+             RETURNING id",
+        )
+        .bind(workspace_id)
+        .bind(doc_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        // Restoring never resurrects an archived ancestor: under one, the
+        // doc would be invisible, so it moves to the end of the top level.
+        if parent_archived {
+            let sort_key =
+                placement::place(&mut tx, workspace_id, None, Placement::Last, Some(doc_id))
+                    .await?;
+            sqlx::query("UPDATE documents SET parent_id = NULL, sort_key = $2 WHERE id = $1")
+                .bind(doc_id)
+                .bind(&sort_key)
+                .execute(&mut *tx)
+                .await?;
+        }
+        audit::record_in_tx(
+            &mut tx,
+            workspace_id,
+            Some(actor),
+            "doc.restore",
+            "doc",
+            doc_id,
+        )
+        .await?;
+        invalidations::record_in_tx(&mut tx, workspace_id, doc_id, "restore").await?;
+        tx.commit().await?;
+        Ok(restored)
     }
 }
 
@@ -451,6 +684,34 @@ impl DocStore for PgDocStore {
         Ok(doc)
     }
 
+    async fn create_placed(
+        &self,
+        workspace_id: Uuid,
+        parent_id: Option<Uuid>,
+        title: &str,
+        placement: Placement,
+        created_by: Uuid,
+    ) -> Result<Document, DocStoreError> {
+        placement::retry_on_deadlock(|| {
+            self.create_placed_once(workspace_id, parent_id, title, placement, created_by)
+        })
+        .await
+    }
+
+    async fn move_placed(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        actor: Uuid,
+        parent_id: Option<Uuid>,
+        placement: Placement,
+    ) -> Result<Document, DocStoreError> {
+        placement::retry_on_deadlock(|| {
+            self.move_placed_once(workspace_id, doc_id, actor, parent_id, placement)
+        })
+        .await
+    }
+
     async fn archive(
         &self,
         workspace_id: Uuid,
@@ -527,95 +788,7 @@ impl DocStore for PgDocStore {
         doc_id: Uuid,
         actor: Uuid,
     ) -> Result<Vec<Uuid>, DocStoreError> {
-        let mut tx = crate::begin(&self.pool).await?;
-        // Lock the parent before the doc, the order archive uses. A
-        // concurrent archive of the parent then either commits first (and
-        // the doc goes to the top level below) or waits for this restore
-        // (and stamps the restored doc along with the parent). Reading the
-        // parent without the lock could leave the doc live under an
-        // archived parent, where purging the parent would delete it.
-        let expected_parent: Option<Option<Uuid>> = sqlx::query_scalar(
-            "SELECT parent_id FROM documents WHERE workspace_id = $1 AND id = $2",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(expected_parent) = expected_parent else {
-            return Err(DocStoreError::NotFound);
-        };
-        let parent_archived = match expected_parent {
-            Some(parent_id) => sqlx::query_scalar::<_, bool>(
-                "SELECT archived_at IS NOT NULL FROM documents WHERE id = $1 FOR SHARE",
-            )
-            .bind(parent_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .unwrap_or(false),
-            None => false,
-        };
-        let row: Option<(Option<Uuid>, Option<Uuid>, bool)> = sqlx::query_as(
-            "SELECT archive_root_id, parent_id, purge_requested_at IS NOT NULL FROM documents
-             WHERE workspace_id = $1 AND id = $2 FOR UPDATE",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        match row {
-            None | Some((None, _, _)) => return Err(DocStoreError::NotFound),
-            Some((Some(root), _, _)) if root != doc_id => {
-                return Err(DocStoreError::NotArchiveRoot);
-            }
-            // Its attachments may already be partly gone.
-            Some((_, _, true)) => return Err(DocStoreError::Purging),
-            // Archived docs can't move, so this only trips if the doc was
-            // restored, moved and archived again between the two reads.
-            Some((Some(_), parent_id, _)) if parent_id != expected_parent => {
-                return Err(DocStoreError::Conflict);
-            }
-            Some(_) => {}
-        }
-        let restored: Vec<Uuid> = sqlx::query_scalar(
-            "UPDATE documents
-                SET archived_at = NULL, archived_by = NULL,
-                    archive_root_id = NULL, updated_at = now()
-              WHERE workspace_id = $1 AND archive_root_id = $2
-             RETURNING id",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        // Restoring never resurrects an archived ancestor: under one, the
-        // doc would be invisible, so it moves to the end of the top level.
-        if parent_archived {
-            let last_top_level_key: Option<String> = sqlx::query_scalar(
-                "SELECT max(sort_key) FROM documents
-                 WHERE workspace_id = $1 AND parent_id IS NULL",
-            )
-            .bind(workspace_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            let sort_key = crate::sort_key_between(last_top_level_key.as_deref(), None);
-            sqlx::query("UPDATE documents SET parent_id = NULL, sort_key = $2 WHERE id = $1")
-                .bind(doc_id)
-                .bind(&sort_key)
-                .execute(&mut *tx)
-                .await?;
-        }
-        audit::record_in_tx(
-            &mut tx,
-            workspace_id,
-            Some(actor),
-            "doc.restore",
-            "doc",
-            doc_id,
-        )
-        .await?;
-        invalidations::record_in_tx(&mut tx, workspace_id, doc_id, "restore").await?;
-        tx.commit().await?;
-        Ok(restored)
+        placement::retry_on_deadlock(|| self.restore_once(workspace_id, doc_id, actor)).await
     }
 
     async fn siblings(
@@ -830,7 +1003,7 @@ const SUBTREE_IDS_SQL: &str = "WITH RECURSIVE sub AS (
      )
      SELECT id FROM sub";
 
-fn map_unique(e: sqlx::Error) -> DocStoreError {
+pub(crate) fn map_unique(e: sqlx::Error) -> DocStoreError {
     match e {
         sqlx::Error::Database(ref db) if db.is_unique_violation() => DocStoreError::Conflict,
         e => DocStoreError::Sqlx(e),

@@ -17,7 +17,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use knot_storage::{Document, PersonRef, WorkspaceRole, sort_key_between};
+use knot_storage::{Document, PersonRef, Placement, WorkspaceRole};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -143,42 +143,28 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
         return internal();
     };
     let title = body.title.unwrap_or_else(|| "Untitled".into());
-
-    let siblings = match docs.siblings(ctx.workspace_id, body.parent_id).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error=?e, "siblings");
-            return internal();
-        }
-    };
-    let (a, b) = match body.after_id {
-        None => (None, siblings.first().map(|d| d.sort_key.as_str())),
-        Some(aid) => {
-            let i = siblings.iter().position(|d| d.id == aid);
-            match i {
-                Some(i) => (
-                    Some(siblings[i].sort_key.as_str()),
-                    siblings.get(i + 1).map(|d| d.sort_key.as_str()),
-                ),
-                None => (siblings.last().map(|d| d.sort_key.as_str()), None),
-            }
-        }
-    };
-    let sk = sort_key_between(a, b);
+    // No anchor: first at its level, where "New page" puts it.
+    let placement = body.after_id.map_or(Placement::First, Placement::After);
 
     match docs
-        .create(ctx.workspace_id, body.parent_id, &title, &sk, ctx.user_id)
+        .create_placed(
+            ctx.workspace_id,
+            body.parent_id,
+            &title,
+            placement,
+            ctx.user_id,
+        )
         .await
     {
         Ok(d) => (StatusCode::CREATED, Json(to_response(&d))).into_response(),
-        // The generated sort_key collided with a sibling's (see move_to for
-        // the same case). That is a client-visible conflict, not an internal
-        // failure — retrying with a different position can succeed.
+        // The key collided with one written outside placement, such as by
+        // an older release during an upgrade. Retrying can succeed.
         Err(knot_storage::DocStoreError::Conflict) => {
             json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "")
         }
         // The parent is in the archive.
         Err(knot_storage::DocStoreError::Archived) => doc_archived(),
+        Err(knot_storage::DocStoreError::BadAnchor) => bad_anchor(),
         Err(e) => {
             tracing::error!(error=?e, "create");
             internal()
@@ -361,42 +347,18 @@ async fn move_doc(
 
     // Spec §6.1: `parent_id` in the request body is the *target* parent. An
     // explicit `null` (or omitted field, since serde collapses both to
-    // `None`) moves the doc to the workspace root. `move_to` will surface
+    // `None`) moves the doc to the workspace root. `move_placed` will surface
     // `DocStoreError::NotFound` if the document doesn't exist, so we skip a
     // pre-flight existence check here.
     let new_parent = body.parent_id;
-
-    let siblings = match docs.siblings(ctx.workspace_id, new_parent).await {
-        Ok(s) => s.into_iter().filter(|d| d.id != doc_id).collect::<Vec<_>>(),
-        Err(e) => {
-            tracing::error!(error=?e, "move siblings");
-            return internal();
-        }
+    let placement = match (body.after_id, body.before_id) {
+        (Some(after), _) => Placement::After(after),
+        (None, Some(before)) => Placement::Before(before),
+        (None, None) => Placement::Last,
     };
-    let end_of_siblings = || (siblings.last().map(|d| d.sort_key.as_str()), None);
-    let (a, b) = match (body.after_id, body.before_id) {
-        (Some(aid), _) => match siblings.iter().position(|d| d.id == aid) {
-            Some(i) => (
-                Some(siblings[i].sort_key.as_str()),
-                siblings.get(i + 1).map(|d| d.sort_key.as_str()),
-            ),
-            None => end_of_siblings(),
-        },
-        (_, Some(bid)) => match siblings.iter().position(|d| d.id == bid) {
-            Some(i) => (
-                i.checked_sub(1)
-                    .and_then(|j| siblings.get(j))
-                    .map(|d| d.sort_key.as_str()),
-                Some(siblings[i].sort_key.as_str()),
-            ),
-            None => end_of_siblings(),
-        },
-        (None, None) => end_of_siblings(),
-    };
-    let sk = sort_key_between(a, b);
 
     match docs
-        .move_to(ctx.workspace_id, doc_id, ctx.user_id, new_parent, &sk)
+        .move_placed(ctx.workspace_id, doc_id, ctx.user_id, new_parent, placement)
         .await
     {
         Ok(d) => Json(to_response(&d)).into_response(),
@@ -409,8 +371,9 @@ async fn move_doc(
         Err(knot_storage::DocStoreError::Cycle) => {
             json_err(StatusCode::CONFLICT, "doc.move_cycle", "")
         }
-        // The destination parent is in the archive.
+        // The doc or the destination parent is in the archive.
         Err(knot_storage::DocStoreError::Archived) => doc_archived(),
+        Err(knot_storage::DocStoreError::BadAnchor) => bad_anchor(),
         Err(e) => {
             tracing::error!(error=?e, "move");
             internal()
@@ -687,16 +650,6 @@ async fn create_from_template_inline(
         }
     };
 
-    // Allocate a sort_key at the end of the destination parent's children.
-    let siblings = match docs.siblings(ctx.workspace_id, body.parent_id).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error=?e, "from_template siblings");
-            return internal();
-        }
-    };
-    let sk = sort_key_between(siblings.last().map(|d| d.sort_key.as_str()), None);
-
     // Default title falls back to the template's title + " copy".
     let title = match body.title {
         Some(t) if !t.trim().is_empty() => t,
@@ -706,8 +659,15 @@ async fn create_from_template_inline(
         },
     };
 
+    // At the end of the destination parent's children.
     let new_doc = match docs
-        .create(ctx.workspace_id, body.parent_id, &title, &sk, ctx.user_id)
+        .create_placed(
+            ctx.workspace_id,
+            body.parent_id,
+            &title,
+            Placement::Last,
+            ctx.user_id,
+        )
         .await
     {
         Ok(d) => d,
@@ -772,4 +732,10 @@ async fn read_json<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, ()
 
 fn internal() -> Response {
     json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "")
+}
+
+/// 422 `doc.bad_anchor`: `after_id` or `before_id` is not a live,
+/// non-template page under the target parent, or it is the moved doc.
+fn bad_anchor() -> Response {
+    json_err(StatusCode::UNPROCESSABLE_ENTITY, "doc.bad_anchor", "")
 }

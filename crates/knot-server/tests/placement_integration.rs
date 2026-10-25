@@ -1,6 +1,7 @@
 //! Where new and moved pages land among their siblings, over HTTP against a
 //! fresh database per test.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -8,23 +9,30 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
 use knot_server::{AppState, router_with_state};
-use knot_storage::WorkspaceRole;
+use knot_storage::{WorkspaceRole, lexorank};
 use serde_json::{Value, json};
+use sqlx::PgPool;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const EMAIL: &str = "owner@placement.test";
 const PASSWORD: &str = "hunter22hunter22";
 
-/// The router plus a logged-in owner's cookie header and CSRF token.
+/// The router plus a logged-in owner's cookie header and CSRF token, and the
+/// database, for seeding rows the API would never write.
+#[derive(Clone)]
 struct World {
     app: axum::Router,
     cookie: String,
     csrf: String,
+    pool: PgPool,
+    workspace: Uuid,
+    owner: Uuid,
 }
 
 async fn world() -> World {
     let pool = knot_test_support::fresh_db().await.pool;
-    let mut state = AppState::with_pool(pool);
+    let mut state = AppState::with_pool(pool.clone());
     state.hasher = Arc::new(Hasher::fast_for_tests());
     state.throttle = Arc::new(Throttle::new());
     state.session_key = b"test-key-32-bytes-aaaaaaaaaaaaaa".to_vec();
@@ -78,6 +86,9 @@ async fn world() -> World {
         app,
         cookie: format!("{sid}; {csrf}"),
         csrf: csrf.trim_start_matches("csrf=").to_string(),
+        pool,
+        workspace: workspace.id,
+        owner: owner.id,
     }
 }
 
@@ -131,6 +142,66 @@ impl World {
         level.sort_by(|x, y| x.1.cmp(&y.1));
         level
     }
+
+    /// A page inserted with raw SQL, so its key can be one the generator
+    /// never writes (as an old release or the database before the heal could).
+    async fn seed(&self, parent: Option<&str>, title: &str, key: &str) -> String {
+        let parent = parent.map(|p| Uuid::parse_str(p).unwrap());
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(self.workspace)
+        .bind(parent)
+        .bind(title)
+        .bind(key)
+        .bind(self.owner)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    /// `POST /api/docs/{id}/move` with `body`.
+    async fn move_doc(&self, id: &str, body: Value) -> (StatusCode, Value) {
+        self.send("POST", &format!("/api/docs/{id}/move"), Some(body))
+            .await
+    }
+
+    /// Every key under `parent` (`None`: the top level), archived pages and
+    /// templates included, by code unit.
+    async fn keys(&self, parent: Option<&str>) -> Vec<String> {
+        let parent = parent.map(|p| Uuid::parse_str(p).unwrap());
+        sqlx::query_scalar(
+            "SELECT sort_key FROM documents
+              WHERE workspace_id = $1 AND parent_id IS NOT DISTINCT FROM $2
+              ORDER BY sort_key COLLATE \"C\"",
+        )
+        .bind(self.workspace)
+        .bind(parent)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+    }
+}
+
+/// Asserts that every key under `parent`, archived pages included, is valid,
+/// at most 64 characters long, and unique.
+async fn assert_keys_healthy(w: &World, parent: Option<&str>) {
+    let keys = w.keys(parent).await;
+    assert!(
+        keys.iter().all(|k| lexorank::is_valid(k) && k.len() <= 64),
+        "bad keys under {parent:?}: {keys:?}"
+    );
+    assert!(
+        keys.windows(2).all(|w| w[0] < w[1]),
+        "duplicate keys under {parent:?}: {keys:?}"
+    );
+}
+
+/// The `error.code` of a JSON error body.
+fn code(body: &Value) -> &str {
+    body["error"]["code"].as_str().unwrap_or_default()
 }
 
 /// Titles of `level`, after asserting its keys are pairwise distinct.
@@ -192,4 +263,335 @@ async fn insert_after_first_ten_times() {
     let mut expected = vec!["First".to_string()];
     expected.extend((1..=10).rev().map(|i| format!("After {i}")));
     assert_eq!(distinct_titles(&level), expected);
+}
+
+/// The parent of `id` as the API reports it.
+async fn parent_of(w: &World, id: &str) -> Option<String> {
+    let (status, doc) = w.send("GET", &format!("/api/docs/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "get {id}: {doc}");
+    doc["parent_id"].as_str().map(str::to_string)
+}
+
+/// Keys from before the heal or from an old release, in the sidebar's order:
+/// below the alphabet (`"0"`), a trailing '0', upper case, and over 64
+/// characters. `between` rejects the first four as neighbours, and the next
+/// key after the last would be 71 characters long.
+fn bad_keys() -> [(&'static str, String); 5] {
+    [
+        ("zero", "0".to_string()),
+        ("double zero", "00".to_string()),
+        ("upper M", "M".to_string()),
+        ("m zero", "m0".to_string()),
+        ("long", "z".repeat(70)),
+    ]
+}
+
+/// "New page" and moves next to keys the generator rejects. The request used
+/// to panic (`sort_key_between` on `"0"`); now the group is respread first,
+/// the request succeeds, every key ends up valid, and the order is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn placement_rebalances_invalid_neighbours() {
+    enum Op {
+        /// `POST /api/docs` under the group, after this page if any.
+        Create(Option<&'static str>),
+        /// Move a top-level page into the group, before this page.
+        MoveBefore(&'static str),
+        /// Move a top-level page into the group, after this page.
+        MoveAfter(&'static str),
+    }
+    let cases = [
+        (
+            Op::Create(None),
+            ["new", "zero", "double zero", "upper M", "m zero", "long"],
+        ),
+        (
+            Op::Create(Some("zero")),
+            ["zero", "new", "double zero", "upper M", "m zero", "long"],
+        ),
+        (
+            Op::Create(Some("long")),
+            ["zero", "double zero", "upper M", "m zero", "long", "new"],
+        ),
+        (
+            Op::MoveBefore("upper M"),
+            ["zero", "double zero", "new", "upper M", "m zero", "long"],
+        ),
+        (
+            Op::MoveAfter("m zero"),
+            ["zero", "double zero", "upper M", "m zero", "new", "long"],
+        ),
+    ];
+    let w = world().await;
+    for (op, expected) in cases {
+        let parent = w.create(json!({"title": "Parent"})).await;
+        let mut ids = HashMap::new();
+        for (title, key) in bad_keys() {
+            ids.insert(title, w.seed(Some(&parent), title, &key).await);
+        }
+        let (status, body) = match op {
+            Op::Create(after) => {
+                let mut body = json!({"title": "new", "parent_id": parent});
+                if let Some(after) = after {
+                    body["after_id"] = json!(ids[after]);
+                }
+                w.send("POST", "/api/docs", Some(body)).await
+            }
+            Op::MoveBefore(anchor) => {
+                let mover = w.create(json!({"title": "new"})).await;
+                w.move_doc(
+                    &mover,
+                    json!({"parent_id": parent, "before_id": ids[anchor]}),
+                )
+                .await
+            }
+            Op::MoveAfter(anchor) => {
+                let mover = w.create(json!({"title": "new"})).await;
+                w.move_doc(
+                    &mover,
+                    json!({"parent_id": parent, "after_id": ids[anchor]}),
+                )
+                .await
+            }
+        };
+        assert!(status.is_success(), "{expected:?}: {status} {body}");
+        assert_eq!(distinct_titles(&w.level(Some(&parent)).await), expected);
+        assert_keys_healthy(&w, Some(&parent)).await;
+    }
+}
+
+/// An archived page keeps its key and still counts towards uniqueness, so it
+/// bounds the key of a page placed next to it. After "A", with "X" archived
+/// between "A" and "B", the new key goes between "A" and "X"; between "A"
+/// and "B" it would be "X"'s key. A regression guard: the routes' sibling
+/// read (`siblings()`) already included archived pages.
+#[tokio::test(flavor = "multi_thread")]
+async fn archived_sibling_between_neighbours_does_not_collide() {
+    let w = world().await;
+    let parent = w.create(json!({"title": "Parent"})).await;
+    let a = w.seed(Some(&parent), "A", "c").await;
+    let x = w.seed(Some(&parent), "X", "i").await;
+    w.seed(Some(&parent), "B", "o").await;
+    let (status, body) = w.send("DELETE", &format!("/api/docs/{x}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "archive X: {body}");
+
+    let (status, created) = w
+        .send(
+            "POST",
+            "/api/docs",
+            Some(json!({"title": "New", "parent_id": parent, "after_id": a})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create after A: {created}");
+    let mover = w.create(json!({"title": "Mover"})).await;
+    let (status, moved) = w
+        .move_doc(&mover, json!({"parent_id": parent, "after_id": a}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "move after A: {moved}");
+
+    let new_key = created["sort_key"].as_str().unwrap();
+    let moved_key = moved["sort_key"].as_str().unwrap();
+    assert!(
+        "c" < moved_key && moved_key < new_key && new_key < "i",
+        "A c < Mover {moved_key} < New {new_key} < X i"
+    );
+    assert_eq!(
+        distinct_titles(&w.level(Some(&parent)).await),
+        ["A", "Mover", "New", "B"]
+    );
+    assert_keys_healthy(&w, Some(&parent)).await;
+}
+
+/// Twenty "New page" requests at once, under a parent and at the top level.
+/// Each read the first key outside any transaction, so several computed the
+/// same key and failed with 409 `doc.sort_key_conflict`: under a parent
+/// always, and at the top level since the heal made those keys unique.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_first_creates_get_distinct_keys() {
+    let w = world().await;
+    let parent = w.create(json!({"title": "Parent"})).await;
+    for group in [Some(parent.as_str()), None] {
+        let requests: Vec<_> = (0..20)
+            .map(|i| {
+                let w = w.clone();
+                let mut body = json!({"title": format!("Page {i}")});
+                if let Some(parent) = group {
+                    body["parent_id"] = json!(parent);
+                }
+                tokio::spawn(async move { w.send("POST", "/api/docs", Some(body)).await })
+            })
+            .collect();
+        for request in requests {
+            let (status, body) = request.await.unwrap();
+            assert_eq!(status, StatusCode::CREATED, "{group:?}: {body}");
+        }
+        let level = w.level(group).await;
+        let pages = distinct_titles(&level)
+            .into_iter()
+            .filter(|t| t.starts_with("Page "))
+            .count();
+        assert_eq!(pages, 20, "{group:?}: {level:?}");
+        assert_keys_healthy(&w, group).await;
+    }
+}
+
+/// A move whose own group must be respread: `"1"` and `"0"` in front of
+/// `spread(11)`, then the last page moves to the top. No key fits before
+/// `"0"`, so the other twelve pages get `spread(12)`, whose last key is the
+/// moving page's current one. The moving page takes a provisional key in the
+/// same statement, so the respread can't collide with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebalance_with_the_moved_page_in_its_group() {
+    let w = world().await;
+    let parent = w.create(json!({"title": "Parent"})).await;
+    let mut keys = vec!["0".to_string(), "1".to_string()];
+    keys.extend(lexorank::spread(11));
+    assert_eq!(
+        lexorank::spread(12).last(),
+        keys.last(),
+        "the respread hands the moving page's key to its neighbour"
+    );
+    let mut ids = Vec::new();
+    for key in &keys {
+        ids.push(w.seed(Some(&parent), key, key).await);
+    }
+
+    let (status, body) = w
+        .move_doc(
+            ids.last().unwrap(),
+            json!({"parent_id": parent, "before_id": ids[0]}),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "move the last page to the top: {body}"
+    );
+
+    let mut expected: Vec<&str> = vec![keys.last().unwrap()];
+    expected.extend(keys[..keys.len() - 1].iter().map(String::as_str));
+    assert_eq!(distinct_titles(&w.level(Some(&parent)).await), expected);
+    assert_keys_healthy(&w, Some(&parent)).await;
+}
+
+/// Two users swap nesting at once: D into P and P into D. One move wins and
+/// the other is refused with 409 `doc.move_cycle`. Never a 500 from a
+/// deadlock, and never both, which made D and P each other's parent and hid
+/// both from the sidebar. A few rounds, each releasing both requests
+/// together.
+#[tokio::test(flavor = "multi_thread")]
+async fn swapping_nesting_moves_do_not_deadlock() {
+    let w = world().await;
+    for round in 0..5 {
+        let d = w.create(json!({"title": format!("D{round}")})).await;
+        let p = w.create(json!({"title": format!("P{round}")})).await;
+        let start = Arc::new(tokio::sync::Barrier::new(2));
+        let swap = |id: &str, parent: &str| {
+            let (w, start) = (w.clone(), start.clone());
+            let (id, body) = (id.to_string(), json!({ "parent_id": parent }));
+            tokio::spawn(async move {
+                start.wait().await;
+                w.move_doc(&id, body).await
+            })
+        };
+        let (d_into_p, p_into_d) = (swap(&d, &p), swap(&p, &d));
+        let mut results = [d_into_p.await.unwrap(), p_into_d.await.unwrap()];
+        results.sort_by_key(|(status, _)| status.as_u16());
+        let [(won, _), (lost, refusal)] = &results;
+        assert_eq!(*won, StatusCode::OK, "round {round}: {results:?}");
+        assert_eq!(
+            (*lost, code(refusal)),
+            (StatusCode::CONFLICT, "doc.move_cycle"),
+            "round {round}: {results:?}"
+        );
+        let nested = [
+            parent_of(&w, &d).await == Some(p.clone()),
+            parent_of(&w, &p).await == Some(d.clone()),
+        ];
+        assert!(
+            nested == [true, false] || nested == [false, true],
+            "round {round}: exactly one nests in the other, got {nested:?}"
+        );
+    }
+}
+
+/// A move anchored to a page outside the target group is refused instead of
+/// landing at the end: a page under another parent, an archived sibling, and
+/// a template.
+#[tokio::test(flavor = "multi_thread")]
+async fn move_with_non_sibling_anchor_is_422() {
+    let w = world().await;
+    let page = w.create(json!({"title": "Page"})).await;
+    let folder = w.create(json!({"title": "Folder"})).await;
+    let nested = w
+        .create(json!({"title": "Nested", "parent_id": folder}))
+        .await;
+    let archived = w.create(json!({"title": "Archived"})).await;
+    let (status, body) = w
+        .send("DELETE", &format!("/api/docs/{archived}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "archive: {body}");
+    let template = w.create(json!({"title": "Template"})).await;
+    let (status, body) = w
+        .send(
+            "POST",
+            &format!("/api/docs/{template}/template"),
+            Some(json!({"is_template": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "mark template: {body}");
+    let before = w.keys(None).await;
+
+    for anchor in [&nested, &archived, &template] {
+        for side in ["after_id", "before_id"] {
+            let mut request = json!({"parent_id": null});
+            request[side] = json!(anchor);
+            let (status, body) = w.move_doc(&page, request).await;
+            assert_eq!(
+                (status, code(&body)),
+                (StatusCode::UNPROCESSABLE_ENTITY, "doc.bad_anchor"),
+                "{side} {anchor}: {body}"
+            );
+        }
+    }
+    assert_eq!(w.keys(None).await, before, "nothing moved");
+}
+
+/// A page can't be placed next to itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn move_with_self_anchor_is_422() {
+    let w = world().await;
+    let page = w.create(json!({"title": "Page"})).await;
+    w.create(json!({"title": "Other"})).await;
+    for side in ["after_id", "before_id"] {
+        let mut request = json!({"parent_id": null});
+        request[side] = json!(page);
+        let (status, body) = w.move_doc(&page, request).await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::UNPROCESSABLE_ENTITY, "doc.bad_anchor"),
+            "{side}: {body}"
+        );
+    }
+}
+
+/// "New page" after a page that isn't under the requested parent is refused
+/// instead of landing at the end.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_with_non_sibling_anchor_is_422() {
+    let w = world().await;
+    let top = w.create(json!({"title": "Top"})).await;
+    let folder = w.create(json!({"title": "Folder"})).await;
+    let (status, body) = w
+        .send(
+            "POST",
+            "/api/docs",
+            Some(json!({"title": "New", "parent_id": folder, "after_id": top})),
+        )
+        .await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::UNPROCESSABLE_ENTITY, "doc.bad_anchor"),
+        "{body}"
+    );
+    assert!(w.level(Some(&folder)).await.is_empty(), "nothing created");
 }
