@@ -9,10 +9,26 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ## [Unreleased]
 
 ### Upgrading
-- One database migration runs on upgrade (the Helm chart's migrate hook
-  applies it).
+- Four database migrations run on upgrade (the Helm chart's migrate hook
+  applies them).
 - Everyone with an account sees the "knot was updated" card once after this
   upgrade. (#45)
+- The upgrade repairs the order keys of pages where two pages at one level
+  shared a key, or a key was invalid or over 64 characters, keeping the
+  order the sidebar showed. From then on no two top-level pages can share a
+  key. (#TBD)
+- After the upgrade, a one-time background refresh renders the cached
+  Markdown and the task listing of every page outside the archive again,
+  about ten pages every two seconds, on one replica. Search, share links,
+  zip export and My Tasks catch up as it runs. A healthy page's Markdown
+  doesn't change, and its tasks keep their place in My Tasks. (#TBD)
+- During a rolling upgrade, pods still on the old version can answer
+  `409 doc.sort_key_conflict` when someone creates or moves a page, until
+  they are replaced. Don't run workspace imports while the rollout is in
+  progress. (#TBD)
+- To see what the upgrade changes on your data before you roll it out, run
+  the real-data compatibility check described in the Helm chart's README
+  (Upgrading) against a restored backup or a staging copy. (#TBD)
 
 ### Added
 - The bottom of the sidebar shows the running version. It opens an About page
@@ -33,8 +49,87 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   time zone, or from a location you type in. Nothing leaves the browser, and
   the choice is saved per browser like the skin itself. The skin is now also
   synced across open tabs, including one picked by hand. (#49)
+- Duplicate… in the sidebar's page menu copies a page right after it, as
+  "<title> (copy)". For a page with subpages, tick "Include its N subpages"
+  to copy them too. The copy gets its own drawings, images and files, so it
+  keeps working if the original is archived, and links between the copied
+  pages point at the copies. Up to 200 pages and 200 MB of files.
+  `POST /api/docs/{id}/duplicate`. (#TBD)
+- Move up, Move down, Indent and Outdent in the sidebar's page menu, and
+  Alt with the arrow keys on a page in the sidebar, move pages without
+  dragging. (#TBD)
+- Screen readers hear each sidebar page's level and number of subpages, how
+  to move it, and where a moved page ended up, instead of page ids. (#TBD)
+
+### Changed
+- Creating a page with an `after_id`, or moving one with an `after_id` or
+  `before_id`, that isn't a live sibling at the target level, or is the
+  moved page itself, returns `422 doc.bad_anchor`. It used to put the page
+  last. (#TBD)
+- Restore returns `409 doc.sort_key_conflict` or `409 doc.restore_conflict`
+  where it used to return a 500. Both can succeed on a retry. (#TBD)
+- Workspace import with a `?parent_id=` that is unknown or in another
+  workspace returns `404 doc.not_found` (was `403 acl.editor_required`).
+  (#TBD)
+- Create, move and create-from-template with a `parent_id` outside your
+  workspace return `404 doc.not_found`, the same as for an id no page has.
+  They used to accept it. (#TBD)
+
+### Fixed
+- Markdown export failed for a page with a line break (Shift+Enter) in a
+  list item, and an image or drawing in a list item was lost. Search, share
+  links, zip export, My Tasks, history preview and restore, and new pages
+  from such a template failed on those pages. History restore, templates
+  and zip import turned a list item with a line break into such a page.
+  (#TBD)
+- Nested checklists, list items and quotes with several paragraphs, images,
+  rules or lists, checkboxes in numbered lists, and empty list items lost
+  their shape or content on the way through Markdown (export, history
+  restore, templates and import). An HTML comment between two lines of a
+  list merged them. (#TBD)
+- Markdown import dropped the line breaks of a code block in a list item or
+  quote, dropped images and drawings in table cells, could move a cell's
+  image into a later paragraph, and stored a lone `>` as a broken empty
+  quote. (#TBD)
+- A page whose content was damaged by an earlier import, or holds content
+  knot doesn't know, exports with that content as text instead of failing
+  the whole page. (#TBD)
+- My Tasks listed other tasks than the checkboxes a toggle counts:
+  checklists in table cells and checkboxes in numbered lists were left out,
+  a bullet starting with `[ ]` was listed, and a nested checklist showed as
+  one merged task. A toggle from My Tasks could check the wrong item. The
+  listing now follows the page's checkboxes. (#TBD)
+- Creating the eighth page under the same parent failed with "Couldn't
+  create document", and at the top level it silently gave two pages the
+  same key, so their order could change. Adding pages after the same page
+  failed the same way, a broken order key could crash the request, and
+  every page added at the end made the keys one character longer. Pages
+  two people create at the same level at the same moment no longer
+  collide. (#TBD)
+- Workspace import skipped a page whose order key was taken and moved its
+  subpages up. Imported pages now keep the export's order with fresh keys,
+  so the same export can be imported twice. (#TBD)
+- Sidebar drag and drop nests, un-nests and reorders where the drop line
+  shows: nesting worked only by luck of mouse speed, a page couldn't be
+  moved out from under its parent when that parent was the last page, and
+  rows slid around in an order that didn't match the screen. Dragging left
+  or right picks the level. Releasing on the page you started from no
+  longer reloads it, a drop outside the tree cancels, a drop that changes
+  nothing sends nothing, and on touch screens a drag starts after a short
+  press, so scrolling works. (#TBD)
+- Restoring a page whose top-level place was taken, or that was restored,
+  moved and archived again at the same time, failed with an internal error.
+  (#TBD)
+
+Thanks to @szEvEz, whose #42 found these bugs and proposed the first fixes.
 
 ### Security
+- A crafted workspace-import zip with pages that are each other's parent, or
+  a very deep chain of parents, crashed the whole server for everyone. Any
+  editor could upload one. The bug predates this release. (#TBD)
+- Create, move, create-from-template and workspace import accepted a parent
+  page from another workspace and put the page under it. They now return
+  `404 doc.not_found`. The bug predates this release. (#TBD)
 - `ctutils` 0.4.5 fixes RUSTSEC-2026-0385: its constant-time helpers could
   compile to branches on secret values. It reaches knot only through the
   Postgres client's password authentication. knot's own session and CSRF
