@@ -114,13 +114,14 @@ struct Sweep {
     ///
     /// The database can end the session too (a restart, a failover), so
     /// each tick checks the connection and ends the pass when it is gone,
-    /// or doesn't answer within [`LOCK_CHECK_TIMEOUT`] (5 s). The check runs
-    /// in the worker's only loop, before the refresh of edited pages, so a
-    /// connection the network dropped silently delays those by that much at
-    /// most.
-    /// Until that check, another replica may start a pass alongside this
-    /// one. That does no harm: a refresh writes the same result however
-    /// often it runs, and never replaces a newer render (the seq guard).
+    /// or doesn't answer within [`LOCK_CHECK_TIMEOUT`] (5 s). Until that
+    /// check, another replica may start a pass alongside this one. That
+    /// does no harm: a refresh writes the same result however often it
+    /// runs, and never replaces a newer render (the seq guard).
+    ///
+    /// The check runs in the worker's only loop, before the refresh of
+    /// edited pages, so a connection the network dropped silently delays
+    /// those by 5 s at most.
     lock: Option<sqlx::PgConnection>,
     /// The last page this pass queued: the next query starts after it, so
     /// pages whose refresh fails can't hold the pass up.
@@ -140,7 +141,7 @@ impl Sweep {
 
     /// The stale pages to refresh on this tick, starting a pass when one is
     /// due and this replica gets the lock, and ending it when the lock's
-    /// connection is gone.
+    /// connection is gone or doesn't answer.
     async fn next(&mut self, state: &AppState) -> Vec<Uuid> {
         let (Some(cache), Some(pool)) = (state.markdown_cache.as_ref(), state.pool.as_ref()) else {
             return Vec::new();
