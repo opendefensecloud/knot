@@ -388,6 +388,9 @@ fn classify_tasks(
 /// root list (its top-level rows, and the children of its templates, which
 /// the sidebar shows at the top level) is respread as one: when one of its
 /// groups needs it, all of them are rewritten.
+///
+/// The heal is `migrations/20261024120000_heal_sort_keys.sql`. Keep the two
+/// in step: when they disagree, the migration follows P7 and this follows it.
 const SORT_KEY_GROUPS: &str = r#"
 WITH sibling_groups AS (
     SELECT d.workspace_id,

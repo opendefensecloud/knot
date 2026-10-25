@@ -441,7 +441,7 @@ async fn public_board_svg_404_for_cross_doc_board() {
         .docs
         .as_ref()
         .unwrap()
-        .create(ws_id, None, "Other", "m", user_id)
+        .create(ws_id, None, "Other", "n", user_id)
         .await
         .unwrap();
     let boards = state.boards.as_ref().unwrap().clone();
@@ -519,7 +519,7 @@ async fn cross_doc_revoke_returns_404_and_token_stays_valid() {
         .docs
         .as_ref()
         .unwrap()
-        .create(ws.id, None, "DocB", "m", alice.id)
+        .create(ws.id, None, "DocB", "n", alice.id)
         .await
         .unwrap();
 

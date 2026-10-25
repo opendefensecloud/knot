@@ -233,11 +233,13 @@ const COLS: &str = "id, workspace_id, parent_id, title, sort_key, icon, created_
 impl DocStore for PgDocStore {
     async fn list_alive(&self, workspace_id: Uuid) -> Result<Vec<Document>, DocStoreError> {
         // Templates live in their own gallery (see list_templates) and
-        // are intentionally excluded from the main doc-tree listing.
+        // are intentionally excluded from the main doc-tree listing. Each
+        // level comes in the sidebar's order (by code unit, whatever the
+        // database's collation), with `id` breaking ties.
         let rows = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "SELECT {COLS} FROM documents
              WHERE workspace_id = $1 AND archived_at IS NULL AND NOT is_template
-             ORDER BY parent_id NULLS FIRST, sort_key"
+             ORDER BY parent_id NULLS FIRST, sort_key COLLATE \"C\", id"
         )))
         .bind(workspace_id)
         .fetch_all(&self.pool)
@@ -624,11 +626,12 @@ impl DocStore for PgDocStore {
         // Archived rows are included on purpose: they keep their sort_key and
         // still count towards UNIQUE (workspace_id, parent_id, sort_key), so a
         // caller generating the next key must see them or it can regenerate a
-        // key an archived sibling still holds.
+        // key an archived sibling still holds. In the sidebar's order, as
+        // list_alive.
         let rows = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "SELECT {COLS} FROM documents
              WHERE workspace_id = $1 AND parent_id IS NOT DISTINCT FROM $2
-             ORDER BY sort_key"
+             ORDER BY sort_key COLLATE \"C\", id"
         )))
         .bind(workspace_id)
         .bind(parent_id)

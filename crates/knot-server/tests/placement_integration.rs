@@ -157,8 +157,8 @@ async fn ten_new_pages_under_a_parent_all_succeed_in_order() {
     assert_eq!(distinct_titles(&level), expected);
 }
 
-/// The same at the top level, where the database accepted the duplicate key,
-/// so the 7th and 8th pages landed in no stable order.
+/// The same at the top level, where the database accepted the duplicate key:
+/// from the 7th page on, every new page got the same "0m" key.
 #[tokio::test(flavor = "multi_thread")]
 async fn ten_new_top_level_pages_get_distinct_ordered_keys() {
     let w = world().await;

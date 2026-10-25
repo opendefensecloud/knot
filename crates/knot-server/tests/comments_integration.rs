@@ -809,7 +809,7 @@ async fn cross_doc_comment_mutation_is_rejected() {
         .docs
         .as_ref()
         .unwrap()
-        .create(ws_id, None, "Doc B", "m", uid)
+        .create(ws_id, None, "Doc B", "n", uid)
         .await
         .unwrap();
     let app = router_with_state(state);
