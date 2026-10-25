@@ -169,8 +169,9 @@ const PURGE_BATCH: i64 = 100;
 pub const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// How old the object of a duplicate that never committed must be before
-/// the purge job deletes it (P16). A duplicate runs far shorter: its caps of
-/// 200 pages and 200 MiB of files keep it to well under a minute.
+/// the purge job deletes it (P16). It must exceed the longest a duplicate
+/// runs, which its caps of 200 pages and 200 MiB of files keep far below an
+/// hour.
 pub const STALE_COPY_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Outcome of one [`run_purge_once`].
