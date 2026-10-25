@@ -312,8 +312,11 @@ async fn importing_the_same_export_twice_under_a_parent_keeps_every_doc() {
     w.assert_keys_fresh().await;
 }
 
-/// Regression guard after Task 9: top-level keys are unique now, so the
-/// export's keys would collide at the top level too.
+/// The same at the top level. Top-level keys used to be allowed to repeat
+/// (NULL parents counted as distinct), so both copies kept the export's keys:
+/// duplicate keys at the top level, and the two copies interleaved by id.
+/// Now that they are unique, reusing the export's keys would collide there
+/// as they do under a parent.
 #[tokio::test(flavor = "multi_thread")]
 async fn importing_the_same_export_twice_at_top_level_keeps_every_doc() {
     let w = world().await;
@@ -373,7 +376,8 @@ async fn import_with_parent_cycle_does_not_crash() {
 
 /// Siblings keep the export's order: by key, byte by byte (`"M"` before
 /// `"c"`), ties in manifest order, whatever order the manifest lists them in,
-/// and with a child listed before its parent.
+/// and with a child listed before its parent. The tied pair is listed against
+/// title order, so a tie broken by title would fail.
 #[tokio::test(flavor = "multi_thread")]
 async fn import_preserves_manifest_order() {
     let w = world().await;
@@ -383,8 +387,8 @@ async fn import_preserves_manifest_order() {
         Page::new(Some(book.id), "Three", "t"),
         Page::new(None, "Afterword", "p"),
         Page::new(Some(book.id), "One", "c"),
-        Page::new(Some(book.id), "Two", "m"),
         Page::new(Some(book.id), "Two, continued", "m"),
+        Page::new(Some(book.id), "Two", "m"),
         Page::new(Some(book.id), "Zero", "M"),
         book,
     ];
@@ -397,8 +401,8 @@ async fn import_preserves_manifest_order() {
             "Book",
             "  Zero",
             "  One",
-            "  Two",
             "  Two, continued",
+            "  Two",
             "  Three",
             "Afterword",
         ]
