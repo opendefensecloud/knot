@@ -815,3 +815,33 @@ async fn from_template_heals_a_damaged_template() {
     assert_eq!(export(&f.app, &sid, &csrf, new_id).await, LINE_BREAK_ITEM);
     assert_schema_valid(&stored_doc(&f.pool, new_id).await);
 }
+
+/// A page nested far deeper than the editor makes one: `>` repeated 100,000
+/// times, which any editor can import. The refresh after the import renders
+/// it, and a writer that recursed once per quote overflowed the stack, which
+/// aborts the whole server (final review md-1). The import succeeds, and the
+/// server goes on serving the page: the export writes the quotes the writer
+/// follows (`to_markdown::MAX_DEPTH`) and the rest as its text, and the page
+/// takes more content.
+#[tokio::test(flavor = "multi_thread")]
+async fn deeply_nested_import_keeps_the_server_serving() {
+    let f = fixture().await;
+    let (sid, csrf) = login(&f.app, "alice@example.com").await;
+    let deep = format!("{} x\n", ">".repeat(100_000));
+
+    let status = import(&f.app, &sid, &csrf, f.doc_id, None, deep).await;
+    assert!(status.is_success(), "import answered {status}");
+
+    let degraded = format!("{}x\n", "> ".repeat(knot_markdown::to_markdown::MAX_DEPTH));
+    assert_eq!(export(&f.app, &sid, &csrf, f.doc_id).await, degraded);
+    // Append merges the two, in an order of Yjs's choosing.
+    assert_eq!(
+        import(&f.app, &sid, &csrf, f.doc_id, None, "# After\n").await,
+        StatusCode::NO_CONTENT
+    );
+    let both = export(&f.app, &sid, &csrf, f.doc_id).await;
+    assert!(
+        both.contains(&degraded) && both.contains("# After\n"),
+        "{both:?}"
+    );
+}

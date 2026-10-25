@@ -776,3 +776,26 @@ async fn sweep_ends_its_pass_when_its_lock_connection_drops() {
         assert!(h.cache_row(*doc).await.is_none(), "{doc} was refreshed");
     }
 }
+
+/// A page nested far deeper than the editor makes one (an import of `>`
+/// repeated 100,000 times) is rendered degraded, and the sweep goes on to the
+/// next page. A writer that recursed once per quote overflowed the worker's
+/// stack, which aborts the process, and the sweep met the page again on every
+/// boot (final review md-1).
+#[tokio::test(flavor = "multi_thread")]
+async fn sweep_renders_a_deeply_nested_page_degraded_and_moves_on() {
+    let mut h = Harness::new().await;
+    let mut pages = [h.empty_page("a").await, h.empty_page("b").await];
+    pages.sort();
+    let [deep, after] = pages;
+    h.fill(deep, &format!("{} x\n", ">".repeat(100_000))).await;
+    h.fill(after, "- [ ] after\n").await;
+
+    h.start_sweep();
+    h.wait_until_rendered(&[deep, after]).await;
+
+    let degraded = format!("{}x\n", "> ".repeat(knot_markdown::to_markdown::MAX_DEPTH));
+    assert_eq!(h.cache_row(deep).await.unwrap().1, degraded);
+    assert_eq!(h.cache_row(after).await.unwrap().1, "- [ ] after\n");
+    h.wait_until_tasks(after, &[(0, "after", false)]).await;
+}

@@ -16,6 +16,7 @@ use common::corpus::{self, Case};
 use common::{N, Run, build, el, ela, hard_break, p, read, run, text};
 use knot_crdt::{DocHandle, YrsEngine};
 use knot_markdown::legacy::{self, compat};
+use knot_markdown::to_markdown::MAX_DEPTH;
 use yrs::types::text::YChange;
 use yrs::{Any, Out, ReadTxn, Text, Transact, Xml, XmlFragment, XmlOut};
 
@@ -795,8 +796,37 @@ fn class_cases() -> Vec<(&'static str, Vec<N>, Option<&'static str>)> {
     let line_break = || el("paragraph", vec![text("a"), hard_break(), text("b")]);
     let nested = |inner: N| vec![p("a"), bullets(vec![inner])];
     let code_in = |lead: &str| vec![p(lead), code()];
+    // `n` blockquotes, one in the other, and `n` lists, each in an item of
+    // the one before. Every list level is two elements deep.
+    let quotes = |n: usize| (0..n).fold(vec![p("deep")], |kids, _| vec![quote(kids)]);
+    let lists = |n: usize| {
+        (0..n).fold(Vec::new(), |kids, _| {
+            vec![bullets(vec![item([vec![p("x")], kids].concat())])]
+        })
+    };
 
     vec![
+        // Under the limit, as before; past it, written as text.
+        (
+            "quotes nested just under the depth limit",
+            quotes(MAX_DEPTH - 1),
+            None,
+        ),
+        (
+            "quotes nested past the depth limit",
+            quotes(MAX_DEPTH + 1),
+            Some("depth_limit"),
+        ),
+        (
+            "lists nested just under the depth limit",
+            lists((MAX_DEPTH - 1) / 2),
+            None,
+        ),
+        (
+            "lists nested past the depth limit",
+            lists(MAX_DEPTH + 1),
+            Some("depth_limit"),
+        ),
         (
             "nested checklist",
             vec![bullets(vec![task(false, nested(task(true, vec![p("b")])))])],

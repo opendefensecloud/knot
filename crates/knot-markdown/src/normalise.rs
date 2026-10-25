@@ -81,19 +81,25 @@ pub fn block_children<T: ReadTxn, F: XmlFragment>(txn: &T, parent: &F) -> Vec<Ch
 }
 
 /// Appends the children of `parent` to `tokens`, consecutive inline nodes as
-/// one run.
+/// one run, and the nodes of a nested fragment in its place. Read with an
+/// explicit stack, so that no nesting of fragments can overflow it.
 fn collect<T: ReadTxn, F: XmlFragment>(txn: &T, parent: &F, tokens: &mut Vec<Token>) {
-    for i in 0..parent.len(txn) {
-        let Some(node) = parent.get(txn, i) else {
-            continue;
-        };
+    let mut stack: Vec<XmlOut> = (0..parent.len(txn))
+        .rev()
+        .filter_map(|i| parent.get(txn, i))
+        .collect();
+    while let Some(node) = stack.pop() {
         let inline = match &node {
             XmlOut::Text(_) => true,
             XmlOut::Element(el) => el.tag().as_ref() == "hard_break",
             XmlOut::Fragment(_) => false,
         };
         match node {
-            XmlOut::Fragment(fragment) => collect(txn, &fragment, tokens),
+            XmlOut::Fragment(fragment) => stack.extend(
+                (0..fragment.len(txn))
+                    .rev()
+                    .filter_map(|i| fragment.get(txn, i)),
+            ),
             XmlOut::Element(el) if !inline => tokens.push(Token::Element(el)),
             node => match tokens.last_mut() {
                 Some(Token::Run(run)) => run.push(node),

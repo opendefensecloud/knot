@@ -29,6 +29,7 @@ use yrs::{
 };
 
 use super::{extract_tasks, parse, serialise};
+use crate::to_markdown::MAX_DEPTH;
 
 /// A named bug class: its name, and whether a document or input is in it.
 type Class<T> = (&'static str, fn(&T) -> bool);
@@ -41,7 +42,11 @@ type Class<T> = (&'static str, fn(&T) -> bool);
 /// A table cell is joined onto one line, where nothing reads back as block
 /// structure, so cells keep the legacy layout: only `ordered_checkbox` and
 /// `damaged_shape` look inside them.
+///
+/// `depth_limit` comes first: the other classes, and legacy, recurse once
+/// per element, so on a page in it they could overflow the stack.
 const EXPORT_CLASSES: &[Class<DocHandle>] = &[
+    ("depth_limit", depth_limit),
     ("damaged_shape", damaged_shape),
     ("nested_tasklist", nested_tasklist),
     ("multi_block_item", multi_block_item),
@@ -953,6 +958,39 @@ fn children<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> Vec<XmlOut> {
     (0..el.len(txn)).filter_map(|i| el.get(txn, i)).collect()
 }
 
+/// A page that nests deeper than [`MAX_DEPTH`] elements and fragments: an
+/// import of `>` repeated, or a crafted Yjs update, never a page the editor
+/// makes. The writer follows block containers only [`MAX_DEPTH`] deep and
+/// writes a deeper blockquote, list or table as its text, one paragraph, so
+/// that no page can overflow the stack (final review md-1). This counts every
+/// element and fragment, where the writer counts only blockquotes, list items
+/// and table cells, so it names every page the limit changes, and a few the
+/// writer still writes in full. Read with an explicit stack.
+fn depth_limit(doc: &DocHandle) -> bool {
+    let ydoc = doc.inner();
+    let txn = ydoc.transact();
+    let Some(frag) = txn.get_xml_fragment("default") else {
+        return false;
+    };
+    // Each node with how many elements and fragments it sits in.
+    let mut stack: Vec<(XmlOut, usize)> = (0..frag.len(&txn))
+        .filter_map(|i| frag.get(&txn, i))
+        .map(|node| (node, 0))
+        .collect();
+    while let Some((node, outer)) = stack.pop() {
+        let nested: Vec<XmlOut> = match &node {
+            XmlOut::Element(el) => children(&txn, el),
+            XmlOut::Fragment(f) => (0..f.len(&txn)).filter_map(|i| f.get(&txn, i)).collect(),
+            XmlOut::Text(_) => continue,
+        };
+        if outer + 1 > MAX_DEPTH {
+            return true;
+        }
+        stack.extend(nested.into_iter().map(|child| (child, outer + 1)));
+    }
+    false
+}
+
 /// Text or a hard break directly in a block container (the top level, a list
 /// item, a blockquote, a table cell): the shape the old importer stored for a
 /// line break or soft break in a tight list item (A1), which restore,
@@ -1146,6 +1184,14 @@ fn written<T: ReadTxn>(txn: &T, block: &XmlOut) -> Option<Written> {
     })
 }
 
+/// Whether `block` is written as a blank line ([`Written::Blank`]): a
+/// paragraph without content. Unlike [`written`], it doesn't look into
+/// lists, which [`ends_open`] would then follow twice per level, and so take
+/// time exponential in their depth.
+fn is_blank<T: ReadTxn>(txn: &T, block: &XmlOut) -> bool {
+    matches!(block, XmlOut::Element(el) if el.tag().as_ref() == "paragraph" && !has_content(txn, el))
+}
+
 /// Whether `paragraph` holds text or a line break.
 fn has_content<T: ReadTxn>(txn: &T, paragraph: &XmlElementRef) -> bool {
     children(txn, paragraph).iter().any(|inline| match inline {
@@ -1220,7 +1266,7 @@ fn ends_open<T: ReadTxn>(txn: &T, block: &XmlOut) -> bool {
                     children(txn, item)
                         .iter()
                         .rev()
-                        .find(|child| written(txn, child) != Some(Written::Blank))
+                        .find(|child| !is_blank(txn, child))
                         .is_some_and(|last| ends_open(txn, last)),
                 ),
                 _ => None,

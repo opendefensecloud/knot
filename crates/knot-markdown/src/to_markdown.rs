@@ -7,6 +7,8 @@
 //!   ([`crate::normalise`], P3).
 //! - A node the schema doesn't name is written as its text (P4).
 //!   [`serialise_with_report`] names them.
+//! - A container nested [`MAX_DEPTH`] deep is written as its text too, so
+//!   that no page can overflow the stack.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +29,22 @@ type RunAttrs = HashMap<Arc<str>, Any>;
 
 /// The tags of the unknown nodes written so far, in document order.
 type Unknown = Vec<String>;
+
+/// How many block containers (blockquotes, list items, table cells) deep the
+/// writer follows a page. A block's depth is the number of containers it
+/// sits in: a top-level block is at depth 0. The writer recurses a few
+/// frames per container, and a stack overflow aborts the whole process, so
+/// a blockquote, list or table at this depth or deeper is written as its
+/// text, one paragraph ([`capped_text`]), as knot-export caps its walk
+/// (`MAX_DEPTH` in `crates/knot-export/src/walk.rs`). No page the editor
+/// makes nests this deep; an import of `>` repeated, or a crafted Yjs
+/// update, can. Every other walk over a page here uses an explicit stack.
+pub const MAX_DEPTH: usize = 128;
+
+/// What [`serialise_with_report`] reports, with the unknown nodes, for each
+/// container it wrote as its text because it nests [`MAX_DEPTH`] deep, as
+/// knot-export reports it.
+pub const DEPTH_LIMIT_TAG: &str = "depth-limit";
 
 /// Read an XML attribute as a plain `String`.
 ///
@@ -53,7 +71,9 @@ pub fn serialise(engine: &YrsEngine, doc: &DocHandle) -> Result<String, SerError
 }
 
 /// [`serialise`], with the tags of the nodes it wrote as their text because
-/// the schema doesn't name them there, in document order (P4).
+/// the schema doesn't name them there, in document order (P4), and a
+/// [`DEPTH_LIMIT_TAG`] for each container it wrote as its text because it
+/// nests [`MAX_DEPTH`] deep.
 pub fn serialise_with_report(
     _engine: &YrsEngine,
     doc: &DocHandle,
@@ -71,7 +91,7 @@ pub fn serialise_with_report(
     let children = written_children(&txn, &frag);
     let len = children.len();
     for (i, child) in children.iter().enumerate() {
-        write_child(&mut buf, &txn, child, &mut unknown)?;
+        write_child(&mut buf, &txn, child, 0, &mut unknown)?;
         if i + 1 < len {
             buf.push('\n');
         }
@@ -106,15 +126,16 @@ fn written_children<T: ReadTxn, F: XmlFragment>(txn: &T, parent: &F) -> Vec<Chil
     children
 }
 
-/// Writes `child`, a block of a block container.
+/// Writes `child`, a block at `depth` ([`MAX_DEPTH`]) of a block container.
 fn write_child<T: ReadTxn>(
     buf: &mut String,
     txn: &T,
     child: &Child,
+    depth: usize,
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
     match child {
-        Child::Block(el) => write_block(buf, txn, el, unknown),
+        Child::Block(el) => write_block(buf, txn, el, depth, unknown),
         Child::Para(inlines) => {
             write_inlines(buf, txn, inlines, true, unknown);
             buf.push('\n');
@@ -123,15 +144,23 @@ fn write_child<T: ReadTxn>(
     }
 }
 
-/// Writes `el`, an element of a block container. One the schema doesn't name
-/// there (a node it doesn't know, or a list item, row or cell out of place)
-/// is written as its text, a paragraph, as knot-export does (P4).
+/// Writes `el`, an element at `depth` ([`MAX_DEPTH`]) of a block container.
+/// One the schema doesn't name there (a node it doesn't know, or a list
+/// item, row or cell out of place) is written as its text, a paragraph, as
+/// knot-export does (P4), and so is a container nested too deep.
 fn write_block<T: ReadTxn>(
     buf: &mut String,
     txn: &T,
     el: &XmlElementRef,
+    depth: usize,
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
+    if too_deep(el, depth) {
+        unknown.push(DEPTH_LIMIT_TAG.to_string());
+        buf.push_str(&capped_text(txn, el));
+        buf.push('\n');
+        return Ok(());
+    }
     let tag = el.tag().to_string();
     match tag.as_str() {
         "paragraph" => {
@@ -152,7 +181,7 @@ fn write_block<T: ReadTxn>(
         }
         "blockquote" => {
             let mut lines = Vec::new();
-            write_quote(&mut lines, txn, el, Purpose::Export, unknown)?;
+            write_quote(&mut lines, txn, el, depth, Purpose::Export, unknown)?;
             write_lines(buf, lines);
         }
         "code_block" => write_code_block(buf, txn, el, "```"),
@@ -190,7 +219,7 @@ fn write_block<T: ReadTxn>(
                     let mut text = String::new();
                     for child in written_children(txn, &cell_el) {
                         let mut inner = String::new();
-                        write_cell_block(&mut inner, txn, &child, unknown)?;
+                        write_cell_block(&mut inner, txn, &child, depth + 1, unknown)?;
                         let inline = inner.replace('|', "\\|").replace('\n', " ");
                         let inline = inline.trim();
                         if !text.is_empty() && !inline.is_empty() {
@@ -286,7 +315,7 @@ fn write_block<T: ReadTxn>(
         "bullet_list" | "ordered_list" => {
             let mut lines = Vec::new();
             for (item, marker) in list_items(txn, el)? {
-                write_list_item(&mut lines, txn, &item, &marker, unknown)?;
+                write_list_item(&mut lines, txn, &item, &marker, depth, unknown)?;
             }
             write_lines(buf, lines);
         }
@@ -357,30 +386,56 @@ fn is_empty_paragraph<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> bool {
 /// All text below `el`, in document order and without marks, as knot-export
 /// keeps an element it doesn't know.
 fn flatten_text<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> String {
-    fn walk<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
+    text_nodes(txn, el)
+        .iter()
+        .flat_map(|t| yrs_text_chunks(t, txn))
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// The text of `el`, a container nested too deep to follow ([`too_deep`]),
+/// as one paragraph: the words of its `XmlText`s in document order, one
+/// space between each two. It keeps every character of the text but its
+/// blanks, and stays on one line, where nothing of it can end the paragraph.
+fn capped_text<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> String {
+    let texts: Vec<String> = text_nodes(txn, el)
+        .iter()
+        .map(|t| {
+            yrs_text_chunks(t, txn)
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect()
+        })
+        .collect();
+    let joined = texts.join(" ");
+    joined.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether `el`, a block at `depth`, is a container the writer doesn't
+/// follow ([`MAX_DEPTH`]).
+fn too_deep(el: &XmlElementRef, depth: usize) -> bool {
+    depth >= MAX_DEPTH
+        && matches!(
+            el.tag().as_ref(),
+            "blockquote" | "bullet_list" | "ordered_list" | "table"
+        )
+}
+
+/// The `XmlText`s below `el`, in document order. Read with an explicit
+/// stack, so that no nesting can overflow it.
+fn text_nodes<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> Vec<XmlTextRef> {
+    let mut texts = Vec::new();
+    let mut stack: Vec<XmlOut> = children(txn, el).into_iter().rev().collect();
+    while let Some(node) = stack.pop() {
         match node {
-            XmlOut::Text(t) => {
-                for (text, _) in yrs_text_chunks(t, txn) {
-                    out.push_str(&text);
-                }
-            }
-            XmlOut::Element(el) => {
-                for child in children(txn, el) {
-                    walk(txn, &child, out);
-                }
-            }
+            XmlOut::Text(t) => texts.push(t),
+            XmlOut::Element(el) => stack.extend(children(txn, &el).into_iter().rev()),
             XmlOut::Fragment(f) => {
-                for child in (0..f.len(txn)).filter_map(|i| f.get(txn, i)) {
-                    walk(txn, &child, out);
-                }
+                stack.extend((0..f.len(txn)).rev().filter_map(|i| f.get(txn, i)));
             }
         }
     }
-    let mut out = String::new();
-    for child in children(txn, el) {
-        walk(txn, &child, &mut out);
-    }
-    out
+    texts
 }
 
 /// The items of `list`, a bullet or an ordered list, each with the marker it
@@ -437,27 +492,29 @@ fn checkbox<T: ReadTxn>(item: &XmlElementRef, txn: &T) -> &'static str {
     }
 }
 
-/// Writes `node`, a block in a table cell, for the cell to join onto its one
-/// line. A cell's lines end up as runs of spaces in its text, and nothing in
-/// it reads back as block structure, so lists and quotes there keep the
-/// layout they always had: no blank lines between blocks, and continuation
-/// lines indented by the whole item prefix, checkbox included. Only the
-/// checkbox of an ordered item is new (A8).
+/// Writes `child`, a block at `depth` ([`MAX_DEPTH`]) in a table cell, for
+/// the cell to join onto its one line. A cell's lines end up as runs of
+/// spaces in its text, and nothing in it reads back as block structure, so
+/// lists and quotes there keep the layout they always had: no blank lines
+/// between blocks, and continuation lines indented by the whole item prefix,
+/// checkbox included. Only the checkbox of an ordered item is new (A8).
 fn write_cell_block<T: ReadTxn>(
     buf: &mut String,
     txn: &T,
     child: &Child,
+    depth: usize,
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
     let Child::Block(el) = child else {
-        return write_child(buf, txn, child, unknown);
+        return write_child(buf, txn, child, depth, unknown);
     };
     let tag = el.tag().to_string();
     match tag.as_str() {
+        _ if too_deep(el, depth) => write_block(buf, txn, el, depth, unknown)?,
         "blockquote" => {
             for child in written_children(txn, el) {
                 let mut inner = String::new();
-                write_cell_block(&mut inner, txn, &child, unknown)?;
+                write_cell_block(&mut inner, txn, &child, depth + 1, unknown)?;
                 for line in inner.trim_end_matches('\n').split('\n') {
                     if line.is_empty() {
                         buf.push_str(">\n");
@@ -475,7 +532,7 @@ fn write_cell_block<T: ReadTxn>(
                 let pad = " ".repeat(prefix.chars().count());
                 for (k, child) in written_children(txn, &item).iter().enumerate() {
                     let mut inner = String::new();
-                    write_cell_block(&mut inner, txn, child, unknown)?;
+                    write_cell_block(&mut inner, txn, child, depth + 1, unknown)?;
                     for (j, line) in inner.trim_end_matches('\n').split('\n').enumerate() {
                         buf.push_str(if k == 0 && j == 0 { &prefix } else { &pad });
                         buf.push_str(line);
@@ -484,7 +541,7 @@ fn write_cell_block<T: ReadTxn>(
                 }
             }
         }
-        _ => write_block(buf, txn, el, unknown)?,
+        _ => write_block(buf, txn, el, depth, unknown)?,
     }
     Ok(())
 }
@@ -514,11 +571,14 @@ fn write_cell_block<T: ReadTxn>(
 ///
 /// An empty item keeps its trailing space (`- `, `- [ ] `, `2. `, P2), and
 /// an item without children or checkbox writes nothing, as before.
+///
+/// `depth` is the list's ([`MAX_DEPTH`]); the item's blocks are one deeper.
 fn write_list_item<T: ReadTxn>(
     buf: &mut Vec<Line>,
     txn: &T,
     item: &XmlElementRef,
     marker: &str,
+    depth: usize,
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
     let children = written_children(txn, item);
@@ -526,22 +586,23 @@ fn write_list_item<T: ReadTxn>(
     write_item(
         buf,
         txn,
-        marker,
-        checkbox,
+        (marker, checkbox),
         children,
+        depth + 1,
         Purpose::Export,
         unknown,
     )
 }
 
-/// Writes a list item of `children` after `marker` and `checkbox` (`""` for
-/// none), as [`write_list_item`] describes, for `purpose`.
+/// Writes a list item of `children`, blocks at `depth` ([`MAX_DEPTH`]),
+/// after its marker and checkbox (`""` for none), as [`write_list_item`]
+/// describes, for `purpose`.
 fn write_item<T: ReadTxn>(
     buf: &mut Vec<Line>,
     txn: &T,
-    marker: &str,
-    checkbox: &str,
+    (marker, checkbox): (&str, &str),
     mut children: Vec<Child>,
+    depth: usize,
     purpose: Purpose,
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
@@ -554,7 +615,7 @@ fn write_item<T: ReadTxn>(
         children.remove(0);
     }
     let mut lines = Vec::new();
-    write_container(&mut lines, txn, &children, false, purpose, unknown)?;
+    write_container(&mut lines, txn, &children, false, depth, purpose, unknown)?;
     // A node the schema doesn't name is written as a paragraph of its text.
     let first_tag = match children.first() {
         Some(Child::Block(first)) if BLOCKS.contains(&first.tag().as_ref()) => {
@@ -634,9 +695,9 @@ pub(crate) fn task_item_markdown<T: ReadTxn>(txn: &T, item: &XmlElementRef) -> S
     let written = write_item(
         &mut lines,
         txn,
-        "- ",
-        "[ ] ",
+        ("- ", "[ ] "),
         children,
+        1,
         Purpose::TaskText,
         &mut Unknown::new(),
     );
@@ -649,37 +710,45 @@ pub(crate) fn task_item_markdown<T: ReadTxn>(txn: &T, item: &XmlElementRef) -> S
 }
 
 /// Whether `child`, a block of a block container, is or holds a list item.
+/// Read with an explicit stack, so that no nesting can overflow it.
 fn holds_list_item<T: ReadTxn>(txn: &T, child: &Child) -> bool {
-    fn holds<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
+    let mut stack = match child {
+        Child::Block(el) => vec![XmlOut::Element(el.clone())],
+        Child::Para(inlines) => inlines.clone(),
+    };
+    while let Some(node) = stack.pop() {
         match node {
-            XmlOut::Element(el) => {
-                el.tag().as_ref() == "list_item"
-                    || children(txn, el).iter().any(|child| holds(txn, child))
-            }
-            XmlOut::Fragment(f) => (0..f.len(txn))
-                .filter_map(|i| f.get(txn, i))
-                .any(|child| holds(txn, &child)),
-            XmlOut::Text(_) => false,
+            XmlOut::Element(el) if el.tag().as_ref() == "list_item" => return true,
+            XmlOut::Element(el) => stack.extend(children(txn, &el)),
+            XmlOut::Fragment(f) => stack.extend((0..f.len(txn)).filter_map(|i| f.get(txn, i))),
+            XmlOut::Text(_) => {}
         }
     }
-    match child {
-        Child::Block(el) => holds(txn, &XmlOut::Element(el.clone())),
-        Child::Para(inlines) => inlines.iter().any(|inline| holds(txn, inline)),
-    }
+    false
 }
 
-/// Writes a blockquote for `purpose`: each line of its blocks after `> `,
-/// and a blank line or an empty line of a code block as `>`.
+/// Writes a blockquote at `depth` ([`MAX_DEPTH`]) for `purpose`: each line
+/// of its blocks after `> `, and a blank line or an empty line of a code
+/// block as `>`.
 fn write_quote<T: ReadTxn>(
     buf: &mut Vec<Line>,
     txn: &T,
     quote: &XmlElementRef,
+    depth: usize,
     purpose: Purpose,
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
     let mut lines = Vec::new();
     let children = written_children(txn, quote);
-    write_container(&mut lines, txn, &children, true, purpose, unknown)?;
+    write_container(
+        &mut lines,
+        txn,
+        &children,
+        true,
+        depth + 1,
+        purpose,
+        unknown,
+    )?;
     buf.extend(lines.into_iter().map(|line| match line {
         Line::Text { text, open } if !text.is_empty() => Line::Text {
             text: format!("> {text}"),
@@ -723,8 +792,9 @@ impl Line {
 }
 
 /// Writes `children`, the blocks of a list item or, when `in_quote`, a
-/// blockquote ([`block_children`]), into `buf`, for the caller to put the
-/// item's indent or the quote's `> ` in front of each line.
+/// blockquote ([`block_children`]), blocks at `depth` ([`MAX_DEPTH`]), into
+/// `buf`, for the caller to put the item's indent or the quote's `> ` in
+/// front of each line.
 ///
 /// Legacy wrote the blocks one right below the other, where Markdown reads
 /// some of them as part of the block above (A5, A6, A9): a paragraph runs on
@@ -745,13 +815,14 @@ fn write_container<T: ReadTxn>(
     txn: &T,
     children: &[Child],
     in_quote: bool,
+    depth: usize,
     purpose: Purpose,
     unknown: &mut Unknown,
 ) -> Result<(), SerError> {
     let task_text = purpose == Purpose::TaskText;
     let mut prev: Option<Block> = None;
     for child in children {
-        let (block, lines) = block_lines(txn, child, purpose, unknown)?;
+        let (block, lines) = block_lines(txn, child, depth, purpose, unknown)?;
         let goes_on = task_text && block.is_text() && prev.is_some_and(Block::is_text);
         if !goes_on && prev.is_some_and(|prev| prev.needs_blank_line_before(block, in_quote)) {
             buf.push(Line::Blank);
@@ -875,25 +946,31 @@ fn is_rule(text: &str) -> bool {
         && text.chars().filter(|&c| c == mark).count() >= 3
 }
 
-/// `child`, a block of a list item or blockquote, as lines without the blank
-/// lines it ends with, and as a [`Block`]. A block written as nothing is one
-/// blank line. A blockquote is written for `purpose`.
+/// `child`, a block at `depth` ([`MAX_DEPTH`]) of a list item or blockquote,
+/// as lines without the blank lines it ends with, and as a [`Block`]. A block
+/// written as nothing is one blank line. A blockquote is written for
+/// `purpose`.
 fn block_lines<T: ReadTxn>(
     txn: &T,
     child: &Child,
+    depth: usize,
     purpose: Purpose,
     unknown: &mut Unknown,
 ) -> Result<(Block, Vec<Line>), SerError> {
     let tag = match child {
+        // Written as a paragraph of its text.
+        Child::Block(el) if too_deep(el, depth) => "paragraph".to_string(),
         Child::Block(el) => el.tag().to_string(),
         Child::Para(_) => "paragraph".to_string(),
     };
     let mut lines = Vec::new();
     match (child, tag.as_str()) {
-        (Child::Block(el), "blockquote") => write_quote(&mut lines, txn, el, purpose, unknown)?,
+        (Child::Block(el), "blockquote") => {
+            write_quote(&mut lines, txn, el, depth, purpose, unknown)?;
+        }
         (Child::Block(el), "bullet_list" | "ordered_list") => {
             for (item, marker) in list_items(txn, el)? {
-                write_list_item(&mut lines, txn, &item, &marker, unknown)?;
+                write_list_item(&mut lines, txn, &item, &marker, depth, unknown)?;
             }
         }
         // A line of the code that is a fence would end the block early.
@@ -914,7 +991,7 @@ fn block_lines<T: ReadTxn>(
         }
         _ => {
             let mut text = String::new();
-            write_child(&mut text, txn, child, unknown)?;
+            write_child(&mut text, txn, child, depth, unknown)?;
             let code = tag == "code_block";
             let open = !matches!(tag.as_str(), "heading" | "code_block" | "horizontal_rule");
             for line in text.trim_end_matches('\n').split('\n') {
@@ -1112,7 +1189,9 @@ fn write_inlines<T: ReadTxn>(
 }
 
 /// Appends the pieces of `inlines` to `out`. With `merge`, adjacent text of
-/// equal marks is one piece, and empty text none.
+/// equal marks is one piece, and empty text none. A fragment's nodes are
+/// read in its place, with an explicit stack, so that no nesting of
+/// fragments can overflow it.
 fn inline_pieces<T: ReadTxn>(
     txn: &T,
     inlines: &[XmlOut],
@@ -1127,21 +1206,21 @@ fn inline_pieces<T: ReadTxn>(
         }
         _ => out.push(Piece::Text(text, marks)),
     };
-    for node in inlines {
+    let mut stack: Vec<XmlOut> = inlines.iter().rev().cloned().collect();
+    while let Some(node) = stack.pop() {
         match node {
             XmlOut::Text(t) => {
-                for (text, attrs) in yrs_text_chunks(t, txn) {
+                for (text, attrs) in yrs_text_chunks(&t, txn) {
                     push(out, text, Marks::of(attrs.as_ref()));
                 }
             }
             XmlOut::Element(el) if el.tag().as_ref() == "hard_break" => out.push(Piece::Break),
             XmlOut::Element(el) => {
                 unknown.push(el.tag().to_string());
-                push(out, flatten_text(txn, el), Marks::default());
+                push(out, flatten_text(txn, &el), Marks::default());
             }
             XmlOut::Fragment(f) => {
-                let nested: Vec<XmlOut> = (0..f.len(txn)).filter_map(|i| f.get(txn, i)).collect();
-                inline_pieces(txn, &nested, merge, unknown, out);
+                stack.extend((0..f.len(txn)).rev().filter_map(|i| f.get(txn, i)));
             }
         }
     }
