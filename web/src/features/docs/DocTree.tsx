@@ -53,6 +53,9 @@ const SCREEN_READER_INSTRUCTIONS = {
  *  when the drag starts, and the rows below it move up. */
 const MEASURING = { droppable: { strategy: MeasuringStrategy.Always } };
 
+/** The key of the move mutations, to count the pending ones. */
+const MOVE_KEY = ["docs-move"];
+
 /** The droppable id of the tree's list. Doc ids are UUIDs, so it can't clash. */
 const TREE_AREA = ":tree";
 
@@ -95,7 +98,19 @@ export function DocTree() {
     },
   });
 
+  // What the last menu or Alt+arrow move did, or that a move was refused,
+  // for the live region.
+  const [announcement, setAnnouncement] = useState("");
+
+  /** How many moves are pending: the one asking, and any queued with it. */
+  const pendingMoves = () => qc.isMutating({ mutationKey: MOVE_KEY });
+
+  // Drags, the row menu and Alt+arrows queue their moves in one scope, so
+  // they are sent one at a time, in the order they were made: each one is
+  // planned from the list the moves before it show.
   const move = useMutation({
+    mutationKey: MOVE_KEY,
+    scope: { id: "docs-move" },
     mutationFn: async (a: { id: string; body: MoveArgs }) => {
       const r = await docsApi.move(a.id, a.body);
       // Thrown, so a refused move (409, 422) is rolled back like a failed request.
@@ -110,13 +125,22 @@ export function DocTree() {
           ok: applyOptimisticMove(prev.ok, a.id, a.body),
         });
       }
-      return { prev };
+      const title = prev && "ok" in prev ? prev.ok.find((d) => d.id === a.id)?.title : undefined;
+      return { prev, title: title ?? "" };
     },
     onError: (_e, _a, ctx) => {
-      if (ctx?.prev) qc.setQueryData(["docs"], ctx.prev);
+      // The list from before this move goes back only when no move is queued
+      // after it: that list lacks the later moves' optimistic updates. Either
+      // way the refetch after the last queued move shows the server's list.
+      if (ctx?.prev && pendingMoves() === 1) qc.setQueryData(["docs"], ctx.prev);
       notify("error", "Couldn't move");
+      setAnnouncement(`Couldn't move “${ctx?.title ?? ""}”.`);
     },
-    onSettled: () => { void qc.invalidateQueries({ queryKey: ["docs"] }); },
+    onSettled: () => {
+      // After the last queued move only: the list fetched in between would
+      // drop the optimistic updates of the moves still on their way.
+      if (pendingMoves() === 1) void qc.invalidateQueries({ queryKey: ["docs"] });
+    },
   });
 
   // No KeyboardSensor: moving by keyboard is a set of explicit commands, not
@@ -188,8 +212,6 @@ export function DocTree() {
   const [clicks] = useState(clickSwallower);
   useEffect(() => () => clicks.release(), [clicks]);
 
-  // What the last menu or Alt+arrow move did, for the live region.
-  const [announcement, setAnnouncement] = useState("");
   // The page a menu or Alt+arrow move keeps focus on, until the move and the
   // refetch after it have rendered. Focus is lost when the menu the move came
   // from closes, and when the page's row remounts, its link with it: under

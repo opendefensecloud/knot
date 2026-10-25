@@ -6,9 +6,10 @@
  * moment. Drags move the pointer the way a hand does: press on a row, a few
  * px to start the drag, then on to the target in steps, so every row on the
  * way sees the pointer pass. The helper lets go only once the target row
- * shows its drop zone (data-drop-zone, data-drop-depth). A build from before
- * those attributes has nothing to wait for: run it with E2E_NO_ZONE_WAIT=1,
- * and the helper waits two frames instead.
+ * shows its drop zone (data-drop-zone, data-drop-depth), or, for a drop that
+ * changes nothing, once no row shows one. A build from before those
+ * attributes has nothing to wait for: run it with E2E_NO_ZONE_WAIT=1, and the
+ * helper waits two frames instead.
  */
 import { expect, type APIRequestContext, type Page } from "@playwright/test";
 
@@ -154,7 +155,8 @@ export type DragOptions = {
    *  level). Not used for a point target. */
   dx?: number;
   /** Wait for the drop zone to show before letting go. A drop that changes
-   *  nothing (or goes outside the tree) shows none: pass false there. */
+   *  nothing (or goes outside the tree) shows none: pass false there, and
+   *  the helper waits until no row shows one. */
   waitForZone?: boolean;
   /** Runs once the drag has started, before the pointer heads for the target. */
   whileDragging?: () => Promise<void>;
@@ -170,7 +172,7 @@ export async function dragRow(
   {
     zone = "into",
     dx = 0,
-    waitForZone = !process.env.E2E_NO_ZONE_WAIT,
+    waitForZone = true,
     whileDragging,
   }: DragOptions = {},
 ): Promise<void> {
@@ -205,16 +207,18 @@ export async function dragRow(
   // 4. On to the target in steps, as a hand moves; never a jump.
   await page.mouse.move(end.x, end.y, { steps: 10 });
 
-  // 5. Let go only once the page shows where the drop goes.
-  if (waitForZone) {
-    const row =
-      "id" in to
-        ? page.getByTestId(`tree-row-${to.id}`)
-        : page.locator(`[data-testid^='tree-row-'][data-drop-zone]`);
+  // 5. Let go only once the page shows where the drop goes. For a drop that
+  //    changes nothing, once no row shows a drop zone: a row the pointer
+  //    passed shows one until the last pointer move has rendered.
+  const zoned = page.locator(`[data-testid^='tree-row-'][data-drop-zone]`);
+  if (process.env.E2E_NO_ZONE_WAIT) {
+    await frames(page, 2);
+  } else if (waitForZone) {
+    const row = "id" in to ? page.getByTestId(`tree-row-${to.id}`) : zoned;
     await expect(row).toHaveAttribute("data-drop-zone", zone);
     await expect(row).toHaveAttribute("data-drop-depth", /^\d+$/);
   } else {
-    await frames(page, 2);
+    await expect(zoned).toHaveCount(0);
   }
 
   // 6. Let go.

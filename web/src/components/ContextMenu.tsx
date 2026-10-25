@@ -62,8 +62,10 @@ export function ContextMenu({
       // The portal moves the menu in the DOM, not in the React tree: its
       // events still bubble through the components that rendered it. The
       // sidebar renders it next to its draggable row, not inside it, so they
-      // reach the row's bare <li> and what encloses it, never the row's drag
-      // listeners. The stops are defensive: rendered inside a drag source, a
+      // reach the row's <li> and what encloses it, never the row's drag
+      // listeners. That <li> cancels a contextmenu bubbling up from here, so
+      // the browser's own menu can't open over this one; it handles nothing
+      // else. The stops are defensive: rendered inside a drag source, a
       // mousedown or touchstart would start a drag, and a key handler there
       // could take the menu's keys. Stopping here also stops the native
       // event at the portal container, before the document listeners above,

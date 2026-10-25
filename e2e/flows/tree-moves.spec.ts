@@ -124,6 +124,8 @@ test("alt_arrow_indents_without_navigating", async ({ page }) => {
   await page.keyboard.press("Alt+ArrowRight");
   await expect.poll(() => outline(page.request)).toEqual(["A", "A/B"]);
   await expect(page).toHaveURL(onA);
+  // Under its new parent B's row is a new element, and it keeps the focus.
+  await expect(page.getByTestId(`doc-row-${B}`)).toBeFocused();
 
   await page.getByTestId(`doc-row-${B}`).focus();
   await page.keyboard.press("Alt+ArrowLeft");

@@ -162,6 +162,9 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
       // would open the browser's own menu over ours: on Windows, Chrome and
       // Edge send the Menu key's contextmenu on keyup, to the item that took
       // focus when the keydown opened the menu. The row's own are left alone.
+      // This holds only while the row menu is the only portal TreeRow
+      // renders: a contextmenu from any other here, such as a dialog with a
+      // text field, would lose the browser's menu too.
       onContextMenu={(e) => {
         if (!e.currentTarget.contains(e.target as Node)) e.preventDefault();
       }}
@@ -217,9 +220,10 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
           to={`/doc/${node.id}`}
           // Viewers can't move pages, so they don't hear how to drag one.
           aria-describedby={canEdit ? `${attributes["aria-describedby"]} ${descId}` : descId}
+          // With no items there is no menu of ours, and the browser's opens.
           onContextMenu={(e) => {
-            e.preventDefault();
             if (items.length === 0) return;
+            e.preventDefault();
             setMenu({ x: e.clientX, y: e.clientY });
           }}
           onKeyDown={(e) => {
@@ -230,11 +234,13 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
               // Cancelled even when the page can't move that way: Alt+← and
               // Alt+→ are Back and Forward in Windows and Linux browsers.
               e.preventDefault();
-              tree.onMove(node.id, cmd);
+              // One move per press: a held key repeats about 30 times a second.
+              if (!e.repeat) tree.onMove(node.id, cmd);
             } else if ((e.key === "F10" && shiftOnly) || e.key === "ContextMenu") {
-              // The keyboard's way to the row menu, which opens below the link.
-              e.preventDefault();
+              // The keyboard's way to the row menu, which opens below the
+              // link. With no items, the browser's opens instead.
               if (items.length === 0) return;
+              e.preventDefault();
               const r = e.currentTarget.getBoundingClientRect();
               setMenu({ x: r.left, y: r.bottom, byKeyboard: true });
             }

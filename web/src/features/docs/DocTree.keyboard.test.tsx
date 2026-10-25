@@ -74,21 +74,33 @@ function serverMove(pages: Page[], id: string, b: MoveBody): Page[] {
   return [...rest.filter((p) => !keyed.some((k) => k.id === p.id)), ...keyed];
 }
 
+/** How the server answers one move. */
+type MoveReply = {
+  /** The move is answered once this resolves. */
+  gate?: Promise<unknown>;
+  /** The move is refused with this error. */
+  refuse?: { status: number; code: string };
+};
+
 type ServerOpts = {
   role?: Role;
   /** Moves are answered once this resolves. */
   gate?: Promise<unknown>;
   /** Moves are refused with this error. */
   refuse?: { status: number; code: string };
+  /** One reply per move, in the order the moves arrive, in place of `gate`
+   *  and `refuse`. */
+  replies?: MoveReply[];
   /** Where the server puts a moved page. By default where the move asked. */
   place?: (pages: Page[], id: string, b: MoveBody) => Page[];
   /** Every GET /api/docs after the first is answered once this resolves. */
   relistGate?: Promise<unknown>;
 };
 
-function server({ role = "editor", gate, refuse, place = serverMove, relistGate }: ServerOpts = {}) {
+function server({ role = "editor", gate, refuse, replies, place = serverMove, relistGate }: ServerOpts = {}) {
   let pages = PAGES;
   let listed = 0;
+  let movesSeen = 0;
   return vi.fn((url: string, init?: RequestInit) => {
     if (url === "/auth/session") {
       return json({ user_id: "u1", email: "a@x.test", display_name: "A", workspace_id: "w1", role });
@@ -104,8 +116,11 @@ function server({ role = "editor", gate, refuse, place = serverMove, relistGate 
     const moved = /^\/api\/docs\/([^/]+)\/move$/.exec(url);
     if (moved && init?.method === "POST") {
       const body = JSON.parse(init.body as string) as MoveBody;
-      return (gate ?? Promise.resolve()).then(() => {
-        if (refuse) return response({ error: { code: refuse.code, message: refuse.code, details: {} } }, refuse.status);
+      const reply = replies ? (replies[movesSeen] ?? {}) : { gate, refuse };
+      movesSeen += 1;
+      return (reply.gate ?? Promise.resolve()).then(() => {
+        const refused = reply.refuse;
+        if (refused) return response({ error: { code: refused.code, message: refused.code, details: {} } }, refused.status);
         pages = place(pages, moved[1]!, body);
         return response({});
       });
@@ -274,6 +289,25 @@ describe("DocTree — Alt+arrow moves", () => {
     expect(screen.queryByTestId("context-menu")).toBeNull();
   });
 
+  // A held key repeats its keydown about 30 times a second. Each repeat would
+  // be another move, planned before the last one has even rendered.
+  it("held_alt_arrow_repeat_sends_one_move: a held Alt+← moves the page once and never navigates", async () => {
+    const fetchMock = server();
+    renderTree(fetchMock);
+    await editorRows();
+    const left = { key: "ArrowLeft", altKey: true };
+    const betaOne = () => screen.getByTestId("doc-row-beta1");
+
+    expect(press(betaOne(), { ...left, repeat: true })).toBe(true);
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+
+    expect(press(betaOne(), left)).toBe(true);
+    for (let i = 0; i < 3; i++) expect(press(betaOne(), { ...left, repeat: true })).toBe(true);
+    await settle();
+    expect(moves(fetchMock)).toEqual([{ id: "beta1", body: { parent_id: null, after_id: "beta" } }]);
+  });
+
   it("leaves Alt+arrows to the browser for viewers, who can't move pages", async () => {
     const fetchMock = server({ role: "viewer" });
     renderTree(fetchMock);
@@ -341,6 +375,100 @@ describe("DocTree — the row menu by keyboard", () => {
     fireEvent(row, onRow);
     expect(onRow.defaultPrevented).toBe(false);
     expect(screen.queryByTestId("context-menu")).toBeNull();
+  });
+});
+
+describe("DocTree — the browser's own menu", () => {
+  // Viewers have no row menu: a right-click on a page must still open the
+  // browser's (open in a new tab, copy the link).
+  it("leaves the browser's menu on a page's link to a user with no row menu items", async () => {
+    renderTree(server({ role: "viewer" }));
+    await screen.findByText("a@x.test");
+    const link = screen.getByTestId("doc-row-beta");
+
+    const ev = createEvent.contextMenu(link);
+    fireEvent(link, ev);
+    expect(ev.defaultPrevented).toBe(false);
+    expect(screen.queryByTestId("context-menu")).toBeNull();
+  });
+
+  it("leaves Shift+F10 and the ContextMenu key to the browser for a user with no row menu items", async () => {
+    renderTree(server({ role: "viewer" }));
+    await screen.findByText("a@x.test");
+    const link = screen.getByTestId("doc-row-beta");
+
+    expect(press(link, { key: "F10", shiftKey: true })).toBe(false);
+    expect(press(link, { key: "ContextMenu" })).toBe(false);
+    expect(screen.queryByTestId("context-menu")).toBeNull();
+  });
+});
+
+describe("DocTree — moves in quick succession", () => {
+  it("moves_are_sent_one_at_a_time: a move is sent once the one before it is answered, in press order", async () => {
+    const first = deferred<void>();
+    const second = deferred<void>();
+    const fetchMock = server({ replies: [{ gate: first.promise }, { gate: second.promise }] });
+    const qc = renderTree(fetchMock);
+    await editorRows();
+
+    fireEvent.click(within(openMenu("alpha")).getByTestId("ctx-move-down"));
+    await waitFor(() => expect(order()).toEqual(["beta", "beta1", "alpha", "gamma"]));
+    // Planned from the list the first move shows.
+    fireEvent.click(within(openMenu("alpha")).getByTestId("ctx-move-down"));
+    await waitFor(() => expect(order()).toEqual(["beta", "beta1", "gamma", "alpha"]));
+    await settle();
+    expect(moves(fetchMock)).toEqual([{ id: "alpha", body: { parent_id: null, after_id: "beta" } }]);
+
+    first.resolve();
+    await waitFor(() => expect(moves(fetchMock)).toHaveLength(2));
+    expect(moves(fetchMock)).toEqual([
+      { id: "alpha", body: { parent_id: null, after_id: "beta" } },
+      { id: "alpha", body: { parent_id: null, after_id: "gamma" } },
+    ]);
+
+    second.resolve();
+    await waitFor(() => {
+      expect(qc.isMutating()).toBe(0);
+      expect(qc.isFetching()).toBe(0);
+    });
+    await settle();
+    // The server applied them in that order: the other order ends with Gamma last.
+    expect(order()).toEqual(["beta", "beta1", "gamma", "alpha"]);
+  });
+
+  it("failed_move_does_not_undo_a_later_one: a refused move leaves the next one shown, then the server's list", async () => {
+    const first = deferred<void>();
+    const second = deferred<void>();
+    const fetchMock = server({
+      replies: [
+        { gate: first.promise, refuse: { status: 422, code: "doc.bad_anchor" } },
+        { gate: second.promise },
+      ],
+    });
+    const qc = renderTree(fetchMock);
+    await editorRows();
+
+    fireEvent.click(within(openMenu("alpha")).getByTestId("ctx-move-down"));
+    await waitFor(() => expect(order()).toEqual(["beta", "beta1", "alpha", "gamma"]));
+    fireEvent.click(within(openMenu("beta1")).getByTestId("ctx-outdent"));
+    await waitFor(() => expect(indentOf(screen.getByTestId("doc-row-beta1"))).toBe(4));
+
+    first.resolve();
+    await waitFor(() => expect(screen.getByTestId("toast-error")).toHaveTextContent("Couldn't move"));
+    await settle();
+    // The second move is still on its way, and still shown at the top level.
+    expect(indentOf(screen.getByTestId("doc-row-beta1"))).toBe(4);
+
+    second.resolve();
+    await waitFor(() => {
+      expect(qc.isMutating()).toBe(0);
+      expect(qc.isFetching()).toBe(0);
+    });
+    await settle();
+    // The server's list: Alpha never moved, Beta one is a top-level page after Beta.
+    expect(order()).toEqual(["alpha", "beta", "beta1", "gamma"]);
+    expect(indentOf(screen.getByTestId("doc-row-beta1"))).toBe(4);
+    expect(screen.getAllByTestId("toast-error")).toHaveLength(1);
   });
 });
 
@@ -490,5 +618,22 @@ describe("DocTree — refused moves (P12)", () => {
       expect(screen.getByTestId("toast-error")).toHaveTextContent("Couldn't move");
       expect(order()).toEqual(["alpha", "beta", "beta1", "gamma"]);
     });
+  });
+
+  it.each([
+    [422, "doc.bad_anchor"],
+    [409, "doc.move_cycle"],
+  ])("refused_move_is_announced: after a %i %s the live region says the page didn't move", async (status, code) => {
+    const gate = deferred<void>();
+    renderTree(server({ gate: gate.promise, refuse: { status, code } }));
+    await editorRows();
+    const live = screen.getByTestId("tree-live");
+
+    fireEvent.click(within(openMenu("alpha")).getByTestId("ctx-move-down"));
+    expect(live).toHaveTextContent(/^Moved “Alpha” to the top level, position 2 of 3$/);
+
+    gate.resolve();
+    await waitFor(() => expect(live).toHaveTextContent(/^Couldn't move “Alpha”\.$/));
+    await waitFor(() => expect(order()).toEqual(["alpha", "beta", "beta1", "gamma"]));
   });
 });
