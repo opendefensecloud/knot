@@ -333,7 +333,9 @@ export function projectDrop(
 /** The menu and Alt+arrow moves of `id`, or null when it can't move that way.
  *  Up and down move the page (with its subtree) past its previous or next
  *  sibling, indent makes it the previous sibling's last child, and outdent
- *  puts it right after its parent. */
+ *  puts it right after its parent. Up and down pass over pages drawn at the
+ *  top level whose parent isn't listed (a template's child): moving past one
+ *  alone changes no real order, so they go on to the next sibling. */
 export function keyboardMove(
   flat: FlatRow[],
   docs: Doc[],
@@ -353,13 +355,15 @@ export function keyboardMove(
     return -1;
   };
   switch (cmd) {
-    case "up": {
-      const s = sibling(home - 1, -1);
-      return s < 0 ? null : at(s, depth);
-    }
+    case "up":
     case "down": {
-      const s = sibling(home, 1);
-      return s < 0 ? null : at(blockEnd(items, s), depth);
+      const step = cmd === "up" ? -1 : 1;
+      // Up: the gap above sibling `s`. Down: the gap after its visible subtree.
+      for (let s = sibling(cmd === "up" ? home - 1 : home, step); s >= 0; s = sibling(s + step, step)) {
+        const args = at(cmd === "up" ? s : blockEnd(items, s), depth);
+        if (args) return args;
+      }
+      return null;
     }
     case "indent":
       return sibling(home - 1, -1) < 0 ? null : at(home, depth + 1);

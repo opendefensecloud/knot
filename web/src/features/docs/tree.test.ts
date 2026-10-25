@@ -443,6 +443,22 @@ describe("keyboardMove", () => {
     // Past A2's children, not into A2.
     expect(km("A1", "down")).toEqual({ parent_id: "A", after_id: "A2" });
   });
+  it("passes over pages drawn at the top level whose parent isn't listed", () => {
+    // A, T1 (a template's child), B: passing T1 alone changes no real order,
+    // so up and down go on to the next sibling, as dragging B above A does.
+    const docs = [doc("A", null, "a"), doc("T1", "T", "b"), doc("B", null, "c")];
+    expect(keyboardMove(rows(docs), docs, "B", "up")).toEqual({ parent_id: null, before_id: "A" });
+    expect(keyboardMove(rows(docs), docs, "A", "down")).toEqual({ parent_id: null, after_id: "B" });
+    // messy: A ─ A1 ; T1 ─ T1a ; B ; Z ; T2. Between A and B lies T1 with its
+    // subpage; after B lie only such pages, so B is already last.
+    for (const collapsed of [[], ["T1"]]) {
+      const f = rows(messy, collapsed);
+      expect(keyboardMove(f, messy, "B", "up")).toEqual({ parent_id: null, before_id: "A" });
+      expect(keyboardMove(f, messy, "A", "down")).toEqual({ parent_id: null, after_id: "B" });
+      expect(keyboardMove(f, messy, "B", "down")).toBeNull();
+      expect(keyboardMove(f, messy, "A", "up")).toBeNull();
+    }
+  });
   it("indents into the previous sibling as its last child", () => {
     expect(km("B", "indent")).toEqual({ parent_id: "A", after_id: "A3" });
     expect(km("A3", "indent")).toEqual({ parent_id: "A2", after_id: "A2a" });
@@ -555,4 +571,40 @@ describe("projections only send valid, real moves", () => {
     }
     expect(bad).toEqual([]);
   });
+});
+
+describe("keyboard up and down can swap any two adjacent real siblings", () => {
+  // Every reorder is reachable by keyboard (WCAG 2.5.7): for each pair of
+  // adjacent real siblings X, Y that the sidebar draws as siblings, "Y up"
+  // and "X down" each give exactly the order with X and Y swapped, even with
+  // pages drawn at the top level (a template's child) between them.
+  const interleaved = [doc("A", null, "a"), doc("T1", "T", "b"), doc("B", null, "c")];
+  it.each([["tree1", tree1], ["proto", proto], ["messy", messy], ["A,T1,B", interleaved]])(
+    "%s",
+    (_name, docs: Doc[]) => {
+      const bad: string[] = [];
+      const order = realOrder(docs);
+      const ids = docs.map((d) => d.id);
+      for (const collapsed of [[], ...ids.map((id) => [id])]) {
+        const f = rows(docs, collapsed);
+        const shown = new Set(f.map((r) => r.id));
+        for (const [parent, sibs] of Object.entries(order)) {
+          // Only the top level and listed, expanded parents: the children of
+          // an unlisted parent (T, "archived") aren't drawn as its children.
+          if (parent !== "" && !shown.has(parent)) continue;
+          if (!sibs.every((id) => shown.has(id))) continue;
+          for (let i = 0; i + 1 < sibs.length; i++) {
+            const [x, y] = [sibs[i]!, sibs[i + 1]!];
+            const want = show({ ...order, [parent]: sibs.map((id, j) => (j === i ? y : j === i + 1 ? x : id)) });
+            for (const [id, cmd] of [[y, "up"], [x, "down"]] as const) {
+              const args = keyboardMove(f, docs, id, cmd);
+              const got = args ? show(serverMove(docs, id, args)) : "null";
+              if (got !== want) bad.push(`[${collapsed.join()}] ${id} ${cmd}: ${JSON.stringify(args)}`);
+            }
+          }
+        }
+      }
+      expect(bad).toEqual([]);
+    },
+  );
 });
