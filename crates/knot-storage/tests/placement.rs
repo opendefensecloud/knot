@@ -509,31 +509,69 @@ async fn anchors_must_be_live_non_template_siblings() {
     assert_eq!(created.parent_id, Some(folder));
 }
 
-/// Runs `op`, which takes the top-level lock and then must update `blocker`,
-/// a top-level row with a bad key, to respread the group. Another
-/// transaction holds `blocker` and then waits for the top-level lock: a
-/// deadlock. Postgres aborts `op`, the first to wait, with 40P01, and `op`
-/// must succeed by running its transaction once more.
+/// Runs `op`, which takes the top-level lock first and later must update
+/// `blocker`, a top-level row with a bad key, to respread the group. A
+/// stand-in transaction holds `blocker` and waits for the top-level lock: a
+/// deadlock. Postgres aborts `op` with 40P01, and `op` must succeed by
+/// running its transaction once more.
+///
+/// Postgres checks a lock wait for a deadlock once, `deadlock_timeout` (1 s)
+/// after the wait starts, and aborts the session whose check finds the
+/// cycle. Two things make that `op`, even on a loaded machine:
+///
+/// - `op`'s wait for `blocker` starts last. A gate transaction holds the
+///   top-level lock until `op` and then the stand-in queue for it. `op`,
+///   first in the queue, gets it when the gate ends and goes on to wait for
+///   `blocker`, with the stand-in already waiting. Without the gate, `op`
+///   waited first, and on a loaded machine the stand-in could queue more
+///   than a second later: `op`'s only check found no cycle yet, and the
+///   stand-in's check aborted the stand-in.
+/// - The stand-in's own check comes a minute after its wait starts, long
+///   after `op`'s. Setting `deadlock_timeout` needs a superuser, which the
+///   test databases' role is (CI and the dev stack).
 async fn deadlocks_once<T, F>(w: &World, blocker: Uuid, op: F) -> T
 where
     T: Send + 'static,
     F: Future<Output = Result<T, DocStoreError>> + Send + 'static,
 {
-    let mut other = w.pool.begin().await.unwrap();
-    sqlx::query("SELECT 1 FROM documents WHERE id = $1 FOR UPDATE")
-        .bind(blocker)
-        .execute(&mut *other)
+    const TAKE_TOP_LEVEL_LOCK: &str = "SELECT pg_advisory_xact_lock($1, hashtext($2::uuid::text))";
+    let mut stand_in = w.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL deadlock_timeout = '1min'")
+        .execute(&mut *stand_in)
         .await
         .unwrap();
-    let op = tokio::spawn(op);
-    wait_for_lock_waits(&w.pool, 1).await;
-    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::uuid::text))")
+    sqlx::query("SELECT 1 FROM documents WHERE id = $1 FOR UPDATE")
+        .bind(blocker)
+        .execute(&mut *stand_in)
+        .await
+        .unwrap();
+    let mut gate = w.pool.begin().await.unwrap();
+    sqlx::query(TAKE_TOP_LEVEL_LOCK)
         .bind(TOP_LEVEL_LOCK)
         .bind(w.ws)
-        .execute(&mut *other)
+        .execute(&mut *gate)
         .await
-        .expect("Postgres aborts the operation that waited first, not this one");
-    other.rollback().await.unwrap();
+        .unwrap();
+
+    let op = tokio::spawn(op);
+    wait_for_lock_waits(&w.pool, 1).await;
+    let ws = w.ws;
+    let stand_in = tokio::spawn(async move {
+        let queued = sqlx::query(TAKE_TOP_LEVEL_LOCK)
+            .bind(TOP_LEVEL_LOCK)
+            .bind(ws)
+            .execute(&mut *stand_in)
+            .await;
+        stand_in.rollback().await.unwrap();
+        queued
+    });
+    wait_for_lock_waits(&w.pool, 2).await;
+    gate.rollback().await.unwrap();
+
+    stand_in
+        .await
+        .unwrap()
+        .expect("Postgres aborts the operation, not the stand-in");
     op.await.unwrap().expect("one retry after the deadlock")
 }
 
