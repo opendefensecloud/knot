@@ -16,6 +16,8 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+
 use common::corpus::{self, Case, Shape};
 use common::{N, build, el, ela, hard_break, p, run, text};
 use knot_crdt::tasks::task_items;
@@ -681,6 +683,9 @@ fn listing_and_toggles_hit_the_same_item() {
             }
         }
     }
+    common::report("listing_and_toggles_hit_the_same_item", || {
+        format!("{toggles} toggles, {} miss their task", failures.len())
+    });
     assert_no_failures("a toggle doesn't flip exactly the listed task", &failures);
     assert_at_least("toggles", toggles, MIN_TOGGLES);
 }
@@ -737,15 +742,24 @@ fn without_html_tags(text: &str) -> String {
 #[test]
 fn listing_matches_legacy_where_legacy_agrees_with_the_room() {
     let (mut same, mut classed) = (0, 0);
+    // For the report: pages, those where legacy agrees with the room, and
+    // the classed tasks by class.
+    let (mut pages, mut agreeing) = (0, 0);
+    let mut classes: BTreeMap<&str, usize> = BTreeMap::new();
     let mut failures = Vec::new();
     for case in corpus_docs() {
+        pages += 1;
         let Some(tasks) = verdicts(&case.doc) else {
             continue;
         };
+        agreeing += 1;
         for (k, (old, new, verdict)) in tasks.iter().enumerate() {
             match verdict {
                 Verdict::Same => same += 1,
-                Verdict::Exempt(_) => classed += 1,
+                Verdict::Exempt(class) => {
+                    classed += 1;
+                    *classes.entry(*class).or_default() += 1;
+                }
                 Verdict::Differs => failures.push(format!(
                     "{}: task {k}\n  legacy: {old:?}\n  new:    {new:?}",
                     case.name
@@ -753,6 +767,17 @@ fn listing_matches_legacy_where_legacy_agrees_with_the_room() {
             }
         }
     }
+    common::report(
+        "listing_matches_legacy_where_legacy_agrees_with_the_room",
+        || {
+            format!(
+                "{pages} pages, {agreeing} where legacy agrees with the room; there, {same} tasks \
+             listed as before, {classed} classed, {} listed otherwise outside a class; per \
+             task class: {classes:?}",
+                failures.len()
+            )
+        },
+    );
     assert_no_failures(
         "a task is listed differently from legacy where legacy agrees with the room",
         &failures,
@@ -833,6 +858,16 @@ fn classed_tasks_are_listed_otherwise_only_where_legacy_damaged_them() {
             ));
         }
     }
+    common::report(
+        "classed_tasks_are_listed_otherwise_only_where_legacy_damaged_them",
+        || {
+            format!(
+                "{otherwise} classed tasks listed otherwise than legacy listed them, {} of them \
+                 items legacy didn't damage",
+                failures.len()
+            )
+        },
+    );
     assert_no_failures(
         "a classed task legacy writes back as it is is listed otherwise",
         &failures,
@@ -872,6 +907,12 @@ fn task_with_text_of_its_own_is_listed_with_text() {
             }
         }
     }
+    common::report("task_with_text_of_its_own_is_listed_with_text", || {
+        format!(
+            "{compared} tasks with text of their own, {} listed without text",
+            failures.len()
+        )
+    });
     assert_no_failures(
         "a task with text of its own is listed without text",
         &failures,

@@ -14,6 +14,20 @@ use yrs::{
     XmlTextPrelim,
 };
 
+/// Prints what test `test` compared, by class, when `KNOT_COMPAT_REPORT=1`:
+/// the counts the harnesses' floors and doc comments cite, so that they can
+/// be reproduced. `summary` runs only then.
+///
+/// ```text
+/// KNOT_COMPAT_REPORT=1 cargo nextest run -p knot-markdown \
+///   --test compat --test tasks_compat --no-capture
+/// ```
+pub fn report(test: &str, summary: impl FnOnce() -> String) {
+    if std::env::var_os("KNOT_COMPAT_REPORT").is_some_and(|v| v == "1") {
+        println!("KNOT_COMPAT_REPORT {test}: {}", summary());
+    }
+}
+
 /// A node to build: an element with attributes and children, or one
 /// `XmlText` made of formatted runs.
 #[derive(Clone, Debug, PartialEq)]

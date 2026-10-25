@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use common::corpus::{self, Case};
 use common::{N, Run, build, el, ela, hard_break, p, read, run, text};
@@ -108,6 +108,29 @@ fn serializer_matches_legacy_on_healthy_docs() {
             )),
         }
     }
+    common::report("serializer_matches_legacy_on_healthy_docs", || {
+        let docs = corpus_docs();
+        let mut healthy = 0;
+        // Per export class: all documents, healthy ones.
+        let mut classes: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for case in &docs {
+            let is_healthy = compat::healthy(&case.doc).is_some();
+            healthy += usize::from(is_healthy);
+            if let Some(class) = compat::export_class(&case.doc) {
+                let counts = classes.entry(class).or_default();
+                counts.0 += 1;
+                counts.1 += usize::from(is_healthy);
+            }
+        }
+        format!(
+            "{} documents ({} Markdown inputs), {healthy} healthy; {compared} healthy outside \
+             the classes compared byte for byte, {} differ; per export class (all, healthy): \
+             {classes:?}",
+            docs.len(),
+            corpus::markdown_inputs().len(),
+            failures.len()
+        )
+    });
     assert_no_failures("healthy document exports differently", &failures);
     assert_at_least("healthy documents", compared, MIN_HEALTHY_DOCS);
 }
@@ -156,6 +179,25 @@ fn importer_matches_legacy_on_healthy_inputs() {
             Err(e) => failures.push(format!("{name}: {md:?}\n  new: error {e}")),
         }
     }
+    common::report("importer_matches_legacy_on_healthy_inputs", || {
+        let mut unique = HashSet::new();
+        let mut classes: BTreeMap<&str, usize> = BTreeMap::new();
+        for (_, md) in &inputs {
+            if unique.insert(md.as_str())
+                && let Some(class) = compat::import_class(md)
+            {
+                *classes.entry(class).or_default() += 1;
+            }
+        }
+        format!(
+            "{} inputs, {} unique; {compared} healthy inputs compared ({compared_files} \
+             fixtures or probes), {} import differently; per import class (unique inputs): \
+             {classes:?}",
+            inputs.len(),
+            unique.len(),
+            failures.len()
+        )
+    });
     assert_no_failures("healthy input imports differently", &failures);
     assert_at_least("healthy inputs", compared, MIN_HEALTHY_INPUTS);
     assert_at_least(
@@ -254,6 +296,12 @@ fn import_export_import_is_stable() {
             ));
         }
     }
+    common::report("import_export_import_is_stable", || {
+        format!(
+            "{checked} inputs checked ({checked_files} fixtures or probes), {} unstable",
+            failures.len()
+        )
+    });
     assert_no_failures("import of the export differs from the import", &failures);
     assert_at_least("inputs", checked, MIN_STABLE_INPUTS);
     assert_at_least(
@@ -290,6 +338,12 @@ fn export_classes_hold_the_fixed_point() {
             ));
         }
     }
+    common::report("export_classes_hold_the_fixed_point", || {
+        format!(
+            "{compared} healthy classed generated documents, {} not fixed points",
+            failures.len()
+        )
+    });
     assert_no_failures("export class export is not a fixed point", &failures);
     assert_at_least("classed healthy documents", compared, MIN_CLASSED_DOCS);
 }
@@ -737,6 +791,20 @@ fn new_export_is_a_fixed_point() {
             )),
         }
     }
+    common::report("new_export_is_a_fixed_point", || {
+        let explained: usize = classed.iter().sum();
+        let classes: Vec<(&str, usize)> = FIXED_POINT_CLASSES
+            .iter()
+            .map(|(name, _)| *name)
+            .zip(classed.iter().copied())
+            .collect();
+        format!(
+            "{} documents, {fixed} fixed points as they are; per class: {classes:?}; {} \
+             unexplained",
+            fixed + explained + failures.len(),
+            failures.len()
+        )
+    });
     assert_no_failures("export is not a fixed point", &failures);
     assert_at_least("fixed points", fixed, MIN_FIXED_POINTS);
     let unused: Vec<&str> = FIXED_POINT_CLASSES
@@ -1158,6 +1226,12 @@ fn export_classes_name_only_damaged_documents() {
             "{name} ({class}): legacy's {legacy_md:?} reads back as written, and the new {md:?} reads back the same"
         ));
     }
+    common::report("export_classes_name_only_damaged_documents", || {
+        format!(
+            "{compared} healthy classed documents, {} that legacy wrote losslessly",
+            failures.len()
+        )
+    });
     assert_no_failures("export class names a lossless document", &failures);
     assert_at_least("classed healthy documents", compared, MIN_CLASSED_DOCS);
 }
@@ -1394,6 +1468,12 @@ fn no_text_is_lost() {
             ));
         }
     }
+    common::report("no_text_is_lost", || {
+        format!(
+            "{exported} documents exported, {} fail or lose text",
+            failures.len()
+        )
+    });
     assert_no_failures("export loses text", &failures);
     assert_at_least("exported documents", exported, MIN_EXPORTED_DOCS);
 }
