@@ -31,7 +31,7 @@
 //! page again on every boot, on every replica. So the sweep records an
 //! attempt before it renders a page (`doc_markdown_sweep_attempts`), clears
 //! it when the render returns, and skips a page the current renderer
-//! started [`SWEEP_ATTEMPTS`] times without finishing. The debug log names
+//! started twice without finishing (`SWEEP_ATTEMPTS`). The debug log names
 //! each page before its render.
 
 use std::collections::HashSet;
@@ -130,7 +130,8 @@ enum Refresh {
 }
 
 /// `refresh` of `doc_id`, run in a task of its own, so that a panic in it
-/// ends that task, not the worker: `None` when it panicked, which this logs.
+/// ends that task, not the worker: `None` when it panicked, or the runtime
+/// cancelled it as it shut down, which this logs.
 async fn refresh_caught(
     state: &AppState,
     doc_id: Uuid,
@@ -145,8 +146,12 @@ async fn refresh_caught(
     });
     match task.await {
         Ok(refreshed) => Some(refreshed),
-        Err(e) => {
+        Err(e) if e.is_panic() => {
             tracing::error!(error = %e, %doc_id, "reindex worker: refresh panicked");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, %doc_id, "reindex worker: refresh cancelled");
             None
         }
     }

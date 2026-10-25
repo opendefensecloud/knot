@@ -3,8 +3,8 @@
 //! stack overflow aborts the whole process, which a server that renders such
 //! a page on every boot (the refresh sweep) never survives. So the writer
 //! follows containers only to `to_markdown::MAX_DEPTH` and writes what lies
-//! deeper as its text, and every other walk over a page reads it with an
-//! explicit stack.
+//! deeper as its text, and the other walks of the export and of the task
+//! listing, and `compat::depth_limit`, read a page with an explicit stack.
 //!
 //! Each test runs on a thread with the stack of a tokio worker, 2 MiB, where
 //! the server renders pages. This file is a test binary of its own, so that
@@ -37,15 +37,30 @@ fn on_worker_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) ->
         .expect("the walk panicked")
 }
 
-/// The page's export, its task listing and its export class, read on a
-/// [`STACK`]-sized stack. `build` builds the page there too.
-fn read_deep(
-    build: impl FnOnce() -> DocHandle + Send + 'static,
-) -> (String, Vec<Task>, Option<&'static str>) {
+/// A page as read on a [`STACK`]-sized stack.
+struct Read {
+    /// Its export.
+    md: String,
+    /// Its task listing.
+    tasks: Vec<Task>,
+    /// Its export class.
+    class: Option<&'static str>,
+    /// The first text character of the page its export lost, if any.
+    lost: Option<(usize, char)>,
+}
+
+/// The page `build` builds, read on a [`STACK`]-sized stack, where `build`
+/// runs too.
+fn read_deep(build: impl FnOnce() -> DocHandle + Send + 'static) -> Read {
     on_worker_stack(|| {
         let doc = build();
         let md = knot_markdown::serialise(&YrsEngine, &doc).expect("serialise");
-        (md, extract_tasks_from_doc(&doc), compat::export_class(&doc))
+        Read {
+            tasks: extract_tasks_from_doc(&doc),
+            class: compat::export_class(&doc),
+            lost: compat::first_lost_char(&compat::doc_text(&doc), &md),
+            md,
+        }
     })
 }
 
@@ -92,7 +107,12 @@ fn checked(k: usize) -> bool {
 /// `deep`.
 #[test]
 fn deeply_nested_quotes_export_and_list_their_task() {
-    let (md, tasks, class) = read_deep(|| {
+    let Read {
+        md,
+        tasks,
+        class,
+        lost,
+    } = read_deep(|| {
         page(|frag, txn| {
             let mut quote = child(frag, txn, "blockquote");
             for _ in 1..DEEP {
@@ -115,6 +135,7 @@ fn deeply_nested_quotes_export_and_list_their_task() {
         }]
     );
     assert_eq!(class, Some("depth_limit"));
+    assert_eq!(lost, None);
 }
 
 /// A checklist [`DEEP`] levels deep: task `k` holds its text, `task k`, and
@@ -123,7 +144,12 @@ fn deeply_nested_quotes_export_and_list_their_task() {
 /// task, each with its own text.
 #[test]
 fn deeply_nested_checklist_exports_and_lists_every_task() {
-    let (md, tasks, class) = read_deep(|| {
+    let Read {
+        md,
+        tasks,
+        class,
+        lost,
+    } = read_deep(|| {
         page(|frag, txn| {
             let mut list = child(frag, txn, "bullet_list");
             for k in 0..DEEP {
@@ -151,6 +177,7 @@ fn deeply_nested_checklist_exports_and_lists_every_task() {
         );
     }
     assert_eq!(class, Some("depth_limit"));
+    assert_eq!(lost, None);
 }
 
 /// Tables in table cells, lists in cells and quotes in list items, in turn,
@@ -158,7 +185,12 @@ fn deeply_nested_checklist_exports_and_lists_every_task() {
 /// too.
 #[test]
 fn deeply_nested_tables_lists_and_quotes_export_their_text() {
-    let (md, tasks, class) = read_deep(|| {
+    let Read {
+        md,
+        tasks,
+        class,
+        lost,
+    } = read_deep(|| {
         page(|frag, txn| {
             let mut container: Option<XmlElementRef> = None;
             for k in 0..DEEP {
@@ -183,13 +215,14 @@ fn deeply_nested_tables_lists_and_quotes_export_their_text() {
     assert!(md.contains("deep"), "{md:?}");
     assert!(tasks.is_empty());
     assert_eq!(class, Some("depth_limit"));
+    assert_eq!(lost, None);
 }
 
 /// A task whose own content is [`DEEP`] quotes deep: its listed text is
 /// written as the export writes it, the quotes past the limit as their text.
 #[test]
 fn deep_content_of_a_task_is_listed_as_its_text() {
-    let (_, tasks, _) = read_deep(|| {
+    let Read { tasks, lost, .. } = read_deep(|| {
         page(|frag, txn| {
             let list = child(frag, txn, "bullet_list");
             let item = task(&list, txn, false, "outer");
@@ -202,6 +235,7 @@ fn deep_content_of_a_task_is_listed_as_its_text() {
     });
     let texts: Vec<&str> = tasks.iter().map(|t| t.text.as_str()).collect();
     assert_eq!(texts, ["outer inner"]);
+    assert_eq!(lost, None);
 }
 
 /// Unknown nodes [`DEEP`] deep, written as their text (P4), and fragments
@@ -209,7 +243,9 @@ fn deep_content_of_a_task_is_listed_as_its_text() {
 /// at the top level, and in a paragraph.
 #[test]
 fn deeply_nested_unknown_nodes_and_fragments_export_their_text() {
-    let (md, _, class) = read_deep(|| {
+    let Read {
+        md, class, lost, ..
+    } = read_deep(|| {
         page(|frag, txn| {
             let mut callout = child(frag, txn, "callout");
             for _ in 1..DEEP {
@@ -234,6 +270,7 @@ fn deeply_nested_unknown_nodes_and_fragments_export_their_text() {
     });
     assert_eq!(md, "unknown\n\n> block\n\ninline\n");
     assert_eq!(class, Some("depth_limit"));
+    assert_eq!(lost, None);
 }
 
 /// An empty fragment in `parent`.

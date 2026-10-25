@@ -35,7 +35,7 @@ type Unknown = Vec<String>;
 /// sits in: a top-level block is at depth 0. The writer recurses a few
 /// frames per container, and a stack overflow aborts the whole process, so
 /// a blockquote, list or table at this depth or deeper is written as its
-/// text, one paragraph ([`capped_text`]), as knot-export caps its walk
+/// text, one paragraph (`capped_text`), as knot-export caps its walk
 /// (`MAX_DEPTH` in `crates/knot-export/src/walk.rs`). No page the editor
 /// makes nests this deep; an import of `>` repeated, or a crafted Yjs
 /// update, can. Every other walk over a page here uses an explicit stack.
