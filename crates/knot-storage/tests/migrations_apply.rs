@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use knot_storage::{DocStore, PgDocStore};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -451,14 +452,15 @@ async fn group_orders(pool: &PgPool) -> BTreeMap<Group, Vec<Uuid>> {
 
 /// A workspace's root list in the order users see, with its keys: the
 /// top-level rows and the children of templates, which the sidebar shows at
-/// the top level (P7).
+/// the top level (P7). Where keys tie across groups, top-level rows come
+/// first, then template children by parent, as in the sidebar.
 async fn root_list(pool: &PgPool, ws: Uuid) -> Vec<(Uuid, String)> {
     sqlx::query_as(
         r#"SELECT d.id, d.sort_key
              FROM documents d
              LEFT JOIN documents p ON p.id = d.parent_id
             WHERE d.workspace_id = $1 AND (d.parent_id IS NULL OR p.is_template)
-            ORDER BY d.sort_key COLLATE "C", d.created_at, d.id"#,
+            ORDER BY d.sort_key COLLATE "C", d.parent_id NULLS FIRST, d.created_at, d.id"#,
     )
     .bind(ws)
     .fetch_all(pool)
@@ -602,34 +604,47 @@ async fn heal_sort_keys_preserves_order_and_fixes_bad_groups() {
 }
 
 /// A bad group of n rows gets exactly `lexorank::spread(n)`, in order: the
-/// migration's `pg_temp.knot_spread_key` computes the same keys.
+/// migration's `pg_temp.knot_spread_key` computes the same keys. The sizes
+/// cover the three key widths: 1 (n = 1, 2, 10), 2 (n = 35, 36, 100) and 3
+/// (n = 700). For n = 35 every key of width 2 ends in '0', which is
+/// trimmed, so the longest is one character.
 #[tokio::test(flavor = "multi_thread")]
 async fn heal_assigns_exactly_lexorank_spread_keys() {
     let (pool, full) = before_heal().await;
     let seed = Seed::new(&pool).await;
     let mut groups = Vec::new();
-    for (parent_key, n) in ["1", "2", "3", "4", "5", "6"]
-        .into_iter()
-        .zip([1, 2, 10, 35, 36, 100])
-    {
+    for (parent_key, (n, longest)) in ["1", "2", "3", "4", "5", "6", "7"].into_iter().zip([
+        (1, 1),
+        (2, 1),
+        (10, 1),
+        (35, 1),
+        (36, 2),
+        (100, 2),
+        (700, 3),
+    ]) {
         let parent = seed.page(None, parent_key).await;
         // Every key ends in '0'; zero-padded, they sort in creation order.
         let mut ids = Vec::new();
         for i in 0..n {
             ids.push(seed.page(Some(parent), &format!("{i:03}0")).await);
         }
-        groups.push((n, ids));
+        groups.push((n, longest, ids));
     }
 
     full.run(&pool).await.expect("apply heal_sort_keys");
     let after = stored(&pool).await;
 
-    for (n, ids) in groups {
+    for (n, longest, ids) in groups {
         let keys: Vec<&str> = ids.iter().map(|id| after[id].sort_key.as_str()).collect();
         assert_eq!(
             keys,
             knot_storage::lexorank::spread(n),
             "a bad group of {n}"
+        );
+        assert_eq!(
+            keys.iter().map(|k| k.len()).max(),
+            Some(longest),
+            "the longest key for {n} rows"
         );
     }
 }
@@ -680,6 +695,84 @@ async fn heal_keeps_rendered_root_order_with_template_children() {
         nested_row,
         "the nested template keeps its key"
     );
+}
+
+/// A workspace's top-level sidebar entries, in the order the sidebar shows
+/// them: `list_alive`'s rows whose parent it doesn't list (top-level pages,
+/// and the children of templates, which it leaves out), sorted by key in
+/// code-unit order with a stable sort, as `buildTree` does
+/// (web/src/features/docs/tree.ts).
+async fn sidebar_roots(pool: &PgPool, ws: Uuid) -> Vec<Uuid> {
+    let docs = PgDocStore::new(pool.clone())
+        .list_alive(ws)
+        .await
+        .expect("list_alive");
+    let listed: BTreeSet<Uuid> = docs.iter().map(|d| d.id).collect();
+    let mut roots: Vec<_> = docs
+        .into_iter()
+        .filter(|d| d.parent_id.is_none_or(|p| !listed.contains(&p)))
+        .collect();
+    roots.sort_by(|a, b| a.sort_key.as_bytes().cmp(b.sort_key.as_bytes()));
+    roots.into_iter().map(|d| d.id).collect()
+}
+
+/// Where keys tie across the groups of a root list, the sidebar shows the
+/// top-level page first, then the template children by parent, whatever
+/// their age: `list_alive` orders by `parent_id NULLS FIRST`, and
+/// `buildTree`'s sort by key is stable. The heal ranks ties the same way
+/// (P7, as amended), so the rendered order stays: a template child older
+/// than a top-level page with its key still comes after it, and the
+/// children of two templates keep their parents' order.
+#[tokio::test(flavor = "multi_thread")]
+async fn heal_ranks_tied_root_keys_as_the_sidebar_does() {
+    let (pool, full) = before_heal().await;
+    let seed = Seed::new(&pool).await;
+    // Two templates, each with a child keyed `m`. The child of the template
+    // with the higher id is created first, so age and parent disagree.
+    let templates = [
+        seed.template(None, "t").await,
+        seed.template(None, "u").await,
+    ];
+    let (low, high) = (
+        *templates.iter().min().unwrap(),
+        *templates.iter().max().unwrap(),
+    );
+    let oldest = seed.page(Some(high), "m").await;
+    let older = seed.page(Some(low), "m").await;
+    // The top level, created after both children: an invalid key, so the
+    // root list needs healing, and a page keyed `m` as well.
+    let bad = seed.page(None, "0").await;
+    let page = seed.page(None, "m").await;
+
+    let shown = [bad, page, older, oldest];
+    let in_root_list = [bad, page, older, oldest, templates[0], templates[1]];
+    let ids = |list: Vec<(Uuid, String)>| list.into_iter().map(|r| r.0).collect::<Vec<_>>();
+    assert_eq!(
+        sidebar_roots(&pool, seed.ws).await,
+        shown,
+        "the sidebar before"
+    );
+    assert_eq!(
+        ids(root_list(&pool, seed.ws).await),
+        in_root_list,
+        "the root list in the sidebar's order before"
+    );
+
+    full.run(&pool).await.expect("apply heal_sort_keys");
+
+    assert_eq!(
+        sidebar_roots(&pool, seed.ws).await,
+        shown,
+        "the sidebar after"
+    );
+    let after = root_list(&pool, seed.ws).await;
+    let keys: Vec<String> = after.iter().map(|r| r.1.clone()).collect();
+    assert_eq!(
+        keys,
+        knot_storage::lexorank::spread(in_root_list.len()),
+        "the root list is respread as one"
+    );
+    assert_eq!(ids(after), in_root_list, "the root list keeps its order");
 }
 
 /// Running the whole file again, as a re-applied migration would, changes

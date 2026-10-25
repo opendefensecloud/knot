@@ -17,10 +17,16 @@
 -- because every key of the combined list is distinct.
 --
 -- Rows keep the order users see: the sidebar sorts by code unit, so by
--- `sort_key COLLATE "C"`, then `created_at`, then `id`. A rewritten list of
--- n rows gets `lexorank::spread(n)` (crates/knot-storage/src/lexorank.rs),
--- which pg_temp.knot_spread_key computes. Only `sort_key` changes: to users
--- the page is the same, so `updated_at` stays.
+-- `sort_key COLLATE "C"`, then `parent_id NULLS FIRST`, then `created_at`,
+-- then `id`. The parent only decides between groups of a root list that
+-- share a key: the sidebar lists top-level pages first, then template
+-- children by parent (`list_alive`), and its stable sort by key keeps that.
+-- Within a group the parent is the same, so it changes nothing there.
+--
+-- A rewritten list of n rows gets `lexorank::spread(n)`
+-- (crates/knot-storage/src/lexorank.rs), which pg_temp.knot_spread_key
+-- computes. Only `sort_key` changes: to users the page is the same, so
+-- `updated_at` stays.
 --
 -- crates/knot-server/tests/markdown_compat.rs (`SORT_KEY_GROUPS`) reports
 -- the same groups, read-only, on a database before the upgrade. Keep the two
@@ -65,6 +71,7 @@ WITH keyed AS (
     -- `list_parent` is NULL for its workspace's root list, else its parent.
     SELECT d.id,
            d.workspace_id,
+           d.parent_id,
            CASE WHEN d.parent_id IS NULL OR coalesce(p.is_template, false) THEN NULL
                 ELSE d.parent_id
            END AS list_parent,
@@ -83,11 +90,13 @@ lists AS (
       FROM keyed
 ),
 respread AS (
-    -- Every row of a list to rewrite, with its key by its rank.
+    -- Every row of a list to rewrite, with its key by its rank in the
+    -- sidebar's order (see the header).
     SELECT id,
            pg_temp.knot_spread_key(
                row_number() OVER (PARTITION BY workspace_id, list_parent
-                                  ORDER BY sort_key COLLATE "C", created_at, id),
+                                  ORDER BY sort_key COLLATE "C", parent_id NULLS FIRST,
+                                           created_at, id),
                count(*) OVER (PARTITION BY workspace_id, list_parent)
            ) AS sort_key
       FROM lists
