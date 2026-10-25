@@ -113,7 +113,11 @@ struct Sweep {
     /// the connection closes, also when this process dies mid-pass.
     ///
     /// The database can end the session too (a restart, a failover), so
-    /// each tick checks the connection and ends the pass when it is gone.
+    /// each tick checks the connection and ends the pass when it is gone,
+    /// or doesn't answer within [`LOCK_CHECK_TIMEOUT`] (5 s). The check runs
+    /// in the worker's only loop, before the refresh of edited pages, so a
+    /// connection the network dropped silently delays those by that much at
+    /// most.
     /// Until that check, another replica may start a pass alongside this
     /// one. That does no harm: a refresh writes the same result however
     /// often it runs, and never replaces a newer render (the seq guard).
@@ -142,8 +146,11 @@ impl Sweep {
             return Vec::new();
         };
         if let Some(conn) = self.lock.as_mut() {
-            if let Err(e) = conn.ping().await {
-                tracing::warn!(error = %e, "reindex sweep: lock connection lost, pass ended");
+            if !lock_answers(conn.ping(), LOCK_CHECK_TIMEOUT).await {
+                // Dropped, not closed: closing a connection that didn't
+                // answer could block as well, and a ping cut short leaves it
+                // in the middle of an exchange anyway.
+                self.lock = None;
                 self.rest().await;
                 return Vec::new();
             }
@@ -198,6 +205,34 @@ impl Sweep {
     }
 }
 
+/// How long the sweep waits for its lock connection to answer the check
+/// each tick. Without a limit, a half-open TCP connection would keep the
+/// check waiting until the kernel gives up on it, about 15 minutes, and hold
+/// up the `/tasks` refresh of every edit meanwhile.
+const LOCK_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether the lock connection answers `ping` within `limit`. When it
+/// doesn't, the pass ends, and this logs why.
+async fn lock_answers(
+    ping: impl Future<Output = Result<(), sqlx::Error>>,
+    limit: Duration,
+) -> bool {
+    match tokio::time::timeout(limit, ping).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "reindex sweep: lock connection lost, pass ended");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                ?limit,
+                "reindex sweep: lock connection didn't answer, pass ended"
+            );
+            false
+        }
+    }
+}
+
 /// [`SWEEP_LOCK_KEY`] on a connection of its own, or `None` when another
 /// replica holds it. The lock is session-level, so the connection is taken
 /// out of the pool: back in the pool it would keep the lock after the pass
@@ -214,4 +249,34 @@ async fn try_lock(pool: &knot_storage::Pool) -> Result<Option<sqlx::PgConnection
     // A failed close still ends the session: the connection is dropped.
     let _ = conn.close().await;
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::{pending, ready};
+    use std::time::Duration;
+
+    use super::lock_answers;
+
+    /// A lock connection that never answers its check, such as a half-open
+    /// TCP connection, ends the pass once the limit is up.
+    #[tokio::test]
+    async fn a_lock_connection_that_does_not_answer_ends_the_pass() {
+        let check = lock_answers(pending(), Duration::from_millis(10));
+        let answered = tokio::time::timeout(Duration::from_secs(5), check)
+            .await
+            .expect("the check waited on for a ping that never answers");
+        assert!(!answered);
+    }
+
+    #[tokio::test]
+    async fn a_lock_connection_that_answers_keeps_the_pass() {
+        assert!(lock_answers(ready(Ok(())), Duration::from_millis(10)).await);
+    }
+
+    #[tokio::test]
+    async fn a_lock_connection_that_fails_its_check_ends_the_pass() {
+        let lost = ready(Err(sqlx::Error::PoolClosed));
+        assert!(!lock_answers(lost, Duration::from_millis(10)).await);
+    }
 }

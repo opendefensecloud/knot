@@ -574,17 +574,17 @@ fn write_item<T: ReadTxn>(
         }
     }
     // An item whose first line holds no text ends at a blank line right
-    // below it, which would leave the rest of a task's text outside it.
+    // below it, which would leave the rest of a task's text outside it. So,
+    // in the Markdown only `/tasks` reads, the blank lines go but the first,
+    // which becomes the checkbox's line.
     //
-    // A line below nothing but blank lines was escaped as one below a blank
-    // line (`task_text_line`), and sits right below the checkbox once they
-    // go: the first of them becomes the checkbox's line. The escape is right
-    // there too. Markdown goes on with no paragraph after a checkbox without
-    // text (`===` right below it underlines nothing, and a line six spaces
-    // in is code), so the line starts a paragraph either way. Only `/tasks`
-    // reads this Markdown, and the line lists as main listed it wherever
-    // its Markdown is its text: main wrote it six spaces in, as code
-    // (`task_lines_read_as_code`), and listed it raw, so only a link, mark,
+    // The line below them was escaped as a line below a blank line
+    // (`task_text_line`). Right below the checkbox, that escape is right
+    // too: Markdown has no paragraph open after a checkbox without text, so
+    // the line starts one either way (`===` there underlines nothing, and a
+    // line six spaces in is code). Legacy wrote such a line six spaces in,
+    // as code (`task_lines_read_as_code`), and listed it raw. So it lists as
+    // legacy listed it wherever its Markdown is its text; only a link, mark,
     // bracket or backtick run in it lists otherwise.
     if purpose == Purpose::TaskText && lines.first().is_some_and(Line::is_blank) {
         let blanks = lines[1..].iter().take_while(|line| line.is_blank()).count();
@@ -826,7 +826,7 @@ fn task_text_line(prev: Option<&Line>, line: Line, after_checkbox: bool) -> Line
 ///   `\# h`, `\<u>`;
 /// - an ordered list marker gets an empty HTML tag in front of it, which
 ///   `/tasks` leaves out: `<span></span>1. slides` lists as `1. slides`, as
-///   main listed it. Markdown has no escape for a digit, and a backslash
+///   legacy listed it. Markdown has no escape for a digit, and a backslash
 ///   before the `.` splits the text, which `extract_tasks` joins with a
 ///   space: `1\. slides` lists as `1 . slides`. Followed by text, the tag
 ///   starts no HTML block.

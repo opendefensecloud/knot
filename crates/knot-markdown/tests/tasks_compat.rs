@@ -254,10 +254,10 @@ fn lines(lines: &[&str]) -> N {
 }
 
 /// A task whose text has a line that reads as block syntax, a list marker
-/// above all, is listed with that text as written, as legacy listed it. On
-/// this branch before the fix, a line `1. slides` or `- milk` was read as a
-/// nested list item, which took the task's place: the task was listed
-/// without text, assignee or due date (controller ruling).
+/// above all, is listed with that text as written, as legacy listed it.
+/// Read as a nested list item, a line `1. slides` or `- milk` would take the
+/// task's place: the task would be listed without text, assignee or due
+/// date (controller ruling).
 #[test]
 fn text_that_reads_as_block_syntax_is_listed_as_written() {
     let board = || {
@@ -478,6 +478,20 @@ fn block_syntax_starting_a_paragraph_below_another_block_keeps_the_task() {
                 vec![p("a"), quote(vec![p("q"), p("1. slides")])],
                 "a q 1. slides",
             ),
+            // The escape of an ordered marker opens no HTML block, which
+            // would run on to the next blank line and take the lines below
+            // it out of the paragraph. Legacy wrote those lines as code, and
+            // listed their line breaks raw (`task_lines_read_as_code`).
+            (
+                "lines below an escaped ordered marker",
+                vec![lines(&["a", "", "1. x", "y"])],
+                "a 1. x y",
+            ),
+            (
+                "lines below an escaped bare ordered marker",
+                vec![lines(&["a", "", "1.", "y", "z"])],
+                "a 1. y z",
+            ),
         ];
         for (what, children, want) in cases {
             let doc = build(&[bullets(vec![task(shape, false, children)])]);
@@ -492,15 +506,17 @@ fn block_syntax_starting_a_paragraph_below_another_block_keeps_the_task() {
 }
 
 /// A digit marker (`1. `, `2) `) that starts a paragraph of a task's text is
-/// listed as written, as main listed it, wherever the paragraph starts:
+/// listed as written, as legacy listed it, wherever the paragraph starts:
 /// below a heading, rule, table or blockquote, as a blockquote's first line,
-/// after a blank line, or right below a checkbox without text. Main wrote
+/// after a blank line, or right below a checkbox without text. Legacy wrote
 /// those lines as more text of the item's first paragraph, or as code, and
 /// listed `1. slides` (and, before it, the block syntax as text, such as
-/// `## h`). On this branch before the fix, the escape `1\. slides` split the
-/// text, which `extract_tasks` joins with a space: `1 . slides`.
+/// `## h`). A backslash escape, `1\. slides`, would split the text, which
+/// `extract_tasks` joins with a space: `1 . slides`. Two cases below a
+/// heading, `1. slides` and `2) two`, are pinned in
+/// `block_syntax_starting_a_paragraph_below_another_block_keeps_the_task`.
 #[test]
-fn digit_marker_starting_a_paragraph_is_listed_as_main_listed_it() {
+fn digit_marker_starting_a_paragraph_lists_as_legacy_listed_it() {
     for shape in Shape::ALL {
         let heading = || ela("heading", vec![("level", shape.int(2))], vec![text("h")]);
         let empty = || el("paragraph", Vec::new());
@@ -512,18 +528,6 @@ fn digit_marker_starting_a_paragraph_is_listed_as_main_listed_it() {
         };
         // The item's blocks, its listed text, and its last line as written.
         let cases: Vec<(&str, Vec<N>, &str, &str)> = vec![
-            (
-                "below a heading",
-                vec![p("a"), heading(), p("1. slides")],
-                "a h 1. slides",
-                "1. slides",
-            ),
-            (
-                "below a first heading",
-                vec![heading(), p("2) two")],
-                "h 2) two",
-                "2) two",
-            ),
             (
                 "two digits below a heading",
                 vec![heading(), p("10. ten")],
@@ -578,6 +582,25 @@ fn digit_marker_starting_a_paragraph_is_listed_as_main_listed_it() {
                 "1. slides",
                 "1. slides",
             ),
+            // A marker that ends the line.
+            (
+                "bare marker below a heading",
+                vec![p("a"), heading(), p("1.")],
+                "a h 1.",
+                "1.",
+            ),
+            (
+                "bare marker below a checkbox",
+                vec![empty(), p("1.")],
+                "1.",
+                "1.",
+            ),
+            (
+                "tab after the marker",
+                vec![p("a"), el("horizontal_rule", Vec::new()), p("1.\tx")],
+                "a 1.\tx",
+                "1.\tx",
+            ),
         ];
         for (what, children, want, last_line) in cases {
             let doc = build(&[bullets(vec![task(shape, false, children)])]);
@@ -587,10 +610,10 @@ fn digit_marker_starting_a_paragraph_is_listed_as_main_listed_it() {
                 "{what} ({})",
                 shape.name()
             );
-            let main = legacy_listing(&doc).expect("legacy export");
+            let old = legacy_listing(&doc).expect("legacy export");
             assert!(
-                main.len() == 1 && main[0].text.ends_with(last_line),
-                "{what} ({}): main listed {main:?}",
+                old.len() == 1 && old[0].text.ends_with(last_line),
+                "{what} ({}): legacy listed {old:?}",
                 shape.name()
             );
         }

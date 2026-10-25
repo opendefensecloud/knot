@@ -1,8 +1,17 @@
-//! Classifiers shared by the differential compatibility harness
-//! (`tests/compat.rs`, `tests/tasks_compat.rs`) and the real-data check
-//! (`knot-server/tests/markdown_compat.rs`; spec "Compatibility
-//! guarantees"), and the task differential both run: the rule by which a
-//! page's new `/tasks` listing is judged against its legacy one.
+//! The rules by which the new Markdown code is judged against the frozen
+//! legacy copy (spec "Compatibility guarantees").
+//!
+//! This module sorts documents and Markdown inputs into the named bug
+//! classes, where the new code may export, import or list a task otherwise
+//! than legacy did. It also decides whether a document is healthy, checks a
+//! document against the schema, and writes a canonical dump of a document
+//! for comparing imports. And it holds the task differential: the rule by
+//! which a page's new `/tasks` listing is judged against its legacy one.
+//!
+//! Two harnesses use it. The differential harness runs it over a generated
+//! corpus (`tests/compat.rs` and `tests/tasks_compat.rs` in this crate).
+//! The real-data check runs it over every page of a database
+//! (`knot-server/tests/markdown_compat.rs`).
 
 use std::fmt::Write as _;
 use std::ops::Range;
