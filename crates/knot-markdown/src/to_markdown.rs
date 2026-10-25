@@ -575,6 +575,17 @@ fn write_item<T: ReadTxn>(
     }
     // An item whose first line holds no text ends at a blank line right
     // below it, which would leave the rest of a task's text outside it.
+    //
+    // A line below nothing but blank lines was escaped as one below a blank
+    // line (`task_text_line`), and sits right below the checkbox once they
+    // go: the first of them becomes the checkbox's line. The escape is right
+    // there too. Markdown goes on with no paragraph after a checkbox without
+    // text (`===` right below it underlines nothing, and a line six spaces
+    // in is code), so the line starts a paragraph either way. Only `/tasks`
+    // reads this Markdown, and the line lists as main listed it wherever
+    // its Markdown is its text: main wrote it six spaces in, as code
+    // (`task_lines_read_as_code`), and listed it raw, so only a link, mark,
+    // bracket or backtick run in it lists otherwise.
     if purpose == Purpose::TaskText && lines.first().is_some_and(Line::is_blank) {
         let blanks = lines[1..].iter().take_while(|line| line.is_blank()).count();
         lines.drain(1..1 + blanks);
@@ -754,7 +765,9 @@ fn write_container<T: ReadTxn>(
         for (i, line) in lines.into_iter().enumerate() {
             let line = match text_from {
                 Some(from) if i >= from => {
-                    // An item's first line follows its checkbox.
+                    // An item's first line follows its checkbox. One below
+                    // blank lines only goes right below the checkbox later
+                    // (`write_item`), where it starts a paragraph too.
                     let after_checkbox = !in_quote && buf.is_empty();
                     task_text_line(buf.last(), line, after_checkbox)
                 }
@@ -788,7 +801,8 @@ enum Purpose {
 /// - right after the item's checkbox (`after_checkbox`), it is as it is:
 ///   nothing there starts a block, and neither does a line of nothing but
 ///   blanks;
-/// - elsewhere it starts a paragraph ([`escape_block_start`]).
+/// - elsewhere it starts a paragraph ([`escape_block_start`]), right below
+///   a checkbox without text too.
 fn task_text_line(prev: Option<&Line>, line: Line, after_checkbox: bool) -> Line {
     let Line::Text { text, open } = line else {
         return line;
@@ -805,13 +819,21 @@ fn task_text_line(prev: Option<&Line>, line: Line, after_checkbox: bool) -> Line
 }
 
 /// `text`, the first line of a paragraph, without the blanks it starts with
-/// (four would make it code, and Markdown drops them anyway), and with a
-/// backslash before the character that would make it the start of a list
-/// item, heading, blockquote, code fence, rule, HTML block or link reference
-/// definition: `\- milk`, `1\. slides`, `\# h`, `\<u>`. Markdown reads
-/// `1\. slides` as two pieces of text, which `/tasks` lists as `1 . slides`;
-/// a paragraph starts below other text only after a heading, code block,
-/// rule, table or blockquote, or in a blockquote, or after a blank line.
+/// (four would make it code, and Markdown drops them anyway), written so
+/// that it doesn't start a list item, heading, blockquote, code fence, rule,
+/// HTML block or link reference definition:
+/// - a backslash goes before the character that would start one: `\- milk`,
+///   `\# h`, `\<u>`;
+/// - an ordered list marker gets an empty HTML tag in front of it, which
+///   `/tasks` leaves out: `<span></span>1. slides` lists as `1. slides`, as
+///   main listed it. Markdown has no escape for a digit, and a backslash
+///   before the `.` splits the text, which `extract_tasks` joins with a
+///   space: `1\. slides` lists as `1 . slides`. Followed by text, the tag
+///   starts no HTML block.
+///
+/// A paragraph starts below other text only after a heading, code block,
+/// rule, table or blockquote, or in a blockquote, or after a blank line, or
+/// right below a checkbox without text.
 fn escape_block_start(text: &str) -> String {
     let text = text.trim_start_matches([' ', '\t']);
     // A marker ends the line, or a blank follows it.
@@ -827,25 +849,19 @@ fn escape_block_start(text: &str) -> String {
     let html = text
         .strip_prefix('<')
         .is_some_and(|tag| tag.starts_with(|c: char| c.is_ascii_alphabetic() || "/!?".contains(c)));
-    let at =
-        if (1..=9).contains(&digits) && number.starts_with(['.', ')']) && ends_marker(&number[1..])
-        {
-            Some(digits)
-        } else if (text.starts_with(['-', '+', '*']) && ends_marker(&text[1..]))
-            || text.starts_with(['#', '>'])
-            || text.starts_with("```")
-            || text.starts_with("~~~")
-            || is_rule(text)
-            || definition
-            || html
-        {
-            Some(0)
-        } else {
-            None
-        };
-    match at {
-        Some(at) => format!("{}\\{}", &text[..at], &text[at..]),
-        None => text.to_string(),
+    if (1..=9).contains(&digits) && number.starts_with(['.', ')']) && ends_marker(&number[1..]) {
+        format!("<span></span>{text}")
+    } else if (text.starts_with(['-', '+', '*']) && ends_marker(&text[1..]))
+        || text.starts_with(['#', '>'])
+        || text.starts_with("```")
+        || text.starts_with("~~~")
+        || is_rule(text)
+        || definition
+        || html
+    {
+        format!("\\{text}")
+    } else {
+        text.to_string()
     }
 }
 

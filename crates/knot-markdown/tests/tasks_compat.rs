@@ -381,13 +381,11 @@ fn assignee_and_due_date_survive_a_list_marker_line() {
 
 /// Where a paragraph starts below a heading, rule or blockquote, starts a
 /// blockquote, or follows a blank line, a first line that reads as block
-/// syntax is escaped instead. The task keeps its text, as written but for
-/// `1. `: Markdown reads the escaped `1\. ` as two pieces of text, which
-/// `extract_tasks` joins with a space. Legacy wrote such items as text of
-/// their first paragraph (`task_block_syntax_as_text`,
-/// `task_lines_read_as_code`). A blank line right below a checkbox without
-/// text would end the item, so none goes there, and code is fenced so that
-/// none of its lines ends it.
+/// syntax is escaped instead. The task keeps its text as written. Legacy
+/// wrote such items as text of their first paragraph
+/// (`task_block_syntax_as_text`, `task_lines_read_as_code`). A blank line
+/// right below a checkbox without text would end the item, so none goes
+/// there, and code is fenced so that none of its lines ends it.
 #[test]
 fn block_syntax_starting_a_paragraph_below_another_block_keeps_the_task() {
     for shape in Shape::ALL {
@@ -431,7 +429,14 @@ fn block_syntax_starting_a_paragraph_below_another_block_keeps_the_task() {
             (
                 "two empty paragraphs first",
                 vec![empty(), empty(), p("1. x")],
-                "1 . x",
+                "1. x",
+            ),
+            // Markdown goes on with no paragraph after a checkbox without
+            // text, so nothing there is a setext underline.
+            (
+                "setext underline below two empty paragraphs",
+                vec![empty(), empty(), p("===")],
+                "===",
             ),
             (
                 "code holding a fence",
@@ -446,12 +451,12 @@ fn block_syntax_starting_a_paragraph_below_another_block_keeps_the_task() {
             (
                 "ordered marker below a heading",
                 vec![p("a"), heading(), p("1. slides")],
-                "a h 1 . slides",
+                "a h 1. slides",
             ),
             (
                 "ordered marker below a first heading",
                 vec![heading(), p("2) two")],
-                "h 2 ) two",
+                "h 2) two",
             ),
             (
                 "quote below a rule",
@@ -480,6 +485,112 @@ fn block_syntax_starting_a_paragraph_below_another_block_keeps_the_task() {
                 texts(&doc),
                 owned(&[(0, want)]),
                 "{what} ({})",
+                shape.name()
+            );
+        }
+    }
+}
+
+/// A digit marker (`1. `, `2) `) that starts a paragraph of a task's text is
+/// listed as written, as main listed it, wherever the paragraph starts:
+/// below a heading, rule, table or blockquote, as a blockquote's first line,
+/// after a blank line, or right below a checkbox without text. Main wrote
+/// those lines as more text of the item's first paragraph, or as code, and
+/// listed `1. slides` (and, before it, the block syntax as text, such as
+/// `## h`). On this branch before the fix, the escape `1\. slides` split the
+/// text, which `extract_tasks` joins with a space: `1 . slides`.
+#[test]
+fn digit_marker_starting_a_paragraph_is_listed_as_main_listed_it() {
+    for shape in Shape::ALL {
+        let heading = || ela("heading", vec![("level", shape.int(2))], vec![text("h")]);
+        let empty = || el("paragraph", Vec::new());
+        let table = || {
+            el(
+                "table",
+                vec![el("table_row", vec![el("table_header", vec![p("t")])])],
+            )
+        };
+        // The item's blocks, its listed text, and its last line as written.
+        let cases: Vec<(&str, Vec<N>, &str, &str)> = vec![
+            (
+                "below a heading",
+                vec![p("a"), heading(), p("1. slides")],
+                "a h 1. slides",
+                "1. slides",
+            ),
+            (
+                "below a first heading",
+                vec![heading(), p("2) two")],
+                "h 2) two",
+                "2) two",
+            ),
+            (
+                "two digits below a heading",
+                vec![heading(), p("10. ten")],
+                "h 10. ten",
+                "10. ten",
+            ),
+            (
+                "below a rule",
+                vec![p("a"), el("horizontal_rule", Vec::new()), p("1. slides")],
+                "a 1. slides",
+                "1. slides",
+            ),
+            (
+                "below a table",
+                vec![p("a"), table(), p("1. slides")],
+                "a t 1. slides",
+                "1. slides",
+            ),
+            (
+                "below a quote",
+                vec![p("a"), el("blockquote", vec![p("q")]), p("1. slides")],
+                "a q 1. slides",
+                "1. slides",
+            ),
+            (
+                "starting a quote",
+                vec![p("a"), el("blockquote", vec![p("1. slides")])],
+                "a 1. slides",
+                "1. slides",
+            ),
+            (
+                "after an empty paragraph",
+                vec![p("a"), empty(), p("1. slides")],
+                "a 1. slides",
+                "1. slides",
+            ),
+            (
+                "after a blank line",
+                vec![lines(&["a", "", "1. slides"])],
+                "a 1. slides",
+                "1. slides",
+            ),
+            (
+                "below a checkbox, after an empty paragraph",
+                vec![empty(), p("1. slides")],
+                "1. slides",
+                "1. slides",
+            ),
+            (
+                "below a checkbox, after a line break",
+                vec![el("paragraph", vec![hard_break(), text("1. slides")])],
+                "1. slides",
+                "1. slides",
+            ),
+        ];
+        for (what, children, want, last_line) in cases {
+            let doc = build(&[bullets(vec![task(shape, false, children)])]);
+            assert_eq!(
+                texts(&doc),
+                owned(&[(0, want)]),
+                "{what} ({})",
+                shape.name()
+            );
+            let main = legacy_listing(&doc).expect("legacy export");
+            assert!(
+                main.len() == 1 && main[0].text.ends_with(last_line),
+                "{what} ({}): main listed {main:?}",
                 shape.name()
             );
         }
@@ -756,7 +867,7 @@ fn task_with_text_of_its_own_is_listed_with_text() {
 ///   before and 2,444 classed ones: task_with_nested_list 1,116,
 ///   task_block_syntax_as_text 1,073, task_lines_read_as_code 197 and
 ///   block_read_into_task 57;
-/// - 2,385 classed tasks listed otherwise than legacy listed them, 10 of
+/// - 2,384 classed tasks listed otherwise than legacy listed them, 10 of
 ///   them from `task_class_cases`, every one an item legacy damaged;
 /// - 19,666 tasks with text of their own.
 const MIN_TOGGLES: usize = 10_000;
