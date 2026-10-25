@@ -22,6 +22,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
+use knot_storage::Placement;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zip::{ZipWriter, write::SimpleFileOptions};
@@ -80,6 +81,8 @@ struct DocEntry {
     id: String,
     parent_id: Option<String>,
     title: String,
+    /// The doc's place among its siblings. Import keeps the order these
+    /// keys give but writes fresh keys.
     sort_key: String,
     /// Path inside the zip that holds this doc's markdown body.
     /// E.g. `docs/Meeting-notes.md`.
@@ -533,9 +536,11 @@ async fn import(
         }
     }
 
-    // 3. Create doc records in tree order (parent before child).
-    //    Topological sort by parent_id chain.
-    let docs_sorted = sort_docs_by_depth(&manifest.docs);
+    // 3. Create doc records, parents before children. Each doc goes last
+    //    among its new siblings and gets a fresh key there: the manifest's
+    //    keys only set the order (see `creation_order`), because they
+    //    collide with the pages of an earlier import of the same export.
+    let docs_sorted = creation_order(&manifest.docs);
     for d in &docs_sorted {
         // Reject malformed doc ids before letting them flow through the
         // remap. They'd be harmless (the doc_remap key is never used as a
@@ -552,11 +557,11 @@ async fn import(
             .and_then(|p| doc_remap.get(p).copied())
             .or(q.parent_id);
         match docs
-            .create(
+            .create_placed(
                 ctx.workspace_id,
                 new_parent,
                 &d.title,
-                &d.sort_key,
+                Placement::Last,
                 ctx.user_id,
             )
             .await
@@ -814,9 +819,13 @@ fn read_zip_entry<R: Read + std::io::Seek>(
     Some(out)
 }
 
-/// Topological sort by parent_id. Inputs without a known parent (or with a
-/// non-workspace parent) end up as roots.
-fn sort_docs_by_depth(entries: &[DocEntry]) -> Vec<DocEntry> {
+/// The order import creates docs in: by depth in the manifest's tree, so
+/// parents come before children, then by `sort_key` byte by byte (the
+/// sidebar's order, `COLLATE "C"`), then by manifest index. Each doc is
+/// appended to its new siblings, so this order is the order they keep.
+/// Inputs without a known parent (or with a non-workspace parent) end up as
+/// roots.
+fn creation_order(entries: &[DocEntry]) -> Vec<DocEntry> {
     let mut by_id: HashMap<&str, &DocEntry> = HashMap::new();
     for e in entries {
         by_id.insert(e.id.as_str(), e);
@@ -854,7 +863,13 @@ fn sort_docs_by_depth(entries: &[DocEntry]) -> Vec<DocEntry> {
             path: e.path.clone(),
         })
         .collect();
-    out.sort_by_key(|e| *depth.get(&e.id).unwrap_or(&0));
+    // Stable, so equal keys keep their manifest order.
+    out.sort_by(|a, b| {
+        let depth_of = |e: &DocEntry| *depth.get(&e.id).unwrap_or(&0);
+        depth_of(a)
+            .cmp(&depth_of(b))
+            .then_with(|| a.sort_key.cmp(&b.sort_key))
+    });
     out
 }
 
