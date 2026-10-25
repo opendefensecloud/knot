@@ -272,8 +272,8 @@ async fn apply_duplicate_inserts_everything_atomically() {
         .chain(&plan.pages)
         .map(|p| p.new_id)
         .collect();
-    for (p, id) in std::iter::once(&plan.top).chain(&plan.pages).zip(&all) {
-        let doc = w.store.get(*id).await.unwrap().unwrap();
+    for p in std::iter::once(&plan.top).chain(&plan.pages) {
+        let doc = w.store.get(p.new_id).await.unwrap().unwrap();
         assert_eq!((doc.created_by, doc.icon.as_deref()), (w.actor, Some("📄")));
         assert_eq!(doc.workspace_id, w.ws);
         assert_eq!(doc.title, p.title);
