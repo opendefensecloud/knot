@@ -50,39 +50,6 @@ export function buildTree(docs: Doc[]): TreeNode[] {
   return roots;
 }
 
-/** Decide drop action from the dragged item's vertical center relative to the
- *  row it is over. Top quarter → before, bottom quarter → after, else into. */
-export function dropIntent(
-  activeCenterY: number,
-  rect: { top: number; height: number },
-): "before" | "after" | "into" {
-  const rel = (activeCenterY - rect.top) / rect.height;
-  if (rel < 0.25) return "before";
-  if (rel > 0.75) return "after";
-  return "into";
-}
-
-/** All descendant ids of `rootId` in the flat list (excludes root). Cycle-safe. */
-export function descendantIds(docs: Doc[], rootId: string): Set<string> {
-  const kids = new Map<string, string[]>();
-  docs.forEach((d) => {
-    if (d.parent_id) {
-      const a = kids.get(d.parent_id) ?? [];
-      a.push(d.id);
-      kids.set(d.parent_id, a);
-    }
-  });
-  const out = new Set<string>();
-  const stack = [...(kids.get(rootId) ?? [])];
-  while (stack.length) {
-    const id = stack.pop()!;
-    if (out.has(id)) continue;
-    out.add(id);
-    (kids.get(id) ?? []).forEach((c) => stack.push(c));
-  }
-  return out;
-}
-
 /** Optimistically apply a move to the flat doc list. Sets the moved doc's
  *  parent and a *provisional* sort_key (copied from the destination neighbor)
  *  and repositions it in the array so buildTree's stable sort lands it in the
@@ -117,20 +84,6 @@ export function applyOptimisticMove(
   const out = [...rest];
   out.splice(insertAt, 0, updated);
   return out;
-}
-
-/** Map a drop target + drop position to the args expected by
- *  POST /api/docs/:id/move. */
-export function moveArgs(
-  target: Doc | null,
-  position: "before" | "after" | "into",
-): { parent_id?: string | null; before_id?: string; after_id?: string } {
-  if (!target) return { parent_id: null };
-  switch (position) {
-    case "before": return { parent_id: target.parent_id, before_id: target.id };
-    case "after":  return { parent_id: target.parent_id, after_id: target.id };
-    case "into":   return { parent_id: target.id };
-  }
 }
 
 // ---- Projection model ------------------------------------------------------

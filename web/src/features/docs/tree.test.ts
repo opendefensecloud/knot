@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Doc } from "../../lib/validators";
-import { buildTree, descendantIds, dropIntent, applyOptimisticMove, moveArgs } from "./tree";
+import { buildTree, applyOptimisticMove } from "./tree";
+import { descendantIds, moveArgs } from "./tree.legacy";
 import {
   INDENT,
   countDescendants,
@@ -86,13 +87,6 @@ describe("buildTree totality (no doc ever vanishes)", () => {
   it("keeps a doc whose parent is missing", () => {
     expect(countNodes(buildTree([doc("a", "ghost", "m")]))).toBe(1);
   });
-});
-
-describe("dropIntent", () => {
-  const rect = { top: 100, height: 40 };
-  it("top quarter → before", () => { expect(dropIntent(105, rect)).toBe("before"); });
-  it("middle → into", () => { expect(dropIntent(120, rect)).toBe("into"); });
-  it("bottom quarter → after", () => { expect(dropIntent(135, rect)).toBe("after"); });
 });
 
 describe("descendantIds", () => {
