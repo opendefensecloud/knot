@@ -28,7 +28,6 @@ pub use contributors::{
 };
 pub use doc_store::{ArchivedRoot, DocStore, DocStoreError, Document, PgDocStore};
 pub use grant_store::{Grant, GrantStore, GrantStoreError, PgGrantStore};
-pub use lexorank::between as sort_key_between;
 pub use markdown_cache::{
     MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore, PgMarkdownCache,
     STALE_RENDERER_VERSION,
@@ -46,3 +45,13 @@ pub use user_store::{PgUserStore, User, UserStore, UserStoreError};
 pub use workspace_store::{
     Member, PgWorkspaceStore, Workspace, WorkspaceRole, WorkspaceStore, WorkspaceStoreError,
 };
+
+/// A sort key between two neighbours (`None`: an open end).
+///
+/// # Panics
+///
+/// When a neighbour is not a valid key, or `a >= b`. `lexorank::between`
+/// returns those cases as a `KeyError` instead.
+pub fn sort_key_between(a: Option<&str>, b: Option<&str>) -> String {
+    lexorank::between(a, b).expect("valid sort keys")
+}

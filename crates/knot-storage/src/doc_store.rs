@@ -595,7 +595,7 @@ impl DocStore for PgDocStore {
             .bind(workspace_id)
             .fetch_one(&mut *tx)
             .await?;
-            let sort_key = crate::lexorank::between(last_top_level_key.as_deref(), None);
+            let sort_key = crate::sort_key_between(last_top_level_key.as_deref(), None);
             sqlx::query("UPDATE documents SET parent_id = NULL, sort_key = $2 WHERE id = $1")
                 .bind(doc_id)
                 .bind(&sort_key)
