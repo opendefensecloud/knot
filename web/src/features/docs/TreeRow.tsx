@@ -156,7 +156,16 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
   }
 
   return (
-    <li>
+    <li
+      // The row menu is portalled out of this <li> in the DOM but not in the
+      // React tree, so its events still bubble here. A contextmenu from it
+      // would open the browser's own menu over ours: on Windows, Chrome and
+      // Edge send the Menu key's contextmenu on keyup, to the item that took
+      // focus when the keydown opened the menu. The row's own are left alone.
+      onContextMenu={(e) => {
+        if (!e.currentTarget.contains(e.target as Node)) e.preventDefault();
+      }}
+    >
       {/* The row is the drag source and a drop target. dnd-kit's
           `attributes` aren't spread on it: they would make it a
           role="button" tab stop around the link, the row's focus target. */}

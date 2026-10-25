@@ -314,6 +314,34 @@ describe("DocTree — the row menu by keyboard", () => {
     expect(screen.queryByTestId("context-menu")).toBeNull();
     expect(link).toHaveFocus();
   });
+
+  // On Windows, Chrome and Edge send the Menu key's contextmenu on keyup, after
+  // the keydown has opened the row menu and moved focus to its first item:
+  // the event lands on that item, and the browser's own menu must not open
+  // over ours.
+  it("keeps the browser's own menu off the row menu", async () => {
+    renderTree(server());
+    await editorRows();
+    const link = screen.getByTestId("doc-row-beta");
+    link.focus();
+    expect(press(link, { key: "ContextMenu" })).toBe(true);
+    const rename = within(screen.getByTestId("context-menu")).getByTestId("ctx-rename");
+    expect(rename).toHaveFocus();
+
+    const onItem = createEvent.contextMenu(rename);
+    fireEvent(rename, onItem);
+    expect(onItem.defaultPrevented).toBe(true);
+    expect(screen.getByTestId("context-menu")).toBeInTheDocument();
+    expect(rename).toHaveFocus();
+
+    // Elsewhere in the row, where no menu of ours opens, the browser's stays.
+    fireEvent.keyDown(rename, { key: "Escape" });
+    const row = screen.getByTestId("tree-row-beta");
+    const onRow = createEvent.contextMenu(row);
+    fireEvent(row, onRow);
+    expect(onRow.defaultPrevented).toBe(false);
+    expect(screen.queryByTestId("context-menu")).toBeNull();
+  });
 });
 
 describe("DocTree — announcements and focus", () => {
