@@ -17,7 +17,9 @@
 //!   `knot-markdown/tests/tasks_compat.rs` proves over the corpus.
 //!
 //! It also reports the sort-key groups the heal migration would rewrite
-//! (P7), and how many pages the refresh sweep would render again (P17).
+//! (P7), how many pages the refresh sweep would render again (P17), and
+//! how many pages have a parent in another workspace, which the upgrade
+//! leaves as they are (reported only).
 //!
 //! `real_data_compat` runs it before a deploy, against a restored backup or
 //! a staging copy, from before the upgrade or after it:
@@ -103,6 +105,8 @@ const FAILING: &[&str] = &[
 const SHOWN_PAGES: usize = 20;
 const SHOWN_GROUPS: usize = 20;
 const SHOWN_LINES: usize = 20;
+/// How many pages with a parent in another workspace the report names.
+const SHOWN_CROSS_WORKSPACE: usize = 5;
 /// Lines of context around a diff.
 const CONTEXT: usize = 2;
 
@@ -124,6 +128,13 @@ pub struct CompatReport {
     /// Whether `doc_markdown_cache.renderer_version` exists. A database from
     /// before the upgrade has none, and every live page there is stale.
     pub renderer_version_column: bool,
+    /// How many pages, archived ones included, have a parent in another
+    /// workspace. This release no longer writes such a link (create, move,
+    /// from-template and import return 404) but doesn't heal the ones there
+    /// are, so they are reported and don't fail the check.
+    pub cross_workspace_parents: i64,
+    /// The first of those pages, in id order, each with its parent.
+    pub cross_workspace_examples: Vec<(Uuid, Uuid)>,
 }
 
 impl CompatReport {
@@ -223,6 +234,10 @@ pub async fn compat_report(pool: &PgPool) -> CompatReport {
     report.renderer_version_column = has_renderer_version(pool).await;
     report.sort_key_groups = sort_key_groups(pool).await;
     report.stale_pages = stale_pages(pool, report.renderer_version_column).await;
+    (
+        report.cross_workspace_parents,
+        report.cross_workspace_examples,
+    ) = cross_workspace_parents(pool).await;
     report
 }
 
@@ -438,6 +453,29 @@ async fn sort_key_groups(pool: &PgPool) -> Vec<SortKeyGroup> {
         .collect()
 }
 
+/// How many pages have a parent in another workspace, and the first
+/// [`SHOWN_CROSS_WORKSPACE`] of them, in id order, each with its parent.
+async fn cross_workspace_parents(pool: &PgPool) -> (i64, Vec<(Uuid, Uuid)>) {
+    let count = sqlx::query_scalar(
+        "SELECT count(*) FROM documents c JOIN documents p ON p.id = c.parent_id
+          WHERE p.workspace_id <> c.workspace_id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count the pages with a parent in another workspace");
+    let examples = sqlx::query_as(
+        "SELECT c.id, p.id FROM documents c JOIN documents p ON p.id = c.parent_id
+          WHERE p.workspace_id <> c.workspace_id
+          ORDER BY c.id
+          LIMIT $1",
+    )
+    .bind(i64::try_from(SHOWN_CROSS_WORKSPACE).expect("a limit"))
+    .fetch_all(pool)
+    .await
+    .expect("the pages with a parent in another workspace");
+    (count, examples)
+}
+
 /// Whether the database has `doc_markdown_cache.renderer_version`, which
 /// this release's migrations add.
 async fn has_renderer_version(pool: &PgPool) -> bool {
@@ -508,6 +546,21 @@ impl fmt::Display for CompatReport {
                 "  (no doc_markdown_cache.renderer_version: a database from before the \
                  upgrade, where every live page is stale)"
             )?;
+        }
+
+        writeln!(
+            f,
+            "\nParents in another workspace: {} pages (reported only; the check \
+             doesn't fail on them, and the upgrade doesn't change them)",
+            self.cross_workspace_parents
+        )?;
+        for (page, parent) in &self.cross_workspace_examples {
+            writeln!(f, "  page {page} under {parent}")?;
+        }
+        let shown = i64::try_from(self.cross_workspace_examples.len()).expect("a count");
+        if self.cross_workspace_parents > shown {
+            let more = self.cross_workspace_parents - shown;
+            writeln!(f, "  … {more} more pages")?;
         }
 
         writeln!(f, "\nThe check fails on {} pages", self.failing_pages.len())?;
@@ -1058,6 +1111,27 @@ async fn real_data_compat_runs_on_a_seeded_db() {
         Some("25006"),
         "not a read-only transaction: {write}"
     );
+    assert_eq!(report.cross_workspace_parents, 0);
+
+    // A page whose parent is in another workspace, which a create, move or
+    // import before this release could write: counted and named, and it
+    // doesn't fail the check.
+    let other = seed.workspace("other").await;
+    let foreign_child = other.page(Some(healthy_id), "m", None).await;
+    let report = compat_report(&pool).await;
+    println!("{report}");
+    assert_eq!(report.cross_workspace_parents, 1);
+    assert_eq!(
+        report.cross_workspace_examples,
+        vec![(foreign_child, healthy_id)]
+    );
+    let shown = report.to_string();
+    assert!(
+        shown.contains("Parents in another workspace: 1 pages")
+            && shown.contains(&format!("page {foreign_child} under {healthy_id}")),
+        "the report shows the count and the page:\n{shown}"
+    );
+    assert_eq!(report.violations(), 0);
 }
 
 /// A task with a nested list, which legacy listed with the list's text as
