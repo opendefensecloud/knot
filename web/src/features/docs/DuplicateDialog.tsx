@@ -78,7 +78,10 @@ export function DuplicateDialog({
         aria-modal="true"
         aria-labelledby={titleId}
         data-testid="duplicate-dialog"
-        className="w-[320px] max-w-full grid gap-3 p-4 rounded-lg bg-surface border border-border shadow-xl"
+        // Focusable but not a tab stop: a click on its text focuses the
+        // dialog, not <body>, so its keys still come here.
+        tabIndex={-1}
+        className="w-[320px] max-w-full grid gap-3 p-4 rounded-lg bg-surface border border-border shadow-xl outline-none"
         onClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
           if (e.key === "Escape") {

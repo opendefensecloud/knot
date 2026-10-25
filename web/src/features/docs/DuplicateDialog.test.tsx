@@ -308,6 +308,28 @@ describe("the Duplicate dialog", () => {
     expect(box).toHaveFocus();
   });
 
+  // A click on its text puts focus on the dialog itself, not on <body>, where
+  // its keys would no longer reach it.
+  it("keeps Tab and Escape when focus is on the dialog itself", async () => {
+    renderTree(server());
+    await editorRows();
+
+    chooseDuplicate("plan");
+    const dialog = screen.getByRole("dialog");
+    dialog.focus();
+    expect(dialog).toHaveFocus();
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(within(dialog).getByRole("checkbox")).toHaveFocus();
+    dialog.focus();
+    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+    expect(within(dialog).getByRole("button", { name: "Duplicate" })).toHaveFocus();
+
+    dialog.focus();
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("doc-row-plan")).toHaveFocus();
+  });
+
   it("sends one request however often Duplicate is pressed while the copy is made", async () => {
     const gate = deferred();
     const fetchMock = server({ gate: gate.promise });
