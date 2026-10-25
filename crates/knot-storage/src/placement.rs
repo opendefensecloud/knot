@@ -14,7 +14,7 @@ use std::future::Future;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use crate::doc_store::DocStoreError;
+use crate::doc_store::{DocStoreError, ParentLock, lock_parent};
 use crate::lexorank;
 
 /// Where a page goes in its group.
@@ -59,18 +59,7 @@ pub(crate) async fn lock_group(
             .await?;
         return Ok(());
     };
-    let archived: Option<bool> = sqlx::query_scalar(
-        "SELECT archived_at IS NOT NULL FROM documents
-          WHERE workspace_id = $1 AND id = $2 FOR NO KEY UPDATE",
-    )
-    .bind(ws)
-    .bind(parent)
-    .fetch_optional(&mut *conn)
-    .await?;
-    if archived == Some(true) {
-        return Err(DocStoreError::Archived);
-    }
-    Ok(())
+    lock_parent(conn, ws, parent, ParentLock::NoKeyUpdate).await
 }
 
 /// Locks what a move of `doc` to `parent` needs: the target group and the

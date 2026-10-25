@@ -592,6 +592,78 @@ async fn restore_retries_once_after_a_deadlock() {
     );
 }
 
+/// A restore to the top level (its parent is archived) when the last
+/// top-level key is one an old release could write and `between` rejects.
+/// The group is respread, and the page goes last with a valid key. Before
+/// placement, restore took the top level's largest key and passed it to
+/// `sort_key_between`, which panicked.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_next_to_an_invalid_last_key_goes_last() {
+    let w = world().await;
+    let parent = w.seed(None, "Parent", "m").await;
+    let child = w.seed(Some(parent), "Child", "m").await;
+    w.store.archive(w.ws, child, w.user).await.unwrap();
+    w.store.archive(w.ws, parent, w.user).await.unwrap();
+    // The last top-level key ends in '0', which `between` rejects.
+    w.seed(None, "z zero", "z0").await;
+
+    let restored = w
+        .store
+        .restore(w.ws, child, w.user)
+        .await
+        .expect("the restore");
+    assert_eq!(restored, [child]);
+    assert_eq!(w.parent_of(child).await, None, "its parent is archived");
+    assert_eq!(
+        healthy_titles(&w.group(None).await),
+        ["Parent", "z zero", "Child"]
+    );
+}
+
+/// A writer that doesn't take the group's lock (an old release during a
+/// rolling upgrade) takes the key restore picked, between restore's read of
+/// the group and its write. Restore then fails with `Conflict`, as create
+/// and move do, rather than with a database error, and restores nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_racing_an_unlocked_writer_for_its_key_is_a_conflict() {
+    let w = world().await;
+    let parent = w.seed(None, "Parent", "m").await;
+    let child = w.seed(Some(parent), "Child", "m").await;
+    w.store.archive(w.ws, child, w.user).await.unwrap();
+    w.store.archive(w.ws, parent, w.user).await.unwrap();
+
+    // The key restore picks: last at the top level, after "m". The old pod
+    // hasn't committed, so restore's read of the group doesn't see it.
+    let last = lexorank::between(Some("m"), None).unwrap();
+    let mut old_pod = w.pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+         VALUES ($1, NULL, 'Old pod', $2, $3)",
+    )
+    .bind(w.ws)
+    .bind(&last)
+    .bind(w.user)
+    .execute(&mut *old_pod)
+    .await
+    .unwrap();
+    let restore = {
+        let (store, ws, user) = (w.store.clone(), w.ws, w.user);
+        tokio::spawn(async move { store.restore(ws, child, user).await })
+    };
+    // Restore's write waits for the old pod's row with the same key.
+    wait_for_lock_waits(&w.pool, 1).await;
+    old_pod.commit().await.unwrap();
+
+    let err = restore
+        .await
+        .unwrap()
+        .expect_err("the old pod took the key");
+    assert!(matches!(err, DocStoreError::Conflict), "got {err:?}");
+    let doc = w.store.get(child).await.unwrap().unwrap();
+    assert!(doc.archived_at.is_some(), "nothing was restored");
+    assert_eq!(doc.parent_id, Some(parent));
+}
+
 /// The group lock under a parent replaces `create`'s `FOR SHARE` on it and
 /// still keeps creates racing an archive of the parent's folder from
 /// leaving a live child under an archived parent.

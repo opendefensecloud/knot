@@ -230,32 +230,7 @@ impl PgDocStore {
         // The group lock also refuses an archived parent, in place of
         // `lock_live_parent`: taking both would deadlock two creates.
         let sort_key = placement::place(&mut tx, workspace_id, parent_id, placement, None).await?;
-        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
-            "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
-             VALUES ($1, $2, $3, $4, $5)
-             RETURNING {COLS}"
-        )))
-        .bind(workspace_id)
-        .bind(parent_id)
-        .bind(title)
-        .bind(&sort_key)
-        .bind(created_by)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_unique)?;
-        let doc = doc_from_row(row);
-        audit::record_in_tx(
-            &mut tx,
-            workspace_id,
-            Some(created_by),
-            "doc.create",
-            "doc",
-            doc.id,
-        )
-        .await?;
-        invalidations::record_in_tx(&mut tx, workspace_id, doc.id, "create").await?;
-        tx.commit().await?;
-        Ok(doc)
+        commit_create(tx, workspace_id, parent_id, title, &sort_key, created_by).await
     }
 
     /// One attempt of `move_placed`.
@@ -271,51 +246,10 @@ impl PgDocStore {
         placement::lock_move(&mut tx, workspace_id, doc_id, parent_id).await?;
         // With both rows locked, a concurrent move that would close a cycle
         // with this one has committed or waits for this transaction.
-        if let Some(p) = parent_id {
-            let creates_cycle: bool = sqlx::query_scalar(
-                "WITH RECURSIVE sub AS (
-                     SELECT id FROM documents WHERE id = $1
-                     UNION ALL
-                     SELECT d.id FROM documents d JOIN sub s ON d.parent_id = s.id
-                 )
-                 SELECT EXISTS(SELECT 1 FROM sub WHERE id = $2)",
-            )
-            .bind(doc_id)
-            .bind(p)
-            .fetch_one(&mut *tx)
-            .await?;
-            if creates_cycle {
-                return Err(DocStoreError::Cycle);
-            }
-        }
+        reject_cycle(&mut tx, doc_id, parent_id).await?;
         let sort_key =
             placement::place(&mut tx, workspace_id, parent_id, placement, Some(doc_id)).await?;
-        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
-            "UPDATE documents SET parent_id = $3, sort_key = $4, updated_at = now()
-             WHERE workspace_id = $1 AND id = $2
-             RETURNING {COLS}"
-        )))
-        .bind(workspace_id)
-        .bind(doc_id)
-        .bind(parent_id)
-        .bind(&sort_key)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_unique)?
-        .ok_or(DocStoreError::NotFound)?;
-        let doc = doc_from_row(row);
-        audit::record_in_tx(
-            &mut tx,
-            workspace_id,
-            Some(actor),
-            "doc.move",
-            "doc",
-            doc.id,
-        )
-        .await?;
-        invalidations::record_in_tx(&mut tx, workspace_id, doc.id, "tree-move").await?;
-        tx.commit().await?;
-        Ok(doc)
+        commit_move(tx, workspace_id, doc_id, actor, parent_id, &sort_key).await
     }
 
     /// One attempt of `restore`.
@@ -399,11 +333,14 @@ impl PgDocStore {
             let sort_key =
                 placement::place(&mut tx, workspace_id, None, Placement::Last, Some(doc_id))
                     .await?;
+            // `Conflict`, as for create and move, when a writer that skips
+            // the group's lock (an old release) took the key meanwhile.
             sqlx::query("UPDATE documents SET parent_id = NULL, sort_key = $2 WHERE id = $1")
                 .bind(doc_id)
                 .bind(&sort_key)
                 .execute(&mut *tx)
-                .await?;
+                .await
+                .map_err(map_unique)?;
         }
         audit::record_in_tx(
             &mut tx,
@@ -549,32 +486,7 @@ impl DocStore for PgDocStore {
     ) -> Result<Document, DocStoreError> {
         let mut tx = crate::begin(&self.pool).await?;
         lock_live_parent(&mut tx, workspace_id, parent_id).await?;
-        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
-            "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
-             VALUES ($1, $2, $3, $4, $5)
-             RETURNING {COLS}"
-        )))
-        .bind(workspace_id)
-        .bind(parent_id)
-        .bind(title)
-        .bind(sort_key)
-        .bind(created_by)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_unique)?;
-        let doc = doc_from_row(row);
-        audit::record_in_tx(
-            &mut tx,
-            workspace_id,
-            Some(created_by),
-            "doc.create",
-            "doc",
-            doc.id,
-        )
-        .await?;
-        invalidations::record_in_tx(&mut tx, workspace_id, doc.id, "create").await?;
-        tx.commit().await?;
-        Ok(doc)
+        commit_create(tx, workspace_id, parent_id, title, sort_key, created_by).await
     }
 
     async fn rename(
@@ -621,26 +533,8 @@ impl DocStore for PgDocStore {
         sort_key: &str,
     ) -> Result<Document, DocStoreError> {
         let mut tx = crate::begin(&self.pool).await?;
-        // Reject moves that would create a parent cycle: the destination
-        // parent must not be the doc itself or one of its descendants. Done
-        // inside the tx so it's correct under concurrency.
-        if let Some(p) = parent_id {
-            let creates_cycle: bool = sqlx::query_scalar(
-                "WITH RECURSIVE sub AS (
-                     SELECT id FROM documents WHERE id = $1
-                     UNION ALL
-                     SELECT d.id FROM documents d JOIN sub s ON d.parent_id = s.id
-                 )
-                 SELECT EXISTS(SELECT 1 FROM sub WHERE id = $2)",
-            )
-            .bind(doc_id)
-            .bind(p)
-            .fetch_one(&mut *tx)
-            .await?;
-            if creates_cycle {
-                return Err(DocStoreError::Cycle);
-            }
-        }
+        // Done inside the tx so it's correct under concurrency.
+        reject_cycle(&mut tx, doc_id, parent_id).await?;
         // Archived docs stay where they are until restored.
         let archived: Option<bool> = sqlx::query_scalar(
             "SELECT archived_at IS NOT NULL FROM documents
@@ -656,32 +550,7 @@ impl DocStore for PgDocStore {
             Some(false) => {}
         }
         lock_live_parent(&mut tx, workspace_id, parent_id).await?;
-        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
-            "UPDATE documents SET parent_id = $3, sort_key = $4, updated_at = now()
-             WHERE workspace_id = $1 AND id = $2
-             RETURNING {COLS}"
-        )))
-        .bind(workspace_id)
-        .bind(doc_id)
-        .bind(parent_id)
-        .bind(sort_key)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_unique)?
-        .ok_or(DocStoreError::NotFound)?;
-        let doc = doc_from_row(row);
-        audit::record_in_tx(
-            &mut tx,
-            workspace_id,
-            Some(actor),
-            "doc.move",
-            "doc",
-            doc.id,
-        )
-        .await?;
-        invalidations::record_in_tx(&mut tx, workspace_id, doc.id, "tree-move").await?;
-        tx.commit().await?;
-        Ok(doc)
+        commit_move(tx, workspace_id, doc_id, actor, parent_id, sort_key).await
     }
 
     async fn create_placed(
@@ -976,21 +845,158 @@ async fn lock_live_parent(
     workspace_id: Uuid,
     parent_id: Option<Uuid>,
 ) -> Result<(), DocStoreError> {
-    let Some(parent_id) = parent_id else {
-        return Ok(());
+    match parent_id {
+        Some(parent_id) => lock_parent(tx, workspace_id, parent_id, ParentLock::Share).await,
+        None => Ok(()),
+    }
+}
+
+/// How `lock_parent` locks the parent's row.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ParentLock {
+    /// `FOR SHARE`, for the explicit-key `create` and `move_to`.
+    Share,
+    /// `FOR NO KEY UPDATE`, for the group lock of placement, which also
+    /// keeps placements under the parent one after the other.
+    NoKeyUpdate,
+}
+
+/// Locks the row of `parent_id`, the parent a page is about to go under,
+/// until the transaction ends, and fails with `Archived` when it is in the
+/// archive. A missing parent is left to the foreign key.
+pub(crate) async fn lock_parent(
+    tx: &mut sqlx::PgConnection,
+    workspace_id: Uuid,
+    parent_id: Uuid,
+    lock: ParentLock,
+) -> Result<(), DocStoreError> {
+    let sql = match lock {
+        ParentLock::Share => {
+            "SELECT archived_at IS NOT NULL FROM documents
+              WHERE workspace_id = $1 AND id = $2 FOR SHARE"
+        }
+        ParentLock::NoKeyUpdate => {
+            "SELECT archived_at IS NOT NULL FROM documents
+              WHERE workspace_id = $1 AND id = $2 FOR NO KEY UPDATE"
+        }
     };
-    let archived: Option<bool> = sqlx::query_scalar(
-        "SELECT archived_at IS NOT NULL FROM documents
-         WHERE workspace_id = $1 AND id = $2 FOR SHARE",
-    )
-    .bind(workspace_id)
-    .bind(parent_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let archived: Option<bool> = sqlx::query_scalar(sql)
+        .bind(workspace_id)
+        .bind(parent_id)
+        .fetch_optional(&mut *tx)
+        .await?;
     if archived == Some(true) {
         return Err(DocStoreError::Archived);
     }
     Ok(())
+}
+
+/// Fails with `Cycle` when moving `doc_id` under `parent_id` would create a
+/// parent cycle: the destination parent is the doc itself or one of its
+/// descendants. The top level (`None`) never is.
+async fn reject_cycle(
+    tx: &mut sqlx::PgConnection,
+    doc_id: Uuid,
+    parent_id: Option<Uuid>,
+) -> Result<(), DocStoreError> {
+    let Some(parent_id) = parent_id else {
+        return Ok(());
+    };
+    let creates_cycle: bool = sqlx::query_scalar(
+        "WITH RECURSIVE sub AS (
+             SELECT id FROM documents WHERE id = $1
+             UNION ALL
+             SELECT d.id FROM documents d JOIN sub s ON d.parent_id = s.id
+         )
+         SELECT EXISTS(SELECT 1 FROM sub WHERE id = $2)",
+    )
+    .bind(doc_id)
+    .bind(parent_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if creates_cycle {
+        return Err(DocStoreError::Cycle);
+    }
+    Ok(())
+}
+
+/// The end of a create, once its parent is locked and its key chosen:
+/// inserts the page, records the audit entry and the ACL invalidation, and
+/// commits. `Conflict` when the key is taken in the group.
+async fn commit_create(
+    mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    workspace_id: Uuid,
+    parent_id: Option<Uuid>,
+    title: &str,
+    sort_key: &str,
+    created_by: Uuid,
+) -> Result<Document, DocStoreError> {
+    let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
+        "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING {COLS}"
+    )))
+    .bind(workspace_id)
+    .bind(parent_id)
+    .bind(title)
+    .bind(sort_key)
+    .bind(created_by)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(map_unique)?;
+    let doc = doc_from_row(row);
+    audit::record_in_tx(
+        &mut tx,
+        workspace_id,
+        Some(created_by),
+        "doc.create",
+        "doc",
+        doc.id,
+    )
+    .await?;
+    invalidations::record_in_tx(&mut tx, workspace_id, doc.id, "create").await?;
+    tx.commit().await?;
+    Ok(doc)
+}
+
+/// The end of a move, once its rows are locked and its key chosen: puts the
+/// page under `parent_id` with `sort_key`, records the audit entry and the
+/// ACL invalidation, and commits. `NotFound` when the page is gone;
+/// `Conflict` when the key is taken in the group.
+async fn commit_move(
+    mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    workspace_id: Uuid,
+    doc_id: Uuid,
+    actor: Uuid,
+    parent_id: Option<Uuid>,
+    sort_key: &str,
+) -> Result<Document, DocStoreError> {
+    let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
+        "UPDATE documents SET parent_id = $3, sort_key = $4, updated_at = now()
+         WHERE workspace_id = $1 AND id = $2
+         RETURNING {COLS}"
+    )))
+    .bind(workspace_id)
+    .bind(doc_id)
+    .bind(parent_id)
+    .bind(sort_key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_unique)?
+    .ok_or(DocStoreError::NotFound)?;
+    let doc = doc_from_row(row);
+    audit::record_in_tx(
+        &mut tx,
+        workspace_id,
+        Some(actor),
+        "doc.move",
+        "doc",
+        doc.id,
+    )
+    .await?;
+    invalidations::record_in_tx(&mut tx, workspace_id, doc.id, "tree-move").await?;
+    tx.commit().await?;
+    Ok(doc)
 }
 
 /// Everything a purge of `$1` deletes: `$1`, every row archived with it
