@@ -189,7 +189,7 @@ export function DocTree() {
   useEffect(() => () => clicks.release(), [clicks]);
 
   // What the last menu or Alt+arrow move did, for the live region.
-  const [moveSaid, setMoveSaid] = useState("");
+  const [announcement, setAnnouncement] = useState("");
   // The page a menu or Alt+arrow move keeps focus on, until the move and the
   // refetch after it have rendered. Focus is lost when the menu the move came
   // from closes, and when the page's row remounts, its link with it: under
@@ -201,7 +201,7 @@ export function DocTree() {
     if (!args) return;
     // Indenting into a collapsed page opens it: the page stays in view, with focus.
     if (args.parent_id !== null && collapsed.has(args.parent_id)) toggle(args.parent_id);
-    setMoveSaid(describeMove(flat, id, args));
+    setAnnouncement(describeMove(flat, id, args));
     refocus.current = id;
     move.mutate({ id, body: args });
   }
@@ -330,7 +330,7 @@ export function DocTree() {
         </DndContext>
       )}
       <div data-testid="tree-live" role="status" aria-live="polite" className="sr-only">
-        {moveSaid}
+        {announcement}
       </div>
       <SidebarVersion />
       {pickerOpen && (
