@@ -44,7 +44,15 @@ import { archiveConfirmText, archiveErrorText } from "./archive";
 import { docsApi } from "./docs.api";
 import { markDocEditMode } from "./editMode";
 import { placementParent, type Placement } from "./placement";
-import { buildTree, applyOptimisticMove, descendantIds, dropIntent, moveArgs, type TreeNode } from "./tree";
+import {
+  buildTree,
+  applyOptimisticMove,
+  countDescendants,
+  descendantIds,
+  dropIntent,
+  moveArgs,
+  type TreeNode,
+} from "./tree";
 
 export function DocTree() {
   const qc = useQueryClient();
@@ -359,11 +367,6 @@ export function NewDocPicker({
       </div>
     </div>
   );
-}
-
-/** Subpages (at any depth) that go to the archive with `node`. */
-function countDescendants(node: TreeNode): number {
-  return node.children.reduce((sum, child) => sum + 1 + countDescendants(child), 0);
 }
 
 function TreeRow({
