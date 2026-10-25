@@ -1,11 +1,12 @@
 import * as v from "valibot";
 
-import { apiFetch } from "../../lib/api";
+import { apiFetch, type ApiResult } from "../../lib/api";
 import { ArchiveEntry, Doc, DocContributors, DocWithRole, parse } from "../../lib/validators";
 
 export type DocCreate = { title?: string; parent_id?: string; after_id?: string };
 export type DocPatch = { title?: string; icon?: string };
 export type DocMove = { parent_id?: string | null; after_id?: string; before_id?: string };
+export type DocDuplicate = { include_subpages: boolean };
 
 export const docsApi = {
   async list() {
@@ -36,6 +37,16 @@ export const docsApi = {
       method: "POST",
       body,
     });
+  },
+  /** Copy a doc right after it, with its subpages when asked (editors and
+   *  owners). 413 `doc.duplicate_too_large` above the server's caps. */
+  async duplicate(id: string, body: DocDuplicate): Promise<ApiResult<Doc>> {
+    const r = await apiFetch<unknown>(`/api/docs/${encodeURIComponent(id)}/duplicate`, {
+      method: "POST",
+      body,
+    });
+    if ("error" in r) return r;
+    return { ok: parse(Doc, r.ok) };
   },
   /** Move a doc and its subpages to the archive (editors and owners). */
   archive(id: string) {

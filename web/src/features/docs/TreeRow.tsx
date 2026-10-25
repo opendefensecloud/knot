@@ -63,6 +63,8 @@ export type TreeState = {
   planMove: (id: string, cmd: MoveCmd) => MoveArgs | null;
   /** Makes a menu or Alt+arrow move. */
   onMove: (id: string, cmd: MoveCmd) => void;
+  /** Copies the page, asking first whether its subpages go too. */
+  onDuplicate: (node: TreeNode) => void;
 };
 
 export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; tree: TreeState }) {
@@ -129,6 +131,7 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
   const items: ContextMenuItem[] = [];
   if (canEdit) {
     items.push({ label: "Rename", testId: "ctx-rename", onSelect: () => void onRename() });
+    items.push({ label: "Duplicate…", testId: "ctx-duplicate", onSelect: () => tree.onDuplicate(node) });
     for (const m of MOVE_ITEMS) {
       items.push({
         label: m.label,

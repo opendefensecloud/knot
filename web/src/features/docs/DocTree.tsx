@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 
@@ -29,11 +29,13 @@ import { SidebarVersion } from "../about/SidebarVersion";
 import { WorkspaceHeader } from "../workspace/WorkspaceHeader";
 import { workspaceApi } from "../workspace/workspace.api";
 import { docsApi } from "./docs.api";
+import { DuplicateDialog, duplicateErrorText } from "./DuplicateDialog";
 import { markDocEditMode } from "./editMode";
 import { placementParent, type Placement } from "./placement";
 import {
   buildTree,
   applyOptimisticMove,
+  countDescendants,
   describeMove,
   dropZone,
   flattenVisible,
@@ -42,6 +44,7 @@ import {
   INDENT,
   type FlatRow,
   type MoveArgs,
+  type TreeNode,
 } from "./tree";
 import { TreeRow, type Drop, type MoveCmd, type TreeState } from "./TreeRow";
 
@@ -55,6 +58,12 @@ const MEASURING = { droppable: { strategy: MeasuringStrategy.Always } };
 
 /** The key of the move mutations, to count the pending ones. */
 const MOVE_KEY = ["docs-move"];
+
+/** The key of the duplicate mutations, to tell whether one is on its way. */
+const DUPLICATE_KEY = ["docs-duplicate"];
+
+/** The page the Duplicate dialog asks about. */
+type DuplicateAsk = { id: string; title: string; subpages: number };
 
 /** The droppable id of the tree's list. Doc ids are UUIDs, so it can't clash. */
 const TREE_AREA = ":tree";
@@ -244,6 +253,67 @@ export function DocTree() {
     clicks.releaseSoon();
   }
 
+  // The page the Duplicate dialog asks about, and why its last try failed.
+  const [dupAsk, setDupAsk] = useState<DuplicateAsk | null>(null);
+  const [dupError, setDupError] = useState<string | null>(null);
+  // The same page, for the answers to read: one that comes after its dialog
+  // has closed goes to a toast instead.
+  const dupOpen = useRef<string | null>(null);
+  const duplicating = useIsMutating({ mutationKey: DUPLICATE_KEY }) > 0;
+
+  function closeDuplicate(id: string) {
+    dupOpen.current = null;
+    setDupAsk(null);
+    setDupError(null);
+    rowLink(treeRef.current, id)?.focus();
+  }
+
+  /** Says why a duplicate failed: in its dialog while that is open, else in a toast. */
+  function duplicateFailed(id: string, text: string) {
+    if (dupOpen.current === id) setDupError(text);
+    else notify("error", text);
+  }
+
+  const duplicate = useMutation({
+    mutationKey: DUPLICATE_KEY,
+    mutationFn: (a: { id: string; include_subpages: boolean }) =>
+      docsApi.duplicate(a.id, { include_subpages: a.include_subpages }),
+    onSuccess: async (r, a) => {
+      if ("error" in r) {
+        duplicateFailed(a.id, duplicateErrorText(r.error.status));
+        return;
+      }
+      await qc.invalidateQueries({ queryKey: ["docs"] });
+      markDocEditMode(r.ok.id);
+      if (dupOpen.current === a.id) closeDuplicate(a.id);
+      await nav(`/doc/${r.ok.id}`);
+    },
+    // No answer, or one that isn't a page.
+    onError: (_e, a) => duplicateFailed(a.id, duplicateErrorText()),
+  });
+
+  /** "Duplicate…": a page with subpages asks whether they go too; any other
+   *  is copied at once. */
+  function startDuplicate(node: TreeNode) {
+    const subpages = countDescendants(node);
+    if (subpages === 0) {
+      duplicate.mutate({ id: node.id, include_subpages: false });
+      return;
+    }
+    dupOpen.current = node.id;
+    setDupError(null);
+    setDupAsk({ id: node.id, title: node.title, subpages });
+  }
+
+  function confirmDuplicate(id: string, includeSubpages: boolean) {
+    // Ignored while a copy is on its way, or a double click makes two. Asked
+    // of the mutation cache, which counts the request at once: `duplicating`
+    // only renders a task later.
+    if (qc.isMutating({ mutationKey: DUPLICATE_KEY }) > 0) return;
+    setDupError(null);
+    duplicate.mutate({ id, include_subpages: includeSubpages });
+  }
+
   // Named rather than an inline `async` handler: `onPickTemplate` is typed
   // to return void, so handing it a promise leaves rejections unhandled.
   // The caller below fires it with `void`.
@@ -280,6 +350,7 @@ export function DocTree() {
     drop,
     planMove: (id, cmd) => keyboardMove(flat, docs, id, cmd),
     onMove: moveBy,
+    onDuplicate: startDuplicate,
   };
   const dragged = draggingId === null ? undefined : rows.get(draggingId);
 
@@ -354,6 +425,20 @@ export function DocTree() {
       <div data-testid="tree-live" role="status" aria-live="polite" className="sr-only">
         {announcement}
       </div>
+      {/* Rendered here, outside the tree, not from the row it is about: the
+          row's <li> cancels every contextmenu that bubbles up from a portal
+          of its own (see TreeRow.tsx), so the browser's menu would never open
+          in the dialog. */}
+      {dupAsk && (
+        <DuplicateDialog
+          title={dupAsk.title}
+          subpages={dupAsk.subpages}
+          pending={duplicating}
+          error={dupError}
+          onCancel={() => closeDuplicate(dupAsk.id)}
+          onConfirm={(include) => confirmDuplicate(dupAsk.id, include)}
+        />
+      )}
       <SidebarVersion />
       {pickerOpen && (
         <NewDocPicker
