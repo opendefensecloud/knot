@@ -32,6 +32,7 @@ async fn migrations_apply_cleanly() {
         "acl_invalidations",
         "audit_events",
         "blob_bytes",
+        "blob_copy_pending",
         "blobs",
         "board_snapshots",
         "board_updates",

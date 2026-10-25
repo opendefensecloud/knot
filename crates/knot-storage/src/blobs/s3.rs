@@ -72,6 +72,25 @@ impl S3Store {
             format!("{}/{}", self.prefix.trim_end_matches('/'), id)
         }
     }
+
+    /// The size of the object at `key` (`None` when the store doesn't say),
+    /// read with `HeadObject`. `NotFound` when there is no such object.
+    async fn size(&self, key: &str) -> Result<Option<i64>> {
+        let (head, status) = self.bucket.head_object(key).await.map_err(|e| {
+            if format!("{e}").contains("404") {
+                BlobStoreError::NotFound
+            } else {
+                BlobStoreError::Backend(format!("s3 head {key}: {e}"))
+            }
+        })?;
+        match status {
+            200..=299 => Ok(head.content_length),
+            404 => Err(BlobStoreError::NotFound),
+            status => Err(BlobStoreError::Backend(format!(
+                "s3 head {key}: status {status}"
+            ))),
+        }
+    }
 }
 
 #[async_trait]
@@ -110,6 +129,39 @@ impl BlobStore for S3Store {
             .delete_object(&key)
             .await
             .map_err(|e| BlobStoreError::Backend(format!("s3 delete {key}: {e}")))?;
+        Ok(())
+    }
+
+    /// A server-side `CopyObject`, so the bytes never pass through knot.
+    /// The content type travels with the object. CopyObject can answer 200
+    /// with an error in its body, so the copy only counts once `dst` exists
+    /// with the size of `src`.
+    async fn copy(&self, src: Uuid, dst: Uuid, _content_type: &str) -> Result<()> {
+        let (from, to) = (self.key(src), self.key(dst));
+        let size = self.size(&from).await?;
+        let status = self
+            .bucket
+            .copy_object_internal(&from, &to)
+            .await
+            .map_err(|e| BlobStoreError::Backend(format!("s3 copy {from} to {to}: {e}")))?;
+        if !(200..300).contains(&status) {
+            return Err(BlobStoreError::Backend(format!(
+                "s3 copy {from} to {to}: status {status}"
+            )));
+        }
+        let copied = match self.size(&to).await {
+            Err(BlobStoreError::NotFound) => {
+                return Err(BlobStoreError::Backend(format!(
+                    "s3 copy {from} to {to}: no object after the copy"
+                )));
+            }
+            copied => copied?,
+        };
+        if copied != size {
+            return Err(BlobStoreError::Backend(format!(
+                "s3 copy {from} to {to}: {copied:?} bytes, expected {size:?}"
+            )));
+        }
         Ok(())
     }
 }

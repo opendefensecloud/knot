@@ -1,5 +1,7 @@
 //! Document storage — CRUD + tree ops.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{AssertSqlSafe, PgPool};
@@ -84,6 +86,21 @@ pub enum DocStoreError {
     /// target parent, or it is the page being moved.
     #[error("bad anchor")]
     BadAnchor,
+    /// A duplicate's source changed after the copy was planned: it, or its
+    /// parent, was moved, archived or purged, or the bytes of a file it
+    /// copies are gone. Trying again can succeed.
+    #[error("duplicate conflict")]
+    DuplicateConflict,
+}
+
+/// One page of a live subtree (see `DocStore::live_subtree`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtreeRow {
+    pub id: Uuid,
+    pub parent_id: Uuid,
+    pub title: String,
+    pub icon: Option<String>,
+    pub sort_key: String,
 }
 
 #[async_trait]
@@ -176,6 +193,16 @@ pub trait DocStore: Send + Sync + 'static {
     /// Everything a purge of `doc_id` deletes: the doc, every row archived
     /// with it, and all their descendants, archived or not.
     async fn subtree_ids(&self, doc_id: Uuid) -> Result<Vec<Uuid>, DocStoreError>;
+    /// The live pages under `root` in `workspace_id`, the root left out.
+    /// Archived pages and templates are skipped, and so is everything under
+    /// them. Depth first, in the sidebar's order: each page comes right
+    /// before its own subpages, and siblings by `sort_key` (code unit), then
+    /// `id`.
+    async fn live_subtree(
+        &self,
+        workspace_id: Uuid,
+        root: Uuid,
+    ) -> Result<Vec<SubtreeRow>, DocStoreError>;
     /// Fence a purge before any blob bytes are deleted outside the
     /// database: marks the archive root and every archive root inside it so
     /// restore refuses them and `due_for_purge` returns them until the purge
@@ -366,7 +393,7 @@ impl PgDocStore {
     }
 }
 
-type DocRow = (
+pub(crate) type DocRow = (
     Uuid,
     Uuid,
     Option<Uuid>,
@@ -381,7 +408,7 @@ type DocRow = (
     Option<Uuid>,
     Option<Uuid>,
 );
-fn doc_from_row(r: DocRow) -> Document {
+pub(crate) fn doc_from_row(r: DocRow) -> Document {
     Document {
         id: r.0,
         workspace_id: r.1,
@@ -406,7 +433,7 @@ fn doc_from_row(r: DocRow) -> Document {
 /// and `SUBTREE_IDS_SQL`), never caller-supplied, and every runtime value
 /// remains a `$N` bind. Keep it that way: interpolating anything else here
 /// would defeat the check.
-const COLS: &str = "id, workspace_id, parent_id, title, sort_key, icon, created_by, created_at, updated_at, archived_at, is_template, archived_by, archive_root_id";
+pub(crate) const COLS: &str = "id, workspace_id, parent_id, title, sort_key, icon, created_by, created_at, updated_at, archived_at, is_template, archived_by, archive_root_id";
 
 #[async_trait]
 impl DocStore for PgDocStore {
@@ -712,6 +739,55 @@ impl DocStore for PgDocStore {
             .bind(doc_id)
             .fetch_all(&self.pool)
             .await?)
+    }
+
+    async fn live_subtree(
+        &self,
+        workspace_id: Uuid,
+        root: Uuid,
+    ) -> Result<Vec<SubtreeRow>, DocStoreError> {
+        // Sorted as siblings are; the walk below keeps that order within
+        // each parent. `d.id <> $2` stops at the root should a parent cycle
+        // run through it (the only kind reachable from it).
+        let rows: Vec<(Uuid, Uuid, String, Option<String>, String)> = sqlx::query_as(
+            "WITH RECURSIVE sub AS (
+                 SELECT id, parent_id, title, icon, sort_key FROM documents
+                  WHERE workspace_id = $1 AND parent_id = $2
+                    AND archived_at IS NULL AND NOT is_template
+                 UNION ALL
+                 SELECT d.id, d.parent_id, d.title, d.icon, d.sort_key
+                   FROM documents d JOIN sub s ON d.parent_id = s.id
+                  WHERE d.workspace_id = $1 AND d.id <> $2
+                    AND d.archived_at IS NULL AND NOT d.is_template
+             )
+             SELECT id, parent_id, title, icon, sort_key FROM sub
+              ORDER BY sort_key COLLATE \"C\", id",
+        )
+        .bind(workspace_id)
+        .bind(root)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut children: HashMap<Uuid, Vec<SubtreeRow>> = HashMap::new();
+        for (id, parent_id, title, icon, sort_key) in rows {
+            children.entry(parent_id).or_default().push(SubtreeRow {
+                id,
+                parent_id,
+                title,
+                icon,
+                sort_key,
+            });
+        }
+        // Depth first, from a stack holding each level in reverse.
+        let mut subtree = Vec::new();
+        let mut stack: Vec<SubtreeRow> = children.remove(&root).unwrap_or_default();
+        stack.reverse();
+        while let Some(row) = stack.pop() {
+            if let Some(below) = children.remove(&row.id) {
+                stack.extend(below.into_iter().rev());
+            }
+            subtree.push(row);
+        }
+        Ok(subtree)
     }
 
     async fn begin_purge(&self, workspace_id: Uuid, doc_id: Uuid) -> Result<(), DocStoreError> {

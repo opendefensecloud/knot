@@ -6,6 +6,7 @@ pub mod boards;
 pub mod comments;
 pub mod contributors;
 pub mod doc_store;
+pub mod duplicate;
 pub mod grant_store;
 pub mod invalidations;
 pub mod lexorank;
@@ -27,7 +28,7 @@ pub use comments::{Comment, CommentStore, CommentStoreError, PgCommentStore, Rea
 pub use contributors::{
     Contributor, ContributorStore, ContributorStoreError, DocByline, PersonRef, PgContributorStore,
 };
-pub use doc_store::{ArchivedRoot, DocStore, DocStoreError, Document, PgDocStore};
+pub use doc_store::{ArchivedRoot, DocStore, DocStoreError, Document, PgDocStore, SubtreeRow};
 pub use grant_store::{Grant, GrantStore, GrantStoreError, PgGrantStore};
 pub use markdown_cache::{
     MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore, PgMarkdownCache,
