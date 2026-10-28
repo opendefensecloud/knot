@@ -225,10 +225,20 @@ async function inFreshBrowser<T>(
 
 type Board = { id: string };
 
-async function boardsOf(page: Page, docId: string): Promise<Board[]> {
+/** The page's board: it must have exactly one. */
+async function boardOf(page: Page, docId: string): Promise<Board> {
   const res = await page.request.get(`/api/docs/${docId}/boards`);
   expect(res.status()).toBe(200);
-  return (await res.json()) as Board[];
+  const boards = (await res.json()) as Board[];
+  expect(boards).toHaveLength(1);
+  return boards[0]!;
+}
+
+/** A board's preview SVG, which must be there. */
+async function svgOf(page: Page, board: Board): Promise<string> {
+  const res = await page.request.get(`/api/boards/${board.id}/svg`);
+  expect(res.status()).toBe(200);
+  return res.text();
 }
 
 test("duplicate_with_subpages", async ({ page, browser }) => {
@@ -292,8 +302,7 @@ test("duplicate_with_subpages", async ({ page, browser }) => {
   const original = await inFreshBrowser(browser, page, `/doc/${ids.Handbook}`, (fresh) =>
     expectContentShown(fresh, shares),
   );
-  const [originalBoard] = await boardsOf(page, ids.Handbook);
-  expect(originalBoard).toBeDefined();
+  const originalBoard = await boardOf(page, ids.Handbook);
 
   // The dialog, with its subpages ticked.
   const { copy, sent } = await duplicateFromMenu(page, ids.Handbook, async (dialog) => {
@@ -331,11 +340,9 @@ test("duplicate_with_subpages", async ({ page, browser }) => {
   expect(copied.src).not.toBe(original.src);
   expect(copied.widths).toHaveLength(original.widths.length);
   copied.widths.forEach((w, i) => expect(Math.abs(w - original.widths[i]!)).toBeLessThanOrEqual(1));
-  const [copyBoard] = await boardsOf(page, copy);
-  expect(copyBoard).toBeDefined();
-  expect(copyBoard!.id).not.toBe(originalBoard!.id);
-  const svgOf = async (board: Board) => (await page.request.get(`/api/boards/${board.id}/svg`)).text();
-  expect(await svgOf(copyBoard!)).toBe(await svgOf(originalBoard!));
+  const copyBoard = await boardOf(page, copy);
+  expect(copyBoard.id).not.toBe(originalBoard.id);
+  expect(await svgOf(page, copyBoard)).toBe(await svgOf(page, originalBoard));
 
   // Archive the original with its subpages: the copy still shows it all.
   page.once("dialog", (dialog) => {
@@ -358,7 +365,7 @@ test("duplicate_with_subpages", async ({ page, browser }) => {
   });
   expect(purged.status()).toBe(204);
   expect((await page.request.get(original.src)).status()).toBe(404);
-  expect((await page.request.get(`/api/boards/${originalBoard!.id}/svg`)).status()).toBe(404);
+  expect((await page.request.get(`/api/boards/${originalBoard.id}/svg`)).status()).toBe(404);
   await inFreshBrowser(browser, page, `/doc/${copy}`, async (fresh) => {
     expect((await expectContentShown(fresh, shares)).src).toBe(copied.src);
     await openBoard(fresh);
