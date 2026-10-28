@@ -32,10 +32,13 @@ pub struct InMsg {
 pub struct ConnHandle {
     pub tx: mpsc::Sender<Vec<u8>>,
     /// Cancelled by the board room when it refuses an update the
-    /// connection sent, as `room::ConnHandle::refused` is; the WS shim then
-    /// closes the socket with 4422. The board room ignores everything the
-    /// connection sends after that (a re-join, an update, presence) and
-    /// sends it nothing more (`BoardRoom::refuse_sender`).
+    /// connection sent while the room holds it, as `room::ConnHandle::refused`
+    /// is; the WS shim then closes the socket with 4422. The board room
+    /// ignores everything the connection sends after that (a re-join, an
+    /// update, presence) and sends it nothing more
+    /// (`BoardRoom::refuse_sender`). A connection the room no longer holds
+    /// (dropped as a slow consumer) has no handle there to cancel: each bad
+    /// update it sends is still refused, but its socket stays open.
     pub refused: CancellationToken,
 }
 
@@ -361,7 +364,8 @@ impl BoardRoom {
     }
 
     /// Refuse an update `from` sent, as `Room::refuse_sender` does: count
-    /// it and tell its WS shim to close the connection with 4422. Unlike a
+    /// it and, if the room holds the connection, tell its WS shim to close
+    /// it with 4422. Unlike a
     /// page room, a board room takes updates from any connection, joined
     /// or not, so dropping the connection would not stop what it still
     /// sends. The room keeps its handle, with `refused` cancelled, until

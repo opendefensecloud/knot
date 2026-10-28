@@ -1492,7 +1492,7 @@ async fn a_refused_connection_stays_refused() {
             .await
             .unwrap();
         let (edit, _) = text_page(3);
-        let mut afters = Vec::new();
+        let mut afters: Vec<Vec<u8>> = Vec::new();
         for _ in 0..2 {
             send(&room, conn, edit.clone()).await;
             room.tx
@@ -1505,8 +1505,12 @@ async fn a_refused_connection_stays_refused() {
             let after = sentinel();
             send(&room, writer, after.clone()).await;
             let before = fanned_out(&mut peer_rx, &after).await;
+            // The room's catch-up may fan an earlier sentinel out again
+            // (see `fanned_out`); nothing else may come first.
             assert!(
-                before.is_empty(),
+                before
+                    .iter()
+                    .all(|f| afters.iter().any(|a| *f == wrap_sync_update(a))),
                 "the refused connection's edit or presence was fanned out"
             );
             afters.push(after);
