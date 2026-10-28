@@ -551,6 +551,45 @@ function touch(el: Element, type: "touchStart" | "touchMove" | "touchEnd", x: nu
 // Folder (0-28), Child (28-56), Grandchild (56-84). On touch a drag starts
 // once the finger has been held still for 250 ms.
 describe("DocTree — touch", () => {
+  // Spec bug C.8: touch drags fought scrolling.
+  it("a swipe scrolls instead of dragging", async () => {
+    const fetchMock = renderTree();
+    await editorRows();
+    layOut();
+    vi.useFakeTimers();
+
+    const link = screen.getByTestId("doc-row-grandchild");
+    touch(link, "touchStart", 100, 70);
+    touch(link, "touchMove", 100, 50); // 20px within the 250 ms: a swipe
+    act(() => void vi.advanceTimersByTime(300));
+    touch(link, "touchMove", 100, 14); // over Folder's middle
+    expect(screen.getByTestId("tree-row-grandchild")).not.toHaveStyle({ opacity: "0.5" }); // not dragging
+    expect(document.querySelector("[data-drop-zone]")).toBeNull();
+    touch(link, "touchEnd", 100, 14);
+    vi.useRealTimers();
+
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+  });
+
+  it("press, hold and move drags", async () => {
+    const fetchMock = renderTree();
+    await editorRows();
+    layOut();
+    vi.useFakeTimers();
+
+    const link = screen.getByTestId("doc-row-grandchild");
+    touch(link, "touchStart", 100, 70);
+    act(() => void vi.advanceTimersByTime(260));
+    touch(link, "touchMove", 100, 62);
+    touch(link, "touchMove", 100, 14); // over Folder's middle
+    expect(screen.getByTestId("tree-row-folder")).toHaveAttribute("data-drop-zone", "into");
+    touch(link, "touchEnd", 100, 14);
+    vi.useRealTimers();
+
+    await waitFor(() => expect(moves(fetchMock)).toEqual([{ id: "grandchild", body: { parent_id: "folder" } }]));
+  });
+
   it("a tap held past 250 ms that rolls 7px sideways moves nothing and opens the page", async () => {
     const fetchMock = renderTree();
     await editorRows();
