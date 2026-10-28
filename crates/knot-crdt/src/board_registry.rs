@@ -62,9 +62,10 @@ impl BoardRooms {
         if let Some(h) = self.live(board_id) {
             return Ok(h);
         }
-        // A board room that evicted itself (a too-deep update,
-        // [`crate::nesting`]) leaves a cancelled handle; drop it so this join
-        // rehydrates from storage.
+        // A board room that evicted itself (an update it refused after
+        // applying it: too deep, [`crate::nesting`], or rejected part-way by
+        // yrs) leaves a cancelled handle; drop it so this join rehydrates
+        // from storage.
         self.drop_if_dead(board_id).await;
         let sub = self.bus.subscribe(board_id).await?;
         let h = BoardRoom::spawn(

@@ -9,36 +9,42 @@
 //!   write what lies deeper as its text;
 //! - a room caps how deep an inbound update may nest the page's types at
 //!   [`MAX_NESTING`], in two steps:
-//!   - [`check_update`] is a cheap prefilter, run *before* the update is
-//!     applied. It refuses an update whose own encoded structure already
-//!     nests a chain of new types past the limit, so yrs never overflows
-//!     applying a crafted update that inserts a deep subtree and deletes it
-//!     in the same transaction. It predicts where yrs will place the
-//!     update's items, which is not exact, so it is a prefilter only — it may
-//!     let an update through (for example one that hangs a short chain of new
-//!     types off existing deep-but-legal content so its depth comes from the
-//!     page, not the update). It never overflows: it walks iteratively and
-//!     bounded.
-//!   - the authoritative check runs *after* `apply_update`
-//!     ([`deepest_inserted_type_depth`], via the engine's
+//!   - [`check_update`] is a best-effort prefilter, run *before* the update
+//!     is applied. It predicts where yrs will place the update's items and
+//!     refuses an update it predicts nests a type past the limit, so nothing
+//!     of that update is applied. The prediction is not exact, so the
+//!     prefilter can let an update through (for example one that hangs a
+//!     short chain of new types off existing deep-but-legal content so its
+//!     depth comes from the page, not the update), and it does not guarantee
+//!     that applying an update stays within the worker's stack. It never
+//!     overflows itself: it walks iteratively and bounded.
+//!   - the authoritative check, for every update that applies, runs *after*
+//!     `apply_update` ([`deepest_inserted_type_depth`], via the engine's
 //!     `apply_update_measuring`). It measures where each type the update
 //!     actually integrated landed, by walking up the real doc's parent chain,
-//!     iteratively and at most `MAX_NESTING + 1` steps. Applying the update
-//!     cannot overflow (integration is iterative; only deletion recurses, and
-//!     the prefilter has already refused any update that would delete a deep
-//!     chain it also inserts). When the authoritative check finds a type
+//!     iteratively and at most `MAX_NESTING + 1` steps. When it finds a type
 //!     nested past the limit, the room does not persist and does not fan out
 //!     the update, closes the sending connection, and evicts itself, so the
 //!     next join reloads the page from storage without the refused update.
-//!     Dropping the evicted room's doc, however deep the refused update made
-//!     it, does not recurse: yrs holds items flat in the block store, and
-//!     neither `Branch` nor `Item` has a custom `Drop`.
+//!     An update yrs rejects part-way (apply returns an error after
+//!     integrating some of its blocks, which yrs does not roll back) is
+//!     refused the same way. Dropping the evicted room's doc, however deep
+//!     the refused update made it, does not recurse: yrs holds items flat in
+//!     the block store, and neither `Branch` nor `Item` has a custom `Drop`.
 //!
-//! So no edit can store a page whose types nest deeper than [`MAX_NESTING`].
-//! Pages stored before this release that do are as they are;
-//! [`nests_deeper_than`] finds them (the real-data check reports them), and
-//! deleting their deep part can still overflow — the documented pre-existing
-//! limitation.
+//! So no update a room accepts stores a page whose types nest deeper than
+//! [`MAX_NESTING`].
+//!
+//! Not guarded (a known limitation, pre-existing on main, where nothing is
+//! checked; tracked as a follow-up — running apply off the worker's stack
+//! needs a design of its own, and the stack size is not changed): an apply
+//! that itself recurses past the worker's stack aborts the process before
+//! any check after it can run. That is a single update whose own apply
+//! deletes a chain of types deep enough (for example one that inserts a
+//! deep subtree and deletes it in the same transaction, in a shape the
+//! prefilter misses), or a later delete of the deep part of a page already
+//! stored deeper than the limit before this release. [`nests_deeper_than`]
+//! finds such stored pages (the real-data check reports them).
 
 use std::collections::{HashMap, HashSet};
 
@@ -81,8 +87,12 @@ pub struct TooDeep {
     pub depth: usize,
 }
 
-/// Checks that applying `update`, a lib0 v1 update, to `doc` nests no type
-/// deeper than [`MAX_NESTING`], without applying it.
+/// Predicts, without applying it, whether applying `update`, a lib0 v1
+/// update, to `doc` would nest a type deeper than [`MAX_NESTING`]. A
+/// best-effort prefilter: `Ok` does not mean the update is within the limit
+/// (the authoritative check is [`deepest_inserted_type_depth`], after
+/// apply), nor that applying it stays within the worker's stack (see the
+/// module doc).
 ///
 /// The update's items are decoded as yrs decodes them, and each new type is
 /// placed under its parent: one the update names, or the parent of the item
@@ -95,7 +105,8 @@ pub struct TooDeep {
 ///
 /// The cost is a decode of the update (and of what is pending) and, for each
 /// new type that hangs under existing content, a walk up from there. An
-/// update that doesn't decode passes, since applying it fails the same way.
+/// update that doesn't decode passes, since applying it fails the same way
+/// (and the room refuses an update it fails to apply).
 pub fn check_update(doc: &DocHandle, update: &[u8]) -> Result<(), TooDeep> {
     let txn = doc.inner().transact();
     let Ok(mut items) = decode_items(update) else {

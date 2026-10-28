@@ -43,10 +43,11 @@ pub struct ConnHandle {
     /// the whole session) and no frame value is free to mean it (an empty
     /// frame is already the presence-clearing message).
     pub revoked: CancellationToken,
-    /// Cancelled by the room when it refuses an update the connection sent,
-    /// one that would nest the page too deep ([`crate::nesting`]); the WS
-    /// shim then closes the socket with 4422. The room no longer holds the
-    /// connection, so nothing more it sends is applied.
+    /// Cancelled by the room when it refuses an update the connection sent:
+    /// one that would nest the page too deep ([`crate::nesting`]), or one
+    /// yrs could not apply; the WS shim then closes the socket with 4422.
+    /// The room no longer holds the connection, so nothing more it sends is
+    /// applied.
     pub refused: CancellationToken,
 }
 
@@ -158,11 +159,12 @@ pub struct Room {
     /// Fires after the writer confirms a successful persist; consumers
     /// debounce + reindex tasks for the doc.
     dirty_tx: Option<mpsc::Sender<Uuid>>,
-    /// Set when the room evicts itself after applying an update that nested
-    /// the page past [`crate::nesting::MAX_NESTING`] (the authoritative
-    /// post-apply check). The live doc then holds the refused content, so the
-    /// final flush must NOT snapshot it: the next join reloads the page from
-    /// storage, which never got the refused update.
+    /// Set when the room evicts itself after applying an update it then
+    /// refused: one that nested the page past
+    /// [`crate::nesting::MAX_NESTING`] (the authoritative post-apply check),
+    /// or one yrs rejected part-way. The live doc then holds the refused
+    /// content, so the final flush must NOT snapshot it: the next join
+    /// reloads the page from storage, which never got the refused update.
     evicted: bool,
 }
 
@@ -558,8 +560,9 @@ impl Room {
 
         // Final flush: write a snapshot at the current seq so the next boot
         // is cheap. Best-effort. Skipped when the room evicted itself over a
-        // too-deep update: the live doc holds that refused content, and a
-        // snapshot of it would be the one thing that persisted it.
+        // refused update (`refuse_applied`): the live doc holds that refused
+        // content, and a snapshot of it would be the one thing that
+        // persisted it.
         if !self.evicted {
             let _ = crate::snapshot::write_snapshot(
                 self.doc_id,
@@ -639,12 +642,14 @@ impl Room {
             tracing::debug!(conn = %m.from, "dropping update from a connection the room no longer holds");
             return;
         }
-        // Prefilter, before anything of it is applied: yrs overflows the
-        // stack applying an update whose own structure nests a deep chain of
-        // new types it then deletes. `check_update` refuses such an update so
-        // apply never recurses; nothing of it is applied, persisted or fanned
-        // out, and the sender is closed. It is a prefilter only — the
-        // authoritative check runs after apply below.
+        // Prefilter, before anything of it is applied: `check_update`
+        // predicts where yrs will place the update's types and refuses one
+        // it predicts nests too deep; nothing of it is applied, persisted or
+        // fanned out, and the sender is closed. It is best-effort: its
+        // prediction can be wrong, so it does not guarantee that applying
+        // the update stays within the worker's stack (see `crate::nesting`
+        // for what is not guarded). The authoritative check runs after
+        // apply below.
         if let Err(too_deep) = crate::nesting::check_update(&self.doc, &m.bytes) {
             tracing::warn!(
                 doc_id = %self.doc_id,
@@ -668,27 +673,15 @@ impl Room {
             .apply_update_measuring(&self.doc, &m.bytes, crate::nesting::MAX_NESTING)
         {
             Ok(applied) if applied.max_depth > crate::nesting::MAX_NESTING => {
-                // The update, now applied, nested a type past the limit.
-                // Refuse it after the fact: do not persist, do not fan out,
-                // close the sender, and evict the room. The live doc holds
-                // the refused content, so the room must reload — self-evicting
-                // (cancel `shutdown`) makes the next join rehydrate from
-                // storage, which never got this update. Dropping the deep doc
-                // does not recurse (`crate::nesting`).
-                tracing::warn!(
-                    doc_id = %self.doc_id,
-                    conn = %m.from,
-                    depth = applied.max_depth,
-                    limit = crate::nesting::MAX_NESTING,
-                    "refused an update that nested the page too deep (post-apply); evicting the room"
+                self.refuse_applied(
+                    m.from,
+                    "nesting",
+                    format_args!(
+                        "it nested a type {} deep, past the limit of {}",
+                        applied.max_depth,
+                        crate::nesting::MAX_NESTING
+                    ),
                 );
-                metrics::counter!("knot_room_updates_refused_total").increment(1);
-                metrics::counter!("knot_room_evicted_total", "reason" => "nesting").increment(1);
-                if let Some(conn) = self.conns.remove(&m.from) {
-                    conn.refused.cancel();
-                }
-                self.evicted = true;
-                self.shutdown.cancel();
                 return;
             }
             // Nothing new — typically the SyncStep2 a (re)connecting writer
@@ -699,8 +692,13 @@ impl Room {
             // fanning it out would make every peer re-apply a no-op.
             Ok(applied) if !applied.changed => return,
             Ok(_) => {}
+            // yrs integrates an update's blocks one by one and does not roll
+            // back when a later one fails, so the blocks before the error
+            // can be in the live doc, unmeasured. Refuse any error like a
+            // too-deep update, a decode error too (nothing integrated, but
+            // the sender is broken or crafted either way).
             Err(e) => {
-                tracing::debug!(error=?e, "apply_update failed");
+                self.refuse_applied(m.from, "apply_failed", format_args!("{e}"));
                 return;
             }
         }
@@ -734,6 +732,31 @@ impl Room {
         {
             tracing::error!(error=?e, "persist channel closed; dropping update");
         }
+    }
+
+    /// Refuse an inbound update the live doc may already hold, all of it or
+    /// the part yrs integrated before it failed: one that nested the page
+    /// past [`crate::nesting::MAX_NESTING`] (`reason` "nesting"), or one
+    /// yrs could not apply ("apply_failed"). The caller persists and fans
+    /// out nothing of it; this closes the sender and evicts the room. The
+    /// live doc can't be trusted any more, so the room ends without its
+    /// final snapshot (`evicted`), and the next join reloads the page from
+    /// storage, which never got the update. Dropping the doc doesn't
+    /// recurse, however deep the update made it (`crate::nesting`).
+    fn refuse_applied(&mut self, from: ConnId, reason: &'static str, why: std::fmt::Arguments) {
+        tracing::warn!(
+            doc_id = %self.doc_id,
+            conn = %from,
+            reason,
+            "refused an update after applying it ({why}); closing its connection and evicting the room"
+        );
+        metrics::counter!("knot_room_updates_refused_total").increment(1);
+        metrics::counter!("knot_room_evicted_total", "reason" => reason).increment(1);
+        if let Some(conn) = self.conns.remove(&from) {
+            conn.refused.cancel();
+        }
+        self.evicted = true;
+        self.shutdown.cancel();
     }
 }
 

@@ -58,11 +58,19 @@ pub trait Engine: Send + Sync + 'static {
     /// 0). A caller refuses the update, without persisting or fanning it out,
     /// when `max_depth > limit`.
     ///
-    /// Applying the update cannot overflow the stack: integration is
-    /// iterative, and the only recursive path (deletion) is left to the
-    /// prefilter [`crate::nesting::check_update`], which the room runs first.
-    /// The measurement walks the real doc iteratively and bounded, so it
-    /// cannot overflow either.
+    /// On `Err` the doc may hold part of the update: yrs integrates an
+    /// update's blocks one by one and does not roll back the ones before a
+    /// block it rejects. A caller must treat `Err` like `max_depth > limit`
+    /// and stop trusting the doc (the rooms evict themselves).
+    ///
+    /// The measurement walks the real doc iteratively and at most
+    /// `limit + 1` steps, so it cannot overflow the stack. The apply itself
+    /// is not guarded: yrs deletes nested types by recursing once per level,
+    /// so an update whose own apply deletes a chain deep enough (one the
+    /// best-effort prefilter [`crate::nesting::check_update`] misses), or
+    /// deletes the deep part of a page already stored deeper than the limit,
+    /// can overflow the worker's stack — a known limitation, pre-existing on
+    /// main (see [`crate::nesting`]).
     fn apply_update_measuring(
         &self,
         d: &DocHandle,

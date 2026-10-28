@@ -3,8 +3,13 @@
 //! nested type by recursing once per level, so a crafted update holding a
 //! subtree 100,000 types deep, and its deletion, overflows a tokio worker's
 //! stack while it is applied, and a stack overflow aborts the whole server.
-//! A room checks every inbound update first, and refuses one that nests
-//! past `MAX_NESTING`: nothing of it is applied, persisted or fanned out.
+//! A room runs a best-effort prefilter before applying an inbound update
+//! (nothing of a refused one is applied), and the authoritative check after
+//! applying it; an update refused after applying it, or one yrs rejects
+//! part-way, is not persisted or fanned out, and the room evicts itself.
+//! These tests are the evidence for the shapes they build; an update whose
+//! own apply overflows in a shape the prefilter misses is not guarded (see
+//! `knot_crdt::nesting`).
 //!
 //! The checks run on a thread with the stack of a tokio worker, 2 MiB, and
 //! the room on a multi-threaded runtime, whose workers have that stack. This
@@ -32,8 +37,8 @@ use yrs::encoding::write::Write;
 use yrs::types::TypeRef;
 use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{
-    Doc, ID, Options, ReadTxn, StateVector, Text, Transact, XmlElementPrelim, XmlElementRef,
-    XmlFragment, XmlTextPrelim,
+    Assoc, Doc, ID, IndexedSequence, Options, ReadTxn, StateVector, Text, Transact,
+    XmlElementPrelim, XmlElementRef, XmlFragment, XmlOut, XmlTextPrelim,
 };
 
 /// How deep the crafted updates nest: far past what a walk that recursed
@@ -345,17 +350,22 @@ impl knot_storage::UpdatesStore for CapturingUpdates {
     }
 }
 
-struct NoSnapshots;
+/// Records the state of every snapshot a room writes, and serves none.
+#[derive(Default)]
+struct RecordingSnapshots {
+    written: Arc<Mutex<Vec<Vec<u8>>>>,
+}
 
 #[async_trait::async_trait]
-impl knot_storage::SnapshotStore for NoSnapshots {
+impl knot_storage::SnapshotStore for RecordingSnapshots {
     async fn insert(
         &self,
         _: Uuid,
         _: i64,
-        _: &[u8],
+        state: &[u8],
         _: &[u8],
     ) -> Result<(), knot_storage::SnapshotStoreError> {
+        self.written.lock().unwrap().push(state.to_vec());
         Ok(())
     }
     async fn latest(
@@ -385,12 +395,26 @@ impl knot_storage::SnapshotStore for NoSnapshots {
 
 /// A room whose writer records what it persists.
 async fn room() -> (RoomHandle, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let (room, persisted, _) = room_and_snapshots().await;
+    (room, persisted)
+}
+
+/// A room whose writer records what it persists, and the snapshots it
+/// writes. Its policy writes none while it runs, so any snapshot is its
+/// final flush.
+async fn room_and_snapshots() -> (
+    RoomHandle,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+) {
     let bus = Arc::new(MemBus::new());
     let doc_id = Uuid::new_v4();
     let sub = knot_crdt::Bus::subscribe(bus.as_ref(), doc_id)
         .await
         .unwrap();
     let persisted = Arc::new(Mutex::new(Vec::new()));
+    let snapshots = RecordingSnapshots::default();
+    let written = snapshots.written.clone();
     let room = Room::spawn(
         doc_id,
         Arc::new(YrsEngine),
@@ -399,7 +423,7 @@ async fn room() -> (RoomHandle, Arc<Mutex<Vec<Vec<u8>>>>) {
         Arc::new(CapturingUpdates {
             persisted: persisted.clone(),
         }),
-        Arc::new(NoSnapshots),
+        Arc::new(snapshots),
         SnapshotPolicy {
             every_n: 1000,
             idle: Duration::from_secs(3600),
@@ -408,7 +432,7 @@ async fn room() -> (RoomHandle, Arc<Mutex<Vec<Vec<u8>>>>) {
     )
     .await
     .unwrap();
-    (room, persisted)
+    (room, persisted, written)
 }
 
 /// A connection joined to `room`: its id, what the room sends it, and the
@@ -651,7 +675,16 @@ fn the_post_apply_check_catches_a_reparenting_update_the_prefilter_misses() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_room_refuses_and_evicts_a_crafted_reparenting_update() {
     let (base, attack) = crafted_attack();
-    let (room, persisted) = room().await;
+    refused_after_apply_and_evicted(base, attack).await;
+}
+
+/// Sends `base` from one connection, then `bad` from another, and checks
+/// that the room accepted `base` (fanned out and persisted) and refused
+/// `bad` after applying it: nothing of `bad` is persisted or fanned out,
+/// its sender is told to close, and the room evicts itself without a final
+/// snapshot of its live doc, which holds what `bad` brought.
+async fn refused_after_apply_and_evicted(base: Vec<u8>, bad: Vec<u8>) {
+    let (room, persisted, snapshots) = room_and_snapshots().await;
     let (writer, _writer_rx, _) = join(&room).await;
     let (attacker, _attacker_rx, refused) = join(&room).await;
     let (_peer, mut peer_rx, _) = join(&room).await;
@@ -672,29 +705,37 @@ async fn a_room_refuses_and_evicts_a_crafted_reparenting_update() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // The crafted update bypasses the prefilter; the room refuses it after
-    // applying it and evicts itself.
-    send(&room, attacker, attack).await;
+    // `bad` passes the prefilter; the room refuses it after applying it and
+    // evicts itself.
+    send(&room, attacker, bad).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !room.shutdown.is_cancelled() {
         assert!(
             std::time::Instant::now() < deadline,
-            "the room did not evict itself after a too-deep update"
+            "the room did not evict itself after refusing the update"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // The actor drops its channel once it has ended, final flush included.
+    tokio::time::timeout(Duration::from_secs(10), room.tx.closed())
+        .await
+        .expect("the evicted room did not stop");
     assert!(refused.is_cancelled(), "the sender was not told to close");
     assert_eq!(
         *persisted.lock().unwrap(),
         vec![base],
-        "the crafted update must not be persisted"
+        "the refused update must not be persisted"
+    );
+    assert!(
+        snapshots.lock().unwrap().is_empty(),
+        "the evicted room snapshotted a doc holding the refused update"
     );
     assert!(
         matches!(
             peer_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty) | Err(mpsc::error::TryRecvError::Disconnected)
         ),
-        "the crafted update must not be fanned out"
+        "the refused update must not be fanned out"
     );
 }
 
@@ -711,7 +752,7 @@ async fn an_evicted_room_is_rebooted_on_the_next_acquire_and_keeps_serving() {
         Arc::new(CapturingUpdates {
             persisted: persisted.clone(),
         }),
-        Arc::new(NoSnapshots),
+        Arc::new(RecordingSnapshots::default()),
         SnapshotPolicy {
             every_n: 1000,
             idle: Duration::from_secs(3600),
@@ -878,10 +919,18 @@ impl knot_storage::BoardStore for CapturingBoard {
 /// its own). RED on HEAD: the board would apply, append and fan it out.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_board_room_refuses_and_evicts_a_crafted_reparenting_update() {
+    let (base, attack) = crafted_attack();
+    board_refused_after_apply_and_evicted(base, attack).await;
+}
+
+/// As [`refused_after_apply_and_evicted`], for a board room: `base` is
+/// appended and fanned out; `bad` is refused after it was applied, so
+/// nothing of it is appended or fanned out, and the board room evicts
+/// itself.
+async fn board_refused_after_apply_and_evicted(base: Vec<u8>, bad: Vec<u8>) {
     use knot_crdt::BoardRoom;
     use knot_crdt::board_room::{Event as BoardEvent, InMsg as BoardInMsg};
 
-    let (base, attack) = crafted_attack();
     let board_id = Uuid::new_v4();
     let bus = Arc::new(MemBus::new());
     let sub = knot_crdt::Bus::subscribe(bus.as_ref(), board_id)
@@ -930,7 +979,7 @@ async fn a_board_room_refuses_and_evicts_a_crafted_reparenting_update() {
 
     h.tx.send(BoardEvent::Inbound(BoardInMsg {
         from: attacker,
-        bytes: attack,
+        bytes: bad,
     }))
     .await
     .unwrap();
@@ -938,20 +987,124 @@ async fn a_board_room_refuses_and_evicts_a_crafted_reparenting_update() {
     while !h.shutdown.is_cancelled() {
         assert!(
             std::time::Instant::now() < deadline,
-            "the board room did not evict itself after a too-deep update"
+            "the board room did not evict itself after refusing the update"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
         *appended.lock().unwrap(),
         vec![base],
-        "the crafted update must not be appended"
+        "the refused update must not be appended"
     );
     assert!(
         matches!(
             peer_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty) | Err(mpsc::error::TryRecvError::Disconnected)
         ),
-        "the crafted update must not be fanned out"
+        "the refused update must not be fanned out"
     );
+}
+
+// ---------------------------------------------------------------------------
+// An update yrs rejects part-way (F1 round 3)
+// ---------------------------------------------------------------------------
+//
+// yrs integrates an update's blocks one at a time and does not roll back
+// when a later one fails, so an update it rejects leaves the blocks before
+// the failing one in the live doc, unmeasured. A room treats an apply error
+// like a too-deep update: nothing of it is persisted or fanned out, the
+// sender is closed, and the room evicts itself, so the next join reloads the
+// page from storage.
+
+/// A page holding one paragraph of text, from client 1, and the id of the
+/// text's first character: an item that holds a string, not a type.
+fn text_page() -> (Vec<u8>, ID) {
+    let doc = Doc::with_client_id(1);
+    let frag = doc.get_or_insert_xml_fragment("default");
+    let first = {
+        let mut txn = doc.transact_mut();
+        let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+        let text = p.push_back(&mut txn, XmlTextPrelim::new("hello"));
+        let index = text
+            .sticky_index(&txn, 0, Assoc::After)
+            .expect("the text has a first character");
+        *index.id().expect("a character has an id")
+    };
+    (state(&doc), first)
+}
+
+/// An ordinary inconsistent update, which yrs integrates part of and then
+/// rejects (`UpdateError::InvalidParent`): from client 77, an element
+/// `partial` in the page's root fragment, then a string whose parent is
+/// `not_a_type`, an item that holds text. yrs's own encoder never writes
+/// such an update; a buggy or crafted client can. Encoded by hand, as
+/// [`attack_bytes`] is.
+fn rejected_part_way(not_a_type: &ID) -> Vec<u8> {
+    let mut enc = EncoderV1::new();
+    enc.write_var(1u32);
+    enc.write_var(2u32);
+    enc.write_client(ClientID::new(77));
+    enc.write_var(0u32);
+    enc.write_info(7);
+    enc.write_parent_info(true);
+    enc.write_string("default");
+    ItemContent::Type(Branch::new(TypeRef::XmlElement("partial".into()))).encode(&mut enc);
+    enc.write_info(4);
+    enc.write_parent_info(false);
+    enc.write_left_id(not_a_type);
+    ItemContent::String("y".into()).encode(&mut enc);
+    enc.write_var(0u32);
+    enc.to_vec()
+}
+
+/// Whether the root fragment of `doc` holds an element tagged `partial`.
+fn holds_partial(doc: &DocHandle) -> bool {
+    let frag = doc.inner().get_or_insert_xml_fragment("default");
+    let txn = doc.inner().transact();
+    frag.children(&txn)
+        .any(|child| matches!(child, XmlOut::Element(e) if e.tag().as_ref() == "partial"))
+}
+
+/// The fixture: the update passes the prefilter, so it reaches apply, and
+/// yrs rejects it there after integrating its first block, which stays in
+/// the doc although apply returned an error.
+#[test]
+fn yrs_rejects_the_update_part_way_and_keeps_what_it_integrated() {
+    let (base, not_a_type) = text_page();
+    let bad = rejected_part_way(&not_a_type);
+    let doc = page(&[&base]);
+    assert_eq!(
+        check_update(&doc, &bad),
+        Ok(()),
+        "the update should pass the prefilter"
+    );
+    assert!(
+        YrsEngine
+            .apply_update_measuring(&doc, &bad, MAX_NESTING)
+            .is_err(),
+        "yrs should reject the update"
+    );
+    assert!(
+        holds_partial(&doc),
+        "yrs should keep the block it integrated before the error"
+    );
+}
+
+/// RED on HEAD: the room logged the apply error and kept running, with the
+/// partly applied update in its live doc, where a later snapshot (its final
+/// flush, at the latest) would store it. Now it is refused like a too-deep
+/// update: not persisted, fanned out or snapshotted, the sender is closed,
+/// and the room evicts itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_room_refuses_and_evicts_an_update_yrs_rejects_part_way() {
+    let (base, not_a_type) = text_page();
+    refused_after_apply_and_evicted(base, rejected_part_way(&not_a_type)).await;
+}
+
+/// The same for a board room. RED on HEAD: the board room logged the error
+/// and kept running.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_board_room_refuses_and_evicts_an_update_yrs_rejects_part_way() {
+    let (base, not_a_type) = text_page();
+    board_refused_after_apply_and_evicted(base, rejected_part_way(&not_a_type)).await;
 }

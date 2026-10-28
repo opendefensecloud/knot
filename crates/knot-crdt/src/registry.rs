@@ -93,7 +93,8 @@ impl Rooms {
         if let Some(h) = self.live(doc_id) {
             return Ok(h);
         }
-        // A room that evicted itself (a too-deep update, [`crate::nesting`])
+        // A room that evicted itself (an update it refused after applying
+        // it: too deep, [`crate::nesting`], or rejected part-way by yrs)
         // leaves a cancelled handle in the map. Drop it before booting a
         // fresh one, so this join rehydrates from storage.
         self.drop_if_dead(doc_id).await;
@@ -122,10 +123,10 @@ impl Rooms {
     /// one: rooms are not evicted when idle, so a background reader that
     /// acquired them would keep every page it read in memory.
     ///
-    /// A room that evicted itself over a too-deep update ([`crate::nesting`])
-    /// is treated as absent — its live doc holds refused content, so a reader
-    /// must fall back to storage. `acquire` prunes the dead entry on the next
-    /// join.
+    /// A room that evicted itself over a refused update (too deep,
+    /// [`crate::nesting`], or rejected part-way by yrs) is treated as absent
+    /// — its live doc holds refused content, so a reader must fall back to
+    /// storage. `acquire` prunes the dead entry on the next join.
     pub fn get_active(&self, doc_id: Uuid) -> Option<Arc<RoomHandle>> {
         self.live(doc_id)
     }

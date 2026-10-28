@@ -228,12 +228,15 @@ impl BoardRoom {
 
     #[tracing::instrument(skip(self, m), fields(board_id = %self.board_id, bytes = m.bytes.len()))]
     async fn on_inbound(&mut self, m: InMsg) {
-        // As in `Room::on_inbound`: nothing of an update that nests too deep
-        // is applied, persisted or fanned out. The board editor never nests
-        // types, so this only ever fires for a crafted update.
+        // As in `Room::on_inbound`: nothing of an update that nests too deep,
+        // or that yrs can't apply, is persisted or fanned out. The board
+        // editor never nests types, so this only ever fires for a crafted
+        // or broken update.
         //
-        // Prefilter: refuse an update whose own structure nests a deep chain
-        // of new types, so apply never recurses deleting it.
+        // Prefilter: refuse, before applying, an update `check_update`
+        // predicts nests too deep. Best-effort only: it does not guarantee
+        // that applying an update stays within the worker's stack (see
+        // `crate::nesting` for what is not guarded).
         if let Err(too_deep) = crate::nesting::check_update(&self.doc, &m.bytes) {
             tracing::warn!(
                 board_id = %self.board_id,
@@ -245,27 +248,21 @@ impl BoardRoom {
             metrics::counter!("knot_room_updates_refused_total").increment(1);
             return;
         }
-        // Authoritative post-apply check, as in `Room::on_inbound`. A board
-        // connection has no close signal of its own, so the room just drops
-        // the update and evicts itself (cancel `shutdown`); the next join
-        // rehydrates from storage, which never got this update. Boards
-        // persist inline, so refusing here means `append_update` below never
-        // runs for the refused update.
+        // Authoritative post-apply check, as in `Room::on_inbound`.
         match self
             .engine
             .apply_update_measuring(&self.doc, &m.bytes, crate::nesting::MAX_NESTING)
         {
             Ok(applied) if applied.max_depth > crate::nesting::MAX_NESTING => {
-                tracing::warn!(
-                    board_id = %self.board_id,
-                    conn = %m.from,
-                    depth = applied.max_depth,
-                    limit = crate::nesting::MAX_NESTING,
-                    "refused a board update that nested too deep (post-apply); evicting the room"
+                self.refuse_applied(
+                    m.from,
+                    "nesting",
+                    format_args!(
+                        "it nested a type {} deep, past the limit of {}",
+                        applied.max_depth,
+                        crate::nesting::MAX_NESTING
+                    ),
                 );
-                metrics::counter!("knot_room_updates_refused_total").increment(1);
-                metrics::counter!("knot_room_evicted_total", "reason" => "nesting").increment(1);
-                self.shutdown.cancel();
                 return;
             }
             // Nothing new — the usual answer to the server's SyncStep1 from a
@@ -273,8 +270,11 @@ impl BoardRoom {
             // open or echo the no-op to every peer (see `Room::on_inbound`).
             Ok(applied) if !applied.changed => return,
             Ok(_) => {}
+            // yrs doesn't roll back the blocks it integrated before the
+            // error; refuse any error like a too-deep update (see
+            // `Room::on_inbound`).
             Err(e) => {
-                tracing::debug!(error=?e, "apply_update failed");
+                self.refuse_applied(m.from, "apply_failed", format_args!("{e}"));
                 return;
             }
         }
@@ -303,6 +303,25 @@ impl BoardRoom {
         for cid in to_close {
             self.conns.remove(&cid);
         }
+    }
+
+    /// Refuse an inbound update the live doc may already hold, all of it or
+    /// the part yrs integrated before it failed, as `Room::refuse_applied`
+    /// does: `reason` "nesting" or "apply_failed". Boards persist inline, so
+    /// the caller's return means `append_update` never runs for it. A board
+    /// connection has no close signal of its own, so the room only evicts
+    /// itself (cancel `shutdown`); the next join rehydrates from storage,
+    /// which never got the update.
+    fn refuse_applied(&mut self, from: ConnId, reason: &'static str, why: std::fmt::Arguments) {
+        tracing::warn!(
+            board_id = %self.board_id,
+            conn = %from,
+            reason,
+            "refused a board update after applying it ({why}); evicting the room"
+        );
+        metrics::counter!("knot_room_updates_refused_total").increment(1);
+        metrics::counter!("knot_room_evicted_total", "reason" => reason).increment(1);
+        self.shutdown.cancel();
     }
 }
 

@@ -17,9 +17,10 @@ use tokio_util::sync::CancellationToken;
 /// - `shutdown` (server draining): close with 1001 so the client reconnects
 ///   elsewhere.
 /// - `revoked` (the room revoked this connection's access): close with 4403.
-/// - `refused` (the room refused an update this connection sent, one that
-///   would nest the page too deep): close with 4422, so the client stops
-///   sending on a session whose state the room no longer shares.
+/// - `refused` (the room refused an update this connection sent: one that
+///   would nest the page too deep, or one yrs could not apply): close with
+///   4422, so the client stops sending on a session whose state the room no
+///   longer shares.
 /// - `done` (the read half ended — the client went away): stop. Without it
 ///   this task would wait on the still-open channel forever, leaking itself
 ///   and the socket for every disconnect.
@@ -45,7 +46,7 @@ pub(crate) async fn run<S>(
                 break;
             }
             _ = refused.cancelled() => {
-                close(&mut sink, 4422, "doc.nesting_too_deep").await;
+                close(&mut sink, 4422, "doc.update_refused").await;
                 break;
             }
             _ = done.cancelled() => break,

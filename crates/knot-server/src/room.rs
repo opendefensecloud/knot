@@ -42,7 +42,8 @@ pub async fn serve(
     // writer then closes the socket with 4403.
     let revoked = CancellationToken::new();
     // Cancelled by the room when it refuses an update this connection sent
-    // (it nests the page too deep); the writer then closes with 4422.
+    // (it nests the page too deep, or yrs can't apply it); the writer then
+    // closes with 4422.
     let refused = CancellationToken::new();
     let conn_handle = || ConnHandle {
         tx: out_tx.clone(),
