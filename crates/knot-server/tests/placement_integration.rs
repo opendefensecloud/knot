@@ -10,6 +10,7 @@ use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
 use knot_server::{AppState, router_with_state};
 use knot_storage::{WorkspaceRole, lexorank};
+use knot_test_support::locks::wait_for_lock_waits;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -594,24 +595,6 @@ async fn create_with_non_sibling_anchor_is_422() {
         "{body}"
     );
     assert!(w.level(Some(&folder)).await.is_empty(), "nothing created");
-}
-
-/// Waits until `n` sessions on this test's database are waiting for a lock.
-async fn wait_for_lock_waits(pool: &PgPool, n: i64) {
-    for _ in 0..500 {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity
-              WHERE datname = current_database() AND wait_event_type = 'Lock'",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        if waiting >= n {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("{n} sessions never waited for a lock together");
 }
 
 /// `DELETE /api/docs/{id}`, asserting 204: `id` goes to the archive.

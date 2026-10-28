@@ -9,19 +9,14 @@
 //! every time.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::time::Duration;
 
 use knot_storage::{
     DocStore, DocStoreError, PgDocStore, PgUserStore, PgWorkspaceStore, Placement, UserStore,
     WorkspaceRole, WorkspaceStore, lexorank,
 };
+use knot_test_support::locks::{TOP_LEVEL_LOCK, deadlocks_once, wait_for_lock_waits};
 use sqlx::PgPool;
 use uuid::Uuid;
-
-/// The first half of the top-level group's advisory lock key (P8), `"knot"` in
-/// ASCII. The second half is `hashtext(workspace_id::text)`.
-const TOP_LEVEL_LOCK: i32 = 1_802_399_604;
 
 struct World {
     store: PgDocStore,
@@ -132,24 +127,6 @@ fn healthy_titles(group: &[(String, String)]) -> Vec<&str> {
         "duplicate keys: {group:?}"
     );
     group.iter().map(|(title, _)| title.as_str()).collect()
-}
-
-/// Waits until `n` sessions on this test's database are waiting for a lock.
-async fn wait_for_lock_waits(pool: &PgPool, n: i64) {
-    for _ in 0..500 {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity
-              WHERE datname = current_database() AND wait_event_type = 'Lock'",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        if waiting >= n {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("{n} sessions never waited for a lock together");
 }
 
 /// Keys from before the heal or from an old release, in the sidebar's order:
@@ -677,78 +654,12 @@ async fn anchors_must_be_live_non_template_siblings() {
     assert_eq!(created.parent_id, Some(folder));
 }
 
-/// Runs `op`, which takes the top-level lock first and later must update
-/// `blocker`, a top-level row with a bad key, to respread the group. A
-/// stand-in transaction holds `blocker` and waits for the top-level lock: a
-/// deadlock. Postgres aborts `op` with 40P01, and `op` must succeed by
-/// running its transaction once more.
-///
-/// Postgres checks a lock wait for a deadlock once, `deadlock_timeout` (1 s)
-/// after the wait starts, and aborts the session whose check finds the
-/// cycle. Two things make that `op`, even on a loaded machine:
-///
-/// - `op`'s wait for `blocker` starts last. A gate transaction holds the
-///   top-level lock until `op` and then the stand-in queue for it. `op`,
-///   first in the queue, gets it when the gate ends and goes on to wait for
-///   `blocker`, with the stand-in already waiting. Without the gate, `op`
-///   waited first, and on a loaded machine the stand-in could queue more
-///   than a second later: `op`'s only check found no cycle yet, and the
-///   stand-in's check aborted the stand-in.
-/// - The stand-in's own check comes a minute after its wait starts, long
-///   after `op`'s. Setting `deadlock_timeout` needs a superuser, which the
-///   test databases' role is (CI and the dev stack).
-async fn deadlocks_once<T, F>(w: &World, blocker: Uuid, op: F) -> T
-where
-    T: Send + 'static,
-    F: Future<Output = Result<T, DocStoreError>> + Send + 'static,
-{
-    const TAKE_TOP_LEVEL_LOCK: &str = "SELECT pg_advisory_xact_lock($1, hashtext($2::uuid::text))";
-    let mut stand_in = w.pool.begin().await.unwrap();
-    sqlx::query("SET LOCAL deadlock_timeout = '1min'")
-        .execute(&mut *stand_in)
-        .await
-        .unwrap();
-    sqlx::query("SELECT 1 FROM documents WHERE id = $1 FOR UPDATE")
-        .bind(blocker)
-        .execute(&mut *stand_in)
-        .await
-        .unwrap();
-    let mut gate = w.pool.begin().await.unwrap();
-    sqlx::query(TAKE_TOP_LEVEL_LOCK)
-        .bind(TOP_LEVEL_LOCK)
-        .bind(w.ws)
-        .execute(&mut *gate)
-        .await
-        .unwrap();
-
-    let op = tokio::spawn(op);
-    wait_for_lock_waits(&w.pool, 1).await;
-    let ws = w.ws;
-    let stand_in = tokio::spawn(async move {
-        let queued = sqlx::query(TAKE_TOP_LEVEL_LOCK)
-            .bind(TOP_LEVEL_LOCK)
-            .bind(ws)
-            .execute(&mut *stand_in)
-            .await;
-        stand_in.rollback().await.unwrap();
-        queued
-    });
-    wait_for_lock_waits(&w.pool, 2).await;
-    gate.rollback().await.unwrap();
-
-    stand_in
-        .await
-        .unwrap()
-        .expect("Postgres aborts the operation, not the stand-in");
-    op.await.unwrap().expect("one retry after the deadlock")
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn create_placed_retries_once_after_a_deadlock() {
     let w = world().await;
     let blocker = w.seed(None, "zero", "0").await;
     let (store, ws, user) = (w.store.clone(), w.ws, w.user);
-    deadlocks_once(&w, blocker, async move {
+    deadlocks_once(&w.pool, w.ws, blocker, async move {
         store
             .create_placed(ws, None, "New", Placement::First, user)
             .await
@@ -764,7 +675,7 @@ async fn move_placed_retries_once_after_a_deadlock() {
     let folder = w.seed(None, "Folder", "m").await;
     let mover = w.seed(Some(folder), "Mover", "m").await;
     let (store, ws, user) = (w.store.clone(), w.ws, w.user);
-    deadlocks_once(&w, blocker, async move {
+    deadlocks_once(&w.pool, w.ws, blocker, async move {
         store
             .move_placed(ws, mover, user, None, Placement::First)
             .await
@@ -786,11 +697,9 @@ async fn restore_retries_once_after_a_deadlock() {
     // Last at the top level is after this key, which `between` rejects.
     let blocker = w.seed(None, "z zero", "z0").await;
     let (store, ws, user) = (w.store.clone(), w.ws, w.user);
-    deadlocks_once(
-        &w,
-        blocker,
-        async move { store.restore(ws, child, user).await },
-    )
+    deadlocks_once(&w.pool, w.ws, blocker, async move {
+        store.restore(ws, child, user).await
+    })
     .await;
     assert_eq!(
         healthy_titles(&w.group(None).await),

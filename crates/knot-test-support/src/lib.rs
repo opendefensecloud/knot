@@ -23,6 +23,8 @@
 use sqlx::{AssertSqlSafe, Executor, PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
 
+pub mod locks;
+
 /// Connection string for the dev-compose Postgres. Override with the
 /// `KNOT_TEST_DATABASE_URL` env var if you run Postgres on a different
 /// port or host.
