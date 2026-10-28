@@ -333,9 +333,12 @@ export function keyboardMove(
 
 /** The live-region announcement for a move, by title:
  *  "Moved “B” into “A”, position 2 of 3". `flat` holds the rows before the
- *  move. The position is left out when the new parent's children are hidden
- *  (it is collapsed), since they can't be counted. */
-export function describeMove(flat: FlatRow[], id: string, args: MoveArgs): string {
+ *  move, `docs` the pages they show. The position is left out when it can't
+ *  be told: when the new parent's children are hidden (it is collapsed), and
+ *  when pages drawn at the top level whose parent isn't listed sit between
+ *  the page's new real neighbours. The server places a page among its real
+ *  siblings only, so where it lands among those is up to its new key. */
+export function describeMove(flat: FlatRow[], docs: Doc[], id: string, args: MoveArgs): string {
   const head = `Moved “${flat.find((r) => r.id === id)?.title ?? ""}”`;
   const items = withoutRow(flat, id);
   const pi = args.parent_id === null ? -1 : items.findIndex((r) => r.id === args.parent_id);
@@ -343,16 +346,25 @@ export function describeMove(flat: FlatRow[], id: string, args: MoveArgs): strin
   if (args.parent_id !== null && !parent) return head;
   const where = parent ? `${head} into “${parent.title}”` : `${head} to the top level`;
   const depth = parent ? parent.depth + 1 : 0;
+  // The rows drawn as the new siblings, and among them the real ones.
   const sibs: string[] = [];
   for (let i = pi + 1; i < items.length && items[i]!.depth >= depth; i++) {
     if (items[i]!.depth === depth) sibs.push(items[i]!.id);
   }
+  const realParent = new Map(docs.map((d) => [d.id, d.parent_id ?? null]));
+  const real = sibs.filter((s) => realParent.get(s) === args.parent_id);
   // A parent with subpages but no visible row under it is collapsed. (In
   // `flat` the moved page itself still counts as visible.)
   const below = parent ? flat[flat.indexOf(parent) + 1] : undefined;
   const hidden =
     parent !== undefined && parent.descendantCount > 0 && !(below && below.depth > parent.depth);
   const anchor = args.after_id ?? args.before_id;
-  if (hidden || (anchor !== undefined && !sibs.includes(anchor))) return where;
-  return `${where}, position ${insertIndex(sibs, args) + 1} of ${sibs.length + 1}`;
+  if (hidden || (anchor !== undefined && !real.includes(anchor))) return where;
+  // The page goes between two real siblings (or the start or end): on
+  // screen, between the rows that show them.
+  const at = insertIndex(real, args);
+  const before = at === 0 ? -1 : sibs.indexOf(real[at - 1]!);
+  const after = at === real.length ? sibs.length : sibs.indexOf(real[at]!);
+  if (after - before > 1) return where;
+  return `${where}, position ${before + 2} of ${sibs.length + 1}`;
 }

@@ -180,10 +180,10 @@ export function DocTree() {
   const [dropped] = useState(lastDrop);
   const accessibility = useMemo(
     () => ({
-      announcements: makeAnnouncements(() => flat, dropped.get),
+      announcements: makeAnnouncements(() => flat, () => docs, dropped.get),
       screenReaderInstructions: SCREEN_READER_INSTRUCTIONS,
     }),
-    [flat, dropped],
+    [flat, docs, dropped],
   );
 
   const treeRef = useRef<HTMLUListElement | null>(null);
@@ -240,7 +240,7 @@ export function DocTree() {
     if (!args) return;
     // Indenting into a collapsed page opens it: the page stays in view, with focus.
     if (args.parent_id !== null && collapsed.has(args.parent_id)) toggle(args.parent_id);
-    setAnnouncement(describeMove(flat, id, args));
+    setAnnouncement(describeMove(flat, docs, id, args));
     refocus.current = id;
     move.mutate({ id, body: args });
   }
@@ -675,11 +675,15 @@ function lastDrop() {
 }
 
 /** dnd-kit's live-region messages, by title: an id means nothing to a
- *  listener. `getFlat` returns the rows on screen, `getDrop` the drop the
- *  drag ended with. The end says what the drop did, not which row it was
- *  over: an un-nest on one's own row moves the page, and a drop over
- *  another row may leave it where it was. */
-export function makeAnnouncements(getFlat: () => FlatRow[], getDrop: () => Drop | null): Announcements {
+ *  listener. `getFlat` returns the rows on screen, `getDocs` the pages they
+ *  show, `getDrop` the drop the drag ended with. The end says what the drop
+ *  did, not which row it was over: an un-nest on one's own row moves the
+ *  page, and a drop over another row may leave it where it was. */
+export function makeAnnouncements(
+  getFlat: () => FlatRow[],
+  getDocs: () => Doc[],
+  getDrop: () => Drop | null,
+): Announcements {
   const name = (id: UniqueIdentifier) => {
     const title = getFlat().find((r) => r.id === String(id))?.title;
     return title === undefined ? "a page" : `“${title}”`;
@@ -694,7 +698,7 @@ export function makeAnnouncements(getFlat: () => FlatRow[], getDrop: () => Drop 
           : `${name(active.id)} is over ${name(over.id)}.`,
     onDragEnd: ({ active, over }) => {
       const drop = getDrop();
-      if (drop) return describeMove(getFlat(), String(active.id), drop.projection.args);
+      if (drop) return describeMove(getFlat(), getDocs(), String(active.id), drop.projection.args);
       return !over
         ? `${name(active.id)} was dropped outside the tree. It didn't move.`
         : `${name(active.id)} was dropped. It didn't move.`;

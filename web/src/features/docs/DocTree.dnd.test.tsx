@@ -230,8 +230,9 @@ describe("DocTree — dragging", () => {
         descendantCount: 0,
       },
     ];
+    const docs = [doc(rows[0]!.id, "Roadmap", null), doc(rows[1]!.id, "Q3 goals", rows[0]!.id)];
     let drop: Drop | null = null;
-    const say = makeAnnouncements(() => rows, () => drop);
+    const say = makeAnnouncements(() => rows, () => docs, () => drop);
     const active = { id: rows[1]!.id } as unknown as Active;
     const over = { id: rows[0]!.id } as unknown as Over;
     const messages = [
@@ -259,8 +260,9 @@ describe("DocTree — dragging", () => {
       { id: "roadmap", parentId: null, depth: 0, title: "Roadmap", descendantCount: 1 },
       { id: "goals", parentId: "roadmap", depth: 1, title: "Q3 goals", descendantCount: 0 },
     ];
+    const docs = [doc("roadmap", "Roadmap", null), doc("goals", "Q3 goals", "roadmap")];
     let drop: Drop | null = { overId: "goals", zone: "below", projection: topLevelAfter("roadmap") };
-    const say = makeAnnouncements(() => rows, () => drop);
+    const say = makeAnnouncements(() => rows, () => docs, () => drop);
     const active = { id: "goals" } as unknown as Active;
     const own = { id: "goals" } as unknown as Over;
     const other = { id: "roadmap" } as unknown as Over;

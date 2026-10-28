@@ -489,14 +489,30 @@ describe("insertIndex", () => {
 describe("describeMove", () => {
   it("names the page, its new parent and its position, by title", () => {
     const f = rows(tree1);
-    expect(describeMove(f, "B", { parent_id: "A", after_id: "A1" })).toBe("Moved “B” into “A”, position 2 of 4");
-    expect(describeMove(f, "D", { parent_id: "C" })).toBe("Moved “D” into “C”, position 2 of 2");
-    expect(describeMove(f, "D", { parent_id: "B" })).toBe("Moved “D” into “B”, position 1 of 1");
-    expect(describeMove(f, "A2", { parent_id: null, after_id: "A" })).toBe("Moved “A2” to the top level, position 2 of 5");
-    expect(describeMove(f, "B", { parent_id: null, before_id: "A" })).toBe("Moved “B” to the top level, position 1 of 4");
+    const say = (id: string, args: MoveArgs) => describeMove(f, tree1, id, args);
+    expect(say("B", { parent_id: "A", after_id: "A1" })).toBe("Moved “B” into “A”, position 2 of 4");
+    expect(say("D", { parent_id: "C" })).toBe("Moved “D” into “C”, position 2 of 2");
+    expect(say("D", { parent_id: "B" })).toBe("Moved “D” into “B”, position 1 of 1");
+    expect(say("A2", { parent_id: null, after_id: "A" })).toBe("Moved “A2” to the top level, position 2 of 5");
+    expect(say("B", { parent_id: null, before_id: "A" })).toBe("Moved “B” to the top level, position 1 of 4");
   });
   it("leaves the position out when the new parent's children are hidden", () => {
-    expect(describeMove(rows(tree1, ["C"]), "D", { parent_id: "C" })).toBe("Moved “D” into “C”");
+    expect(describeMove(rows(tree1, ["C"]), tree1, "D", { parent_id: "C" })).toBe("Moved “D” into “C”");
+  });
+  it("leaves the position out when pages whose parent isn't listed sit where the page lands", () => {
+    // messy: A ─ A1 ; T1 ─ T1a ; B ; Z ; T2. T1, Z and T2 are drawn at the
+    // top level but aren't top-level pages. The server places a page among
+    // the real ones only, so where it lands among those is its key's call.
+    const f = rows(messy);
+    expect(describeMove(f, messy, "A", { parent_id: null, after_id: "B" })).toBe("Moved “A” to the top level");
+    expect(describeMove(f, messy, "Z", { parent_id: null, after_id: "A" })).toBe("Moved “Z” to the top level");
+    // Nothing drawn between its new real neighbours: the position is known.
+    expect(describeMove(f, messy, "B", { parent_id: null, before_id: "A" })).toBe(
+      "Moved “B” to the top level, position 1 of 5",
+    );
+    expect(describeMove(f, messy, "T1a", { parent_id: "A", after_id: "A1" })).toBe(
+      "Moved “T1a” into “A”, position 2 of 2",
+    );
   });
 });
 
