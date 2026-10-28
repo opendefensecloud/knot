@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::archive::{PurgeError, PurgeTrigger};
 use crate::auth::{AuthContext, DocArchived, EffectiveDocRole, require_doc_role_mw};
-use crate::duplicate::DuplicateError;
+use crate::duplicate::{DuplicateError, MAX_DUPLICATE_BLOB_BYTES, MAX_DUPLICATE_PAGES};
 use crate::http_error::{doc_archived, json_err};
 
 #[derive(Serialize)]
@@ -469,7 +469,10 @@ fn duplicate_error(e: DuplicateError) -> Response {
         DuplicateError::TooLarge => json_err(
             StatusCode::PAYLOAD_TOO_LARGE,
             "doc.duplicate_too_large",
-            "over 200 pages or 200 MiB of files",
+            &format!(
+                "over {MAX_DUPLICATE_PAGES} pages or {} MiB of files",
+                MAX_DUPLICATE_BLOB_BYTES / (1024 * 1024)
+            ),
         ),
         // `DocStoreError::DuplicateConflict` and a file object missing from
         // the store: the source was moved or archived, or a file it shows

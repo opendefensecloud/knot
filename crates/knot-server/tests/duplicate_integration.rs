@@ -1465,6 +1465,15 @@ async fn template_is_422() {
     assert_eq!(w.counts().await, pages);
 }
 
+/// The error of a 413: the caps, as the web client shows them.
+fn too_large() -> Value {
+    json!({
+        "code": "doc.duplicate_too_large",
+        "message": "over 200 pages or 200 MiB of files",
+        "details": {},
+    })
+}
+
 /// Above 200 pages, or 200 MiB of files, nothing is copied (413). Exactly
 /// at the caps, the copy is made. The files are kept outside the database,
 /// so a duplicate refused over the cap would show every object it copied,
@@ -1494,7 +1503,7 @@ async fn too_large_is_413() {
     let rows = w.counts().await;
     let response = w.duplicate(&w.owner, source, Some(true)).await;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(error_code(response).await, "doc.duplicate_too_large");
+    assert_eq!(body_json(response).await["error"], too_large());
     assert_eq!(w.counts().await, rows);
     // Without its subpages, the page alone is small enough.
     w.duplicate_ok(source, None).await;
@@ -1533,7 +1542,7 @@ async fn too_large_is_413() {
     let rows = w.counts().await;
     let response = w.duplicate(&w.owner, over, None).await;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(error_code(response).await, "doc.duplicate_too_large");
+    assert_eq!(body_json(response).await["error"], too_large());
     assert_eq!(w.counts().await, rows);
     assert!(
         store.copied.lock().unwrap().is_empty(),
