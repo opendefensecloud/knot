@@ -161,6 +161,46 @@ test("releasing_on_own_row_does_not_reload", async ({ page }) => {
   expect(await outline(page.request)).toEqual(["A", "B"]);
 });
 
+// A trackpad click easily slips a few px. Past the 6px that start a drag,
+// but short of one INDENT, it moves nothing and opens the page in the app,
+// with no page load. The browser's own click can't do it: the button goes up
+// over the drag ghost, so that click never reaches the link.
+test("a_click_that_slips_sideways_opens_the_page", async ({ page }) => {
+  await setupOwner(page);
+  const { A, A1, B } = await seedPages(page.request, [
+    { title: "A" },
+    { title: "A1", parent: "A" },
+    { title: "B" },
+  ]);
+  let loads = 0;
+  page.on("load", () => loads++);
+  await showTree(page, [A, A1, B], `/doc/${A}`);
+  const moves = watchMoves(page);
+
+  // 9px right on B, which one INDENT would nest under A; 9px left on A1, a
+  // last child, which one INDENT would un-nest.
+  for (const [id, dx] of [
+    [B, 9],
+    [A1, -9],
+  ] as const) {
+    const link = await page.getByTestId(`doc-row-${id}`).boundingBox();
+    if (!link) throw new Error("not laid out");
+    const x = link.x + 30;
+    const y = link.y + link.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + dx, y + 1, { steps: 4 });
+    await expect(page.getByTestId(`tree-row-${id}`)).toHaveCSS("opacity", "0.5"); // dragging
+    await page.mouse.up();
+    await expect(page).toHaveURL(new RegExp(`/doc/${id}$`));
+  }
+
+  await roundTrip(page);
+  expect(moves).toEqual([]);
+  expect(loads).toBe(1);
+  expect(await outline(page.request)).toEqual(["A", "A/A1", "B"]);
+});
+
 test("drop_outside_cancels", async ({ page }) => {
   await setupOwner(page);
   const { A, B, C } = await seedPages(page.request, [{ title: "A" }, { title: "B" }, { title: "C" }]);

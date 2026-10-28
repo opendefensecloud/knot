@@ -205,7 +205,8 @@ export function DocTree() {
   }
 
   /** Re-project from the latest hit: the pointer's height picks the gap,
-   *  the horizontal drag the depth. */
+   *  the horizontal drag the depth. A level takes a full INDENT, so the 6px
+   *  that start a drag never change it. */
   function track(activeId: UniqueIdentifier, deltaX: number) {
     const hit = hitRef.current;
     if (!hit) {
@@ -214,12 +215,19 @@ export function DocTree() {
     }
     const id = String(activeId);
     const zone = dropZone(hit.pointerY, hit.rect, hit.id === id);
-    const projection = projectDrop(flat, docs, id, hit.id, zone, Math.round(deltaX / INDENT));
+    const projection = projectDrop(flat, docs, id, hit.id, zone, Math.trunc(deltaX / INDENT));
     showDrop(projection && { overId: hit.id, zone, projection });
   }
 
   const [clicks] = useState(clickSwallower);
-  useEffect(() => () => clicks.release(), [clicks]);
+  const [slip] = useState(slipTracker);
+  useEffect(
+    () => () => {
+      clicks.release();
+      slip.stop();
+    },
+    [clicks, slip],
+  );
 
   // The page a menu or Alt+arrow move keeps focus on, until the move and the
   // refetch after it have rendered. Focus is lost when the menu the move came
@@ -251,6 +259,7 @@ export function DocTree() {
     showDrop(null);
     setDraggingId(null);
     clicks.releaseSoon();
+    slip.stop();
   }
 
   // The page the Duplicate dialog asks about, and why its last try failed.
@@ -392,15 +401,29 @@ export function DocTree() {
             showDrop(null);
             setDraggingId(String(e.active.id));
             clicks.arm(() => treeRef.current);
+            slip.start(e.activatorEvent);
           }}
-          onDragMove={(e) => track(e.active.id, e.delta.x)}
+          onDragMove={(e) => {
+            slip.moved(e.delta);
+            track(e.active.id, e.delta.x);
+          }}
           onDragOver={(e) => track(e.active.id, e.delta.x)}
           onDragEnd={(e) => {
             const d = dropRef.current;
+            const id = String(e.active.id);
+            // A click on the row's link whose pointer slipped far enough to
+            // start a drag: it opens the page, as the link does. The browser
+            // sends that click to the drag ghost under the pointer, which is
+            // gone by then, so no click reaches the link.
+            const opens =
+              !d &&
+              slip.isClick() &&
+              (rowLink(treeRef.current, id)?.contains(e.activatorEvent.target as Node) ?? false);
             dropped.set(d);
             endDrag();
             // No projection: a drop in place, a no-op or outside the tree.
-            if (d) move.mutate({ id: String(e.active.id), body: d.projection.args });
+            if (d) move.mutate({ id, body: d.projection.args });
+            else if (opens) void nav(`/doc/${id}`);
           }}
           onDragCancel={endDrag}
         >
@@ -571,6 +594,70 @@ function clickSwallower() {
       timer = setTimeout(release, 100);
     },
     release,
+  };
+}
+
+type Point = { x: number; y: number };
+
+/** Where a mouse or touch event is in the viewport: the mouse's position,
+ *  or the first touch's (for a touchend, the one lifted). */
+function pointOf(e: Event): Point | null {
+  if ("touches" in e) {
+    const { touches, changedTouches } = e as TouchEvent;
+    const t = touches[0] ?? changedTouches[0];
+    return t ? { x: t.clientX, y: t.clientY } : null;
+  }
+  return e instanceof MouseEvent ? { x: e.clientX, y: e.clientY } : null;
+}
+
+/** Tells a click from a drag. A click whose pointer slips 6px (mouse), or a
+ *  tap held 250 ms (touch), starts a drag; it is still a click when the
+ *  pointer travels less than one INDENT along its whole path: from the
+ *  press, through every position the drag reports, to the release. Not
+ *  when a modifier key or another button was pressed (the browser opens a
+ *  link in a new tab or window then), nor when a context menu opened on the
+ *  way (a long press opens the row menu on touch). */
+function slipTracker() {
+  const events = ["mouseup", "touchend", "contextmenu"] as const;
+  let press: Point | null = null;
+  let at: Point | null = null;
+  let travel = 0;
+  let plain = false;
+  let menu = false;
+  function to(p: Point) {
+    if (at) travel += Math.hypot(p.x - at.x, p.y - at.y);
+    at = p;
+  }
+  // On `window` in the capture phase: before the sensor ends the drag.
+  const seen = (e: Event) => {
+    if (e.type === "contextmenu") menu = true;
+    const p = pointOf(e);
+    if (p) to(p);
+  };
+  function stop() {
+    for (const type of events) window.removeEventListener(type, seen, { capture: true });
+  }
+  return {
+    /** At drag start, with the press that started it. */
+    start(e: Event) {
+      stop();
+      press = pointOf(e);
+      at = press;
+      travel = 0;
+      const m = e as MouseEvent; // a TouchEvent has the same modifier keys
+      plain = (!(e instanceof MouseEvent) || m.button === 0) && !m.altKey && !m.ctrlKey && !m.metaKey && !m.shiftKey;
+      menu = false;
+      for (const type of events) window.addEventListener(type, seen, { capture: true });
+    },
+    /** On each drag move, with the pointer's offset from the press. */
+    moved(delta: Point) {
+      if (press) to({ x: press.x + delta.x, y: press.y + delta.y });
+    },
+    /** At drag end, once the release has been seen. */
+    isClick(): boolean {
+      return press !== null && plain && !menu && travel < INDENT;
+    },
+    stop,
   };
 }
 

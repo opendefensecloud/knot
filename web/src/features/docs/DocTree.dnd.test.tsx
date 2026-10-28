@@ -1,13 +1,13 @@
 import type { Active, Over } from "@dnd-kit/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SessionProvider } from "../../auth/SessionContext";
 
 import { DocTree, makeAnnouncements } from "./DocTree";
-import type { FlatRow, Projection } from "./tree";
+import { INDENT, type FlatRow, type Projection } from "./tree";
 import type { Drop } from "./TreeRow";
 
 afterEach(() => {
@@ -44,8 +44,20 @@ function doc(id: string, title: string, parent_id: string | null) {
   };
 }
 
-/** A workspace with Folder > Child > Grandchild. */
-function server(role: "owner" | "editor" | "viewer") {
+/** Folder > Child > Grandchild. */
+const NESTED = [doc("folder", "Folder", null), doc("child", "Child", "folder"), doc("grandchild", "Grandchild", "child")];
+
+/** Alpha > Alpha one; Beta; Gamma. Beta can nest under Alpha, and Alpha one,
+ *  a last child, can un-nest. */
+const SIBLINGS = [
+  doc("alpha", "Alpha", null),
+  doc("alpha1", "Alpha one", "alpha"),
+  doc("beta", "Beta", null),
+  doc("gamma", "Gamma", null),
+];
+
+/** A workspace with `pages` (equal sort keys: the list order is the sidebar's). */
+function server(role: "owner" | "editor" | "viewer", pages = NESTED) {
   return vi.fn((url: string, init?: RequestInit) => {
     if (url === "/auth/session") {
       return json({ user_id: "u1", email: "a@x.test", display_name: "A", workspace_id: "w1", role });
@@ -54,11 +66,7 @@ function server(role: "owner" | "editor" | "viewer") {
       return json({ id: "w1", slug: "default", name: "W", role, archive_retention_days: 14 });
     }
     if (url === "/api/docs" && (!init?.method || init.method === "GET")) {
-      return json([
-        doc("folder", "Folder", null),
-        doc("child", "Child", "folder"),
-        doc("grandchild", "Grandchild", "child"),
-      ]);
+      return json(pages);
     }
     if (url.endsWith("/move") && init?.method === "POST") return json({});
     return json({ error: { code: "not_found", message: url, details: {} } }, 404);
@@ -100,8 +108,8 @@ function Location() {
   return <output data-testid="location">{useLocation().pathname}</output>;
 }
 
-function renderTree(role: "owner" | "editor" | "viewer" = "editor") {
-  const fetchMock = server(role);
+function renderTree(role: "owner" | "editor" | "viewer" = "editor", pages = NESTED) {
+  const fetchMock = server(role, pages);
   vi.stubGlobal("fetch", fetchMock);
   render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
@@ -117,8 +125,8 @@ function renderTree(role: "owner" | "editor" | "viewer" = "editor") {
 }
 
 /** Rows for editors: the session has loaded once every row has its "More" button. */
-async function editorRows() {
-  await waitFor(() => expect(screen.getAllByRole("button", { name: "More" })).toHaveLength(3));
+async function editorRows(count = NESTED.length) {
+  await waitFor(() => expect(screen.getAllByRole("button", { name: "More" })).toHaveLength(count));
 }
 
 /** The inline left padding of the nearest ancestor that has one: e2e's depth probe. */
@@ -326,7 +334,7 @@ describe("DocTree — drops", () => {
     layOut();
     fireEvent.mouseDown(screen.getByTestId("doc-row-grandchild"), { button: 0, clientX: 100, clientY: 70 });
     fireEvent.mouseMove(document, { clientX: 92, clientY: 70 }); // past 6px: the drag starts
-    fireEvent.mouseMove(document, { clientX: 86, clientY: 70 }); // one INDENT left, rounded
+    fireEvent.mouseMove(document, { clientX: 86, clientY: 70 }); // past one INDENT left
     const row = screen.getByTestId("tree-row-grandchild");
     expect(row).toHaveAttribute("data-drop-zone", "below");
     expect(row).toHaveAttribute("data-drop-depth", "1");
@@ -421,5 +429,167 @@ describe("DocTree — drops", () => {
 
     await settle();
     expect(moves(fetchMock)).toEqual([]);
+  });
+});
+
+/** Press on page `id`'s link at (100, y), then move the mouse through
+ *  `path`: each point [dx, dy] from where it pressed. */
+function mouseDrag(id: string, y: number, path: [number, number][], init: MouseEventInit = {}): HTMLElement {
+  const link = screen.getByTestId(`doc-row-${id}`);
+  fireEvent.mouseDown(link, { button: 0, clientX: 100, clientY: y, ...init });
+  for (const [dx, dy] of path) fireEvent.mouseMove(document, { clientX: 100 + dx, clientY: y + dy });
+  return link;
+}
+
+// Alpha (0-28) > Alpha one (28-56); Beta (56-84); Gamma (84-112). A trackpad
+// click easily slips a few px: past the mouse sensor's 6px, a drag starts.
+// Less than one INDENT of travel that moves nothing is still a click.
+describe("DocTree — a click that slips", () => {
+  it.each([
+    ["sideways", "beta", 70, 7],
+    ["left on a last child", "alpha1", 42, -7],
+  ])("a click that slips 7px %s sends no move and opens the page", async (_how, id, y, dx) => {
+    const fetchMock = renderTree("editor", SIBLINGS);
+    await editorRows(SIBLINGS.length);
+    layOut();
+
+    // 4px, then 7px with a little vertical jitter: the drag starts at 7px.
+    const link = mouseDrag(id, y, [[Math.sign(dx) * 4, 0], [dx, 1], [dx, 2]]);
+    expect(screen.getByTestId(`tree-row-${id}`)).toHaveStyle({ opacity: "0.5" }); // dragging
+    // No drop line: letting go here moves nothing.
+    expect(document.querySelector("[data-drop-zone]")).toBeNull();
+    fireEvent.mouseUp(document, { clientX: 100 + dx, clientY: y + 2 });
+    // A click after it, if the browser sends one, loads no page in full.
+    expect(fireEvent.click(link)).toBe(false);
+
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+    expect(screen.getByTestId("location")).toHaveTextContent(`/doc/${id}`);
+  });
+
+  it.each([
+    ["right still nests", "beta", 70, INDENT, { parent_id: "alpha", after_id: "alpha1" }],
+    ["left still un-nests", "alpha1", 42, -INDENT, { parent_id: null, after_id: "alpha" }],
+  ])("a drag one INDENT %s", async (_how, id, y, dx, body) => {
+    const fetchMock = renderTree("editor", SIBLINGS);
+    await editorRows(SIBLINGS.length);
+    layOut();
+
+    const link = mouseDrag(id, y, [[Math.sign(dx) * 4, 0], [Math.sign(dx) * 7, 1], [dx, 1]]);
+    const row = screen.getByTestId(`tree-row-${id}`);
+    expect(row).toHaveAttribute("data-drop-zone", "below");
+    expect(row).toHaveAttribute("data-drop-depth", dx > 0 ? "1" : "0");
+    fireEvent.mouseUp(document, { clientX: 100 + dx, clientY: y + 1 });
+    expect(fireEvent.click(link)).toBe(false);
+
+    await waitFor(() => expect(moves(fetchMock)).toEqual([{ id, body }]));
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+  });
+
+  // Travel is the whole path, not how far from the press it ends.
+  it("a drag that goes away and comes back moves nothing and opens nothing", async () => {
+    const fetchMock = renderTree("editor", SIBLINGS);
+    await editorRows(SIBLINGS.length);
+    layOut();
+
+    const link = mouseDrag("beta", 70, [[4, 0], [7, 1], [20, 1]]);
+    expect(screen.getByTestId("tree-row-beta")).toHaveAttribute("data-drop-zone", "below");
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 70 }); // back where it pressed
+    expect(document.querySelector("[data-drop-zone]")).toBeNull();
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 70 });
+    expect(fireEvent.click(link)).toBe(false);
+
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+  });
+
+  it("a slipped click on the row's More button opens no page", async () => {
+    const fetchMock = renderTree("editor", SIBLINGS);
+    await editorRows(SIBLINGS.length);
+    layOut();
+
+    const more = within(screen.getByTestId("tree-row-beta")).getByRole("button", { name: "More" });
+    fireEvent.mouseDown(more, { button: 0, clientX: 240, clientY: 70 });
+    fireEvent.mouseMove(document, { clientX: 244, clientY: 70 });
+    fireEvent.mouseMove(document, { clientX: 247, clientY: 71 });
+    fireEvent.mouseMove(document, { clientX: 247, clientY: 72 });
+    expect(screen.getByTestId("tree-row-beta")).toHaveStyle({ opacity: "0.5" }); // dragging
+    fireEvent.mouseUp(document, { clientX: 247, clientY: 72 });
+
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+  });
+
+  // With a modifier key the browser opens a link elsewhere (a new tab or
+  // window), so a slipped click doesn't open it here.
+  it.each(["metaKey", "ctrlKey", "shiftKey", "altKey"])(
+    "a slipped click with %s moves nothing and opens nothing here",
+    async (key) => {
+      const fetchMock = renderTree("editor", SIBLINGS);
+      await editorRows(SIBLINGS.length);
+      layOut();
+
+      const link = mouseDrag("beta", 70, [[4, 0], [7, 1], [7, 2]], { [key]: true });
+      fireEvent.mouseUp(document, { clientX: 107, clientY: 72 });
+      fireEvent.click(link, { [key]: true });
+
+      await settle();
+      expect(moves(fetchMock)).toEqual([]);
+      expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+    },
+  );
+});
+
+/** One touch on `el` at (x, y): its start, a move, or its end. */
+function touch(el: Element, type: "touchStart" | "touchMove" | "touchEnd", x: number, y: number) {
+  const t = { clientX: x, clientY: y, pageX: x, pageY: y, identifier: 0, target: el };
+  fireEvent[type](el, type === "touchEnd" ? { touches: [], changedTouches: [t] } : { touches: [t], changedTouches: [t] });
+}
+
+// Folder (0-28), Child (28-56), Grandchild (56-84). On touch a drag starts
+// once the finger has been held still for 250 ms.
+describe("DocTree — touch", () => {
+  it("a tap held past 250 ms that rolls 7px sideways moves nothing and opens the page", async () => {
+    const fetchMock = renderTree();
+    await editorRows();
+    layOut();
+    vi.useFakeTimers();
+
+    const link = screen.getByTestId("doc-row-grandchild");
+    touch(link, "touchStart", 100, 70);
+    act(() => void vi.advanceTimersByTime(260));
+    // Grandchild is a last child: 7px left is less than the INDENT that un-nests it.
+    touch(link, "touchMove", 93, 71);
+    expect(screen.getByTestId("tree-row-grandchild")).toHaveStyle({ opacity: "0.5" }); // dragging
+    expect(document.querySelector("[data-drop-zone]")).toBeNull();
+    touch(link, "touchEnd", 93, 71);
+    vi.useRealTimers();
+
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+    expect(screen.getByTestId("location")).toHaveTextContent("/doc/grandchild");
+  });
+
+  // A long press opens the row menu (Android sends contextmenu while the
+  // finger is still down), and the drag has started by then.
+  it("a long press that opens the row menu opens no page", async () => {
+    const fetchMock = renderTree();
+    await editorRows();
+    layOut();
+    vi.useFakeTimers();
+
+    const link = screen.getByTestId("doc-row-grandchild");
+    touch(link, "touchStart", 100, 70);
+    act(() => void vi.advanceTimersByTime(600));
+    fireEvent.contextMenu(link, { clientX: 100, clientY: 70 });
+    touch(link, "touchEnd", 100, 70);
+    vi.useRealTimers();
+
+    await settle();
+    expect(screen.getByTestId("context-menu")).toBeInTheDocument();
+    expect(moves(fetchMock)).toEqual([]);
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
   });
 });
