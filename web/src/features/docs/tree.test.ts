@@ -529,6 +529,115 @@ describe("projectDrop matches today's moveArgs for every gesture it supports", (
   });
 });
 
+// Ruling (final review, web-3): the table above reaches main's "before" and
+// "after" next to a row at another depth with a sideways move main never
+// needed. Without one (depthDelta 0), the straight up-or-down gesture main
+// used now keeps the dragged page's own depth, as far as the gap allows;
+// main took the hovered row's. Only moving sideways changes the depth, and
+// the drop line shows it before release. This pins what that gesture does.
+describe("projectDrop with no sideways move keeps the page's depth next to rows at other depths", () => {
+  it("A1 onto C's top gap nests it under B (main: the top level, before C)", () => {
+    const docs = [doc("A", null, "a"), doc("A1", "A", "a"), doc("B", null, "b"), doc("C", null, "c")];
+    expect(moveArgs(docs[3]!, "before")).toEqual({ parent_id: null, before_id: "C" });
+    expect(projectDrop(rows(docs, [], "A1"), docs, "A1", "C", "above", 0)).toEqual({
+      depth: 1,
+      minDepth: 0,
+      maxDepth: 1,
+      args: { parent_id: "B" },
+    });
+  });
+
+  it("X onto A1a's bottom gap puts it at the top level after A (main: after A1a, under A1)", () => {
+    const docs = [
+      doc("A", null, "a"),
+      doc("A1", "A", "a"),
+      doc("A1a", "A1", "a"),
+      doc("B", null, "b"),
+      doc("X", null, "c"),
+    ];
+    expect(moveArgs(docs[2]!, "after")).toEqual({ parent_id: "A1", after_id: "A1a" });
+    expect(projectDrop(rows(docs, [], "X"), docs, "X", "A1a", "below", 0)).toEqual({
+      depth: 0,
+      minDepth: 0,
+      maxDepth: 3,
+      args: { parent_id: null, after_id: "A" },
+    });
+  });
+
+  /** The real order once `id` goes into gap `g` of `items` (the rows without
+   *  it) at `depth`: under the nearest row above one level up, right after
+   *  the nearest row above at that depth, else first, or last when that
+   *  parent's children are hidden. tree1 draws every page under its real
+   *  parent. */
+  function placed(items: FlatRow[], collapsed: string[], id: string, g: number, depth: number): Order {
+    let parent: string | null = null;
+    let prev: string | undefined;
+    for (let i = g - 1; i >= 0; i--) {
+      const r = items[i]!;
+      if (r.depth < depth) {
+        parent = r.id;
+        break;
+      }
+      if (r.depth === depth) prev ??= r.id;
+    }
+    const order = realOrder(tree1.filter((d) => d.id !== id));
+    const sibs = (order[parent ?? ""] ??= []);
+    const hidden = parent !== null && collapsed.includes(parent);
+    sibs.splice(prev !== undefined ? sibs.indexOf(prev) + 1 : hidden ? sibs.length : 0, 0, id);
+    return order;
+  }
+
+  // Counted too: how many of these gestures land elsewhere than on main.
+  it.each([
+    [[], 84, 53],
+    [["A"], 14, 10],
+    [["A2"], 56, 34],
+    [["C"], 66, 41],
+  ])("every such drop in tree1, collapsed %j", (collapsed: string[], gestures: number, unlikeMain: number) => {
+    const wrong: string[] = [];
+    let seen = 0;
+    let changed = 0;
+    for (const active of tree1) {
+      const f = rows(tree1, collapsed, active.id);
+      const a = f.find((r) => r.id === active.id);
+      if (!a) continue; // hidden under a collapsed row: not draggable
+      const items = f.filter((r) => r.id !== active.id);
+      for (const target of items) {
+        if (target.depth === a.depth) continue;
+        const t = tree1.find((d) => d.id === target.id)!;
+        for (const position of ["before", "after"] as const) {
+          // Before: the gap above the target. After: the gap below its last
+          // visible row, hovered on that row (the dragged one, when it is
+          // last). `g` is the gap among `items`.
+          let overId = target.id;
+          let zone: Zone = "above";
+          let g = items.indexOf(target);
+          if (position === "after") {
+            let last = f.indexOf(target);
+            while ((f[last + 1]?.depth ?? -1) > target.depth) last++;
+            overId = f[last]!.id;
+            zone = "below";
+            g = overId === a.id ? f.indexOf(a) : items.indexOf(f[last]!) + 1;
+          }
+          // The page's own depth, as far as the rows around the gap allow.
+          const [prev, next] = [items[g - 1], items[g]];
+          const depth = Math.min(prev ? prev.depth + 1 : 0, Math.max(next ? next.depth : 0, a.depth));
+
+          const p = projectDrop(f, tree1, active.id, overId, zone, 0);
+          const now = show(p ? serverMove(tree1, active.id, p.args) : realOrder(tree1));
+          if (now !== show(placed(items, collapsed, active.id, g, depth)) || (p && p.depth !== depth)) {
+            wrong.push(`${active.id} ${position} ${target.id}: ${JSON.stringify(p)}`);
+          }
+          seen++;
+          if (now !== show(serverMove(tree1, active.id, moveArgs(t, position)))) changed++;
+        }
+      }
+    }
+    expect(wrong).toEqual([]);
+    expect({ gestures: seen, unlikeMain: changed }).toEqual({ gestures, unlikeMain });
+  });
+});
+
 describe("projections only send valid, real moves", () => {
   // Every drag and keyboard move gives null, or args the server accepts that
   // change the real order: a no-op never POSTs.
