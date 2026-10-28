@@ -86,11 +86,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ### Fixed
 - A line break (Shift+Enter) in a list item exported fine until the page
   went through a history restore, a template, or a Markdown or zip import,
-  which stored it in a broken shape; a Markdown import stored any list item
-  with a line break in that shape too. Markdown export then failed for the
-  page, and with it search, share links, zip export, My Tasks, history
-  preview and restore, and new pages from it as a template. An image or
-  drawing in a list item was lost on the same paths. (#TBD)
+  which stored it in a broken shape; a Markdown import stored a line break
+  in an item of a tight list (one with no blank lines between its items)
+  that way too. Markdown export then failed for the page, and with it
+  search, share links, zip export, My Tasks, history preview and restore,
+  and new pages from it as a template. An image or drawing in an item of a
+  tight list was lost on the same paths. (#TBD)
 - Nested checklists, list items and quotes with several paragraphs, images,
   rules or lists, checkboxes in numbered lists, and empty list items lost
   their shape or content on the way through Markdown (export, history
@@ -136,7 +137,9 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - On S3, a file the bucket refused to hand out (a 403 or a server error)
   was served as the bucket's error message instead of failing. (#TBD)
 
-Thanks to @szEvEz, whose #42 found these bugs and proposed the first fixes.
+Thanks to @szEvEz, whose #42 found the list export, page order and sidebar
+drag and drop bugs above, asked for Duplicate, and proposed the first
+fixes.
 
 ### Security
 - A crafted workspace-import zip with pages that are each other's parent, or
@@ -144,13 +147,20 @@ Thanks to @szEvEz, whose #42 found these bugs and proposed the first fixes.
   editor could upload one. The bug predates this release. (#TBD)
 - A page nested a few thousand levels deep, made with a crafted Markdown
   upload or editor update, crashed the whole server for everyone when knot
-  exported it. Any editor could make one. Nesting is now capped: Markdown
-  and zip import, history restore and templates keep 128 levels of quotes,
-  list items and table cells and store anything deeper as one paragraph of
-  its text, a page already stored deeper exports its deep part in that
-  flattened form, and an editor update that nests a page past the limit is
-  refused (its connection closes with code 4422). The bug predates this
-  release. (#TBD)
+  exported it. Any editor could make one. The bug predates this release.
+  Markdown import and export now follow at most 128 levels of quotes, list
+  items and table cells, and turn anything deeper into one paragraph of its
+  text, so no text is lost: Markdown and zip import, history restore and
+  templates store it that way, and a page already stored deeper exports its
+  deep part that way. An editor update that nests a page past 512 nested
+  types is refused, and its connection closes with code 4422. Two cases
+  remain known limitations, as before this release (see #TBD): a single
+  crafted editor update whose own apply nests and deletes deep enough, and
+  deleting the deep part of a page already stored deeper, can still crash
+  the server. (#TBD)
+- `pulldown-cmark` 0.13.5 fixes RUSTSEC-2026-0414: with wiki links enabled,
+  a crafted Markdown input could make it produce exponentially many events.
+  knot never enables wiki links, so it was not affected. (#TBD)
 - Create, move, create-from-template and workspace import accepted a parent
   page from another workspace and put the page under it. They now return
   `404 doc.not_found`. The bug predates this release. (#TBD)

@@ -329,16 +329,20 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
 
 - `flattenVisible(tree, collapsed, activeId?)` returns rows in on-screen
   order. It skips children of collapsed rows and the dragged row's subtree.
-- `projectDrop(flat, activeId, overId, pointerY, rowRect, deltaX)` returns
-  `{ depth, args } | null`.
-  - Vertical position picks the gap.
-  - `deltaX / INDENT` (shared constant, 12px) picks the depth, clamped between
-    the next row's depth and the previous row's depth + 1. It is truncated
-    toward zero (`Math.trunc`), so a level takes a full INDENT of sideways
-    movement, and the slip that starts a drag during a click (the mouse
-    sensor starts a drag past 6px of travel) can't change the level. (Amended
-    in Task F4; Task 13 first rounded, which made a 7px slip nest or un-nest
-    the page.)
+- `projectDrop(flat, docs, activeId, overId, zone, depthDelta)` returns
+  `{ depth, args } | null`. (Amended in Task F6, as the plan's P11 has it;
+  this first read `projectDrop(flat, activeId, overId, pointerY, rowRect,
+  deltaX)`.)
+  - Vertical position picks the gap: `zone` is
+    `dropZone(pointerY, rowRect, isOwnRow)`.
+  - `depthDelta = Math.trunc(deltaX / INDENT)` (shared constant, 12px) picks
+    the depth, clamped between the next row's depth and the previous row's
+    depth + 1. It is truncated toward zero, so a level takes a full INDENT
+    of sideways movement, and the slip that starts a drag during a click
+    (the mouse sensor starts a drag past 6px of travel) can't change the
+    level. (Amended in Task F4; Task 13 first rounded, which made a 7px slip
+    nest or un-nest the page.)
+  - `docs` gives each page's real parent, which anchors come from.
   - Hovering one's own row means "same gap, new depth" (un-nest in place).
   - It returns `null` for no-ops.
 - `keyboardMove(flat, id, "up" | "down" | "indent" | "outdent")` and
@@ -355,12 +359,17 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
     changes.
   - The post-drag click is suppressed only after pointer drags, only inside
     the tree.
-  - A drag that ends with no move, after less than one INDENT of pointer
-    travel, counts as a click: a plain press on a row's link opens that page
-    in the app (no reload, no move request). On touch this applies after the
-    250ms hold. A longer drag that moves nothing opens nothing. (Amended in
-    Task F4: the browser sends no click after a drag, so the drag's end
-    opens the page.)
+  - A drop with less than one INDENT of pointer travel moves nothing:
+    travel is the whole path from the press to the release, and until it
+    reaches one INDENT no drop line shows. Such a drag counts as a click: a
+    plain press on a row's link opens that page in the app (no reload, no
+    move request), replacing the history entry when the page is already
+    open. On touch this applies after the 250ms hold. A longer drag that
+    moves nothing opens nothing. (Amended in Task F4: the browser sends no
+    click after a drag, so the drag's end opens the page. Amended in Task
+    F6: the rule first covered only drags that moved nothing, and a click
+    pressed at a row's top edge that slipped a few px up could still nest
+    the page into the row above.)
   - No-op drops send nothing.
   - Dropping outside the tree cancels.
   - Custom drag announcements use titles.
@@ -489,6 +498,19 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
      `depth_limit`, for exports and for imports, covers every document and
      input the limit changes. It is checked before the other classes and
      before legacy, which recurse once per element. (Amended in Task F1.)
+   - **Room refusals.** A room, page or board, refuses an inbound update and
+     closes its sender with 4422 when the update nests the page's types past
+     `MAX_NESTING`, or doesn't decode. Nothing of a refused update is
+     persisted or fanned out. Only an update the room had already applied
+     (the check after apply) also evicts the room, closing every other
+     connection with 1012, so the next join reloads the page from storage.
+     An update yrs rejects part-way is measured over what the apply
+     integrated: past the limit it is refused as above; within it, the room
+     does what main does: it neither persists nor fans out the update, and
+     keeps the sender and the rest of the room. yrs's error need not be the
+     sender's: within the same apply it retries the blocks it parked
+     earlier for a missing dependency and passes on their error. (Amended
+     in Task F6.)
 2. **Real-data check (opt-in).**
    - It runs the old and new serializers over every page in a database:
      `cargo test -p knot-server --test markdown_compat -- --ignored`, with
@@ -658,8 +680,10 @@ not part of the repo. The probe inputs are in the repo as
 below are kept only as a record of what was prototyped. (Amended in
 Task F5.)
 
-All in the session scratchpad, `pr42-probes/`. The scratchpad is temporary,
-so copy the probe cases into the repo as fixtures:
+The probe cases went into the repo as probes, not fixtures: every fixture
+must round-trip byte for byte, which a probe input need not (the plan's
+P21). (Amended in Task F6; this first said to copy them in as fixtures.)
+What was in `pr42-probes/`:
 - **Markdown:** `knot-markdown-fixed/` (importer adapter + serializer, 23/23
   existing tests pass, the 40-input matrix round-trips) and `out-*.txt`.
 - **Sort keys:** `lexo/newimpl.rs`, the exhaustive/random harnesses, and
