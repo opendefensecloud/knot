@@ -430,8 +430,9 @@ pub(crate) fn doc_from_row(r: DocRow) -> Document {
 ///
 /// sqlx 0.9 only accepts `&'static str` directly, so every query below wraps
 /// its `format!` in `AssertSqlSafe`. That assertion holds because the only
-/// values interpolated into those strings are compile-time constants (this
-/// and `SUBTREE_IDS_SQL`), never caller-supplied, and every runtime value
+/// values interpolated into those strings are compile-time constants (this,
+/// `SUBTREE_IDS_SQL` and the group conditions of `siblings_sql`), never
+/// caller-supplied, and every runtime value
 /// remains a `$N` bind. Keep it that way: interpolating anything else here
 /// would defeat the check.
 pub(crate) const COLS: &str = "id, workspace_id, parent_id, title, sort_key, icon, created_by, created_at, updated_at, archived_at, is_template, archived_by, archive_root_id";
@@ -708,15 +709,13 @@ impl DocStore for PgDocStore {
         // caller generating the next key must see them or it can regenerate a
         // key an archived sibling still holds. In the sidebar's order, as
         // list_alive.
-        let rows = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
-            "SELECT {COLS} FROM documents
-             WHERE workspace_id = $1 AND parent_id IS NOT DISTINCT FROM $2
-             ORDER BY sort_key COLLATE \"C\", id"
-        )))
-        .bind(workspace_id)
-        .bind(parent_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let read =
+            sqlx::query_as::<_, DocRow>(AssertSqlSafe(siblings_sql(parent_id))).bind(workspace_id);
+        let read = match parent_id {
+            Some(parent_id) => read.bind(parent_id),
+            None => read,
+        };
+        let rows = read.fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(doc_from_row).collect())
     }
 
@@ -1122,6 +1121,22 @@ const SUBTREE_IDS_SQL: &str = "WITH RECURSIVE sub AS (
          SELECT d.id FROM documents d JOIN sub s ON d.parent_id = s.id
      )
      SELECT id FROM sub";
+
+/// The statement of `siblings`: the rows of the group in workspace `$1`, in
+/// the sidebar's order. Under a parent, the parent is `$2`. One statement
+/// per kind of group, so that each can use the index on `(workspace_id,
+/// parent_id, sort_key)`, as `placement::place`'s group read does.
+pub(crate) fn siblings_sql(parent_id: Option<Uuid>) -> String {
+    let group = match parent_id {
+        None => "parent_id IS NULL",
+        Some(_) => "parent_id = $2",
+    };
+    format!(
+        "SELECT {COLS} FROM documents
+          WHERE workspace_id = $1 AND {group}
+          ORDER BY sort_key COLLATE \"C\", id"
+    )
+}
 
 pub(crate) fn map_unique(e: sqlx::Error) -> DocStoreError {
     match e {

@@ -153,17 +153,12 @@ pub(crate) async fn place(
     moving: Option<Uuid>,
 ) -> Result<String, DocStoreError> {
     lock_group(conn, ws, parent).await?;
-    let mut group: Vec<Member> = sqlx::query_as(
-        "SELECT id, sort_key, archived_at IS NULL AND NOT is_template FROM documents
-          WHERE workspace_id = $1 AND parent_id IS NOT DISTINCT FROM $2
-            AND id IS DISTINCT FROM $3
-          ORDER BY sort_key COLLATE \"C\", id",
-    )
-    .bind(ws)
-    .bind(parent)
-    .bind(moving)
-    .fetch_all(&mut *conn)
-    .await?;
+    let read = sqlx::query_as(group_read(parent)).bind(ws).bind(moving);
+    let read = match parent {
+        Some(parent) => read.bind(parent),
+        None => read,
+    };
+    let mut group: Vec<Member> = read.fetch_all(&mut *conn).await?;
     let slot = slot(&group, placement)?;
     if let Some(key) = key_at(&group, slot) {
         return Ok(key);
@@ -172,6 +167,29 @@ pub(crate) async fn place(
     // Unreachable in practice: neighbours from `spread` are valid, ordered
     // and short.
     key_at(&group, slot).ok_or(DocStoreError::Conflict)
+}
+
+/// The group read of `place`: every row of the group in workspace `$1` but
+/// `$2`, the page being placed, in the sidebar's order. Under a parent, the
+/// parent is `$3`.
+///
+/// One statement per kind of group, so that each finds its rows through the
+/// index on `(workspace_id, parent_id, sort_key)`. `parent_id IS NOT
+/// DISTINCT FROM $n` can't use an index for the parent, so one statement for
+/// both read the whole workspace (or table), under the group's lock.
+fn group_read(parent: Option<Uuid>) -> &'static str {
+    match parent {
+        None => {
+            "SELECT id, sort_key, archived_at IS NULL AND NOT is_template FROM documents
+              WHERE workspace_id = $1 AND parent_id IS NULL AND id IS DISTINCT FROM $2
+              ORDER BY sort_key COLLATE \"C\", id"
+        }
+        Some(_) => {
+            "SELECT id, sort_key, archived_at IS NULL AND NOT is_template FROM documents
+              WHERE workspace_id = $1 AND parent_id = $3 AND id IS DISTINCT FROM $2
+              ORDER BY sort_key COLLATE \"C\", id"
+        }
+    }
 }
 
 /// One row of a group: id, key, and whether it can be an anchor.
@@ -263,5 +281,124 @@ where
             attempt().await
         }
         result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::{AssertSqlSafe, PgConnection, PgPool, Row};
+    use uuid::Uuid;
+
+    /// A workspace of 100 top-level pages with 40 subpages each, analysed,
+    /// and one of the top-level pages.
+    async fn seeded() -> (PgPool, Uuid, Uuid) {
+        let pool = knot_test_support::fresh_db().await.pool;
+        let ws: Uuid = sqlx::query_scalar(
+            "INSERT INTO workspaces (slug, name) VALUES ('w', 'W') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let user: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (email, display_name) VALUES ('a@x.test', 'A') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO documents (workspace_id, title, sort_key, created_by)
+             SELECT $1, 'Page', 'p' || to_char(i, 'FM000'), $2 FROM generate_series(1, 100) i",
+        )
+        .bind(ws)
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+             SELECT $1, p.id, 'Subpage', 's' || to_char(i, 'FM00'), $2
+               FROM documents p, generate_series(1, 40) i",
+        )
+        .bind(ws)
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE documents")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let parent = sqlx::query_scalar("SELECT id FROM documents WHERE parent_id IS NULL LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        (pool, ws, parent)
+    }
+
+    /// The plan, in text form, of `sql` prepared with three `uuid`
+    /// parameters and run with `args`, under `plan_cache_mode` `mode`: a
+    /// custom plan for these values, or the generic plan that a statement
+    /// sqlx keeps prepared can switch to.
+    async fn plan(conn: &mut PgConnection, sql: &str, args: &str, mode: &str) -> String {
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            "SET plan_cache_mode = {mode}; PREPARE read(uuid, uuid, uuid) AS {sql}"
+        )))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        let rows = sqlx::raw_sql(AssertSqlSafe(format!("EXPLAIN EXECUTE read({args})")))
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::raw_sql("DEALLOCATE read")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        rows.iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The group reads find their rows through the index on
+    /// `(workspace_id, parent_id, sort_key)`, at the top level and under a
+    /// parent, in custom and generic plans. `parent_id IS NOT DISTINCT FROM
+    /// $n` can't use an index for the parent: with one workspace in the
+    /// table, each read scanned all of it, `place` while it held the group's
+    /// lock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn group_reads_find_their_rows_through_the_parent_index() {
+        let (pool, ws, parent) = seeded().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let at = |parent: Option<Uuid>| parent.map_or("NULL".to_owned(), |p| format!("'{p}'"));
+        // `place` binds the workspace, the page being placed (none for a
+        // create) and the parent; `siblings` the workspace and the parent.
+        let reads = [None, Some(parent)].into_iter().flat_map(|group| {
+            [
+                (
+                    format!("place, parent {group:?}"),
+                    super::group_read(group).to_owned(),
+                    format!("'{ws}', NULL, {}", at(group)),
+                ),
+                (
+                    format!("siblings, parent {group:?}"),
+                    crate::doc_store::siblings_sql(group),
+                    format!("'{ws}', {}, NULL", at(group)),
+                ),
+            ]
+        });
+        let mut wrong = Vec::new();
+        for (what, sql, args) in reads {
+            for mode in ["force_custom_plan", "force_generic_plan"] {
+                let plan = plan(&mut conn, &sql, &args, mode).await;
+                let by_parent = plan
+                    .lines()
+                    .any(|line| line.contains("Index Cond") && line.contains("parent_id"));
+                if plan.contains("Seq Scan") || !by_parent {
+                    wrong.push(format!("{what}, {mode}:\n{plan}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
     }
 }
