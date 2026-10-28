@@ -1396,11 +1396,30 @@ async fn archived_source_is_409() {
     assert_eq!(w.counts().await, pages);
 }
 
+/// An unknown page, or one in another workspace (even of a member of both),
+/// gets the answer every `/api/docs/{id}` route gives it: 403 `acl.no_grant`
+/// from the page-role check, which tells nothing about whether it exists.
+/// Behind that check, the duplicate itself finds no such page in the
+/// user's workspace.
 #[tokio::test(flavor = "multi_thread")]
-async fn unknown_or_foreign_source_is_not_found() {
+async fn unknown_or_foreign_source_is_refused() {
     let w = world().await;
-    let (_, foreign_page) = w.foreign_doc().await;
+    let (other_ws, foreign_page) = w.foreign_doc().await;
+    // The owner is a member there too, but signed in to their own workspace.
+    w.state
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .add_member(other_ws, w.owner.user_id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    let rows = w.counts().await;
     for source in [Uuid::new_v4(), foreign_page] {
+        let response = w.duplicate(&w.owner, source, None).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{source}");
+        assert_eq!(error_code(response).await, "acl.no_grant");
+        assert_eq!(w.counts().await, rows);
+
         let result = duplicate::run(
             w.state.clone(),
             w.ctx(&w.owner, WorkspaceRole::Owner),
