@@ -47,7 +47,8 @@ pub struct ConnHandle {
     /// one that would nest the page too deep ([`crate::nesting`]), or one
     /// yrs could not apply; the WS shim then closes the socket with 4422.
     /// The room no longer holds the connection, so nothing more it sends is
-    /// applied.
+    /// applied. When the refusal also evicts the room, the other
+    /// connections are closed through [`RoomHandle::shutdown`].
     pub refused: CancellationToken,
 }
 
@@ -170,6 +171,12 @@ pub struct Room {
 
 pub struct RoomHandle {
     pub tx: mpsc::Sender<Event>,
+    /// The room's lifetime. Cancel it to stop the room. The room cancels it
+    /// itself when it evicts itself (`Room::refuse_applied`), and its actor
+    /// cancels it whenever it ends, panics included. Once it is cancelled the
+    /// registry treats the room as gone and boots a fresh one on the next
+    /// join, and every WS shim of the room, which watches it, closes its
+    /// socket so the client reconnects to that fresh room.
     pub shutdown: CancellationToken,
 }
 
@@ -253,6 +260,10 @@ impl Room {
 
     #[tracing::instrument(skip_all, fields(doc_id = %self.doc_id))]
     async fn run(mut self) {
+        // However the actor ends (eviction, a shutdown, a panic), cancel the
+        // room's token on the way out, so the shims close their sockets and
+        // the registry stops handing out this room (see `RoomHandle`).
+        let _ended = self.shutdown.clone().drop_guard();
         let mut idle_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut catchup_tick = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
@@ -696,7 +707,9 @@ impl Room {
             // back when a later one fails, so the blocks before the error
             // can be in the live doc, unmeasured. Refuse any error like a
             // too-deep update, a decode error too (nothing integrated, but
-            // the sender is broken or crafted either way).
+            // the sender is broken or crafted either way). The eviction
+            // closes every other connection too, so their clients reconnect
+            // to the reloaded room (see `refuse_applied`).
             Err(e) => {
                 self.refuse_applied(m.from, "apply_failed", format_args!("{e}"));
                 return;
@@ -743,6 +756,13 @@ impl Room {
     /// final snapshot (`evicted`), and the next join reloads the page from
     /// storage, which never got the update. Dropping the doc doesn't
     /// recurse, however deep the update made it (`crate::nesting`).
+    ///
+    /// Every other connection is closed too, through the room's token
+    /// (`RoomHandle::shutdown`), which its WS shim watches: it closes the
+    /// socket with 1012, and the client reconnects to the reloaded room and
+    /// re-sends its edits in its answer to the server's SyncStep1. Without
+    /// that, a peer would keep editing on this dead room. The sender's
+    /// `refused` is cancelled first, so the sender is closed with 4422.
     fn refuse_applied(&mut self, from: ConnId, reason: &'static str, why: std::fmt::Arguments) {
         tracing::warn!(
             doc_id = %self.doc_id,
@@ -756,6 +776,8 @@ impl Room {
             conn.refused.cancel();
         }
         self.evicted = true;
+        // Ends the actor (the loop's next turn) and closes every other
+        // connection (see above).
         self.shutdown.cancel();
     }
 }
@@ -1850,5 +1872,34 @@ mod tests {
         );
 
         h.shutdown.cancel();
+    }
+
+    /// However the actor ends, its token is cancelled: the WS shims watch it
+    /// to close their sockets, and the registry to boot a fresh room. Here
+    /// the actor ends on `Event::Shutdown`, without anyone cancelling it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_room_whose_actor_ends_cancels_its_token() {
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            Arc::new(NoopUpdates),
+            Arc::new(NoopSnapshots),
+            crate::snapshot::SnapshotPolicy {
+                every_n: 1000,
+                idle: std::time::Duration::from_secs(60),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        h.tx.send(Event::Shutdown).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.shutdown.cancelled())
+            .await
+            .expect("the room's token was not cancelled when its actor ended");
     }
 }

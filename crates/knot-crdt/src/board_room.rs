@@ -64,6 +64,10 @@ pub struct BoardRoom {
 
 pub struct BoardRoomHandle {
     pub tx: mpsc::Sender<Event>,
+    /// The board room's lifetime, as `RoomHandle::shutdown`: the room
+    /// cancels it when it evicts itself, and its actor whenever it ends;
+    /// the registry then boots a fresh room on the next join, and every WS
+    /// shim of the room closes its socket so the client reconnects to it.
     pub shutdown: CancellationToken,
 }
 
@@ -129,6 +133,9 @@ impl BoardRoom {
 
     #[tracing::instrument(skip_all, fields(board_id = %self.board_id))]
     async fn run(mut self) {
+        // However the actor ends, cancel the room's token on the way out, as
+        // `Room::run` does (see `BoardRoomHandle::shutdown`).
+        let _ended = self.shutdown.clone().drop_guard();
         // Periodic catch-up: Postgres NOTIFY is best-effort and the PgBus
         // channel drops on overflow/reconnect, so a missed seq would otherwise
         // leave this pod diverged until the next local edit. Re-sweep the log
@@ -309,9 +316,11 @@ impl BoardRoom {
     /// the part yrs integrated before it failed, as `Room::refuse_applied`
     /// does: `reason` "nesting" or "apply_failed". Boards persist inline, so
     /// the caller's return means `append_update` never runs for it. A board
-    /// connection has no close signal of its own, so the room only evicts
-    /// itself (cancel `shutdown`); the next join rehydrates from storage,
-    /// which never got the update.
+    /// connection has no close signal of its own, so the room evicts itself
+    /// (cancel `shutdown`), and that closes every connection, the sender's
+    /// included: each WS shim watches the token and closes its socket with
+    /// 1012, and the client reconnects to a fresh room, rehydrated from
+    /// storage, which never got the update.
     fn refuse_applied(&mut self, from: ConnId, reason: &'static str, why: std::fmt::Arguments) {
         tracing::warn!(
             board_id = %self.board_id,
@@ -474,5 +483,23 @@ mod tests {
             "the refused update was fanned out"
         );
         h.shutdown.cancel();
+    }
+
+    /// As for `Room`: however the actor ends, its token is cancelled, so the
+    /// WS shims close their sockets and the registry boots a fresh room.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_board_room_whose_actor_ends_cancels_its_token() {
+        let board_id = Uuid::new_v4();
+        let bus = Arc::new(MemBus::new());
+        let sub = bus.subscribe(board_id).await.unwrap();
+        let store: Arc<dyn knot_storage::BoardStore> = Arc::new(NoopBoardStore);
+        let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
+        let h = BoardRoom::spawn(board_id, engine, store, bus, sub)
+            .await
+            .unwrap();
+        h.tx.send(Event::Shutdown).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.shutdown.cancelled())
+            .await
+            .expect("the board room's token was not cancelled when its actor ended");
     }
 }

@@ -92,15 +92,21 @@ pub async fn serve(
 
     let (sink, mut stream) = socket.split();
     // Cancelled by whichever half ends the session first, so the other one
-    // stops too: the writer on a revoke, a server shutdown or a dead socket;
-    // this read loop when the client goes away.
+    // stops too: the writer on a revoke, a refusal, the room's end, a server
+    // shutdown or a dead socket; this read loop when the client goes away.
     let done = CancellationToken::new();
+    // The room's own token, cancelled when the room ends: it evicts itself
+    // after refusing an update (this connection's or another one's), or its
+    // actor stops. The writer then closes with 1012 so the client reconnects
+    // to a fresh room and re-sends its edits; this session's room would no
+    // longer apply, persist or share them. A refused sender gets 4422.
     let writer = tokio::spawn(crate::ws_writer::run(
         sink,
         out_rx,
         shutdown.clone(),
         revoked.clone(),
         refused.clone(),
+        handle.shutdown.clone(),
         done.clone(),
     ));
 

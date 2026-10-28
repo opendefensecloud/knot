@@ -26,7 +26,10 @@
 //!     nested past the limit, the room does not persist and does not fan out
 //!     the update, closes the sending connection, and evicts itself, so the
 //!     next join reloads the page from storage without the refused update.
-//!     An update yrs rejects part-way (apply returns an error after
+//!     Evicting also closes every other connection of the room (each WS
+//!     shim watches the room's token), so those clients reconnect to the
+//!     reloaded room and re-send their edits instead of editing on the
+//!     evicted one. An update yrs rejects part-way (apply returns an error after
 //!     integrating some of its blocks, which yrs does not roll back) is
 //!     refused the same way. Dropping the evicted room's doc, however deep
 //!     the refused update made it, does not recurse: yrs holds items flat in

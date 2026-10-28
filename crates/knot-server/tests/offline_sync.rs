@@ -717,3 +717,228 @@ async fn board_noop_sync_reply_is_neither_persisted_nor_fanned_out() {
     b.disconnect().await;
     c.disconnect().await;
 }
+
+// ---------------------------------------------------------------------------
+// A room that evicts itself closes every connection, not only the sender's
+// ---------------------------------------------------------------------------
+
+/// An update payload yrs can't decode: what a broken or crafted client
+/// sends. A room refuses it and evicts itself (`knot_crdt::nesting`), so the
+/// next join reloads the page from storage.
+const UNDECODABLE_UPDATE: &[u8] = &[0xff, 0xff, 0xff];
+
+impl Peer {
+    /// Send `payload` as a y-sync Update frame as it is, outside the local
+    /// doc.
+    async fn send_raw_update(&mut self, payload: &[u8]) {
+        self.ws
+            .as_mut()
+            .expect("send on a connected peer")
+            .send(tungstenite::Message::Binary(sync_frame(2, payload).into()))
+            .await
+            .unwrap();
+    }
+
+    /// Handle frames until the server closes the socket, and return the
+    /// close code. `None` if the socket is still open after `within`, or
+    /// ended without a close frame. The peer is offline afterwards.
+    async fn close_code(&mut self, within: Duration) -> Option<u16> {
+        let deadline = Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let ws = self
+                .ws
+                .as_mut()
+                .expect("wait for a close on a connected peer");
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Ok(Some(Ok(tungstenite::Message::Binary(b)))) => self.handle(&b).await,
+                Ok(Some(Ok(tungstenite::Message::Close(frame)))) => {
+                    self.ws.take();
+                    return frame.map(|f| u16::from(f.code));
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(_)) | None) | Err(_) => {
+                    self.ws.take();
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// One writer's update that the room refuses after applying it evicts the
+/// room. Every other connection must be closed too. Otherwise its shim keeps
+/// forwarding edits to the dead room, which neither persists nor shares
+/// them, and it sees no one else's edits, while new joiners get a fresh
+/// room. Closed with 1012, the provider reconnects to the reloaded room and
+/// re-sends what the server lacks (its answer to SyncStep1), so nothing is
+/// lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn doc_peers_of_a_room_that_evicts_itself_are_closed_and_resync() {
+    let fx = fixture().await;
+    let path = format!("/collab/doc/{}", fx.doc_id);
+
+    let mut a = Peer::new();
+    a.connect(&fx, &path).await;
+    assert!(
+        a.pump_until(DEADLINE, |p| p.step1_answered >= 1).await,
+        "A never completed the handshake"
+    );
+    let mut b = Peer::new();
+    b.connect(&fx, &path).await;
+    assert!(
+        b.pump_until(DEADLINE, |p| p.step1_answered >= 1).await,
+        "B never completed the handshake"
+    );
+    let text: Arc<Mutex<Option<XmlTextRef>>> = Arc::default();
+    let slot = text.clone();
+    b.edit(move |r, txn| {
+        *slot.lock().unwrap() = Some(paragraph_text(r, txn, "before"));
+    })
+    .await;
+    let text = text.lock().unwrap().take().unwrap();
+    assert!(
+        a.pump_until(DEADLINE, |p| p.doc_text().contains("before"))
+            .await,
+        "A never received B's edit"
+    );
+
+    // A sends an update yrs can't apply: the room refuses it and evicts
+    // itself.
+    a.send_raw_update(UNDECODABLE_UPDATE).await;
+    assert_eq!(
+        a.close_code(DEADLINE).await,
+        Some(4422),
+        "the sender of the refused update must be closed with 4422"
+    );
+    assert_eq!(
+        b.close_code(DEADLINE).await,
+        Some(1012),
+        "the room evicted itself, but B's socket was not closed with 1012: B \
+         would keep editing a room that neither persists nor shares its edits"
+    );
+
+    // As KnotProvider does on any close but 4403/4408/4500: offline (B keeps
+    // typing; nothing is sent), then reconnect.
+    let t = text.clone();
+    b.edit(move |_, txn| t.push(txn, " after")).await;
+    b.connect(&fx, &path).await;
+    assert!(
+        b.pump_until(DEADLINE, |p| p.step1_answered >= 2).await,
+        "the reloaded room never asked B for its state"
+    );
+
+    // A fresh reader has everything B typed, and so does storage.
+    let mut c = Peer::new();
+    c.connect(&fx, &path).await;
+    assert!(
+        c.pump_until(DEADLINE, |p| p.doc_text().contains("before after"))
+            .await,
+        "a fresh client never saw B's edit after the eviction: got {:?}",
+        c.doc_text()
+    );
+    // And B is live in the reloaded room: its next edit reaches C.
+    let t = text.clone();
+    b.edit(move |_, txn| t.push(txn, "!")).await;
+    assert!(
+        c.pump_until(DEADLINE, |p| p.doc_text().contains("before after!"))
+            .await,
+        "B's live edit after reconnecting never reached C: got {:?}",
+        c.doc_text()
+    );
+    let pool = fx.pool.clone();
+    let doc_id = fx.doc_id;
+    wait_for_storage(
+        "B's edits after the eviction",
+        || hydrate_doc(&pool, doc_id),
+        |d| doc_text(d).contains("before after!"),
+    )
+    .await;
+
+    b.disconnect().await;
+    c.disconnect().await;
+}
+
+/// The same for a board room. A board connection has no refusal signal of
+/// its own, so every connection, the sender's included, is closed with 1012
+/// and reconnects to the reloaded board room.
+#[tokio::test(flavor = "multi_thread")]
+async fn board_peers_of_a_board_room_that_evicts_itself_are_closed_and_resync() {
+    let fx = fixture().await;
+    let board = fx.boards.create(fx.doc_id, fx.user_id, None).await.unwrap();
+    let path = format!("/collab/board/{}", board.id);
+
+    let mut a = Peer::new();
+    a.connect(&fx, &path).await;
+    assert!(
+        a.pump_until(DEADLINE, |p| p.step1_answered >= 1).await,
+        "A never completed the handshake"
+    );
+    let mut b = Peer::new();
+    b.connect(&fx, &path).await;
+    assert!(
+        b.pump_until(DEADLINE, |p| p.step1_answered >= 1).await,
+        "B never completed the handshake"
+    );
+    b.edit(|r, txn| {
+        r.elements.insert(txn, "before", "rect");
+    })
+    .await;
+    assert!(
+        a.pump_until(DEADLINE, |p| p.board_keys() == ["before"])
+            .await,
+        "A never received B's edit"
+    );
+
+    a.send_raw_update(UNDECODABLE_UPDATE).await;
+    assert_eq!(
+        a.close_code(DEADLINE).await,
+        Some(1012),
+        "the board room evicted itself, but the sender's socket was not closed with 1012"
+    );
+    assert_eq!(
+        b.close_code(DEADLINE).await,
+        Some(1012),
+        "the board room evicted itself, but B's socket was not closed with 1012: \
+         B would keep editing a room that neither persists nor shares its edits"
+    );
+
+    b.edit(|r, txn| {
+        r.elements.insert(txn, "after", "ellipse");
+    })
+    .await;
+    b.connect(&fx, &path).await;
+    assert!(
+        b.pump_until(DEADLINE, |p| p.step1_answered >= 2).await,
+        "the reloaded board room never asked B for its state"
+    );
+
+    let mut c = Peer::new();
+    c.connect(&fx, &path).await;
+    assert!(
+        c.pump_until(DEADLINE, |p| p.board_keys() == ["after", "before"])
+            .await,
+        "a fresh client never saw B's edit after the eviction: got {:?}",
+        c.board_keys()
+    );
+    b.edit(|r, txn| {
+        r.elements.insert(txn, "live", "rect");
+    })
+    .await;
+    assert!(
+        c.pump_until(DEADLINE, |p| p.board_keys() == ["after", "before", "live"])
+            .await,
+        "B's live edit after reconnecting never reached C: got {:?}",
+        c.board_keys()
+    );
+    let boards = fx.boards.clone();
+    wait_for_storage(
+        "B's board edits after the eviction",
+        || hydrate_board(&boards, board.id),
+        |d| board_keys(d) == ["after", "before", "live"],
+    )
+    .await;
+
+    b.disconnect().await;
+    c.disconnect().await;
+}

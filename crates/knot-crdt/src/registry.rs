@@ -173,8 +173,9 @@ impl Rooms {
         }
     }
 
-    /// Cancel the room's actor and unsubscribe from the bus. The caller
-    /// is responsible for ordering this with any in-flight WS connections.
+    /// Cancel the room's actor and unsubscribe from the bus. Each WS shim
+    /// of the room watches its token and closes its socket: 1012, or 4403
+    /// when a revoke reached the connection first.
     pub async fn evict(&self, doc_id: Uuid) {
         if let Some((_, h)) = self.map.remove(&doc_id) {
             h.shutdown.cancel();

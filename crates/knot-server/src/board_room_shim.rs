@@ -55,8 +55,11 @@ pub async fn serve(
     let (sink, mut stream) = socket.split();
     // As in `room::serve`: whichever half ends the session cancels `done` so
     // the other stops. Boards have no ACL revocation of their own, and a
-    // board room refuses an update without closing its connection, so the
-    // writer's revoke and refuse signals are never raised here.
+    // board connection has no refusal signal, so the writer's revoke and
+    // refuse signals are never raised here. When the board room ends (it
+    // evicts itself after refusing an update, or its actor stops), its token
+    // closes every connection, the sender's included, with 1012, so each
+    // client reconnects to a fresh board room and re-sends its edits.
     let done = CancellationToken::new();
     let writer = tokio::spawn(crate::ws_writer::run(
         sink,
@@ -64,6 +67,7 @@ pub async fn serve(
         shutdown.clone(),
         CancellationToken::new(),
         CancellationToken::new(),
+        handle.shutdown.clone(),
         done.clone(),
     ));
 

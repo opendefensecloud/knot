@@ -64,7 +64,7 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     );
     describe_counter!(
         "knot_room_evicted_total",
-        "Rooms that evicted themselves after applying an inbound update they then refused, by reason. reason=nesting: the update nested the document's types past knot_crdt::nesting::MAX_NESTING (the authoritative post-apply check). reason=apply_failed: yrs rejected the update part-way, after integrating some of it. Either way the update was neither persisted nor fanned out, and the next join reloads the page from storage"
+        "Rooms that evicted themselves after applying an inbound update they then refused, by reason. reason=nesting: the update nested the document's types past knot_crdt::nesting::MAX_NESTING (the authoritative post-apply check). reason=apply_failed: yrs rejected the update, part-way after integrating some of it, or before applying anything (it does not decode). Either way the update was neither persisted nor fanned out, every connection of the room was closed (a page room's sender with 4422, every other one with 1012) so its client reconnects, and the next join reloads the page from storage"
     );
     describe_counter!("knot_room_snapshots_total", "Snapshots written to storage");
     describe_histogram!(
