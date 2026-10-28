@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,13 +17,16 @@ use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
 use knot_crdt::{Rooms, SnapshotPolicy, YrsEngine};
 use knot_server::auth::AuthContext;
-use knot_server::duplicate::{self, DuplicateError, MAX_DUPLICATE_BLOB_BYTES, MAX_DUPLICATE_PAGES};
+use knot_server::duplicate::{
+    self, DuplicateError, MAX_CONCURRENT_DUPLICATES, MAX_DUPLICATE_BLOB_BYTES, MAX_DUPLICATE_PAGES,
+};
 use knot_server::{AppState, router_with_state};
 use knot_storage::{
-    BlobStore, BlobStoreError, DocStore, PgDocStore, PgSnapshotStore, PgUpdatesStore,
-    SnapshotStore, UpdatesStore, WorkspaceRole,
+    BlobStore, BlobStoreError, DocStore, DocTask, DocTaskInput, PgDocStore, PgSnapshotStore,
+    PgUpdatesStore, SnapshotStore, TaskStore, TaskStoreError, UpdatesStore, WorkspaceRole,
 };
 use serde_json::{Value, json};
+use tokio::sync::{Notify, Semaphore};
 use tower::ServiceExt;
 use uuid::Uuid;
 use yrs::types::text::YChange;
@@ -649,6 +653,31 @@ impl World {
             role,
         }
     }
+
+    /// Waits until `n` duplicate permits are free: every duplicate that
+    /// held one has ended, the refresh of its copy included.
+    ///
+    /// # Panics
+    ///
+    /// When they aren't within ten seconds.
+    async fn wait_for_permits(&self, n: usize) {
+        for _ in 0..500 {
+            if self.state.duplicate_permits.available_permits() == n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "{} duplicate permits free, expected {n}",
+            self.state.duplicate_permits.available_permits()
+        );
+    }
+
+    /// Waits until every duplicate has ended, the refresh of its copy
+    /// included (the world's default permits).
+    async fn wait_for_refreshes(&self) {
+        self.wait_for_permits(MAX_CONCURRENT_DUPLICATES).await;
+    }
 }
 
 fn apply(doc: &yrs::Doc, bytes: &[u8]) {
@@ -900,6 +929,99 @@ impl BlobStore for RecordingBlobStore {
     fn bytes_deleted_with_metadata(&self) -> bool {
         false
     }
+}
+
+/// A task store that, once armed, holds every `upsert_for_doc` (the last
+/// step of a page's refresh after an edit or a duplicate) until the test
+/// opens it, and announces each one on `entered`.
+struct GatedTasks {
+    inner: Arc<dyn TaskStore>,
+    armed: AtomicBool,
+    entered: Notify,
+    open: Semaphore,
+}
+
+impl GatedTasks {
+    fn new(inner: Arc<dyn TaskStore>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(false),
+            entered: Notify::new(),
+            open: Semaphore::new(0),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Lets every held write through, and every later one.
+    fn open(&self) {
+        self.open.add_permits(1);
+    }
+
+    /// Waits until a write is held.
+    async fn entered(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.entered.notified())
+            .await
+            .expect("a task write reached the gate");
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskStore for GatedTasks {
+    async fn upsert_for_doc(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        items: &[DocTaskInput],
+    ) -> Result<(), TaskStoreError> {
+        if self.armed.load(Ordering::SeqCst) {
+            self.entered.notify_one();
+            // Given back at once, so one opening lets every writer through.
+            drop(self.open.acquire().await);
+        }
+        self.inner.upsert_for_doc(workspace_id, doc_id, items).await
+    }
+
+    async fn sync_for_doc_quiet(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        items: &[DocTaskInput],
+    ) -> Result<(), TaskStoreError> {
+        self.inner
+            .sync_for_doc_quiet(workspace_id, doc_id, items)
+            .await
+    }
+
+    async fn list_for_assignee(
+        &self,
+        workspace_id: Uuid,
+        user_id: Uuid,
+        include_completed: bool,
+    ) -> Result<Vec<DocTask>, TaskStoreError> {
+        self.inner
+            .list_for_assignee(workspace_id, user_id, include_completed)
+            .await
+    }
+
+    async fn list_for_doc(&self, doc_id: Uuid) -> Result<Vec<DocTask>, TaskStoreError> {
+        self.inner.list_for_doc(doc_id).await
+    }
+}
+
+/// A world whose task store is a [`GatedTasks`], and `configure` applied.
+async fn gated_world(configure: impl FnOnce(&mut AppState)) -> (World, Arc<GatedTasks>) {
+    let mut gate = None;
+    let w = world_with(|state| {
+        let gated = Arc::new(GatedTasks::new(state.tasks.take().unwrap()));
+        state.tasks = Some(gated.clone());
+        gate = Some(gated);
+        configure(state);
+    })
+    .await;
+    (w, gate.unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -1561,6 +1683,8 @@ async fn copied_tasks_are_indexed() {
 
     let top = id_of(&w.duplicate_ok(source, Some(true)).await);
     let child_copy = w.order(Some(top)).await[0];
+    // The copies are refreshed after the answer.
+    w.wait_for_refreshes().await;
 
     let tasks = w.state.tasks.as_ref().unwrap();
     let listed = |doc: Uuid| async move {
@@ -1599,6 +1723,126 @@ async fn copied_tasks_are_indexed() {
                 .unwrap();
         assert_eq!(version, knot_markdown::RENDERER_VERSION);
     }
+}
+
+/// The answer comes as soon as the copy is stored. The refresh of its
+/// derived data (cached Markdown and task rows, for up to 200 pages) runs
+/// after it, in the background, so a large copy can't outlast the request
+/// timeout and then be made a second time by a retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn answers_once_the_copy_is_stored() {
+    let (w, gate) = gated_world(|_| {}).await;
+    let owner = w.owner.user_id;
+    let source = w.create_doc(&w.owner, "Plan", None).await;
+    w.set_markdown(
+        source,
+        &format!("- [ ] [Olive Owner](knot://user/{owner}) ship it\n"),
+    )
+    .await;
+    gate.arm();
+
+    let response =
+        tokio::time::timeout(Duration::from_secs(10), w.duplicate(&w.owner, source, None))
+            .await
+            .expect("the answer doesn't wait for the refresh of the copy");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let copy = id_of(&body_json(response).await);
+    assert_eq!(w.doc(copy).await["title"], "Plan (copy)");
+
+    // The refresh runs on, held at the copy's task rows.
+    gate.entered().await;
+    let tasks = w.state.tasks.as_ref().unwrap();
+    assert!(tasks.list_for_doc(copy).await.unwrap().is_empty());
+    gate.open();
+    w.wait_for_refreshes().await;
+    let copied: Vec<String> = tasks
+        .list_for_doc(copy)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.text)
+        .collect();
+    assert_eq!(copied, ["ship it"]);
+}
+
+/// A duplicate holds every page it copies in memory, so at most
+/// `MAX_CONCURRENT_DUPLICATES` run at once. One that gets no permit within
+/// the busy wait is refused with 503 `doc.duplicate_busy` and copies
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn busy_duplicate_is_503() {
+    assert_eq!(MAX_CONCURRENT_DUPLICATES, 2);
+    let w = world_with(|state| {
+        state.duplicate_permits = Arc::new(Semaphore::new(0));
+        state.duplicate_busy_wait = Duration::from_millis(50);
+    })
+    .await;
+    let source = w.create_doc(&w.owner, "Plan", None).await;
+    let rows = w.counts().await;
+
+    let response = w.duplicate(&w.owner, source, None).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("5")
+    );
+    assert_eq!(error_code(response).await, "doc.duplicate_busy");
+    assert_eq!(w.counts().await, rows, "nothing is copied");
+
+    w.state.duplicate_permits.add_permits(1);
+    w.duplicate_ok(source, None).await;
+}
+
+/// A duplicate keeps its permit until the refresh of its copy ends, so
+/// no more copies than permitted are ever held in memory, and gives it back
+/// after a success and after a failure alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_duplicate_holds_its_permit_until_its_refresh_ends() {
+    let (w, gate) = gated_world(|state| {
+        state.duplicate_permits = Arc::new(Semaphore::new(1));
+        state.duplicate_busy_wait = Duration::from_millis(50);
+    })
+    .await;
+    let source = w.create_doc(&w.owner, "Plan", None).await;
+    let template = w.create_doc(&w.owner, "Meeting notes", None).await;
+    let response = send_json(
+        &w.app,
+        &w.owner,
+        "POST",
+        &format!("/api/docs/{template}/template"),
+        json!({"is_template": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "make template");
+    gate.arm();
+
+    let response =
+        tokio::time::timeout(Duration::from_secs(10), w.duplicate(&w.owner, source, None))
+            .await
+            .expect("the answer doesn't wait for the refresh of the copy");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    gate.entered().await;
+    assert_eq!(
+        w.state.duplicate_permits.available_permits(),
+        0,
+        "the refresh holds the permit"
+    );
+    let response = w.duplicate(&w.owner, source, None).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error_code(response).await, "doc.duplicate_busy");
+
+    // After a success: back once the refresh ends.
+    gate.open();
+    w.wait_for_permits(1).await;
+    // After a failure.
+    let response = w.duplicate(&w.owner, template, None).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    w.wait_for_permits(1).await;
+    w.duplicate_ok(source, None).await;
+    w.wait_for_permits(1).await;
 }
 
 /// The hourly purge job removes the objects of duplicates that never

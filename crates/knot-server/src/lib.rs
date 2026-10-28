@@ -86,6 +86,11 @@ pub struct AppState {
     pub export_permits: Arc<tokio::sync::Semaphore>,
     /// How long an export waits for a permit before it is refused as busy.
     pub export_busy_wait: std::time::Duration,
+    /// Duplicates running at once in this process, each until the refresh
+    /// of its copy ends.
+    pub duplicate_permits: Arc<tokio::sync::Semaphore>,
+    /// How long a duplicate waits for a permit before it is refused as busy.
+    pub duplicate_busy_wait: std::time::Duration,
 }
 
 impl AppState {
@@ -123,6 +128,10 @@ impl AppState {
             shutdown: tokio_util::sync::CancellationToken::new(),
             export_permits: Arc::new(tokio::sync::Semaphore::new(export::MAX_CONCURRENT_EXPORTS)),
             export_busy_wait: export::BUSY_WAIT,
+            duplicate_permits: Arc::new(tokio::sync::Semaphore::new(
+                duplicate::MAX_CONCURRENT_DUPLICATES,
+            )),
+            duplicate_busy_wait: duplicate::BUSY_WAIT,
         }
     }
 
@@ -190,6 +199,10 @@ impl AppState {
             shutdown: tokio_util::sync::CancellationToken::new(),
             export_permits: Arc::new(tokio::sync::Semaphore::new(export::MAX_CONCURRENT_EXPORTS)),
             export_busy_wait: export::BUSY_WAIT,
+            duplicate_permits: Arc::new(tokio::sync::Semaphore::new(
+                duplicate::MAX_CONCURRENT_DUPLICATES,
+            )),
+            duplicate_busy_wait: duplicate::BUSY_WAIT,
         }
     }
 

@@ -13,14 +13,13 @@
 use axum::{
     Json, Router,
     extract::{Path, Request, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use knot_storage::{Document, PersonRef, Placement, WorkspaceRole};
 use serde::{Deserialize, Serialize};
-use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -414,19 +413,47 @@ async fn duplicate(
     let Ok(body) = read_json::<DuplicateRequest>(req).await else {
         return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
     };
+    // Taken before the copy starts, and held until its refresh ends, so no
+    // more than the permitted copies are held in memory at once.
+    let permit = tokio::time::timeout(
+        state.duplicate_busy_wait,
+        state.duplicate_permits.clone().acquire_owned(),
+    )
+    .await;
+    let permit = match permit {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "duplicate permits closed");
+            return internal();
+        }
+        Err(_) => return duplicate_busy(),
+    };
     // On a task of its own (P16): dropping this handler, on the request
     // timeout or when the client goes away, can't stop a duplicate halfway.
-    let task = tokio::spawn(
-        crate::duplicate::run(state, ctx, role.0, doc_id, body.include_subpages).in_current_span(),
-    );
-    match task.await {
+    // The answer comes once the copy is stored, before its refresh.
+    let answer = crate::duplicate::start(state, ctx, role.0, doc_id, body.include_subpages, permit);
+    match answer.await {
         Ok(Ok(top)) => (StatusCode::CREATED, Json(to_response(&top))).into_response(),
         Ok(Err(e)) => duplicate_error(e),
-        Err(e) => {
-            tracing::error!(error = %e, "duplicate task");
+        Err(_) => {
+            tracing::error!("duplicate task ended without an answer");
             internal()
         }
     }
+}
+
+/// `503 doc.duplicate_busy`: every duplicate permit stayed taken for the
+/// busy wait.
+fn duplicate_busy() -> Response {
+    let mut response = json_err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "doc.duplicate_busy",
+        "too many copies at once",
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
 }
 
 fn duplicate_error(e: DuplicateError) -> Response {

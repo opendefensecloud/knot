@@ -14,10 +14,16 @@
 //!   Nothing is deleted on the request path: if the transaction doesn't
 //!   commit, the hourly purge job removes them (`archive::run_purge_once`).
 //!
-//! The route runs [`run`] on a task of its own, so the request timeout or a
-//! client going away can't stop it halfway.
+//! The route runs a duplicate through [`start`], on a task of its own, so
+//! the request timeout or a client going away can't stop it halfway. The
+//! answer comes as soon as the copy is stored; the refresh of the copy's
+//! derived data ([`Refresh`]) runs after it, on the same task. The task
+//! holds one of [`MAX_CONCURRENT_DUPLICATES`] permits until both end, since
+//! it keeps every copied page in memory until then.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::time::Duration;
 
 use knot_crdt::{DocHandle, Engine, YrsEngine};
 use knot_markdown::remap::{Refs, Remap, references, remap_refs};
@@ -27,6 +33,8 @@ use knot_storage::duplicate::{
 use knot_storage::{
     BlobStoreError, Board, BoardStore, BoardStoreError, DocStoreError, Document, WorkspaceRole,
 };
+use tokio::sync::{OwnedSemaphorePermit, oneshot};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -37,6 +45,11 @@ use crate::routes::api::markdown::{current_snapshot, refresh_markdown_from};
 pub const MAX_DUPLICATE_PAGES: usize = 200;
 /// Bytes of files one duplicate may copy, by their recorded sizes.
 pub const MAX_DUPLICATE_BLOB_BYTES: i64 = 200 * 1024 * 1024;
+/// Duplicates one server process runs at a time. Each holds every page it
+/// copies in memory until the refresh of its copy ends.
+pub const MAX_CONCURRENT_DUPLICATES: usize = 2;
+/// How long a duplicate waits for a free slot before it is refused as busy.
+pub const BUSY_WAIT: Duration = Duration::from_secs(5);
 
 /// Why [`run`] made no copy.
 #[derive(Debug, thiserror::Error)]
@@ -90,16 +103,85 @@ struct PlannedBoard {
     new_doc_id: Uuid,
 }
 
+/// A stored copy.
+#[derive(Debug)]
+pub struct Copied {
+    /// The copy of the page.
+    pub top: Document,
+    /// What is left to do for it.
+    pub refresh: Refresh,
+}
+
+/// The refresh of a stored copy's derived data: the cached Markdown and the
+/// task rows of every page of the copy.
+pub struct Refresh {
+    /// Each page of the copy, its content and the seq of the update that
+    /// holds it.
+    pages: Vec<(Uuid, DocHandle, i64)>,
+}
+
+impl Refresh {
+    /// Best effort: a copy whose refresh fails has no cached Markdown, and
+    /// the refresh sweep renders it and indexes its tasks later.
+    pub async fn run(self, state: &AppState) {
+        for (doc_id, content, seq) in self.pages {
+            if let Err(e) = refresh_markdown_from(state, doc_id, &content, seq).await {
+                tracing::warn!(error = ?e, %doc_id, "duplicate: refresh of the copy failed");
+            }
+        }
+    }
+}
+
+impl fmt::Debug for Refresh {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Refresh")
+            .field("pages", &self.pages.len())
+            .finish()
+    }
+}
+
+/// Runs [`run`] on a task of its own, and then the [`Refresh`] of its copy,
+/// holding `permit` until both end. The returned receiver gets the answer
+/// as soon as the copy is stored or refused; dropping it (the request timed
+/// out, or the client went away) stops neither.
+pub fn start(
+    state: AppState,
+    ctx: AuthContext,
+    doc_role: WorkspaceRole,
+    source_id: Uuid,
+    include_subpages: bool,
+    permit: OwnedSemaphorePermit,
+) -> oneshot::Receiver<Result<Document, DuplicateError>> {
+    let (answer, answered) = oneshot::channel();
+    tokio::spawn(
+        async move {
+            match run(state.clone(), ctx, doc_role, source_id, include_subpages).await {
+                Ok(Copied { top, refresh }) => {
+                    let _ = answer.send(Ok(top));
+                    refresh.run(&state).await;
+                }
+                Err(e) => {
+                    let _ = answer.send(Err(e));
+                }
+            }
+            drop(permit);
+        }
+        .in_current_span(),
+    );
+    answered
+}
+
 /// Copy `source_id` as `ctx`'s user, whose role on the page is `doc_role`,
 /// right after it, with its live subpages when `include_subpages`. Returns
-/// the copy of the page.
+/// once the copy is stored, with the refresh of its derived data still to
+/// run.
 pub async fn run(
     state: AppState,
     ctx: AuthContext,
     doc_role: WorkspaceRole,
     source_id: Uuid,
     include_subpages: bool,
-) -> Result<Document, DuplicateError> {
+) -> Result<Copied, DuplicateError> {
     // P15: the copy is a new page, so the workspace role counts too.
     if doc_role == WorkspaceRole::Viewer || ctx.role == WorkspaceRole::Viewer {
         return Err(DuplicateError::EditorRequired);
@@ -255,21 +337,24 @@ pub async fn run(
         "duplicate"
     );
 
-    // Best effort: a copy whose refresh fails has no cached Markdown, and
-    // the refresh sweep renders it and indexes its tasks later.
-    let contents: HashMap<Uuid, &DocHandle> = pages
-        .iter()
-        .map(|page| (page.new_id, &page.content))
+    let mut contents: HashMap<Uuid, DocHandle> = pages
+        .into_iter()
+        .map(|page| (page.new_id, page.content))
         .collect();
-    for (doc_id, seq) in &outcome.pages {
-        let Some(content) = contents.get(doc_id) else {
-            continue;
-        };
-        if let Err(e) = refresh_markdown_from(&state, *doc_id, content, *seq).await {
-            tracing::warn!(error = ?e, %doc_id, "duplicate: refresh of the copy failed");
-        }
-    }
-    Ok(outcome.top)
+    let refresh = Refresh {
+        pages: outcome
+            .pages
+            .iter()
+            .filter_map(|(doc_id, seq)| {
+                let content = contents.remove(doc_id)?;
+                Some((*doc_id, content, *seq))
+            })
+            .collect(),
+    };
+    Ok(Copied {
+        top: outcome.top,
+        refresh,
+    })
 }
 
 /// Whether `doc_id` is a page of `ctx`'s workspace that its user can read:
