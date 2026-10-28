@@ -162,7 +162,9 @@ fixes.
   text, so no text is lost: Markdown and zip import, history restore and
   templates store it that way, and a page already stored deeper exports its
   deep part that way. An editor update that nests a page past 512 nested
-  types is refused, and its connection closes with code 4422. Two cases
+  types is refused, and its connection closes with code 4422. The editor
+  then stops reconnecting and shows "Changes refused" until the page is
+  reloaded, instead of sending the refused update again. Two cases
   remain known limitations, as before this release (see #53): a single
   crafted editor update whose own apply nests and deletes deep enough, and
   deleting the deep part of a page already stored deeper, can still crash

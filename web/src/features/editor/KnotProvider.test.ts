@@ -185,3 +185,42 @@ describe("KnotProvider offline edits", () => {
     p.destroy();
   });
 });
+
+describe("KnotProvider close codes", () => {
+  beforeEach(() => {
+    FakeSocket.all = [];
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeSocket);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  // The server refused an update this client sent (4422). The local doc
+  // still holds it, so a reconnect would hand it over again in the answer
+  // to the server's SYNC_STEP_1 and be refused again, every half second.
+  it("stays closed after the server refused an update (4422)", () => {
+    const p = new KnotProvider({ url: "ws://x/collab", doc: new Y.Doc() });
+    FakeSocket.all.at(-1)!.open();
+
+    FakeSocket.all.at(-1)!.drop(4422);
+
+    expect(p.status).toBe("refused");
+    vi.advanceTimersByTime(31_000);
+    expect(FakeSocket.all).toHaveLength(1);
+    p.destroy();
+  });
+
+  it("reconnects after the room restarted (1012)", () => {
+    const p = new KnotProvider({ url: "ws://x/collab", doc: new Y.Doc() });
+    FakeSocket.all.at(-1)!.open();
+
+    FakeSocket.all.at(-1)!.drop(1012);
+
+    expect(p.status).toBe("offline");
+    vi.advanceTimersByTime(31_000);
+    expect(FakeSocket.all).toHaveLength(2);
+    p.destroy();
+  });
+});
