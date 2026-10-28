@@ -8,6 +8,7 @@ import {
   describeMove,
   dropZone,
   flattenVisible,
+  insertIndex,
   keyboardMove,
   projectDrop,
   rowDescription,
@@ -470,6 +471,18 @@ describe("keyboardMove", () => {
   it("can't outdent at the top level", () => {
     expect(km("A", "outdent")).toBeNull();
     expect(km("D", "outdent")).toBeNull();
+  });
+});
+
+describe("insertIndex", () => {
+  it("puts the page right after after_id, at before_id's place, or last", () => {
+    const sibs = ["a", "b", "c"];
+    expect(insertIndex(sibs, { parent_id: null, after_id: "a" })).toBe(1);
+    expect(insertIndex(sibs, { parent_id: null, after_id: "c" })).toBe(3);
+    expect(insertIndex(sibs, { parent_id: null, before_id: "a" })).toBe(0);
+    expect(insertIndex(sibs, { parent_id: null, before_id: "c" })).toBe(2);
+    expect(insertIndex(sibs, { parent_id: null })).toBe(3);
+    expect(insertIndex([], { parent_id: "p" })).toBe(0);
   });
 });
 

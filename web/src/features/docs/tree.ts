@@ -224,6 +224,14 @@ function anchored(m: Moving, g: number, depth: number, parent: string | null): M
   return { parent_id: parent };
 }
 
+/** Where a move puts the page among `sibs`, its new siblings without it:
+ *  right after `after_id`, at `before_id`'s place, or last. */
+export function insertIndex(sibs: readonly string[], args: MoveArgs): number {
+  return args.after_id !== undefined ? sibs.indexOf(args.after_id) + 1
+    : args.before_id !== undefined ? sibs.indexOf(args.before_id)
+    : sibs.length;
+}
+
 /** The move keeps the page's real parent and its place among its real siblings. */
 function isNoop(m: Moving, args: MoveArgs): boolean {
   if (m.realParent.get(m.page.id) !== args.parent_id) return false;
@@ -231,12 +239,7 @@ function isNoop(m: Moving, args: MoveArgs): boolean {
     .filter((d) => (d.parent_id ?? null) === args.parent_id)
     .sort(bySortKey)
     .map((d) => d.id);
-  const rest = sibs.filter((id) => id !== m.page.id);
-  const at =
-    args.after_id !== undefined ? rest.indexOf(args.after_id) + 1
-    : args.before_id !== undefined ? rest.indexOf(args.before_id)
-    : rest.length;
-  return at === sibs.indexOf(m.page.id);
+  return insertIndex(sibs.filter((id) => id !== m.page.id), args) === sibs.indexOf(m.page.id);
 }
 
 /** P11 for a drop in gap `g` of `m.items` at the `wanted` depth (clamped). */
@@ -351,9 +354,5 @@ export function describeMove(flat: FlatRow[], id: string, args: MoveArgs): strin
     parent !== undefined && parent.descendantCount > 0 && !(below && below.depth > parent.depth);
   const anchor = args.after_id ?? args.before_id;
   if (hidden || (anchor !== undefined && !sibs.includes(anchor))) return where;
-  const at =
-    args.after_id !== undefined ? sibs.indexOf(args.after_id) + 1
-    : args.before_id !== undefined ? sibs.indexOf(args.before_id)
-    : sibs.length;
-  return `${where}, position ${at + 1} of ${sibs.length + 1}`;
+  return `${where}, position ${insertIndex(sibs, args) + 1} of ${sibs.length + 1}`;
 }
