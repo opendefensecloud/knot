@@ -1418,6 +1418,212 @@ async fn a_board_room_evicts_itself_over_an_update_that_nests_too_deep_before_it
 }
 
 // ---------------------------------------------------------------------------
+// A refused connection stays refused (F7)
+// ---------------------------------------------------------------------------
+//
+// A room refuses the sender of an update the prefilter refuses, or of one
+// that doesn't decode, and the WS shim closes that connection with 4422.
+// Until the socket is gone, the room still gets what the connection sent
+// after the refused update: its client may have pipelined more, and the
+// shim forwards a SyncStep1 as a re-join. The room ignores all of it: it
+// doesn't join the connection again, and applies, stores and fans out
+// nothing it sends, presence included.
+
+/// The updates a room refuses its sender for and keeps running: one the
+/// prefilter refuses, and one that doesn't decode.
+fn refused_without_eviction() -> [Vec<u8>; 2] {
+    let [no_update, _] = undecodable();
+    [chain_update(MAX_NESTING + 1), no_update]
+}
+
+/// Whether the text of the page `state` builds holds `text`.
+fn holds_text(state: &[u8], text: &str) -> bool {
+    use yrs::GetString;
+    let doc = page(&[state]);
+    let frag = doc.inner().get_or_insert_xml_fragment("default");
+    let txn = doc.inner().transact();
+    frag.get_string(&txn).contains(text)
+}
+
+/// RED on HEAD: the room took the refused connection back on its queued
+/// SyncStep1, then applied, persisted and fanned out the edit it sent next;
+/// it also fanned out its presence.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_connection_stays_refused() {
+    for bad in refused_without_eviction() {
+        let store = Stored::default();
+        let room = room_on(Uuid::new_v4(), &store).await;
+        // The connection's handle as the WS shim builds it for every
+        // (re-)join: the same sender and the same signals each time.
+        let (tx, rx) = mpsc::channel(64);
+        let (revoked, refused) = (CancellationToken::new(), CancellationToken::new());
+        let handle = || ConnHandle {
+            tx: tx.clone(),
+            revoked: revoked.clone(),
+            refused: refused.clone(),
+        };
+        let conn = Uuid::new_v4();
+        let (reply, joined) = oneshot::channel();
+        room.tx
+            .send(Event::Join {
+                conn_id: conn,
+                handle: handle(),
+                reply,
+            })
+            .await
+            .unwrap();
+        joined.await.unwrap().unwrap();
+        let (writer, _writer_rx, _) = join(&room).await;
+        let (_peer, mut peer_rx, _) = join(&room).await;
+
+        send(&room, conn, bad).await;
+        // Its WS shim closes the socket and stops reading.
+        drop(rx);
+        // Queued behind the refused update: a SyncStep1, then an edit and
+        // presence, twice: a peer's edit fanned out in between must not
+        // let the connection back in.
+        let (reply, rejoined) = oneshot::channel();
+        room.tx
+            .send(Event::Join {
+                conn_id: conn,
+                handle: handle(),
+                reply,
+            })
+            .await
+            .unwrap();
+        let (edit, _) = text_page(3);
+        let mut afters = Vec::new();
+        for _ in 0..2 {
+            send(&room, conn, edit.clone()).await;
+            room.tx
+                .send(Event::AwarenessIn {
+                    from: conn,
+                    payload: b"presence".to_vec(),
+                })
+                .await
+                .unwrap();
+            let after = sentinel();
+            send(&room, writer, after.clone()).await;
+            let before = fanned_out(&mut peer_rx, &after).await;
+            assert!(
+                before.is_empty(),
+                "the refused connection's edit or presence was fanned out"
+            );
+            afters.push(after);
+        }
+        store.holds(&afters[1]).await;
+        assert_eq!(
+            store.rows(),
+            afters,
+            "the refused connection's edit was persisted"
+        );
+        assert!(
+            rejoined.await.is_err(),
+            "the refused connection was joined again"
+        );
+        let (reply, state) = oneshot::channel();
+        room.tx.send(Event::ExportState(reply)).await.unwrap();
+        let (state, _) = state.await.unwrap().unwrap();
+        assert!(
+            !holds_text(&state, "hello"),
+            "the refused connection's edit was applied"
+        );
+        assert!(refused.is_cancelled(), "the sender was not told to close");
+        assert!(!room.shutdown.is_cancelled(), "the room evicted itself");
+        room.shutdown.cancel();
+    }
+}
+
+/// The same for a board room. RED on HEAD: the board room took the refused
+/// connection back on its queued SyncStep1, and applied, stored and fanned
+/// out the edit it sent next even without that, as it takes updates from
+/// any connection; it also fanned out its presence.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_board_connection_stays_refused() {
+    for bad in refused_without_eviction() {
+        let store = StoredBoard::default();
+        let h = board_on(Uuid::new_v4(), &store).await;
+        let (tx, rx) = mpsc::channel(64);
+        let refused = CancellationToken::new();
+        let handle = || knot_crdt::board_room::ConnHandle {
+            tx: tx.clone(),
+            refused: refused.clone(),
+        };
+        let conn = Uuid::new_v4();
+        let (reply, joined) = oneshot::channel();
+        h.tx.send(knot_crdt::board_room::Event::Join {
+            conn_id: conn,
+            handle: handle(),
+            reply,
+        })
+        .await
+        .unwrap();
+        joined.await.unwrap().unwrap();
+        let (writer, _writer_rx, _) = join_board(&h).await;
+        let (_peer, mut peer_rx, _) = join_board(&h).await;
+
+        send_board(&h, conn, bad).await;
+        drop(rx);
+        let (reply, rejoined) = oneshot::channel();
+        h.tx.send(knot_crdt::board_room::Event::Join {
+            conn_id: conn,
+            handle: handle(),
+            reply,
+        })
+        .await
+        .unwrap();
+        // Twice: fanning the peer's edit out must not drop the refused
+        // connection, whose channel is closed, and with it the board room's
+        // knowledge that it was refused.
+        let (edit, _) = text_page(3);
+        let mut afters = Vec::new();
+        for _ in 0..2 {
+            send_board(&h, conn, edit.clone()).await;
+            h.tx.send(knot_crdt::board_room::Event::AwarenessIn {
+                from: conn,
+                payload: b"presence".to_vec(),
+            })
+            .await
+            .unwrap();
+            let after = sentinel();
+            send_board(&h, writer, after.clone()).await;
+            let before = fanned_out(&mut peer_rx, &after).await;
+            assert!(
+                before.is_empty(),
+                "the refused connection's edit or presence was fanned out"
+            );
+            afters.push(after);
+        }
+        assert_eq!(
+            store.rows(),
+            afters,
+            "the refused connection's edit was stored"
+        );
+        assert!(
+            rejoined.await.is_err(),
+            "the refused connection was joined again"
+        );
+        // What a client joining now gets: the board room's live doc.
+        let (reply, state) = oneshot::channel();
+        h.tx.send(knot_crdt::board_room::Event::Join {
+            conn_id: Uuid::new_v4(),
+            handle: knot_crdt::board_room::ConnHandle::new(mpsc::channel(64).0),
+            reply,
+        })
+        .await
+        .unwrap();
+        let state = state.await.unwrap().unwrap();
+        assert!(
+            !holds_text(&state.update, "hello"),
+            "the refused connection's edit was applied"
+        );
+        assert!(refused.is_cancelled(), "the sender was not told to close");
+        assert!(!h.shutdown.is_cancelled(), "the board room evicted itself");
+        h.shutdown.cancel();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The reader
 // ---------------------------------------------------------------------------
 

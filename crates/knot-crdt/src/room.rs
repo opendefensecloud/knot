@@ -48,8 +48,9 @@ pub struct ConnHandle {
     /// Cancelled by the room when it refuses an update the connection sent:
     /// one that would nest the page too deep ([`crate::nesting`]), or one
     /// that doesn't decode; the WS shim then closes the socket with 4422.
-    /// The room no longer holds the connection, so nothing more it sends is
-    /// applied. When the refusal also evicts the room (an update it applied
+    /// The room no longer holds the connection and doesn't join it again,
+    /// so nothing more it sends is applied or shared, its presence
+    /// included. When the refusal also evicts the room (an update it applied
     /// and then refused), the other connections are closed through
     /// [`RoomHandle::shutdown`].
     pub refused: CancellationToken,
@@ -315,6 +316,11 @@ impl Room {
                     }
                     Some(Event::AwarenessIn { from, payload }) => {
                         if crate::presence::is_oversize(&payload) { continue; }
+                        // Only connections the room holds share presence, as
+                        // only they may write (`on_inbound`): a refused or
+                        // revoked one (or one dropped as a slow consumer)
+                        // can keep sending until its socket is torn down.
+                        if !self.conns.contains_key(&from) { continue; }
                         // Local fan-out (sans origin).
                         let mut to_close: Vec<ConnId> = Vec::new();
                         for (cid, conn) in &self.conns {
@@ -647,11 +653,12 @@ impl Room {
         handle: ConnHandle,
         reply: oneshot::Sender<Result<JoinState, EngineError>>,
     ) {
-        // A re-join (client SyncStep1) racing a revoke still carries the
-        // connection's cancelled handle. Refuse it by dropping `reply`: no
-        // state for someone whose access just ended, and no re-registration
+        // A re-join (client SyncStep1) racing a revoke, or queued behind an
+        // update the room refused, still carries the connection's cancelled
+        // handle. Refuse it by dropping `reply`: no state for someone whose
+        // access just ended or who was just refused, and no re-registration
         // that would let their updates through again.
-        if handle.revoked.is_cancelled() {
+        if handle.revoked.is_cancelled() || handle.refused.is_cancelled() {
             return;
         }
         self.conns.insert(conn_id, handle);
@@ -779,9 +786,10 @@ impl Room {
         }
     }
 
-    /// Refuse an update `from` sent: count it, drop the connection, so that
-    /// nothing more it sends is applied, and tell its WS shim to close it
-    /// with 4422 (`ConnHandle::refused`).
+    /// Refuse an update `from` sent: count it, drop the connection, which
+    /// `on_join` doesn't take back, so that nothing more it sends is applied
+    /// or shared, and tell its WS shim to close it with 4422
+    /// (`ConnHandle::refused`).
     fn refuse_sender(&mut self, from: ConnId) {
         metrics::counter!("knot_room_updates_refused_total").increment(1);
         if let Some(conn) = self.conns.remove(&from) {

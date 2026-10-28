@@ -33,7 +33,9 @@ pub struct ConnHandle {
     pub tx: mpsc::Sender<Vec<u8>>,
     /// Cancelled by the board room when it refuses an update the
     /// connection sent, as `room::ConnHandle::refused` is; the WS shim then
-    /// closes the socket with 4422.
+    /// closes the socket with 4422. The board room ignores everything the
+    /// connection sends after that (a re-join, an update, presence) and
+    /// sends it nothing more (`BoardRoom::refuse_sender`).
     pub refused: CancellationToken,
 }
 
@@ -171,8 +173,9 @@ impl BoardRoom {
                         // out locally also fits under PgBus's cross-pod size limit;
                         // otherwise large presence would silently fail across pods.
                         if crate::presence::is_oversize(&payload) { continue; }
+                        if self.is_refused(&from) { continue; }
                         let mut to_close: Vec<ConnId> = Vec::new();
-                        for (cid, conn) in &self.conns {
+                        for (cid, conn) in self.served() {
                             if *cid == from { continue; }
                             if conn.tx.try_send(payload.clone()).is_err() {
                                 to_close.push(*cid);
@@ -194,7 +197,7 @@ impl BoardRoom {
                 }
                 Some(payload) = self.bus_presence_rx.recv() => {
                     let mut to_close: Vec<ConnId> = Vec::new();
-                    for (cid, conn) in &self.conns {
+                    for (cid, conn) in self.served() {
                         if conn.tx.try_send(payload.clone()).is_err() { to_close.push(*cid); }
                     }
                     for cid in to_close { self.conns.remove(&cid); }
@@ -223,7 +226,7 @@ impl BoardRoom {
             if self.engine.apply_update(&self.doc, &bytes).is_ok() {
                 let framed = wrap_sync_update(&bytes);
                 let mut to_close: Vec<ConnId> = Vec::new();
-                for (cid, conn) in &self.conns {
+                for (cid, conn) in self.served() {
                     if conn.tx.try_send(framed.clone()).is_err() {
                         to_close.push(*cid);
                     }
@@ -242,12 +245,24 @@ impl BoardRoom {
         handle: ConnHandle,
         reply: oneshot::Sender<Result<JoinState, EngineError>>,
     ) {
+        // A re-join (client SyncStep1) queued behind an update the room
+        // refused still carries the connection's cancelled handle. Refuse it
+        // by dropping `reply`, as `Room::on_join` does.
+        if handle.refused.is_cancelled() {
+            return;
+        }
         self.conns.insert(conn_id, handle);
         let _ = reply.send(JoinState::of(self.engine.as_ref(), &self.doc));
     }
 
     #[tracing::instrument(skip(self, m), fields(board_id = %self.board_id, bytes = m.bytes.len()))]
     async fn on_inbound(&mut self, m: InMsg) {
+        // A board room takes updates from any connection, except one it
+        // refused: that one can keep sending until its socket is torn down.
+        if self.is_refused(&m.from) {
+            tracing::debug!(conn = %m.from, "dropping a board update from a refused connection");
+            return;
+        }
         // The same rules as `Room::on_inbound`: nothing of an update that
         // nests too deep, that doesn't decode, or that yrs rejects part-way
         // is persisted or fanned out. The board editor never nests types,
@@ -332,7 +347,7 @@ impl BoardRoom {
         }
         let framed = wrap_sync_update(&m.bytes);
         let mut to_close: Vec<ConnId> = Vec::new();
-        for (cid, conn) in &self.conns {
+        for (cid, conn) in self.served() {
             if *cid == m.from {
                 continue;
             }
@@ -346,14 +361,35 @@ impl BoardRoom {
     }
 
     /// Refuse an update `from` sent, as `Room::refuse_sender` does: count
-    /// it, drop the connection and tell its WS shim to close it with 4422.
-    /// An update the connection sent meanwhile is still applied: unlike a
-    /// page room, a board room takes updates from any connection.
+    /// it and tell its WS shim to close the connection with 4422. Unlike a
+    /// page room, a board room takes updates from any connection, joined
+    /// or not, so dropping the connection would not stop what it still
+    /// sends. The room keeps its handle, with `refused` cancelled, until
+    /// the connection leaves: [`Self::is_refused`] then makes it ignore
+    /// everything the connection sends (a re-join, an update, presence),
+    /// and [`Self::served`] leaves it out of every fan-out, so that it is
+    /// never dropped as a slow or closed consumer before it leaves.
     fn refuse_sender(&mut self, from: ConnId) {
         metrics::counter!("knot_room_updates_refused_total").increment(1);
-        if let Some(conn) = self.conns.remove(&from) {
+        if let Some(conn) = self.conns.get(&from) {
             conn.refused.cancel();
         }
+    }
+
+    /// Whether `from` is a connection the board room refused
+    /// ([`Self::refuse_sender`]).
+    fn is_refused(&self, from: &ConnId) -> bool {
+        self.conns
+            .get(from)
+            .is_some_and(|conn| conn.refused.is_cancelled())
+    }
+
+    /// The connections the board room sends to: every one it holds except
+    /// those it refused.
+    fn served(&self) -> impl Iterator<Item = (&ConnId, &ConnHandle)> {
+        self.conns
+            .iter()
+            .filter(|(_, conn)| !conn.refused.is_cancelled())
     }
 
     /// Refuse an inbound update the live doc already holds, all of it or
@@ -465,7 +501,7 @@ mod tests {
 
     /// An update nesting a board's types deeper than a room accepts is
     /// neither applied nor fanned out (`crate::nesting`), and its sender is
-    /// told to close; the next one is applied.
+    /// told to close; the next one, from another connection, is applied.
     #[tokio::test(flavor = "multi_thread")]
     async fn board_room_refuses_a_deeply_nested_update() {
         use yrs::{Map, MapPrelim, ReadTxn, StateVector, Transact};
@@ -479,7 +515,7 @@ mod tests {
             .await
             .unwrap();
         let mut conns = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             let conn_id = Uuid::new_v4();
             let (tx, rx) = mpsc::channel(64);
             let handle = ConnHandle::new(tx);
@@ -508,15 +544,15 @@ mod tests {
             doc.transact()
                 .encode_state_as_update_v1(&StateVector::default())
         };
-        let sender = conns[0].0;
+        let (sender, writer) = (conns[0].0, conns[2].0);
         let shallow = update(1);
-        for bytes in [update(crate::nesting::MAX_NESTING + 1), shallow.clone()] {
-            h.tx.send(Event::Inbound(InMsg {
-                from: sender,
-                bytes,
-            }))
-            .await
-            .unwrap();
+        for (from, bytes) in [
+            (sender, update(crate::nesting::MAX_NESTING + 1)),
+            (writer, shallow.clone()),
+        ] {
+            h.tx.send(Event::Inbound(InMsg { from, bytes }))
+                .await
+                .unwrap();
         }
         let fanned = tokio::time::timeout(std::time::Duration::from_secs(10), conns[1].1.recv())
             .await
