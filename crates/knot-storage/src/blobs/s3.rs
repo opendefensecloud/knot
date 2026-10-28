@@ -16,6 +16,7 @@ use s3::Bucket;
 use s3::Region;
 use s3::creds::Credentials;
 use s3::error::S3Error;
+use s3::request::ResponseData;
 use uuid::Uuid;
 
 use super::{BlobStore, BlobStoreError, Result};
@@ -107,6 +108,24 @@ fn head_size(
     }
 }
 
+/// The file's bytes, from what a `GetObject` of `key` answered.
+///
+/// As for `head_size`, only a 404 status means the object is missing, and
+/// an `Err` is a request that failed, whose text (the URL, with a key that
+/// can contain "404") says nothing about the object. Any other status that
+/// isn't 2xx is a refusal or a failure: its body is the store's error
+/// document, not the file.
+fn got(key: &str, resp: std::result::Result<ResponseData, S3Error>) -> Result<Vec<u8>> {
+    let resp = resp.map_err(|e| BlobStoreError::Backend(format!("s3 get {key}: {e}")))?;
+    match resp.status_code() {
+        200..=299 => Ok(resp.to_vec()),
+        404 => Err(BlobStoreError::NotFound),
+        status => Err(BlobStoreError::Backend(format!(
+            "s3 get {key}: status {status}"
+        ))),
+    }
+}
+
 /// Whether the copy of `from` (`size` bytes, by its HEAD) arrived at `to`,
 /// given the HEAD of `to`. Only two sizes that are known and equal count:
 /// without them, a failed copy can't be told from a good one.
@@ -148,21 +167,7 @@ impl BlobStore for S3Store {
 
     async fn get(&self, id: Uuid) -> Result<Vec<u8>> {
         let key = self.key(id);
-        let resp = self.bucket.get_object(&key).await.map_err(|e| {
-            let s = format!("{e}");
-            if s.contains("404")
-                || s.to_lowercase().contains("not found")
-                || s.contains("NoSuchKey")
-            {
-                BlobStoreError::NotFound
-            } else {
-                BlobStoreError::Backend(format!("s3 get {key}: {e}"))
-            }
-        })?;
-        if resp.status_code() == 404 {
-            return Err(BlobStoreError::NotFound);
-        }
-        Ok(resp.bytes().to_vec())
+        got(&key, self.bucket.get_object(&key).await)
     }
 
     async fn delete(&self, id: Uuid) -> Result<()> {
@@ -232,6 +237,45 @@ mod tests {
         assert!(is_not_found(&head_size(KEY, Ok((None, 404)))));
         for status in [301, 403, 500, 503] {
             let result = head_size(KEY, Ok((Some(5), status)));
+            assert!(is_backend(&result), "{status}: {result:?}");
+        }
+    }
+
+    /// A request that failed says nothing about the object, whatever its
+    /// text holds: the URL, whose key can contain "404", or a message that
+    /// mentions "not found" or "NoSuchKey".
+    #[test]
+    fn a_failed_get_request_is_a_backend_error() {
+        for text in [
+            format!("error sending request for url (https://s3.example/{KEY}): connection reset"),
+            "dns error: host not found".to_string(),
+            "NoSuchKey retry budget exhausted".to_string(),
+        ] {
+            let failed = Err(S3Error::Io(std::io::Error::other(text.clone())));
+            let result = got(KEY, failed);
+            assert!(is_backend(&result), "{text}: {result:?}");
+        }
+    }
+
+    /// Only a 404 means the object is missing, and only a 2xx carries its
+    /// bytes. Without `fail-on-err` every other status arrives as `Ok`, its
+    /// body an error document, not the file.
+    #[test]
+    fn get_status_decides_the_result() {
+        let answer = |status: u16, body: &[u8]| {
+            Ok(ResponseData::new(
+                body.to_vec().into(),
+                status,
+                std::collections::HashMap::new(),
+            ))
+        };
+        assert_eq!(got(KEY, answer(200, b"bytes")).unwrap(), b"bytes");
+        assert!(is_not_found(&got(
+            KEY,
+            answer(404, b"<Error>NoSuchKey</Error>")
+        )));
+        for status in [301, 403, 500, 503] {
+            let result = got(KEY, answer(status, b"<Error>AccessDenied</Error>"));
             assert!(is_backend(&result), "{status}: {result:?}");
         }
     }
