@@ -298,10 +298,15 @@ test("duplicate_with_subpages", async ({ page, browser }) => {
   await page.getByTestId("excalidraw-modal-close").click();
   await expect(page.getByTestId("excalidraw-modal")).toHaveCount(0);
 
-  // Everything has reached the server: a browser of its own shows it all.
-  const original = await inFreshBrowser(browser, page, `/doc/${ids.Handbook}`, (fresh) =>
-    expectContentShown(fresh, shares),
-  );
+  // Everything has reached the server before it is copied: a browser of its
+  // own shows it all, with the drawing in the board itself, not just in its
+  // preview (the preview is saved apart from the board's content).
+  const original = await inFreshBrowser(browser, page, `/doc/${ids.Handbook}`, async (fresh) => {
+    const shown = await expectContentShown(fresh, shares);
+    await openBoard(fresh);
+    await expect.poll(() => boardElements(fresh)).toBe(1);
+    return shown;
+  });
   const originalBoard = await boardOf(page, ids.Handbook);
 
   // The dialog, with its subpages ticked.
