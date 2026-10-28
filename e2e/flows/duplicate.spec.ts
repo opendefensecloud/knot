@@ -7,24 +7,18 @@ import { expect, test, type Browser, type Locator, type Page } from "@playwright
 
 import { reset } from "../support/reset";
 
-import { outline, seedPages, setupOwner, showTree } from "./tree-helpers";
+import { outline, seedPages, setupOwner, showTree, writeHeaders } from "./tree-helpers";
 
 // Per test, not once: both tests sign up through /setup, which closes as
 // soon as a user exists.
 test.beforeEach(reset);
 
-// 70-byte transparent 1x1 PNG.
+// 69-byte transparent 1x1 PNG.
 const TINY_PNG_HEX =
   "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da6360600000000004000" +
   "15c5b66e30000000049454e44ae426082";
 
 const EDITOR = "[data-testid='editor-host'] .ProseMirror";
-
-async function writeHeaders(page: Page): Promise<Record<string, string>> {
-  const csrf = (await page.context().cookies()).find((c) => c.name === "csrf");
-  if (!csrf) throw new Error("csrf cookie not found");
-  return { "X-CSRF-Token": csrf.value };
-}
 
 async function waitConnected(page: Page): Promise<void> {
   await expect(page.getByTestId("status-dot")).toHaveAttribute("data-status", "connected", {
@@ -72,7 +66,7 @@ test("duplicate_without_subpages", async ({ page }) => {
     { title: "Delta" },
   ]);
   const md = await page.request.post(`/api/docs/${ids.Charlie}/markdown`, {
-    headers: { ...(await writeHeaders(page)), "Content-Type": "text/markdown" },
+    headers: { ...(await writeHeaders(page.request)), "Content-Type": "text/markdown" },
     data: "Agenda for Charlie\n",
   });
   expect(md.status()).toBe(204);
@@ -360,7 +354,7 @@ test("duplicate_with_subpages", async ({ page, browser }) => {
   // are gone, and the copy still shows its own, with the drawing in the
   // board, not just in its preview.
   const purged = await page.request.post(`/api/docs/${ids.Handbook}/purge`, {
-    headers: await writeHeaders(page),
+    headers: await writeHeaders(page.request),
   });
   expect(purged.status()).toBe(204);
   expect((await page.request.get(original.src)).status()).toBe(404);

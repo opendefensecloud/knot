@@ -33,7 +33,8 @@ export async function setupOwner(page: Page): Promise<void> {
   await expect(page.getByTestId("doc-tree")).toBeVisible({ timeout: 10_000 });
 }
 
-async function writeHeaders(request: APIRequestContext): Promise<Record<string, string>> {
+/** The CSRF header a write through `request` needs: its session's csrf cookie. */
+export async function writeHeaders(request: APIRequestContext): Promise<Record<string, string>> {
   const { cookies } = await request.storageState();
   const csrf = cookies.find((c) => c.name === "csrf");
   if (!csrf) throw new Error("csrf cookie not found: sign in before seeding");
