@@ -182,22 +182,49 @@ function headerWidths(page: Page): Promise<number[]> {
     .evaluateAll((cells) => cells.map((cell) => cell.getBoundingClientRect().width));
 }
 
+/** Waits until the open page shows its first image, loaded and not broken,
+ *  from one of knot's files. Returns its src. */
+async function shownImage(page: Page): Promise<string> {
+  const img = page.locator(`${EDITOR} img`).first();
+  await expect(img).toBeVisible({ timeout: 10_000 });
+  await expect
+    .poll(() => img.evaluate((el) => (el as HTMLImageElement).complete && (el as HTMLImageElement).naturalWidth > 0))
+    .toBe(true);
+  const src = await img.getAttribute("src");
+  expect(src).toMatch(/^\/api\/blobs\/[0-9a-f-]{36}$/);
+  return src!;
+}
+
 /**
  * Waits until the open page shows its image (loaded, not broken), its
  * board's preview and its table with the columns at `shares`. Returns the
  * image's src and the header cells' widths.
  */
 async function expectContentShown(page: Page, shares: string[]): Promise<{ src: string; widths: number[] }> {
-  const img = page.locator(`${EDITOR} img`).first();
-  await expect(img).toBeVisible({ timeout: 10_000 });
-  await expect
-    .poll(() => img.evaluate((el) => (el as HTMLImageElement).complete && (el as HTMLImageElement).naturalWidth > 0))
-    .toBe(true);
+  const src = await shownImage(page);
   await expect(page.locator("[data-testid='excalidraw-board'] svg").first()).toBeVisible({ timeout: 10_000 });
   await expect.poll(() => columnShares(page)).toEqual(shares);
-  const src = await img.getAttribute("src");
-  expect(src).toMatch(/^\/api\/blobs\/[0-9a-f-]{36}$/);
-  return { src: src!, widths: await headerWidths(page) };
+  return { src, widths: await headerWidths(page) };
+}
+
+/** Uploads the tiny PNG as a file of page `docId`. Returns its URL. */
+async function uploadImage(page: Page, docId: string): Promise<string> {
+  const res = await page.request.post(`/api/docs/${docId}/blobs`, {
+    headers: await writeHeaders(page.request),
+    multipart: { file: { name: "tiny.png", mimeType: "image/png", buffer: Buffer.from(TINY_PNG_HEX, "hex") } },
+  });
+  expect(res.status()).toBe(201);
+  return ((await res.json()) as { url: string }).url;
+}
+
+/** The id of page `parentId`'s subpage titled `title`. */
+async function childOf(page: Page, parentId: string, title: string): Promise<string> {
+  const res = await page.request.get("/api/docs");
+  expect(res.status()).toBe(200);
+  const docs = (await res.json()) as { id: string; parent_id: string | null; title: string }[];
+  const child = docs.filter((d) => d.parent_id === parentId && d.title === title);
+  expect(child).toHaveLength(1);
+  return child[0]!.id;
 }
 
 /**
@@ -242,7 +269,7 @@ async function svgOf(page: Page, board: Board): Promise<string> {
 }
 
 test("duplicate_with_subpages", async ({ page, browser }) => {
-  // Two Excalidraw loads and three browser contexts: on a cold dev server,
+  // Three Excalidraw loads and six browser contexts: on a cold dev server,
   // more than the default 30 s.
   test.slow();
   await setupOwner(page);
@@ -252,6 +279,13 @@ test("duplicate_with_subpages", async ({ page, browser }) => {
     { title: "Section", parent: "Chapter" },
     { title: "Appendix" },
   ]);
+  // A subpage with content of its own: a paragraph and an image.
+  const chapterImage = await uploadImage(page, ids.Chapter);
+  const md = await page.request.post(`/api/docs/${ids.Chapter}/markdown`, {
+    headers: { ...(await writeHeaders(page.request)), "Content-Type": "text/markdown" },
+    data: `Chapter text\n\n![tiny](${chapterImage})\n`,
+  });
+  expect(md.status()).toBe(204);
   await showTree(page, Object.values(ids), `/doc/${ids.Handbook}`);
   await waitConnected(page);
 
@@ -349,6 +383,16 @@ test("duplicate_with_subpages", async ({ page, browser }) => {
   expect(copyBoard.id).not.toBe(originalBoard.id);
   expect(await svgOf(page, copyBoard)).toBe(await svgOf(page, originalBoard));
 
+  // The copy's subpage has the subpage's text, and its image from a file
+  // of its own.
+  const copyChapter = await childOf(page, copy, "Chapter");
+  const chapterShown = async (fresh: Page) => {
+    await expect(fresh.locator(EDITOR)).toContainText("Chapter text");
+    return shownImage(fresh);
+  };
+  const copiedChapterImage = await inFreshBrowser(browser, page, `/doc/${copyChapter}`, chapterShown);
+  expect(copiedChapterImage).not.toBe(chapterImage);
+
   // Archive the original with its subpages: the copy still shows it all.
   page.once("dialog", (dialog) => {
     expect(dialog.message()).toContain('Move "Handbook" to the archive?');
@@ -371,10 +415,12 @@ test("duplicate_with_subpages", async ({ page, browser }) => {
   expect(purged.status()).toBe(204);
   expect((await page.request.get(original.src)).status()).toBe(404);
   expect((await page.request.get(`/api/boards/${originalBoard.id}/svg`)).status()).toBe(404);
+  expect((await page.request.get(chapterImage)).status()).toBe(404);
   await inFreshBrowser(browser, page, `/doc/${copy}`, async (fresh) => {
     expect((await expectContentShown(fresh, shares)).src).toBe(copied.src);
     await openBoard(fresh);
     await expect.poll(() => boardElements(fresh)).toBe(1);
   });
+  expect(await inFreshBrowser(browser, page, `/doc/${copyChapter}`, chapterShown)).toBe(copiedChapterImage);
 });
 
