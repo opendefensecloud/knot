@@ -1745,6 +1745,91 @@ async fn byline_credits_the_duplicating_user() {
     );
 }
 
+/// Spec D: comments, history, share links and grants stay with the source.
+/// A copied grant would widen who can reach the copy, and a copied share
+/// link would publish it.
+#[tokio::test(flavor = "multi_thread")]
+async fn comments_history_shares_and_grants_are_not_copied() {
+    let w = world().await;
+    let source = w.create_doc(&w.owner, "Plan", None).await;
+    let viewer = w.member("viewer@duplicate.test", "viewer").await;
+    let post = |uri: String, body: Value| {
+        let (app, owner) = (w.app.clone(), w.owner.clone());
+        async move {
+            let response = send_json(&app, &owner, "POST", &uri, body).await;
+            assert_eq!(response.status(), StatusCode::CREATED, "{uri}");
+        }
+    };
+    post(
+        format!("/api/docs/{source}/comments"),
+        json!({"body": "Looks good", "anchor_text": "Plan"}),
+    )
+    .await;
+    post(format!("/api/docs/{source}/shares"), json!({})).await;
+    let granted = send_json(
+        &w.app,
+        &w.owner,
+        "PUT",
+        &format!("/api/docs/{source}/grants/user:{}", viewer.user_id),
+        json!({"role": "editor", "inherit": true}),
+    )
+    .await;
+    assert!(granted.status().is_success(), "grant");
+    // Two history entries, each a snapshot of the page as it then was.
+    let snapshots = PgSnapshotStore::new(w.pool().clone());
+    let updates = PgUpdatesStore::new(w.pool().clone());
+    for draft in ["First draft.\n", "Second draft.\n"] {
+        w.set_markdown(source, draft).await;
+        let state = w.stored(source).await;
+        let txn = state.transact();
+        snapshots
+            .insert(
+                source,
+                updates.max_seq(source).await.unwrap(),
+                &txn.encode_state_as_update_v1(&yrs::StateVector::default()),
+                &yrs::updates::encoder::Encode::encode_v1(&txn.state_vector()),
+            )
+            .await
+            .unwrap();
+    }
+    // The lists of `doc_id`, as the owner sees them.
+    let world = &w;
+    let lists = |doc_id: Uuid| async move {
+        let mut lengths = Vec::new();
+        for list in ["comments", "shares", "grants", "history"] {
+            let (status, body) = world.fetch(&format!("/api/docs/{doc_id}/{list}")).await;
+            assert_eq!(status, StatusCode::OK, "{list}");
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            lengths.push((list, body.as_array().unwrap().len()));
+        }
+        lengths
+    };
+    assert_eq!(
+        lists(source).await,
+        [
+            ("comments", 1),
+            ("shares", 1),
+            ("grants", 1),
+            ("history", 2)
+        ]
+    );
+
+    let copy = id_of(&w.duplicate_ok(source, None).await);
+
+    assert_eq!(
+        lists(copy).await,
+        [
+            ("comments", 0),
+            ("shares", 0),
+            ("grants", 0),
+            ("history", 0)
+        ]
+    );
+    // The copy's whole history is the one update that holds its content.
+    assert_eq!(updates.since(copy, 0).await.unwrap().len(), 1);
+    assert!(w.markdown(copy).await.contains("Second draft."));
+}
+
 /// A copy is a copy: its checklist items are tasks again, for the same
 /// assignees, and its Markdown is cached by the current renderer.
 #[tokio::test(flavor = "multi_thread")]
