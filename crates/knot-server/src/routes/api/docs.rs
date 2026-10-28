@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::archive::{PurgeError, PurgeTrigger};
 use crate::auth::{AuthContext, DocArchived, EffectiveDocRole, require_doc_role_mw};
-use crate::duplicate::{DuplicateError, MAX_DUPLICATE_BLOB_BYTES, MAX_DUPLICATE_PAGES};
+use crate::duplicate::{BUSY_WAIT, DuplicateError, MAX_DUPLICATE_BLOB_BYTES, MAX_DUPLICATE_PAGES};
 use crate::http_error::{doc_archived, json_err};
 
 #[derive(Serialize)]
@@ -413,6 +413,11 @@ async fn duplicate(
     let Ok(body) = read_json::<DuplicateRequest>(req).await else {
         return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
     };
+    // Before the wait for a permit: these answers need none, so a busy
+    // server doesn't turn them into 503s.
+    if let Err(e) = crate::duplicate::check(&state, &ctx, role.0, doc_id).await {
+        return duplicate_error(e);
+    }
     // Taken before the copy starts, and held until its refresh ends, so no
     // more than the permitted copies are held in memory at once.
     let permit = tokio::time::timeout(
@@ -443,7 +448,8 @@ async fn duplicate(
 }
 
 /// `503 doc.duplicate_busy`: every duplicate permit stayed taken for the
-/// busy wait.
+/// busy wait. A retry is worth it once a copy may have ended: after
+/// [`BUSY_WAIT`], the time a duplicate waits for a permit.
 fn duplicate_busy() -> Response {
     let mut response = json_err(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -452,7 +458,7 @@ fn duplicate_busy() -> Response {
     );
     response
         .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        .insert(header::RETRY_AFTER, HeaderValue::from(BUSY_WAIT.as_secs()));
     response
 }
 

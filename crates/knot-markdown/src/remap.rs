@@ -20,6 +20,7 @@
 //! A rewritten id is written hyphenated, and everything else in the page
 //! stays as it is.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -167,8 +168,12 @@ fn sites<T: ReadTxn>(txn: &T, offsets: OffsetKind) -> Vec<Site> {
     let Some(frag) = txn.get_xml_fragment("default") else {
         return out;
     };
-    // Read once, when a text first needs it.
-    let mut held = None;
+    // Read once per call, when a text with a reference link first needs it:
+    // it encodes and decodes the whole document. Duplicate calls
+    // `references` and then `remap_refs` for each page, so a page with
+    // reference links is decoded twice; that is fine within Duplicate's cap
+    // of 200 pages.
+    let held = OnceCell::new();
     // Iterative, so it is safe at any depth: children go on the stack in
     // reverse, so they pop in document order.
     let mut stack = Vec::new();
@@ -180,7 +185,7 @@ fn sites<T: ReadTxn>(txn: &T, offsets: OffsetKind) -> Vec<Site> {
                 push_children(&mut stack, txn, &el);
             }
             XmlOut::Fragment(f) => push_children(&mut stack, txn, &f),
-            XmlOut::Text(t) => links(txn, &t, offsets, &mut held, &mut out),
+            XmlOut::Text(t) => links(txn, &t, offsets, &held, &mut out),
         }
     }
     out
@@ -229,7 +234,7 @@ fn links<T: ReadTxn>(
     txn: &T,
     text: &XmlTextRef,
     offsets: OffsetKind,
-    held: &mut Option<Option<HeldItems>>,
+    held: &OnceCell<Option<HeldItems>>,
     out: &mut Vec<Site>,
 ) {
     let chunks = text.diff(txn, YChange::identity);
@@ -242,7 +247,7 @@ fn links<T: ReadTxn>(
     {
         return;
     }
-    let Some(held) = held.get_or_insert_with(|| HeldItems::read(txn)) else {
+    let Some(held) = held.get_or_init(|| HeldItems::read(txn)) else {
         return;
     };
     let held = held.of(text);

@@ -1964,6 +1964,40 @@ async fn busy_duplicate_is_503() {
     w.duplicate_ok(source, None).await;
 }
 
+/// The checks that need no permit come before the wait for one: while
+/// every permit is taken, a viewer still gets 403 `acl.editor_required`
+/// and a template 422 `doc.is_template`, never 503. RED on HEAD: both got
+/// 503 `doc.duplicate_busy`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_server_still_answers_a_viewer_and_a_template_with_their_own_codes() {
+    let w = world_with(|state| {
+        state.duplicate_permits = Arc::new(Semaphore::new(0));
+        state.duplicate_busy_wait = Duration::from_millis(50);
+    })
+    .await;
+    let source = w.create_doc(&w.owner, "Plan", None).await;
+    let template = w.create_doc(&w.owner, "Meeting notes", None).await;
+    let response = send_json(
+        &w.app,
+        &w.owner,
+        "POST",
+        &format!("/api/docs/{template}/template"),
+        json!({"is_template": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "make template");
+    let viewer = w.member("viewer@duplicate.test", "viewer").await;
+    let rows = w.counts().await;
+
+    let response = w.duplicate(&viewer, source, None).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_code(response).await, "acl.editor_required");
+    let response = w.duplicate(&w.owner, template, None).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(response).await, "doc.is_template");
+    assert_eq!(w.counts().await, rows, "nothing is copied");
+}
+
 /// A duplicate keeps its permit until the refresh of its copy ends, so
 /// no more copies than permitted are ever held in memory, and gives it back
 /// after a success and after a failure alike.

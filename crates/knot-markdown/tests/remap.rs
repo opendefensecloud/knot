@@ -844,33 +844,60 @@ fn a_deleted_embed_takes_no_room() {
     assert_eq!(dump(&back), dump(&want));
 }
 
-#[test]
-fn a_document_counting_utf16_units_keeps_the_mark_on_its_characters() {
+/// `source`'s content in a document that counts UTF-16 units, as a Yjs
+/// client's does.
+fn in_utf16(source: &DocHandle) -> Doc {
+    use yrs::{Transact, Update, updates::decoder::Decode};
+
     let doc = Doc::with_options(Options {
         offset_kind: OffsetKind::Utf16,
         ..Options::default()
     });
-    {
-        use yrs::{Transact, Update, updates::decoder::Decode};
-        let source = build(&non_ascii(DOC, LINKED));
-        let state = YrsEngine
-            .encode_state_as_update(&source, None)
-            .expect("encode");
-        let mut txn = doc.transact_mut();
-        txn.apply_update(Update::decode_v1(&state).expect("decode"))
-            .expect("apply");
-    }
-    assert_eq!(remap_refs(&doc, &remap()), 2);
+    let state = YrsEngine
+        .encode_state_as_update(source, None)
+        .expect("encode");
+    doc.transact_mut()
+        .apply_update(Update::decode_v1(&state).expect("decode"))
+        .expect("apply");
+    doc
+}
+
+/// `doc`'s content back in a document as knot makes them.
+fn back_from(doc: &Doc) -> DocHandle {
+    use yrs::{ReadTxn, Transact};
 
     let back = YrsEngine.new_doc();
-    {
-        use yrs::{ReadTxn, Transact};
-        let state = doc
-            .transact()
-            .encode_state_as_update_v1(&Default::default());
-        YrsEngine.apply_update(&back, &state).expect("apply");
-    }
-    assert_eq!(dump(&back), dump(&build(&non_ascii(DOC_NEW, LINKED_NEW))));
+    let state = doc
+        .transact()
+        .encode_state_as_update_v1(&Default::default());
+    YrsEngine.apply_update(&back, &state).expect("apply");
+    back
+}
+
+#[test]
+fn a_document_counting_utf16_units_keeps_the_mark_on_its_characters() {
+    let doc = in_utf16(&build(&non_ascii(DOC, LINKED)));
+    assert_eq!(remap_refs(&doc, &remap()), 2);
+    assert_eq!(
+        dump(&back_from(&doc)),
+        dump(&build(&non_ascii(DOC_NEW, LINKED_NEW)))
+    );
+}
+
+/// "Grüße " (one unit more in bytes than in UTF-16), an embed (one unit
+/// either way), then the link: in a document counting UTF-16 units, the
+/// link is rewritten on its own characters. Regression guard: F3 made
+/// embeds count one and offsets follow the document's offset kind.
+#[test]
+fn utf16_non_ascii_text_and_an_embed_before_a_link_keep_the_mark_on_its_characters() {
+    let embed = Any::Map(Arc::new(HashMap::from([("k".into(), Any::from("v"))])));
+    let doc = in_utf16(&with_embed(&doc_url(DOC), Some(embed)));
+    assert_eq!(remap_refs(&doc, &remap()), 1);
+    // `dump` leaves the embed out.
+    assert_eq!(
+        dump(&back_from(&doc)),
+        dump(&with_embed(&doc_url(DOC_NEW), None))
+    );
 }
 
 #[test]

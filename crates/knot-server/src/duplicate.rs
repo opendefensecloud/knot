@@ -171,6 +171,38 @@ pub fn start(
     answered
 }
 
+/// Whether `ctx`'s user, whose role on the page is `doc_role`, may copy
+/// `source_id`: the user's roles (P15), and a live page of their workspace
+/// that is no template. Returns the page. None of it needs a permit, so the
+/// route checks it before it waits for one: a viewer or a template gets its
+/// own answer while the server is busy. [`run`] checks it again.
+pub async fn check(
+    state: &AppState,
+    ctx: &AuthContext,
+    doc_role: WorkspaceRole,
+    source_id: Uuid,
+) -> Result<Document, DuplicateError> {
+    // P15: the copy is a new page, so the workspace role counts too.
+    if doc_role == WorkspaceRole::Viewer || ctx.role == WorkspaceRole::Viewer {
+        return Err(DuplicateError::EditorRequired);
+    }
+    let docs = state
+        .docs
+        .as_ref()
+        .ok_or_else(|| internal("docs not configured"))?;
+    let source = match docs.get(source_id).await.map_err(internal)? {
+        Some(doc) if doc.workspace_id == ctx.workspace_id => doc,
+        _ => return Err(DuplicateError::NotFound),
+    };
+    if source.is_template {
+        return Err(DuplicateError::IsTemplate);
+    }
+    if source.archived_at.is_some() {
+        return Err(DuplicateError::Archived);
+    }
+    Ok(source)
+}
+
 /// Copy `source_id` as `ctx`'s user, whose role on the page is `doc_role`,
 /// right after it, with its live subpages when `include_subpages`. Returns
 /// once the copy is stored, with the refresh of its derived data still to
@@ -182,10 +214,7 @@ pub async fn run(
     source_id: Uuid,
     include_subpages: bool,
 ) -> Result<Copied, DuplicateError> {
-    // P15: the copy is a new page, so the workspace role counts too.
-    if doc_role == WorkspaceRole::Viewer || ctx.role == WorkspaceRole::Viewer {
-        return Err(DuplicateError::EditorRequired);
-    }
+    let source = check(&state, &ctx, doc_role, source_id).await?;
     let not_configured = |what: &str| internal(format!("{what} not configured"));
     let docs = state.docs.as_ref().ok_or_else(|| not_configured("docs"))?;
     let pool = state.pool.as_ref().ok_or_else(|| not_configured("pool"))?;
@@ -199,16 +228,6 @@ pub async fn run(
         .ok_or_else(|| not_configured("boards"))?;
     let ws = ctx.workspace_id;
 
-    let source = match docs.get(source_id).await.map_err(internal)? {
-        Some(doc) if doc.workspace_id == ws => doc,
-        _ => return Err(DuplicateError::NotFound),
-    };
-    if source.is_template {
-        return Err(DuplicateError::IsTemplate);
-    }
-    if source.archived_at.is_some() {
-        return Err(DuplicateError::Archived);
-    }
     let subpages = if include_subpages {
         docs.live_subtree(ws, source_id).await.map_err(internal)?
     } else {
