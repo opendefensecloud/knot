@@ -56,8 +56,11 @@ const SCREEN_READER_INSTRUCTIONS = {
  *  when the drag starts, and the rows below it move up. */
 const MEASURING = { droppable: { strategy: MeasuringStrategy.Always } };
 
+/** The scope the move mutations queue in, one at a time. */
+const MOVE_SCOPE = "docs-move";
+
 /** The key of the move mutations, to count the pending ones. */
-const MOVE_KEY = ["docs-move"];
+const MOVE_KEY = [MOVE_SCOPE];
 
 /** The key of the duplicate mutations, to tell whether one is on its way. */
 const DUPLICATE_KEY = ["docs-duplicate"];
@@ -119,7 +122,7 @@ export function DocTree() {
   // planned from the list the moves before it show.
   const move = useMutation({
     mutationKey: MOVE_KEY,
-    scope: { id: "docs-move" },
+    scope: { id: MOVE_SCOPE },
     mutationFn: async (a: { id: string; body: MoveArgs }) => {
       const r = await docsApi.move(a.id, a.body);
       // Thrown, so a refused move (409, 422) is rolled back like a failed request.
