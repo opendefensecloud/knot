@@ -60,11 +60,11 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     );
     describe_counter!(
         "knot_room_updates_refused_total",
-        "Inbound CRDT updates a page or board room refused: ones that nest the document's types deeper than the room accepts (knot_crdt::nesting::MAX_NESTING), refused by the best-effort prefilter before applying or by the authoritative check after applying, and ones yrs could not apply. A refusal after applying also evicts the room (see knot_room_evicted_total)"
+        "Inbound CRDT updates a page or board room refused, closing their sender with 4422: ones that nest the document's types deeper than the room accepts (knot_crdt::nesting::MAX_NESTING), refused by the best-effort prefilter before applying or by the authoritative check after applying (also when yrs rejected the rest of the update), and ones that don't decode, of which nothing is applied. Only a refusal after applying evicts the room (see knot_room_evicted_total). An update yrs rejects part-way within the limit is not refused: as before, it is neither persisted nor fanned out, and its sender stays"
     );
     describe_counter!(
         "knot_room_evicted_total",
-        "Rooms that evicted themselves after applying an inbound update they then refused, by reason. reason=nesting: the update nested the document's types past knot_crdt::nesting::MAX_NESTING (the authoritative post-apply check). reason=apply_failed: yrs rejected the update, part-way after integrating some of it, or before applying anything (it does not decode). Either way the update was neither persisted nor fanned out, every connection of the room was closed (a page room's sender with 4422, every other one with 1012) so its client reconnects, and the next join reloads the page from storage"
+        "Rooms that evicted themselves after applying an inbound update that nested the document's types past knot_crdt::nesting::MAX_NESTING (the authoritative post-apply check), whether yrs applied all of the update or rejected the rest. The update was neither persisted nor fanned out, every connection of the room was closed (the sender with 4422, every other one with 1012) so its client reconnects, and the next join reloads the page from storage"
     );
     describe_counter!("knot_room_snapshots_total", "Snapshots written to storage");
     describe_histogram!(

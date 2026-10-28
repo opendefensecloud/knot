@@ -58,7 +58,8 @@ pub enum ItemParent {
 /// ranges are passed over, their clocks counted.
 ///
 /// An update that doesn't decode yields the items before the error, then
-/// the error, and then nothing.
+/// the error, and then nothing. A block whose clocks run past `u32::MAX`
+/// is such an error, where yrs's own decoder doesn't check.
 pub fn decode(update: &[u8]) -> UpdateItems<'_> {
     UpdateItems {
         decoder: DecoderV1::new(Cursor::new(update)),
@@ -124,15 +125,28 @@ impl UpdateItems<'_> {
                 BLOCK_GC_REF_NUMBER => self.decoder.read_len()?,
                 info => match read_item(&mut self.decoder, id, info)? {
                     Some(item) => {
-                        self.next.clock += item.len;
+                        self.next.clock = clock_after(id, item.len)?;
                         return Ok(Some(item));
                     }
                     None => 0,
                 },
             };
-            self.next.clock += len;
+            self.next.clock = clock_after(id, len)?;
         }
     }
+}
+
+/// The clock after a block of `len` clocks at `id`. A block whose clocks run
+/// past `u32::MAX` doesn't decode: yrs's own decoder adds them up unchecked,
+/// which panics in a debug build and wraps in a release build.
+fn clock_after(id: ID, len: u32) -> Result<u32, Error> {
+    id.clock.checked_add(len).ok_or_else(|| {
+        Error::Custom(format!(
+            "a block of {len} clocks at {}:{} runs past u32::MAX",
+            id.client.get(),
+            id.clock
+        ))
+    })
 }
 
 /// The item with `id` whose `info` was just read, read as `decode_block`

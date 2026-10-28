@@ -2184,6 +2184,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "uuid",
+ "yrs",
 ]
 
 [[package]]

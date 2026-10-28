@@ -26,13 +26,21 @@ pub async fn serve(
     };
     let conn_id: ConnId = Uuid::new_v4();
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(256);
+    // Cancelled by the board room when it refuses an update this connection
+    // sent (it nests the board too deep, or it doesn't decode); the writer
+    // then closes with 4422.
+    let refused = CancellationToken::new();
+    let conn_handle = || ConnHandle {
+        tx: out_tx.clone(),
+        refused: refused.clone(),
+    };
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if handle
         .tx
         .send(Event::Join {
             conn_id,
-            handle: ConnHandle { tx: out_tx.clone() },
+            handle: conn_handle(),
             reply: reply_tx,
         })
         .await
@@ -54,19 +62,20 @@ pub async fn serve(
 
     let (sink, mut stream) = socket.split();
     // As in `room::serve`: whichever half ends the session cancels `done` so
-    // the other stops. Boards have no ACL revocation of their own, and a
-    // board connection has no refusal signal, so the writer's revoke and
-    // refuse signals are never raised here. When the board room ends (it
-    // evicts itself after refusing an update, or its actor stops), its token
-    // closes every connection, the sender's included, with 1012, so each
-    // client reconnects to a fresh board room and re-sends its edits.
+    // the other stops. Boards have no ACL revocation of their own, so the
+    // writer's revoke signal is never raised here. A refused sender is
+    // closed with 4422. When the board room ends (it evicts itself after
+    // refusing an update it had applied, which nested the board too deep,
+    // or its actor stops), its token closes every other connection with
+    // 1012, so each client reconnects to a fresh board room and re-sends
+    // its edits.
     let done = CancellationToken::new();
     let writer = tokio::spawn(crate::ws_writer::run(
         sink,
         out_rx,
         shutdown.clone(),
         CancellationToken::new(),
-        CancellationToken::new(),
+        refused.clone(),
         handle.shutdown.clone(),
         done.clone(),
     ));
@@ -89,7 +98,7 @@ pub async fn serve(
                         .tx
                         .send(Event::Join {
                             conn_id,
-                            handle: ConnHandle { tx: out_tx.clone() },
+                            handle: conn_handle(),
                             reply: rtx,
                         })
                         .await;

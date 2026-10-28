@@ -27,6 +27,7 @@ use knot_storage::{
     BoardStore, PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore, WorkspaceRole,
     sort_key_between,
 };
+use knot_test_support::crafted::crafted_attack;
 use tokio::net::TcpListener;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
@@ -722,9 +723,9 @@ async fn board_noop_sync_reply_is_neither_persisted_nor_fanned_out() {
 // A room that evicts itself closes every connection, not only the sender's
 // ---------------------------------------------------------------------------
 
-/// An update payload yrs can't decode: what a broken or crafted client
-/// sends. A room refuses it and evicts itself (`knot_crdt::nesting`), so the
-/// next join reloads the page from storage.
+/// An update payload that doesn't decode: what a broken or crafted client
+/// sends. Nothing of it is applied, so a room refuses only its sender
+/// (`knot_crdt::nesting`).
 const UNDECODABLE_UPDATE: &[u8] = &[0xff, 0xff, 0xff];
 
 impl Peer {
@@ -803,9 +804,12 @@ async fn doc_peers_of_a_room_that_evicts_itself_are_closed_and_resync() {
         "A never received B's edit"
     );
 
-    // A sends an update yrs can't apply: the room refuses it and evicts
-    // itself.
-    a.send_raw_update(UNDECODABLE_UPDATE).await;
+    // A sends a page, then an update that nests it too deep where only the
+    // room's check after apply sees it (`knot_test_support::crafted`): the
+    // room refuses that one after applying it and evicts itself.
+    let (base, too_deep) = crafted_attack();
+    a.send_raw_update(&base).await;
+    a.send_raw_update(&too_deep).await;
     assert_eq!(
         a.close_code(DEADLINE).await,
         Some(4422),
@@ -859,9 +863,8 @@ async fn doc_peers_of_a_room_that_evicts_itself_are_closed_and_resync() {
     c.disconnect().await;
 }
 
-/// The same for a board room. A board connection has no refusal signal of
-/// its own, so every connection, the sender's included, is closed with 1012
-/// and reconnects to the reloaded board room.
+/// The same for a board room: the sender is closed with 4422, every other
+/// connection with 1012, and each reconnects to the reloaded board room.
 #[tokio::test(flavor = "multi_thread")]
 async fn board_peers_of_a_board_room_that_evicts_itself_are_closed_and_resync() {
     let fx = fixture().await;
@@ -890,11 +893,13 @@ async fn board_peers_of_a_board_room_that_evicts_itself_are_closed_and_resync() 
         "A never received B's edit"
     );
 
-    a.send_raw_update(UNDECODABLE_UPDATE).await;
+    let (base, too_deep) = crafted_attack();
+    a.send_raw_update(&base).await;
+    a.send_raw_update(&too_deep).await;
     assert_eq!(
         a.close_code(DEADLINE).await,
-        Some(1012),
-        "the board room evicted itself, but the sender's socket was not closed with 1012"
+        Some(4422),
+        "the sender of the refused update must be closed with 4422"
     );
     assert_eq!(
         b.close_code(DEADLINE).await,
@@ -936,6 +941,136 @@ async fn board_peers_of_a_board_room_that_evicts_itself_are_closed_and_resync() 
         "B's board edits after the eviction",
         || hydrate_board(&boards, board.id),
         |d| board_keys(d) == ["after", "before", "live"],
+    )
+    .await;
+
+    b.disconnect().await;
+    c.disconnect().await;
+}
+
+// ---------------------------------------------------------------------------
+// An update that doesn't decode closes only its sender
+// ---------------------------------------------------------------------------
+
+/// Nothing of an update that doesn't decode is applied: the room refuses
+/// its sender (4422) and keeps every other connection. RED on HEAD: the
+/// room evicted itself as if it had applied the update, and closed B with
+/// 1012.
+#[tokio::test(flavor = "multi_thread")]
+async fn doc_update_that_does_not_decode_closes_only_its_sender() {
+    let fx = fixture().await;
+    let path = format!("/collab/doc/{}", fx.doc_id);
+    let mut a = Peer::new();
+    a.connect(&fx, &path).await;
+    assert!(
+        a.pump_until(DEADLINE, |p| p.step1_answered >= 1).await,
+        "A never completed the handshake"
+    );
+    let mut b = Peer::new();
+    b.connect(&fx, &path).await;
+    assert!(
+        b.pump_until(DEADLINE, |p| p.step1_answered >= 1).await,
+        "B never completed the handshake"
+    );
+
+    a.send_raw_update(UNDECODABLE_UPDATE).await;
+    assert_eq!(
+        a.close_code(DEADLINE).await,
+        Some(4422),
+        "the sender of the update must be closed with 4422"
+    );
+
+    // B is still in the same room: its edit is stored and reaches a new
+    // peer, and that peer's edit reaches B.
+    b.edit(|r, txn| {
+        paragraph_text(r, txn, "still here");
+    })
+    .await;
+    let mut c = Peer::new();
+    c.connect(&fx, &path).await;
+    assert!(
+        c.pump_until(DEADLINE, |p| p.doc_text().contains("still here"))
+            .await,
+        "a new peer never saw B's edit: got {:?}",
+        c.doc_text()
+    );
+    c.edit(|r, txn| {
+        paragraph_text(r, txn, "from c");
+    })
+    .await;
+    assert!(
+        b.pump_until(DEADLINE, |p| p.doc_text().contains("from c"))
+            .await,
+        "B no longer gets its peers' edits: got {:?}",
+        b.doc_text()
+    );
+    let pool = fx.pool.clone();
+    let doc_id = fx.doc_id;
+    wait_for_storage(
+        "B's and C's edits",
+        || hydrate_doc(&pool, doc_id),
+        |d| doc_text(d).contains("still here") && doc_text(d).contains("from c"),
+    )
+    .await;
+
+    b.disconnect().await;
+    c.disconnect().await;
+}
+
+/// The same for a board room. RED on HEAD: the board room evicted itself
+/// and closed every connection with 1012, the sender's included.
+#[tokio::test(flavor = "multi_thread")]
+async fn board_update_that_does_not_decode_closes_only_its_sender() {
+    let fx = fixture().await;
+    let board = fx.boards.create(fx.doc_id, fx.user_id, None).await.unwrap();
+    let path = format!("/collab/board/{}", board.id);
+    let mut a = Peer::new();
+    a.connect(&fx, &path).await;
+    assert!(
+        a.pump_until(DEADLINE, |p| p.step1_answered >= 1).await,
+        "A never completed the handshake"
+    );
+    let mut b = Peer::new();
+    b.connect(&fx, &path).await;
+    assert!(
+        b.pump_until(DEADLINE, |p| p.step1_answered >= 1).await,
+        "B never completed the handshake"
+    );
+
+    a.send_raw_update(UNDECODABLE_UPDATE).await;
+    assert_eq!(
+        a.close_code(DEADLINE).await,
+        Some(4422),
+        "the sender of the update must be closed with 4422"
+    );
+
+    b.edit(|r, txn| {
+        r.elements.insert(txn, "still", "rect");
+    })
+    .await;
+    let mut c = Peer::new();
+    c.connect(&fx, &path).await;
+    assert!(
+        c.pump_until(DEADLINE, |p| p.board_keys() == ["still"])
+            .await,
+        "a new peer never saw B's edit: got {:?}",
+        c.board_keys()
+    );
+    c.edit(|r, txn| {
+        r.elements.insert(txn, "from_c", "ellipse");
+    })
+    .await;
+    assert!(
+        b.pump_until(DEADLINE, |p| p.board_keys() == ["from_c", "still"])
+            .await,
+        "B no longer gets its peers' edits: got {:?}",
+        b.board_keys()
+    );
+    let boards = fx.boards.clone();
+    wait_for_storage(
+        "B's and C's board edits",
+        || hydrate_board(&boards, board.id),
+        |d| board_keys(d) == ["from_c", "still"],
     )
     .await;
 

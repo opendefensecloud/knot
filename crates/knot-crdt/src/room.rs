@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::bus::{Bus, Subscription};
-use crate::engine::{DocHandle, Engine, EngineError};
+use crate::engine::{ApplyMeasured, DocHandle, Engine, EngineError};
 use crate::protocol::wrap_sync_update;
 use crate::tasks::patch_task_checked;
 
@@ -38,17 +38,20 @@ pub struct InMsg {
 pub struct ConnHandle {
     pub tx: mpsc::Sender<Vec<u8>>,
     /// Cancelled by the room when the connection's access is revoked; the WS
-    /// shim then closes the socket with 4403. A dedicated signal because the
-    /// channel cannot carry it by closing (the shim holds its own sender for
-    /// the whole session) and no frame value is free to mean it (an empty
-    /// frame is already the presence-clearing message).
+    /// shim then closes the socket with 4403. The shim makes it a child of
+    /// [`RoomHandle::revoked`], which revokes every connection at once. A
+    /// dedicated signal because the channel cannot carry it by closing (the
+    /// shim holds its own sender for the whole session) and no frame value
+    /// is free to mean it (an empty frame is already the presence-clearing
+    /// message).
     pub revoked: CancellationToken,
     /// Cancelled by the room when it refuses an update the connection sent:
     /// one that would nest the page too deep ([`crate::nesting`]), or one
-    /// yrs could not apply; the WS shim then closes the socket with 4422.
+    /// that doesn't decode; the WS shim then closes the socket with 4422.
     /// The room no longer holds the connection, so nothing more it sends is
-    /// applied. When the refusal also evicts the room, the other
-    /// connections are closed through [`RoomHandle::shutdown`].
+    /// applied. When the refusal also evicts the room (an update it applied
+    /// and then refused), the other connections are closed through
+    /// [`RoomHandle::shutdown`].
     pub refused: CancellationToken,
 }
 
@@ -163,9 +166,10 @@ pub struct Room {
     /// Set when the room evicts itself after applying an update it then
     /// refused: one that nested the page past
     /// [`crate::nesting::MAX_NESTING`] (the authoritative post-apply check),
-    /// or one yrs rejected part-way. The live doc then holds the refused
-    /// content, so the final flush must NOT snapshot it: the next join
-    /// reloads the page from storage, which never got the refused update.
+    /// whether yrs applied all of it or rejected the rest. The live doc then
+    /// holds the refused content, so the final flush must NOT snapshot it:
+    /// the next join reloads the page from storage, which never got the
+    /// refused update.
     evicted: bool,
 }
 
@@ -178,6 +182,12 @@ pub struct RoomHandle {
     /// join, and every WS shim of the room, which watches it, closes its
     /// socket so the client reconnects to that fresh room.
     pub shutdown: CancellationToken,
+    /// Cancelled when the page's access ends for everyone and the room goes
+    /// with it ([`crate::Rooms::revoke_and_evict`], for a purge). Each WS
+    /// shim makes its connection's [`ConnHandle::revoked`] a child of it,
+    /// so every socket closes with 4403 and its client leaves the page,
+    /// rather than with 1012 and a reconnect to a page that is gone.
+    pub revoked: CancellationToken,
 }
 
 impl Room {
@@ -255,7 +265,11 @@ impl Room {
             evicted: false,
         };
         tokio::spawn(room.run());
-        Ok(RoomHandle { tx, shutdown })
+        Ok(RoomHandle {
+            tx,
+            shutdown,
+            revoked: CancellationToken::new(),
+        })
     }
 
     #[tracing::instrument(skip_all, fields(doc_id = %self.doc_id))]
@@ -669,10 +683,7 @@ impl Room {
                 limit = crate::nesting::MAX_NESTING,
                 "refused an update that nests the page too deep (prefilter); closing its connection"
             );
-            metrics::counter!("knot_room_updates_refused_total").increment(1);
-            if let Some(conn) = self.conns.remove(&m.from) {
-                conn.refused.cancel();
-            }
+            self.refuse_sender(m.from);
             return;
         }
         // Apply, then run the authoritative nesting check on the real doc:
@@ -683,15 +694,35 @@ impl Room {
             .engine
             .apply_update_measuring(&self.doc, &m.bytes, crate::nesting::MAX_NESTING)
         {
+            // Measured over what the apply integrated, also when yrs
+            // rejected the rest of the update.
             Ok(applied) if applied.max_depth > crate::nesting::MAX_NESTING => {
                 self.refuse_applied(
                     m.from,
-                    "nesting",
                     format_args!(
                         "it nested a type {} deep, past the limit of {}",
                         applied.max_depth,
                         crate::nesting::MAX_NESTING
                     ),
+                );
+                return;
+            }
+            // yrs rejected the update part-way, within the limit: as on main,
+            // nothing of it is persisted or fanned out, and the room keeps
+            // running with every connection. The error need not be the
+            // sender's: yrs retries the blocks it parked earlier for a
+            // missing dependency within the same apply and passes on their
+            // error, so closing the sender could lock an innocent writer out
+            // for as long as the parked block is stored.
+            Ok(ApplyMeasured {
+                rejected: Some(error),
+                ..
+            }) => {
+                tracing::debug!(
+                    doc_id = %self.doc_id,
+                    conn = %m.from,
+                    %error,
+                    "yrs rejected an update part-way; neither persisted nor fanned out"
                 );
                 return;
             }
@@ -703,15 +734,16 @@ impl Room {
             // fanning it out would make every peer re-apply a no-op.
             Ok(applied) if !applied.changed => return,
             Ok(_) => {}
-            // yrs integrates an update's blocks one by one and does not roll
-            // back when a later one fails, so the blocks before the error
-            // can be in the live doc, unmeasured. Refuse any error like a
-            // too-deep update, a decode error too (nothing integrated, but
-            // the sender is broken or crafted either way). The eviction
-            // closes every other connection too, so their clients reconnect
-            // to the reloaded room (see `refuse_applied`).
+            // It doesn't decode, so nothing of it was applied: refuse its
+            // sender, which is broken or crafted, and no one else.
             Err(e) => {
-                self.refuse_applied(m.from, "apply_failed", format_args!("{e}"));
+                tracing::warn!(
+                    doc_id = %self.doc_id,
+                    conn = %m.from,
+                    error = %e,
+                    "refused an update that doesn't decode; closing its connection"
+                );
+                self.refuse_sender(m.from);
                 return;
             }
         }
@@ -747,15 +779,25 @@ impl Room {
         }
     }
 
-    /// Refuse an inbound update the live doc may already hold, all of it or
-    /// the part yrs integrated before it failed: one that nested the page
-    /// past [`crate::nesting::MAX_NESTING`] (`reason` "nesting"), or one
-    /// yrs could not apply ("apply_failed"). The caller persists and fans
-    /// out nothing of it; this closes the sender and evicts the room. The
-    /// live doc can't be trusted any more, so the room ends without its
-    /// final snapshot (`evicted`), and the next join reloads the page from
-    /// storage, which never got the update. Dropping the doc doesn't
-    /// recurse, however deep the update made it (`crate::nesting`).
+    /// Refuse an update `from` sent: count it, drop the connection, so that
+    /// nothing more it sends is applied, and tell its WS shim to close it
+    /// with 4422 (`ConnHandle::refused`).
+    fn refuse_sender(&mut self, from: ConnId) {
+        metrics::counter!("knot_room_updates_refused_total").increment(1);
+        if let Some(conn) = self.conns.remove(&from) {
+            conn.refused.cancel();
+        }
+    }
+
+    /// Refuse an inbound update the live doc already holds, all of it or
+    /// the part yrs integrated before it rejected the rest, because it
+    /// nested the page past [`crate::nesting::MAX_NESTING`]. The caller
+    /// persists and fans out nothing of it; this closes the sender and
+    /// evicts the room. The live doc can't be trusted any more, so the room
+    /// ends without its final snapshot (`evicted`), and the next join
+    /// reloads the page from storage, which never got the update. Dropping
+    /// the doc doesn't recurse, however deep the update made it
+    /// (`crate::nesting`).
     ///
     /// Every other connection is closed too, through the room's token
     /// (`RoomHandle::shutdown`), which its WS shim watches: it closes the
@@ -763,18 +805,14 @@ impl Room {
     /// re-sends its edits in its answer to the server's SyncStep1. Without
     /// that, a peer would keep editing on this dead room. The sender's
     /// `refused` is cancelled first, so the sender is closed with 4422.
-    fn refuse_applied(&mut self, from: ConnId, reason: &'static str, why: std::fmt::Arguments) {
+    fn refuse_applied(&mut self, from: ConnId, why: std::fmt::Arguments) {
         tracing::warn!(
             doc_id = %self.doc_id,
             conn = %from,
-            reason,
             "refused an update after applying it ({why}); closing its connection and evicting the room"
         );
-        metrics::counter!("knot_room_updates_refused_total").increment(1);
-        metrics::counter!("knot_room_evicted_total", "reason" => reason).increment(1);
-        if let Some(conn) = self.conns.remove(&from) {
-            conn.refused.cancel();
-        }
+        metrics::counter!("knot_room_evicted_total").increment(1);
+        self.refuse_sender(from);
         self.evicted = true;
         // Ends the actor (the loop's next turn) and closes every other
         // connection (see above).

@@ -93,10 +93,10 @@ impl Rooms {
         if let Some(h) = self.live(doc_id) {
             return Ok(h);
         }
-        // A room that evicted itself (an update it refused after applying
-        // it: too deep, [`crate::nesting`], or rejected part-way by yrs)
-        // leaves a cancelled handle in the map. Drop it before booting a
-        // fresh one, so this join rehydrates from storage.
+        // A room that evicted itself (it refused an update it had applied,
+        // which nested the page too deep: [`crate::nesting`]) leaves a
+        // cancelled handle in the map. Drop it before booting a fresh one,
+        // so this join rehydrates from storage.
         self.drop_if_dead(doc_id).await;
         let sub = self.bus.subscribe(doc_id).await?;
         let h = Room::spawn(
@@ -123,10 +123,10 @@ impl Rooms {
     /// one: rooms are not evicted when idle, so a background reader that
     /// acquired them would keep every page it read in memory.
     ///
-    /// A room that evicted itself over a refused update (too deep,
-    /// [`crate::nesting`], or rejected part-way by yrs) is treated as absent
-    /// — its live doc holds refused content, so a reader must fall back to
-    /// storage. `acquire` prunes the dead entry on the next join.
+    /// A room that evicted itself over an update it refused after applying
+    /// it (too deep, [`crate::nesting`]) is treated as absent — its live doc
+    /// holds refused content, so a reader must fall back to storage.
+    /// `acquire` prunes the dead entry on the next join.
     pub fn get_active(&self, doc_id: Uuid) -> Option<Arc<RoomHandle>> {
         self.live(doc_id)
     }
@@ -155,9 +155,11 @@ impl Rooms {
         }
     }
 
-    /// Send a revoke event to the room (if active). The room drops all
-    /// conns; the WS shim's writer detects the closed channel and emits
-    /// a 4403 close frame to each client.
+    /// Send a revoke event to the room (if active). The room cancels each
+    /// connection's `revoked` token and drops the connection; each WS
+    /// shim's writer then closes its socket with 4403. Returns once the
+    /// event is queued, before the room has handled it: to close the
+    /// sockets of a room that goes too, use [`Rooms::revoke_and_evict`].
     pub async fn revoke_all_for_doc(&self, doc_id: Uuid) {
         if let Some(h) = self.map.get(&doc_id) {
             let _ = h.tx.send(crate::room::Event::Revoke).await;
@@ -171,6 +173,19 @@ impl Rooms {
         if let Some(h) = self.map.get(&doc_id) {
             let _ = h.tx.send(crate::room::Event::ServerFrame(frame)).await;
         }
+    }
+
+    /// Close every connection of the doc's room with 4403, then evict it:
+    /// for a page whose access ends for everyone (a purge). The revocation
+    /// takes effect first and at once: each connection's `revoked` token is
+    /// a child of the room's ([`RoomHandle::revoked`]), and each WS shim
+    /// checks it before the room's end, which would close with 1012 and
+    /// make the client reconnect to a page that is gone.
+    pub async fn revoke_and_evict(&self, doc_id: Uuid) {
+        if let Some(h) = self.map.get(&doc_id).map(|h| h.clone()) {
+            h.revoked.cancel();
+        }
+        self.evict(doc_id).await;
     }
 
     /// Cancel the room's actor and unsubscribe from the bus. Each WS shim

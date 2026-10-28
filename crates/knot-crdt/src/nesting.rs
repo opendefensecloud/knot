@@ -18,22 +18,29 @@
 //!     depth comes from the page, not the update), and it does not guarantee
 //!     that applying an update stays within the worker's stack. It never
 //!     overflows itself: it walks iteratively and bounded.
-//!   - the authoritative check, for every update that applies, runs *after*
+//!   - the authoritative check, for every update that decodes, runs *after*
 //!     `apply_update` ([`deepest_inserted_type_depth`], via the engine's
-//!     `apply_update_measuring`). It measures where each type the update
+//!     `apply_update_measuring`). It measures where each type the apply
 //!     actually integrated landed, by walking up the real doc's parent chain,
-//!     iteratively and at most `MAX_NESTING + 1` steps. When it finds a type
-//!     nested past the limit, the room does not persist and does not fan out
-//!     the update, closes the sending connection, and evicts itself, so the
-//!     next join reloads the page from storage without the refused update.
-//!     Evicting also closes every other connection of the room (each WS
-//!     shim watches the room's token), so those clients reconnect to the
-//!     reloaded room and re-send their edits instead of editing on the
-//!     evicted one. An update yrs rejects part-way (apply returns an error after
-//!     integrating some of its blocks, which yrs does not roll back) is
-//!     refused the same way. Dropping the evicted room's doc, however deep
-//!     the refused update made it, does not recurse: yrs holds items flat in
-//!     the block store, and neither `Branch` nor `Item` has a custom `Drop`.
+//!     iteratively and at most `MAX_NESTING + 1` steps; also when yrs
+//!     rejected the update part-way (it doesn't roll back the blocks it
+//!     integrated before the error). When it finds a type nested past the
+//!     limit, the room does not persist and does not fan out the update,
+//!     closes the sending connection, and evicts itself, so the next join
+//!     reloads the page from storage without the refused update. Evicting
+//!     also closes every other connection of the room (each WS shim watches
+//!     the room's token), so those clients reconnect to the reloaded room
+//!     and re-send their edits instead of editing on the evicted one.
+//!     Dropping the evicted room's doc, however deep the refused update made
+//!     it, does not recurse: yrs holds items flat in the block store, and
+//!     neither `Branch` nor `Item` has a custom `Drop`.
+//!
+//! An update that doesn't decode is not applied at all, and the room
+//! refuses only its sender. An update yrs rejects part-way within the limit
+//! is handled as on main: not persisted, not fanned out, and the room keeps
+//! running with its sender. yrs's error need not be the sender's fault: it
+//! retries, within the same apply, the blocks it parked earlier for a
+//! missing dependency, and passes on their error.
 //!
 //! So no update a room accepts stores a page whose types nest deeper than
 //! [`MAX_NESTING`].
@@ -104,8 +111,9 @@ pub struct TooDeep {
 ///
 /// The cost is a decode of the update (and of what is pending) and, for each
 /// new type that hangs under existing content, a walk up from there. An
-/// update that doesn't decode passes, since applying it fails the same way
-/// (and the room refuses an update it fails to apply).
+/// update that doesn't decode passes: the engine reads it the same way
+/// before it applies anything, so nothing of it is applied (and the room
+/// refuses its sender).
 pub fn check_update(doc: &DocHandle, update: &[u8]) -> Result<(), TooDeep> {
     let txn = doc.inner().transact();
     let Ok(mut items) = decode_items(update) else {
@@ -142,19 +150,15 @@ pub fn nests_deeper_than(doc: &DocHandle, limit: usize) -> bool {
 }
 
 /// The ids of the shared types a lib0 v1 `update` inserts, decoded as yrs
-/// decodes it, without applying it. Used after `apply_update` to find where
-/// each type actually landed. An update that doesn't decode yields no ids
-/// (applying it fails the same way).
-pub fn inserted_type_ids(update: &[u8]) -> Vec<ID> {
-    decode_items(update)
-        .map(|items| {
-            items
-                .into_iter()
-                .filter(|item| item.is_type)
-                .map(|item| item.id)
-                .collect()
-        })
-        .unwrap_or_default()
+/// decodes it ([`update_items::decode`]), without applying it. Used after
+/// `apply_update` to find where each type actually landed. `Err` for an
+/// update that doesn't decode: the engine then applies nothing of it.
+pub fn inserted_type_ids(update: &[u8]) -> Result<Vec<ID>, yrs::encoding::read::Error> {
+    Ok(decode_items(update)?
+        .into_iter()
+        .filter(|item| item.is_type)
+        .map(|item| item.id)
+        .collect())
 }
 
 /// The deepest any type in `ids` nests in `doc` (a root type is at depth 0),

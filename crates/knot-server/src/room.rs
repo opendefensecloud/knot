@@ -38,11 +38,12 @@ pub async fn serve(
     };
     let conn_id: ConnId = Uuid::new_v4();
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(256);
-    // Cancelled by the room when an ACL change revokes this connection; the
-    // writer then closes the socket with 4403.
-    let revoked = CancellationToken::new();
+    // Cancelled by the room when an ACL change revokes this connection, and
+    // with the room's own when a purge revokes them all; the writer then
+    // closes the socket with 4403.
+    let revoked = handle.revoked.child_token();
     // Cancelled by the room when it refuses an update this connection sent
-    // (it nests the page too deep, or yrs can't apply it); the writer then
+    // (it nests the page too deep, or it doesn't decode); the writer then
     // closes with 4422.
     let refused = CancellationToken::new();
     let conn_handle = || ConnHandle {
@@ -96,10 +97,12 @@ pub async fn serve(
     // shutdown or a dead socket; this read loop when the client goes away.
     let done = CancellationToken::new();
     // The room's own token, cancelled when the room ends: it evicts itself
-    // after refusing an update (this connection's or another one's), or its
+    // after refusing an update it had applied, which nested the page too
+    // deep (this connection's or another one's), it is evicted, or its
     // actor stops. The writer then closes with 1012 so the client reconnects
     // to a fresh room and re-sends its edits; this session's room would no
-    // longer apply, persist or share them. A refused sender gets 4422.
+    // longer apply, persist or share them. A refused sender gets 4422, and
+    // a revoked connection 4403 (both checked first).
     let writer = tokio::spawn(crate::ws_writer::run(
         sink,
         out_rx,

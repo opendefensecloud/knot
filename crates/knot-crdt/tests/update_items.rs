@@ -216,3 +216,41 @@ fn an_update_that_does_not_decode_ends_in_one_error() {
     assert!(matches!(empty.next(), Some(Err(_))));
     assert!(empty.next().is_none());
 }
+
+/// One client's blocks from `clock`: `blocks` writes them.
+fn client_from(clock: u32, blocks: u32, write: impl FnOnce(&mut EncoderV1)) -> Vec<u8> {
+    let mut enc = EncoderV1::new();
+    enc.write_var(1u32);
+    enc.write_var(blocks);
+    enc.write_client(ClientID::new(7));
+    enc.write_var(clock);
+    write(&mut enc);
+    enc.write_var(0u32);
+    enc.to_vec()
+}
+
+/// A block's clocks must fit in a u32: an item or a skipped range that runs
+/// past `u32::MAX` doesn't decode. Adding its length to the clock
+/// overflowed, which panicked in a debug build and wrapped in a release
+/// build. The last clock may be `u32::MAX` itself.
+#[test]
+fn a_block_whose_clocks_run_past_u32_max_does_not_decode() {
+    let item = client_from(u32::MAX - 1, 1, |enc| write_string(enc, None, "abc"));
+    let skipped = client_from(u32::MAX - 1, 1, |enc| {
+        enc.write_info(BLOCK_SKIP_REF_NUMBER);
+        enc.write_var(5u32);
+    });
+    for (what, update) in [("an item", item), ("a skipped range", skipped)] {
+        let read: Vec<_> = decode(&update).collect();
+        assert!(
+            matches!(read.as_slice(), [Err(_)]),
+            "{what} past u32::MAX: {read:?}"
+        );
+    }
+
+    let to_the_end = client_from(u32::MAX - 3, 1, |enc| write_string(enc, None, "abc"));
+    assert_eq!(
+        seen(&to_the_end),
+        [format!(r#"7:{} (3) in t: string "abc""#, u32::MAX - 3)]
+    );
+}

@@ -112,9 +112,9 @@ pub async fn purge_doc(
     evict_local(state, &deleted).await;
     if let Some(rooms) = state.rooms_v2.as_ref() {
         for id in &deleted {
-            // Disconnect read-only viewers and drop the in-memory copy.
-            rooms.revoke_all_for_doc(*id).await;
-            rooms.evict(*id).await;
+            // Disconnect read-only viewers (4403: the page is gone) and drop
+            // the in-memory copy.
+            rooms.revoke_and_evict(*id).await;
         }
     }
     metrics::counter!("knot_docs_purged_total", "trigger" => trigger.label()).increment(1);

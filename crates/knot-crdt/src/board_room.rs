@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::bus::Bus;
-use crate::engine::{DocHandle, Engine, EngineError};
+use crate::engine::{ApplyMeasured, DocHandle, Engine, EngineError};
 
 use crate::protocol::wrap_sync_update;
 pub use crate::room::JoinState;
@@ -31,6 +31,19 @@ pub struct InMsg {
 
 pub struct ConnHandle {
     pub tx: mpsc::Sender<Vec<u8>>,
+    /// Cancelled by the board room when it refuses an update the
+    /// connection sent, as `room::ConnHandle::refused` is; the WS shim then
+    /// closes the socket with 4422.
+    pub refused: CancellationToken,
+}
+
+impl ConnHandle {
+    pub fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            tx,
+            refused: CancellationToken::new(),
+        }
+    }
 }
 
 pub enum Event {
@@ -235,10 +248,11 @@ impl BoardRoom {
 
     #[tracing::instrument(skip(self, m), fields(board_id = %self.board_id, bytes = m.bytes.len()))]
     async fn on_inbound(&mut self, m: InMsg) {
-        // As in `Room::on_inbound`: nothing of an update that nests too deep,
-        // or that yrs can't apply, is persisted or fanned out. The board
-        // editor never nests types, so this only ever fires for a crafted
-        // or broken update.
+        // The same rules as `Room::on_inbound`: nothing of an update that
+        // nests too deep, that doesn't decode, or that yrs rejects part-way
+        // is persisted or fanned out. The board editor never nests types,
+        // so the nesting checks only ever fire for a crafted or broken
+        // update.
         //
         // Prefilter: refuse, before applying, an update `check_update`
         // predicts nests too deep. Best-effort only: it does not guarantee
@@ -250,9 +264,9 @@ impl BoardRoom {
                 conn = %m.from,
                 depth = too_deep.depth,
                 limit = crate::nesting::MAX_NESTING,
-                "refused a board update that nests too deep (prefilter)"
+                "refused a board update that nests too deep (prefilter); closing its connection"
             );
-            metrics::counter!("knot_room_updates_refused_total").increment(1);
+            self.refuse_sender(m.from);
             return;
         }
         // Authoritative post-apply check, as in `Room::on_inbound`.
@@ -263,7 +277,6 @@ impl BoardRoom {
             Ok(applied) if applied.max_depth > crate::nesting::MAX_NESTING => {
                 self.refuse_applied(
                     m.from,
-                    "nesting",
                     format_args!(
                         "it nested a type {} deep, past the limit of {}",
                         applied.max_depth,
@@ -272,16 +285,36 @@ impl BoardRoom {
                 );
                 return;
             }
+            // Rejected part-way within the limit: as on main, nothing is
+            // appended or fanned out, and the room keeps every connection
+            // (see `Room::on_inbound` for why the sender stays).
+            Ok(ApplyMeasured {
+                rejected: Some(error),
+                ..
+            }) => {
+                tracing::debug!(
+                    board_id = %self.board_id,
+                    conn = %m.from,
+                    %error,
+                    "yrs rejected a board update part-way; neither appended nor fanned out"
+                );
+                return;
+            }
             // Nothing new — the usual answer to the server's SyncStep1 from a
             // (re)connecting client. Don't append a `board_updates` row per
             // open or echo the no-op to every peer (see `Room::on_inbound`).
             Ok(applied) if !applied.changed => return,
             Ok(_) => {}
-            // yrs doesn't roll back the blocks it integrated before the
-            // error; refuse any error like a too-deep update (see
-            // `Room::on_inbound`).
+            // It doesn't decode: nothing of it was applied. Refuse its
+            // sender and no one else.
             Err(e) => {
-                self.refuse_applied(m.from, "apply_failed", format_args!("{e}"));
+                tracing::warn!(
+                    board_id = %self.board_id,
+                    conn = %m.from,
+                    error = %e,
+                    "refused a board update that doesn't decode; closing its connection"
+                );
+                self.refuse_sender(m.from);
                 return;
             }
         }
@@ -312,24 +345,34 @@ impl BoardRoom {
         }
     }
 
-    /// Refuse an inbound update the live doc may already hold, all of it or
-    /// the part yrs integrated before it failed, as `Room::refuse_applied`
-    /// does: `reason` "nesting" or "apply_failed". Boards persist inline, so
-    /// the caller's return means `append_update` never runs for it. A board
-    /// connection has no close signal of its own, so the room evicts itself
-    /// (cancel `shutdown`), and that closes every connection, the sender's
-    /// included: each WS shim watches the token and closes its socket with
-    /// 1012, and the client reconnects to a fresh room, rehydrated from
-    /// storage, which never got the update.
-    fn refuse_applied(&mut self, from: ConnId, reason: &'static str, why: std::fmt::Arguments) {
+    /// Refuse an update `from` sent, as `Room::refuse_sender` does: count
+    /// it, drop the connection and tell its WS shim to close it with 4422.
+    /// An update the connection sent meanwhile is still applied: unlike a
+    /// page room, a board room takes updates from any connection.
+    fn refuse_sender(&mut self, from: ConnId) {
+        metrics::counter!("knot_room_updates_refused_total").increment(1);
+        if let Some(conn) = self.conns.remove(&from) {
+            conn.refused.cancel();
+        }
+    }
+
+    /// Refuse an inbound update the live doc already holds, all of it or
+    /// the part yrs integrated before it rejected the rest, because it
+    /// nested the board past the limit, as `Room::refuse_applied` does.
+    /// Boards persist inline, so the caller's return means `append_update`
+    /// never runs for it. The sender is closed with 4422, and the room
+    /// evicts itself (cancel `shutdown`), which closes every other
+    /// connection: each WS shim watches the token and closes its socket
+    /// with 1012, and the client reconnects to a fresh room, rehydrated
+    /// from storage, which never got the update.
+    fn refuse_applied(&mut self, from: ConnId, why: std::fmt::Arguments) {
         tracing::warn!(
             board_id = %self.board_id,
             conn = %from,
-            reason,
-            "refused a board update after applying it ({why}); evicting the room"
+            "refused a board update after applying it ({why}); closing its connection and evicting the room"
         );
-        metrics::counter!("knot_room_updates_refused_total").increment(1);
-        metrics::counter!("knot_room_evicted_total", "reason" => reason).increment(1);
+        metrics::counter!("knot_room_evicted_total").increment(1);
+        self.refuse_sender(from);
         self.shutdown.cancel();
     }
 }
@@ -421,7 +464,8 @@ mod tests {
     }
 
     /// An update nesting a board's types deeper than a room accepts is
-    /// neither applied nor fanned out (`crate::nesting`); the next one is.
+    /// neither applied nor fanned out (`crate::nesting`), and its sender is
+    /// told to close; the next one is applied.
     #[tokio::test(flavor = "multi_thread")]
     async fn board_room_refuses_a_deeply_nested_update() {
         use yrs::{Map, MapPrelim, ReadTxn, StateVector, Transact};
@@ -438,16 +482,18 @@ mod tests {
         for _ in 0..2 {
             let conn_id = Uuid::new_v4();
             let (tx, rx) = mpsc::channel(64);
+            let handle = ConnHandle::new(tx);
+            let refused = handle.refused.clone();
             let (reply, joined) = oneshot::channel();
             h.tx.send(Event::Join {
                 conn_id,
-                handle: ConnHandle { tx },
+                handle,
                 reply,
             })
             .await
             .unwrap();
             joined.await.unwrap().unwrap();
-            conns.push((conn_id, rx));
+            conns.push((conn_id, rx, refused));
         }
         let update = |depth: usize| {
             let doc = yrs::Doc::new();
@@ -462,8 +508,7 @@ mod tests {
             doc.transact()
                 .encode_state_as_update_v1(&StateVector::default())
         };
-        let (sender, _) = &conns[0];
-        let sender = *sender;
+        let sender = conns[0].0;
         let shallow = update(1);
         for bytes in [update(crate::nesting::MAX_NESTING + 1), shallow.clone()] {
             h.tx.send(Event::Inbound(InMsg {
@@ -482,6 +527,11 @@ mod tests {
             wrap_sync_update(&shallow),
             "the refused update was fanned out"
         );
+        assert!(
+            conns[0].2.is_cancelled(),
+            "the sender was not told to close"
+        );
+        assert!(!conns[1].2.is_cancelled(), "the peer was told to close");
         h.shutdown.cancel();
     }
 

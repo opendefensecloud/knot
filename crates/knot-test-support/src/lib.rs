@@ -23,6 +23,7 @@
 use sqlx::{AssertSqlSafe, Executor, PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
 
+pub mod crafted;
 pub mod locks;
 
 /// Connection string for the dev-compose Postgres. Override with the

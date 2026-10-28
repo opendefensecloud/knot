@@ -11,20 +11,34 @@ use yrs::{
 pub enum EngineError {
     #[error("yrs apply: {0}")]
     Apply(String),
+    /// The update doesn't decode, so nothing of it was applied. Only
+    /// [`Engine::apply_update_measuring`] tells this apart from `Apply`.
+    #[error("yrs decode: {0}")]
+    Decode(String),
     #[error("yrs encode: {0}")]
     Encode(String),
 }
 
-/// What [`Engine::apply_update_measuring`] reports: whether the doc changed,
-/// and how deep the update nested the doc's shared types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What [`Engine::apply_update_measuring`] reports for an update that
+/// decoded: whether the doc changed, how deep the update nested the doc's
+/// shared types, and whether yrs rejected part of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyMeasured {
     /// Whether the doc changed, as [`Engine::apply_update_changed`] reports.
     pub changed: bool,
-    /// The depth of the deepest shared type the update integrated, capped at
+    /// The depth of the deepest shared type the apply integrated, capped at
     /// `limit + 1` (a root type is at depth 0). `> limit` means a type nests
     /// past the limit.
     pub max_depth: usize,
+    /// The error yrs rejected the update with, or `None` when it applied in
+    /// full. yrs integrates an update's blocks one at a time and doesn't
+    /// roll back the ones before a block it rejects, so the doc may hold
+    /// part of the update. Within the same apply yrs also retries the blocks
+    /// it parked earlier for a missing dependency, and passes on their
+    /// error: it can come from another client's parked block, not from this
+    /// update. `changed` and `max_depth` cover what the apply integrated
+    /// either way.
+    pub rejected: Option<String>,
 }
 
 pub struct DocHandle(pub(crate) Doc);
@@ -53,15 +67,17 @@ pub trait Engine: Send + Sync + 'static {
     /// Apply `update` and, in the same transaction, measure how deep it
     /// nested the doc's shared types — the authoritative nesting check (see
     /// [`crate::nesting`]). Returns whether the doc changed (as
-    /// [`Engine::apply_update_changed`]) and the depth of the deepest type
-    /// the update integrated, capped at `limit + 1` (a root type is at depth
-    /// 0). A caller refuses the update, without persisting or fanning it out,
-    /// when `max_depth > limit`.
+    /// [`Engine::apply_update_changed`]), the depth of the deepest type the
+    /// apply integrated, capped at `limit + 1` (a root type is at depth 0),
+    /// and whether yrs rejected part of the update ([`ApplyMeasured`]). A
+    /// caller refuses the update, without persisting or fanning it out, when
+    /// `max_depth > limit`: the doc then holds what it refused, also when
+    /// yrs rejected the rest.
     ///
-    /// On `Err` the doc may hold part of the update: yrs integrates an
-    /// update's blocks one by one and does not roll back the ones before a
-    /// block it rejects. A caller must treat `Err` like `max_depth > limit`
-    /// and stop trusting the doc (the rooms evict themselves).
+    /// `Err` ([`EngineError::Decode`]) means the update doesn't decode, as
+    /// yrs or [`crate::update_items`] reads it: nothing of it was applied.
+    /// The latter also refuses an update whose clocks run past `u32::MAX`,
+    /// which yrs's own decoder adds up unchecked.
     ///
     /// The measurement walks the real doc iteratively and at most
     /// `limit + 1` steps, so it cannot overflow the stack. The apply itself
@@ -128,20 +144,25 @@ impl Engine for YrsEngine {
         update: &[u8],
         limit: usize,
     ) -> Result<ApplyMeasured, EngineError> {
-        let u = Update::decode_v1(update).map_err(|e| EngineError::Apply(e.to_string()))?;
+        // The shared types this apply could integrate: the update's own, read
+        // before yrs reads it (an update this reader refuses is not applied
+        // at all), and any already parked as pending — this update may be
+        // what they were waiting for, in which case they integrate now and
+        // must be measured.
+        let mut type_ids = crate::nesting::inserted_type_ids(update)
+            .map_err(|e| EngineError::Decode(e.to_string()))?;
+        let u = Update::decode_v1(update).map_err(|e| EngineError::Decode(e.to_string()))?;
         let mut txn = d.0.transact_mut();
         let pending_before = pending_fingerprint(&txn);
-        // The shared types this apply could integrate: the update's own, and
-        // any already parked as pending — this update may be what they were
-        // waiting for, in which case they integrate now and must be measured.
-        let mut type_ids = crate::nesting::inserted_type_ids(update);
         if let Some(pending) = txn.store().pending_update() {
-            type_ids.extend(crate::nesting::inserted_type_ids(
-                &pending.update.encode_v1(),
-            ));
+            // yrs encoded them, from updates that decoded.
+            type_ids.extend(
+                crate::nesting::inserted_type_ids(&pending.update.encode_v1()).unwrap_or_default(),
+            );
         }
-        txn.apply_update(u)
-            .map_err(|e| EngineError::Apply(e.to_string()))?;
+        // On an error, what yrs integrated before it stays in the doc, and
+        // is measured below like the rest.
+        let rejected = txn.apply_update(u).err().map(|e| e.to_string());
         let changed = !txn.insert_set().is_empty()
             || !txn.delete_set().is_empty()
             || pending_fingerprint(&txn) != pending_before;
@@ -157,7 +178,11 @@ impl Engine for YrsEngine {
         // integrated, garbage-collected document.
         txn.commit();
         let max_depth = crate::nesting::deepest_inserted_type_depth(&txn, &type_ids, limit);
-        Ok(ApplyMeasured { changed, max_depth })
+        Ok(ApplyMeasured {
+            changed,
+            max_depth,
+            rejected,
+        })
     }
 
     fn encode_state_as_update(

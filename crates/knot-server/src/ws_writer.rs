@@ -18,12 +18,13 @@ use tokio_util::sync::CancellationToken;
 ///   elsewhere.
 /// - `revoked` (the room revoked this connection's access): close with 4403.
 /// - `refused` (the room refused an update this connection sent: one that
-///   would nest the page too deep, or one yrs could not apply): close with
+///   would nest the page too deep, or one that doesn't decode): close with
 ///   4422, so the client stops sending on a session whose state the room no
 ///   longer shares.
 /// - `room_ended` (the room this session joined has ended: it evicted
-///   itself after refusing an update, from this connection or another one,
-///   or its actor stopped any other way): close with 1012 (service restart),
+///   itself after refusing an update it had applied, which nested the page
+///   too deep, from this connection or another one, it was evicted, or its
+///   actor stopped any other way): close with 1012 (service restart),
 ///   so the client reconnects to a fresh room, reloaded from storage, and
 ///   re-sends what that room lacks in its answer to the server's SyncStep1.
 ///   Without it the session would stay open on a room that no longer

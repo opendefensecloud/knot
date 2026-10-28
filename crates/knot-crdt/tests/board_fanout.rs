@@ -71,7 +71,7 @@ async fn join_conn(
     room.tx
         .send(Event::Join {
             conn_id: Uuid::new_v4(),
-            handle: ConnHandle { tx },
+            handle: ConnHandle::new(tx),
             reply: reply_tx,
         })
         .await
