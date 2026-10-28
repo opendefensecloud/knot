@@ -10,6 +10,10 @@
 //!   `image`, an `attachment`);
 //! - the `href` of a `link` mark, `knot://doc/<id>` or `/api/blobs/<id>`.
 //!
+//! Attributes are matched by name, on any element, not by the element's
+//! tag. `tools/schema.json` gives these attributes to those three nodes
+//! only, so for a page that follows the schema the two are the same.
+//!
 //! The id is the whole value after its prefix, parsed as a UUID in any
 //! spelling, as knot-export reads it (`crates/knot-export/src/walk.rs`). An
 //! id inside a longer value, such as an external URL, is not a reference.
@@ -20,11 +24,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use uuid::Uuid;
+use yrs::block::{
+    BLOCK_GC_REF_NUMBER, BLOCK_SKIP_REF_NUMBER, HAS_ORIGIN, HAS_PARENT_SUB, HAS_RIGHT_ORIGIN,
+    ItemContent,
+};
+use yrs::branch::Branch;
+use yrs::encoding::read::{Cursor, Read};
 use yrs::types::Attrs;
 use yrs::types::text::YChange;
+use yrs::updates::decoder::{Decode, Decoder, DecoderV1};
 use yrs::{
-    Any, Doc, OffsetKind, Out, ReadTxn, Text, Transact, TransactionMut, Xml, XmlElementRef,
-    XmlFragment, XmlOut, XmlTextRef,
+    Any, Assoc, BranchID, Doc, ID, IdSet, OffsetKind, Out, ReadTxn, StateVector, StickyIndex, Text,
+    Transact, TransactionMut, Xml, XmlElementRef, XmlFragment, XmlOut, XmlTextRef,
 };
 
 use crate::DOC_URL_PREFIX;
@@ -160,6 +171,8 @@ fn sites<T: ReadTxn>(txn: &T, offsets: OffsetKind) -> Vec<Site> {
     let Some(frag) = txn.get_xml_fragment("default") else {
         return out;
     };
+    // Read once, when a text first needs it.
+    let mut held = None;
     // Iterative, so it is safe at any depth: children go on the stack in
     // reverse, so they pop in document order.
     let mut stack = Vec::new();
@@ -171,7 +184,7 @@ fn sites<T: ReadTxn>(txn: &T, offsets: OffsetKind) -> Vec<Site> {
                 push_children(&mut stack, txn, &el);
             }
             XmlOut::Fragment(f) => push_children(&mut stack, txn, &f),
-            XmlOut::Text(t) => links(txn, &t, offsets, &mut out),
+            XmlOut::Text(t) => links(txn, &t, offsets, &mut held, &mut out),
         }
     }
     out
@@ -207,14 +220,52 @@ fn element<T: ReadTxn>(txn: &T, el: &XmlElementRef, out: &mut Vec<Site>) {
 /// The references in the link marks of `text`. A link is a run of
 /// consecutive chunks with an equal link mark: a text's diff is split at
 /// every format item, so one link can span several chunks.
-fn links<T: ReadTxn>(txn: &T, text: &XmlTextRef, offsets: OffsetKind, out: &mut Vec<Site>) {
+///
+/// A chunk's length depends on what its item holds: a string counts its
+/// length, and an embed (whatever its value) or an embedded type counts 1.
+/// The diff shows an embedded string just like text, so the embeds of the
+/// text are read from its items (`held`): a chunk at an embed's offset is
+/// that embed. A text holding content the diff leaves out ([`Held`]) has
+/// offsets the diff can't tell, and its links are left alone rather than
+/// marked wrongly.
+fn links<T: ReadTxn>(
+    txn: &T,
+    text: &XmlTextRef,
+    offsets: OffsetKind,
+    held: &mut Option<Option<HeldItems>>,
+    out: &mut Vec<Site>,
+) {
+    let chunks = text.diff(txn, YChange::identity);
+    // Only a text with a reference needs its offsets.
+    let refers =
+        |attrs: Option<&Attrs>| link_mark(attrs).is_some_and(|link| href_ref(&link).is_some());
+    if !chunks
+        .iter()
+        .any(|chunk| refers(chunk.attributes.as_deref()))
+    {
+        return;
+    }
+    let Some(held) = held.get_or_insert_with(|| HeldItems::read(txn)) else {
+        return;
+    };
+    let held = held.of(text);
+    if held.iter().any(|&(_, held)| held == Held::Hidden) {
+        return;
+    }
+    let embeds: HashSet<u32> = held
+        .iter()
+        .filter(|&&(_, held)| held == Held::Embed)
+        .map(|&(at, _)| at)
+        .collect();
     // (index, len, link mark): the runs of chunks with an equal link mark.
     let mut runs: Vec<(u32, u32, Option<LinkMark>)> = Vec::new();
     let mut index = 0;
-    for chunk in text.diff(txn, YChange::identity) {
+    for chunk in chunks {
         let (len, link) = match &chunk.insert {
-            Out::Any(Any::String(s)) => (units(s, offsets), link_mark(chunk.attributes.as_deref())),
-            // An embed counts 1, and ends a link.
+            Out::Any(Any::String(s)) if !embeds.contains(&index) => {
+                (units(s, offsets), link_mark(chunk.attributes.as_deref()))
+            }
+            // An embed or an embedded type counts 1, and ends a link.
             _ => (1, None),
         };
         match runs.last_mut() {
@@ -224,12 +275,6 @@ fn links<T: ReadTxn>(txn: &T, text: &XmlTextRef, offsets: OffsetKind, out: &mut 
             _ => runs.push((index, len, link)),
         }
         index += len;
-    }
-    // The diff shows an embedded string as text, so a text holding one has
-    // offsets it can't tell. Its links are left alone rather than marked
-    // wrongly.
-    if index != text.len(txn) {
-        return;
     }
     for (index, len, link) in runs {
         if let Some(link) = link
@@ -270,6 +315,111 @@ fn href_ref(link: &HashMap<String, Any>) -> Option<(Kind, Uuid)> {
 /// The id of `value` when it is `prefix` followed by a UUID and nothing else.
 fn id_after(value: &str, prefix: &str) -> Option<Uuid> {
     Uuid::parse_str(value.strip_prefix(prefix)?).ok()
+}
+
+/// What an item of a text holds, where the text's diff can't tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// An embed, which counts 1 whatever its value. The diff shows an
+    /// embedded string like text.
+    Embed,
+    /// Content the diff leaves out, which has a length too: `Any`, `JSON`,
+    /// `Binary` and sub-document items. Only a crafted update puts them into
+    /// a text.
+    Hidden,
+}
+
+/// The live items of a document that hold an embed or hidden content (see
+/// [`Held`]), by the text they are in, with their offsets in it.
+struct HeldItems(HashMap<BranchID, Vec<(u32, Held)>>);
+
+impl HeldItems {
+    /// Reads the items from the document's state, decoded as yrs 0.27
+    /// decodes an update (`Update::decode`, `decode_block`) without
+    /// integrating it, and places each in its text by its id
+    /// (`StickyIndex::get_offset`). `None` if the state doesn't decode.
+    fn read<T: ReadTxn>(txn: &T) -> Option<Self> {
+        let state = txn.encode_state_as_update_v1(&StateVector::default());
+        let mut decoder = DecoderV1::new(Cursor::new(&state));
+        let mut found = Vec::new();
+        let clients: u32 = decoder.read_var().ok()?;
+        for _ in 0..clients {
+            let blocks: u32 = decoder.read_var().ok()?;
+            let client = decoder.read_client().ok()?;
+            let mut clock: u32 = decoder.read_var().ok()?;
+            for _ in 0..blocks {
+                let len = match decoder.read_info().ok()? {
+                    BLOCK_SKIP_REF_NUMBER => decoder.read_var().ok()?,
+                    BLOCK_GC_REF_NUMBER => decoder.read_len().ok()?,
+                    info => {
+                        let content = item_content(&mut decoder, info).ok()?;
+                        let held = match content {
+                            ItemContent::Embed(_) => Some(Held::Embed),
+                            ItemContent::Any(_)
+                            | ItemContent::JSON(_)
+                            | ItemContent::Binary(_)
+                            | ItemContent::Doc(..) => Some(Held::Hidden),
+                            _ => None,
+                        };
+                        let len = content.len(OffsetKind::Utf16);
+                        if let Some(held) = held
+                            && len > 0
+                        {
+                            found.push((ID::new(client, clock), held));
+                        }
+                        len
+                    }
+                };
+                clock += len;
+            }
+        }
+        let deleted = IdSet::decode(&mut decoder).ok()?;
+        let mut texts: HashMap<BranchID, Vec<(u32, Held)>> = HashMap::new();
+        for (id, held) in found {
+            if deleted.contains(&id) {
+                continue;
+            }
+            if let Some(at) = StickyIndex::from_id(id, Assoc::After).get_offset(txn) {
+                texts
+                    .entry(at.branch.id())
+                    .or_default()
+                    .push((at.index, held));
+            }
+        }
+        Some(Self(texts))
+    }
+
+    /// The items of `text`, by offset.
+    fn of(&self, text: &XmlTextRef) -> &[(u32, Held)] {
+        let branch: &Branch = text.as_ref();
+        self.0.get(&branch.id()).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// The content of the item whose `info` was just read: what follows it, as
+/// `decode_block` reads it, with its origins and parent skipped.
+fn item_content(
+    decoder: &mut DecoderV1,
+    info: u8,
+) -> Result<ItemContent, yrs::encoding::read::Error> {
+    let no_origins = info & (HAS_ORIGIN | HAS_RIGHT_ORIGIN) == 0;
+    if info & HAS_ORIGIN != 0 {
+        decoder.read_left_id()?;
+    }
+    if info & HAS_RIGHT_ORIGIN != 0 {
+        decoder.read_right_id()?;
+    }
+    if no_origins {
+        if decoder.read_parent_info()? {
+            decoder.read_string()?;
+        } else {
+            decoder.read_left_id()?;
+        }
+        if info & HAS_PARENT_SUB != 0 {
+            decoder.read_string()?;
+        }
+    }
+    ItemContent::decode(decoder, info)
 }
 
 /// The length of `s` in the document's offset units.

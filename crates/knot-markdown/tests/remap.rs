@@ -595,12 +595,134 @@ fn an_embed_before_a_link_counts_one() {
     assert_eq!(dump(&doc), dump(&with_embed(&doc_url(DOC_NEW), None)));
 }
 
+/// One paragraph, one `XmlText`: "x", an embedded string, a link to
+/// `page`, an empty embedded string, " mid ", an embedded map, a link to
+/// `file`, " end". Each embed counts one offset unit, whatever its value;
+/// the diff shows the two strings among them as text. No embed has a mark.
+fn embeds_next_to_strings(page: &str, file: &str) -> DocHandle {
+    use yrs::types::Attrs;
+    use yrs::{Text, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+
+    let doc = YrsEngine.new_doc();
+    {
+        let ydoc = doc.inner();
+        let frag = ydoc.get_or_insert_xml_fragment("default");
+        let mut txn = ydoc.transact_mut();
+        let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+        let t = p.push_back(&mut txn, XmlTextPrelim::new(""));
+        let map = Any::Map(Arc::new(HashMap::from([("k".into(), Any::from("v"))])));
+        let linked = |href: &str| Attrs::from([(Arc::from("link"), link(href))]);
+        for (piece, embed) in [
+            (Some(("x", Attrs::new())), None),
+            (None, Some(Any::from("ab"))),
+            (Some(("one", linked(page))), None),
+            (None, Some(Any::from(""))),
+            (Some((" mid ", Attrs::new())), None),
+            (None, Some(map)),
+            (Some(("two", linked(file))), None),
+            (Some((" end", Attrs::new())), None),
+        ] {
+            let at = t.len(&txn);
+            match (piece, embed) {
+                (Some((s, attrs)), None) => t.insert_with_attributes(&mut txn, at, s, attrs),
+                (None, Some(embed)) => {
+                    t.insert_embed_with_attributes(&mut txn, at, embed, Attrs::new());
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+    doc
+}
+
 #[test]
-fn links_are_left_alone_in_a_text_whose_offsets_the_diff_hides() {
-    // A text's diff shows an embedded string as text, so the offsets read
-    // from it are wrong. The link is left alone rather than the mark put on
-    // the wrong characters. A link in the next paragraph is rewritten.
-    let doc = with_embed(&doc_url(DOC), Some(Any::from("embedded")));
+fn embeds_next_to_strings_count_one_each() {
+    // The diff alone reads "ab" as two units and "" as none: the miscounts
+    // cancel out over the text, and the first link's mark landed one
+    // character late.
+    let doc = embeds_next_to_strings(&doc_url(DOC), &blob_url(LINKED));
+    assert_eq!(
+        references(doc.inner()),
+        Refs {
+            docs: ids(&[DOC]),
+            blobs: ids(&[LINKED]),
+            ..Refs::default()
+        }
+    );
+    assert_eq!(remap_refs(doc.inner(), &remap()), 2);
+    assert_eq!(
+        dump(&doc),
+        dump(&embeds_next_to_strings(
+            &doc_url(DOC_NEW),
+            &blob_url(LINKED_NEW)
+        ))
+    );
+}
+
+/// A paragraph of one `XmlText`: "Grüße ", an item the diff doesn't show,
+/// then what `rest` writes at the text's end. The item is an `Any` item,
+/// which only a crafted update puts into a text. It has a length, so
+/// everything after it is one unit further than the diff tells.
+fn with_hidden_item(rest: impl FnOnce(&mut yrs::TransactionMut, &yrs::XmlTextRef)) -> DocHandle {
+    use yrs::block::{BLOCK_ITEM_ANY_REF_NUMBER, ClientID, HAS_ORIGIN, ItemContent};
+    use yrs::encoding::write::Write;
+    use yrs::updates::decoder::Decode;
+    use yrs::updates::encoder::{Encoder, EncoderV1};
+    use yrs::{ID, ReadTxn, Transact, Update, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+
+    let doc = YrsEngine.new_doc();
+    let ydoc = doc.inner();
+    let frag = ydoc.get_or_insert_xml_fragment("default");
+    let text = {
+        let mut txn = ydoc.transact_mut();
+        let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+        p.push_back(&mut txn, XmlTextPrelim::new("Grüße "))
+    };
+    // "Grüße " is the last thing written so far.
+    let client = ydoc.client_id();
+    let last = ydoc.transact().state_vector().get(&client) - 1;
+    let mut enc = EncoderV1::new();
+    enc.write_var(1u32); // one client
+    enc.write_var(1u32); // one item
+    enc.write_client(ClientID::new(client.get() ^ 1)); // another client
+    enc.write_var(0u32); // its first clock
+    enc.write_info(BLOCK_ITEM_ANY_REF_NUMBER | HAS_ORIGIN);
+    enc.write_left_id(&ID::new(client, last));
+    ItemContent::Any(vec![Any::from("hidden")]).encode(&mut enc);
+    enc.write_var(0u32); // no deletions
+    ydoc.transact_mut()
+        .apply_update(Update::decode_v1(&enc.to_vec()).expect("decode"))
+        .expect("apply");
+    rest(&mut ydoc.transact_mut(), &text);
+    doc
+}
+
+/// Writes `s` at the end of `text`, with `attrs` and no other mark.
+fn append(
+    txn: &mut yrs::TransactionMut,
+    text: &yrs::XmlTextRef,
+    s: &str,
+    attrs: yrs::types::Attrs,
+) {
+    use yrs::Text;
+    let at = text.len(txn);
+    text.insert_with_attributes(txn, at, s, attrs);
+}
+
+fn linked_attrs(href: &str) -> yrs::types::Attrs {
+    yrs::types::Attrs::from([(Arc::from("link"), link(href))])
+}
+
+#[test]
+fn links_are_left_alone_in_a_text_holding_what_the_diff_hides() {
+    // The diff leaves out an `Any` item, which still has a length: the
+    // offsets read from the diff are wrong after it. The link is left alone
+    // rather than the mark put on the wrong characters. A link in the next
+    // paragraph is rewritten.
+    let doc = with_hidden_item(|txn, text| {
+        append(txn, text, "the spec", linked_attrs(&doc_url(DOC)));
+        append(txn, text, " ende", yrs::types::Attrs::new());
+    });
     {
         use yrs::types::Attrs;
         use yrs::{Text, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
@@ -613,6 +735,23 @@ fn links_are_left_alone_in_a_text_whose_offsets_the_diff_hides() {
         let attrs = Attrs::from([(Arc::from("link"), link(&blob_url(LINKED)))]);
         t.insert_with_attributes(&mut txn, 0, "next", attrs);
     }
+    {
+        use yrs::{Text, Transact, XmlFragment};
+        let ydoc = doc.inner();
+        let frag = ydoc.get_or_insert_xml_fragment("default");
+        let txn = ydoc.transact();
+        let text = frag
+            .get(&txn, 0)
+            .and_then(|p| p.into_xml_element())
+            .and_then(|p| p.get(&txn, 0))
+            .and_then(|t| t.into_xml_text())
+            .expect("the first paragraph's text");
+        assert_eq!(
+            text.len(&txn) as usize,
+            "Grüße ".len() + 1 + "the spec ende".len(),
+            "the hidden item counts one"
+        );
+    }
     let before = dump(&doc);
     assert_eq!(
         references(doc.inner()),
@@ -623,6 +762,62 @@ fn links_are_left_alone_in_a_text_whose_offsets_the_diff_hides() {
     );
     assert_eq!(remap_refs(doc.inner(), &remap()), 1);
     assert_eq!(dump(&doc), before.replace(LINKED, LINKED_NEW));
+}
+
+#[test]
+fn hidden_content_is_found_inside_a_run_of_text() {
+    // The diff leaves the hidden item out and reads "Grüße x" as one run of
+    // text, so the linked embedded string "ab" seems to start on "x". Read
+    // as two units of text, as the diff shows it, "ab" makes up for the
+    // hidden item's length, so the text's length gives nothing away. The
+    // item is found in the text, so its link is left alone rather than put
+    // on "x".
+    let doc = with_hidden_item(|txn, text| {
+        use yrs::Text;
+        append(txn, text, "x", yrs::types::Attrs::new());
+        let at = text.len(txn);
+        text.insert_embed_with_attributes(txn, at, Any::from("ab"), linked_attrs(&doc_url(DOC)));
+        append(txn, text, " ende", yrs::types::Attrs::new());
+    });
+    let before = dump(&doc);
+    assert_eq!(references(doc.inner()), Refs::default());
+    assert_eq!(remap_refs(doc.inner(), &remap()), 0);
+    assert_eq!(dump(&doc), before);
+}
+
+#[test]
+fn a_deleted_embed_takes_no_room() {
+    use yrs::types::Attrs;
+    use yrs::{ReadTxn, Text, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+
+    // A document that keeps its deleted items (knot's collect them): "x",
+    // an embed that is then deleted, and a link where the embed was.
+    let doc = Doc::with_options(Options {
+        skip_gc: true,
+        ..Options::default()
+    });
+    {
+        let frag = doc.get_or_insert_xml_fragment("default");
+        let mut txn = doc.transact_mut();
+        let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+        let t = p.push_back(&mut txn, XmlTextPrelim::new(""));
+        t.insert_with_attributes(&mut txn, 0, "x", Attrs::new());
+        t.insert_embed_with_attributes(&mut txn, 1, Any::from("ab"), Attrs::new());
+        t.insert_with_attributes(&mut txn, 2, "one", linked_attrs(&doc_url(DOC)));
+        t.remove_range(&mut txn, 1, 1);
+    }
+    assert_eq!(remap_refs(&doc, &remap()), 1);
+
+    let back = YrsEngine.new_doc();
+    let state = doc
+        .transact()
+        .encode_state_as_update_v1(&Default::default());
+    YrsEngine.apply_update(&back, &state).expect("apply");
+    let want = build(&[para(vec![
+        run("x", vec![]),
+        run("one", vec![("link", link(&doc_url(DOC_NEW)))]),
+    ])]);
+    assert_eq!(dump(&back), dump(&want));
 }
 
 #[test]
@@ -659,8 +854,10 @@ fn references_at_any_depth_are_found_and_rewritten() {
     use yrs::types::Attrs;
     use yrs::{Text, Transact, Xml, XmlElementPrelim, XmlFragment, XmlTextPrelim};
 
-    // Deeper than a recursive walk gets on the small stack below.
-    const DEPTH: usize = 20_000;
+    // Far deeper than a walk that recursed once per level could get on a
+    // tokio worker's stack.
+    const DEPTH: usize = 100_000;
+    const WORKER_STACK: usize = 2 * 1024 * 1024;
     let page = YrsEngine.new_doc();
     {
         let ydoc = page.inner();
@@ -676,20 +873,22 @@ fn references_at_any_depth_are_found_and_rewritten() {
         let attrs = Attrs::from([(Arc::from("link"), link(&doc_url(DOC)))]);
         t.insert_with_attributes(&mut txn, 0, "deep", attrs);
     }
-    // The page comes back to be dropped here, so only the walk runs on the
-    // small stack.
-    let (page, refs, rewrites, after) = std::thread::Builder::new()
-        .stack_size(256 * 1024)
+    // As Duplicate does it: the page copied into a new document, whose
+    // references are read and rewritten. The documents come back to be
+    // dropped here, so only the copy and the walk run on the worker's stack.
+    let (page, dup, refs, rewrites, after) = std::thread::Builder::new()
+        .stack_size(WORKER_STACK)
         .spawn(move || {
-            let refs = references(page.inner());
-            let rewrites = remap_refs(page.inner(), &remap());
-            let after = references(page.inner());
-            (page, refs, rewrites, after)
+            let dup = copy(&page);
+            let refs = references(dup.inner());
+            let rewrites = remap_refs(dup.inner(), &remap());
+            let after = references(dup.inner());
+            (page, dup, refs, rewrites, after)
         })
         .expect("spawn")
         .join()
-        .expect("the walk fits a small stack");
-    drop(page);
+        .expect("the walk fits a worker's stack");
+    drop((page, dup));
     let found = |docs: &[&str], boards: &[&str]| Refs {
         docs: ids(docs),
         boards: ids(boards),
