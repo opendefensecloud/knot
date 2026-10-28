@@ -1,7 +1,9 @@
 //! A page from another workspace is never a parent: create, move,
 //! from-template and import under one fail with `404 doc.not_found`, the
 //! same response as an unknown id, and write nothing in either workspace.
-//! The foreign key on `parent_id` only proves the row exists somewhere.
+//! The foreign key on `parent_id` only proves the row exists somewhere. A
+//! page of the caller's own workspace in the archive is refused as archived
+//! instead, `409 doc.archived`.
 //!
 //! Two workspaces: `A`, where both users sign in, and `B`. One user is a
 //! member of both, the other of `A` only.
@@ -343,6 +345,45 @@ async fn from_template_under_a_foreign_parent_is_404() {
         .await
     })
     .await;
+}
+
+/// The 404 is for parents outside the workspace only. Under a page of the
+/// caller's own workspace that is in the archive, from-template is refused
+/// as `409 doc.archived`, as create, move and import are
+/// (`archive_integration.rs`), and no page changes or appears.
+#[tokio::test(flavor = "multi_thread")]
+async fn from_template_under_an_archived_parent_of_its_own_workspace_is_409() {
+    let w = world().await;
+    let parent = w.mover;
+    let (status, body) = w
+        .send(
+            &w.both,
+            "DELETE",
+            &format!("/api/docs/{parent}"),
+            "application/json",
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "archive the parent: {body}");
+    let before = w.documents().await;
+
+    let uri = format!("/api/docs/from-template/{}", w.template);
+    for (user, who) in [("both", &w.both), ("only A", &w.only_a)] {
+        let (status, body) = w
+            .send_json(
+                who,
+                "POST",
+                &uri,
+                json!({"title": "Stray", "parent_id": parent}),
+            )
+            .await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::CONFLICT, "doc.archived"),
+            "as {user}: {body}"
+        );
+    }
+    assert_eq!(w.documents().await, before, "no page changed or appeared");
 }
 
 /// `POST /api/workspace/import?parent_id=` with a page of `B` was refused
