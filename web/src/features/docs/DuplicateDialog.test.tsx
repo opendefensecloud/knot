@@ -75,9 +75,11 @@ type ServerOpts = {
   gate?: Promise<void>;
   /** Every GET /api/docs after the first is answered once this resolves. */
   relistGate?: Promise<void>;
+  /** The copy is stored even when the answer is `reply`'s error. */
+  stored?: boolean;
 };
 
-function server({ role = "editor", reply, gate, relistGate }: ServerOpts = {}) {
+function server({ role = "editor", reply, gate, relistGate, stored }: ServerOpts = {}) {
   let pages = PAGES;
   let listed = 0;
   return vi.fn((url: string, init?: RequestInit) => {
@@ -95,11 +97,11 @@ function server({ role = "editor", reply, gate, relistGate }: ServerOpts = {}) {
     const dup = /^\/api\/docs\/([^/]+)\/duplicate$/.exec(url);
     if (dup && init?.method === "POST") {
       return (gate ?? Promise.resolve()).then(() => {
-        if (reply === "network") throw new TypeError("Failed to fetch");
-        if (reply) return response({ error: { code: reply.code, message: reply.code, details: {} } }, reply.status);
         const src = pages.find((p) => p.id === dup[1])!;
         const copy = { id: "copy", title: `${src.title} (copy)`, parent_id: src.parent_id, sort_key: `${src.sort_key}m` };
-        pages = [...pages, copy];
+        if (!reply || stored) pages = [...pages, copy];
+        if (reply === "network") throw new TypeError("Failed to fetch");
+        if (reply) return response({ error: { code: reply.code, message: reply.code, details: {} } }, reply.status);
         return response(doc(copy), 201);
       });
     }
@@ -439,6 +441,24 @@ describe("when Duplicate fails", () => {
 
     expect(await screen.findByTestId("toast-error")).toHaveTextContent(text);
     expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+  });
+
+  // The copy may have been stored anyway: a request timed out (408) or
+  // whose answer was lost.
+  it.each<[string, Reply]>([
+    ["a 408", { status: 408, code: "http_error" }],
+    ["a failed request", "network"],
+  ])("refreshes the list after %s, so a copy stored anyway shows", async (_what, reply) => {
+    const fetchMock = server({ reply, stored: true });
+    renderTree(fetchMock);
+    await editorRows();
+
+    chooseDuplicate("notes");
+
+    expect(await screen.findByTestId("toast-error")).toHaveTextContent(FAILED);
+    expect(await screen.findByTestId("doc-row-copy")).toHaveTextContent("Meeting notes (copy)");
+    expect(lists(fetchMock)).toBe(2);
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
   });
 

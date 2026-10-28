@@ -290,8 +290,11 @@ export function DocTree() {
     rowLink(treeRef.current, id)?.focus();
   }
 
-  /** Says why a duplicate failed: in its dialog while that is open, else in a toast. */
+  /** Says why a duplicate failed: in its dialog while that is open, else in
+   *  a toast. The list is fetched again: the copy may have been stored all
+   *  the same, when the request timed out (408) or its answer was lost. */
   function duplicateFailed(id: string, text: string) {
+    void qc.invalidateQueries({ queryKey: ["docs"] });
     if (dupOpen.current === id) setDupError(text);
     else notify("error", text);
   }
