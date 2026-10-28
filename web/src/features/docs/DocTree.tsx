@@ -304,7 +304,7 @@ export function DocTree() {
     mutationFn: (a: DuplicateArgs) => docsApi.duplicate(a.id, { include_subpages: a.include_subpages }),
     onSuccess: async (r, a) => {
       if ("error" in r) {
-        duplicateFailed(a.id, duplicateErrorText(r.error.status));
+        duplicateFailed(a.id, duplicateErrorText(r.error));
         return;
       }
       await qc.invalidateQueries({ queryKey: ["docs"] });

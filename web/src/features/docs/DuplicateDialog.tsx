@@ -9,10 +9,16 @@ const DUPLICATE_FAILED = "Couldn't duplicate this page.";
  *  `MAX_DUPLICATE_PAGES` and `MAX_DUPLICATE_BLOB_BYTES`. */
 const DUPLICATE_TOO_LARGE = "This page is too large to duplicate (over 200 pages or 200 MB of files).";
 
-/** What to tell the user when a duplicate failed with this HTTP status, or
- *  with no answer at all. */
-export function duplicateErrorText(status?: number): string {
-  return status === 413 ? DUPLICATE_TOO_LARGE : DUPLICATE_FAILED;
+/** Shown on a 503 `doc.duplicate_busy`: the server makes only a few copies
+ *  at once, and none came free in time. Another 503 isn't the server's. */
+const DUPLICATE_BUSY = "Too many copies are being made right now. Try again in a moment.";
+
+/** What to tell the user when a duplicate failed with this error, or with
+ *  no answer at all. */
+export function duplicateErrorText(error?: { status: number; code: string }): string {
+  if (error?.status === 413) return DUPLICATE_TOO_LARGE;
+  if (error?.code === "doc.duplicate_busy") return DUPLICATE_BUSY;
+  return DUPLICATE_FAILED;
 }
 
 /** The controls Tab moves between. */

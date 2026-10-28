@@ -39,7 +39,8 @@ export const docsApi = {
     });
   },
   /** Copy a doc right after it, with its subpages when asked (editors and
-   *  owners). 413 `doc.duplicate_too_large` above the server's caps. */
+   *  owners). 413 `doc.duplicate_too_large` above the server's caps, 503
+   *  `doc.duplicate_busy` while it is making as many copies as it will. */
   async duplicate(id: string, body: DocDuplicate): Promise<ApiResult<Doc>> {
     const r = await apiFetch<unknown>(`/api/docs/${encodeURIComponent(id)}/duplicate`, {
       method: "POST",

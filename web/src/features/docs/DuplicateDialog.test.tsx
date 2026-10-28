@@ -20,6 +20,7 @@ afterEach(() => {
 });
 
 const TOO_LARGE = "This page is too large to duplicate (over 200 pages or 200 MB of files).";
+const BUSY = "Too many copies are being made right now. Try again in a moment.";
 const FAILED = "Couldn't duplicate this page.";
 
 type Role = "owner" | "editor" | "viewer";
@@ -412,6 +413,9 @@ describe("after a successful Duplicate", () => {
 describe("when Duplicate fails", () => {
   const ERRORS: [string, Reply, string][] = [
     ["a 413", { status: 413, code: "doc.duplicate_too_large" }, TOO_LARGE],
+    ["a 503 doc.duplicate_busy", { status: 503, code: "doc.duplicate_busy" }, BUSY],
+    // Not the server's own answer: a proxy in front of it.
+    ["a 503 without that code", { status: 503, code: "http_error" }, FAILED],
     ["a 409", { status: 409, code: "doc.duplicate_conflict" }, FAILED],
     ["a 422", { status: 422, code: "doc.is_template" }, FAILED],
     ["a 500", { status: 500, code: "internal" }, FAILED],
