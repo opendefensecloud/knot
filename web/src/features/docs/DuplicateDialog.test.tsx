@@ -202,6 +202,31 @@ describe("Duplicate without subpages", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(duplicates(fetchMock)).toEqual([{ id: "notes", body: { include_subpages: false } }]);
   });
+
+  it("says Duplicating… on the row, and Duplicate… is off until the copy is made", async () => {
+    const gate = deferred();
+    const fetchMock = server({ gate: gate.promise });
+    renderTree(fetchMock);
+    await editorRows();
+
+    chooseDuplicate("notes");
+    const row = screen.getByTestId("tree-row-notes");
+    expect(await within(row).findByText("Duplicating…")).toBeInTheDocument();
+    expect(screen.getByTestId("tree-live")).toHaveTextContent("Duplicating “Meeting notes”…");
+    // Picking it again makes no second copy.
+    const again = within(openMenu("notes")).getByTestId("ctx-duplicate");
+    expect(again).toBeDisabled();
+    fireEvent.click(again);
+    // Another page's copy can still be asked for.
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(within(openMenu("plan")).getByTestId("ctx-duplicate")).toBeEnabled();
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    gate.resolve();
+
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("/doc/copy"));
+    expect(within(row).queryByText("Duplicating…")).toBeNull();
+    expect(duplicates(fetchMock)).toEqual([{ id: "notes", body: { include_subpages: false } }]);
+  });
 });
 
 describe("the Duplicate dialog", () => {

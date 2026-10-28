@@ -1,4 +1,4 @@
-import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 
@@ -68,6 +68,9 @@ const DUPLICATE_KEY = ["docs-duplicate"];
 /** The page the Duplicate dialog asks about. */
 type DuplicateAsk = { id: string; title: string; subpages: number };
 
+/** What a duplicate mutation copies. */
+type DuplicateArgs = { id: string; include_subpages: boolean };
+
 /** The droppable id of the tree's list. Doc ids are UUIDs, so it can't clash. */
 const TREE_AREA = ":tree";
 
@@ -110,8 +113,8 @@ export function DocTree() {
     },
   });
 
-  // What the last menu or Alt+arrow move did, or that a move was refused,
-  // for the live region.
+  // What the last menu or Alt+arrow move did, that a move was refused, or
+  // that a copy is being made, for the live region.
   const [announcement, setAnnouncement] = useState("");
 
   /** How many moves are pending: the one asking, and any queued with it. */
@@ -271,7 +274,14 @@ export function DocTree() {
   // The same page, for the answers to read: one that comes after its dialog
   // has closed goes to a toast instead.
   const dupOpen = useRef<string | null>(null);
-  const duplicating = useIsMutating({ mutationKey: DUPLICATE_KEY }) > 0;
+  // The pages whose copy is being made: their rows say so, and their
+  // "Duplicate…" is off meanwhile.
+  const copyingIds = useMutationState({
+    filters: { mutationKey: DUPLICATE_KEY, status: "pending" },
+    select: (m) => (m.state.variables as DuplicateArgs).id,
+  });
+  const copying = useMemo(() => new Set(copyingIds), [copyingIds]);
+  const duplicating = copying.size > 0;
 
   function closeDuplicate(id: string) {
     dupOpen.current = null;
@@ -288,8 +298,7 @@ export function DocTree() {
 
   const duplicate = useMutation({
     mutationKey: DUPLICATE_KEY,
-    mutationFn: (a: { id: string; include_subpages: boolean }) =>
-      docsApi.duplicate(a.id, { include_subpages: a.include_subpages }),
+    mutationFn: (a: DuplicateArgs) => docsApi.duplicate(a.id, { include_subpages: a.include_subpages }),
     onSuccess: async (r, a) => {
       if ("error" in r) {
         duplicateFailed(a.id, duplicateErrorText(r.error.status));
@@ -309,6 +318,7 @@ export function DocTree() {
   function startDuplicate(node: TreeNode) {
     const subpages = countDescendants(node);
     if (subpages === 0) {
+      setAnnouncement(`Duplicating “${node.title}”…`);
       duplicate.mutate({ id: node.id, include_subpages: false });
       return;
     }
@@ -363,6 +373,7 @@ export function DocTree() {
     planMove: (id, cmd) => keyboardMove(flat, docs, id, cmd),
     onMove: moveBy,
     onDuplicate: startDuplicate,
+    copying,
   };
   const dragged = draggingId === null ? undefined : rows.get(draggingId);
 

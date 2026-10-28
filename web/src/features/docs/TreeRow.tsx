@@ -65,6 +65,8 @@ export type TreeState = {
   onMove: (id: string, cmd: MoveCmd) => void;
   /** Copies the page, asking first whether its subpages go too. */
   onDuplicate: (node: TreeNode) => void;
+  /** The pages whose copy is being made. */
+  copying: ReadonlySet<string>;
 };
 
 export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; tree: TreeState }) {
@@ -92,6 +94,7 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
   const row = tree.rows.get(node.id);
   const drop = tree.drop?.overId === node.id ? tree.drop : null;
   const expanded = !tree.collapsed.has(node.id);
+  const copying = tree.copying.has(node.id);
   const descId = `tree-desc-${node.id}`;
 
   async function onRename() {
@@ -131,7 +134,13 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
   const items: ContextMenuItem[] = [];
   if (canEdit) {
     items.push({ label: "Rename", testId: "ctx-rename", onSelect: () => void onRename() });
-    items.push({ label: "Duplicate…", testId: "ctx-duplicate", onSelect: () => tree.onDuplicate(node) });
+    items.push({
+      label: "Duplicate…",
+      testId: "ctx-duplicate",
+      // One copy of a page at a time: picking it again would make a second.
+      disabled: copying,
+      onSelect: () => tree.onDuplicate(node),
+    });
     for (const m of MOVE_ITEMS) {
       items.push({
         label: m.label,
@@ -252,6 +261,7 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
         >
           {node.title}
         </Link>
+        {copying && <span className="shrink-0 text-[11px] text-fg-muted">Duplicating…</span>}
         <span id={descId} className="sr-only">
           {row && rowDescription(row)}
         </span>
