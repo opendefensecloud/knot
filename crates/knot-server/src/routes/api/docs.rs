@@ -4,6 +4,7 @@
 //! - GET    /api/docs/{id}        metadata + effective_role (+ archive state)
 //! - PATCH  /api/docs/{id}        rename / icon
 //! - POST   /api/docs/{id}/move   reparent / reorder
+//! - POST   /api/docs/{id}/duplicate  body: {include_subpages?}; copy right after it (editor+)
 //! - DELETE /api/docs/{id}        move to the archive, with its subtree (editor+)
 //! - POST   /api/docs/{id}/restore  bring an archive root back (editor+)
 //! - POST   /api/docs/{id}/purge  delete an archive root for good (owner)
@@ -12,18 +13,19 @@
 use axum::{
     Json, Router,
     extract::{Path, Request, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use knot_storage::{Document, PersonRef, WorkspaceRole, sort_key_between};
+use knot_storage::{Document, PersonRef, Placement, WorkspaceRole};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::AppState;
 use crate::archive::{PurgeError, PurgeTrigger};
 use crate::auth::{AuthContext, DocArchived, EffectiveDocRole, require_doc_role_mw};
+use crate::duplicate::{BUSY_WAIT, DuplicateError, MAX_DUPLICATE_BLOB_BYTES, MAX_DUPLICATE_PAGES};
 use crate::http_error::{doc_archived, json_err};
 
 #[derive(Serialize)]
@@ -57,6 +59,7 @@ pub fn router(state: AppState) -> Router<AppState> {
     let doc_id_routes: Router<AppState> = Router::new()
         .route("/api/docs/{id}", get(get_one).patch(rename).delete(archive))
         .route("/api/docs/{id}/move", post(move_doc))
+        .route("/api/docs/{id}/duplicate", post(duplicate))
         .route(crate::auth::ARCHIVE_RESTORE_ROUTE, post(restore))
         .route(crate::auth::ARCHIVE_PURGE_ROUTE, post(purge))
         .route(
@@ -143,42 +146,32 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
         return internal();
     };
     let title = body.title.unwrap_or_else(|| "Untitled".into());
-
-    let siblings = match docs.siblings(ctx.workspace_id, body.parent_id).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error=?e, "siblings");
-            return internal();
-        }
-    };
-    let (a, b) = match body.after_id {
-        None => (None, siblings.first().map(|d| d.sort_key.as_str())),
-        Some(aid) => {
-            let i = siblings.iter().position(|d| d.id == aid);
-            match i {
-                Some(i) => (
-                    Some(siblings[i].sort_key.as_str()),
-                    siblings.get(i + 1).map(|d| d.sort_key.as_str()),
-                ),
-                None => (siblings.last().map(|d| d.sort_key.as_str()), None),
-            }
-        }
-    };
-    let sk = sort_key_between(a, b);
+    // No anchor: first at its level, where "New page" puts it.
+    let placement = body.after_id.map_or(Placement::First, Placement::After);
 
     match docs
-        .create(ctx.workspace_id, body.parent_id, &title, &sk, ctx.user_id)
+        .create_placed(
+            ctx.workspace_id,
+            body.parent_id,
+            &title,
+            placement,
+            ctx.user_id,
+        )
         .await
     {
         Ok(d) => (StatusCode::CREATED, Json(to_response(&d))).into_response(),
-        // The generated sort_key collided with a sibling's (see move_to for
-        // the same case). That is a client-visible conflict, not an internal
-        // failure — retrying with a different position can succeed.
+        // The key collided with one written outside placement, such as by
+        // an older release during an upgrade. Retrying can succeed.
         Err(knot_storage::DocStoreError::Conflict) => {
             json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "")
         }
         // The parent is in the archive.
         Err(knot_storage::DocStoreError::Archived) => doc_archived(),
+        // The parent is not a page of this workspace.
+        Err(knot_storage::DocStoreError::NotFound) => {
+            json_err(StatusCode::NOT_FOUND, "doc.not_found", "")
+        }
+        Err(knot_storage::DocStoreError::BadAnchor) => bad_anchor(),
         Err(e) => {
             tracing::error!(error=?e, "create");
             internal()
@@ -361,42 +354,19 @@ async fn move_doc(
 
     // Spec §6.1: `parent_id` in the request body is the *target* parent. An
     // explicit `null` (or omitted field, since serde collapses both to
-    // `None`) moves the doc to the workspace root. `move_to` will surface
-    // `DocStoreError::NotFound` if the document doesn't exist, so we skip a
-    // pre-flight existence check here.
+    // `None`) moves the doc to the workspace root. `move_placed` will surface
+    // `DocStoreError::NotFound` if the document doesn't exist, or if the
+    // target parent is not a page of this workspace, so we skip a pre-flight
+    // existence check here.
     let new_parent = body.parent_id;
-
-    let siblings = match docs.siblings(ctx.workspace_id, new_parent).await {
-        Ok(s) => s.into_iter().filter(|d| d.id != doc_id).collect::<Vec<_>>(),
-        Err(e) => {
-            tracing::error!(error=?e, "move siblings");
-            return internal();
-        }
+    let placement = match (body.after_id, body.before_id) {
+        (Some(after), _) => Placement::After(after),
+        (None, Some(before)) => Placement::Before(before),
+        (None, None) => Placement::Last,
     };
-    let end_of_siblings = || (siblings.last().map(|d| d.sort_key.as_str()), None);
-    let (a, b) = match (body.after_id, body.before_id) {
-        (Some(aid), _) => match siblings.iter().position(|d| d.id == aid) {
-            Some(i) => (
-                Some(siblings[i].sort_key.as_str()),
-                siblings.get(i + 1).map(|d| d.sort_key.as_str()),
-            ),
-            None => end_of_siblings(),
-        },
-        (_, Some(bid)) => match siblings.iter().position(|d| d.id == bid) {
-            Some(i) => (
-                i.checked_sub(1)
-                    .and_then(|j| siblings.get(j))
-                    .map(|d| d.sort_key.as_str()),
-                Some(siblings[i].sort_key.as_str()),
-            ),
-            None => end_of_siblings(),
-        },
-        (None, None) => end_of_siblings(),
-    };
-    let sk = sort_key_between(a, b);
 
     match docs
-        .move_to(ctx.workspace_id, doc_id, ctx.user_id, new_parent, &sk)
+        .move_placed(ctx.workspace_id, doc_id, ctx.user_id, new_parent, placement)
         .await
     {
         Ok(d) => Json(to_response(&d)).into_response(),
@@ -409,10 +379,116 @@ async fn move_doc(
         Err(knot_storage::DocStoreError::Cycle) => {
             json_err(StatusCode::CONFLICT, "doc.move_cycle", "")
         }
-        // The destination parent is in the archive.
+        // The doc or the destination parent is in the archive.
         Err(knot_storage::DocStoreError::Archived) => doc_archived(),
+        Err(knot_storage::DocStoreError::BadAnchor) => bad_anchor(),
         Err(e) => {
             tracing::error!(error=?e, "move");
+            internal()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DuplicateRequest {
+    /// Copy the page's live subpages too. Off unless asked for.
+    #[serde(default)]
+    include_subpages: bool,
+}
+
+/// Copy a page right after it, with its subpages when asked (spec D). See
+/// `crate::duplicate`.
+#[tracing::instrument(skip_all, name = "docs.duplicate")]
+async fn duplicate(
+    State(state): State<AppState>,
+    Path(doc_id): Path<Uuid>,
+    req: Request,
+) -> Response {
+    let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
+        return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
+    };
+    let Some(role) = req.extensions().get::<EffectiveDocRole>().copied() else {
+        return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
+    };
+    let Ok(body) = read_json::<DuplicateRequest>(req).await else {
+        return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
+    };
+    // Before the wait for a permit: these answers need none, so a busy
+    // server doesn't turn them into 503s.
+    if let Err(e) = crate::duplicate::check(&state, &ctx, role.0, doc_id).await {
+        return duplicate_error(e);
+    }
+    // Taken before the copy starts, and held until its refresh ends, so no
+    // more than the permitted copies are held in memory at once.
+    let permit = tokio::time::timeout(
+        state.duplicate_busy_wait,
+        state.duplicate_permits.clone().acquire_owned(),
+    )
+    .await;
+    let permit = match permit {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "duplicate permits closed");
+            return internal();
+        }
+        Err(_) => return duplicate_busy(),
+    };
+    // On a task of its own (P16): dropping this handler, on the request
+    // timeout or when the client goes away, can't stop a duplicate halfway.
+    // The answer comes once the copy is stored, before its refresh.
+    let answer = crate::duplicate::start(state, ctx, role.0, doc_id, body.include_subpages, permit);
+    match answer.await {
+        Ok(Ok(top)) => (StatusCode::CREATED, Json(to_response(&top))).into_response(),
+        Ok(Err(e)) => duplicate_error(e),
+        Err(_) => {
+            tracing::error!("duplicate task ended without an answer");
+            internal()
+        }
+    }
+}
+
+/// `503 doc.duplicate_busy`: every duplicate permit stayed taken for the
+/// busy wait. A retry is worth it once a copy may have ended: after
+/// [`BUSY_WAIT`], the time a duplicate waits for a permit.
+fn duplicate_busy() -> Response {
+    let mut response = json_err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "doc.duplicate_busy",
+        "too many copies at once",
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(BUSY_WAIT.as_secs()));
+    response
+}
+
+fn duplicate_error(e: DuplicateError) -> Response {
+    match e {
+        DuplicateError::EditorRequired => {
+            json_err(StatusCode::FORBIDDEN, "acl.editor_required", "")
+        }
+        DuplicateError::NotFound => json_err(StatusCode::NOT_FOUND, "doc.not_found", ""),
+        DuplicateError::IsTemplate => {
+            json_err(StatusCode::UNPROCESSABLE_ENTITY, "doc.is_template", "")
+        }
+        DuplicateError::Archived => doc_archived(),
+        DuplicateError::TooLarge => json_err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "doc.duplicate_too_large",
+            &format!(
+                "over {MAX_DUPLICATE_PAGES} pages or {} MiB of files",
+                MAX_DUPLICATE_BLOB_BYTES / (1024 * 1024)
+            ),
+        ),
+        // `DocStoreError::DuplicateConflict` and a file object missing from
+        // the store: the source was moved or archived, or a file it shows
+        // was purged or lost, while it was copied.
+        DuplicateError::Conflict => json_err(StatusCode::CONFLICT, "doc.duplicate_conflict", ""),
+        DuplicateError::SortKeyConflict => {
+            json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "")
+        }
+        DuplicateError::Internal(e) => {
+            tracing::error!(error = %e, "duplicate");
             internal()
         }
     }
@@ -486,6 +562,17 @@ async fn restore(
         // A purge has started deleting its attachments.
         Err(knot_storage::DocStoreError::Purging) => {
             json_err(StatusCode::CONFLICT, "doc.purging", "")
+        }
+        // The key it would get at the top level was taken by a writer
+        // outside placement, such as an older release during an upgrade.
+        // Retrying can succeed.
+        Err(knot_storage::DocStoreError::Conflict) => {
+            json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "")
+        }
+        // It was restored, moved and archived again while this ran.
+        // Retrying can succeed.
+        Err(knot_storage::DocStoreError::RestoreConflict) => {
+            json_err(StatusCode::CONFLICT, "doc.restore_conflict", "")
         }
         Err(e) => {
             tracing::error!(error=?e, "restore");
@@ -687,16 +774,6 @@ async fn create_from_template_inline(
         }
     };
 
-    // Allocate a sort_key at the end of the destination parent's children.
-    let siblings = match docs.siblings(ctx.workspace_id, body.parent_id).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error=?e, "from_template siblings");
-            return internal();
-        }
-    };
-    let sk = sort_key_between(siblings.last().map(|d| d.sort_key.as_str()), None);
-
     // Default title falls back to the template's title + " copy".
     let title = match body.title {
         Some(t) if !t.trim().is_empty() => t,
@@ -706,8 +783,15 @@ async fn create_from_template_inline(
         },
     };
 
+    // At the end of the destination parent's children.
     let new_doc = match docs
-        .create(ctx.workspace_id, body.parent_id, &title, &sk, ctx.user_id)
+        .create_placed(
+            ctx.workspace_id,
+            body.parent_id,
+            &title,
+            Placement::Last,
+            ctx.user_id,
+        )
         .await
     {
         Ok(d) => d,
@@ -715,6 +799,10 @@ async fn create_from_template_inline(
             return json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "");
         }
         Err(knot_storage::DocStoreError::Archived) => return doc_archived(),
+        // The parent is not a page of this workspace.
+        Err(knot_storage::DocStoreError::NotFound) => {
+            return json_err(StatusCode::NOT_FOUND, "doc.not_found", "");
+        }
         Err(e) => {
             tracing::error!(error=?e, "from_template create");
             return internal();
@@ -772,4 +860,10 @@ async fn read_json<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, ()
 
 fn internal() -> Response {
     json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "")
+}
+
+/// 422 `doc.bad_anchor`: `after_id` or `before_id` is not a live,
+/// non-template page under the target parent, or it is the moved doc.
+fn bad_anchor() -> Response {
+    json_err(StatusCode::UNPROCESSABLE_ENTITY, "doc.bad_anchor", "")
 }

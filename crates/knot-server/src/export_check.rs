@@ -5,14 +5,13 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use anyhow::Context as _;
-use knot_crdt::{DocHandle, Engine, YrsEngine};
+use knot_crdt::DocHandle;
 use knot_export::{Assets, Fallbacks, Meta};
-use knot_storage::{
-    DocStore, PgDocStore, PgSnapshotStore, PgUpdatesStore, PgWorkspaceStore, SnapshotStore,
-    UpdatesStore, WorkspaceStore,
-};
+use knot_storage::{DocStore, PgDocStore, PgWorkspaceStore, WorkspaceStore};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use crate::routes::api::markdown::stored_snapshot;
 
 #[derive(Debug)]
 pub struct CheckReport {
@@ -22,21 +21,11 @@ pub struct CheckReport {
 }
 
 /// The page as the room would load it: latest snapshot, then the updates
-/// after it. Errors are returned, not swallowed.
+/// after it. Errors are returned, not swallowed. This is the markdown
+/// refresh's load (`routes::api::markdown::stored_snapshot`), without its
+/// seq.
 pub async fn hydrate(pool: &PgPool, doc_id: Uuid) -> anyhow::Result<DocHandle> {
-    let engine = YrsEngine;
-    let doc = engine.new_doc();
-    let mut applied = 0;
-    if let Some(snap) = PgSnapshotStore::new(pool.clone()).latest(doc_id).await? {
-        engine.apply_update(&doc, &snap.state_bytes)?;
-        applied = snap.snapshot_seq;
-    }
-    for update in PgUpdatesStore::new(pool.clone())
-        .since(doc_id, applied)
-        .await?
-    {
-        engine.apply_update(&doc, &update.update_bytes)?;
-    }
+    let (doc, _seq) = stored_snapshot(pool, doc_id).await?;
     Ok(doc)
 }
 

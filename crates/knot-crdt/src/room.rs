@@ -17,8 +17,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::bus::{Bus, Subscription};
-use crate::engine::{DocHandle, Engine, EngineError};
+use crate::engine::{ApplyMeasured, DocHandle, Engine, EngineError};
 use crate::protocol::wrap_sync_update;
+use crate::tasks::patch_task_checked;
 
 pub type ConnId = Uuid;
 
@@ -37,11 +38,22 @@ pub struct InMsg {
 pub struct ConnHandle {
     pub tx: mpsc::Sender<Vec<u8>>,
     /// Cancelled by the room when the connection's access is revoked; the WS
-    /// shim then closes the socket with 4403. A dedicated signal because the
-    /// channel cannot carry it by closing (the shim holds its own sender for
-    /// the whole session) and no frame value is free to mean it (an empty
-    /// frame is already the presence-clearing message).
+    /// shim then closes the socket with 4403. The shim makes it a child of
+    /// [`RoomHandle::revoked`], which revokes every connection at once. A
+    /// dedicated signal because the channel cannot carry it by closing (the
+    /// shim holds its own sender for the whole session) and no frame value
+    /// is free to mean it (an empty frame is already the presence-clearing
+    /// message).
     pub revoked: CancellationToken,
+    /// Cancelled by the room when it refuses an update the connection sent:
+    /// one that would nest the page too deep ([`crate::nesting`]), or one
+    /// that doesn't decode; the WS shim then closes the socket with 4422.
+    /// The room no longer holds the connection and doesn't join it again,
+    /// so nothing more it sends is applied or shared, its presence
+    /// included. When the refusal also evicts the room (an update it applied
+    /// and then refused), the other connections are closed through
+    /// [`RoomHandle::shutdown`].
+    pub refused: CancellationToken,
 }
 
 impl ConnHandle {
@@ -49,6 +61,7 @@ impl ConnHandle {
         Self {
             tx,
             revoked: CancellationToken::new(),
+            refused: CancellationToken::new(),
         }
     }
 }
@@ -117,10 +130,10 @@ pub enum Event {
     },
     /// Flip the `checked` attribute on the Nth task `list_item` in the doc.
     /// `item_index` counts list_item nodes with a `checked` attr in
-    /// document order — matches the index produced by
-    /// `knot_markdown::tasks::extract_tasks`. The mutation happens
-    /// directly on the live doc; the resulting update is persisted and
-    /// fanned out via the same pipeline as `ApplyUpdate`.
+    /// document order ([`crate::tasks::task_items`]) — the index
+    /// `knot_markdown::tasks::extract_tasks_from_doc` lists. The mutation
+    /// happens directly on the live doc; the resulting update is persisted
+    /// and fanned out via the same pipeline as `ApplyUpdate`.
     PatchTaskChecked {
         item_index: i32,
         checked: bool,
@@ -151,11 +164,31 @@ pub struct Room {
     /// Fires after the writer confirms a successful persist; consumers
     /// debounce + reindex tasks for the doc.
     dirty_tx: Option<mpsc::Sender<Uuid>>,
+    /// Set when the room evicts itself after applying an update it then
+    /// refused: one that nested the page past
+    /// [`crate::nesting::MAX_NESTING`] (the authoritative post-apply check),
+    /// whether yrs applied all of it or rejected the rest. The live doc then
+    /// holds the refused content, so the final flush must NOT snapshot it:
+    /// the next join reloads the page from storage, which never got the
+    /// refused update.
+    evicted: bool,
 }
 
 pub struct RoomHandle {
     pub tx: mpsc::Sender<Event>,
+    /// The room's lifetime. Cancel it to stop the room. The room cancels it
+    /// itself when it evicts itself (`Room::refuse_applied`), and its actor
+    /// cancels it whenever it ends, panics included. Once it is cancelled the
+    /// registry treats the room as gone and boots a fresh one on the next
+    /// join, and every WS shim of the room, which watches it, closes its
+    /// socket so the client reconnects to that fresh room.
     pub shutdown: CancellationToken,
+    /// Cancelled when the page's access ends for everyone and the room goes
+    /// with it ([`crate::Rooms::revoke_and_evict`], for a purge). Each WS
+    /// shim makes its connection's [`ConnHandle::revoked`] a child of it,
+    /// so every socket closes with 4403 and its client leaves the page,
+    /// rather than with 1012 and a reconnect to a page that is gone.
+    pub revoked: CancellationToken,
 }
 
 impl Room {
@@ -230,13 +263,22 @@ impl Room {
             policy,
             snap_state,
             dirty_tx,
+            evicted: false,
         };
         tokio::spawn(room.run());
-        Ok(RoomHandle { tx, shutdown })
+        Ok(RoomHandle {
+            tx,
+            shutdown,
+            revoked: CancellationToken::new(),
+        })
     }
 
     #[tracing::instrument(skip_all, fields(doc_id = %self.doc_id))]
     async fn run(mut self) {
+        // However the actor ends (eviction, a shutdown, a panic), cancel the
+        // room's token on the way out, so the shims close their sockets and
+        // the registry stops handing out this room (see `RoomHandle`).
+        let _ended = self.shutdown.clone().drop_guard();
         let mut idle_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut catchup_tick = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
@@ -274,6 +316,11 @@ impl Room {
                     }
                     Some(Event::AwarenessIn { from, payload }) => {
                         if crate::presence::is_oversize(&payload) { continue; }
+                        // Only connections the room holds share presence, as
+                        // only they may write (`on_inbound`): a refused or
+                        // revoked one (or one dropped as a slow consumer)
+                        // can keep sending until its socket is torn down.
+                        if !self.conns.contains_key(&from) { continue; }
                         // Local fan-out (sans origin).
                         let mut to_close: Vec<ConnId> = Vec::new();
                         for (cid, conn) in &self.conns {
@@ -543,15 +590,20 @@ impl Room {
         }
 
         // Final flush: write a snapshot at the current seq so the next boot
-        // is cheap. Best-effort.
-        let _ = crate::snapshot::write_snapshot(
-            self.doc_id,
-            self.last_applied_seq,
-            self.engine.as_ref(),
-            &self.doc,
-            self.snapshots.as_ref(),
-        )
-        .await;
+        // is cheap. Best-effort. Skipped when the room evicted itself over a
+        // refused update (`refuse_applied`): the live doc holds that refused
+        // content, and a snapshot of it would be the one thing that
+        // persisted it.
+        if !self.evicted {
+            let _ = crate::snapshot::write_snapshot(
+                self.doc_id,
+                self.last_applied_seq,
+                self.engine.as_ref(),
+                &self.doc,
+                self.snapshots.as_ref(),
+            )
+            .await;
+        }
     }
 
     async fn replay_since_watermark(&mut self) {
@@ -601,11 +653,12 @@ impl Room {
         handle: ConnHandle,
         reply: oneshot::Sender<Result<JoinState, EngineError>>,
     ) {
-        // A re-join (client SyncStep1) racing a revoke still carries the
-        // connection's cancelled handle. Refuse it by dropping `reply`: no
-        // state for someone whose access just ended, and no re-registration
+        // A re-join (client SyncStep1) racing a revoke, or queued behind an
+        // update the room refused, still carries the connection's cancelled
+        // handle. Refuse it by dropping `reply`: no state for someone whose
+        // access just ended or who was just refused, and no re-registration
         // that would let their updates through again.
-        if handle.revoked.is_cancelled() {
+        if handle.revoked.is_cancelled() || handle.refused.is_cancelled() {
             return;
         }
         self.conns.insert(conn_id, handle);
@@ -621,17 +674,83 @@ impl Room {
             tracing::debug!(conn = %m.from, "dropping update from a connection the room no longer holds");
             return;
         }
-        match self.engine.apply_update_changed(&self.doc, &m.bytes) {
-            Ok(true) => {}
+        // Prefilter, before anything of it is applied: `check_update`
+        // predicts where yrs will place the update's types and refuses one
+        // it predicts nests too deep; nothing of it is applied, persisted or
+        // fanned out, and the sender is closed. It is best-effort: its
+        // prediction can be wrong, so it does not guarantee that applying
+        // the update stays within the worker's stack (see `crate::nesting`
+        // for what is not guarded). The authoritative check runs after
+        // apply below.
+        if let Err(too_deep) = crate::nesting::check_update(&self.doc, &m.bytes) {
+            tracing::warn!(
+                doc_id = %self.doc_id,
+                conn = %m.from,
+                depth = too_deep.depth,
+                limit = crate::nesting::MAX_NESTING,
+                "refused an update that nests the page too deep (prefilter); closing its connection"
+            );
+            self.refuse_sender(m.from);
+            return;
+        }
+        // Apply, then run the authoritative nesting check on the real doc:
+        // the prefilter predicts yrs and can be bypassed (an update that
+        // hangs a short chain of new types off existing legal content nests
+        // past the limit without its own structure being deep).
+        match self
+            .engine
+            .apply_update_measuring(&self.doc, &m.bytes, crate::nesting::MAX_NESTING)
+        {
+            // Measured over what the apply integrated, also when yrs
+            // rejected the rest of the update.
+            Ok(applied) if applied.max_depth > crate::nesting::MAX_NESTING => {
+                self.refuse_applied(
+                    m.from,
+                    format_args!(
+                        "it nested a type {} deep, past the limit of {}",
+                        applied.max_depth,
+                        crate::nesting::MAX_NESTING
+                    ),
+                );
+                return;
+            }
+            // yrs rejected the update part-way, within the limit: as on main,
+            // nothing of it is persisted or fanned out, and the room keeps
+            // running with every connection. The error need not be the
+            // sender's: yrs retries the blocks it parked earlier for a
+            // missing dependency within the same apply and passes on their
+            // error, so closing the sender could lock an innocent writer out
+            // for as long as the parked block is stored.
+            Ok(ApplyMeasured {
+                rejected: Some(error),
+                ..
+            }) => {
+                tracing::debug!(
+                    doc_id = %self.doc_id,
+                    conn = %m.from,
+                    %error,
+                    "yrs rejected an update part-way; neither persisted nor fanned out"
+                );
+                return;
+            }
             // Nothing new — typically the SyncStep2 a (re)connecting writer
             // sends in answer to the server's SyncStep1, which re-sends the
             // whole delete set even when the client has no offline edits.
             // Persisting it would write a `doc_updates` row on every page
             // open (and attribute an edit to someone who only looked);
             // fanning it out would make every peer re-apply a no-op.
-            Ok(false) => return,
+            Ok(applied) if !applied.changed => return,
+            Ok(_) => {}
+            // It doesn't decode, so nothing of it was applied: refuse its
+            // sender, which is broken or crafted, and no one else.
             Err(e) => {
-                tracing::debug!(error=?e, "apply_update failed");
+                tracing::warn!(
+                    doc_id = %self.doc_id,
+                    conn = %m.from,
+                    error = %e,
+                    "refused an update that doesn't decode; closing its connection"
+                );
+                self.refuse_sender(m.from);
                 return;
             }
         }
@@ -666,54 +785,47 @@ impl Room {
             tracing::error!(error=?e, "persist channel closed; dropping update");
         }
     }
-}
 
-/// Walk a fragment in document order, find the Nth `list_item` element that
-/// carries a `checked` attribute, and update that attribute. Returns the
-/// number of matching items walked (so callers can distinguish "no match"
-/// from a successful patch).
-fn patch_task_checked(
-    frag: &yrs::XmlFragmentRef,
-    txn: &mut yrs::TransactionMut,
-    target_index: i32,
-    checked: bool,
-) -> Result<(), String> {
-    use yrs::{Xml, XmlFragment, XmlOut};
-    if target_index < 0 {
-        return Err("negative item_index".into());
-    }
-    let mut counter: i32 = 0;
-    let mut found: Option<yrs::XmlElementRef> = None;
-    // Iterative DFS to avoid recursion + lifetime juggling on the txn.
-    let mut stack: Vec<yrs::XmlElementRef> = Vec::new();
-    // Seed with top-level children.
-    let top_len = frag.len(txn);
-    for i in (0..top_len).rev() {
-        if let Some(XmlOut::Element(el)) = frag.get(txn, i) {
-            stack.push(el);
+    /// Refuse an update `from` sent: count it, drop the connection, which
+    /// `on_join` doesn't take back, so that nothing more it sends is applied
+    /// or shared, and tell its WS shim to close it with 4422
+    /// (`ConnHandle::refused`).
+    fn refuse_sender(&mut self, from: ConnId) {
+        metrics::counter!("knot_room_updates_refused_total").increment(1);
+        if let Some(conn) = self.conns.remove(&from) {
+            conn.refused.cancel();
         }
     }
-    while let Some(el) = stack.pop() {
-        if el.tag().as_ref() == "list_item" && el.get_attribute(txn, "checked").is_some() {
-            if counter == target_index {
-                found = Some(el);
-                break;
-            }
-            counter += 1;
-        }
-        // Push children (in reverse so document order is preserved on pop).
-        let n = el.len(txn);
-        for i in (0..n).rev() {
-            if let Some(XmlOut::Element(child)) = el.get(txn, i) {
-                stack.push(child);
-            }
-        }
+
+    /// Refuse an inbound update the live doc already holds, all of it or
+    /// the part yrs integrated before it rejected the rest, because it
+    /// nested the page past [`crate::nesting::MAX_NESTING`]. The caller
+    /// persists and fans out nothing of it; this closes the sender and
+    /// evicts the room. The live doc can't be trusted any more, so the room
+    /// ends without its final snapshot (`evicted`), and the next join
+    /// reloads the page from storage, which never got the update. Dropping
+    /// the doc doesn't recurse, however deep the update made it
+    /// (`crate::nesting`).
+    ///
+    /// Every other connection is closed too, through the room's token
+    /// (`RoomHandle::shutdown`), which its WS shim watches: it closes the
+    /// socket with 1012, and the client reconnects to the reloaded room and
+    /// re-sends its edits in its answer to the server's SyncStep1. Without
+    /// that, a peer would keep editing on this dead room. The sender's
+    /// `refused` is cancelled first, so the sender is closed with 4422.
+    fn refuse_applied(&mut self, from: ConnId, why: std::fmt::Arguments) {
+        tracing::warn!(
+            doc_id = %self.doc_id,
+            conn = %from,
+            "refused an update after applying it ({why}); closing its connection and evicting the room"
+        );
+        metrics::counter!("knot_room_evicted_total").increment(1);
+        self.refuse_sender(from);
+        self.evicted = true;
+        // Ends the actor (the loop's next turn) and closes every other
+        // connection (see above).
+        self.shutdown.cancel();
     }
-    let Some(el) = found else {
-        return Err(format!("no task at index {target_index}"));
-    };
-    el.insert_attribute(txn, "checked", if checked { "true" } else { "false" });
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1806,5 +1918,34 @@ mod tests {
         );
 
         h.shutdown.cancel();
+    }
+
+    /// However the actor ends, its token is cancelled: the WS shims watch it
+    /// to close their sockets, and the registry to boot a fresh room. Here
+    /// the actor ends on `Event::Shutdown`, without anyone cancelling it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_room_whose_actor_ends_cancels_its_token() {
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            Arc::new(NoopUpdates),
+            Arc::new(NoopSnapshots),
+            crate::snapshot::SnapshotPolicy {
+                every_n: 1000,
+                idle: std::time::Duration::from_secs(60),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        h.tx.send(Event::Shutdown).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.shutdown.cancelled())
+            .await
+            .expect("the room's token was not cancelled when its actor ended");
     }
 }

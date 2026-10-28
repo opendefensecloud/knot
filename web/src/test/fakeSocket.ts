@@ -51,9 +51,10 @@ export class FakeSocket {
     new Uint8Array(data).set(frame);
     this.onmessage?.({ data });
   }
-  drop() {
+  /** The socket closing with `code`: by default as a lost network does. */
+  drop(code = 1006) {
     this.readyState = FakeSocket.CLOSED;
-    this.onclose?.({ code: 1006 });
+    this.onclose?.({ code });
   }
   /** Payloads of the document-carrying frames the client sent (SYNC_STEP_2
    *  and SYNC_UPDATE — the server treats both as edits). */

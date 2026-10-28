@@ -50,3 +50,30 @@ describe("BoardProvider offline edits", () => {
     p.destroy();
   });
 });
+
+describe("BoardProvider close codes", () => {
+  // As KnotProvider: a reconnect would hand the refused update over again.
+  it("stays closed after the server refused an update (4422)", () => {
+    const p = new BoardProvider({ url: "ws://x/boards", doc: new Y.Doc() });
+    FakeSocket.all.at(-1)!.open();
+
+    FakeSocket.all.at(-1)!.drop(4422);
+
+    expect(p.status).toBe("refused");
+    vi.advanceTimersByTime(31_000);
+    expect(FakeSocket.all).toHaveLength(1);
+    p.destroy();
+  });
+
+  it("reconnects after the room restarted (1012)", () => {
+    const p = new BoardProvider({ url: "ws://x/boards", doc: new Y.Doc() });
+    FakeSocket.all.at(-1)!.open();
+
+    FakeSocket.all.at(-1)!.drop(1012);
+
+    expect(p.status).toBe("offline");
+    vi.advanceTimersByTime(31_000);
+    expect(FakeSocket.all).toHaveLength(2);
+    p.destroy();
+  });
+});

@@ -40,6 +40,13 @@ pub trait BlobStore: Send + Sync {
     async fn put(&self, id: Uuid, bytes: &[u8], content_type: &str) -> Result<()>;
     async fn get(&self, id: Uuid) -> Result<Vec<u8>>;
     async fn delete(&self, id: Uuid) -> Result<()>;
+    /// Stores a copy of the object `src` as `dst`, with `content_type`.
+    /// `NotFound` when `src` has no object. The default reads the bytes and
+    /// writes them back; a backend that can copy in place overrides it.
+    async fn copy(&self, src: Uuid, dst: Uuid, content_type: &str) -> Result<()> {
+        let bytes = self.get(src).await?;
+        self.put(dst, &bytes, content_type).await
+    }
     /// True when the bytes are rows that the `blobs` metadata row cascades
     /// to (the Postgres backend), so deleting the metadata deletes them in
     /// the same transaction and no separate `delete` is needed.

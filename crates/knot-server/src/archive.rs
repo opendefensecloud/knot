@@ -112,9 +112,9 @@ pub async fn purge_doc(
     evict_local(state, &deleted).await;
     if let Some(rooms) = state.rooms_v2.as_ref() {
         for id in &deleted {
-            // Disconnect read-only viewers and drop the in-memory copy.
-            rooms.revoke_all_for_doc(*id).await;
-            rooms.evict(*id).await;
+            // Disconnect read-only viewers (4403: the page is gone) and drop
+            // the in-memory copy.
+            rooms.revoke_and_evict(*id).await;
         }
     }
     metrics::counter!("knot_docs_purged_total", "trigger" => trigger.label()).increment(1);
@@ -168,6 +168,12 @@ const PURGE_BATCH: i64 = 100;
 /// deploy with a wrong retention setting can be rolled back first.
 pub const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// How old the object of a duplicate that never committed must be before
+/// the purge job deletes it (P16). It must exceed the longest a duplicate
+/// runs, which its caps of 200 pages and 200 MiB of files keep far below an
+/// hour.
+pub const STALE_COPY_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// Outcome of one [`run_purge_once`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurgeRun {
@@ -177,8 +183,9 @@ pub enum PurgeRun {
     Done { purged: usize, failed: usize },
 }
 
-/// Purge every archive root archived longer than `retention` ago, unless
-/// another replica is already doing so.
+/// Purge every archive root archived longer than `retention` ago, and
+/// delete the objects of duplicates that never committed, unless another
+/// replica is already doing so.
 pub async fn run_purge_once(
     state: &AppState,
     retention: chrono::Duration,
@@ -202,8 +209,23 @@ pub async fn run_purge_once(
         return Ok(PurgeRun::Skipped);
     }
     let run = purge_due(state, chrono::Utc::now() - retention).await;
+    remove_stale_copies(state, &pool).await;
     drop(lock_conn);
     run
+}
+
+/// Deletes the objects that duplicates copied outside the database and
+/// never committed, once [`STALE_COPY_AGE`] old (P16). A failure is logged,
+/// and what it left is tried again on the next run.
+async fn remove_stale_copies(state: &AppState, pool: &knot_storage::Pool) {
+    let Some(blobs) = state.blob_store.as_deref() else {
+        return;
+    };
+    match knot_storage::duplicate::purge_stale_copies(pool, blobs, STALE_COPY_AGE).await {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "duplicate copies never committed deleted"),
+        Err(e) => tracing::warn!(error = %e, "duplicate copies cleanup failed; retrying next run"),
+    }
 }
 
 async fn purge_due(

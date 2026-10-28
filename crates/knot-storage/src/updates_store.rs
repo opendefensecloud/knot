@@ -51,6 +51,60 @@ pub trait UpdatesStore: Send + Sync + 'static {
     async fn delete_up_to(&self, doc_id: Uuid, cutoff_seq: i64) -> Result<u64, UpdatesStoreError>;
 }
 
+/// Appends one doc's updates, each with its author, and credits the
+/// authors in `doc_contributors` in the same statement. Binds: `$1` the
+/// doc, `$2` the authors (`uuid[]`), `$3` the updates (`bytea[]`). Returns
+/// the seqs, ascending, in input order.
+///
+/// One statement whatever the batch size: the rows travel as two
+/// parallel arrays. `seq` comes from nextval() as rows are inserted,
+/// and UNNEST … ORDER BY ord feeds them in input order, so ascending
+/// seq IS input order — which the writer relies on to zip seqs back
+/// onto its jobs.
+///
+/// The `contrib` CTE credits every distinct author in the SAME
+/// statement, so a content change and its byline entry commit or fail
+/// together. A data-modifying CTE always runs to completion even
+/// though the outer SELECT never reads it. Details:
+///   - DISTINCT: ON CONFLICT DO UPDATE may not touch a row twice in
+///     one statement, and a batch often holds many rows per author.
+///   - ORDER BY by_user_id: replicas flush the same doc concurrently;
+///     taking the row locks in one global order rules out deadlocks.
+///   - the refresh is throttled to once a minute — continuous typing
+///     flushes every 250 ms, and a minute-old "last edited" is as good
+///     as a fresh one for a byline. The NOT EXISTS skips authors
+///     credited within the minute before the upsert, because ON
+///     CONFLICT … DO UPDATE locks the existing row even when its WHERE
+///     then skips the update; without it every flush would queue on
+///     the rows of concurrent flushes (other replicas) of the same doc
+///     while holding an allocated seq. The WHERE stays for the race
+///     where a row turns fresh after the NOT EXISTS ran.
+pub(crate) const INSERT_UPDATES_SQL: &str = "WITH ins AS (
+             INSERT INTO doc_updates (doc_id, by_user_id, update_bytes)
+             SELECT $1, u.by_user_id, u.update_bytes
+             FROM UNNEST($2::uuid[], $3::bytea[])
+                  WITH ORDINALITY AS u(by_user_id, update_bytes, ord)
+             ORDER BY u.ord
+             RETURNING seq, by_user_id
+         ),
+         contrib AS (
+             INSERT INTO doc_contributors (doc_id, user_id)
+             SELECT DISTINCT $1::uuid, ins.by_user_id
+             FROM ins
+             WHERE ins.by_user_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM doc_contributors c
+                   WHERE c.doc_id = $1
+                     AND c.user_id = ins.by_user_id
+                     AND c.last_edited_at >= now() - interval '1 minute'
+               )
+             ORDER BY ins.by_user_id
+             ON CONFLICT (doc_id, user_id) DO UPDATE
+                 SET last_edited_at = now()
+                 WHERE doc_contributors.last_edited_at < now() - interval '1 minute'
+         )
+         SELECT seq FROM ins ORDER BY seq";
+
 #[derive(Clone)]
 pub struct PgUpdatesStore {
     pool: PgPool,
@@ -74,61 +128,12 @@ impl UpdatesStore for PgUpdatesStore {
         }
         let (authors, bytes): (Vec<Option<Uuid>>, Vec<&[u8]>) =
             updates.iter().map(|(by, b)| (*by, b.as_slice())).unzip();
-        // One statement whatever the batch size: the rows travel as two
-        // parallel arrays. `seq` comes from nextval() as rows are inserted,
-        // and UNNEST … ORDER BY ord feeds them in input order, so ascending
-        // seq IS input order — which the writer relies on to zip seqs back
-        // onto its jobs.
-        //
-        // The `contrib` CTE credits every distinct author in the SAME
-        // statement, so a content change and its byline entry commit or fail
-        // together. A data-modifying CTE always runs to completion even
-        // though the outer SELECT never reads it. Details:
-        //   - DISTINCT: ON CONFLICT DO UPDATE may not touch a row twice in
-        //     one statement, and a batch often holds many rows per author.
-        //   - ORDER BY by_user_id: replicas flush the same doc concurrently;
-        //     taking the row locks in one global order rules out deadlocks.
-        //   - the refresh is throttled to once a minute — continuous typing
-        //     flushes every 250 ms, and a minute-old "last edited" is as good
-        //     as a fresh one for a byline. The NOT EXISTS skips authors
-        //     credited within the minute before the upsert, because ON
-        //     CONFLICT … DO UPDATE locks the existing row even when its WHERE
-        //     then skips the update; without it every flush would queue on
-        //     the rows of concurrent flushes (other replicas) of the same doc
-        //     while holding an allocated seq. The WHERE stays for the race
-        //     where a row turns fresh after the NOT EXISTS ran.
-        let seqs = sqlx::query_scalar::<_, i64>(
-            "WITH ins AS (
-                 INSERT INTO doc_updates (doc_id, by_user_id, update_bytes)
-                 SELECT $1, u.by_user_id, u.update_bytes
-                 FROM UNNEST($2::uuid[], $3::bytea[])
-                      WITH ORDINALITY AS u(by_user_id, update_bytes, ord)
-                 ORDER BY u.ord
-                 RETURNING seq, by_user_id
-             ),
-             contrib AS (
-                 INSERT INTO doc_contributors (doc_id, user_id)
-                 SELECT DISTINCT $1::uuid, ins.by_user_id
-                 FROM ins
-                 WHERE ins.by_user_id IS NOT NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM doc_contributors c
-                       WHERE c.doc_id = $1
-                         AND c.user_id = ins.by_user_id
-                         AND c.last_edited_at >= now() - interval '1 minute'
-                   )
-                 ORDER BY ins.by_user_id
-                 ON CONFLICT (doc_id, user_id) DO UPDATE
-                     SET last_edited_at = now()
-                     WHERE doc_contributors.last_edited_at < now() - interval '1 minute'
-             )
-             SELECT seq FROM ins ORDER BY seq",
-        )
-        .bind(doc_id)
-        .bind(&authors)
-        .bind(&bytes)
-        .fetch_all(&self.pool)
-        .await?;
+        let seqs = sqlx::query_scalar::<_, i64>(INSERT_UPDATES_SQL)
+            .bind(doc_id)
+            .bind(&authors)
+            .bind(&bytes)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(seqs)
     }
 

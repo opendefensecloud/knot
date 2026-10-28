@@ -58,6 +58,14 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         "knot_room_updates_total",
         "CRDT updates applied to rooms, by source (local|peer)"
     );
+    describe_counter!(
+        "knot_room_updates_refused_total",
+        "Inbound CRDT updates a page or board room refused, closing their sender with 4422: ones that nest the document's types deeper than the room accepts (knot_crdt::nesting::MAX_NESTING), refused by the best-effort prefilter before applying or by the authoritative check after applying (also when yrs rejected the rest of the update), and ones that don't decode, of which nothing is applied. Only a refusal after applying evicts the room (see knot_room_evicted_total). An update yrs rejects part-way within the limit is not refused: as before, it is neither persisted nor fanned out, and its sender stays"
+    );
+    describe_counter!(
+        "knot_room_evicted_total",
+        "Rooms that evicted themselves after applying an inbound update that nested the document's types past knot_crdt::nesting::MAX_NESTING (the authoritative post-apply check), whether yrs applied all of the update or rejected the rest. The update was neither persisted nor fanned out, every connection of the room was closed (the sender with 4422, every other one with 1012) so its client reconnects, and the next join reloads the page from storage"
+    );
     describe_counter!("knot_room_snapshots_total", "Snapshots written to storage");
     describe_histogram!(
         "knot_room_hydrate_seconds",
@@ -83,6 +91,16 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     describe_counter!(
         "knot_export_fallback_total",
         "Content an export could not include as-is, by kind (diagram|image_unavailable|image_over_budget|unknown_element)"
+    );
+
+    // Markdown
+    describe_counter!(
+        "knot_markdown_unknown_nodes_total",
+        "Nodes the schema doesn't name that a page's Markdown export (cache, search, tasks, GET markdown) wrote as their text"
+    );
+    describe_counter!(
+        "knot_markdown_depth_limited_total",
+        "Blockquotes, lists and tables nested past the Markdown writer's depth limit (128 block containers) that a page's Markdown export (cache, search, tasks, GET markdown) wrote as their text"
     );
 
     // Storage / pool

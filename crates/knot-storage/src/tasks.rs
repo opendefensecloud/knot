@@ -57,6 +57,17 @@ pub trait TaskStore: Send + Sync + 'static {
         items: &[DocTaskInput],
     ) -> Result<()>;
 
+    /// [`upsert_for_doc`](Self::upsert_for_doc) for a refresh that isn't an
+    /// edit: it inserts, updates and deletes only the rows whose values
+    /// change, so a row that stays the same keeps its `updated_at` and
+    /// `/tasks` (newest first) doesn't reshuffle.
+    async fn sync_for_doc_quiet(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        items: &[DocTaskInput],
+    ) -> Result<()>;
+
     /// All open (uncompleted) tasks for a user across the workspace.
     async fn list_for_assignee(
         &self,
@@ -77,19 +88,15 @@ impl PgTaskStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
-}
 
-fn task_id(doc_id: Uuid, item_index: i32) -> String {
-    format!("{doc_id}:{item_index}")
-}
-
-#[async_trait]
-impl TaskStore for PgTaskStore {
-    async fn upsert_for_doc(
+    /// Replace the task set for `doc_id` with `items`. With `quiet`, a row
+    /// whose values stay the same is left as it is.
+    async fn write_for_doc(
         &self,
         workspace_id: Uuid,
         doc_id: Uuid,
         items: &[DocTaskInput],
+        quiet: bool,
     ) -> Result<()> {
         let mut tx = crate::begin(&self.pool).await?;
 
@@ -115,7 +122,8 @@ impl TaskStore for PgTaskStore {
         }
 
         // Upsert each task. `completed_at` flips to NOW() when `checked`
-        // transitions false → true, and to NULL on true → false.
+        // transitions false → true, and to NULL on true → false. `$9`
+        // (quiet) skips the update of a row whose values are the same.
         for item in items {
             let id = task_id(doc_id, item.item_index);
             sqlx::query(
@@ -131,7 +139,10 @@ impl TaskStore for PgTaskStore {
                      WHEN EXCLUDED.checked THEN NOW() \
                      ELSE NULL \
                    END, \
-                   updated_at = NOW()",
+                   updated_at = NOW() \
+                 WHERE NOT $9 \
+                    OR (doc_tasks.text, doc_tasks.assignee_user_id, doc_tasks.checked, doc_tasks.due_at) \
+                       IS DISTINCT FROM (EXCLUDED.text, EXCLUDED.assignee_user_id, EXCLUDED.checked, EXCLUDED.due_at)",
             )
             .bind(&id)
             .bind(workspace_id)
@@ -141,12 +152,38 @@ impl TaskStore for PgTaskStore {
             .bind(item.assignee_user_id)
             .bind(item.checked)
             .bind(item.due_at)
+            .bind(quiet)
             .execute(&mut *tx)
             .await?;
         }
 
         tx.commit().await?;
         Ok(())
+    }
+}
+
+fn task_id(doc_id: Uuid, item_index: i32) -> String {
+    format!("{doc_id}:{item_index}")
+}
+
+#[async_trait]
+impl TaskStore for PgTaskStore {
+    async fn upsert_for_doc(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        items: &[DocTaskInput],
+    ) -> Result<()> {
+        self.write_for_doc(workspace_id, doc_id, items, false).await
+    }
+
+    async fn sync_for_doc_quiet(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        items: &[DocTaskInput],
+    ) -> Result<()> {
+        self.write_for_doc(workspace_id, doc_id, items, true).await
     }
 
     async fn list_for_assignee(

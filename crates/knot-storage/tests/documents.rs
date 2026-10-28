@@ -38,6 +38,28 @@ async fn create_get_list_lifecycle() {
     assert_eq!(list.len(), 1);
 }
 
+/// Siblings and the doc tree come back in the order the sidebar sorts in:
+/// by code unit (`COLLATE "C"`), whatever the database compares text by. A
+/// locale, as production databases often use (ICU here), puts `M` beside
+/// `m` rather than before `a`.
+#[tokio::test(flavor = "multi_thread")]
+async fn siblings_and_list_alive_sort_by_code_unit() {
+    let (store, ws, user, pool) = setup_with_pool().await;
+    sqlx::query(r#"ALTER TABLE documents ALTER COLUMN sort_key TYPE text COLLATE "und-x-icu""#)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for key in ["m", "M", "a", "B"] {
+        store.create(ws, None, key, key, user).await.unwrap();
+    }
+    let keys = |docs: Vec<knot_storage::Document>| -> Vec<String> {
+        docs.into_iter().map(|d| d.sort_key).collect()
+    };
+    let sidebar = ["B", "M", "a", "m"];
+    assert_eq!(keys(store.siblings(ws, None).await.unwrap()), sidebar);
+    assert_eq!(keys(store.list_alive(ws).await.unwrap()), sidebar);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rename_updates_title_and_icon() {
     let (store, ws, user) = setup().await;
@@ -108,9 +130,9 @@ async fn templates_flow_set_and_list() {
     let sk = sort_key_between(None, None);
     let a = store.create(ws, None, "A", &sk, user).await.unwrap();
     assert!(!a.is_template);
-    let sk = sort_key_between(None, None);
+    let sk = sort_key_between(Some(&a.sort_key), None);
     let b = store.create(ws, None, "B", &sk, user).await.unwrap();
-    let sk = sort_key_between(None, None);
+    let sk = sort_key_between(Some(&b.sort_key), None);
     let tpl = store
         .create(ws, None, "Meeting notes", &sk, user)
         .await
@@ -550,7 +572,7 @@ async fn purge_takes_rows_stamped_with_the_root_outside_its_subtree() {
     let (store, ws, user, pool) = setup_with_pool().await;
     let folder = store.create(ws, None, "Folder", "m", user).await.unwrap();
     let moved = store
-        .create(ws, Some(folder.id), "Moved away", "m", user)
+        .create(ws, Some(folder.id), "Moved away", "n", user)
         .await
         .unwrap();
     store.archive(ws, folder.id, user).await.unwrap();

@@ -212,7 +212,7 @@ test("the sidebar's own controls keep clear of the handle's target area", async 
   await signIn(page);
   await newDoc(page);
   // A row in the tree, which is a drag target of its own.
-  await expect(sidebar(page).locator("li[role='button']").first()).toBeVisible();
+  await expect(sidebar(page).locator("[data-testid^='tree-row-']").first()).toBeVisible();
   await expectWidth(page, 260);
   await expect(handle(page)).toBeVisible();
 
@@ -224,7 +224,7 @@ test("the sidebar's own controls keep clear of the handle's target area", async 
   const h = (await handle(page).boundingBox())!;
   const centre = h.x + h.width / 2;
   const rights = await sidebar(page)
-    .locator("a, button, input, [role='button'], [tabindex]:not([tabindex='-1'])")
+    .locator("a, button, input, [role='button'], [tabindex]:not([tabindex='-1']), [data-testid^='tree-row-']")
     .evaluateAll((els) =>
       els
         .map((el) => el.getBoundingClientRect())

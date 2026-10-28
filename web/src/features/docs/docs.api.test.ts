@@ -57,3 +57,51 @@ describe("docsApi.contributors", () => {
     await expect(docsApi.contributors("d1")).rejects.toThrow();
   });
 });
+
+/** The server's DocResponse: a Doc without the archive fields. */
+const COPY = {
+  id: "d2",
+  workspace_id: "w1",
+  parent_id: null,
+  title: "Plan (copy)",
+  sort_key: "n",
+  icon: null,
+  created_by: "u-alice",
+  archived: false,
+  is_template: false,
+};
+
+describe("docsApi.duplicate", () => {
+  it("POSTs include_subpages to the doc's duplicate sub-resource and returns the parsed copy", async () => {
+    const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(COPY, 201));
+
+    const r = await docsApi.duplicate("d/1", { include_subpages: true });
+
+    expect(spy.mock.calls[0]?.[0]).toBe("/api/docs/d%2F1/duplicate");
+    expect(spy.mock.calls[0]?.[1]?.method).toBe("POST");
+    expect(JSON.parse(spy.mock.calls[0]?.[1]?.body as string)).toEqual({ include_subpages: true });
+    if (!("ok" in r)) throw new Error("expected ok");
+    expect(r.ok).toEqual({ ...COPY, archived_at: null, archive_root_id: null });
+  });
+
+  it("passes the error envelope through on 413", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(
+        { error: { code: "doc.duplicate_too_large", message: "over 200 pages or 200 MiB of files", details: {} } },
+        413,
+      ),
+    );
+
+    const r = await docsApi.duplicate("d1", { include_subpages: false });
+
+    if (!("error" in r)) throw new Error("expected error");
+    expect(r.error.status).toBe(413);
+    expect(r.error.code).toBe("doc.duplicate_too_large");
+  });
+
+  it("rejects a body that does not match the contract", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ ...COPY, id: 7 }, 201));
+
+    await expect(docsApi.duplicate("d1", { include_subpages: false })).rejects.toThrow();
+  });
+});

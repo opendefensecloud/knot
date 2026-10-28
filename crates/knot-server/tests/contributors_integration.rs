@@ -1067,6 +1067,43 @@ async fn revoked_editor_is_closed_with_4403_and_its_edits_are_dropped() {
     carol.leave().await;
 }
 
+/// Purging a page ("Delete permanently") closes the sockets still open on
+/// it with 4403, so the client leaves the page instead of reconnecting to
+/// one that is gone. RED on HEAD: the purge queued a revoke for the room and
+/// then evicted it at once, and the room's end (1012) closed them first.
+#[tokio::test(flavor = "multi_thread")]
+async fn purging_a_page_closes_its_open_sockets_with_4403() {
+    let fx = fixture().await;
+    let archived = fx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/docs/{}", fx.doc_id))
+                .header("cookie", &fx.alice.session.cookie)
+                .header("x-csrf-token", &fx.alice.session.csrf)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived.status(), StatusCode::NO_CONTENT, "archive");
+    // An editor still reads the archived page.
+    let mut carol = Peer::join(&fx, &fx.carol).await;
+
+    let (status, body) = post(
+        &fx.app,
+        &fx.alice.session,
+        &format!("/api/docs/{}/purge", fx.doc_id),
+        "application/json",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "purge: {body}");
+    assert_eq!(close_code(&mut carol).await, 4403);
+}
+
 /// Docs damaged by the old offline-edit bug hold pending content for good
 /// (later edits depend on clocks that were never uploaded), and every client
 /// that loads such a doc re-sends that content in its SyncStep2 answer.

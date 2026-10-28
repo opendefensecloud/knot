@@ -9,10 +9,37 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ## [Unreleased]
 
 ### Upgrading
-- One database migration runs on upgrade (the Helm chart's migrate hook
-  applies it).
+- Five database migrations run on upgrade (the Helm chart's migrate hook
+  applies them).
+- Rolling back to 0.8.1 after the upgrade needs a database restore: 0.8.1
+  doesn't start on a database that has migrations it doesn't know.
 - Everyone with an account sees the "knot was updated" card once after this
   upgrade. (#45)
+- The upgrade repairs the order keys of pages where two pages at one level
+  shared a key, or a key was invalid or over 64 characters, keeping the
+  order the sidebar showed. From then on no two top-level pages can share a
+  key. (#52)
+- The migration that repairs the order keys locks the `documents` table until
+  it commits, so on a large database, requests that touch pages wait while the
+  pre-upgrade migrate job runs. (#52)
+- After the upgrade, a one-time background refresh renders the cached
+  Markdown and the task listing of every page outside the archive again,
+  about ten pages every two seconds, on one replica. Search, share links,
+  zip export and My Tasks catch up as it runs. A healthy page's Markdown
+  doesn't change, and its tasks keep their place in My Tasks. (#52)
+- During a rolling upgrade, pods still on the old version can answer
+  `409 doc.sort_key_conflict` when someone creates or moves a page, until
+  they are replaced. Don't run workspace imports while the rollout is in
+  progress. (#52)
+- On S3, when the bucket refused to delete an archived page's files (for
+  example because knot's credentials lack `s3:DeleteObject`), purging the
+  page deleted it anyway and left its files in the bucket. Now the purge
+  keeps the page and tries again on the next hourly run, so knot's S3
+  credentials need `s3:DeleteObject`. Until a purge gets through, "Delete
+  permanently" fails for that page and it can't be restored. (#52)
+- To see what the upgrade changes on your data before you roll it out, run
+  the real-data compatibility check described in the Helm chart's README
+  (Upgrading) against a restored backup or a staging copy. (#52)
 
 ### Added
 - The bottom of the sidebar shows the running version. It opens an About page
@@ -33,8 +60,121 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   time zone, or from a location you type in. Nothing leaves the browser, and
   the choice is saved per browser like the skin itself. The skin is now also
   synced across open tabs, including one picked by hand. (#49)
+- Duplicate… in the sidebar's page menu copies a page right after it, as
+  "<title> (copy)". For a page with subpages, tick "Include its N subpages"
+  to copy them too. The copy gets its own drawings, images and files, so it
+  keeps working if the original is archived, and links between the copied
+  pages point at the copies. Up to 200 pages and 200 MB of files.
+  `POST /api/docs/{id}/duplicate`. A server makes two copies at a time; when
+  no slot frees up within five seconds, it answers `503 doc.duplicate_busy`
+  with `Retry-After`. (#52)
+- Move up, Move down, Indent and Outdent in the sidebar's page menu, and
+  Alt with the arrow keys on a page in the sidebar, move pages without
+  dragging. (#52)
+- Screen readers hear each sidebar page's level and number of subpages, how
+  to move it, and where a moved page ended up, instead of page ids. (#52)
+
+### Changed
+- Creating a page with an `after_id`, or moving one with an `after_id` or
+  `before_id`, that isn't a live sibling at the target level, or is the
+  moved page itself, returns `422 doc.bad_anchor`. It used to put the page
+  last. (#52)
+- Restore returns `409 doc.sort_key_conflict` or `409 doc.restore_conflict`
+  where it used to return a 500. Both can succeed on a retry. (#52)
+- Workspace import with a `?parent_id=` that is unknown or in another
+  workspace returns `404 doc.not_found` (was `403 acl.editor_required`).
+  (#52)
+- Create, move and create-from-template with a `parent_id` outside your
+  workspace return `404 doc.not_found`, the same as for an id no page has.
+  They used to accept it. (#52)
+- The sidebar's keyboard drag (Space or Enter on a page to pick it up, the
+  arrow keys to move it, Space or Enter to drop it) is gone. Alt with the
+  arrow keys, and Move up, Move down, Indent and Outdent in the page menu,
+  move pages instead. (#52)
+
+### Fixed
+- A line break (Shift+Enter) in a list item exported fine until the page
+  went through a history restore, a template, or a Markdown or zip import,
+  which stored it in a broken shape; a Markdown import stored a line break
+  in an item of a tight list (one with no blank lines between its items)
+  that way too. Markdown export then failed for the page, and with it
+  search, share links, zip export, My Tasks, history preview and restore,
+  and new pages from it as a template. An image or drawing in an item of a
+  tight list was lost on the same paths. (#52)
+- Nested checklists, list items and quotes with several paragraphs, images,
+  rules or lists, checkboxes in numbered lists, and empty list items lost
+  their shape or content on the way through Markdown (export, history
+  restore, templates and import). An HTML comment between two lines of a
+  list merged them. (#52)
+- Markdown import dropped the line breaks of a code block in a list item or
+  quote, dropped images and drawings in table cells, could move a cell's
+  image into a later paragraph, and stored a lone `>` as a broken empty
+  quote. (#52)
+- A page whose content was damaged by an earlier import, or holds content
+  knot doesn't know, exports with that content as text instead of failing
+  the whole page. (#52)
+- My Tasks listed other tasks than the checkboxes a toggle counts:
+  checklists in table cells and checkboxes in numbered lists were left out,
+  a bullet starting with `[ ]` was listed, and a nested checklist showed as
+  one merged task. A toggle from My Tasks could check the wrong item. The
+  listing now follows the page's checkboxes. (#52)
+- Creating the eighth page under the same parent failed with "Couldn't
+  create document", and at the top level it silently gave two pages the
+  same key, so their order could change. Adding pages after the same page
+  failed the same way, a broken order key could crash the request, and
+  every page added at the end made the keys one character longer. Pages
+  two people create at the same level at the same moment no longer
+  collide. (#52)
+- Workspace import skipped a page whose order key was taken and moved its
+  subpages up. Imported pages now keep the export's order with fresh keys,
+  so the same export can be imported twice. (#52)
+- Sidebar drag and drop nests, un-nests and reorders where the drop line
+  shows: nesting worked only by luck of mouse speed, a page couldn't be
+  moved out from under its parent when that parent was the last page, and
+  rows slid around in an order that didn't match the screen. Dragging left
+  or right picks the level. Releasing on the page you started from no
+  longer reloads it, a drop outside the tree cancels, a drop that changes
+  nothing sends nothing, and on touch screens a drag starts after a short
+  press, so scrolling works. (#52)
+- Restoring a page whose top-level place was taken, or that was restored,
+  moved and archived again at the same time, failed with an internal error.
+  (#52)
+- Two pages moved at the same moment could end up nested inside each
+  other's subpages, in a loop. Moving or archiving one of them then hung a
+  database connection. Moves into a page now take turns, and moving or
+  archiving a page of such a loop finishes. (#52)
+- On S3, a file the bucket refused to hand out (a 403 or a server error)
+  was served as the bucket's error message instead of failing. (#52)
+
+Thanks to @szEvEz, whose #42 found the list export, page order and sidebar
+drag and drop bugs above, asked for Duplicate, and proposed the first
+fixes.
 
 ### Security
+- A crafted workspace-import zip with pages that are each other's parent, or
+  a very deep chain of parents, crashed the whole server for everyone. Any
+  editor could upload one. The bug predates this release. (#52)
+- A page nested a few thousand levels deep, made with a crafted Markdown
+  upload or editor update, crashed the whole server for everyone when knot
+  exported it. Any editor could make one. The bug predates this release.
+  Markdown import and export now follow at most 128 levels of quotes, list
+  items and table cells, and turn anything deeper into one paragraph of its
+  text, so no text is lost: Markdown and zip import, history restore and
+  templates store it that way, and a page already stored deeper exports its
+  deep part that way. An editor update that nests a page past 512 nested
+  types is refused, and its connection closes with code 4422. The editor
+  then stops reconnecting and shows "Changes refused" until the page is
+  reloaded, instead of sending the refused update again. Two cases
+  remain known limitations, as before this release (see #53): a single
+  crafted editor update whose own apply nests and deletes deep enough, and
+  deleting the deep part of a page already stored deeper, can still crash
+  the server. (#52)
+- `pulldown-cmark` 0.13.5 fixes RUSTSEC-2026-0414: with wiki links enabled,
+  a crafted Markdown input could make it produce exponentially many events.
+  knot never enables wiki links, so it was not affected. (#52)
+- Create, move, create-from-template and workspace import accepted a parent
+  page from another workspace and put the page under it. They now return
+  `404 doc.not_found`. The bug predates this release. (#52)
 - `ctutils` 0.4.5 fixes RUSTSEC-2026-0385: its constant-time helpers could
   compile to branches on secret values. It reaches knot only through the
   Postgres client's password authentication. knot's own session and CSRF

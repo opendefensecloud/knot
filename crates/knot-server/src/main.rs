@@ -261,7 +261,7 @@ async fn run_server(cfg: Config) {
         }
     };
     if let Some(rx) = reindex_rx {
-        knot_server::reindex::spawn(state.clone(), rx);
+        knot_server::reindex::spawn_with_sweep(state.clone(), rx);
         tracing::info!("reindex worker spawned");
     }
     if state.pool.is_some() {

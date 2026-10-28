@@ -5,7 +5,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use knot_auth::{Hasher, Throttle};
 use knot_server::{AppState, router_with_state};
-use knot_storage::WorkspaceRole;
+use knot_storage::{WorkspaceRole, sort_key_between};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -41,12 +41,12 @@ async fn state_with_seeded(role: WorkspaceRole) -> (AppState, Uuid, Uuid) {
     (s, ws.id, user.id)
 }
 
+/// A top-level page after the last one, so top-level keys stay distinct.
 async fn make_doc(state: &AppState, workspace_id: Uuid, user_id: Uuid, title: &str) -> Uuid {
-    state
-        .docs
-        .as_ref()
-        .unwrap()
-        .create(workspace_id, None, title, "m", user_id)
+    let docs = state.docs.as_ref().unwrap();
+    let last = docs.siblings(workspace_id, None).await.unwrap().pop();
+    let key = sort_key_between(last.as_ref().map(|d| d.sort_key.as_str()), None);
+    docs.create(workspace_id, None, title, &key, user_id)
         .await
         .unwrap()
         .id

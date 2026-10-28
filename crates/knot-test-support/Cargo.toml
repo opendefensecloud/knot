@@ -9,3 +9,4 @@ publish = false
 sqlx.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+yrs.workspace = true

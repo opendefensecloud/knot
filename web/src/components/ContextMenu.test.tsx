@@ -23,9 +23,10 @@ describe("ContextMenu", () => {
   });
 
   // The menu portals to <body>, but React events still bubble through the
-  // React tree. The sidebar renders it inside a sortable row whose dnd-kit
-  // KeyboardSensor claims Enter/Space and calls preventDefault, so a
-  // keyboard user could never activate an item.
+  // React tree. Defensive: the sidebar renders it next to its row, not inside
+  // it, but no key handler around it may take Enter/Space. The old sortable
+  // row's keyboard sensor did (with preventDefault), so a keyboard user could
+  // never activate an item.
   it("keeps key and pointer events from reaching the component that opened it", () => {
     const onSelect = vi.fn();
     const rowKeyDown = vi.fn();
@@ -45,6 +46,29 @@ describe("ContextMenu", () => {
     fireEvent.pointerDown(item);
     expect(rowKeyDown).not.toHaveBeenCalled();
     expect(rowPointerDown).not.toHaveBeenCalled();
+  });
+
+  // Defensive: the sidebar's rows start a drag on mousedown and touchstart
+  // (dnd-kit's mouse and touch sensors). The menu is rendered next to a row,
+  // not inside it, but a press on it must not start a drag wherever it is.
+  it("keeps mouse and touch presses from reaching the component that opened it", () => {
+    const rowMouseDown = vi.fn();
+    const rowTouchStart = vi.fn();
+    render(
+      <div onMouseDown={rowMouseDown} onTouchStart={rowTouchStart}>
+        <ContextMenu
+          x={0}
+          y={0}
+          onClose={() => {}}
+          items={[{ label: "Rename", testId: "ctx-rename", onSelect: () => {} }]}
+        />
+      </div>,
+    );
+    const item = screen.getByTestId("ctx-rename");
+    fireEvent.mouseDown(item);
+    fireEvent.touchStart(item);
+    expect(rowMouseDown).not.toHaveBeenCalled();
+    expect(rowTouchStart).not.toHaveBeenCalled();
   });
 
   it("takes focus when it opens, so keyboard users can reach its items", () => {

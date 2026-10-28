@@ -151,7 +151,7 @@ async fn docs_crud_happy_path() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn move_with_unknown_anchor_falls_to_end() {
+async fn move_with_unknown_anchor_is_422() {
     let (state, joined) = login_state("a@x.test", "hunter22").await;
     let (cookie, csrf) = split_cookie_csrf(&joined);
     let app = router_with_state(state);
@@ -185,11 +185,11 @@ async fn move_with_unknown_anchor_falls_to_end() {
     }
     let a = create_doc(&app, cookie, csrf, "A").await;
     let _b = create_doc(&app, cookie, csrf, "B").await;
-    let c = create_doc(&app, cookie, csrf, "C").await;
+    let _c = create_doc(&app, cookie, csrf, "C").await;
 
     // Move A with an after_id that does NOT refer to one of its siblings
-    // (use a freshly minted UUID). Expect it to land at the END of the
-    // sibling list (sort_key > C's sort_key), NOT at the first slot.
+    // (use a freshly minted UUID). It used to land at the end of the sibling
+    // list; now the move is refused with 422 `doc.bad_anchor`.
     let nonsense_anchor = uuid::Uuid::new_v4();
     let r = app
         .clone()
@@ -207,15 +207,12 @@ async fn move_with_unknown_anchor_falls_to_end() {
         )
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let moved_body = r.into_body().collect().await.unwrap().to_bytes();
-    let moved: serde_json::Value = serde_json::from_slice(&moved_body).unwrap();
-    let moved_key = moved["sort_key"].as_str().unwrap();
-    let c_key = c["sort_key"].as_str().unwrap();
-
-    assert!(
-        moved_key > c_key,
-        "with unknown after_id, doc A should land at the end (key {moved_key} > C's key {c_key})",
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = r.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["error"]["code"], "doc.bad_anchor",
+        "error code must be doc.bad_anchor, got: {v}"
     );
 }
 

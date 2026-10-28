@@ -79,9 +79,25 @@ fn attr<X: Xml, T: ReadTxn>(el: &X, txn: &T, name: &str) -> Option<String> {
     el.get_attribute(txn, name).map(|v| v.to_string(txn))
 }
 
+/// A child of a block container, for [`walk_blocks`]: a run of one or more
+/// consecutive inline nodes (text, `hard_break`), or another node.
+enum Token {
+    Run(Vec<Inline>),
+    Paragraph(yrs::XmlElementRef),
+    Element(yrs::XmlElementRef),
+    Fragment(yrs::XmlFragmentRef),
+}
+
 /// Walk the children of a block container. Raw text or `hard_break` children
-/// (the import's soft-break shape) are repaired into paragraphs; consecutive
-/// ones share a paragraph.
+/// (the shape the old importer stored for a line or soft break in a tight
+/// list item) are repaired by the glue rule, the same as knot-markdown's
+/// `normalise::block_children` (P3; both crates' tests share its vectors):
+/// - a chain `paragraph (run paragraph)+` becomes one paragraph, its runs
+///   between the paragraphs' content: the line the importer split;
+/// - a run next to only one paragraph, or alone, becomes a paragraph of its
+///   own;
+/// - in such a paragraph, adjacent text with equal marks is one run
+///   ([`merge_runs`]).
 fn walk_blocks<F: XmlFragment, T: ReadTxn>(
     parent: &F,
     txn: &T,
@@ -92,37 +108,93 @@ fn walk_blocks<F: XmlFragment, T: ReadTxn>(
         tally.unknown.push("depth-limit".to_owned());
         return capped_paragraphs(parent, txn);
     }
-    let mut out = Vec::new();
-    let mut stray: Vec<Inline> = Vec::new();
+    let mut tokens: Vec<Token> = Vec::new();
+    // The run being read: there is one as soon as an inline node is, even
+    // one without content (an empty text).
+    let mut run: Option<Vec<Inline>> = None;
     let mut last_href: Option<String> = None;
     for i in 0..parent.len(txn) {
-        match parent.get(txn, i) {
-            Some(XmlOut::Text(t)) => push_text(&mut stray, &mut last_href, &t, txn),
+        let token = match parent.get(txn, i) {
+            Some(XmlOut::Text(t)) => {
+                push_text(run.get_or_insert_default(), &mut last_href, &t, txn);
+                continue;
+            }
             Some(XmlOut::Element(el)) if el.tag().as_ref() == "hard_break" => {
                 last_href = None;
-                stray.push(Inline::Break);
+                run.get_or_insert_default().push(Inline::Break);
+                continue;
             }
-            Some(XmlOut::Element(el)) => {
-                flush_stray(&mut stray, &mut out);
-                last_href = None;
-                out.extend(walk_element(&el, txn, tally, depth));
-            }
-            Some(XmlOut::Fragment(f)) => {
-                flush_stray(&mut stray, &mut out);
-                last_href = None;
-                out.extend(walk_blocks(&f, txn, tally, depth + 1));
-            }
-            None => {}
-        }
+            Some(XmlOut::Element(el)) if el.tag().as_ref() == "paragraph" => Token::Paragraph(el),
+            Some(XmlOut::Element(el)) => Token::Element(el),
+            Some(XmlOut::Fragment(f)) => Token::Fragment(f),
+            None => continue,
+        };
+        last_href = None;
+        tokens.extend(run.take().map(Token::Run));
+        tokens.push(token);
     }
-    flush_stray(&mut stray, &mut out);
+    tokens.extend(run.take().map(Token::Run));
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
+            Token::Paragraph(el) => {
+                let mut glued: Option<Vec<Inline>> = None;
+                while let (Some(Token::Run(run)), Some(Token::Paragraph(next))) =
+                    (tokens.get(i + 1), tokens.get(i + 2))
+                {
+                    let content = glued.get_or_insert_with(|| inlines(el, txn, depth));
+                    content.extend(run.iter().cloned());
+                    content.extend(inlines(next, txn, depth));
+                    i += 2;
+                }
+                match glued {
+                    Some(content) => out.push(Block::Paragraph(merge_runs(content))),
+                    None => out.extend(walk_element(el, txn, tally, depth)),
+                }
+            }
+            // A run without content outside a chain has nothing to show.
+            Token::Run(run) if run.is_empty() => {}
+            Token::Run(run) => out.push(Block::Paragraph(merge_runs(run.clone()))),
+            Token::Element(el) => out.extend(walk_element(el, txn, tally, depth)),
+            Token::Fragment(f) => out.extend(walk_blocks(f, txn, tally, depth + 1)),
+        }
+        i += 1;
+    }
     out
 }
 
-fn flush_stray(stray: &mut Vec<Inline>, out: &mut Vec<Block>) {
-    if !stray.is_empty() {
-        out.push(Block::Paragraph(std::mem::take(stray)));
+/// `content` with adjacent text of equal marks joined into one run, and
+/// adjacent links to one target into one link (P3).
+fn merge_runs(content: Vec<Inline>) -> Vec<Inline> {
+    fn join(runs: &mut Vec<Run>, run: Run) {
+        match runs.last_mut() {
+            Some(prev) if prev.marks == run.marks => prev.text.push_str(&run.text),
+            _ => runs.push(run),
+        }
     }
+    let mut out: Vec<Inline> = Vec::with_capacity(content.len());
+    for inline in content {
+        match (out.last_mut(), inline) {
+            (Some(Inline::Run(prev)), Inline::Run(run)) if prev.marks == run.marks => {
+                prev.text.push_str(&run.text);
+            }
+            (
+                Some(Inline::Link { target, runs }),
+                Inline::Link {
+                    target: next,
+                    runs: more,
+                },
+            ) if *target == next => {
+                for run in more {
+                    join(runs, run);
+                }
+            }
+            (_, inline) => out.push(inline),
+        }
+    }
+    out
 }
 
 fn walk_list<T: ReadTxn>(
