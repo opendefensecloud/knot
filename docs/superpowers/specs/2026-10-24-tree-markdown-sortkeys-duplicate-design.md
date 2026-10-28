@@ -359,17 +359,24 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
     changes.
   - The post-drag click is suppressed only after pointer drags, only inside
     the tree.
-  - A drop with less than one INDENT of pointer travel moves nothing:
-    travel is the whole path from the press to the release, and until it
-    reaches one INDENT no drop line shows. Such a drag counts as a click: a
-    plain press on a row's link opens that page in the app (no reload, no
-    move request), replacing the history entry when the page is already
-    open. On touch this applies after the 250ms hold. A longer drag that
-    moves nothing opens nothing. (Amended in Task F4: the browser sends no
-    click after a drag, so the drag's end opens the page. Amended in Task
-    F6: the rule first covered only drags that moved nothing, and a click
-    pressed at a row's top edge that slipped a few px up could still nest
-    the page into the row above.)
+  - A drop released less than one INDENT from the press (the straight,
+    Euclidean distance) moves nothing, and while the pointer is that near
+    no drop line shows. Such a drop counts as a click only when the
+    pointer's whole path, from the press through every position to the
+    release, is under one INDENT too: a plain press on a row's link then
+    opens that page in the app (no reload, no move request), replacing the
+    history entry when the page is already open. A drag that goes out and
+    comes back near the press moves nothing and opens nothing, as does any
+    longer drag that moves nothing. On touch this applies after the 250ms
+    hold. (Amended in Task F4: the browser sends no click after a drag, so
+    the drag's end opens the page. Amended in Task F6: the rule first
+    covered only drags that moved nothing, and a click pressed at a row's
+    top edge that slipped a few px up could still nest the page into the
+    row above. Amended in the F6 review's fix round: F6 measured the path
+    alone, so a hand that jittered on the way made the path one INDENT long
+    and an 8px slip up still nested the page; the distance from the press
+    now decides whether a drop moves anything, the path whether it is a
+    click.)
   - No-op drops send nothing.
   - Dropping outside the tree cancels.
   - Custom drag announcements use titles.
@@ -500,7 +507,10 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
      before legacy, which recurse once per element. (Amended in Task F1.)
    - **Room refusals.** A room, page or board, refuses an inbound update and
      closes its sender with 4422 when the update nests the page's types past
-     `MAX_NESTING`, or doesn't decode. Nothing of a refused update is
+     `MAX_NESTING`, or doesn't decode. An update decodes when yrs's decoder
+     reads it: knot's reader, which reads it first, reads exactly what yrs
+     reads (a differential test over the repo's update corpora pins it),
+     and also refuses clocks past `u32::MAX`. Nothing of a refused update is
      persisted or fanned out. Only an update the room had already applied
      (the check after apply) also evicts the room, closing every other
      connection with 1012, so the next join reloads the page from storage.
@@ -510,7 +520,8 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
      keeps the sender and the rest of the room. yrs's error need not be the
      sender's: within the same apply it retries the blocks it parked
      earlier for a missing dependency and passes on their error. (Amended
-     in Task F6.)
+     in Task F6, and in the F6 review's fix round: the reader also reads
+     the delete set, as yrs does.)
 2. **Real-data check (opt-in).**
    - It runs the old and new serializers over every page in a database:
      `cargo test -p knot-server --test markdown_compat -- --ignored`, with

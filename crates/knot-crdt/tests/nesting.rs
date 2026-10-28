@@ -17,6 +17,8 @@
 //! file is a test binary of its own, so that an overflow can abort only
 //! these tests.
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -785,14 +787,20 @@ fn a_resend_of_an_already_deep_page_is_not_measured_as_a_violation() {
 // The board room shares the same prefilter + post-apply path
 // ---------------------------------------------------------------------------
 
-/// A board store that records every update appended, to check nothing of a
-/// refused update is stored.
-struct CapturingBoard {
-    appended: Arc<Mutex<Vec<Vec<u8>>>>,
+/// Board updates appended in order and served back, as Postgres does: a
+/// test reads what a board room stored, and a board room can be reloaded
+/// from what an earlier one stored.
+#[derive(Clone, Default)]
+struct StoredBoard(Arc<Mutex<Vec<Vec<u8>>>>);
+
+impl StoredBoard {
+    fn rows(&self) -> Vec<Vec<u8>> {
+        self.0.lock().unwrap().clone()
+    }
 }
 
 #[async_trait::async_trait]
-impl knot_storage::BoardStore for CapturingBoard {
+impl knot_storage::BoardStore for StoredBoard {
     async fn create(
         &self,
         _: Uuid,
@@ -823,18 +831,28 @@ impl knot_storage::BoardStore for CapturingBoard {
         Ok(())
     }
     async fn load_updates(&self, _: Uuid) -> knot_storage::boards::Result<Vec<Vec<u8>>> {
-        Ok(vec![])
+        Ok(self.rows())
     }
     async fn append_update(&self, _: Uuid, bytes: &[u8]) -> knot_storage::boards::Result<i64> {
-        let mut a = self.appended.lock().unwrap();
-        a.push(bytes.to_vec());
-        Ok(a.len() as i64)
+        let mut rows = self.0.lock().unwrap();
+        rows.push(bytes.to_vec());
+        Ok(rows.len() as i64)
     }
-    async fn since(&self, _: Uuid, _: i64) -> knot_storage::boards::Result<Vec<(i64, Vec<u8>)>> {
-        Ok(vec![])
+    async fn since(
+        &self,
+        _: Uuid,
+        after: i64,
+    ) -> knot_storage::boards::Result<Vec<(i64, Vec<u8>)>> {
+        Ok(self
+            .rows()
+            .into_iter()
+            .zip(1..)
+            .filter(|&(_, seq)| seq > after)
+            .map(|(row, seq)| (seq, row))
+            .collect())
     }
     async fn max_update_seq(&self, _: Uuid) -> knot_storage::boards::Result<i64> {
-        Ok(0)
+        Ok(self.rows().len() as i64)
     }
     async fn set_svg(&self, _: Uuid, _: &[u8]) -> knot_storage::boards::Result<()> {
         Ok(())
@@ -842,6 +860,23 @@ impl knot_storage::BoardStore for CapturingBoard {
     async fn get_svg(&self, _: Uuid) -> knot_storage::boards::Result<Option<Vec<u8>>> {
         Ok(None)
     }
+}
+
+/// A board room for `board_id` loaded from `store`, which it appends to.
+async fn board_on(board_id: Uuid, store: &StoredBoard) -> knot_crdt::BoardRoomHandle {
+    let bus = Arc::new(MemBus::new());
+    let sub = knot_crdt::Bus::subscribe(bus.as_ref(), board_id)
+        .await
+        .unwrap();
+    knot_crdt::BoardRoom::spawn(
+        board_id,
+        Arc::new(YrsEngine),
+        Arc::new(store.clone()),
+        bus,
+        sub,
+    )
+    .await
+    .unwrap()
 }
 
 /// The board room runs the same prefilter and authoritative post-apply check.
@@ -859,18 +894,8 @@ async fn a_board_room_refuses_and_evicts_a_crafted_reparenting_update() {
 /// nothing of it is appended or fanned out, its sender is told to close,
 /// and the board room evicts itself.
 async fn board_refused_after_apply_and_evicted(base: Vec<u8>, bad: Vec<u8>) {
-    let board_id = Uuid::new_v4();
-    let bus = Arc::new(MemBus::new());
-    let sub = knot_crdt::Bus::subscribe(bus.as_ref(), board_id)
-        .await
-        .unwrap();
-    let appended = Arc::new(Mutex::new(Vec::new()));
-    let store: Arc<dyn knot_storage::BoardStore> = Arc::new(CapturingBoard {
-        appended: appended.clone(),
-    });
-    let h = knot_crdt::BoardRoom::spawn(board_id, Arc::new(YrsEngine), store, bus, sub)
-        .await
-        .unwrap();
+    let store = StoredBoard::default();
+    let h = board_on(Uuid::new_v4(), &store).await;
     let (writer, _writer_rx, _) = join_board(&h).await;
     let (attacker, _attacker_rx, refused) = join_board(&h).await;
     let (_peer, mut peer_rx, _) = join_board(&h).await;
@@ -893,7 +918,7 @@ async fn board_refused_after_apply_and_evicted(base: Vec<u8>, bad: Vec<u8>) {
     }
     assert!(refused.is_cancelled(), "the sender was not told to close");
     assert_eq!(
-        *appended.lock().unwrap(),
+        store.rows(),
         vec![base],
         "the refused update must not be appended"
     );
@@ -1271,97 +1296,6 @@ async fn a_room_evicts_itself_over_an_update_that_nests_too_deep_before_it_fails
 
 // The board room follows the same rules.
 
-/// Board updates appended in order and served back, so a board room can be
-/// reloaded from what an earlier one stored.
-#[derive(Clone, Default)]
-struct StoredBoard(Arc<Mutex<Vec<Vec<u8>>>>);
-
-impl StoredBoard {
-    fn rows(&self) -> Vec<Vec<u8>> {
-        self.0.lock().unwrap().clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl knot_storage::BoardStore for StoredBoard {
-    async fn create(
-        &self,
-        _: Uuid,
-        _: Uuid,
-        _: Option<String>,
-    ) -> knot_storage::boards::Result<knot_storage::Board> {
-        unimplemented!()
-    }
-    async fn get(&self, _: Uuid) -> knot_storage::boards::Result<knot_storage::Board> {
-        Err(knot_storage::boards::BoardStoreError::NotFound)
-    }
-    async fn list_for_doc(
-        &self,
-        _: Uuid,
-    ) -> knot_storage::boards::Result<Vec<knot_storage::Board>> {
-        Ok(vec![])
-    }
-    async fn delete(&self, _: Uuid) -> knot_storage::boards::Result<()> {
-        Ok(())
-    }
-    async fn latest_snapshot(
-        &self,
-        _: Uuid,
-    ) -> knot_storage::boards::Result<Option<(i64, Vec<u8>)>> {
-        Ok(None)
-    }
-    async fn put_snapshot(&self, _: Uuid, _: i64, _: &[u8]) -> knot_storage::boards::Result<()> {
-        Ok(())
-    }
-    async fn load_updates(&self, _: Uuid) -> knot_storage::boards::Result<Vec<Vec<u8>>> {
-        Ok(self.rows())
-    }
-    async fn append_update(&self, _: Uuid, bytes: &[u8]) -> knot_storage::boards::Result<i64> {
-        let mut rows = self.0.lock().unwrap();
-        rows.push(bytes.to_vec());
-        Ok(rows.len() as i64)
-    }
-    async fn since(
-        &self,
-        _: Uuid,
-        after: i64,
-    ) -> knot_storage::boards::Result<Vec<(i64, Vec<u8>)>> {
-        Ok(self
-            .rows()
-            .into_iter()
-            .zip(1..)
-            .filter(|&(_, seq)| seq > after)
-            .map(|(row, seq)| (seq, row))
-            .collect())
-    }
-    async fn max_update_seq(&self, _: Uuid) -> knot_storage::boards::Result<i64> {
-        Ok(self.rows().len() as i64)
-    }
-    async fn set_svg(&self, _: Uuid, _: &[u8]) -> knot_storage::boards::Result<()> {
-        Ok(())
-    }
-    async fn get_svg(&self, _: Uuid) -> knot_storage::boards::Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
-}
-
-/// A board room for `board_id` loaded from `store`, which it appends to.
-async fn board_on(board_id: Uuid, store: &StoredBoard) -> knot_crdt::BoardRoomHandle {
-    let bus = Arc::new(MemBus::new());
-    let sub = knot_crdt::Bus::subscribe(bus.as_ref(), board_id)
-        .await
-        .unwrap();
-    knot_crdt::BoardRoom::spawn(
-        board_id,
-        Arc::new(YrsEngine),
-        Arc::new(store.clone()),
-        bus,
-        sub,
-    )
-    .await
-    .unwrap()
-}
-
 /// A connection joined to the board room `h`: its id, what the room sends
 /// it, and the signal the room raises when it refuses its update.
 async fn join_board(
@@ -1481,4 +1415,50 @@ async fn a_board_room_keeps_the_sender_whose_update_a_parked_block_fails_on() {
 async fn a_board_room_evicts_itself_over_an_update_that_nests_too_deep_before_it_fails() {
     let (base, bad) = nests_too_deep_then_rejected();
     board_refused_after_apply_and_evicted(base, bad).await;
+}
+
+// ---------------------------------------------------------------------------
+// The reader
+// ---------------------------------------------------------------------------
+
+/// A room reads every inbound update with `knot_crdt::update_items` before
+/// yrs reads it (the prefilter, and `inserted_type_ids`), and refuses the
+/// sender of one it can't read. It reads the updates this file builds, and
+/// every update that ends early in one, as yrs reads them
+/// (`common::disagreements`; `tests/update_items.rs` checks the rest of
+/// knot-crdt's). The update [`DEEP`] types deep is compared whole: each of
+/// its prefixes would be decoded in full. Left out: [`undecodable`]'s clock
+/// past `u32::MAX`, which the reader refuses on purpose where yrs's decoder
+/// panics in a debug build.
+#[test]
+fn the_reader_reads_the_updates_of_these_tests_as_yrs_does() {
+    let (text, first_char) = text_page(1);
+    let (parked, edit) = parked_block_and_the_edit_it_fails_on();
+    let (deep_base, too_deep) = nests_too_deep_then_rejected();
+    let [no_update, _past_u32_max] = undecodable();
+    let updates = [
+        ("a chain one past the limit", chain_update(MAX_NESTING + 1)),
+        ("a one-paragraph edit", sentinel()),
+        ("a page of text", text),
+        (
+            "an update yrs rejects part-way",
+            rejected_part_way(&first_char),
+        ),
+        ("a block yrs parks", parked),
+        ("the edit it fails on", edit),
+        ("the crafted base page plus text", deep_base),
+        ("an update too deep, then rejected", too_deep),
+        ("three bytes that are no update", no_update),
+    ];
+    common::assert_read_as_yrs_reads(
+        updates
+            .into_iter()
+            .map(|(what, update)| (what.to_string(), update))
+            .collect(),
+    );
+    assert_eq!(
+        common::disagreement(&insert_and_delete_update()),
+        None,
+        "a subtree DEEP types deep, and its deletion"
+    );
 }

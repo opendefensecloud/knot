@@ -219,12 +219,13 @@ export function DocTree() {
 
   /** Re-project from the latest hit: the pointer's height picks the gap,
    *  the horizontal drag the depth. A level takes a full INDENT, so the 6px
-   *  that start a drag never change it. Until the pointer has travelled one
-   *  INDENT there is no drop: a click that slips (sideways, or a few px up
-   *  into the row above) moves nothing. */
+   *  that start a drag never change it. While the pointer is less than one
+   *  INDENT from the press there is no drop: a click that slips (sideways,
+   *  or a few px up into the row above, however it jitters on the way)
+   *  moves nothing. */
   function track(activeId: UniqueIdentifier, deltaX: number) {
     const hit = hitRef.current;
-    if (!hit || slip.isShort()) {
+    if (!hit || slip.isNear()) {
       showDrop(null);
       return;
     }
@@ -447,7 +448,9 @@ export function DocTree() {
           }}
           onDragOver={(e) => track(e.active.id, e.delta.x)}
           onDragEnd={(e) => {
-            const d = dropRef.current;
+            // Released less than one INDENT from the press: no drop, even if
+            // the last move showed one.
+            const d = slip.isNear() ? null : dropRef.current;
             const id = String(e.active.id);
             // A click on the row's link whose pointer slipped far enough to
             // start a drag: it opens the page, as the link does. The browser
@@ -460,7 +463,7 @@ export function DocTree() {
             dropped.set(d);
             endDrag();
             // No projection: a drop in place, a no-op, outside the tree, or
-            // after less than one INDENT of travel.
+            // less than one INDENT from the press.
             if (d) move.mutate({ id, body: d.projection.args });
             else if (opens) {
               // As the link would, it replaces the history entry when the
@@ -654,14 +657,19 @@ function pointOf(e: Event): Point | null {
   return e instanceof MouseEvent ? { x: e.clientX, y: e.clientY } : null;
 }
 
-/** Tells a click from a drag. A click whose pointer slips past 6px (mouse),
- *  or a tap held 250 ms (touch), starts a drag; until the pointer has
- *  travelled one INDENT along its whole path (from the press, through every
- *  position the drag reports, to the release) the drag is short, and a
- *  drop moves nothing. A short drag is a click, unless a modifier key or
- *  another button was pressed (the browser opens a link in a new tab or
- *  window then), or a context menu opened on the way (a long press opens
- *  the row menu on touch). */
+/** Tells a slip from a move, and a click from a drag. A click whose pointer
+ *  slips past 6px (mouse), or a tap held 250 ms (touch), starts a drag.
+ *  From the press, it measures two distances:
+ *  - how far the pointer is from the press, in a straight line: while that
+ *    is under one INDENT the drag is near, and a drop moves nothing, however
+ *    the pointer got there (a hand that jitters on the way included);
+ *  - how far the pointer has travelled along its whole path, through every
+ *    position the drag reports, to the release: while that is under one
+ *    INDENT the drag is short (and so near too).
+ *  A short drag is a click, unless a modifier key or another button was
+ *  pressed (the browser opens a link in a new tab or window then), or a
+ *  context menu opened on the way (a long press opens the row menu on
+ *  touch). A drag that goes out and comes back near is no click. */
 function slipTracker() {
   const events = ["mouseup", "touchend", "contextmenu"] as const;
   let press: Point | null = null;
@@ -682,7 +690,8 @@ function slipTracker() {
   function stop() {
     for (const type of events) window.removeEventListener(type, seen, { capture: true });
   }
-  // Short only for a press it saw: without one it can't measure.
+  // Near and short only for a press it saw: without one it can't measure.
+  const isNear = () => press !== null && at !== null && Math.hypot(at.x - press.x, at.y - press.y) < INDENT;
   const isShort = () => press !== null && travel < INDENT;
   return {
     /** At drag start, with the press that started it. */
@@ -700,10 +709,12 @@ function slipTracker() {
     moved(delta: Point) {
       if (press) to({ x: press.x + delta.x, y: press.y + delta.y });
     },
-    /** The pointer has travelled less than one INDENT so far: a drop moves
-     *  nothing. */
-    isShort,
-    /** At drag end, once the release has been seen. */
+    /** The pointer is less than one INDENT from the press: a drop moves
+     *  nothing. At drag end, once the release has been seen, from the
+     *  release. */
+    isNear,
+    /** At drag end, once the release has been seen: the path from the press
+     *  was under one INDENT, from a plain press, with no menu on the way. */
     isClick(): boolean {
       return isShort() && plain && !menu;
     },

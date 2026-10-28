@@ -211,8 +211,8 @@ test("a_click_that_slips_sideways_opens_the_page", async ({ page }) => {
 
 // Collision is by pointer: a click pressed at the top edge of B's row that
 // slips a few px up is in the middle of A's row, which nests B. A drop
-// after less than one INDENT of travel moves nothing, and opens the page as
-// the click would (ruling F6).
+// less than one INDENT from the press moves nothing, and after a path that
+// short it opens the page as the click would (ruling F6).
 test("a_click_that_slips_up_into_the_row_above_opens_the_page", async ({ page }) => {
   await setupOwner(page);
   const { A, B } = await seedPages(page.request, [{ title: "A" }, { title: "B" }]);

@@ -2,14 +2,28 @@
 //!
 //! yrs reads an update only to integrate it, and keeps what it reads private
 //! (an `Update`'s blocks, an item's content). [`decode`] reads a lib0 v1
-//! update block by block as yrs 0.27 does (`Update::decode` and
-//! `Update::decode_block`, `yrs/src/update.rs`), and yields each item with
-//! its id, origins, parent and content. It follows yrs's own encoding, so
-//! when that changes, this is the one place to change. Its users:
-//! - [`crate::nesting`] predicts how deep an inbound update nests its types;
+//! update as yrs 0.27's `Update::decode_v1` does: block by block
+//! (`Update::decode` and `Update::decode_block`, `yrs/src/update.rs`), then
+//! past the delete set (`IdSet::decode`, `yrs/src/id_set.rs`), whose ranges
+//! it doesn't keep. It yields each item with its id, origins, parent and
+//! content. It follows yrs's own encoding, so when that changes, this is the
+//! one place to change. Its users:
+//! - [`crate::nesting`] predicts how deep an inbound update nests its types,
+//!   and finds the types an apply integrated;
 //! - `knot_markdown::remap` finds the embeds in a page's texts.
 //!
-//! The update's delete set, after its blocks, is not read.
+//! A room reads every inbound update with it before yrs does, and refuses
+//! the sender of an update it can't read (4422), so it must refuse nothing
+//! yrs reads. It accepts exactly the updates yrs's decoder accepts, and
+//! reads the same items (`tests/update_items.rs` and knot-markdown's
+//! `tests/update_reader.rs` check both against yrs over the repo's update
+//! corpora), with one exception on purpose: a block whose clocks run past
+//! `u32::MAX` doesn't decode here, where yrs's decoder adds them up
+//! unchecked, which panics in a debug build and wraps in a release build.
+//! A delete set's ranges are not added up here, nor checked: yrs adds them
+//! unchecked too (a known limitation). yrs also refuses a count of clients
+//! or blocks it can't reserve memory for, before reading them; an update
+//! that held that many would be gigabytes long.
 
 use std::sync::Arc;
 
@@ -58,8 +72,9 @@ pub enum ItemParent {
 /// ranges are passed over, their clocks counted.
 ///
 /// An update that doesn't decode yields the items before the error, then
-/// the error, and then nothing. A block whose clocks run past `u32::MAX`
-/// is such an error, where yrs's own decoder doesn't check.
+/// the error, and then nothing: one whose delete set doesn't decode yields
+/// all its items first. A block whose clocks run past `u32::MAX` is such an
+/// error, where yrs's own decoder doesn't check.
 pub fn decode(update: &[u8]) -> UpdateItems<'_> {
     UpdateItems {
         decoder: DecoderV1::new(Cursor::new(update)),
@@ -100,7 +115,8 @@ impl Iterator for UpdateItems<'_> {
 }
 
 impl UpdateItems<'_> {
-    /// The next item, or `None` after the last client's last block.
+    /// The next item, or `None` after the last client's last block and the
+    /// delete set.
     fn read_next(&mut self) -> Result<Option<UpdateItem>, Error> {
         loop {
             while self.blocks == 0 {
@@ -110,6 +126,7 @@ impl UpdateItems<'_> {
                 };
                 let Some(rest) = clients.checked_sub(1) else {
                     self.clients = Some(0);
+                    self.read_delete_set()?;
                     return Ok(None);
                 };
                 self.clients = Some(rest);
@@ -133,6 +150,23 @@ impl UpdateItems<'_> {
             };
             self.next.clock = clock_after(id, len)?;
         }
+    }
+
+    /// Reads past the delete set after the blocks, as yrs's `IdSet::decode`
+    /// reads it, so that an update whose delete set doesn't decode doesn't
+    /// decode here either. Its ranges are not kept, nor added up.
+    fn read_delete_set(&mut self) -> Result<(), Error> {
+        let clients: u32 = self.decoder.read_var()?;
+        for _ in 0..clients {
+            self.decoder.reset_ds_cur_val();
+            let _client: u64 = self.decoder.read_var()?;
+            let ranges: u32 = self.decoder.read_var()?;
+            for _ in 0..ranges {
+                self.decoder.read_ds_clock()?;
+                self.decoder.read_ds_len()?;
+            }
+        }
+        Ok(())
     }
 }
 

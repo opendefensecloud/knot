@@ -1,10 +1,15 @@
 //! The items of a yrs update, read without applying it
 //! (`knot_crdt::update_items`), as nesting's prefilter and Duplicate's
-//! remap read them.
+//! remap read them, and as a room reads every inbound update before yrs
+//! does.
+
+mod common;
 
 use std::fmt::Write as _;
 
 use knot_crdt::update_items::{ItemParent, UpdateItem, decode};
+use knot_crdt::{Engine, YrsEngine};
+use knot_test_support::crafted::crafted_attack;
 use yrs::block::{
     BLOCK_GC_REF_NUMBER, BLOCK_ITEM_STRING_REF_NUMBER, BLOCK_SKIP_REF_NUMBER, ClientID, HAS_ORIGIN,
     ItemContent,
@@ -107,26 +112,36 @@ fn items_carry_their_ids_origins_parents_and_content() {
     );
 }
 
-#[test]
-fn a_string_spans_its_utf16_length() {
+/// A text "Grüße 🙂", by client 1.
+fn non_ascii_text() -> Vec<u8> {
     let doc = Doc::with_client_id(1);
     let text = doc.get_or_insert_text("t");
     text.insert(&mut doc.transact_mut(), 0, "Grüße 🙂");
+    state(&doc)
+}
+
+#[test]
+fn a_string_spans_its_utf16_length() {
     let n = "Grüße 🙂".encode_utf16().count();
     assert_eq!(
-        seen(&state(&doc)),
+        seen(&non_ascii_text()),
         [format!(r#"1:0 ({n}) in t: string "Grüße 🙂""#)]
     );
 }
 
-#[test]
-fn a_deleted_item_is_read_with_its_deleted_content() {
+/// A text "abc" by client 1, whose "b" was deleted.
+fn with_a_deleted_item() -> Vec<u8> {
     let doc = Doc::with_client_id(1);
     let text = doc.get_or_insert_text("t");
     text.insert(&mut doc.transact_mut(), 0, "abc");
     text.remove_range(&mut doc.transact_mut(), 1, 1);
+    state(&doc)
+}
+
+#[test]
+fn a_deleted_item_is_read_with_its_deleted_content() {
     assert_eq!(
-        seen(&state(&doc)),
+        seen(&with_a_deleted_item()),
         [
             r#"1:0 (1) in t: string "a""#,
             r#"1:1 (1) after 1:0: deleted 1"#,
@@ -157,10 +172,9 @@ fn write_string(enc: &mut EncoderV1, origin: Option<&ID>, s: &str) {
     ItemContent::String(s.into()).encode(enc);
 }
 
-#[test]
-fn collected_and_skipped_ranges_count_their_clocks() {
-    // Client 7 from clock 10: 3 collected clocks, "ab", 5 skipped clocks,
-    // then "c" after "b".
+/// Client 7 from clock 10: 3 collected clocks, "ab", 5 skipped clocks, then
+/// "c" after "b".
+fn collected_and_skipped() -> Vec<u8> {
     let mut enc = EncoderV1::new();
     enc.write_var(1u32); // one client
     enc.write_var(4u32); // four blocks
@@ -173,7 +187,12 @@ fn collected_and_skipped_ranges_count_their_clocks() {
     enc.write_var(5u32);
     write_string(&mut enc, Some(&id(7, 14)), "c");
     enc.write_var(0u32); // no deletions
-    let update = enc.to_vec();
+    enc.to_vec()
+}
+
+#[test]
+fn collected_and_skipped_ranges_count_their_clocks() {
+    let update = collected_and_skipped();
     Update::decode_v1(&update).expect("yrs reads it too");
     assert_eq!(
         seen(&update),
@@ -184,9 +203,8 @@ fn collected_and_skipped_ranges_count_their_clocks() {
     );
 }
 
-#[test]
-fn an_empty_item_is_left_out() {
-    // yrs drops an item without content, and counts no clock for it.
+/// From client 7: an empty string, then "a".
+fn with_an_empty_item() -> Vec<u8> {
     let mut enc = EncoderV1::new();
     enc.write_var(1u32);
     enc.write_var(2u32);
@@ -195,7 +213,13 @@ fn an_empty_item_is_left_out() {
     write_string(&mut enc, None, "");
     write_string(&mut enc, None, "a");
     enc.write_var(0u32);
-    assert_eq!(seen(&enc.to_vec()), [r#"7:0 (1) in t: string "a""#]);
+    enc.to_vec()
+}
+
+#[test]
+fn an_empty_item_is_left_out() {
+    // yrs drops an item without content, and counts no clock for it.
+    assert_eq!(seen(&with_an_empty_item()), [r#"7:0 (1) in t: string "a""#]);
 }
 
 #[test]
@@ -215,6 +239,20 @@ fn an_update_that_does_not_decode_ends_in_one_error() {
     let mut empty = decode(&[]);
     assert!(matches!(empty.next(), Some(Err(_))));
     assert!(empty.next().is_none());
+}
+
+/// The delete set after the blocks is read too, as yrs reads it: an update
+/// that ends inside it doesn't decode, after all its items.
+#[test]
+fn an_update_whose_delete_set_ends_early_does_not_decode() {
+    let update = with_a_deleted_item();
+    let cut = &update[..update.len() - 1];
+    Update::decode_v1(cut).expect_err("yrs doesn't read it");
+    let read: Vec<_> = decode(cut).collect();
+    let (last, items) = read.split_last().expect("something is read");
+    assert!(last.is_err(), "the last is the error: {last:?}");
+    assert_eq!(items.len(), 3, "every item comes first: {items:?}");
+    assert!(items.iter().all(Result::is_ok), "{items:?}");
 }
 
 /// One client's blocks from `clock`: `blocks` writes them.
@@ -248,9 +286,96 @@ fn a_block_whose_clocks_run_past_u32_max_does_not_decode() {
         );
     }
 
-    let to_the_end = client_from(u32::MAX - 3, 1, |enc| write_string(enc, None, "abc"));
     assert_eq!(
-        seen(&to_the_end),
+        seen(&to_the_end()),
         [format!(r#"7:{} (3) in t: string "abc""#, u32::MAX - 3)]
     );
+}
+
+/// An item whose last clock is `u32::MAX`.
+fn to_the_end() -> Vec<u8> {
+    client_from(u32::MAX - 3, 1, |enc| write_string(enc, None, "abc"))
+}
+
+/// The updates of the engine's own tests (`src/engine.rs`), built as they
+/// build them: a state with a delete set, a diff that only deletes, an
+/// update that waits for a missing dependency, the state of a doc that
+/// holds it pending (which re-sends it), and three bytes that are no
+/// update.
+fn the_engines_updates() -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut add = |what: &str, update: Vec<u8>| out.push((format!("engine: {what}"), update));
+
+    let src = Doc::new();
+    let t = src.get_or_insert_text("t");
+    t.push(&mut src.transact_mut(), "hellox");
+    t.remove_range(&mut src.transact_mut(), 5, 1);
+    add("a state with a delete set", state(&src));
+    let before = src.transact().state_vector();
+    t.remove_range(&mut src.transact_mut(), 0, 1);
+    add(
+        "a diff that only deletes",
+        src.transact().encode_state_as_update_v1(&before),
+    );
+
+    let src = Doc::new();
+    let t = src.get_or_insert_text("t");
+    t.push(&mut src.transact_mut(), "a");
+    let after_a = src.transact().state_vector();
+    t.push(&mut src.transact_mut(), "b");
+    let only_b = src.transact().encode_state_as_update_v1(&after_a);
+    let d = YrsEngine.new_doc();
+    YrsEngine.apply_update(&d, &only_b).expect("apply");
+    add("an update missing its dependency", only_b);
+    add("a state re-sending what is pending", state(d.inner()));
+
+    add("three bytes that are no update", vec![0xff, 0xff, 0xff]);
+    out
+}
+
+/// The updates of the conformance tests (`tests/conformance.rs`): an empty
+/// doc's state, and the diff a doc sends for another's state vector.
+fn the_conformance_updates() -> Vec<(String, Vec<u8>)> {
+    let e = YrsEngine;
+    let (a, b) = (e.new_doc(), e.new_doc());
+    let sv_b = e.encode_state_vector(&b).expect("state vector");
+    vec![
+        (
+            "conformance: an empty doc's state".to_string(),
+            e.encode_state_as_update(&a, None).expect("state"),
+        ),
+        (
+            "conformance: a diff for a state vector".to_string(),
+            e.encode_state_as_update(&a, Some(&sv_b)).expect("diff"),
+        ),
+    ]
+}
+
+/// The reader reads every update knot-crdt's tests build as yrs reads it,
+/// and every update that ends early in one (`common::disagreements`):
+/// this file's, the engine's and the conformance tests', and the crafted
+/// base page and attack (`knot_test_support::crafted`); `tests/nesting.rs`
+/// checks its own. Left out: the two updates whose clocks run past
+/// `u32::MAX` (above), which the reader refuses on purpose where yrs's
+/// decoder panics in a debug build and wraps in a release build.
+#[test]
+fn the_reader_reads_the_updates_of_these_tests_as_yrs_does() {
+    let mut updates: Vec<(String, Vec<u8>)> = [
+        ("a page from two clients", page()),
+        ("a non-ASCII text", non_ascii_text()),
+        ("a deleted item", with_a_deleted_item()),
+        ("an empty doc", state(&Doc::new())),
+        ("collected and skipped ranges", collected_and_skipped()),
+        ("an empty item", with_an_empty_item()),
+        ("an item up to u32::MAX", to_the_end()),
+    ]
+    .into_iter()
+    .map(|(what, update)| (what.to_string(), update))
+    .collect();
+    updates.extend(the_engines_updates());
+    updates.extend(the_conformance_updates());
+    let (base, attack) = crafted_attack();
+    updates.push(("the crafted base page".to_string(), base));
+    updates.push(("the crafted attack".to_string(), attack));
+    common::assert_read_as_yrs_reads(updates);
 }

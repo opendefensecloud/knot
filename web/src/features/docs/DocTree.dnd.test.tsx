@@ -497,8 +497,9 @@ describe("DocTree — a click that slips", () => {
 
   // Collision is by pointer: pressed at the top edge of Beta (56-84), 8px up
   // is in the middle band of Alpha one (28-56), which nests. On main that
-  // did nothing, and a drop after less than one INDENT of travel moves
-  // nothing (ruling F6): no drop line shows, and it is a click.
+  // did nothing, and a drop less than one INDENT from the press moves
+  // nothing (ruling F6): no drop line shows, and after a path that short it
+  // is a click.
   it("a click that slips 8px up into the row above moves nothing and opens the page", async () => {
     const fetchMock = renderTree("editor", SIBLINGS);
     await editorRows(SIBLINGS.length);
@@ -514,6 +515,27 @@ describe("DocTree — a click that slips", () => {
     await settle();
     expect(moves(fetchMock)).toEqual([]);
     expect(screen.getByTestId("location")).toHaveTextContent("/doc/beta");
+  });
+
+  // A hand that jitters on the way: the path runs past one INDENT, but the
+  // pointer ends 8px from the press, in the middle band of Alpha one, which
+  // nests. Less than one INDENT from the press, a drop moves nothing; after
+  // a path of one INDENT or more it is no click either.
+  it("a jittery slip that ends less than one INDENT from the press moves nothing and opens nothing", async () => {
+    const fetchMock = renderTree("editor", SIBLINGS);
+    await editorRows(SIBLINGS.length);
+    layOut();
+
+    // 4px, then 7px: the drag starts; then side to side, 8px up, to y=49.
+    const link = mouseDrag("beta", 57, [[0, -4], [0, -7], [2, -8], [-2, -8], [2, -8], [-2, -8], [0, -8]]);
+    expect(screen.getByTestId("tree-row-beta")).toHaveStyle({ opacity: "0.5" }); // dragging
+    expect(document.querySelector("[data-drop-zone]")).toBeNull();
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 49 });
+    expect(fireEvent.click(link)).toBe(false);
+
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
   });
 
   // As react-router's Link does: going where the app already is replaces the
@@ -537,7 +559,8 @@ describe("DocTree — a click that slips", () => {
     expect(location).toHaveAttribute("data-navigation", "PUSH");
   });
 
-  // Travel is the whole path, not how far from the press it ends.
+  // Back where it pressed, a drop moves nothing; but a click is a path of
+  // less than one INDENT, so a drag that went away first opens nothing.
   it("a drag that goes away and comes back moves nothing and opens nothing", async () => {
     const fetchMock = renderTree("editor", SIBLINGS);
     await editorRows(SIBLINGS.length);
