@@ -1909,6 +1909,61 @@ async fn a_duplicate_holds_its_permit_until_its_refresh_ends() {
     w.wait_for_permits(1).await;
 }
 
+/// A writer that skips the group's lock (an older release during an
+/// upgrade) takes the copy's order key while the copy is stored. The
+/// duplicate answers 409 `doc.sort_key_conflict`, which a retry gets past,
+/// rather than a database error, and stores nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn order_key_taken_meanwhile_is_409() {
+    let w = world().await;
+    let source = w.create_doc(&w.owner, "Plan", None).await;
+    let source_key = w.doc(source).await["sort_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The copy's key: right after the source, the last page at the top
+    // level. The old release hasn't committed, so the copy's placement
+    // doesn't see it.
+    let taken = knot_storage::sort_key_between(Some(&source_key), None);
+    let mut rows = w.counts().await;
+    let mut old_release = w.pool().begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+         VALUES ($1, NULL, 'Old release', $2, $3)",
+    )
+    .bind(w.workspace_id)
+    .bind(&taken)
+    .bind(w.owner.user_id)
+    .execute(&mut *old_release)
+    .await
+    .unwrap();
+    let duplicate = {
+        let (app, owner) = (w.app.clone(), w.owner.clone());
+        tokio::spawn(async move {
+            send_json(
+                &app,
+                &owner,
+                "POST",
+                &format!("/api/docs/{source}/duplicate"),
+                json!({}),
+            )
+            .await
+        })
+    };
+    // The copy's final update waits for the old release's row, which holds
+    // the same key.
+    knot_test_support::locks::wait_for_lock_waits(w.pool(), 1).await;
+    old_release.commit().await.unwrap();
+
+    let response = duplicate.await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(error_code(response).await, "doc.sort_key_conflict");
+    assert_eq!(rows[0].0, "documents");
+    rows[0].1 += 1; // the old release's page
+    assert_eq!(w.counts().await, rows, "the copy stored nothing");
+    assert_eq!(w.order(None).await.len(), 2);
+}
+
 /// The hourly purge job removes the objects of duplicates that never
 /// committed once they are an hour old (P16), and leaves younger ones.
 #[tokio::test(flavor = "multi_thread")]
