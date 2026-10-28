@@ -1,7 +1,7 @@
 //! Placement: where `create_placed`, `move_placed` and restore put a page
-//! among its siblings, how a group's keys are respread when no key fits, and
-//! how placements serialize with each other, against a fresh database per
-//! test.
+//! among its siblings, how a group's keys are respread when no key fits, how
+//! placements serialize with each other, and how moves keep out of, and
+//! cope with, parent cycles, against a fresh database per test.
 //!
 //! The concurrency tests order their steps with a stand-in transaction on a
 //! connection of its own, and wait until the sessions under test are blocked
@@ -81,6 +81,15 @@ impl World {
     async fn page(&self, title: &str) -> Uuid {
         self.store
             .create_placed(self.ws, None, title, Placement::Last, self.user)
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// A page at the end of `parent`'s children, placed the new way.
+    async fn child(&self, parent: Uuid, title: &str) -> Uuid {
+        self.store
+            .create_placed(self.ws, Some(parent), title, Placement::Last, self.user)
             .await
             .unwrap()
             .id
@@ -387,6 +396,165 @@ async fn swapping_nesting_moves_do_not_deadlock() {
     assert!(matches!(err, DocStoreError::Cycle), "got {err:?}");
     assert_eq!(w.parent_of(d).await, Some(p));
     assert_eq!(w.parent_of(p).await, None);
+}
+
+/// Two moves on disjoint rows that close a parent cycle together: C is B's
+/// parent and A is D's, then A goes into B while C goes into D. Each locked
+/// only its own two rows, so both cycle checks read the tree before either
+/// move committed, both passed, and both committed: A → B → C → D → A, four
+/// pages the sidebar can't place. Moves into a parent now take a lock of
+/// their own per workspace first, so the second check sees the first move
+/// and refuses with `Cycle`.
+#[tokio::test(flavor = "multi_thread")]
+async fn disjoint_moves_do_not_close_a_parent_cycle() {
+    let w = world().await;
+    let c = w.page("C").await;
+    let b = w.child(c, "B").await;
+    let a = w.page("A").await;
+    let d = w.child(a, "D").await;
+    // Holds the first move just before it commits, with its row locks taken:
+    // its last write is the ACL invalidation.
+    let mut holder = w.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE acl_invalidations IN EXCLUSIVE MODE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let move_into = |doc: Uuid, parent: Uuid| {
+        let (store, ws, user) = (w.store.clone(), w.ws, w.user);
+        tokio::spawn(async move {
+            store
+                .move_placed(ws, doc, user, Some(parent), Placement::Last)
+                .await
+        })
+    };
+    let first = move_into(a, b);
+    wait_for_lock_waits(&w.pool, 1).await;
+    let second = move_into(c, d);
+    wait_for_lock_waits(&w.pool, 2).await;
+    holder.commit().await.unwrap();
+
+    first.await.unwrap().expect("A into B");
+    let err = second
+        .await
+        .unwrap()
+        .expect_err("C into D after A went into B");
+    assert!(matches!(err, DocStoreError::Cycle), "got {err:?}");
+    let parents = [
+        w.parent_of(a).await,
+        w.parent_of(b).await,
+        w.parent_of(c).await,
+        w.parent_of(d).await,
+    ];
+    assert_eq!(
+        parents,
+        [Some(b), Some(c), None, Some(a)],
+        "A, B, C, D: C stays at the top level"
+    );
+}
+
+/// A store on this test's database whose statements Postgres cancels after
+/// five seconds, so that a query that never ends fails the test instead of
+/// running until the server is killed. Nothing else holds a lock here, and
+/// every statement takes milliseconds.
+fn store_with_statement_timeout(w: &World) -> PgDocStore {
+    let options = (*w.pool.connect_options())
+        .clone()
+        .options([("statement_timeout", "5s")]);
+    PgDocStore::new(
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with(options),
+    )
+}
+
+/// A parent cycle already in the database: `A` under `B`, `B` under `A`,
+/// both live. Two racing moves could commit one (above), and so could
+/// releases before the moves took their locks.
+async fn seed_cycle(w: &World, name: &str) -> (Uuid, Uuid) {
+    let a = w.seed(None, &format!("{name} A"), name).await;
+    let b = w.seed(Some(a), &format!("{name} B"), "m").await;
+    sqlx::query("UPDATE documents SET parent_id = $2 WHERE id = $1")
+        .bind(a)
+        .bind(b)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    (a, b)
+}
+
+/// The cycle check walks down from the moved page. From a page of a cycle,
+/// its `UNION ALL` walk never ended, so moving that page anywhere outside
+/// the cycle ran until the server was killed, holding its row locks and a
+/// pool connection. It finishes now, and the move breaks the cycle. A page
+/// moved into the cycle was never affected (its walk stays below it); it
+/// still goes in.
+#[tokio::test(flavor = "multi_thread")]
+async fn moves_into_and_out_of_a_parent_cycle_finish() {
+    let w = world().await;
+    let store = store_with_statement_timeout(&w);
+    let (a, b) = seed_cycle(&w, "c").await;
+    let page = w.page("Page").await;
+    let outside = w.page("Outside").await;
+
+    store
+        .move_placed(w.ws, page, w.user, Some(a), Placement::Last)
+        .await
+        .expect("a page into the cycle");
+    store
+        .move_placed(w.ws, a, w.user, Some(outside), Placement::Last)
+        .await
+        .expect("a page of the cycle out of it");
+
+    let parents = [
+        w.parent_of(a).await,
+        w.parent_of(b).await,
+        w.parent_of(page).await,
+    ];
+    assert_eq!(parents, [Some(outside), Some(a), Some(a)], "A, B, Page");
+}
+
+/// Archive stamps the subtree it walks down from the archived page with
+/// `UNION ALL`, which never ended on a cycle. It finishes now and archives
+/// the whole cycle, with what hangs below it, under the page archived.
+#[tokio::test(flavor = "multi_thread")]
+async fn archiving_a_page_of_a_parent_cycle_finishes() {
+    let w = world().await;
+    let store = store_with_statement_timeout(&w);
+    let (a, b) = seed_cycle(&w, "c").await;
+    let below = w.child(a, "Below").await;
+
+    let archived = store
+        .archive(w.ws, b, w.user)
+        .await
+        .expect("archive a page of the cycle");
+
+    assert_eq!(archived.first(), Some(&b), "the archived page first");
+    let mut archived = archived;
+    archived.sort();
+    let mut expected = vec![a, b, below];
+    expected.sort();
+    assert_eq!(archived, expected);
+}
+
+/// The subpages of a page in a cycle, which the ACL listener lists after an
+/// archive or a grant change, came from a `UNION ALL` walk that never ended
+/// either. Now they are every page below it, the page itself left out.
+#[tokio::test(flavor = "multi_thread")]
+async fn subpages_of_a_page_in_a_parent_cycle_are_listed() {
+    let w = world().await;
+    let store = store_with_statement_timeout(&w);
+    let (a, b) = seed_cycle(&w, "c").await;
+    let below = w.child(a, "Below").await;
+
+    let mut subpages = store
+        .descendant_ids(a)
+        .await
+        .expect("the subpages of a page of the cycle");
+
+    subpages.sort();
+    let mut expected = vec![b, below];
+    expected.sort();
+    assert_eq!(subpages, expected);
 }
 
 /// A restore to the top level (its parent is archived) while a top-level

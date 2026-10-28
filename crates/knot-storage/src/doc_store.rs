@@ -280,8 +280,9 @@ impl PgDocStore {
     ) -> Result<Document, DocStoreError> {
         let mut tx = crate::begin(&self.pool).await?;
         placement::lock_move(&mut tx, workspace_id, doc_id, parent_id).await?;
-        // With both rows locked, a concurrent move that would close a cycle
-        // with this one has committed or waits for this transaction.
+        // With the move lock held, every other move into a parent of this
+        // workspace, which a cycle with this one would need, has committed
+        // (and this check sees it) or waits for this transaction.
         reject_cycle(&mut tx, doc_id, parent_id).await?;
         let sort_key =
             placement::place(&mut tx, workspace_id, parent_id, placement, Some(doc_id)).await?;
@@ -642,13 +643,14 @@ impl DocStore for PgDocStore {
         // Repeat until a pass stamps nothing: a create that held its parent
         // `FOR SHARE` can commit a child after one UPDATE took its snapshot;
         // the next statement sees it. Creates that start later block on the
-        // stamped parent's row lock and then find it archived.
+        // stamped parent's row lock and then find it archived. `UNION` ends
+        // the walk on a parent cycle (see `reject_cycle`).
         let mut stamped: Vec<Uuid> = Vec::new();
         loop {
             let ids: Vec<Uuid> = sqlx::query_scalar(
                 "WITH RECURSIVE sub AS (
                      SELECT id FROM documents WHERE id = $2
-                     UNION ALL
+                     UNION
                      SELECT d.id FROM documents d JOIN sub s ON d.parent_id = s.id
                       WHERE d.archived_at IS NULL OR d.archive_root_id = $2
                  )
@@ -719,12 +721,15 @@ impl DocStore for PgDocStore {
     }
 
     async fn descendant_ids(&self, doc_id: Uuid) -> Result<Vec<Uuid>, DocStoreError> {
-        // Recursive CTE descending from doc_id.
+        // Recursive CTE descending from doc_id. On a parent cycle through
+        // doc_id (see `reject_cycle`), `d.id <> $1` keeps the doc itself out
+        // and `UNION` ends the walk.
         let rows = sqlx::query_scalar::<_, Uuid>(
             "WITH RECURSIVE chain AS (
                  SELECT id FROM documents WHERE parent_id = $1
-                 UNION ALL
+                 UNION
                  SELECT d.id FROM documents d JOIN chain c ON d.parent_id = c.id
+                  WHERE d.id <> $1
              )
              SELECT id FROM chain",
         )
@@ -994,6 +999,15 @@ async fn lock_parent_row(
 /// Fails with `Cycle` when moving `doc_id` under `parent_id` would create a
 /// parent cycle: the destination parent is the doc itself or one of its
 /// descendants. The top level (`None`) never is.
+///
+/// The walk down from the doc uses `UNION`, so it ends on a parent cycle
+/// already in the database (one that racing moves committed before
+/// `lock_move` took the move lock, or an older release wrote): it stops once
+/// it has seen every row. With `UNION ALL` it went round the cycle forever,
+/// and the statement ran until the server was killed, holding its locks and
+/// a pool connection. The other walks over `parent_id` in this crate end on
+/// a cycle too: by `UNION`, by leaving out the row they start from
+/// (`live_subtree`), or by a depth cap (`list_inherited`).
 async fn reject_cycle(
     tx: &mut sqlx::PgConnection,
     doc_id: Uuid,
@@ -1005,7 +1019,7 @@ async fn reject_cycle(
     let creates_cycle: bool = sqlx::query_scalar(
         "WITH RECURSIVE sub AS (
              SELECT id FROM documents WHERE id = $1
-             UNION ALL
+             UNION
              SELECT d.id FROM documents d JOIN sub s ON d.parent_id = s.id
          )
          SELECT EXISTS(SELECT 1 FROM sub WHERE id = $2)",

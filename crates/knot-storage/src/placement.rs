@@ -34,6 +34,11 @@ pub enum Placement {
 /// ASCII. The second half is `hashtext(workspace_id::text)`.
 const TOP_LEVEL_LOCK: i32 = 0x6b6e_6f74;
 
+/// The first half of the advisory lock key that moves into a parent take,
+/// one per workspace (see `lock_move`): `"move"` in ASCII. The second half
+/// is `hashtext(workspace_id::text)`.
+const MOVE_LOCK: i32 = 0x6d6f_7665;
+
 /// The longest key placement writes. A longer one respreads the group.
 const MAX_KEY_LEN: usize = 64;
 
@@ -63,13 +68,24 @@ pub(crate) async fn lock_group(
 }
 
 /// Locks what a move of `doc` to `parent` needs: the target group and the
-/// moved row, both `FOR NO KEY UPDATE`.
+/// moved row, both `FOR NO KEY UPDATE`. The caller takes it first in its
+/// transaction.
 ///
-/// - Under a parent, in one statement that takes the two rows in id order.
-///   Two moves that swap nesting (D into P, P into D) lock the same rows in
-///   the same order, so the second waits for the first and then its cycle
-///   check sees the first's result.
-/// - At the top level, the group's advisory lock first, then the row.
+/// - Under a parent, first the workspace's move lock, a transaction-scoped
+///   advisory lock that only moves into a parent take, then the two rows in
+///   id order, in one statement. Moves into a parent therefore run one at a
+///   time per workspace, and the caller's cycle check sees every one that
+///   committed before it. Row locks alone left a gap: two moves on disjoint
+///   rows (A into B, and C into D, where C is B's parent and A is D's) took
+///   no lock in common, both checks read the tree before either committed,
+///   and together they closed the cycle A → B → C → D → A.
+/// - At the top level, the group's advisory lock first, then the row. A
+///   move to the top level can't close a cycle, so it skips the move lock.
+///
+/// The move lock adds no deadlock: it is the first lock of every
+/// transaction that takes it, so a move waiting for it holds nothing that
+/// another transaction can wait for. Its holder then locks as before: the
+/// top-level lock before any row, rows under a parent in id order.
 ///
 /// `NotFound` when the doc or the parent is not a page of `ws`, before the
 /// caller's cycle check can say anything about a page elsewhere; `Archived`
@@ -82,6 +98,11 @@ pub(crate) async fn lock_move(
 ) -> Result<(), DocStoreError> {
     let rows: Vec<(Uuid, bool)> = match parent {
         Some(parent) => {
+            sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::uuid::text))")
+                .bind(MOVE_LOCK)
+                .bind(ws)
+                .execute(&mut *conn)
+                .await?;
             sqlx::query_as(
                 "SELECT id, archived_at IS NOT NULL FROM documents
                   WHERE workspace_id = $1 AND id = ANY($2)
