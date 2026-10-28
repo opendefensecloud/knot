@@ -24,9 +24,11 @@
 -- Within a group the parent is the same, so it changes nothing there.
 --
 -- A rewritten list of n rows gets `lexorank::spread(n)`
--- (crates/knot-storage/src/lexorank.rs), which pg_temp.knot_spread_key
+-- (crates/knot-storage/src/lexorank.rs), which knot_heal_spread_key
 -- computes. Only `sort_key` changes: to users the page is the same, so
--- `updated_at` stays.
+-- `updated_at` stays. The helper is an ordinary function, dropped again at
+-- the end: one in `pg_temp` would need the TEMPORARY privilege, which
+-- hardened databases revoke, while every migration already needs CREATE.
 --
 -- crates/knot-server/tests/markdown_compat.rs (`SORT_KEY_GROUPS`) reports
 -- the same groups, read-only, on a database before the upgrade. Keep the two
@@ -42,7 +44,7 @@ ALTER TABLE documents
 -- Key `i` (from 1) of `n` evenly spaced keys, as `lexorank::spread(n)`: with
 -- `w` the smallest width where 36^w > 2(n+1), floor(i * 36^w / (n+1)) as `w`
 -- base-36 digits, padded with '0' on the left, without its trailing '0's.
-CREATE OR REPLACE FUNCTION pg_temp.knot_spread_key(i bigint, n bigint) RETURNS text
+CREATE OR REPLACE FUNCTION knot_heal_spread_key(i bigint, n bigint) RETURNS text
 LANGUAGE plpgsql IMMUTABLE STRICT AS $$
 DECLARE
     width int := 1;
@@ -93,7 +95,7 @@ respread AS (
     -- Every row of a list to rewrite, with its key by its rank in the
     -- sidebar's order (see the header).
     SELECT id,
-           pg_temp.knot_spread_key(
+           knot_heal_spread_key(
                row_number() OVER (PARTITION BY workspace_id, list_parent
                                   ORDER BY sort_key COLLATE "C", parent_id NULLS FIRST,
                                            created_at, id),
@@ -117,4 +119,4 @@ ALTER TABLE documents
     UNIQUE NULLS NOT DISTINCT (workspace_id, parent_id, sort_key)
     DEFERRABLE INITIALLY IMMEDIATE;
 
-DROP FUNCTION pg_temp.knot_spread_key(bigint, bigint);
+DROP FUNCTION knot_heal_spread_key(bigint, bigint);

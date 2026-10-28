@@ -606,7 +606,7 @@ async fn heal_sort_keys_preserves_order_and_fixes_bad_groups() {
 }
 
 /// A bad group of n rows gets exactly `lexorank::spread(n)`, in order: the
-/// migration's `pg_temp.knot_spread_key` computes the same keys. The sizes
+/// migration's `knot_heal_spread_key` computes the same keys. The sizes
 /// cover the three key widths: 1 (n = 1, 2, 10), 2 (n = 35, 36, 100) and 3
 /// (n = 700). For n = 35 every key of width 2 ends in '0', which is
 /// trimmed, so the longest is one character.
@@ -808,13 +808,120 @@ async fn heal_sort_keys_is_idempotent() {
 
     assert_eq!(stored(&pool).await, healed);
     assert_eq!(unique_constraints(&pool).await, constraints);
-    let helper: Option<String> = sqlx::query_scalar(
-        "SELECT to_regprocedure('pg_temp.knot_spread_key(bigint, bigint)')::text",
-    )
-    .fetch_one(&mut *conn)
-    .await
-    .unwrap();
+    let helper: Option<String> =
+        sqlx::query_scalar("SELECT to_regprocedure('knot_heal_spread_key(bigint, bigint)')::text")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
     assert_eq!(helper, None, "the helper is dropped at the end");
+}
+
+/// The heal runs as a migration user that may create tables but not
+/// temporary objects: TEMPORARY revoked from PUBLIC, a common hardening
+/// step. Its helper function lived in `pg_temp`, so the pre-upgrade job
+/// failed with "permission denied to create temporary tables", although the
+/// user had the `CREATE TABLE` rights the chart asks for. The helper is an
+/// ordinary function now, dropped again at the end. The whole chain runs as
+/// that user, over bad keys, so the helper is called too.
+///
+/// Roles belong to the whole server, so the user is dropped again even when
+/// a check fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn heal_sort_keys_runs_without_the_temporary_privilege() {
+    use sqlx::AssertSqlSafe;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+
+    let url = knot_test_support::fresh_db_url().await;
+    let db = url.rsplit('/').next().unwrap().to_owned();
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect as the test role");
+    let role = format!("migrator_{}", Uuid::new_v4().simple());
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        r#"CREATE ROLE "{role}" LOGIN PASSWORD 'migrator';
+           REVOKE TEMPORARY ON DATABASE "{db}" FROM PUBLIC;
+           GRANT CONNECT, CREATE ON DATABASE "{db}" TO "{role}";
+           GRANT USAGE, CREATE ON SCHEMA public TO "{role}";"#
+    )))
+    .execute(&admin)
+    .await
+    .expect("a migration user without TEMPORARY");
+    let options = url
+        .parse::<PgConnectOptions>()
+        .unwrap()
+        .username(&role)
+        .password("migrator");
+
+    let checks = tokio::spawn(heal_as_a_user_without_temporary(options)).await;
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        r#"REASSIGN OWNED BY "{role}" TO CURRENT_USER;
+           DROP OWNED BY "{role}";
+           DROP ROLE "{role}";"#
+    )))
+    .execute(&admin)
+    .await
+    .expect("drop the migration user");
+    if let Err(failed) = checks {
+        std::panic::resume_unwind(failed.into_panic());
+    }
+}
+
+/// The checks of `heal_sort_keys_runs_without_the_temporary_privilege`, as
+/// the migration user `options` connects as.
+async fn heal_as_a_user_without_temporary(options: sqlx::postgres::PgConnectOptions) {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options)
+        .await
+        .expect("connect as the migration user");
+    let temporary = sqlx::query("CREATE TEMPORARY TABLE probe (x int)")
+        .execute(&pool)
+        .await;
+    assert!(
+        matches!(&temporary, Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42501")),
+        "the migration user can't create temporary objects: {temporary:?}"
+    );
+
+    let full = sqlx::migrate!("../../migrations");
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            full.migrations
+                .iter()
+                .filter(|m| m.version < HEAL_SORT_KEYS)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    before
+        .run(&pool)
+        .await
+        .expect("migrate to just before the heal as the migration user");
+    let seed = Seed::new(&pool).await;
+    let parent = seed.page(None, "m").await;
+    seed.page(None, "m").await;
+    seed.page(Some(parent), "0").await;
+
+    full.run(&pool)
+        .await
+        .expect("apply heal_sort_keys as the migration user");
+
+    let healed = stored(&pool).await;
+    assert!(
+        healed
+            .values()
+            .all(|r| knot_storage::lexorank::is_valid(&r.sort_key)),
+        "the migration healed every group: {healed:?}"
+    );
+    let helper: Option<String> =
+        sqlx::query_scalar("SELECT to_regprocedure('knot_heal_spread_key(bigint, bigint)')::text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(helper, None, "the helper is dropped at the end");
+    pool.close().await;
 }
 
 /// After the heal, keys are unique at the top level as well as under a
