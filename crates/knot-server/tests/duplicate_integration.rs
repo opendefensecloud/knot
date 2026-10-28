@@ -1646,6 +1646,42 @@ async fn missing_file_object_is_a_conflict() {
     );
 }
 
+/// P18: a duplicate reads its pages without booting their rooms. Rooms are
+/// never evicted when idle, so booting them would keep every page copied in
+/// memory. Neither pages nobody opened nor their copies have a room once the
+/// duplicate, the refresh of its copies included, has ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_boots_no_room() {
+    let w = world().await;
+    let source = w.create_doc(&w.owner, "Plan", None).await;
+    let child = w.create_doc(&w.owner, "Steps", Some(source)).await;
+    // Content stored without a room: pages nobody opened since a restart.
+    let updates = PgUpdatesStore::new(w.pool().clone());
+    for (doc_id, text) in [(source, "The plan"), (child, "The steps")] {
+        let content = page(|txn, fragment| paragraph(txn, fragment, text));
+        let state = content
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        updates
+            .insert_batch(doc_id, &[(Some(w.owner.user_id), state)])
+            .await
+            .unwrap();
+    }
+    let rooms = w.state.rooms_v2.as_ref().unwrap();
+    assert!(rooms.get_active(source).is_none());
+    assert!(rooms.get_active(child).is_none());
+
+    let top = id_of(&w.duplicate_ok(source, Some(true)).await);
+    w.wait_for_refreshes().await;
+
+    let child_copy = w.order(Some(top)).await[0];
+    for id in [source, child, top, child_copy] {
+        assert!(rooms.get_active(id).is_none(), "{id} has a room");
+    }
+    assert!(tree(&w.stored(top).await).contains("The plan"));
+    assert!(tree(&w.stored(child_copy).await).contains("The steps"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn byline_credits_the_duplicating_user() {
     let w = world().await;
