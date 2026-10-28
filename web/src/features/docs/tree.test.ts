@@ -484,6 +484,16 @@ describe("insertIndex", () => {
     expect(insertIndex(sibs, { parent_id: null })).toBe(3);
     expect(insertIndex([], { parent_id: "p" })).toBe(0);
   });
+
+  // As applyOptimisticMove places it. It gave 0 for a missing after_id and
+  // -1 for a missing before_id, and splice(-1, …) puts a page before the
+  // last sibling.
+  it("puts the page last when its anchor isn't among the siblings", () => {
+    const sibs = ["a", "b", "c"];
+    expect(insertIndex(sibs, { parent_id: null, after_id: "x" })).toBe(3);
+    expect(insertIndex(sibs, { parent_id: null, before_id: "x" })).toBe(3);
+    expect(insertIndex([], { parent_id: "p", after_id: "x" })).toBe(0);
+  });
 });
 
 describe("describeMove", () => {

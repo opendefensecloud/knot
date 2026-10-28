@@ -43,9 +43,9 @@ export function DuplicateDialog({
   title: string;
   /** How many subpages it has, at every depth. */
   subpages: number;
-  /** A copy is being made: Duplicate shows as unavailable. The caller
-   *  ignores presses meanwhile itself, because this prop arrives a render
-   *  too late to stop a double click. */
+  /** A copy of this page is being made: Duplicate shows as unavailable.
+   *  The caller ignores presses meanwhile itself, because this prop arrives
+   *  a render too late to stop a double click. */
   pending: boolean;
   /** Why the last attempt failed, or null. */
   error: string | null;

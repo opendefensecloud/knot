@@ -13,7 +13,9 @@
  */
 import { expect, type APIRequestContext, type Page } from "@playwright/test";
 
-/** Pixels per tree level: the rows' `paddingLeft: 4 + depth * 12`. */
+/** Pixels per tree level: the rows' `paddingLeft: 4 + depth * 12`. A drag of
+ *  one level goes INDENT + 2: exactly one INDENT sits on the boundary of the
+ *  sidebar's Math.trunc(deltaX / INDENT). */
 export const INDENT = 12;
 
 /** The part of a row a drop lands in: its top quarter, its middle (nest

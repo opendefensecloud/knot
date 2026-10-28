@@ -1,5 +1,5 @@
 import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 
 import { FileText, FilePlus, LayoutTemplate, Plus, X } from "lucide-react";
@@ -68,8 +68,14 @@ const DUPLICATE_KEY = ["docs-duplicate"];
 /** The page the Duplicate dialog asks about. */
 type DuplicateAsk = { id: string; title: string; subpages: number };
 
-/** What a duplicate mutation copies. */
-type DuplicateArgs = { id: string; include_subpages: boolean };
+/** What a duplicate mutation copies, and the page's title for the live
+ *  region. */
+type DuplicateArgs = { id: string; title: string; include_subpages: boolean };
+
+/** What the live region says while a page without subpages is copied. */
+function duplicatingText(title: string): string {
+  return `Duplicating “${title}”…`;
+}
 
 /** The droppable id of the tree's list. Doc ids are UUIDs, so it can't clash. */
 const TREE_AREA = ":tree";
@@ -81,6 +87,7 @@ type Hit = { id: string; rect: ClientRect; pointerY: number };
 export function DocTree() {
   const qc = useQueryClient();
   const nav = useNavigate();
+  const location = useLocation();
   const notify = useUi((s) => s.notify);
   const { id: openId } = useParams();
 
@@ -212,10 +219,12 @@ export function DocTree() {
 
   /** Re-project from the latest hit: the pointer's height picks the gap,
    *  the horizontal drag the depth. A level takes a full INDENT, so the 6px
-   *  that start a drag never change it. */
+   *  that start a drag never change it. Until the pointer has travelled one
+   *  INDENT there is no drop: a click that slips (sideways, or a few px up
+   *  into the row above) moves nothing. */
   function track(activeId: UniqueIdentifier, deltaX: number) {
     const hit = hitRef.current;
-    if (!hit) {
+    if (!hit || slip.isShort()) {
       showDrop(null);
       return;
     }
@@ -281,7 +290,13 @@ export function DocTree() {
     select: (m) => (m.state.variables as DuplicateArgs).id,
   });
   const copying = useMemo(() => new Set(copyingIds), [copyingIds]);
-  const duplicating = copying.size > 0;
+  /** Whether a copy of page `id` is on its way. Asked of the mutation cache,
+   *  which counts a request at once: `copying` only renders a tick later. */
+  const copyingNow = (id: string) =>
+    qc.isMutating({
+      mutationKey: DUPLICATE_KEY,
+      predicate: (m) => (m.state.variables as DuplicateArgs | undefined)?.id === id,
+    }) > 0;
 
   function closeDuplicate(id: string) {
     dupOpen.current = null;
@@ -308,12 +323,19 @@ export function DocTree() {
         return;
       }
       await qc.invalidateQueries({ queryKey: ["docs"] });
-      markDocEditMode(r.ok.id);
       if (dupOpen.current === a.id) closeDuplicate(a.id);
+      // Another page's Duplicate dialog is open: the copy shows in the list,
+      // and the app stays where it is, dialog and all.
+      if (dupOpen.current !== null) return;
+      markDocEditMode(r.ok.id);
       await nav(`/doc/${r.ok.id}`);
     },
     // No answer, or one that isn't a page.
     onError: (_e, a) => duplicateFailed(a.id, duplicateErrorText()),
+    // The live region speaks only when its text changes: cleared, a later
+    // copy of the same page is heard again.
+    onSettled: (_r, _e, a) =>
+      setAnnouncement((now) => (now === duplicatingText(a.title) ? "" : now)),
   });
 
   /** "Duplicate…": a page with subpages asks whether they go too; any other
@@ -321,8 +343,8 @@ export function DocTree() {
   function startDuplicate(node: TreeNode) {
     const subpages = countDescendants(node);
     if (subpages === 0) {
-      setAnnouncement(`Duplicating “${node.title}”…`);
-      duplicate.mutate({ id: node.id, include_subpages: false });
+      setAnnouncement(duplicatingText(node.title));
+      duplicate.mutate({ id: node.id, title: node.title, include_subpages: false });
       return;
     }
     dupOpen.current = node.id;
@@ -330,13 +352,12 @@ export function DocTree() {
     setDupAsk({ id: node.id, title: node.title, subpages });
   }
 
-  function confirmDuplicate(id: string, includeSubpages: boolean) {
-    // Ignored while a copy is on its way, or a double click makes two. Asked
-    // of the mutation cache, which counts the request at once: `duplicating`
-    // only renders a task later.
-    if (qc.isMutating({ mutationKey: DUPLICATE_KEY }) > 0) return;
+  function confirmDuplicate(ask: DuplicateAsk, includeSubpages: boolean) {
+    // Ignored while this page's copy is on its way, or a double click makes
+    // two. Another page's copy doesn't hold it up, as in the row menu.
+    if (copyingNow(ask.id)) return;
     setDupError(null);
-    duplicate.mutate({ id, include_subpages: includeSubpages });
+    duplicate.mutate({ id: ask.id, title: ask.title, include_subpages: includeSubpages });
   }
 
   // Named rather than an inline `async` handler: `onPickTemplate` is typed
@@ -438,9 +459,15 @@ export function DocTree() {
               (rowLink(treeRef.current, id)?.contains(e.activatorEvent.target as Node) ?? false);
             dropped.set(d);
             endDrag();
-            // No projection: a drop in place, a no-op or outside the tree.
+            // No projection: a drop in place, a no-op, outside the tree, or
+            // after less than one INDENT of travel.
             if (d) move.mutate({ id, body: d.projection.args });
-            else if (opens) void nav(`/doc/${id}`);
+            else if (opens) {
+              // As the link would, it replaces the history entry when the
+              // page is already open.
+              const path = `/doc/${id}`;
+              void nav(path, { replace: location.pathname === path });
+            }
           }}
           onDragCancel={endDrag}
         >
@@ -473,10 +500,10 @@ export function DocTree() {
         <DuplicateDialog
           title={dupAsk.title}
           subpages={dupAsk.subpages}
-          pending={duplicating}
+          pending={copying.has(dupAsk.id)}
           error={dupError}
           onCancel={() => closeDuplicate(dupAsk.id)}
-          onConfirm={(include) => confirmDuplicate(dupAsk.id, include)}
+          onConfirm={(include) => confirmDuplicate(dupAsk, include)}
         />
       )}
       <SidebarVersion />
@@ -628,12 +655,13 @@ function pointOf(e: Event): Point | null {
 }
 
 /** Tells a click from a drag. A click whose pointer slips past 6px (mouse),
- *  or a tap held 250 ms (touch), starts a drag; it is still a click when the
- *  pointer travels less than one INDENT along its whole path: from the
- *  press, through every position the drag reports, to the release. Not
- *  when a modifier key or another button was pressed (the browser opens a
- *  link in a new tab or window then), nor when a context menu opened on the
- *  way (a long press opens the row menu on touch). */
+ *  or a tap held 250 ms (touch), starts a drag; until the pointer has
+ *  travelled one INDENT along its whole path (from the press, through every
+ *  position the drag reports, to the release) the drag is short, and a
+ *  drop moves nothing. A short drag is a click, unless a modifier key or
+ *  another button was pressed (the browser opens a link in a new tab or
+ *  window then), or a context menu opened on the way (a long press opens
+ *  the row menu on touch). */
 function slipTracker() {
   const events = ["mouseup", "touchend", "contextmenu"] as const;
   let press: Point | null = null;
@@ -654,6 +682,8 @@ function slipTracker() {
   function stop() {
     for (const type of events) window.removeEventListener(type, seen, { capture: true });
   }
+  // Short only for a press it saw: without one it can't measure.
+  const isShort = () => press !== null && travel < INDENT;
   return {
     /** At drag start, with the press that started it. */
     start(e: Event) {
@@ -670,9 +700,12 @@ function slipTracker() {
     moved(delta: Point) {
       if (press) to({ x: press.x + delta.x, y: press.y + delta.y });
     },
+    /** The pointer has travelled less than one INDENT so far: a drop moves
+     *  nothing. */
+    isShort,
     /** At drag end, once the release has been seen. */
     isClick(): boolean {
-      return press !== null && plain && !menu && travel < INDENT;
+      return isShort() && plain && !menu;
     },
     stop,
   };

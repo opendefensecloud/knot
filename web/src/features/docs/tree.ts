@@ -225,11 +225,14 @@ function anchored(m: Moving, g: number, depth: number, parent: string | null): M
 }
 
 /** Where a move puts the page among `sibs`, its new siblings without it:
- *  right after `after_id`, at `before_id`'s place, or last. */
+ *  right after `after_id`, at `before_id`'s place, or last. An anchor that
+ *  isn't among `sibs` counts as none, so the page goes last, as
+ *  applyOptimisticMove puts it. */
 export function insertIndex(sibs: readonly string[], args: MoveArgs): number {
-  return args.after_id !== undefined ? sibs.indexOf(args.after_id) + 1
-    : args.before_id !== undefined ? sibs.indexOf(args.before_id)
-    : sibs.length;
+  const anchor = args.after_id ?? args.before_id;
+  const at = anchor === undefined ? -1 : sibs.indexOf(anchor);
+  if (at < 0) return sibs.length;
+  return args.after_id !== undefined ? at + 1 : at;
 }
 
 /** The move keeps the page's real parent and its place among its real siblings. */

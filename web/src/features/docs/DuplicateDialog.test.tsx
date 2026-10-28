@@ -74,15 +74,22 @@ type ServerOpts = {
   reply?: Reply;
   /** Duplicates are answered once this resolves. */
   gate?: Promise<void>;
+  /** A duplicate of the page with this id is answered once its promise
+   *  resolves, instead of `gate`. */
+  gates?: Record<string, Promise<void>>;
+  /** The ids of the copies, in the order they are asked for; "copy" for
+   *  any past the list. */
+  copyIds?: string[];
   /** Every GET /api/docs after the first is answered once this resolves. */
   relistGate?: Promise<void>;
   /** The copy is stored even when the answer is `reply`'s error. */
   stored?: boolean;
 };
 
-function server({ role = "editor", reply, gate, relistGate, stored }: ServerOpts = {}) {
+function server({ role = "editor", reply, gate, gates, copyIds = [], relistGate, stored }: ServerOpts = {}) {
   let pages = PAGES;
   let listed = 0;
+  let copies = 0;
   return vi.fn((url: string, init?: RequestInit) => {
     if (url === "/auth/session") {
       return json({ user_id: "u1", email: "a@x.test", display_name: "A", workspace_id: "w1", role });
@@ -97,9 +104,11 @@ function server({ role = "editor", reply, gate, relistGate, stored }: ServerOpts
     }
     const dup = /^\/api\/docs\/([^/]+)\/duplicate$/.exec(url);
     if (dup && init?.method === "POST") {
-      return (gate ?? Promise.resolve()).then(() => {
+      const id = copyIds[copies] ?? "copy";
+      copies += 1;
+      return (gates?.[dup[1]!] ?? gate ?? Promise.resolve()).then(() => {
         const src = pages.find((p) => p.id === dup[1])!;
-        const copy = { id: "copy", title: `${src.title} (copy)`, parent_id: src.parent_id, sort_key: `${src.sort_key}m` };
+        const copy = { id, title: `${src.title} (copy)`, parent_id: src.parent_id, sort_key: `${src.sort_key}m` };
         if (!reply || stored) pages = [...pages, copy];
         if (reply === "network") throw new TypeError("Failed to fetch");
         if (reply) return response({ error: { code: reply.code, message: reply.code, details: {} } }, reply.status);
@@ -229,6 +238,25 @@ describe("Duplicate without subpages", () => {
     await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("/doc/copy"));
     expect(within(row).queryByText("Duplicating…")).toBeNull();
     expect(duplicates(fetchMock)).toEqual([{ id: "notes", body: { include_subpages: false } }]);
+  });
+
+  // The live region speaks only when its text changes: left as it was, a
+  // second copy of the same page would go unheard.
+  it.each<[string, Reply | undefined]>([
+    ["is made", undefined],
+    ["fails", { status: 500, code: "internal" }],
+  ])("clears “Duplicating…” from the live region once the copy %s", async (_how, reply) => {
+    renderTree(server({ reply, copyIds: ["copy", "copy-2"] }));
+    await editorRows();
+    const live = screen.getByTestId("tree-live");
+
+    chooseDuplicate("notes");
+    expect(live).toHaveTextContent("Duplicating “Meeting notes”…");
+    await waitFor(() => expect(live.textContent).toBe(""));
+
+    chooseDuplicate("notes");
+    expect(live).toHaveTextContent("Duplicating “Meeting notes”…");
+    await waitFor(() => expect(live.textContent).toBe(""));
   });
 });
 
@@ -378,6 +406,40 @@ describe("the Duplicate dialog", () => {
 
     await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("/doc/copy"));
     expect(duplicates(fetchMock)).toHaveLength(1);
+  });
+});
+
+// Both ways to Duplicate… follow one rule: only a page's own copy holds up
+// another copy of that page.
+describe("copies of two pages at once", () => {
+  it("opens another page's dialog ready, and keeps it open when the first copy is made", async () => {
+    const notes = deferred();
+    const fetchMock = server({ gates: { notes: notes.promise }, copyIds: ["copy-notes", "copy-plan"] });
+    renderTree(fetchMock);
+    await editorRows();
+
+    chooseDuplicate("notes");
+    expect(await within(screen.getByTestId("tree-row-notes")).findByText("Duplicating…")).toBeInTheDocument();
+    chooseDuplicate("plan");
+    const dialog = screen.getByRole("dialog", { name: "Duplicate “Q4 planning”" });
+    const ok = within(dialog).getByRole("button", { name: "Duplicate" });
+    expect(ok).toHaveAttribute("aria-disabled", "false");
+
+    // The first copy is made while the dialog is open: it shows in the
+    // list, and the app stays where it is, dialog and all.
+    notes.resolve();
+    expect(await screen.findByTestId("doc-row-copy-notes")).toBeInTheDocument();
+    await settle();
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+    expect(screen.getByRole("dialog")).toBe(dialog);
+
+    fireEvent.click(ok);
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("/doc/copy-plan"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(duplicates(fetchMock)).toEqual([
+      { id: "notes", body: { include_subpages: false } },
+      { id: "plan", body: { include_subpages: false } },
+    ]);
   });
 });
 

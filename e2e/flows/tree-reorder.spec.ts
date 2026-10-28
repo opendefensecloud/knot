@@ -89,7 +89,7 @@ test("un-nest: drag B (under A) onto the bottom quarter of C and one level left 
 
   // Below C, B would keep its depth and nest under C; one level left puts
   // it next to C instead.
-  await dragRow(page, B, { id: C }, { zone: "below", dx: -INDENT });
+  await dragRow(page, B, { id: C }, { zone: "below", dx: -(INDENT + 2) });
 
   await expect.poll(() => outline(page.request)).toEqual(["A", "C", "B"]);
   await assertAllVisible(page, [A, B, C]);

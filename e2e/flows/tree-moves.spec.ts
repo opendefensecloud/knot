@@ -39,7 +39,7 @@ test("un_nest_last_child_of_last_root_by_dragging_left", async ({ page }) => {
 
   // C is the sidebar's last row: there is no row after R's subtree to drop
   // it on. One level left on its own row puts it right after R.
-  await dragRow(page, C, { id: C }, { zone: "below", dx: -INDENT });
+  await dragRow(page, C, { id: C }, { zone: "below", dx: -(INDENT + 2) });
 
   await expect.poll(() => outline(page.request)).toEqual(["A", "R", "C"]);
 });
@@ -51,7 +51,7 @@ test("nest_by_dragging_right", async ({ page }) => {
   expect(await outline(page.request)).toEqual(["A", "B"]);
 
   // One level right on its own row: B becomes the subpage of A, the page above.
-  await dragRow(page, B, { id: B }, { zone: "below", dx: INDENT });
+  await dragRow(page, B, { id: B }, { zone: "below", dx: INDENT + 2 });
 
   await expect.poll(() => outline(page.request)).toEqual(["A", "A/B"]);
 });
@@ -209,6 +209,43 @@ test("a_click_that_slips_sideways_opens_the_page", async ({ page }) => {
   expect(await outline(page.request)).toEqual(["A", "A/A1", "B"]);
 });
 
+// Collision is by pointer: a click pressed at the top edge of B's row that
+// slips a few px up is in the middle of A's row, which nests B. A drop
+// after less than one INDENT of travel moves nothing, and opens the page as
+// the click would (ruling F6).
+test("a_click_that_slips_up_into_the_row_above_opens_the_page", async ({ page }) => {
+  await setupOwner(page);
+  const { A, B } = await seedPages(page.request, [{ title: "A" }, { title: "B" }]);
+  let loads = 0;
+  page.on("load", () => loads++);
+  await showTree(page, [A, B], `/doc/${A}`);
+  const moves = watchMoves(page);
+
+  const link = await page.getByTestId(`doc-row-${B}`).boundingBox();
+  const above = await page.getByTestId(`tree-row-${A}`).boundingBox();
+  if (!link || !above) throw new Error("not laid out");
+  const x = link.x + 30;
+  // 1px into B's link, and up to A's middle band, which reaches down to
+  // three quarters of the row: past the 6px that start a drag, short of
+  // one INDENT.
+  const from = link.y + 1;
+  const to = above.y + above.height * 0.7;
+  expect(from - to).toBeGreaterThan(6);
+  expect(from - to).toBeLessThan(INDENT);
+  await page.mouse.move(x, from);
+  await page.mouse.down();
+  await page.mouse.move(x, to, { steps: 4 });
+  await expect(page.getByTestId(`tree-row-${B}`)).toHaveCSS("opacity", "0.5"); // dragging
+  await expect(page.locator("[data-testid^='tree-row-'][data-drop-zone]")).toHaveCount(0);
+  await page.mouse.up();
+  await expect(page).toHaveURL(new RegExp(`/doc/${B}$`));
+
+  await roundTrip(page);
+  expect(moves).toEqual([]);
+  expect(loads).toBe(1);
+  expect(await outline(page.request)).toEqual(["A", "B"]);
+});
+
 test("drop_outside_cancels", async ({ page }) => {
   await setupOwner(page);
   const { A, B, C } = await seedPages(page.request, [{ title: "A" }, { title: "B" }, { title: "C" }]);
@@ -248,7 +285,7 @@ test("both_rows_render_after_moves", async ({ page }) => {
   await expect(page.getByTestId(`doc-row-${Parent}`)).toBeVisible();
   await expect(page.getByTestId(`doc-row-${Child}`)).toBeVisible();
 
-  await dragRow(page, Child, { id: Child }, { zone: "below", dx: -INDENT });
+  await dragRow(page, Child, { id: Child }, { zone: "below", dx: -(INDENT + 2) });
   await expect.poll(() => outline(page.request)).toEqual(["Parent", "Child"]);
   await expect(rows).toHaveCount(2);
   await expect(page.getByTestId(`doc-row-${Parent}`)).toBeVisible();

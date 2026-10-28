@@ -1,7 +1,7 @@
 import type { Active, Over } from "@dnd-kit/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigationType } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SessionProvider } from "../../auth/SessionContext";
@@ -103,18 +103,23 @@ async function settle() {
   await act(() => new Promise((r) => setTimeout(r, 30)));
 }
 
-/** Where the router is: a click that reaches a row link navigates there. */
+/** Where the router is: a click that reaches a row link navigates there.
+ *  `data-navigation` says how it got there: PUSH, REPLACE or POP. */
 function Location() {
-  return <output data-testid="location">{useLocation().pathname}</output>;
+  return (
+    <output data-testid="location" data-navigation={useNavigationType()}>
+      {useLocation().pathname}
+    </output>
+  );
 }
 
-function renderTree(role: "owner" | "editor" | "viewer" = "editor", pages = NESTED) {
+function renderTree(role: "owner" | "editor" | "viewer" = "editor", pages = NESTED, at = "/") {
   const fetchMock = server(role, pages);
   vi.stubGlobal("fetch", fetchMock);
   render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
       <SessionProvider>
-        <MemoryRouter>
+        <MemoryRouter initialEntries={[at]}>
           <DocTree />
           <Location />
         </MemoryRouter>
@@ -469,10 +474,12 @@ describe("DocTree — a click that slips", () => {
     expect(screen.getByTestId("location")).toHaveTextContent(`/doc/${id}`);
   });
 
+  // INDENT + 2, not INDENT: a drag of exactly one INDENT sits on the
+  // boundary of Math.trunc(deltaX / INDENT).
   it.each([
-    ["right still nests", "beta", 70, INDENT, { parent_id: "alpha", after_id: "alpha1" }],
-    ["left still un-nests", "alpha1", 42, -INDENT, { parent_id: null, after_id: "alpha" }],
-  ])("a drag one INDENT %s", async (_how, id, y, dx, body) => {
+    ["right still nests", "beta", 70, INDENT + 2, { parent_id: "alpha", after_id: "alpha1" }],
+    ["left still un-nests", "alpha1", 42, -(INDENT + 2), { parent_id: null, after_id: "alpha" }],
+  ])("a drag just past one INDENT %s", async (_how, id, y, dx, body) => {
     const fetchMock = renderTree("editor", SIBLINGS);
     await editorRows(SIBLINGS.length);
     layOut();
@@ -486,6 +493,48 @@ describe("DocTree — a click that slips", () => {
 
     await waitFor(() => expect(moves(fetchMock)).toEqual([{ id, body }]));
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+  });
+
+  // Collision is by pointer: pressed at the top edge of Beta (56-84), 8px up
+  // is in the middle band of Alpha one (28-56), which nests. On main that
+  // did nothing, and a drop after less than one INDENT of travel moves
+  // nothing (ruling F6): no drop line shows, and it is a click.
+  it("a click that slips 8px up into the row above moves nothing and opens the page", async () => {
+    const fetchMock = renderTree("editor", SIBLINGS);
+    await editorRows(SIBLINGS.length);
+    layOut();
+
+    // 4px, then 7px: the drag starts; then 8px, to y=49.
+    const link = mouseDrag("beta", 57, [[0, -4], [0, -7], [0, -8]]);
+    expect(screen.getByTestId("tree-row-beta")).toHaveStyle({ opacity: "0.5" }); // dragging
+    expect(document.querySelector("[data-drop-zone]")).toBeNull();
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 49 });
+    expect(fireEvent.click(link)).toBe(false);
+
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+    expect(screen.getByTestId("location")).toHaveTextContent("/doc/beta");
+  });
+
+  // As react-router's Link does: going where the app already is replaces the
+  // history entry, so Back doesn't stay on the same page.
+  it("a slipped click on the page that is open replaces its history entry", async () => {
+    renderTree("editor", SIBLINGS, "/doc/beta");
+    await editorRows(SIBLINGS.length);
+    layOut();
+    const location = screen.getByTestId("location");
+
+    mouseDrag("beta", 70, [[4, 0], [7, 1], [7, 2]]);
+    fireEvent.mouseUp(document, { clientX: 107, clientY: 72 });
+    await settle();
+    expect(location).toHaveTextContent("/doc/beta");
+    expect(location).toHaveAttribute("data-navigation", "REPLACE");
+
+    mouseDrag("alpha1", 42, [[-4, 0], [-7, 1], [-7, 2]]);
+    fireEvent.mouseUp(document, { clientX: 93, clientY: 44 });
+    await settle();
+    expect(location).toHaveTextContent("/doc/alpha1");
+    expect(location).toHaveAttribute("data-navigation", "PUSH");
   });
 
   // Travel is the whole path, not how far from the press it ends.
