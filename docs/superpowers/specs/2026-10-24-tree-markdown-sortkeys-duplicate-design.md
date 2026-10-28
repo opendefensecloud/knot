@@ -1,9 +1,12 @@
 # Markdown lists, sort keys, sidebar drag and drop, and Duplicate: design
 
 **Date:** 2026-10-24
-**Status:** Draft (brainstorm), awaiting approval
+**Status:** Approved (brainstorm)
 **Origin:** PR #42 by @szEvEz. It reports these four problems and proposes partial fixes. We are not merging it, because its commit signature is unverified and the author hasn't responded. This is our own reimplementation, and its PR credits the report.
-**Mockup (Duplicate, approved):** https://claude.ai/artifact/7DugWgaahZQUHmKv42A4mQ
+**Mockup (Duplicate, approved):**
+[`2026-10-24-duplicate-mockup.html`](2026-10-24-duplicate-mockup.html).
+(Amended in Task F5; this first linked a private copy of the same mockup on
+claude.ai.)
 
 ## Intent
 
@@ -285,12 +288,22 @@ Image and HTML were missed.
 - **Placement in the store, in one transaction.**
   - `DocStore::create_placed` and `move_placed` take
     `Placement::{First, Last, After(id), Before(id)}`.
-  - They lock the sibling group: the parent row `FOR UPDATE`, or a
-    transaction-scoped advisory lock per workspace for the top level.
+  - They lock the sibling group: the parent row `FOR NO KEY UPDATE`, or a
+    transaction-scoped advisory lock per workspace for the top level. A move
+    locks the target parent and the moved page together. (Amended in
+    Task 10; this first read the parent row `FOR UPDATE`. With the
+    deferrable constraint below, neither `parent_id` nor `sort_key` is a key
+    column, so `FOR NO KEY UPDATE` is enough.)
+  - A move into a page first takes a per-workspace move lock, so two
+    concurrent moves can't both pass their cycle check and leave pages in a
+    parent cycle. (Amended in Task F2.)
   - They read siblings, archived included, inside the transaction.
   - On `KeyError`, or a key over 64 characters, they **rebalance the
-    group** with `spread`, in two steps because UNIQUE is not deferrable. Then
-    they generate again.
+    group** with `spread`, in one `UPDATE` statement: the unique constraint
+    is `DEFERRABLE INITIALLY IMMEDIATE`, so it is checked at the end of that
+    statement, and keys may repeat while it runs. Then they generate again.
+    (Amended in Task 10; this first read "in two steps because UNIQUE is not
+    deferrable".)
   - Routes (create, move, from-template, restore, import) use these.
 - **Heal migration** (`migrations/20261024120000_heal_sort_keys.sql`, in the
   `heal_doc_cycles` style):
@@ -304,7 +317,8 @@ Image and HTML were missed.
     Task 9; this first read `sort_key COLLATE "C", created_at, id`.)
   - Archived rows are included. It is idempotent and a no-op on healthy data.
   - Then it swaps the constraint to `UNIQUE NULLS NOT DISTINCT (workspace_id,
-    parent_id, sort_key)`.
+    parent_id, sort_key) DEFERRABLE INITIALLY IMMEDIATE`. (Amended in Task 9;
+    this first had no `DEFERRABLE`.)
   - Sibling and list queries add `id` as a final tie-breaker.
 - **Workspace import** ignores manifest keys. It assigns fresh keys in the
   manifest's per-parent order.
@@ -319,7 +333,12 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
   `{ depth, args } | null`.
   - Vertical position picks the gap.
   - `deltaX / INDENT` (shared constant, 12px) picks the depth, clamped between
-    the next row's depth and the previous row's depth + 1.
+    the next row's depth and the previous row's depth + 1. It is truncated
+    toward zero (`Math.trunc`), so a level takes a full INDENT of sideways
+    movement, and the slip that starts a drag during a click (the mouse
+    sensor starts a drag past 6px of travel) can't change the level. (Amended
+    in Task F4; Task 13 first rounded, which made a 7px slip nest or un-nest
+    the page.)
   - Hovering one's own row means "same gap, new depth" (un-nest in place).
   - It returns `null` for no-ops.
 - `keyboardMove(flat, id, "up" | "down" | "indent" | "outdent")` and
@@ -336,6 +355,12 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
     changes.
   - The post-drag click is suppressed only after pointer drags, only inside
     the tree.
+  - A drag that ends with no move, after less than one INDENT of pointer
+    travel, counts as a click: a plain press on a row's link opens that page
+    in the app (no reload, no move request). On touch this applies after the
+    250ms hold. A longer drag that moves nothing opens nothing. (Amended in
+    Task F4: the browser sends no click after a drag, so the drag's end
+    opens the page.)
   - No-op drops send nothing.
   - Dropping outside the tree cancels.
   - Custom drag announcements use titles.
@@ -407,16 +432,31 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
     idle-transaction limit.
   - **Cleanup:** copied S3 objects are recorded first. A detached cleanup task
     removes them if the transaction doesn't commit, so a dropped request can't
-    orphan them.
+    orphan them. (Amended in Task 17: they are recorded in the table
+    `blob_copy_pending`, committed before the first copy, and the hourly
+    purge job removes those whose copy never committed once they are an hour
+    old. Nothing is deleted on the request path, so a copy whose commit
+    answer was lost keeps its files.)
+  - **Concurrency:** a server runs two duplicates at a time. A request that
+    gets no slot within 5 s answers `503 doc.duplicate_busy` with
+    `Retry-After: 5`. The answer comes once the copy commits; the refresh of
+    the copies' derived data runs after it, still holding the slot.
+    (Amended in Task F3.)
 
 ## Compatibility guarantees (deliverable)
 
 1. **Markdown differential harness.**
    - **Frozen reference.** Today's `to_markdown.rs` and `from_markdown.rs`
      are frozen as test-only reference copies (`crates/knot-markdown/tests/legacy/`).
+     (Amended in Task 1, per the plan's P20: they live in
+     `crates/knot-markdown/src/legacy/`, behind the `legacy-compat` feature,
+     so the server's real-data check can use them. Production builds don't
+     enable it.)
    - **Corpus:**
      - all fixtures;
-     - all probe cases, copied into the repo as fixtures;
+     - all probe cases, copied into the repo as fixtures (amended in Task 1,
+       per P21: as `crates/knot-markdown/tests/probes/*.md`, used only by
+       the harness, since every fixture must round-trip byte for byte);
      - a generated set of documents: combinations of every node and mark,
        nesting up to 4, editor-shaped attributes (link `target`/`rel`/`class`,
        table `colwidth`/`colspan`, Bool `checked`, `{}` marks) and
@@ -437,12 +477,28 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
      schema-valid and legacy-exports to a fixed point, the new import is
      identical under a normaliser comparing tags, attribute values as strings,
      text, and mark keys *and* values. Only named bug classes may differ.
+   - **Depth limit.** The writer and the importer follow a page at most 128
+     block containers deep (blockquotes, list items, table cells:
+     `knot_crdt::nesting::MAX_BLOCK_DEPTH`, the writer's `MAX_DEPTH`). The
+     writer writes a deeper blockquote, list or table as one paragraph of
+     its text, in order, and the importer stores such Markdown the same way.
+     So a page nested thousands of levels deep, which aborted the server on
+     main too, can't overflow the stack in a walk of the writer or the
+     importer, and no text is lost. Rooms refuse an update that nests a
+     page's types past `MAX_NESTING` (4 × 128). The named class
+     `depth_limit`, for exports and for imports, covers every document and
+     input the limit changes. It is checked before the other classes and
+     before legacy, which recurse once per element. (Amended in Task F1.)
 2. **Real-data check (opt-in).**
    - It runs the old and new serializers over every page in a database:
      `cargo test -p knot-server --test markdown_compat -- --ignored`, with
      `KNOT_COMPAT_DATABASE_URL` set.
    - It is read-only, with no migrations. It reports pages whose output would
      change, by class, with diffs.
+   - It fails on a page whose export changes and would lose text, or whose
+     new export fails. It lists, reported only, the pages past the depth
+     limit and the pages whose types nest past `MAX_NESTING`. (Amended in
+     Task F1.)
    - It's for running against a restored backup or staging copy before
      deploying.
 3. **Sort keys.**
@@ -462,22 +518,42 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
      node per index): texts, indexes and states are identical.
    - **All other pages:** these are the only ones allowed to change, and the
      lockstep property must hold for them.
-5. **Moves.** Every gesture that was reachable before lands the page in the
-   **same final position** as before. The unit table compares resulting
-   orders, not request bodies.
+5. **Moves.** Same-depth reorders and "into" are gesture-identical to main:
+   each such gesture that was reachable before lands the page in the **same
+   final position** as before. The unit table compares resulting orders, not
+   request bodies.
    - "Into" still appends as the last child.
-   - Two intentional changes:
+   - Intentional changes:
      - the gap directly under an expanded parent now means "first child". It
        wasn't reachable before;
-     - a child dropped on the bottom gap of the next top-level page, without
-       moving left, now nests under that page: the drop depth follows the
-       pointer's x, and the drop line shows it before release. On main the
-       same release put it at the top level after that page, reached only by
-       luck of mouse speed (C.1). Moving one level left puts it there now.
-       (Ratified in Task 15.)
+     - **the general rule:** a before/after drop next to a row at another
+       depth keeps the dragged page's depth unless the pointer moves
+       sideways (one INDENT per level, clamped to the depths the gap
+       allows), and the drop line shows that depth before release. Main
+       took the hovered row's depth. Worked examples, pinned by
+       `tree.test.ts` ("projectDrop with no sideways move keeps the page's
+       depth next to rows at other depths"), both dragged straight up or
+       down:
+       - in `A ─ A1 ; B ; C`, A1 dropped on C's top gap nests under B
+         (`{parent_id: "B"}`). Main put it at the top level, before C;
+       - in `A ─ A1 ─ A1a ; B ; X`, X dropped on A1a's bottom gap goes to
+         the top level, after A (`{parent_id: null, after_id: "A"}`). Main
+         made it a sibling of A1a, after it.
+
+       Task 15's un-nest case is one instance of the rule: a child dropped
+       on the bottom gap of the next top-level page, without moving left,
+       nests under that page, where main put it at the top level after that
+       page (reached only by luck of mouse speed, C.1). Moving one level
+       left puts it there now. (Ratified in Task 15; amended in Task F5,
+       after the final review found the rule general and not one case: this
+       first listed only that case and the gap under an expanded parent.)
 6. **Existing suites stay green unchanged:** all Rust, web and e2e tests. Any
    change to an existing test must be justified in the PR as a bug the old
-   test encoded.
+   test encoded, or as a mechanical adaptation (the plan's P6 lists them).
+   Tests of code this PR removes are removed with it: main's
+   `describe("dropIntent")` in `tree.test.ts` went with `dropIntent`, which
+   had no caller left, and `dropZone`'s tests probe the same geometry.
+   (Amended in Task 21a.)
 
 ## Testing (new coverage)
 
@@ -575,6 +651,12 @@ Each item fails on main (RED evidence in the PR) and passes after.
 - **Duplicate:** S3 copy implementation details.
 
 ## Prototypes and probes
+
+Historical: these were in a temporary session scratchpad, `pr42-probes/`,
+not part of the repo. The probe inputs are in the repo as
+`crates/knot-markdown/tests/probes/*.md` (the plan's P21), and the paths
+below are kept only as a record of what was prototyped. (Amended in
+Task F5.)
 
 All in the session scratchpad, `pr42-probes/`. The scratchpad is temporary,
 so copy the probe cases into the repo as fixtures:

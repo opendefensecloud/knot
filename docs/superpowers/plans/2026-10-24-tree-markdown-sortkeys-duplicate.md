@@ -22,7 +22,7 @@
 
 **Tech Stack:** Rust (yrs 0.27.3, sqlx, axum), Postgres 18, React + dnd-kit core 6.3.1, Vitest, Playwright.
 
-**Spec:** `docs/superpowers/specs/2026-10-24-tree-markdown-sortkeys-duplicate-design.md`. Read it before any task, together with the "Planning decisions" section below. Problem ids (A1–A12, B1–B6, C1–C9, D) refer to the spec. Prototype paths below are absolute; they are reference material to port, never code to copy blindly.
+**Spec:** `docs/superpowers/specs/2026-10-24-tree-markdown-sortkeys-duplicate-design.md`. Read it before any task, together with the "Planning decisions" section below. Problem ids (A1–A12, B1–B6, C1–C9, D) refer to the spec. Prototype paths below are historical: they point into a temporary session scratchpad (`pr42-probes/`), not part of the repo. They were reference material to port, never code to copy blindly. The probe inputs that matter are in the repo as `crates/knot-markdown/tests/probes/*.md` (P21). (Amended in Task F5.)
 
 ## Global Constraints
 
@@ -102,6 +102,9 @@
   - `docs_integration.rs` `move_with_unknown_anchor_falls_to_end`: asserts `422 doc.bad_anchor` (Task 10).
   - `e2e/flows/tree-reorder.spec.ts` is rewritten, and `e2e/flows/tree-dnd.spec.ts` deleted (Task 15). They encoded the bug: a teleported pointer, and "no toast" as the only check.
   - `e2e/flows/sidebar-resize.spec.ts` (Task 13, amended during execution): `:215` waits for `[data-testid^='tree-row-']` instead of `li[role='button']`, which Task 13 removes (C.7), and `:227`'s target selector gains `[data-testid^='tree-row-']`, so the row div, still a drag target, keeps counting for the WCAG 2.5.8 clearance check. The test encoded the `role="button"` misuse. The comment at `DocTree.archive.test.tsx:113` is reworded only (it no longer names a dnd-kit sortable or keyboard sensor).
+  - `crates/knot-storage/tests/migrations_apply.rs` `migrations_apply_cleanly` (Task 17, amended during execution): its exact table list gains the table of each plan-mandated migration, `blob_copy_pending` (P16, Task 17) and `doc_markdown_sweep_attempts` (Task F1). The change is mechanical.
+  - `crates/knot-server/src/ws_writer.rs` in-module tests (Task F1, amended during execution): the shared `start()` harness passes `run`'s two new tokens, `refused` and `room_ended`. A mechanical API adaptation; no existing test's assertion changes.
+  - `web/src/features/docs/tree.test.ts` (Task 21a, amended during execution): main's `describe("dropIntent")` (three cases) is removed with `dropIntent`, which had no caller left. A test of code this PR removes goes with it, and `dropZone`'s tests probe the same rect at the same three points. `descendantIds` and `moveArgs`, also without a production caller, move unchanged into the test-only `tree.legacy.ts`, which the test now imports them from; their own tests are unchanged. The comment-only rewording in `web/src/components/ContextMenu.test.tsx` (Task 13, P10) changes no assertion.
   - These insert duplicate top-level keys and switch to distinct keys (Task 9):
     - `knot-storage/tests/documents.rs` `templates_flow_set_and_list`;
     - `shares_integration.rs` `cross_doc_revoke_returns_404_and_token_stays_valid` and `public_board_svg_404_for_cross_doc_board`;
@@ -115,7 +118,7 @@
     2. the heal;
     3. `DROP CONSTRAINT IF EXISTS documents_sort_key_unique`;
     4. `ADD CONSTRAINT documents_sort_key_unique UNIQUE NULLS NOT DISTINCT (workspace_id, parent_id, sort_key) DEFERRABLE INITIALLY IMMEDIATE`.
-  - Its helper is `CREATE OR REPLACE FUNCTION pg_temp.knot_spread_key(...)`. It is always called qualified, and dropped at the end, so re-running the file is a no-op.
+  - Its helper is `CREATE OR REPLACE FUNCTION knot_heal_spread_key(...)`, an ordinary function in the current schema. It is dropped at the end of the same migration, so re-running the file is a no-op and leaves no function behind. (Amended in Task F2; this first read `pg_temp.knot_spread_key`, always called qualified. Creating anything in `pg_temp` needs the database's TEMPORARY privilege, which a hardened database may revoke from the migration user; an ordinary function needs only the CREATE right the Helm chart already asks for.)
   - **What users see:** the sidebar re-sorts siblings on the client by code-unit comparison (`web/src/features/docs/tree.ts:40-42`), which is `COLLATE "C"` order.
   - **The heal** ranks rows by `sort_key COLLATE "C", parent_id NULLS FIRST, created_at, id`, which is exactly the order users see: `list_alive` orders `parent_id NULLS FIRST`, so the sidebar lists top-level pages before template children, and `buildTree`'s stable sort by key keeps that order on a key tie. `parent_id` is the same within a group, so it only decides between the groups of a root list. (Amended in Task 9 from `sort_key COLLATE "C", created_at, id`; Task 7's real-data `SELECT` uses the same order.) A group is healed when any key is invalid, duplicated, or longer than 64 characters.
   - **Root list.** The sidebar shows the children of templates at the root, sorted together with the top-level pages (`buildTree`, `tree.ts:9-17`).
@@ -138,6 +141,7 @@
     - at the top level: the advisory lock, then the moved doc `FOR NO KEY UPDATE`.
 
     Then the cycle check. Two moves that swap nesting (D into P, P into D) therefore serialize: one succeeds and the other gets `409 doc.move_cycle`, with no deadlock. `FOR NO KEY UPDATE` is enough for the moved row: with the deferrable constraint, neither `parent_id` nor `sort_key` is a key column. It still conflicts with archive's `FOR UPDATE`.
+  - **Move lock.** A move into a parent first takes `pg_advisory_xact_lock(MOVE_LOCK, hashtext(workspace_id::text))`, as the first statement of its transaction, before the locks above. Moves into a parent therefore run one at a time per workspace, and each cycle check sees every such move committed before it: two moves on disjoint rows (A into B, C into D, where C is B's parent and A is D's parent) could otherwise both pass their check and commit the cycle A→B→C→D→A. A move to the top level can't close a cycle and skips it. A waiter on the move lock holds no lock, so the lock order (move lock, top-level lock, row locks) adds no deadlock. Every recursive walk over `parent_id` in `knot-storage` also ends on a cycle (`UNION`, or a guard). (Amended in Task F2.)
   - **Restore:** when the doc may move to the top level (`expected_parent.is_some()`), it takes `lock_group(None)` first, before its parent lock (`doc_store.rs:547`). Taking it again inside `place` is a no-op.
   - **Safety net:** `create_placed`, `move_placed`, restore and `apply_duplicate` retry the whole transaction once on SQLSTATE `40P01` (deadlock detected). One example is archive's single stamping `UPDATE` racing a rebalance inside the subtree being archived.
   - The existing explicit-key `create(ws, parent, title, sort_key, user)` and `move_to(.., sort_key)` stay exactly as they are, for the tests that call them. Routes stop using them.
@@ -151,6 +155,8 @@
     3. **Anchors** only from *real* siblings (docs whose real `parent_id` equals the projected parent): the nearest real sibling before the position gives `after_id`; otherwise the nearest after gives `before_id`; otherwise no anchor (Last).
     4. **No-op:** same real parent and same position among real siblings → `null`.
   - `FlatRow.parentId` is the *rendered* parent. A template's child shows at the root with `parentId: null`. Real parents come from `docs`.
+  - **`depthDelta = Math.trunc(deltaX / INDENT)`:** a level takes a full INDENT of sideways movement, so the slip that starts a drag during a click (MouseSensor starts past 6 px, P9) can't change the level. A drag that ends with no move after less than one INDENT of total pointer travel counts as a click: a plain press on a row's link opens that page with an in-app navigation, with no move request. A longer drag that moves nothing still swallows the click. On touch the same rule applies after the 250 ms hold. (Amended in Task F4, ruling web-1; Task 13 first used `Math.round`, so a 7 px slip during a click nested or un-nested the page and swallowed the click. The drag's end opens the page because Chromium dispatches no click after a drag.)
+  - **The gesture rule** that follows from the order above: a before/after drop next to a row at another depth keeps the dragged page's depth unless the pointer moves sideways; main took the hovered row's depth. Only same-depth reorders and "into" are gesture-identical to main. The spec's acceptance 5 states it with worked examples, and `tree.test.ts` pins it with `depthDelta` 0. (Amended in Task F5, ruling web-3.)
 - **P12. Move errors (Task 14).** `move.mutationFn` throws when the result is an error, so 409/422 roll back the optimistic update and show "Couldn't move". This lands in Task 14 because the menu moves added there are the first moves jsdom can drive.
 - **P13. DOM contracts kept for existing e2e:**
   - the inline `paddingLeft` on an ancestor of the row Link;
@@ -277,7 +283,7 @@ e2e/flows/{tree-helpers.ts (NEW), tree-reorder.spec.ts (rewritten), tree-moves.s
     - All of it sits behind `#[cfg(feature = "legacy-compat")] pub mod legacy;` in `lib.rs`.
   - `tests/common/{mod.rs,corpus.rs}`. `mod.rs` starts with `#![allow(dead_code)]`, as `crates/knot-export/tests/common/mod.rs:1` does.
   - `tests/compat.rs`.
-  - `tests/probes/*.md`: the 40 Markdown inputs of `/private/tmp/claude-501/-Users-christianhuening-code-odc-knot/33e5095c-5ecc-4688-b5a2-e58623055ffa/scratchpad/pr42-probes/shared/cases.rs`, one file per case, named after the case.
+  - `tests/probes/*.md`: the 40 Markdown inputs of the prototype's `pr42-probes/shared/cases.rs` (historical: a temporary session scratchpad, not part of the repo), one file per case, named after the case. They are now the in-repo record of those probes.
 - Modify:
   - `crates/knot-markdown/Cargo.toml`: `[features] legacy-compat = []` and a new `[dev-dependencies] knot-markdown = { path = ".", features = ["legacy-compat"] }`. Do not use `required-features`: it makes `--test compat` error or skip silently.
   - `tests/round_trip.rs`: add `round_trip_fixture_directory`, which reads every `tests/fixtures/*.md` sorted and asserts `serialise(parse(md)) == md`. The existing `round_trip_all_fixtures` stays.
@@ -316,7 +322,7 @@ e2e/flows/{tree-helpers.ts (NEW), tree-reorder.spec.ts (rewritten), tree-moves.s
 - Modify: `crates/knot-markdown/src/from_markdown.rs`, `src/legacy/compat.rs` (classes).
 - Create: fixture `tests/fixtures/list_breaks.md`, which must be a fixed point.
 - Test: `tests/import_lists.rs`.
-- Reference: `TightParagraphs` in `/private/tmp/claude-501/-Users-christianhuening-code-odc-knot/33e5095c-5ecc-4688-b5a2-e58623055ffa/scratchpad/pr42-probes/knot-markdown-fixed/src/from_markdown.rs` (around line 544).
+- Reference (historical: a temporary session scratchpad, not part of the repo): `TightParagraphs` in the prototype's `pr42-probes/knot-markdown-fixed/src/from_markdown.rs` (around line 544).
 
 **Interfaces:**
 - `parse` is unchanged.
@@ -565,7 +571,7 @@ e2e/flows/{tree-helpers.ts (NEW), tree-reorder.spec.ts (rewritten), tree-moves.s
   - `crates/knot-storage/src/lib.rs` (P5);
   - `crates/knot-storage/src/doc_store.rs:598` (`crate::sort_key_between`, P5).
 - Create: `crates/knot-server/tests/placement_integration.rs` (Task 10 adds to it).
-- Reference: `/private/tmp/claude-501/-Users-christianhuening-code-odc-knot/33e5095c-5ecc-4688-b5a2-e58623055ffa/scratchpad/pr42-probes/lexo/newimpl.rs`. Its `between(None, None)` returns `"i"`; special-case it to `"m"`.
+- Reference (historical: a temporary session scratchpad, not part of the repo): the prototype's `pr42-probes/lexo/newimpl.rs`. Its `between(None, None)` returns `"i"`; special-case it to `"m"`.
 
 **Interfaces:**
 - `pub enum KeyError { Invalid(String), Unordered }`, deriving `Debug, PartialEq, Eq, thiserror::Error`.
@@ -614,7 +620,7 @@ e2e/flows/{tree-helpers.ts (NEW), tree-reorder.spec.ts (rewritten), tree-moves.s
   - the duplicate-key tests in P6.
 - Test: `crates/knot-storage/tests/migrations_apply.rs`, using the `VERSION` pattern at 179-233 (apply up to the previous migration, seed, apply the rest).
 
-**Interfaces:** the migration and its `pg_temp.knot_spread_key(i, n)` implement `lexorank::spread`'s formula exactly.
+**Interfaces:** the migration and its `pg_temp.knot_spread_key(i, n)` implement `lexorank::spread`'s formula exactly. (Amended in Task F2: the helper is `knot_heal_spread_key(i, n)`, see P7.)
 
 - [ ] **Step 1: Write the failing tests:**
   - `heal_sort_keys_leaves_healthy_groups_untouched`: keys and `updated_at` byte for byte;
@@ -714,7 +720,7 @@ async fn move_placed(&self, ws: Uuid, doc_id: Uuid, actor: Uuid, parent: Option<
 
 **Files:**
 - Modify: `web/src/features/docs/tree.ts`, `tree.test.ts`; `DocTree.tsx` (import `countDescendants` from `tree.ts`).
-- Reference: `/private/tmp/claude-501/-Users-christianhuening-code-odc-knot/33e5095c-5ecc-4688-b5a2-e58623055ffa/scratchpad/pr42-probes/dnd/projection-proto.mts`. It has no `docs` argument, and its no-op assertion at line 52 (`"B","B","below",0` → `{parent_id:"A"}`) becomes `null`.
+- Reference (historical: a temporary session scratchpad, not part of the repo): the prototype's `pr42-probes/dnd/projection-proto.mts`. It has no `docs` argument, and its no-op assertion at line 52 (`"B","B","below",0` → `{parent_id:"A"}`) becomes `null`.
 
 **Interfaces:**
 
@@ -768,8 +774,8 @@ export function describeMove(flat: FlatRow[], id: string, args: MoveArgs): strin
   - `sensors = [MouseSensor, TouchSensor]` (P9).
   - A custom `collisionDetection` stores `args.pointerCoordinates` in a ref. It returns the row under the pointer, or the row with the closest vertical centre. It returns no collision when the pointer is outside the tree's rect, so a drop outside cancels.
   - `measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}`.
-  - `onDragMove` reads `pointerY` from that ref, takes `depthDelta = Math.round(delta.x / INDENT)`, calls `dropZone` + `projectDrop`, and sets state only when the projection changes.
-  - `onDragEnd` mutates only when the projection is non-null.
+  - `onDragMove` reads `pointerY` from that ref, takes `depthDelta = Math.round(delta.x / INDENT)`, calls `dropZone` + `projectDrop`, and sets state only when the projection changes. (Amended in Task F4: `Math.trunc`, see P11.)
+  - `onDragEnd` mutates only when the projection is non-null. (Amended in Task F4: with no projection after less than one INDENT of travel, it opens the pressed row's page as a click would, see P11.)
 - **Rows:**
   - The row `div` (`data-testid="tree-row-<id>"`) uses `useDraggable`'s `listeners` and `setNodeRef`, plus `useDroppable`. It does **not** spread `attributes`, so there is no `role="button"` and no extra tab stop.
   - The row `div` carries `data-drop-zone` and `data-drop-depth` while it is the drop target.

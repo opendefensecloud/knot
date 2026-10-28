@@ -9,7 +9,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ## [Unreleased]
 
 ### Upgrading
-- Four database migrations run on upgrade (the Helm chart's migrate hook
+- Five database migrations run on upgrade (the Helm chart's migrate hook
   applies them).
 - Everyone with an account sees the "knot was updated" card once after this
   upgrade. (#45)
@@ -26,6 +26,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   `409 doc.sort_key_conflict` when someone creates or moves a page, until
   they are replaced. Don't run workspace imports while the rollout is in
   progress. (#TBD)
+- On S3, when the bucket refused to delete an archived page's files (for
+  example because knot's credentials lack `s3:DeleteObject`), purging the
+  page deleted it anyway and left its files in the bucket. Now the purge
+  keeps the page and tries again on the next hourly run, so knot's S3
+  credentials need `s3:DeleteObject`. Until a purge gets through, "Delete
+  permanently" fails for that page and it can't be restored. (#TBD)
 - To see what the upgrade changes on your data before you roll it out, run
   the real-data compatibility check described in the Helm chart's README
   (Upgrading) against a restored backup or a staging copy. (#TBD)
@@ -54,7 +60,9 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   to copy them too. The copy gets its own drawings, images and files, so it
   keeps working if the original is archived, and links between the copied
   pages point at the copies. Up to 200 pages and 200 MB of files.
-  `POST /api/docs/{id}/duplicate`. (#TBD)
+  `POST /api/docs/{id}/duplicate`. A server makes two copies at a time; when
+  no slot frees up within five seconds, it answers `503 doc.duplicate_busy`
+  with `Retry-After`. (#TBD)
 - Move up, Move down, Indent and Outdent in the sidebar's page menu, and
   Alt with the arrow keys on a page in the sidebar, move pages without
   dragging. (#TBD)
@@ -76,12 +84,13 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   They used to accept it. (#TBD)
 
 ### Fixed
-- Markdown export failed for a page with a line break (Shift+Enter) in a
-  list item, and an image or drawing in a list item was lost. Search, share
-  links, zip export, My Tasks, history preview and restore, and new pages
-  from such a template failed on those pages. History restore, templates
-  and zip import turned a list item with a line break into such a page.
-  (#TBD)
+- A line break (Shift+Enter) in a list item exported fine until the page
+  went through a history restore, a template, or a Markdown or zip import.
+  From then on, and for any list item with a line break that a Markdown
+  import made, Markdown export failed for the page: search, share links,
+  zip export, My Tasks, history preview and restore, and new pages from it
+  as a template failed on it. An image or drawing in a list item was lost
+  the same way. (#TBD)
 - Nested checklists, list items and quotes with several paragraphs, images,
   rules or lists, checkboxes in numbered lists, and empty list items lost
   their shape or content on the way through Markdown (export, history
@@ -120,6 +129,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - Restoring a page whose top-level place was taken, or that was restored,
   moved and archived again at the same time, failed with an internal error.
   (#TBD)
+- Two pages moved at the same moment could end up nested inside each
+  other's subpages, in a loop. Moving or archiving one of them then hung a
+  database connection. Moves into a page now take turns, and moving or
+  archiving a page of such a loop finishes. (#TBD)
+- On S3, a file the bucket refused to hand out (a 403 or a server error)
+  was served as the bucket's error message instead of failing. (#TBD)
 
 Thanks to @szEvEz, whose #42 found these bugs and proposed the first fixes.
 
@@ -127,6 +142,15 @@ Thanks to @szEvEz, whose #42 found these bugs and proposed the first fixes.
 - A crafted workspace-import zip with pages that are each other's parent, or
   a very deep chain of parents, crashed the whole server for everyone. Any
   editor could upload one. The bug predates this release. (#TBD)
+- A page nested a few thousand levels deep, made with a crafted Markdown
+  upload or editor update, crashed the whole server for everyone when knot
+  exported it. Any editor could make one. Nesting is now capped: Markdown
+  and zip import, history restore and templates keep 128 levels of quotes,
+  list items and table cells and store anything deeper as one paragraph of
+  its text, a page already stored deeper exports its deep part in that
+  flattened form, and an editor update that nests a page past the limit is
+  refused (its connection closes with code 4422). The bug predates this
+  release. (#TBD)
 - Create, move, create-from-template and workspace import accepted a parent
   page from another workspace and put the page under it. They now return
   `404 doc.not_found`. The bug predates this release. (#TBD)
