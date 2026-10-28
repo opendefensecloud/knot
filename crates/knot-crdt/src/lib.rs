@@ -12,6 +12,7 @@ pub mod registry;
 pub mod room;
 pub mod snapshot;
 pub mod tasks;
+pub mod update_items;
 pub mod writer;
 
 pub use board_registry::{BoardAcquireError, BoardRooms};

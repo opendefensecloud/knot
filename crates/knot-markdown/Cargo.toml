@@ -12,6 +12,7 @@ thiserror.workspace = true
 pulldown-cmark.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+tracing.workspace = true
 
 [features]
 # The frozen pre-fix serializer, importer and task extractor, and the

@@ -23,19 +23,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use knot_crdt::update_items;
 use uuid::Uuid;
-use yrs::block::{
-    BLOCK_GC_REF_NUMBER, BLOCK_SKIP_REF_NUMBER, HAS_ORIGIN, HAS_PARENT_SUB, HAS_RIGHT_ORIGIN,
-    ItemContent,
-};
+use yrs::block::ItemContent;
 use yrs::branch::Branch;
-use yrs::encoding::read::{Cursor, Read};
 use yrs::types::text::YChange;
 use yrs::types::{Attrs, TypeRef};
-use yrs::updates::decoder::{Decoder, DecoderV1};
 use yrs::{
-    Any, Assoc, BranchID, Doc, ID, OffsetKind, Out, ReadTxn, StateVector, StickyIndex, Text,
-    Transact, TransactionMut, Xml, XmlElementRef, XmlFragment, XmlOut, XmlTextRef,
+    Any, Assoc, BranchID, Doc, OffsetKind, Out, ReadTxn, StateVector, StickyIndex, Text, Transact,
+    TransactionMut, Xml, XmlElementRef, XmlFragment, XmlOut, XmlTextRef,
 };
 
 use crate::DOC_URL_PREFIX;
@@ -227,7 +223,8 @@ fn element<T: ReadTxn>(txn: &T, el: &XmlElementRef, out: &mut Vec<Site>) {
 /// text are read from its items (`held`): a chunk at an embed's offset is
 /// that embed. A text holding content the diff leaves out ([`Held`]) has
 /// offsets the diff can't tell, and its links are left alone rather than
-/// marked wrongly.
+/// marked wrongly. So are the links of every text when the items can't be
+/// read ([`HeldItems::read`], which logs it).
 fn links<T: ReadTxn>(
     txn: &T,
     text: &XmlTextRef,
@@ -329,49 +326,56 @@ enum Held {
     Hidden,
 }
 
+impl Held {
+    /// What an item holding `content` holds, if the diff can't tell.
+    fn of(content: &ItemContent) -> Option<Self> {
+        match content {
+            ItemContent::Embed(_) => Some(Held::Embed),
+            ItemContent::Any(_)
+            | ItemContent::JSON(_)
+            | ItemContent::Binary(_)
+            | ItemContent::Doc(..) => Some(Held::Hidden),
+            _ => None,
+        }
+    }
+}
+
 /// The live items of a document that hold an embed or hidden content (see
 /// [`Held`]), by the text they are in, with their offsets in it.
 struct HeldItems(HashMap<BranchID, Vec<(u32, Held)>>);
 
 impl HeldItems {
-    /// Reads the items from the document's state, decoded as yrs 0.27
-    /// decodes an update (`Update::decode`, `decode_block`) without
-    /// integrating it, and places each live one that is part of a text's
-    /// content in that text, at its offset, found by its id
-    /// (`StickyIndex::get_offset`). `None` if the state doesn't decode.
+    /// Reads the items from the document's own state, decoded as yrs
+    /// decodes an update, without integrating it
+    /// ([`knot_crdt::update_items::decode`]).
     fn read<T: ReadTxn>(txn: &T) -> Option<Self> {
         let state = txn.encode_state_as_update_v1(&StateVector::default());
-        let mut decoder = DecoderV1::new(Cursor::new(&state));
+        Self::from_state(txn, &state)
+    }
+
+    /// Reads the items from `state`, the document's state as an update, and
+    /// places each live one that is part of a text's content in that text,
+    /// at its offset, found by its id (`StickyIndex::get_offset`).
+    ///
+    /// `None`, logged, if the state doesn't decode: the decoder follows
+    /// yrs's own encoding, so a yrs that encodes differently ends here, and
+    /// every link is then left as it is.
+    fn from_state<T: ReadTxn>(txn: &T, state: &[u8]) -> Option<Self> {
         let mut found = Vec::new();
-        let clients: u32 = decoder.read_var().ok()?;
-        for _ in 0..clients {
-            let blocks: u32 = decoder.read_var().ok()?;
-            let client = decoder.read_client().ok()?;
-            let mut clock: u32 = decoder.read_var().ok()?;
-            for _ in 0..blocks {
-                let len = match decoder.read_info().ok()? {
-                    BLOCK_SKIP_REF_NUMBER => decoder.read_var().ok()?,
-                    BLOCK_GC_REF_NUMBER => decoder.read_len().ok()?,
-                    info => {
-                        let content = item_content(&mut decoder, info).ok()?;
-                        let held = match content {
-                            ItemContent::Embed(_) => Some(Held::Embed),
-                            ItemContent::Any(_)
-                            | ItemContent::JSON(_)
-                            | ItemContent::Binary(_)
-                            | ItemContent::Doc(..) => Some(Held::Hidden),
-                            _ => None,
-                        };
-                        let len = content.len(OffsetKind::Utf16);
-                        if let Some(held) = held
-                            && len > 0
-                        {
-                            found.push((ID::new(client, clock), held));
-                        }
-                        len
+        for item in update_items::decode(state) {
+            match item {
+                Ok(item) => {
+                    if let Some(held) = Held::of(&item.content) {
+                        found.push((item.id, held));
                     }
-                };
-                clock += len;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "remap: the page's state doesn't decode; its links are left as they are"
+                    );
+                    return None;
+                }
             }
         }
         let mut texts: HashMap<BranchID, Vec<(u32, Held)>> = HashMap::new();
@@ -404,32 +408,6 @@ impl HeldItems {
     }
 }
 
-/// The content of the item whose `info` was just read: what follows it, as
-/// `decode_block` reads it, with its origins and parent skipped.
-fn item_content(
-    decoder: &mut DecoderV1,
-    info: u8,
-) -> Result<ItemContent, yrs::encoding::read::Error> {
-    let no_origins = info & (HAS_ORIGIN | HAS_RIGHT_ORIGIN) == 0;
-    if info & HAS_ORIGIN != 0 {
-        decoder.read_left_id()?;
-    }
-    if info & HAS_RIGHT_ORIGIN != 0 {
-        decoder.read_right_id()?;
-    }
-    if no_origins {
-        if decoder.read_parent_info()? {
-            decoder.read_string()?;
-        } else {
-            decoder.read_left_id()?;
-        }
-        if info & HAS_PARENT_SUB != 0 {
-            decoder.read_string()?;
-        }
-    }
-    ItemContent::decode(decoder, info)
-}
-
 /// The length of `s` in the document's offset units.
 fn units(s: &str, offsets: OffsetKind) -> u32 {
     let n = match offsets {
@@ -437,4 +415,50 @@ fn units(s: &str, offsets: OffsetKind) -> u32 {
         OffsetKind::Utf16 => s.encode_utf16().count(),
     };
     n as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Metadata, Subscriber};
+    use yrs::{Doc, Transact};
+
+    use super::HeldItems;
+
+    /// Counts the warnings logged while it is the subscriber.
+    struct Warnings(Arc<AtomicUsize>);
+
+    impl Subscriber for Warnings {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            if *event.metadata().level() == Level::WARN {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test]
+    fn a_state_that_does_not_decode_is_logged_and_read_as_no_items() {
+        let doc = Doc::new();
+        let txn = doc.transact();
+        let warnings = Arc::new(AtomicUsize::new(0));
+        // One client, then the buffer ends.
+        let read = tracing::subscriber::with_default(Warnings(warnings.clone()), || {
+            HeldItems::from_state(&txn, &[1])
+        });
+        assert!(read.is_none(), "no items are read");
+        assert_eq!(warnings.load(Ordering::SeqCst), 1, "the failure is logged");
+    }
 }

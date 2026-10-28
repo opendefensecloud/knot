@@ -51,21 +51,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use yrs::block::{
-    BLOCK_GC_REF_NUMBER, BLOCK_SKIP_REF_NUMBER, HAS_ORIGIN, HAS_PARENT_SUB, HAS_RIGHT_ORIGIN,
-    ItemContent,
-};
+use yrs::block::ItemContent;
 use yrs::branch::BranchPtr;
-use yrs::encoding::read::{Cursor, Read};
 use yrs::types::text::YChange;
-use yrs::updates::decoder::{Decoder, DecoderV1};
 use yrs::updates::encoder::Encode;
 use yrs::{
-    ArrayRef, Assoc, BranchID, ClientID, ID, Map, MapRef, OffsetKind, Out, ReadTxn, StickyIndex,
-    Text, Transact, Xml, XmlFragment,
+    ArrayRef, Assoc, BranchID, ClientID, ID, Map, MapRef, Out, ReadTxn, StickyIndex, Text,
+    Transact, Xml, XmlFragment,
 };
 
 use crate::engine::DocHandle;
+use crate::update_items::{self, ItemParent, UpdateItem};
 
 /// How many block containers (blockquotes, list items, table cells) deep
 /// the Markdown importer and writer follow a page. No page the editor makes
@@ -274,7 +270,8 @@ fn nested<T: ReadTxn>(txn: &T, node: &Out) -> Vec<Out> {
     found
 }
 
-/// An item of an update, as far as nesting goes.
+/// An item of an update, as far as nesting goes: an [`UpdateItem`] without
+/// its content.
 #[derive(Debug, Clone)]
 struct NewItem {
     id: ID,
@@ -282,101 +279,30 @@ struct NewItem {
     len: u32,
     origin: Option<ID>,
     right_origin: Option<ID>,
-    parent: Parent,
+    parent: ItemParent,
     /// Whether it holds a shared type, which other items can nest in.
     is_type: bool,
 }
 
-/// The parent an item names.
-#[derive(Debug, Clone)]
-enum Parent {
-    /// A root type.
-    Root,
-    /// The type of the item with this id.
-    Item(ID),
-    /// None: the item has the parent of its origin, or else of its right
-    /// origin.
-    OfOrigin,
+impl From<UpdateItem> for NewItem {
+    fn from(item: UpdateItem) -> Self {
+        Self {
+            id: item.id,
+            len: item.len,
+            origin: item.origin,
+            right_origin: item.right_origin,
+            parent: item.parent,
+            is_type: matches!(item.content, ItemContent::Type(_)),
+        }
+    }
 }
 
-/// The items of `update`, decoded as yrs decodes an update (yrs 0.27,
-/// `Update::decode` and `decode_block`), without integrating them.
+/// The items of `update`, decoded as yrs decodes an update, without
+/// integrating them ([`update_items::decode`]).
 fn decode_items(update: &[u8]) -> Result<Vec<NewItem>, yrs::encoding::read::Error> {
-    let mut decoder = DecoderV1::new(Cursor::new(update));
-    let mut items = Vec::new();
-    let clients: u32 = decoder.read_var()?;
-    for _ in 0..clients {
-        let blocks: u32 = decoder.read_var()?;
-        let client = decoder.read_client()?;
-        let mut clock: u32 = decoder.read_var()?;
-        for _ in 0..blocks {
-            let id = ID::new(client, clock);
-            let info = decoder.read_info()?;
-            match info {
-                BLOCK_SKIP_REF_NUMBER => {
-                    let len: u32 = decoder.read_var()?;
-                    clock += len;
-                }
-                BLOCK_GC_REF_NUMBER => {
-                    clock += decoder.read_len()?;
-                }
-                info => {
-                    let item = decode_item(&mut decoder, id, info)?;
-                    if let Some(item) = item {
-                        clock += item.len;
-                        items.push(item);
-                    }
-                }
-            }
-        }
-    }
-    Ok(items)
-}
-
-/// The item with `id` and `info`, read as yrs reads it, or `None` for an
-/// empty one, which yrs drops.
-fn decode_item(
-    decoder: &mut DecoderV1,
-    id: ID,
-    info: u8,
-) -> Result<Option<NewItem>, yrs::encoding::read::Error> {
-    let no_origins = info & (HAS_ORIGIN | HAS_RIGHT_ORIGIN) == 0;
-    let origin = if info & HAS_ORIGIN != 0 {
-        Some(decoder.read_left_id()?)
-    } else {
-        None
-    };
-    let right_origin = if info & HAS_RIGHT_ORIGIN != 0 {
-        Some(decoder.read_right_id()?)
-    } else {
-        None
-    };
-    let parent = if no_origins {
-        if decoder.read_parent_info()? {
-            decoder.read_string()?;
-            Parent::Root
-        } else {
-            Parent::Item(decoder.read_left_id()?)
-        }
-    } else {
-        Parent::OfOrigin
-    };
-    if no_origins && info & HAS_PARENT_SUB != 0 {
-        decoder.read_string()?;
-    }
-    let content = ItemContent::decode(decoder, info)?;
-    let len = content.len(OffsetKind::Utf16);
-    if len == 0 {
-        return Ok(None);
-    }
-    Ok(Some(NewItem {
-        id,
-        len,
-        origin,
-        right_origin,
-        parent,
-        is_type: matches!(content, ItemContent::Type(_)),
-    }))
+    update_items::decode(update)
+        .map(|item| item.map(NewItem::from))
+        .collect()
 }
 
 /// Where an item hangs.
@@ -499,9 +425,9 @@ impl<'a, T: ReadTxn> Placement<'a, T> {
                 break Attach::Missing;
             };
             match item.parent {
-                Parent::Root => break Attach::Depth(0),
-                Parent::Item(parent) => break self.type_at(&parent),
-                Parent::OfOrigin => {
+                ItemParent::Root(_) => break Attach::Depth(0),
+                ItemParent::Item(parent) => break self.type_at(&parent),
+                ItemParent::OfOrigin => {
                     // yrs takes the parent of the origin, or, when that is
                     // missing or collected, of the right origin.
                     let mut next = None;
