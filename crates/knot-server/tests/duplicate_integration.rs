@@ -1484,7 +1484,7 @@ async fn template_is_422() {
     assert_eq!(w.counts().await, pages);
 }
 
-/// The error of a 413: the caps, as the web client shows them.
+/// The error of a 413, whose message names the caps.
 fn too_large() -> Value {
     json!({
         "code": "doc.duplicate_too_large",
