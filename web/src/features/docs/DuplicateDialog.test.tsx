@@ -414,7 +414,11 @@ describe("the Duplicate dialog", () => {
 describe("copies of two pages at once", () => {
   it("opens another page's dialog ready, and keeps it open when the first copy is made", async () => {
     const notes = deferred();
-    const fetchMock = server({ gates: { notes: notes.promise }, copyIds: ["copy-notes", "copy-plan"] });
+    const plan = deferred();
+    const fetchMock = server({
+      gates: { notes: notes.promise, plan: plan.promise },
+      copyIds: ["copy-notes", "copy-plan"],
+    });
     renderTree(fetchMock);
     await editorRows();
 
@@ -424,6 +428,8 @@ describe("copies of two pages at once", () => {
     const dialog = screen.getByRole("dialog", { name: "Duplicate “Q4 planning”" });
     const ok = within(dialog).getByRole("button", { name: "Duplicate" });
     expect(ok).toHaveAttribute("aria-disabled", "false");
+    fireEvent.click(ok);
+    await waitFor(() => expect(duplicates(fetchMock)).toHaveLength(2));
 
     // The first copy is made while the dialog is open: it shows in the
     // list, and the app stays where it is, dialog and all.
@@ -433,7 +439,7 @@ describe("copies of two pages at once", () => {
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
     expect(screen.getByRole("dialog")).toBe(dialog);
 
-    fireEvent.click(ok);
+    plan.resolve();
     await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("/doc/copy-plan"));
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(duplicates(fetchMock)).toEqual([
