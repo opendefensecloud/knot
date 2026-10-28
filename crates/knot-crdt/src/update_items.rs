@@ -17,13 +17,21 @@
 //! yrs reads. It accepts exactly the updates yrs's decoder accepts, and
 //! reads the same items (`tests/update_items.rs` and knot-markdown's
 //! `tests/update_reader.rs` check both against yrs over the repo's update
-//! corpora), with one exception on purpose: a block whose clocks run past
-//! `u32::MAX` doesn't decode here, where yrs's decoder adds them up
-//! unchecked, which panics in a debug build and wraps in a release build.
-//! A delete set's ranges are not added up here, nor checked: yrs adds them
-//! unchecked too (a known limitation). yrs also refuses a count of clients
-//! or blocks it can't reserve memory for, before reading them; an update
-//! that held that many would be gigabytes long.
+//! corpora), except in these cases:
+//! - A block whose clocks run past `u32::MAX` doesn't decode here, on
+//!   purpose: yrs's decoder adds them up unchecked, which panics in a debug
+//!   build and wraps in a release build.
+//! - A delete set's ranges are not added up here, nor checked: yrs adds
+//!   them unchecked too (a known limitation).
+//! - A delete set's clients are read here as the raw `u64` they encode.
+//!   yrs makes a `ClientID` of each (`ClientID::new`, `yrs/src/block.rs`),
+//!   which debug-asserts the 53-bit limit: a client past 53 bits panics yrs
+//!   in a debug build only, and a release build of either reads it. (A
+//!   block's client is read with yrs's own `read_client`, so the two agree
+//!   there.)
+//! - yrs refuses a count of clients or blocks it can't reserve memory for,
+//!   before reading them; an update that held that many would be gigabytes
+//!   long.
 
 use std::sync::Arc;
 
@@ -154,7 +162,9 @@ impl UpdateItems<'_> {
 
     /// Reads past the delete set after the blocks, as yrs's `IdSet::decode`
     /// reads it, so that an update whose delete set doesn't decode doesn't
-    /// decode here either. Its ranges are not kept, nor added up.
+    /// decode here either. Its ranges are not kept, nor added up, and its
+    /// clients are not checked against yrs's 53-bit limit (see the module
+    /// doc).
     fn read_delete_set(&mut self) -> Result<(), Error> {
         let clients: u32 = self.decoder.read_var()?;
         for _ in 0..clients {

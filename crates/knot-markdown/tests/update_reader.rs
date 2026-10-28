@@ -19,16 +19,19 @@
 //! and its state then (collected ranges, deleted items and a delete set).
 //! For the files, every update that ends early in one of those is compared
 //! too: none decodes. knot-crdt's `tests/update_items.rs` and
-//! `tests/nesting.rs` compare knot-crdt's own updates the same way.
+//! `tests/nesting.rs` compare knot-crdt's own updates the same way, with
+//! the same rule and failure message: `reader_vs_yrs` is knot-crdt's
+//! `tests/common/mod.rs`, the one copy of both.
 
 mod common;
+#[path = "../../knot-crdt/tests/common/mod.rs"]
+mod reader_vs_yrs;
 
 use common::corpus::{self, Case};
 use knot_crdt::DocHandle;
-use knot_crdt::update_items::decode;
 use knot_markdown::{from_markdown, legacy};
-use yrs::updates::decoder::Decode;
-use yrs::{IdSet, ReadTxn, StateVector, Transact, Update, XmlFragment};
+use reader_vs_yrs::{disagreement, disagreements};
+use yrs::{ReadTxn, StateVector, Transact, XmlFragment};
 
 /// The compat harness's random corpus (`tests/compat.rs`): its seeds, and
 /// documents per seed.
@@ -39,28 +42,6 @@ const RANDOM_DOCS_PER_SEED: usize = 200;
 /// can't make the comparison pass by comparing nothing: far below today's
 /// 94,544 (`KNOT_COMPAT_REPORT=1` prints the count).
 const MIN_UPDATES: usize = 40_000;
-
-/// How many disagreements the failure prints.
-const SHOWN: usize = 10;
-
-/// How the reader and yrs disagree on `update`, if they do.
-fn disagreement(update: &[u8]) -> Option<String> {
-    let read = decode(update).try_fold(IdSet::new(), |mut items, item| {
-        let item = item?;
-        items.insert(item.id, item.len);
-        Ok::<_, yrs::encoding::read::Error>(items)
-    });
-    match (read, Update::decode_v1(update)) {
-        (Ok(read), Ok(decoded)) => {
-            // Every item yrs decoded: none is marked deleted yet.
-            let items = decoded.insertions(false);
-            (read != items).then(|| format!("the reader reads the items {read:?}, yrs {items:?}"))
-        }
-        (Ok(_), Err(e)) => Some(format!("the reader reads it, yrs doesn't: {e}")),
-        (Err(e), Ok(_)) => Some(format!("yrs reads it, the reader doesn't: {e}")),
-        (Err(_), Err(_)) => None,
-    }
-}
 
 /// The updates of `doc`, named after `what`, as the module doc lists them;
 /// `stored` is the update its import wrote, if it was imported. Deletes the
@@ -91,24 +72,14 @@ fn updates_of(what: &str, doc: &DocHandle, stored: Option<Vec<u8>>) -> Vec<(Stri
     out
 }
 
-/// Panics with the disagreements `test` found (see the module doc). With
-/// `KNOT_COMPAT_REPORT=1`, first prints how many updates it compared.
+/// Panics with the disagreements `test` found (see the module doc and
+/// `reader_vs_yrs::assert_none`). With `KNOT_COMPAT_REPORT=1`, first prints
+/// how many updates it compared.
 fn assert_none(test: &str, found: &[String], compared: usize) {
     common::report(test, || {
         format!("{compared} updates compared, {} disagreements", found.len())
     });
-    let count = |how: &str| found.iter().filter(|d| d.contains(how)).count();
-    assert!(
-        found.is_empty(),
-        "{} disagreement(s) over {compared} update(s) ({} where only the reader reads it, \
-         {} where only yrs does, {} on the items), the first {}:\n{}",
-        found.len(),
-        count("the reader reads it, yrs doesn't"),
-        count("yrs reads it, the reader doesn't"),
-        count("the reader reads the items"),
-        found.len().min(SHOWN),
-        found[..found.len().min(SHOWN)].join("\n")
-    );
+    reader_vs_yrs::assert_none(found, compared);
 }
 
 #[test]
@@ -145,15 +116,8 @@ fn the_reader_reads_the_imported_files_as_yrs_does_and_every_update_that_ends_ea
         ];
         for (how, (doc, stored)) in imports {
             for (what, update) in updates_of(&format!("{how} of {name}"), &doc, Some(stored)) {
-                for end in 0..=update.len() {
-                    compared += 1;
-                    if let Some(how) = disagreement(&update[..end]) {
-                        found.push(format!(
-                            "{what}, its first {end} of {}: {how}",
-                            update.len()
-                        ));
-                    }
-                }
+                compared += update.len() + 1;
+                found.extend(disagreements(&what, &update));
             }
         }
     }

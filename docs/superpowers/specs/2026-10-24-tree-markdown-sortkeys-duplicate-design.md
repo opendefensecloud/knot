@@ -360,12 +360,15 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
   - The post-drag click is suppressed only after pointer drags, only inside
     the tree.
   - A drop released less than one INDENT from the press (the straight,
-    Euclidean distance) moves nothing, and while the pointer is that near
-    no drop line shows. Such a drop counts as a click only when the
-    pointer's whole path, from the press through every position to the
-    release, is under one INDENT too: a plain press on a row's link then
-    opens that page in the app (no reload, no move request), replacing the
-    history entry when the page is already open. A drag that goes out and
+    Euclidean distance, along the list: dnd-kit's drag delta, which counts
+    a sidebar that scrolls under the pointer) moves nothing, and while the
+    pointer is that near no drop line shows; the drop line and the drop
+    use the same delta, so a drop line shown is a drop made. Such a drop
+    counts as a click only when the pointer's whole path, from the press
+    through every position to the release, is under one INDENT too: a
+    plain press on a row's link then opens that page in the app (no
+    reload, no move request), replacing the history entry when the page is
+    already open. A drag that goes out and
     comes back near the press moves nothing and opens nothing, as does any
     longer drag that moves nothing. On touch this applies after the 250ms
     hold. (Amended in Task F4: the browser sends no click after a drag, so
@@ -376,7 +379,10 @@ dnd-kit's SortableTree projection model, as pure functions in `tree.ts`:
     alone, so a hand that jittered on the way made the path one INDENT long
     and an 8px slip up still nested the page; the distance from the press
     now decides whether a drop moves anything, the path whether it is a
-    click.)
+    click. Amended in the F6 review's fix round 2: the release was measured
+    on screen and the drop line along the list, so after the sidebar
+    scrolled during a drag a drop line could show and the drop then move
+    nothing, where main moved the page.)
   - No-op drops send nothing.
   - Dropping outside the tree cancels.
   - Custom drag announcements use titles.

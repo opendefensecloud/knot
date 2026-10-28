@@ -84,14 +84,16 @@ const ROW_H = 28;
 const TREE_W = 260;
 
 /** jsdom has no layout. Give the tree's list and its rows the boxes a real
- *  sidebar would: rows 28px high, top to bottom in DOM order. */
+ *  sidebar would: rows 28px high, top to bottom in DOM order, moved up by
+ *  as far as the sidebar has scrolled. */
 function layOut() {
   vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
     const rows = Array.from(document.querySelectorAll("[data-testid^='tree-row-']"));
     const i = rows.indexOf(this);
+    const scrolled = document.querySelector("[data-testid='sidebar']")?.scrollTop ?? 0;
     const box =
-      i >= 0 ? { left: 0, top: i * ROW_H, width: TREE_W, height: ROW_H }
-      : this.matches("[data-testid='doc-tree'] > ul") ? { left: 0, top: 0, width: TREE_W, height: 400 }
+      i >= 0 ? { left: 0, top: i * ROW_H - scrolled, width: TREE_W, height: ROW_H }
+      : this.matches("[data-testid='doc-tree'] > ul") ? { left: 0, top: -scrolled, width: TREE_W, height: 400 }
       : { left: 0, top: 0, width: 0, height: 0 };
     const { left, top, width, height } = box;
     return { ...box, x: left, y: top, right: left + width, bottom: top + height, toJSON: () => box };
@@ -120,7 +122,10 @@ function renderTree(role: "owner" | "editor" | "viewer" = "editor", pages = NEST
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
       <SessionProvider>
         <MemoryRouter initialEntries={[at]}>
-          <DocTree />
+          {/* It scrolls, as the app's sidebar does (AppShell). */}
+          <div data-testid="sidebar" style={{ overflowY: "auto" }}>
+            <DocTree />
+          </div>
           <Location />
         </MemoryRouter>
       </SessionProvider>
@@ -575,6 +580,34 @@ describe("DocTree — a click that slips", () => {
 
     await settle();
     expect(moves(fetchMock)).toEqual([]);
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+  });
+
+  // The sidebar scrolls under a drag (it autoscrolls near its edge, or the
+  // wheel turns): the pointer has moved along the list by as much, and the
+  // drop line counts that. Here it ends 7px below the press on screen, but
+  // a row further down the list, over Gamma: the drop is what the line
+  // shows.
+  it("a drop after the sidebar scrolled under the pointer goes where the drop line shows", async () => {
+    const fetchMock = renderTree("editor", SIBLINGS);
+    await editorRows(SIBLINGS.length);
+    layOut();
+
+    // Pressed in Beta (56-84); 4px, then 7px down: the drag starts.
+    const link = mouseDrag("beta", 66, [[0, 4], [0, 7]]);
+    expect(screen.getByTestId("tree-row-beta")).toHaveStyle({ opacity: "0.5" }); // dragging
+    expect(document.querySelector("[data-drop-zone]")).toBeNull();
+    // One row: Gamma (now 56-84) is under the pointer, in its middle band.
+    const sidebar = screen.getByTestId("sidebar");
+    sidebar.scrollTop = ROW_H;
+    fireEvent.scroll(sidebar);
+    const gamma = screen.getByTestId("tree-row-gamma");
+    expect(gamma).toHaveAttribute("data-drop-zone", "into");
+    expect(gamma).toHaveAttribute("data-drop-depth", "1");
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 73 });
+    expect(fireEvent.click(link)).toBe(false);
+
+    await waitFor(() => expect(moves(fetchMock)).toEqual([{ id: "beta", body: { parent_id: "gamma" } }]));
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
   });
 
