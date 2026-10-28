@@ -289,6 +289,17 @@ mod tests {
     use sqlx::{AssertSqlSafe, PgConnection, PgPool, Row};
     use uuid::Uuid;
 
+    /// The lock helpers the placement tests use
+    /// (`knot_test_support::locks`) take the top-level group's lock by a
+    /// copy of its key: it must be this one.
+    #[test]
+    fn the_test_helpers_take_the_same_top_level_lock() {
+        assert_eq!(
+            knot_test_support::locks::TOP_LEVEL_LOCK,
+            super::TOP_LEVEL_LOCK
+        );
+    }
+
     /// A workspace of 100 top-level pages with 40 subpages each, analysed,
     /// and one of the top-level pages.
     async fn seeded() -> (PgPool, Uuid, Uuid) {

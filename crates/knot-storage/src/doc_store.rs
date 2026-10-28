@@ -1000,11 +1000,12 @@ async fn lock_parent_row(
 ///
 /// The walk down from the doc uses `UNION`, so it ends on a parent cycle
 /// already in the database (racing moves could commit one before moves
-/// took `lock_move`'s move lock): it stops once it has seen every row. With `UNION ALL` it went round the cycle forever,
-/// and the statement ran until the server was killed, holding its locks and
-/// a pool connection. The other walks over `parent_id` in this crate end on
-/// a cycle too: by `UNION`, by leaving out the row they start from
-/// (`live_subtree`), or by a depth cap (`list_inherited`).
+/// took `lock_move`'s move lock): it stops once it has seen every row.
+/// With `UNION ALL` it went round the cycle forever, and the statement ran
+/// until the server was killed, holding its locks and a pool connection.
+/// The other walks over `parent_id` in this crate end on a cycle too: by
+/// `UNION`, by leaving out the row they start from (`live_subtree`), or by
+/// a depth cap (`list_inherited`).
 async fn reject_cycle(
     tx: &mut sqlx::PgConnection,
     doc_id: Uuid,
