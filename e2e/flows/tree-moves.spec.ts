@@ -150,8 +150,16 @@ test("releasing_on_own_row_does_not_reload", async ({ page }) => {
   );
   const moves = watchMoves(page);
 
-  // Off and back onto B's own row, at its depth: nothing to drop.
-  await dragRow(page, B, { id: B }, { zone: "below", waitForZone: false });
+  // Off and back onto B's own row, at its depth: nothing to drop. Off onto
+  // A's row first: a drag that travels less than one INDENT is a click,
+  // which opens the page.
+  const b = await page.getByTestId(`doc-row-${B}`).boundingBox();
+  if (!b) throw new Error("not laid out");
+  await dragRow(page, B, { id: B }, {
+    zone: "below",
+    waitForZone: false,
+    whileDragging: () => page.mouse.move(b.x + b.width / 2, b.y - b.height / 2, { steps: 5 }),
+  });
 
   expect(await page.evaluate(() => sessionStorage.getItem("tree-e2e-unload"))).toBeNull();
   await roundTrip(page);

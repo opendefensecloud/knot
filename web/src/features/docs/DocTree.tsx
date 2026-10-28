@@ -430,8 +430,8 @@ export function DocTree() {
             const id = String(e.active.id);
             // A click on the row's link whose pointer slipped far enough to
             // start a drag: it opens the page, as the link does. The browser
-            // sends that click to the drag ghost under the pointer, which is
-            // gone by then, so no click reaches the link.
+            // can't: the button went up over the drag ghost, which is gone
+            // by the time the click would follow, so it sends no click.
             const opens =
               !d &&
               slip.isClick() &&
@@ -627,8 +627,8 @@ function pointOf(e: Event): Point | null {
   return e instanceof MouseEvent ? { x: e.clientX, y: e.clientY } : null;
 }
 
-/** Tells a click from a drag. A click whose pointer slips 6px (mouse), or a
- *  tap held 250 ms (touch), starts a drag; it is still a click when the
+/** Tells a click from a drag. A click whose pointer slips past 6px (mouse),
+ *  or a tap held 250 ms (touch), starts a drag; it is still a click when the
  *  pointer travels less than one INDENT along its whole path: from the
  *  press, through every position the drag reports, to the release. Not
  *  when a modifier key or another button was pressed (the browser opens a
