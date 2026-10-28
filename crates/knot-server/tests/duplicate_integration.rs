@@ -1466,12 +1466,21 @@ async fn template_is_422() {
 }
 
 /// Above 200 pages, or 200 MiB of files, nothing is copied (413). Exactly
-/// at the caps, the copy is made.
+/// at the caps, the copy is made. The files are kept outside the database,
+/// so a duplicate refused over the cap would show every object it copied,
+/// and every copy it recorded for cleanup, before it checked.
 #[tokio::test(flavor = "multi_thread")]
 async fn too_large_is_413() {
     assert_eq!(MAX_DUPLICATE_PAGES, 200);
     assert_eq!(MAX_DUPLICATE_BLOB_BYTES, 200 * 1024 * 1024);
-    let w = world().await;
+    let mut recording = None;
+    let w = world_with(|state| {
+        let store = Arc::new(RecordingBlobStore::new(state.pool.clone().unwrap()));
+        state.blob_store = Some(store.clone());
+        recording = Some(store);
+    })
+    .await;
+    let store = recording.unwrap();
     let source = w.create_doc(&w.owner, "Big", None).await;
     for i in 0..MAX_DUPLICATE_PAGES - 1 {
         w.create_doc(&w.owner, &format!("Page {i}"), Some(source))
@@ -1506,6 +1515,11 @@ async fn too_large_is_413() {
     w.set_content(at_cap, &content).await;
     let copy = id_of(&w.duplicate_ok(at_cap, None).await);
     assert_eq!(w.blobs_of(copy).await.len(), files.len());
+    assert_eq!(
+        store.copied.lock().unwrap().len(),
+        files.len(),
+        "the objects are copied through the store"
+    );
 
     let over = w.create_doc(&w.owner, "Over the cap", None).await;
     let one_byte = w.insert_blob(w.workspace_id, over, 1).await;
@@ -1515,12 +1529,17 @@ async fn too_large_is_413() {
         }
     });
     w.set_content(over, &content).await;
+    store.copied.lock().unwrap().clear();
     let rows = w.counts().await;
     let response = w.duplicate(&w.owner, over, None).await;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(error_code(response).await, "doc.duplicate_too_large");
     assert_eq!(w.counts().await, rows);
-    assert!(w.pending().await.is_empty());
+    assert!(
+        store.copied.lock().unwrap().is_empty(),
+        "no object is copied"
+    );
+    assert!(w.pending().await.is_empty(), "no copy is recorded");
 }
 
 /// Review Focus 5: the source is archived after its files were copied, so
