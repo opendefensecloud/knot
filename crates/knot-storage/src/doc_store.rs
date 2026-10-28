@@ -432,9 +432,8 @@ pub(crate) fn doc_from_row(r: DocRow) -> Document {
 /// its `format!` in `AssertSqlSafe`. That assertion holds because the only
 /// values interpolated into those strings are compile-time constants (this,
 /// `SUBTREE_IDS_SQL` and the group conditions of `siblings_sql`), never
-/// caller-supplied, and every runtime value
-/// remains a `$N` bind. Keep it that way: interpolating anything else here
-/// would defeat the check.
+/// caller-supplied, and every runtime value remains a `$N` bind. Keep it
+/// that way: interpolating anything else here would defeat the check.
 pub(crate) const COLS: &str = "id, workspace_id, parent_id, title, sort_key, icon, created_by, created_at, updated_at, archived_at, is_template, archived_by, archive_root_id";
 
 #[async_trait]
@@ -1000,9 +999,8 @@ async fn lock_parent_row(
 /// descendants. The top level (`None`) never is.
 ///
 /// The walk down from the doc uses `UNION`, so it ends on a parent cycle
-/// already in the database (one that racing moves committed before
-/// `lock_move` took the move lock, or an older release wrote): it stops once
-/// it has seen every row. With `UNION ALL` it went round the cycle forever,
+/// already in the database (racing moves could commit one before moves
+/// took `lock_move`'s move lock): it stops once it has seen every row. With `UNION ALL` it went round the cycle forever,
 /// and the statement ran until the server was killed, holding its locks and
 /// a pool connection. The other walks over `parent_id` in this crate end on
 /// a cycle too: by `UNION`, by leaving out the row they start from

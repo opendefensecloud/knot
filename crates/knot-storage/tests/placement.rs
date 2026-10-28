@@ -378,10 +378,11 @@ async fn swapping_nesting_moves_do_not_deadlock() {
 /// Two moves on disjoint rows that close a parent cycle together: C is B's
 /// parent and A is D's, then A goes into B while C goes into D. Each locked
 /// only its own two rows, so both cycle checks read the tree before either
-/// move committed, both passed, and both committed: A → B → C → D → A, four
-/// pages the sidebar can't place. Moves into a parent now take a lock of
-/// their own per workspace first, so the second check sees the first move
-/// and refuses with `Cycle`.
+/// move committed, both passed, and both committed: A → B → C → D → A. The
+/// sidebar can only show such pages at the top level, and moving or
+/// archiving one of them then never finished (below). Moves into a parent
+/// now take a lock of their own per workspace first, so the second check
+/// sees the first move and refuses with `Cycle`.
 #[tokio::test(flavor = "multi_thread")]
 async fn disjoint_moves_do_not_close_a_parent_cycle() {
     let w = world().await;

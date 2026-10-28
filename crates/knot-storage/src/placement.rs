@@ -68,8 +68,8 @@ pub(crate) async fn lock_group(
 }
 
 /// Locks what a move of `doc` to `parent` needs: the target group and the
-/// moved row, both `FOR NO KEY UPDATE`. The caller takes it first in its
-/// transaction.
+/// moved row, both `FOR NO KEY UPDATE`. Call it before anything else in the
+/// transaction (see the move lock below).
 ///
 /// - Under a parent, first the workspace's move lock, a transaction-scoped
 ///   advisory lock that only moves into a parent take, then the two rows in
