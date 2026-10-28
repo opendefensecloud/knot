@@ -30,11 +30,11 @@ use yrs::block::{
 };
 use yrs::branch::Branch;
 use yrs::encoding::read::{Cursor, Read};
-use yrs::types::Attrs;
 use yrs::types::text::YChange;
-use yrs::updates::decoder::{Decode, Decoder, DecoderV1};
+use yrs::types::{Attrs, TypeRef};
+use yrs::updates::decoder::{Decoder, DecoderV1};
 use yrs::{
-    Any, Assoc, BranchID, Doc, ID, IdSet, OffsetKind, Out, ReadTxn, StateVector, StickyIndex, Text,
+    Any, Assoc, BranchID, Doc, ID, OffsetKind, Out, ReadTxn, StateVector, StickyIndex, Text,
     Transact, TransactionMut, Xml, XmlElementRef, XmlFragment, XmlOut, XmlTextRef,
 };
 
@@ -336,7 +336,8 @@ struct HeldItems(HashMap<BranchID, Vec<(u32, Held)>>);
 impl HeldItems {
     /// Reads the items from the document's state, decoded as yrs 0.27
     /// decodes an update (`Update::decode`, `decode_block`) without
-    /// integrating it, and places each in its text by its id
+    /// integrating it, and places each live one that is part of a text's
+    /// content in that text, at its offset, found by its id
     /// (`StickyIndex::get_offset`). `None` if the state doesn't decode.
     fn read<T: ReadTxn>(txn: &T) -> Option<Self> {
         let state = txn.encode_state_as_update_v1(&StateVector::default());
@@ -373,13 +374,20 @@ impl HeldItems {
                 clock += len;
             }
         }
-        let deleted = IdSet::decode(&mut decoder).ok()?;
         let mut texts: HashMap<BranchID, Vec<(u32, Held)>> = HashMap::new();
         for (id, held) in found {
-            if deleted.contains(&id) {
+            let Some(at) = StickyIndex::from_id(id, Assoc::After).get_offset(txn) else {
+                continue;
+            };
+            // Not an item of a text: an element's attribute, for one.
+            if !matches!(at.branch.type_ref(), TypeRef::XmlText) {
                 continue;
             }
-            if let Some(at) = StickyIndex::from_id(id, Assoc::After).get_offset(txn) {
+            // An attribute of the text is an item of it too, but not of its
+            // content, and a deleted item is no longer part of it: only a
+            // live item of its content is the one found at its offset.
+            let first = StickyIndex::at(txn, at.branch, at.index, Assoc::After);
+            if first.as_ref().and_then(StickyIndex::id) == Some(&id) {
                 texts
                     .entry(at.branch.id())
                     .or_default()

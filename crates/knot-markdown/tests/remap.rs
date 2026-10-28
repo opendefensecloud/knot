@@ -786,6 +786,30 @@ fn hidden_content_is_found_inside_a_run_of_text() {
 }
 
 #[test]
+fn an_attribute_of_a_text_is_not_its_content() {
+    use yrs::{Transact, Xml, XmlFragment};
+
+    // A text's attributes are `Any` items too, held in the text but at no
+    // offset: they don't move its links.
+    let doc = with_embed(&doc_url(DOC), None);
+    {
+        let ydoc = doc.inner();
+        let frag = ydoc.get_or_insert_xml_fragment("default");
+        let mut txn = ydoc.transact_mut();
+        let text = frag
+            .get(&txn, 0)
+            .and_then(|p| p.into_xml_element())
+            .and_then(|p| p.get(&txn, 0))
+            .and_then(|t| t.into_xml_text())
+            .expect("the paragraph's text");
+        text.insert_attribute(&mut txn, "lang", Any::from("de"));
+    }
+    let before = dump(&doc);
+    assert_eq!(remap_refs(doc.inner(), &remap()), 1);
+    assert_eq!(dump(&doc), before.replace(DOC, DOC_NEW));
+}
+
+#[test]
 fn a_deleted_embed_takes_no_room() {
     use yrs::types::Attrs;
     use yrs::{ReadTxn, Text, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
