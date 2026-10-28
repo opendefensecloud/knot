@@ -85,12 +85,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ### Fixed
 - A line break (Shift+Enter) in a list item exported fine until the page
-  went through a history restore, a template, or a Markdown or zip import.
-  From then on, and for any list item with a line break that a Markdown
-  import made, Markdown export failed for the page: search, share links,
-  zip export, My Tasks, history preview and restore, and new pages from it
-  as a template failed on it. An image or drawing in a list item was lost
-  the same way. (#TBD)
+  went through a history restore, a template, or a Markdown or zip import,
+  which stored it in a broken shape; a Markdown import stored any list item
+  with a line break in that shape too. Markdown export then failed for the
+  page, and with it search, share links, zip export, My Tasks, history
+  preview and restore, and new pages from it as a template. An image or
+  drawing in a list item was lost on the same paths. (#TBD)
 - Nested checklists, list items and quotes with several paragraphs, images,
   rules or lists, checkboxes in numbered lists, and empty list items lost
   their shape or content on the way through Markdown (export, history
