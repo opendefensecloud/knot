@@ -188,6 +188,22 @@ fixes.
   to verify OIDC ID-token signatures, which involves public values only, and
   the fix exists only in a major version that `openidconnect` does not yet
   support. (#47)
+- `dompurify` 3.4.17 fixes six advisories in its `SAFE_FOR_TEMPLATES` and
+  `IN_PLACE` modes, its `application/xhtml+xml` parser mode and node-removing
+  hooks. knot was not affected: neither knot's sanitiser nor mermaid uses
+  those settings, and mermaid's hooks remove no nodes.
+- `source-map-js` 1.2.2 and `postcss-selector-parser` 6.1.5 fix CPU and
+  event-loop denial of service from crafted source maps and CSS selectors.
+  Both run only when the web app is built, on knot's own sources.
+- Development tooling only, none of it shipped: `vite` 7.3.7, `vitest`
+  4.1.12, `undici` 7.30.1 (through `jsdom`), `shell-quote` 1.12.0 (through
+  `concurrently` 10.0.6), `brace-expansion` 1.1.21 and 5.0.12, and `zod`
+  4.6.7 (through `eslint-plugin-react-hooks`).
+- `katex` 0.16.47, which mermaid draws math labels with, keeps
+  GHSA-238p-pmpm-9mq7 (low): it matters only if something else on the page
+  already allows prototype pollution. The fix needs mermaid 12, which changes
+  the layout and look of every existing diagram, so it waits for that
+  upgrade. `web/SECURITY-NOTES.md` records it.
 
 ## [0.8.1] - 2026-10-21
 

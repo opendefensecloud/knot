@@ -37,7 +37,7 @@
     "@tiptap/suggestion": "^3.31.3",
     "@tiptap/y-tiptap": "^3.0.9",
     "autoprefixer": "^10.5.4",
-    "dompurify": "^3.4.13",
+    "dompurify": "^3.4.17",
     "lucide-react": "^1.31.0",
     "marked": "^18.0.11",
     "mermaid": "^11.16.1",
@@ -61,16 +61,16 @@
     "@typescript-eslint/eslint-plugin": "^8.67.0",
     "@typescript-eslint/parser": "^8.67.0",
     "@vitejs/plugin-react": "^4.7.0",
-    "@vitest/coverage-v8": "4.1.10",
-    "concurrently": "^10.0.5",
+    "@vitest/coverage-v8": "4.1.12",
+    "concurrently": "^10.0.6",
     "eslint": "^10.8.1",
     "eslint-plugin-import": "^2.32.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "jsdom": "^29.1.1",
     "prettier": "^3.9.6",
     "typescript": "^5.9.3",
-    "vite": "^7.3.6",
-    "vitest": "^4.1.10"
+    "vite": "^7.3.7",
+    "vitest": "^4.1.12"
   },
   "packageManager": "pnpm@11.22.0"
 }
