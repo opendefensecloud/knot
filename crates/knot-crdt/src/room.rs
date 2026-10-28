@@ -158,6 +158,12 @@ pub struct Room {
     /// Fires after the writer confirms a successful persist; consumers
     /// debounce + reindex tasks for the doc.
     dirty_tx: Option<mpsc::Sender<Uuid>>,
+    /// Set when the room evicts itself after applying an update that nested
+    /// the page past [`crate::nesting::MAX_NESTING`] (the authoritative
+    /// post-apply check). The live doc then holds the refused content, so the
+    /// final flush must NOT snapshot it: the next join reloads the page from
+    /// storage, which never got the refused update.
+    evicted: bool,
 }
 
 pub struct RoomHandle {
@@ -237,6 +243,7 @@ impl Room {
             policy,
             snap_state,
             dirty_tx,
+            evicted: false,
         };
         tokio::spawn(room.run());
         Ok(RoomHandle { tx, shutdown })
@@ -550,15 +557,19 @@ impl Room {
         }
 
         // Final flush: write a snapshot at the current seq so the next boot
-        // is cheap. Best-effort.
-        let _ = crate::snapshot::write_snapshot(
-            self.doc_id,
-            self.last_applied_seq,
-            self.engine.as_ref(),
-            &self.doc,
-            self.snapshots.as_ref(),
-        )
-        .await;
+        // is cheap. Best-effort. Skipped when the room evicted itself over a
+        // too-deep update: the live doc holds that refused content, and a
+        // snapshot of it would be the one thing that persisted it.
+        if !self.evicted {
+            let _ = crate::snapshot::write_snapshot(
+                self.doc_id,
+                self.last_applied_seq,
+                self.engine.as_ref(),
+                &self.doc,
+                self.snapshots.as_ref(),
+            )
+            .await;
+        }
     }
 
     async fn replay_since_watermark(&mut self) {
@@ -628,18 +639,19 @@ impl Room {
             tracing::debug!(conn = %m.from, "dropping update from a connection the room no longer holds");
             return;
         }
-        // Before anything of it is applied: yrs overflows the stack applying
-        // an update that inserts a deep subtree and deletes it again, and
-        // deleting a deep subtree later would too. Nothing of it is applied,
-        // persisted or fanned out, and the sender is closed: its own copy of
-        // the page now holds what the room refused.
+        // Prefilter, before anything of it is applied: yrs overflows the
+        // stack applying an update whose own structure nests a deep chain of
+        // new types it then deletes. `check_update` refuses such an update so
+        // apply never recurses; nothing of it is applied, persisted or fanned
+        // out, and the sender is closed. It is a prefilter only — the
+        // authoritative check runs after apply below.
         if let Err(too_deep) = crate::nesting::check_update(&self.doc, &m.bytes) {
             tracing::warn!(
                 doc_id = %self.doc_id,
                 conn = %m.from,
                 depth = too_deep.depth,
                 limit = crate::nesting::MAX_NESTING,
-                "refused an update that nests the page too deep; closing its connection"
+                "refused an update that nests the page too deep (prefilter); closing its connection"
             );
             metrics::counter!("knot_room_updates_refused_total").increment(1);
             if let Some(conn) = self.conns.remove(&m.from) {
@@ -647,15 +659,46 @@ impl Room {
             }
             return;
         }
-        match self.engine.apply_update_changed(&self.doc, &m.bytes) {
-            Ok(true) => {}
+        // Apply, then run the authoritative nesting check on the real doc:
+        // the prefilter predicts yrs and can be bypassed (an update that
+        // hangs a short chain of new types off existing legal content nests
+        // past the limit without its own structure being deep).
+        match self
+            .engine
+            .apply_update_measuring(&self.doc, &m.bytes, crate::nesting::MAX_NESTING)
+        {
+            Ok(applied) if applied.max_depth > crate::nesting::MAX_NESTING => {
+                // The update, now applied, nested a type past the limit.
+                // Refuse it after the fact: do not persist, do not fan out,
+                // close the sender, and evict the room. The live doc holds
+                // the refused content, so the room must reload — self-evicting
+                // (cancel `shutdown`) makes the next join rehydrate from
+                // storage, which never got this update. Dropping the deep doc
+                // does not recurse (`crate::nesting`).
+                tracing::warn!(
+                    doc_id = %self.doc_id,
+                    conn = %m.from,
+                    depth = applied.max_depth,
+                    limit = crate::nesting::MAX_NESTING,
+                    "refused an update that nested the page too deep (post-apply); evicting the room"
+                );
+                metrics::counter!("knot_room_updates_refused_total").increment(1);
+                metrics::counter!("knot_room_evicted_total", "reason" => "nesting").increment(1);
+                if let Some(conn) = self.conns.remove(&m.from) {
+                    conn.refused.cancel();
+                }
+                self.evicted = true;
+                self.shutdown.cancel();
+                return;
+            }
             // Nothing new — typically the SyncStep2 a (re)connecting writer
             // sends in answer to the server's SyncStep1, which re-sends the
             // whole delete set even when the client has no offline edits.
             // Persisting it would write a `doc_updates` row on every page
             // open (and attribute an edit to someone who only looked);
             // fanning it out would make every peer re-apply a no-op.
-            Ok(false) => return,
+            Ok(applied) if !applied.changed => return,
+            Ok(_) => {}
             Err(e) => {
                 tracing::debug!(error=?e, "apply_update failed");
                 return;

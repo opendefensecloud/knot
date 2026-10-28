@@ -14,17 +14,25 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use knot_crdt::nesting::{MAX_NESTING, TooDeep, check_update, nests_deeper_than};
+use knot_crdt::nesting::{
+    MAX_NESTING, TooDeep, check_update, deepest_inserted_type_depth, inserted_type_ids,
+    nests_deeper_than,
+};
 use knot_crdt::protocol::wrap_sync_update;
 use knot_crdt::{
-    ConnHandle, DocHandle, Engine, Event, InMsg, MemBus, Room, RoomHandle, SnapshotPolicy,
+    ConnHandle, DocHandle, Engine, Event, InMsg, MemBus, Room, RoomHandle, Rooms, SnapshotPolicy,
     YrsEngine,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use yrs::block::{ClientID, HAS_ORIGIN, HAS_RIGHT_ORIGIN, ItemContent};
+use yrs::branch::{Branch, BranchID};
+use yrs::encoding::write::Write;
+use yrs::types::TypeRef;
+use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{
-    Doc, Options, ReadTxn, StateVector, Text, Transact, XmlElementPrelim, XmlElementRef,
+    Doc, ID, Options, ReadTxn, StateVector, Text, Transact, XmlElementPrelim, XmlElementRef,
     XmlFragment, XmlTextPrelim,
 };
 
@@ -508,4 +516,442 @@ async fn a_room_refuses_a_deeply_nested_update() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_room_refuses_an_update_that_inserts_and_deletes_a_deep_subtree() {
     refused_and_still_serving(insert_and_delete_update()).await;
+}
+
+// ---------------------------------------------------------------------------
+// The reviewer's crafted reparenting sequence (F1 round 2)
+// ---------------------------------------------------------------------------
+//
+// `check_update` (the prefilter) predicts where yrs will place an update's
+// items, so it can be bypassed: an update can hang a short chain of new types
+// off existing, legal, deep-but-within-limit content so the chain's depth
+// comes from the page, not from the update's own structure. The reviewer's
+// probe does exactly that, and reached depth 10,501 over 20 rounds while every
+// round passed `check_update`; a later delete then overflowed the stack. The
+// authoritative post-apply check measures where the types actually landed and
+// refuses the update after the fact.
+
+/// How many blockquotes the crafted update nests under its reparented head.
+const CRAFTED_CHAIN: u32 = 500;
+/// How many blockquotes the crafted base page is deep (within the limit).
+const CRAFTED_BASE_DEPTH: usize = 500;
+
+fn nested_id(el: &XmlElementRef) -> ID {
+    match <XmlElementRef as AsRef<Branch>>::as_ref(el).id() {
+        BranchID::Nested(id) => id,
+        _ => panic!("root type has no nested id"),
+    }
+}
+
+/// The reviewer's crafted update, as raw lib0 v1 bytes (yrs keeps `Update`'s
+/// blocks private, so it is encoded by hand, exactly as the probe does):
+/// `x` — a string whose parent is the deleted, garbage-collected paragraph
+/// `dead`; `Y` — a blockquote with origin `x` and right origin `right` (an
+/// item deep in the base page), which yrs reparents under `right`'s parent;
+/// and [`CRAFTED_CHAIN`] blockquotes nested under `Y`.
+fn attack_bytes(attacker: ClientID, start: u32, dead: &ID, right: &ID) -> Vec<u8> {
+    let mut enc = EncoderV1::new();
+    enc.write_var(1u32);
+    enc.write_var(2 + CRAFTED_CHAIN);
+    enc.write_client(attacker);
+    enc.write_var(start);
+    enc.write_info(4);
+    enc.write_parent_info(false);
+    enc.write_left_id(dead);
+    ItemContent::String("x".into()).encode(&mut enc);
+    enc.write_info(7 | HAS_ORIGIN | HAS_RIGHT_ORIGIN);
+    enc.write_left_id(&ID::new(attacker, start));
+    enc.write_right_id(right);
+    ItemContent::Type(Branch::new(TypeRef::XmlElement("blockquote".into()))).encode(&mut enc);
+    for i in 0..CRAFTED_CHAIN {
+        enc.write_info(7);
+        enc.write_parent_info(false);
+        enc.write_left_id(&ID::new(attacker, start + 1 + i));
+        ItemContent::Type(Branch::new(TypeRef::XmlElement("blockquote".into()))).encode(&mut enc);
+    }
+    enc.write_var(0u32);
+    enc.to_vec()
+}
+
+/// The crafted base page (the full state update) and the crafted attack
+/// update that reparents onto it. The base is [`CRAFTED_BASE_DEPTH`]
+/// blockquotes deep plus a bottom paragraph (within the limit), and holds one
+/// deleted paragraph that yrs garbage-collects — the item the attack's string
+/// hangs under.
+fn crafted_attack() -> (Vec<u8>, Vec<u8>) {
+    on_big_stack(|| {
+        let doc = Doc::with_client_id(1);
+        let frag = doc.get_or_insert_xml_fragment("default");
+        let dead;
+        let bottom;
+        {
+            let mut txn = doc.transact_mut();
+            let d = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            dead = nested_id(&d);
+            let mut q = frag.push_back(&mut txn, XmlElementPrelim::empty("blockquote"));
+            for _ in 1..CRAFTED_BASE_DEPTH {
+                q = q.push_back(&mut txn, XmlElementPrelim::empty("blockquote"));
+            }
+            let p = q.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            bottom = nested_id(&p);
+        }
+        {
+            let mut txn = doc.transact_mut();
+            frag.remove_range(&mut txn, 0, 1);
+        }
+        let base = state(&doc);
+        let attack = attack_bytes(ClientID::new(99), 0, &dead, &bottom);
+        (base, attack)
+    })
+}
+
+/// The authoritative post-apply check catches the crafted update that
+/// `check_update` lets through. GREEN-only: it names new API.
+#[test]
+fn the_post_apply_check_catches_a_reparenting_update_the_prefilter_misses() {
+    let (base, attack) = crafted_attack();
+    on_worker_stack(move || {
+        let doc = YrsEngine.new_doc();
+        YrsEngine.apply_update(&doc, &base).expect("apply base");
+        // The base page is within the limit.
+        assert!(
+            !nests_deeper_than(&doc, MAX_NESTING),
+            "the base page should be within the limit"
+        );
+        // The prefilter is bypassed: it returns Ok for the crafted update.
+        assert_eq!(
+            check_update(&doc, &attack),
+            Ok(()),
+            "the crafted update should pass the prefilter"
+        );
+        // Applying it and measuring where the types landed catches it.
+        let measured = YrsEngine
+            .apply_update_measuring(&doc, &attack, MAX_NESTING)
+            .expect("apply and measure");
+        assert!(measured.changed);
+        assert!(
+            measured.max_depth > MAX_NESTING,
+            "the post-apply check must catch the crafted update; got {}",
+            measured.max_depth
+        );
+        // And the doc really did get nested past the limit.
+        assert!(nests_deeper_than(&doc, MAX_NESTING));
+        // Directly: the update's inserted types are measured past the limit.
+        let ids = inserted_type_ids(&attack);
+        let txn = doc.inner().transact();
+        assert!(deepest_inserted_type_depth(&txn, &ids, MAX_NESTING) > MAX_NESTING);
+    });
+}
+
+/// RED on HEAD: without the post-apply check the room applies, persists and
+/// fans out the crafted update and never evicts, so this times out waiting
+/// for the eviction. With the fix the room refuses it after the fact —
+/// nothing of it is persisted or fanned out, the sender is closed, and the
+/// room evicts itself — and the process keeps running throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_room_refuses_and_evicts_a_crafted_reparenting_update() {
+    let (base, attack) = crafted_attack();
+    let (room, persisted) = room().await;
+    let (writer, _writer_rx, _) = join(&room).await;
+    let (attacker, _attacker_rx, refused) = join(&room).await;
+    let (_peer, mut peer_rx, _) = join(&room).await;
+
+    // The base page (within the limit) is accepted, fanned out and persisted.
+    send(&room, writer, base.clone()).await;
+    let base_fanout = tokio::time::timeout(Duration::from_secs(10), peer_rx.recv())
+        .await
+        .expect("the room never fanned out the base")
+        .expect("peer channel closed");
+    assert_eq!(base_fanout, wrap_sync_update(&base));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while persisted.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the base was never persisted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The crafted update bypasses the prefilter; the room refuses it after
+    // applying it and evicts itself.
+    send(&room, attacker, attack).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !room.shutdown.is_cancelled() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the room did not evict itself after a too-deep update"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refused.is_cancelled(), "the sender was not told to close");
+    assert_eq!(
+        *persisted.lock().unwrap(),
+        vec![base],
+        "the crafted update must not be persisted"
+    );
+    assert!(
+        matches!(
+            peer_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty) | Err(mpsc::error::TryRecvError::Disconnected)
+        ),
+        "the crafted update must not be fanned out"
+    );
+}
+
+/// After a room evicts itself over a too-deep update, the next acquire boots
+/// a fresh room from storage (which never got the refused update), and that
+/// room serves edits — the server keeps serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_evicted_room_is_rebooted_on_the_next_acquire_and_keeps_serving() {
+    let (base, attack) = crafted_attack();
+    let persisted = Arc::new(Mutex::new(Vec::new()));
+    let rooms = Rooms::new(
+        Arc::new(YrsEngine),
+        Arc::new(MemBus::new()),
+        Arc::new(CapturingUpdates {
+            persisted: persisted.clone(),
+        }),
+        Arc::new(NoSnapshots),
+        SnapshotPolicy {
+            every_n: 1000,
+            idle: Duration::from_secs(3600),
+        },
+        Duration::from_secs(300),
+    );
+    let doc_id = Uuid::new_v4();
+    let first = rooms.acquire(doc_id).await.unwrap();
+
+    let (writer, _wr, _) = join(&first).await;
+    let (attacker, _ar, _refused) = join(&first).await;
+    send(&first, writer, base).await;
+    send(&first, attacker, attack).await;
+
+    // The room evicts itself.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !first.shutdown.is_cancelled() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the room did not evict itself"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        rooms.get_active(doc_id).is_none(),
+        "the evicted room must not be handed out as active"
+    );
+
+    // The next acquire boots a fresh, live room.
+    let second = rooms.acquire(doc_id).await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "acquire must boot a new room after eviction"
+    );
+    assert!(!second.shutdown.is_cancelled(), "the rebooted room is live");
+
+    // It reloaded from storage, which never got the refused update, and it
+    // serves a new edit.
+    let (editor, _editor_rx, _) = join(&second).await;
+    let (_peer, mut peer_rx, _) = join(&second).await;
+    let edit = sentinel();
+    send(&second, editor, edit.clone()).await;
+    let fanned = tokio::time::timeout(Duration::from_secs(10), peer_rx.recv())
+        .await
+        .expect("the rebooted room stopped serving")
+        .expect("peer channel closed");
+    assert_eq!(fanned, wrap_sync_update(&edit));
+
+    let (reply, st) = oneshot::channel();
+    second.tx.send(Event::ExportState(reply)).await.unwrap();
+    let (bytes, _) = st.await.unwrap().unwrap();
+    assert!(
+        !on_worker_stack(move || nests_deeper_than(&page(&[&bytes]), MAX_NESTING)),
+        "the rebooted room must hold nothing past the limit"
+    );
+    second.shutdown.cancel();
+}
+
+/// Dropping a doc 100,000 types deep does not recurse: yrs holds items flat
+/// in the block store, and neither `Branch` nor `Item` has a custom `Drop`.
+/// The room relies on this when it evicts itself (drops the deep doc) over a
+/// refused update. The drop runs on a tokio worker's 2 MiB stack.
+#[test]
+fn dropping_a_hundred_thousand_deep_doc_does_not_recurse() {
+    let deep = on_big_stack(|| chain_update(DEEP));
+    let doc = page(&[&deep]);
+    on_worker_stack(move || drop(doc));
+}
+
+/// A full-state SyncStep2 re-send of a page already nested past the limit (a
+/// legacy page, the pre-existing limitation) must not be measured as a fresh
+/// violation: nothing is newly integrated, so a client reconnecting to such a
+/// page does not evict the room on every join. GREEN-only: names new API.
+#[test]
+fn a_resend_of_an_already_deep_page_is_not_measured_as_a_violation() {
+    let deep = on_big_stack(|| chain_update(MAX_NESTING + 100));
+    on_worker_stack(move || {
+        let doc = YrsEngine.new_doc();
+        // As if hydrated from storage (a legacy deep page): applied without
+        // the measuring path, the way `Room::spawn` replays stored updates.
+        YrsEngine.apply_update(&doc, &deep).expect("hydrate");
+        assert!(
+            nests_deeper_than(&doc, MAX_NESTING),
+            "fixture: the hydrated page is over the limit"
+        );
+        // A client's full-state re-send integrates nothing new.
+        let measured = YrsEngine
+            .apply_update_measuring(&doc, &deep, MAX_NESTING)
+            .expect("measure a re-send");
+        assert!(!measured.changed, "a re-send integrates nothing new");
+        assert_eq!(
+            measured.max_depth, 0,
+            "a re-send of a legacy deep page must not read as a fresh violation"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The board room shares the same prefilter + post-apply path
+// ---------------------------------------------------------------------------
+
+/// A board store that records every update appended, to check nothing of a
+/// refused update is stored.
+struct CapturingBoard {
+    appended: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+#[async_trait::async_trait]
+impl knot_storage::BoardStore for CapturingBoard {
+    async fn create(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        _: Option<String>,
+    ) -> knot_storage::boards::Result<knot_storage::Board> {
+        unimplemented!()
+    }
+    async fn get(&self, _: Uuid) -> knot_storage::boards::Result<knot_storage::Board> {
+        Err(knot_storage::boards::BoardStoreError::NotFound)
+    }
+    async fn list_for_doc(
+        &self,
+        _: Uuid,
+    ) -> knot_storage::boards::Result<Vec<knot_storage::Board>> {
+        Ok(vec![])
+    }
+    async fn delete(&self, _: Uuid) -> knot_storage::boards::Result<()> {
+        Ok(())
+    }
+    async fn latest_snapshot(
+        &self,
+        _: Uuid,
+    ) -> knot_storage::boards::Result<Option<(i64, Vec<u8>)>> {
+        Ok(None)
+    }
+    async fn put_snapshot(&self, _: Uuid, _: i64, _: &[u8]) -> knot_storage::boards::Result<()> {
+        Ok(())
+    }
+    async fn load_updates(&self, _: Uuid) -> knot_storage::boards::Result<Vec<Vec<u8>>> {
+        Ok(vec![])
+    }
+    async fn append_update(&self, _: Uuid, bytes: &[u8]) -> knot_storage::boards::Result<i64> {
+        let mut a = self.appended.lock().unwrap();
+        a.push(bytes.to_vec());
+        Ok(a.len() as i64)
+    }
+    async fn since(&self, _: Uuid, _: i64) -> knot_storage::boards::Result<Vec<(i64, Vec<u8>)>> {
+        Ok(vec![])
+    }
+    async fn max_update_seq(&self, _: Uuid) -> knot_storage::boards::Result<i64> {
+        Ok(0)
+    }
+    async fn set_svg(&self, _: Uuid, _: &[u8]) -> knot_storage::boards::Result<()> {
+        Ok(())
+    }
+    async fn get_svg(&self, _: Uuid) -> knot_storage::boards::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+}
+
+/// The board room runs the same prefilter and authoritative post-apply check.
+/// The crafted update is refused after apply: nothing of it is appended or
+/// fanned out, and the board room evicts itself (it has no close signal of
+/// its own). RED on HEAD: the board would apply, append and fan it out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_board_room_refuses_and_evicts_a_crafted_reparenting_update() {
+    use knot_crdt::BoardRoom;
+    use knot_crdt::board_room::{Event as BoardEvent, InMsg as BoardInMsg};
+
+    let (base, attack) = crafted_attack();
+    let board_id = Uuid::new_v4();
+    let bus = Arc::new(MemBus::new());
+    let sub = knot_crdt::Bus::subscribe(bus.as_ref(), board_id)
+        .await
+        .unwrap();
+    let appended = Arc::new(Mutex::new(Vec::new()));
+    let store: Arc<dyn knot_storage::BoardStore> = Arc::new(CapturingBoard {
+        appended: appended.clone(),
+    });
+    let h = BoardRoom::spawn(board_id, Arc::new(YrsEngine), store, bus, sub)
+        .await
+        .unwrap();
+
+    async fn join_board(h: &knot_crdt::BoardRoomHandle, tx: mpsc::Sender<Vec<u8>>) -> Uuid {
+        let conn_id = Uuid::new_v4();
+        let (reply, joined) = oneshot::channel();
+        h.tx.send(knot_crdt::board_room::Event::Join {
+            conn_id,
+            handle: knot_crdt::board_room::ConnHandle { tx },
+            reply,
+        })
+        .await
+        .unwrap();
+        joined.await.unwrap().unwrap();
+        conn_id
+    }
+
+    let (wtx, _wrx) = mpsc::channel(64);
+    let writer = join_board(&h, wtx).await;
+    let (atx, _arx) = mpsc::channel(64);
+    let attacker = join_board(&h, atx).await;
+    let (ptx, mut peer_rx) = mpsc::channel(64);
+    let _peer = join_board(&h, ptx).await;
+
+    h.tx.send(BoardEvent::Inbound(BoardInMsg {
+        from: writer,
+        bytes: base.clone(),
+    }))
+    .await
+    .unwrap();
+    let base_fanout = tokio::time::timeout(Duration::from_secs(10), peer_rx.recv())
+        .await
+        .expect("the board never fanned out the base")
+        .expect("peer channel closed");
+    assert_eq!(base_fanout, wrap_sync_update(&base));
+
+    h.tx.send(BoardEvent::Inbound(BoardInMsg {
+        from: attacker,
+        bytes: attack,
+    }))
+    .await
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !h.shutdown.is_cancelled() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the board room did not evict itself after a too-deep update"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        *appended.lock().unwrap(),
+        vec![base],
+        "the crafted update must not be appended"
+    );
+    assert!(
+        matches!(
+            peer_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty) | Err(mpsc::error::TryRecvError::Disconnected)
+        ),
+        "the crafted update must not be fanned out"
+    );
 }

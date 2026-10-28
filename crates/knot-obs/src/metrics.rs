@@ -60,7 +60,11 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     );
     describe_counter!(
         "knot_room_updates_refused_total",
-        "Inbound CRDT updates a page or board room refused, unapplied, because they would nest the document's types deeper than the room accepts (knot_crdt::nesting::MAX_NESTING)"
+        "Inbound CRDT updates a page or board room refused because they nest the document's types deeper than the room accepts (knot_crdt::nesting::MAX_NESTING). Refused either by the cheap prefilter before applying, or by the authoritative check after applying — the latter also evicts the room (see knot_room_evicted_total)"
+    );
+    describe_counter!(
+        "knot_room_evicted_total",
+        "Rooms that evicted themselves, by reason. reason=nesting: an inbound update nested the document's types past knot_crdt::nesting::MAX_NESTING and was caught by the authoritative post-apply check; the update was neither persisted nor fanned out and the next join reloads the page from storage"
     );
     describe_counter!("knot_room_snapshots_total", "Snapshots written to storage");
     describe_histogram!(

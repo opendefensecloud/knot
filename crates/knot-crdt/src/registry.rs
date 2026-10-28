@@ -81,8 +81,8 @@ impl Rooms {
     /// (transient DB/bus blip). The inflight entry is removed after a
     /// successful insert so it does not accumulate indefinitely.
     pub async fn acquire(&self, doc_id: Uuid) -> Result<Arc<RoomHandle>, AcquireError> {
-        if let Some(h) = self.map.get(&doc_id) {
-            return Ok(h.clone());
+        if let Some(h) = self.live(doc_id) {
+            return Ok(h);
         }
         let guard = self
             .inflight
@@ -90,9 +90,13 @@ impl Rooms {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let _lock = guard.lock().await;
-        if let Some(h) = self.map.get(&doc_id) {
-            return Ok(h.clone());
+        if let Some(h) = self.live(doc_id) {
+            return Ok(h);
         }
+        // A room that evicted itself (a too-deep update, [`crate::nesting`])
+        // leaves a cancelled handle in the map. Drop it before booting a
+        // fresh one, so this join rehydrates from storage.
+        self.drop_if_dead(doc_id).await;
         let sub = self.bus.subscribe(doc_id).await?;
         let h = Room::spawn(
             doc_id,
@@ -117,8 +121,37 @@ impl Rooms {
     /// The room for `doc_id` if one is already running here. Never boots
     /// one: rooms are not evicted when idle, so a background reader that
     /// acquired them would keep every page it read in memory.
+    ///
+    /// A room that evicted itself over a too-deep update ([`crate::nesting`])
+    /// is treated as absent — its live doc holds refused content, so a reader
+    /// must fall back to storage. `acquire` prunes the dead entry on the next
+    /// join.
     pub fn get_active(&self, doc_id: Uuid) -> Option<Arc<RoomHandle>> {
-        self.map.get(&doc_id).map(|h| h.clone())
+        self.live(doc_id)
+    }
+
+    /// The running room for `doc_id`, or `None` if there is none or it has
+    /// evicted itself (its `shutdown` is cancelled).
+    fn live(&self, doc_id: Uuid) -> Option<Arc<RoomHandle>> {
+        let h = self.map.get(&doc_id)?;
+        (!h.shutdown.is_cancelled()).then(|| h.clone())
+    }
+
+    /// Remove a self-evicted room from the map (best-effort unsubscribe,
+    /// gauge down). A no-op if the room is live or absent. Idempotent with
+    /// [`Rooms::evict`]: only the call whose `remove` wins adjusts the gauge.
+    async fn drop_if_dead(&self, doc_id: Uuid) {
+        let dead = self
+            .map
+            .get(&doc_id)
+            .map(|h| h.shutdown.is_cancelled())
+            .unwrap_or(false);
+        if dead {
+            if self.map.remove(&doc_id).is_some() {
+                metrics::gauge!("knot_room_active").decrement(1.0);
+            }
+            let _ = self.bus.unsubscribe(doc_id).await;
+        }
     }
 
     /// Send a revoke event to the room (if active). The room drops all

@@ -15,6 +15,18 @@ pub enum EngineError {
     Encode(String),
 }
 
+/// What [`Engine::apply_update_measuring`] reports: whether the doc changed,
+/// and how deep the update nested the doc's shared types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplyMeasured {
+    /// Whether the doc changed, as [`Engine::apply_update_changed`] reports.
+    pub changed: bool,
+    /// The depth of the deepest shared type the update integrated, capped at
+    /// `limit + 1` (a root type is at depth 0). `> limit` means a type nests
+    /// past the limit.
+    pub max_depth: usize,
+}
+
 pub struct DocHandle(pub(crate) Doc);
 
 impl DocHandle {
@@ -38,6 +50,25 @@ pub trait Engine: Send + Sync + 'static {
     /// to skip persisting / fanning out such no-ops; anything that could not
     /// be integrated yet reports `true`, so it is never dropped.
     fn apply_update_changed(&self, d: &DocHandle, update: &[u8]) -> Result<bool, EngineError>;
+    /// Apply `update` and, in the same transaction, measure how deep it
+    /// nested the doc's shared types — the authoritative nesting check (see
+    /// [`crate::nesting`]). Returns whether the doc changed (as
+    /// [`Engine::apply_update_changed`]) and the depth of the deepest type
+    /// the update integrated, capped at `limit + 1` (a root type is at depth
+    /// 0). A caller refuses the update, without persisting or fanning it out,
+    /// when `max_depth > limit`.
+    ///
+    /// Applying the update cannot overflow the stack: integration is
+    /// iterative, and the only recursive path (deletion) is left to the
+    /// prefilter [`crate::nesting::check_update`], which the room runs first.
+    /// The measurement walks the real doc iteratively and bounded, so it
+    /// cannot overflow either.
+    fn apply_update_measuring(
+        &self,
+        d: &DocHandle,
+        update: &[u8],
+        limit: usize,
+    ) -> Result<ApplyMeasured, EngineError>;
     fn encode_state_as_update(
         &self,
         d: &DocHandle,
@@ -81,6 +112,44 @@ impl Engine for YrsEngine {
         Ok(!txn.insert_set().is_empty()
             || !txn.delete_set().is_empty()
             || pending_fingerprint(&txn) != pending_before)
+    }
+
+    fn apply_update_measuring(
+        &self,
+        d: &DocHandle,
+        update: &[u8],
+        limit: usize,
+    ) -> Result<ApplyMeasured, EngineError> {
+        let u = Update::decode_v1(update).map_err(|e| EngineError::Apply(e.to_string()))?;
+        let mut txn = d.0.transact_mut();
+        let pending_before = pending_fingerprint(&txn);
+        // The shared types this apply could integrate: the update's own, and
+        // any already parked as pending — this update may be what they were
+        // waiting for, in which case they integrate now and must be measured.
+        let mut type_ids = crate::nesting::inserted_type_ids(update);
+        if let Some(pending) = txn.store().pending_update() {
+            type_ids.extend(crate::nesting::inserted_type_ids(
+                &pending.update.encode_v1(),
+            ));
+        }
+        txn.apply_update(u)
+            .map_err(|e| EngineError::Apply(e.to_string()))?;
+        let changed = !txn.insert_set().is_empty()
+            || !txn.delete_set().is_empty()
+            || pending_fingerprint(&txn) != pending_before;
+        // Measure only the types THIS transaction actually integrated — the
+        // ones in its insert set. A full-state SyncStep2 re-send re-encodes
+        // every type the doc already has; those must not be re-measured, or
+        // reconnecting to a page already nested past the limit (a legacy
+        // page, the documented pre-existing limitation) would wrongly evict
+        // the room on every join. Content parked as pending that integrates
+        // now IS in the insert set, so it is still measured.
+        type_ids.retain(|id| txn.insert_set().contains(id));
+        // Commit now (rather than on drop) so the walk below reads the
+        // integrated, garbage-collected document.
+        txn.commit();
+        let max_depth = crate::nesting::deepest_inserted_type_depth(&txn, &type_ids, limit);
+        Ok(ApplyMeasured { changed, max_depth })
     }
 
     fn encode_state_as_update(

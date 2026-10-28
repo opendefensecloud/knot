@@ -7,15 +7,38 @@
 //! - the Markdown importer and writer follow a page only [`MAX_BLOCK_DEPTH`]
 //!   block containers deep (`knot_markdown::to_markdown::MAX_DEPTH`), and
 //!   write what lies deeper as its text;
-//! - a room refuses an inbound update that would nest a type deeper than
-//!   [`MAX_NESTING`] ([`check_update`]), before it applies, persists or fans
-//!   out anything of it. The check has to come first: one crafted update can
-//!   insert a deep subtree and delete it again, and yrs overflows applying
-//!   it.
+//! - a room caps how deep an inbound update may nest the page's types at
+//!   [`MAX_NESTING`], in two steps:
+//!   - [`check_update`] is a cheap prefilter, run *before* the update is
+//!     applied. It refuses an update whose own encoded structure already
+//!     nests a chain of new types past the limit, so yrs never overflows
+//!     applying a crafted update that inserts a deep subtree and deletes it
+//!     in the same transaction. It predicts where yrs will place the
+//!     update's items, which is not exact, so it is a prefilter only — it may
+//!     let an update through (for example one that hangs a short chain of new
+//!     types off existing deep-but-legal content so its depth comes from the
+//!     page, not the update). It never overflows: it walks iteratively and
+//!     bounded.
+//!   - the authoritative check runs *after* `apply_update`
+//!     ([`deepest_inserted_type_depth`], via the engine's
+//!     `apply_update_measuring`). It measures where each type the update
+//!     actually integrated landed, by walking up the real doc's parent chain,
+//!     iteratively and at most `MAX_NESTING + 1` steps. Applying the update
+//!     cannot overflow (integration is iterative; only deletion recurses, and
+//!     the prefilter has already refused any update that would delete a deep
+//!     chain it also inserts). When the authoritative check finds a type
+//!     nested past the limit, the room does not persist and does not fan out
+//!     the update, closes the sending connection, and evicts itself, so the
+//!     next join reloads the page from storage without the refused update.
+//!     Dropping the evicted room's doc, however deep the refused update made
+//!     it, does not recurse: yrs holds items flat in the block store, and
+//!     neither `Branch` nor `Item` has a custom `Drop`.
 //!
-//! So no edit can store a page that nests deeper. Pages stored before that
-//! do are as they are; [`nests_deeper_than`] finds them (the real-data
-//! check reports them).
+//! So no edit can store a page whose types nest deeper than [`MAX_NESTING`].
+//! Pages stored before this release that do are as they are;
+//! [`nests_deeper_than`] finds them (the real-data check reports them), and
+//! deleting their deep part can still overflow — the documented pre-existing
+//! limitation.
 
 use std::collections::{HashMap, HashSet};
 
@@ -106,6 +129,99 @@ pub fn nests_deeper_than(doc: &DocHandle, limit: usize) -> bool {
         );
     }
     false
+}
+
+/// The ids of the shared types a lib0 v1 `update` inserts, decoded as yrs
+/// decodes it, without applying it. Used after `apply_update` to find where
+/// each type actually landed. An update that doesn't decode yields no ids
+/// (applying it fails the same way).
+pub fn inserted_type_ids(update: &[u8]) -> Vec<ID> {
+    decode_items(update)
+        .map(|items| {
+            items
+                .into_iter()
+                .filter(|item| item.is_type)
+                .map(|item| item.id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The deepest any type in `ids` nests in `doc` (a root type is at depth 0),
+/// capped at `limit + 1`. Each id is looked up where it actually landed and
+/// measured by walking up the real parent chain, iteratively and at most
+/// `limit + 1` steps, so no nesting overflows the stack. Ids yrs did not
+/// integrate (dropped, garbage-collected, or still pending) are not found
+/// and don't count. `> limit` means a type nests past the limit.
+///
+/// This is the authoritative post-apply check: unlike [`check_update`] it
+/// does not predict yrs, it reads the integrated document. Call it on the
+/// same transaction that applied the update (after its `commit`), with the
+/// type ids of the update and of anything that was pending before it (this
+/// update may be what the pending content was waiting for).
+pub fn deepest_inserted_type_depth<T: ReadTxn>(txn: &T, ids: &[ID], limit: usize) -> usize {
+    let mut depths: HashMap<BranchID, usize> = HashMap::new();
+    let mut deepest = 0;
+    for id in ids {
+        let Some(branch) = BranchID::get_nested(txn, id) else {
+            continue;
+        };
+        let depth = branch_depth(txn, branch, &mut depths, limit);
+        if depth > deepest {
+            deepest = depth;
+        }
+        if deepest > limit {
+            break;
+        }
+    }
+    deepest
+}
+
+/// The depth of `branch` in the doc `txn` reads (a root type is at depth 0),
+/// read up to its root with an explicit stack, or `limit + 1` when it is
+/// deeper than the limit — the walk goes no further. Depths measured on the
+/// way are memoised in `depths`.
+fn branch_depth<T: ReadTxn>(
+    txn: &T,
+    branch: BranchPtr,
+    depths: &mut HashMap<BranchID, usize>,
+    limit: usize,
+) -> usize {
+    let mut chain: Vec<BranchID> = Vec::new();
+    let mut cur = branch;
+    let base = loop {
+        let id = cur.id();
+        if let Some(&depth) = depths.get(&id) {
+            break depth;
+        }
+        let BranchID::Nested(item) = &id else {
+            break 0;
+        };
+        chain.push(id.clone());
+        if chain.len() > limit {
+            // Deeper than we need to measure; the types on the way keep no
+            // depth, so a later id re-walks them, still bounded.
+            return limit + 1;
+        }
+        match parent_branch(txn, item) {
+            Some(parent) => cur = parent,
+            None => break 0,
+        }
+    };
+    let mut depth = base;
+    for id in chain.into_iter().rev() {
+        depth += 1;
+        depths.insert(id, depth);
+    }
+    depths.get(&branch.id()).copied().unwrap_or(base)
+}
+
+/// The type of the doc that directly holds the item with `id`, if the doc
+/// has it: the parent of that item's type.
+fn parent_branch<T: ReadTxn>(txn: &T, id: &ID) -> Option<BranchPtr> {
+    StickyIndex::from_id(*id, Assoc::After)
+        .get_offset(txn)
+        .map(|offset| offset.branch)
 }
 
 /// The shared types directly in `node`: its children, attribute values and
