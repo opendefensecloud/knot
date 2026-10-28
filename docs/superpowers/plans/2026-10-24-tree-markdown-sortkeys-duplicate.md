@@ -111,6 +111,9 @@
     - `comments_integration.rs` `cross_doc_comment_mutation_is_rejected`;
     - `search_integration.rs`: the `make_doc` helper (`:49`) gets a distinct key per call, which fixes `results_capped_at_max_limit` and `multi_word_prefix_is_and`.
   - Any other existing test that fails *only* because it inserts duplicate top-level keys gets the same fix, and is named in the commit message.
+    - Under this clause (Task 9, named in commit 43082af): `crates/knot-storage/tests/documents.rs` `purge_takes_rows_stamped_with_the_root_outside_its_subtree` switches to distinct keys. Its raw UPDATE moved a child keyed `"m"` to the top level beside its parent, also `"m"`; the child is now keyed `"n"`.
+  - `crates/knot-crdt/tests/board_fanout.rs` (Task F6, amended during execution, Ruling (F6 review, amends P6)): the shared `join_conn` helper builds `ConnHandle::new(tx)` instead of `ConnHandle { tx }`, because board connections now carry the refusal token. A mechanical API adaptation; no assertion changes.
+  - `e2e/flows/tree-reorder.spec.ts`, beyond its rewrite (Task 15): the un-nest case drags one level left, as the drop-depth rule requires (spec, Compatibility guarantees, 5. Moves); and drags of exactly one INDENT become `INDENT + 2` (Task F6, amended during execution, Ruling (F6, amends P6)), because under `Math.trunc` an exact INDENT sits on the rounding boundary. The test's intent, one level, is unchanged.
   - Nothing else changes. `round_trip_all_fixtures` and `tasks_live_reindex.rs` stay as they are.
 - **P7. Constraint and order.**
   - The heal migration (Task 9) runs inside its migration transaction:

@@ -11,12 +11,17 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ### Upgrading
 - Five database migrations run on upgrade (the Helm chart's migrate hook
   applies them).
+- Rolling back to 0.8.1 after the upgrade needs a database restore: 0.8.1
+  doesn't start on a database that has migrations it doesn't know.
 - Everyone with an account sees the "knot was updated" card once after this
   upgrade. (#45)
 - The upgrade repairs the order keys of pages where two pages at one level
   shared a key, or a key was invalid or over 64 characters, keeping the
   order the sidebar showed. From then on no two top-level pages can share a
   key. (#TBD)
+- The migration that repairs the order keys locks the `documents` table until
+  it commits, so on a large database, requests that touch pages wait while the
+  pre-upgrade migrate job runs. (#TBD)
 - After the upgrade, a one-time background refresh renders the cached
   Markdown and the task listing of every page outside the archive again,
   about ten pages every two seconds, on one replica. Search, share links,
@@ -82,6 +87,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - Create, move and create-from-template with a `parent_id` outside your
   workspace return `404 doc.not_found`, the same as for an id no page has.
   They used to accept it. (#TBD)
+- The sidebar's keyboard drag (Space or Enter on a page to pick it up, the
+  arrow keys to move it, Space or Enter to drop it) is gone. Alt with the
+  arrow keys, and Move up, Move down, Indent and Outdent in the page menu,
+  move pages instead. (#TBD)
 
 ### Fixed
 - A line break (Shift+Enter) in a list item exported fine until the page
