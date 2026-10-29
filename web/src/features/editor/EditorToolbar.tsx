@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
 
 import type { Editor } from "@tiptap/react";
 import { useQuery } from "@tanstack/react-query";
@@ -89,6 +89,16 @@ export function EditorToolbar({
     return filtered.slice(0, 8);
   }, [docs.data, docQuery]);
   const notify = useUi((s) => s.notify);
+
+  // Every `active` below reads editor.isActive(...) during render, but
+  // Tiptap 3's useEditor doesn't re-render on transactions. Without this the
+  // pressed states only caught up when something unrelated re-rendered.
+  const [, rerender] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => {
+    if (!editor) return;
+    editor.on("transaction", rerender);
+    return () => { editor.off("transaction", rerender); };
+  }, [editor]);
 
   if (!editor) return null;
   const c = () => editor.chain().focus();

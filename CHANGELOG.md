@@ -11,6 +11,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ### Added
 - A search box above the Members table filters it by name, email or role
   as you type, and shows how many members match. Escape clears it.
+### Fixed
+- The editor toolbar's buttons show at once what the caret is in (a heading,
+  bold text, a table). They could stay on the previous state until something
+  else on the page changed.
 
 ## [0.9.0] - 2026-10-28
 
