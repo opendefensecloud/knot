@@ -273,6 +273,10 @@ export const DateTimeExtension = Extension.create({
       key: dateTimePluginKey,
       props: {
         handleClickOn(view, _pos, _node, _nodePos, event) {
+          // prosemirror-view calls this in read mode too, and Apply and
+          // Clear write to the shared doc.
+          if (!view.editable) return false;
+          if (event.button !== 0 || event.shiftKey || event.altKey) return false;
           const target = event.target as HTMLElement | null;
           const anchor = target?.closest("a") as HTMLAnchorElement | null;
           if (!anchor) return false;

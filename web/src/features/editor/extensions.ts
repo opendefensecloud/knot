@@ -158,6 +158,25 @@ function pastedLinksWithoutUnderline(): Plugin {
 }
 
 /**
+ * Doc links, @-mentions and date chips are links to `knot://doc/`,
+ * `knot://user/` and `knot://time/`.
+ *
+ * Link renders `href=""` for a scheme `isAllowedUri` refuses, and its parse
+ * rule refuses an `<a>` without an allowed href, so the editor's DOM lost
+ * where these point. Clicking a doc link or a date chip then did nothing
+ * (both read the href off the clicked `<a>`), copying one pasted plain text,
+ * the doc picker could not link a selection, and in Safari, typing right
+ * after one turned it into plain text: WebKit restructures the DOM there and
+ * ProseMirror re-reads it.
+ *
+ * Only these three prefixes are let through. Registering `knot` in Link's
+ * `protocols` would also make linkify autolink typed `knot://` text.
+ */
+function isInternalHref(url: string): boolean {
+  return /^knot:\/\/(doc|user|time)\//.test(url);
+}
+
+/**
  * Autolink only the local user's own typing.
  *
  * Upstream's autolink plugin is an `appendTransaction` hook that fires on
@@ -290,6 +309,7 @@ export function createExtensions(opts: {
       openOnClick: false,
       autolink: true,
       HTMLAttributes: { rel: "noopener noreferrer", target: "_blank" },
+      isAllowedUri: (url, { defaultValidate }) => isInternalHref(url) || defaultValidate(url),
     }),
     Collaboration.configure({ document: opts.doc }),
     // Successor to CollaborationCursor, which has no v3 release. Only ever
