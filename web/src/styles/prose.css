@@ -229,19 +229,22 @@
   text-underline-offset: 2px;
 }
 /* Internal document links: subtle pill background so authors can tell at
-   a glance that a link points inside the workspace vs out to the web. */
-.ProseMirror a.knot-internal-link {
+   a glance that a link points inside the workspace vs out to the web.
+   These classes come from InternalLinkExtension's inline decorations, which
+   ProseMirror renders as a span inside the link's <a>, so the selectors
+   below must not require an `a`. */
+.ProseMirror .knot-internal-link {
   background: rgb(99 102 241 / 0.10);
   padding: 0 3px;
   border-radius: 3px;
   text-decoration-color: rgb(99 102 241 / 0.55);
 }
-.ProseMirror a.knot-internal-link:hover {
+.ProseMirror .knot-internal-link:hover {
   background: rgb(99 102 241 / 0.18);
 }
 /* @-mentions ride on the link mark too (href `knot://user/<uuid>`).
    Style them like Notion/Linear: a colored pill, no underline. */
-.ProseMirror a.knot-mention {
+.ProseMirror .knot-mention {
   background: rgb(245 158 11 / 0.14);
   color: var(--color-fg);
   padding: 0 4px;
@@ -249,12 +252,12 @@
   text-decoration: none;
   font-weight: 500;
 }
-.ProseMirror a.knot-mention:hover {
+.ProseMirror .knot-mention:hover {
   background: rgb(245 158 11 / 0.22);
 }
 /* Inline datetimes (href `knot://time/<iso>`) render as a calm pill so
    users can spot them at a glance. Click opens the picker. */
-.ProseMirror a.knot-datetime {
+.ProseMirror .knot-datetime {
   background: rgb(16 185 129 / 0.12);
   color: var(--color-fg);
   padding: 0 4px;
@@ -263,7 +266,7 @@
   font-variant-numeric: tabular-nums;
   cursor: pointer;
 }
-.ProseMirror a.knot-datetime:hover {
+.ProseMirror .knot-datetime:hover {
   background: rgb(16 185 129 / 0.22);
 }
 

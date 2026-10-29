@@ -21,6 +21,16 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   links copied or dragged within knot keep an underline the author gave
   them. Links pasted before the fix keep theirs, and so does text typed after
   them.
+- Page links, @-mentions and dates in the editor work as links again. In
+  Safari, typing right after one turned it into plain text for everyone.
+  Clicking a page link now opens the page, clicking a date in edit mode
+  opens its picker, copying one within knot keeps the link, and the link
+  popover's Document tab links selected text instead of doing nothing.
+
+### Changed
+- Page links, @-mentions and dates show as coloured pills, as their styles
+  always intended. The styles never matched what the editor renders, so
+  these links looked like any other link.
 
 ## [0.9.0] - 2026-10-28
 
