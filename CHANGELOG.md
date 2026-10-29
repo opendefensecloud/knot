@@ -8,6 +8,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Added
+- A search box above the Members table filters it by name, email or role
+  as you type, and shows how many members match. Escape clears it.
+
 ## [0.9.0] - 2026-10-28
 
 Version info and release notes in the app, Word and ODT export, page
