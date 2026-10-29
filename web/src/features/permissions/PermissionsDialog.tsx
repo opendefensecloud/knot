@@ -4,6 +4,7 @@ import { useNavigate, useParams } from "react-router-dom";
 
 import { useUi } from "../../stores/ui";
 import { sharesApi, type Share } from "../../lib/shares.api";
+import type { Member } from "../../lib/validators";
 import { grantsApi } from "../docs/grants.api";
 import { workspaceApi } from "../workspace/workspace.api";
 
@@ -13,6 +14,35 @@ function toLocalInput(iso: string): string {
   const d = new Date(iso);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function PrincipalLabel({
+  principal,
+  member,
+  membersLoaded,
+}: {
+  principal: string;
+  member: Member | undefined;
+  membersLoaded: boolean;
+}) {
+  if (member) {
+    return (
+      <>
+        <div className="text-fg">{member.display_name}</div>
+        <div className="text-fg-muted text-[12px]">{member.email}</div>
+      </>
+    );
+  }
+  // Hold off until the member list is in, so ids don't flash before names.
+  if (!membersLoaded) return <span className="text-fg-muted">…</span>;
+  // A user grant can outlive the membership; keep the id so it stays removable
+  // and identifiable.
+  return (
+    <>
+      {principal.startsWith("user:") && <div className="text-fg-muted">Former member</div>}
+      <div className="text-fg-muted font-mono text-[12px]">{principal}</div>
+    </>
+  );
 }
 
 export default function PermissionsDialog() {
@@ -30,6 +60,11 @@ export default function PermissionsDialog() {
     queryKey: ["members"],
     queryFn: () => workspaceApi.listMembers(),
   });
+  // Grants name users by `user:<uuid>`; resolve that against the member list
+  // so the table shows people, not ids.
+  const memberById = new Map<string, Member>(
+    members.data && "ok" in members.data ? members.data.ok.map((m) => [m.user_id, m]) : [],
+  );
 
   const shares = useQuery({
     queryKey: ["shares", id],
@@ -210,7 +245,13 @@ export default function PermissionsDialog() {
             <tbody>
               {grants.data && "ok" in grants.data && grants.data.ok.map((g) => (
                 <tr key={g.principal} data-testid={`grant-${g.principal}`} className="border-t border-border">
-                  <td className="px-3 py-2 text-fg font-mono text-[12px]">{g.principal}</td>
+                  <td className="px-3 py-2">
+                    <PrincipalLabel
+                      principal={g.principal}
+                      member={memberById.get(g.principal.replace(/^user:/, ""))}
+                      membersLoaded={!members.isPending}
+                    />
+                  </td>
                   <td className="px-3 py-2 text-fg">{g.role}</td>
                   <td className="px-3 py-2 text-fg-muted">{g.inherit ? "yes" : "no"}</td>
                   <td className="px-3 py-2 whitespace-nowrap">
