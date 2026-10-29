@@ -8,6 +8,11 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Fixed
+- The editor toolbar's buttons show at once what the caret is in (a heading,
+  bold text, a table). They could stay on the previous state until something
+  else on the page changed.
+
 ## [0.9.0] - 2026-10-28
 
 Version info and release notes in the app, Word and ODT export, page
