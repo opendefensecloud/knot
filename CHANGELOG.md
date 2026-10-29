@@ -15,6 +15,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - The editor toolbar's buttons show at once what the caret is in (a heading,
   bold text, a table). They could stay on the previous state until something
   else on the page changed.
+- Text typed after a link pasted from a web page, Google Docs or Word is no
+  longer underlined. The link brought the source page's underline along, and
+  the underline carried on past the link's end. Pasted links now drop it;
+  links copied or dragged within knot keep an underline the author gave
+  them. Links pasted before the fix keep theirs, and so does text typed after
+  them.
 
 ## [0.9.0] - 2026-10-28
 

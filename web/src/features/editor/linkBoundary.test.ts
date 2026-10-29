@@ -29,6 +29,15 @@ function stubCaretCoords(view: EditorView) {
   view.coordsAtPos = () => ({ left: 0, right: 0, top: 0, bottom: 0 });
 }
 
+/** The first paragraph's text nodes with the names of their marks. */
+function markRuns(bound: BoundEditor): { text: string; marks: string[] }[] {
+  const runs: { text: string; marks: string[] }[] = [];
+  bound.editor.state.doc.firstChild?.forEach((inline) => {
+    runs.push({ text: inline.text ?? "", marks: inline.marks.map((mark) => mark.type.name) });
+  });
+  return runs;
+}
+
 function datePickerIsOpen(bound: BoundEditor): boolean {
   return bound.editor.storage.knotDateTime.popup?.isOpen() ?? false;
 }
@@ -90,6 +99,104 @@ describe("text after a pasted link", () => {
     expect(linkRuns(bound)).toEqual([
       { text: "Example", href: "https://example.com" },
       { text: " more", href: null },
+    ]);
+  });
+
+  // A link copied from a web page arrives styled the way that page showed
+  // it, and Underline's parser turns `text-decoration: underline` into a
+  // mark of its own. Underline is inclusive, so once the (non-inclusive)
+  // link ended, the underline carried on into whatever was typed next.
+  it.each([
+    ["styled anchor", '<a href="https://example.com" style="text-decoration: underline">Example</a>'],
+    [
+      "Google Docs span",
+      '<a href="https://example.com" style="text-decoration:none"><span style="text-decoration:underline">Example</span></a>',
+    ],
+    ["<u> inside the anchor", '<a href="https://example.com"><u>Example</u></a>'],
+  ])("does not continue a pasted link's underline (%s)", (_source, html) => {
+    bound = mountBoundEditor();
+    bound.editor.view.pasteHTML(html, pasteEvent());
+    typeText(bound.editor.view, " more");
+
+    expect(markRuns(bound)).toEqual([
+      { text: "Example", marks: ["link"] },
+      { text: " more", marks: [] },
+    ]);
+  });
+
+  it("drops a pasted link's underline inside a Google Docs list", () => {
+    // An open slice: the list wrapper is pasted around the link.
+    bound = mountBoundEditor();
+    bound.editor.view.pasteHTML(
+      '<b style="font-weight:normal;" id="docs-internal-guid-1"><ul><li><p><a href="https://example.com" style="text-decoration:none"><span style="text-decoration:underline">Example</span></a></p></li></ul></b>',
+      pasteEvent(),
+    );
+
+    const linked: string[][] = [];
+    bound.editor.state.doc.descendants((node) => {
+      if (node.isText && node.marks.some((mark) => mark.type.name === "link")) {
+        linked.push(node.marks.map((mark) => mark.type.name));
+      }
+    });
+    expect(linked).toEqual([["link"]]);
+  });
+
+  it("drops the underline of a line break inside a pasted link", () => {
+    bound = mountBoundEditor();
+    bound.editor.view.pasteHTML(
+      '<p><a href="https://example.com" style="text-decoration:underline">foo<br>bar</a></p>',
+      pasteEvent(),
+    );
+
+    expect(markRuns(bound).map((run) => run.marks)).toEqual([["link"], ["link"], ["link"]]);
+  });
+
+  it("keeps an underline the author gave a link when it is copied within knot", () => {
+    bound = mountBoundEditor();
+    bound.editor.commands.setContent(
+      '<p><a href="https://example.com"><u>Example</u></a> tail</p>',
+    );
+    const { view } = bound.editor;
+    const { dom } = view.serializeForClipboard(view.state.doc.slice(1, 8));
+    placeSelection(bound, view.state.doc.content.size - 1);
+    view.pasteHTML(dom.innerHTML, pasteEvent());
+
+    expect(markRuns(bound)).toEqual([
+      { text: "Example", marks: ["link", "underline"] },
+      { text: " tail", marks: [] },
+      { text: "Example", marks: ["link", "underline"] },
+    ]);
+  });
+
+  it("keeps an underline the author gave a link when it is dragged within knot", () => {
+    bound = mountBoundEditor();
+    bound.editor.commands.setContent('<p><a href="https://example.com"><u>Example</u></a></p>');
+    const { view } = bound.editor;
+    let slice = view.state.doc.slice(1, 8);
+    view.dragging = { slice, move: true };
+    view.someProp("transformPasted", (transform) => {
+      slice = transform(slice, view, false);
+    });
+    view.dragging = null;
+
+    const marks: string[] = [];
+    slice.content.descendants((node) => {
+      if (node.isText) marks.push(...node.marks.map((mark) => mark.type.name));
+    });
+    expect(marks).toEqual(["link", "underline"]);
+  });
+
+  it("keeps the underline of pasted text that is not a link", () => {
+    bound = mountBoundEditor();
+    bound.editor.view.pasteHTML(
+      '<p><u>under</u> and <a href="https://example.com">Example</a></p>',
+      pasteEvent(),
+    );
+
+    expect(markRuns(bound)).toEqual([
+      { text: "under", marks: ["underline"] },
+      { text: " and ", marks: [] },
+      { text: "Example", marks: ["link"] },
     ]);
   });
 
