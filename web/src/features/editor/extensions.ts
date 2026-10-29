@@ -3,7 +3,8 @@ import CollaborationCaret from "@tiptap/extension-collaboration-caret";
 import Image from "@tiptap/extension-image";
 import Link from "@tiptap/extension-link";
 import Underline from "@tiptap/extension-underline";
-import { Plugin, Selection, type Transaction } from "@tiptap/pm/state";
+import { Fragment, Slice, type Node as ProseMirrorNode } from "@tiptap/pm/model";
+import { Plugin, PluginKey, Selection, type Transaction } from "@tiptap/pm/state";
 import StarterKit from "@tiptap/starter-kit";
 import { ySyncPluginKey } from "@tiptap/y-tiptap";
 import type { Awareness } from "y-protocols/awareness";
@@ -91,17 +92,70 @@ const KnotLink = Link.extend({
    * Adjusts two upstream plugins; see localAutolinkOnly and
    * caretAfterPastedLink. Both are found by their key names because upstream
    * exports neither; autolink.test.ts and linkBoundary.test.ts fail if a
-   * lookup ever stops matching.
+   * lookup ever stops matching. Adds pastedLinksWithoutUnderline.
    */
   addProseMirrorPlugins() {
-    return (this.parent?.() ?? []).map((plugin) => {
+    const upstream = (this.parent?.() ?? []).map((plugin) => {
       const keyName = (plugin as unknown as { key?: string }).key ?? "";
       if (keyName.startsWith("autolink$")) return localAutolinkOnly(plugin);
       if (keyName.startsWith("handlePasteLink$")) return caretAfterPastedLink(plugin);
       return plugin;
     });
+    return [...upstream, pastedLinksWithoutUnderline()];
   },
 });
+
+/**
+ * Pasted links lose the underline they were copied with.
+ *
+ * A link copied from a web page, Google Docs or Word carries the source's
+ * link styling — `text-decoration: underline` on the anchor or on a span in
+ * it — and Underline's parser turns that into an `underline` mark beside
+ * `link`. Underline is inclusive and the link is not (see KnotLink), so at
+ * the link's end the underline carried on into everything typed next: text
+ * that was not part of the link, yet looked like it.
+ *
+ * Knot does not underline links, so an underline arriving with one is the
+ * source page's look, not the author's. Underline on text outside a link is
+ * kept, and so is content copied or dragged within knot (or from another
+ * ProseMirror editor, which marks its clipboard HTML with `data-pm-slice`,
+ * the same test Tiptap's paste rules use): there an underlined link was
+ * underlined on purpose, with Mod-U. External drops go through the same
+ * clipboard parser and are handled like pastes.
+ *
+ * Not covered: an underlined URL pasted without an anchor, which the link
+ * paste rule only links after this has run.
+ */
+function pastedLinksWithoutUnderline(): Plugin {
+  // transformPastedHTML and transformPasted run in one parseFromClipboard
+  // call, so the flag never outlives the paste it describes.
+  let fromProseMirror = false;
+  return new Plugin({
+    key: new PluginKey("knotPastedLinkUnderline"),
+    props: {
+      transformPastedHTML(html) {
+        fromProseMirror = html.includes("data-pm-slice");
+        return html;
+      },
+      transformPasted(slice, view) {
+        const internal = fromProseMirror || view.dragging !== null;
+        fromProseMirror = false;
+        const { link, underline } = view.state.schema.marks;
+        if (internal || !link || !underline) return slice;
+        const strip = (fragment: Fragment): Fragment => {
+          const nodes: ProseMirrorNode[] = [];
+          fragment.forEach((node) => {
+            let next = node.isText ? node : node.copy(strip(node.content));
+            if (link.isInSet(next.marks)) next = next.mark(underline.removeFromSet(next.marks));
+            nodes.push(next);
+          });
+          return Fragment.fromArray(nodes);
+        };
+        return new Slice(strip(slice.content), slice.openStart, slice.openEnd);
+      },
+    },
+  });
+}
 
 /**
  * Autolink only the local user's own typing.
