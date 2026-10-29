@@ -8,29 +8,48 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-29
+
+A search box for the Members page, and fixes to links in the editor: page
+links, @-mentions and dates work as links again, and text typed after a
+pasted link is no longer underlined.
+
+### Upgrading
+- Nothing to do. This release changes only the web app: no database
+  migrations, no configuration or Helm chart changes, and rolling back to
+  0.9.0 works as is.
+
 ### Added
 - A search box above the Members table filters it by name, email or role
-  as you type, and shows how many members match. Escape clears it.
-### Fixed
-- The editor toolbar's buttons show at once what the caret is in (a heading,
-  bold text, a table). They could stay on the previous state until something
-  else on the page changed.
-- Text typed after a link pasted from a web page, Google Docs or Word is no
-  longer underlined. The link brought the source page's underline along, and
-  the underline carried on past the link's end. Pasted links now drop it;
-  links copied or dragged within knot keep an underline the author gave
-  them. Links pasted before the fix keep theirs, and so does text typed after
-  them.
-- Page links, @-mentions and dates in the editor work as links again. In
-  Safari, typing right after one turned it into plain text for everyone.
-  Clicking a page link now opens the page, clicking a date in edit mode
-  opens its picker, copying one within knot keeps the link, and the link
-  popover's Document tab links selected text instead of doing nothing.
+  as you type, and shows how many members match. Escape clears it. (#58)
 
 ### Changed
-- Page links, @-mentions and dates show as coloured pills, as their styles
-  always intended. The styles never matched what the editor renders, so
-  these links looked like any other link.
+- Page links, @-mentions and dates in the editor show as coloured pills, so
+  you can tell them apart from links to the web at a glance. Their styles
+  were always meant to do this, but never matched what the editor renders,
+  so they looked like any other link. (#61)
+
+### Fixed
+- Page links, @-mentions and dates in the editor work as links again:
+  - In Safari, typing right after one no longer turns it into plain text.
+    This change was saved for everyone working on the page.
+  - Clicking a page link opens the page, and clicking a date in edit mode
+    opens its date picker. Both clicks did nothing.
+  - Copying one within knot pastes it as a link, not as plain text.
+  - The link popover's Document tab now links selected text to a page. It
+    did nothing before. (#61)
+- Text typed after a link pasted from a web page, Google Docs or Word is no
+  longer underlined. The link brought the source page's underline along,
+  and the underline carried on past the link's end. Pasted links now drop
+  it; links copied or dragged within knot keep an underline you gave them.
+  Links pasted before this release keep theirs, and so does text typed
+  after them. (#60)
+- The page Permissions dialog lists people by name and email instead of a
+  raw `user:<id>`. A grant for someone who has left the workspace shows as
+  "Former member". (#57)
+- The editor toolbar's buttons show at once what the caret is in (a heading,
+  bold text, a table). They could stay on the previous state until something
+  else on the page changed. (#59)
 
 ## [0.9.0] - 2026-10-28
 
@@ -779,7 +798,9 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/opendefensecloud/knot/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/opendefensecloud/knot/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/opendefensecloud/knot/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/opendefensecloud/knot/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/opendefensecloud/knot/compare/v0.6.0...v0.7.0
