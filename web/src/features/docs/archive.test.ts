@@ -34,6 +34,15 @@ describe("archiveErrorText", () => {
     expect(archiveErrorText("doc.archived")).toBe("It is already in the archive.");
     expect(archiveErrorText("internal")).toBe("Couldn't move it to the archive.");
   });
+
+  it("explains restricted-page refusals", () => {
+    expect(archiveErrorText("doc.hidden_descendants")).toBe(
+      "This page has subpages you can't see. Ask their owners to move them first.",
+    );
+    expect(archiveErrorText("doc.restore_restricted_parent_archived")).toBe(
+      "Restore the archived parent page first.",
+    );
+  });
 });
 
 describe("daysUntil", () => {

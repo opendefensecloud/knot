@@ -898,3 +898,165 @@ async fn body_over_4096_returns_413() {
         "body >4096: expected 413, got {status}: {json}"
     );
 }
+
+/// Add a member with `role` whose display name is `name`; returns their id.
+async fn add_member(
+    state: &AppState,
+    ws_id: Uuid,
+    email: &str,
+    name: &str,
+    role: WorkspaceRole,
+) -> Uuid {
+    let hash = state.hasher.hash("hunter22").unwrap();
+    let user = state
+        .users
+        .as_ref()
+        .unwrap()
+        .create_local(email, name, &hash)
+        .await
+        .unwrap();
+    state
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .add_member(ws_id, user.id, role)
+        .await
+        .unwrap();
+    user.id
+}
+
+/// Give `grantee` `role` on `doc_id`, inheriting to its subpages.
+async fn grant(
+    state: &AppState,
+    ws_id: Uuid,
+    doc_id: Uuid,
+    grantee: Uuid,
+    role: WorkspaceRole,
+    actor: Uuid,
+) {
+    state
+        .grants
+        .as_ref()
+        .unwrap()
+        .put(ws_id, doc_id, &format!("user:{grantee}"), role, true, actor)
+        .await
+        .unwrap();
+}
+
+/// A workspace owner whose access to a restricted doc is an editor grant
+/// moderates nothing there: deleting others' comments takes the effective
+/// doc role Owner, which the restricting member has.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_owner_with_editor_grant_cannot_delete_others_comment_in_restricted_doc() {
+    let (state, ws_id, doc_id, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    let bob = add_bob(&state, ws_id, WorkspaceRole::Editor).await;
+    state
+        .docs
+        .as_ref()
+        .unwrap()
+        .set_restricted(ws_id, doc_id, bob, true)
+        .await
+        .unwrap();
+    grant(&state, ws_id, doc_id, alice, WorkspaceRole::Editor, bob).await;
+    let app = router_with_state(state);
+    let (sid_alice, csrf_alice) = login(&app, "alice@example.com").await;
+    let (sid_bob, csrf_bob) = login(&app, "bob@example.com").await;
+
+    let (status, bob_comment) = post_json(
+        &app,
+        &format!("/api/docs/{doc_id}/comments"),
+        &sid_bob,
+        &csrf_bob,
+        serde_json::json!({"body": "Bob's comment"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{bob_comment}");
+    let bob_comment_id = bob_comment["id"].as_str().unwrap();
+    let (status, alice_comment) = post_json(
+        &app,
+        &format!("/api/docs/{doc_id}/comments"),
+        &sid_alice,
+        &csrf_alice,
+        serde_json::json!({"body": "Alice's comment"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{alice_comment}");
+    let alice_comment_id = alice_comment["id"].as_str().unwrap();
+
+    let status = delete_req(
+        &app,
+        &format!("/api/docs/{doc_id}/comments/{bob_comment_id}"),
+        &sid_alice,
+        &csrf_alice,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the workspace role does not moderate a restricted doc"
+    );
+
+    let status = delete_req(
+        &app,
+        &format!("/api/docs/{doc_id}/comments/{alice_comment_id}"),
+        &sid_bob,
+        &csrf_bob,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the doc's owner by grant moderates it, workspace editor or not"
+    );
+}
+
+/// `@bob @carol` on a restricted doc only Carol was granted notifies Carol.
+#[tokio::test(flavor = "multi_thread")]
+async fn mention_broadcast_skips_members_without_access() {
+    let (state, ws_id, doc_id, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    add_bob(&state, ws_id, WorkspaceRole::Editor).await;
+    let carol = add_member(
+        &state,
+        ws_id,
+        "carol@example.com",
+        "Carol",
+        WorkspaceRole::Viewer,
+    )
+    .await;
+    state
+        .docs
+        .as_ref()
+        .unwrap()
+        .set_restricted(ws_id, doc_id, alice, true)
+        .await
+        .unwrap();
+    grant(&state, ws_id, doc_id, carol, WorkspaceRole::Viewer, alice).await;
+    let mut listener = sqlx::postgres::PgListener::connect_with(state.pool.as_ref().unwrap())
+        .await
+        .unwrap();
+    listener.listen("comment_mentions").await.unwrap();
+    let app = router_with_state(state);
+    let (sid_alice, csrf_alice) = login(&app, "alice@example.com").await;
+
+    let (status, comment) = post_json(
+        &app,
+        &format!("/api/docs/{doc_id}/comments"),
+        &sid_alice,
+        &csrf_alice,
+        serde_json::json!({"body": "@bob @carol please look"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{comment}");
+
+    let notification = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
+        .await
+        .expect("a mention notification")
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(notification.payload()).unwrap();
+    assert_eq!(payload["comment_id"], comment["id"]);
+    assert_eq!(
+        payload["user_ids"],
+        serde_json::json!([carol]),
+        "Bob, a workspace editor without a grant, is not told: {payload}"
+    );
+}

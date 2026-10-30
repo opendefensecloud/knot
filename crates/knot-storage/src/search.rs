@@ -35,11 +35,15 @@ pub struct SearchHit {
 
 #[async_trait]
 pub trait SearchStore: Send + Sync {
+    /// Up to `limit` live docs matching `q`, best first. Docs in `hidden`
+    /// (those the caller can't read) are left out before the limit is
+    /// applied, so they can't crowd readable matches out of the page.
     async fn search(
         &self,
         workspace_id: Uuid,
         q: &str,
         limit: i64,
+        hidden: &[Uuid],
     ) -> Result<Vec<SearchHit>, SearchStoreError>;
 }
 
@@ -81,6 +85,7 @@ impl SearchStore for PgSearchStore {
         workspace_id: Uuid,
         q: &str,
         limit: i64,
+        hidden: &[Uuid],
     ) -> Result<Vec<SearchHit>, SearchStoreError> {
         let Some(ts) = to_prefix_tsquery(q) else {
             return Ok(vec![]);
@@ -105,6 +110,7 @@ impl SearchStore for PgSearchStore {
               LEFT JOIN doc_markdown_cache c ON c.doc_id = d.id
              WHERE d.workspace_id = $1
                AND d.archived_at IS NULL
+               AND NOT (d.id = ANY($4))
                AND (
                      d.title_tsv @@ to_tsquery('english', $2)
                   OR c.body_tsv  @@ to_tsquery('english', $2)
@@ -116,6 +122,7 @@ impl SearchStore for PgSearchStore {
         .bind(workspace_id)
         .bind(&ts)
         .bind(limit)
+        .bind(hidden)
         .fetch_all(&self.pool)
         .await?;
 

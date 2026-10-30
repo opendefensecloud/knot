@@ -1,9 +1,10 @@
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
-import { ChevronRight, FileText, MoreHorizontal, Plus } from "lucide-react";
+import { ChevronRight, FileText, Lock, MoreHorizontal, Plus } from "lucide-react";
 import { useCallback, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
+import type { Role } from "../../auth/useEffectiveRole";
 import { ContextMenu, type ContextMenuItem } from "../../components/ContextMenu";
 import { IconButton } from "../../components/ui/IconButton";
 import { useUi } from "../../stores/ui";
@@ -48,8 +49,10 @@ const ALT_ARROWS: Partial<Record<string, MoveCmd>> = {
 export type TreeState = {
   /** The page open in the editor. */
   openId?: string;
-  canEdit: boolean;
-  isOwner: boolean;
+  /** The user's workspace role: a row's role when the list doesn't say. */
+  workspaceRole: Role | null;
+  /** Whether any page can be dragged: rows are drop targets only then. */
+  dragEnabled: boolean;
   retentionDays: number;
   /** The rendered rows by id, from `flattenVisible`. */
   rows: ReadonlyMap<string, FlatRow>;
@@ -73,16 +76,23 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
   const qc = useQueryClient();
   const nav = useNavigate();
   const notify = useUi((s) => s.notify);
-  const { canEdit, isOwner } = tree;
+  // Row actions follow the user's role on this page, which a restricted
+  // page sets apart from the workspace role. The server always sends it;
+  // the workspace role stands in only for a list that doesn't.
+  const rowRole = node.effective_role ?? tree.workspaceRole;
+  const canEdit = rowRole === "owner" || rowRole === "editor";
+  const isOwner = rowRole === "owner";
+  // A page whose parent is hidden stays where it is: it can't be dragged.
+  const draggable = canEdit && !node.parent_hidden;
   // Opened from the keyboard, the menu gives focus back to the link when it closes.
   const [menu, setMenu] = useState<{ x: number; y: number; byKeyboard?: boolean } | null>(null);
   const linkRef = useRef<HTMLAnchorElement | null>(null);
 
   const { attributes, listeners, setNodeRef: setDragNode, isDragging } = useDraggable({
     id: node.id,
-    disabled: !canEdit,
+    disabled: !draggable,
   });
-  const { setNodeRef: setDropNode } = useDroppable({ id: node.id, disabled: !canEdit });
+  const { setNodeRef: setDropNode } = useDroppable({ id: node.id, disabled: !tree.dragEnabled });
   const setRowNode = useCallback(
     (el: HTMLDivElement | null) => {
       setDragNode(el);
@@ -134,13 +144,17 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
   const items: ContextMenuItem[] = [];
   if (canEdit) {
     items.push({ label: "Rename", testId: "ctx-rename", onSelect: () => void onRename() });
-    items.push({
-      label: "Duplicate…",
-      testId: "ctx-duplicate",
-      // One copy of a page at a time: picking it again would make a second.
-      disabled: copying,
-      onSelect: () => tree.onDuplicate(node),
-    });
+    // The copy goes next to the page, under a parent the user can't see when
+    // it is hidden: the server refuses that.
+    if (!node.parent_hidden) {
+      items.push({
+        label: "Duplicate…",
+        testId: "ctx-duplicate",
+        // One copy of a page at a time: picking it again would make a second.
+        disabled: copying,
+        onSelect: () => tree.onDuplicate(node),
+      });
+    }
     for (const m of MOVE_ITEMS) {
       items.push({
         label: m.label,
@@ -230,8 +244,8 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
           ref={linkRef}
           data-testid={`doc-row-${node.id}`}
           to={`/doc/${node.id}`}
-          // Viewers can't move pages, so they don't hear how to drag one.
-          aria-describedby={canEdit ? `${attributes["aria-describedby"]} ${descId}` : descId}
+          // Pages the user can't move don't tell them how to drag them.
+          aria-describedby={draggable ? `${attributes["aria-describedby"]} ${descId}` : descId}
           // With no items there is no menu of ours, and the browser's opens.
           onContextMenu={(e) => {
             if (items.length === 0) return;
@@ -261,9 +275,16 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
         >
           {node.title}
         </Link>
+        {node.restricted ? (
+          <Lock size={12} role="img" aria-label="Restricted" className="text-fg-muted shrink-0" />
+        ) : (
+          node.within_restricted && (
+            <Lock size={12} role="img" aria-label="In a restricted page" className="text-fg-muted/50 shrink-0" />
+          )
+        )}
         {copying && <span className="shrink-0 text-[11px] text-fg-muted">Duplicating…</span>}
         <span id={descId} className="sr-only">
-          {row && rowDescription(row)}
+          {row && rowDescription(row, node.within_restricted)}
         </span>
         {canEdit && (
           <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5">

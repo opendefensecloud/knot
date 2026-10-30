@@ -575,3 +575,273 @@ async fn public_board_svg_404_when_no_preview() {
     let (status, _, _) = anon_get_board_svg(&app, &token, board.id).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------
+// Restricted documents
+// ---------------------------------------------------------------------------
+
+async fn post_json(
+    app: &axum::Router,
+    sid: &str,
+    csrf: &str,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("cookie", format!("{sid}; csrf={csrf}"))
+                .header("x-csrf-token", csrf)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}));
+    (status, json)
+}
+
+/// Anonymous GET of any `/p/*` path; returns the status, the
+/// `Cache-Control` header and the body as text.
+async fn anon_get_with_cache_control(
+    app: &axum::Router,
+    uri: &str,
+) -> (StatusCode, Option<String>, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let cache_control = response
+        .headers()
+        .get("cache-control")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        cache_control,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+/// A top-level restricted doc "Vault" created by `actor`, who gets the
+/// owner grant restricting gives.
+async fn restricted_vault(state: &AppState, workspace_id: Uuid, actor: Uuid) -> Uuid {
+    let docs = state.docs.as_ref().unwrap();
+    let vault = docs
+        .create(workspace_id, None, "Vault", "v", actor)
+        .await
+        .unwrap();
+    docs.set_restricted(workspace_id, vault.id, actor, true)
+        .await
+        .unwrap();
+    vault.id
+}
+
+/// Neither a restriction boundary nor a page below one can get a public
+/// link.
+#[tokio::test(flavor = "multi_thread")]
+async fn cannot_create_share_inside_restricted_subtree() {
+    let (state, workspace_id, _doc_id, alice_id) = state_with_seeded(WorkspaceRole::Owner).await;
+    let vault_id = restricted_vault(&state, workspace_id, alice_id).await;
+    let child = state
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(workspace_id, Some(vault_id), "Child", "m", alice_id)
+        .await
+        .unwrap();
+    let app = router_with_state(state);
+    let (sid, csrf) = login_alice(&app).await;
+
+    for target_id in [vault_id, child.id] {
+        let (status, json) =
+            create_share(&app, &sid, &csrf, target_id, serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["error"]["code"], "share.restricted");
+    }
+}
+
+/// A link created before its doc was moved into a restricted subtree stops
+/// resolving, for the page and for its board previews alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn share_stops_working_when_doc_moved_into_restricted_subtree() {
+    let (state, workspace_id, doc_id, alice_id) = state_with_seeded(WorkspaceRole::Owner).await;
+    state
+        .markdown_cache
+        .as_ref()
+        .unwrap()
+        .put(doc_id, 1, "# Share Me\n\nbody text")
+        .await
+        .unwrap();
+    let boards = state.boards.as_ref().unwrap().clone();
+    let board = boards.create(doc_id, alice_id, None).await.unwrap();
+    boards.set_svg(board.id, b"<svg/>").await.unwrap();
+    let vault_id = restricted_vault(&state, workspace_id, alice_id).await;
+    let app = router_with_state(state);
+    let (sid, csrf) = login_alice(&app).await;
+
+    let (status, json) = create_share(&app, &sid, &csrf, doc_id, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = json["token"].as_str().unwrap().to_string();
+    let (status, _) = anon_get_token(&app, &token).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, json) = post_json(
+        &app,
+        &sid,
+        &csrf,
+        &format!("/api/docs/{doc_id}/move"),
+        serde_json::json!({ "parent_id": vault_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    let (status, body) = anon_get_token(&app, &token).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert!(
+        !body.contains("body text"),
+        "restricted content leaked: {body}"
+    );
+    // As for a dead link, the board preview answers 404.
+    let (status, _, _) = anon_get_board_svg(&app, &token, board.id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A shared page that links to a doc in a restricted subtree renders that
+/// link as a dead anchor, even when the target still has an active link of
+/// its own (it was shared before being moved in).
+#[tokio::test(flavor = "multi_thread")]
+async fn public_page_does_not_link_to_restricted_targets() {
+    let (state, workspace_id, doc_id, alice_id) = state_with_seeded(WorkspaceRole::Owner).await;
+    let docs = state.docs.as_ref().unwrap().clone();
+    let target = docs
+        .create(workspace_id, None, "Target", "t", alice_id)
+        .await
+        .unwrap();
+    state
+        .markdown_cache
+        .as_ref()
+        .unwrap()
+        .put(
+            doc_id,
+            1,
+            &format!("# Share Me\n\n[See target](knot://doc/{})\n", target.id),
+        )
+        .await
+        .unwrap();
+    let vault_id = restricted_vault(&state, workspace_id, alice_id).await;
+    let app = router_with_state(state);
+    let (sid, csrf) = login_alice(&app).await;
+
+    let (status, json) = create_share(&app, &sid, &csrf, doc_id, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = json["token"].as_str().unwrap().to_string();
+    let (status, json) = create_share(&app, &sid, &csrf, target.id, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let target_token = json["token"].as_str().unwrap().to_string();
+
+    // Before the move the link points at the target's share.
+    let (status, body) = anon_get_token(&app, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&format!("/p/{target_token}")),
+        "expected link to the target's share: {body}"
+    );
+
+    docs.move_placed(
+        workspace_id,
+        target.id,
+        alice_id,
+        Some(vault_id),
+        knot_storage::Placement::Last,
+        true,
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = anon_get_token(&app, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains(&format!("/p/{target_token}")),
+        "restricted target still linked: {body}"
+    );
+    assert!(body.contains("See target"), "link text dropped: {body}");
+    assert!(
+        body.contains("href=\"#\""),
+        "expected a dead anchor: {body}"
+    );
+}
+
+/// Every successful `/p/*` response is `private, no-cache`, so no shared
+/// cache keeps serving a page after its link stops working.
+#[tokio::test(flavor = "multi_thread")]
+async fn public_responses_are_private_no_cache() {
+    let (state, workspace_id, doc_id, alice_id) = state_with_seeded(WorkspaceRole::Owner).await;
+    state
+        .markdown_cache
+        .as_ref()
+        .unwrap()
+        .put(doc_id, 1, "# Share Me\n\nbody text")
+        .await
+        .unwrap();
+    let boards = state.boards.as_ref().unwrap().clone();
+    let board = boards.create(doc_id, alice_id, None).await.unwrap();
+    boards.set_svg(board.id, b"<svg/>").await.unwrap();
+    let blob_id = Uuid::new_v4();
+    let blob_bytes = b"\x89PNG fake".to_vec();
+    state
+        .blob_meta
+        .as_ref()
+        .unwrap()
+        .insert(&knot_storage::BlobMetadata {
+            id: blob_id,
+            workspace_id,
+            doc_id,
+            content_type: "image/png".into(),
+            byte_size: blob_bytes.len() as i64,
+            sha256: vec![0; 32],
+            original_name: None,
+            created_by: alice_id,
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    state
+        .blob_store
+        .as_ref()
+        .unwrap()
+        .put(blob_id, &blob_bytes, "image/png")
+        .await
+        .unwrap();
+    let app = router_with_state(state);
+    let (sid, csrf) = login_alice(&app).await;
+
+    let (status, json) = create_share(&app, &sid, &csrf, doc_id, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = json["token"].as_str().unwrap().to_string();
+
+    for uri in [
+        format!("/p/{token}"),
+        format!("/p/{token}/blobs/{blob_id}"),
+        format!("/p/{token}/boards/{}/svg", board.id),
+    ] {
+        let (status, cache_control, _) = anon_get_with_cache_control(&app, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(cache_control.as_deref(), Some("private, no-cache"), "{uri}");
+    }
+}

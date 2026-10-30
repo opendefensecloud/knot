@@ -1,14 +1,18 @@
 //! Documents API:
-//! - GET    /api/docs            flat list (alive only)
+//! - GET    /api/docs            flat list (alive, readable only; per-doc role)
 //! - POST   /api/docs            body: {title?, parent_id?, after_id?}
 //! - GET    /api/docs/{id}        metadata + effective_role (+ archive state)
 //! - PATCH  /api/docs/{id}        rename / icon
+//! - PUT    /api/docs/{id}/restricted  body: {restricted}; make it a restriction boundary (owner)
+//! - GET    /api/docs/{id}/access  who can see it, for the permissions dialog (any reader)
 //! - POST   /api/docs/{id}/move   reparent / reorder
-//! - POST   /api/docs/{id}/duplicate  body: {include_subpages?}; copy right after it (editor+)
+//! - POST   /api/docs/{id}/duplicate  body: {include_subpages?}; copy right after it (editor+ here and on the parent)
 //! - DELETE /api/docs/{id}        move to the archive, with its subtree (editor+)
 //! - POST   /api/docs/{id}/restore  bring an archive root back (editor+)
 //! - POST   /api/docs/{id}/purge  delete an archive root for good (owner)
 //! - GET    /api/workspace/archive  archive roots, newest first (editor+)
+
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -18,6 +22,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
+use knot_docs::Visibility;
 use knot_storage::{Document, PersonRef, Placement, WorkspaceRole};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -39,9 +44,15 @@ struct DocResponse {
     created_by: String,
     archived: bool,
     is_template: bool,
+    /// A restriction boundary (only explicit grants give access below it).
+    restricted: bool,
 }
 
-fn to_response(d: &Document) -> DocResponse {
+/// `d` as stored, parent included. Never sent as is: a parent may be a
+/// hidden restricted folder. Responses go through [`caller_doc_response`] (one
+/// doc) or [`listed_response`] (listings), which null a parent the caller
+/// can't read.
+fn unfiltered_response(d: &Document) -> DocResponse {
     DocResponse {
         id: d.id.to_string(),
         workspace_id: d.workspace_id.to_string(),
@@ -52,6 +63,7 @@ fn to_response(d: &Document) -> DocResponse {
         created_by: d.created_by.to_string(),
         archived: d.archived_at.is_some(),
         is_template: d.is_template,
+        restricted: d.restricted,
     }
 }
 
@@ -96,6 +108,11 @@ pub fn router(state: AppState) -> Router<AppState> {
             get(crate::routes::api::contributors::byline),
         )
         .route("/api/docs/{id}/template", post(set_template_inline))
+        .route("/api/docs/{id}/restricted", put(set_restricted_inline))
+        .route(
+            "/api/docs/{id}/access",
+            get(crate::routes::api::grants::access_inline),
+        )
         .route(
             "/api/docs/from-template/{id}",
             post(create_from_template_inline),
@@ -108,6 +125,133 @@ pub fn router(state: AppState) -> Router<AppState> {
     list_routes.merge(doc_id_routes)
 }
 
+/// One sidebar entry: a doc the caller can read, with their role on it.
+#[derive(Serialize)]
+struct ListedDoc {
+    #[serde(flatten)]
+    doc: DocResponse,
+    /// The caller's role on this doc (grants can raise it above the
+    /// workspace role, and restrictions replace the workspace role).
+    effective_role: &'static str,
+    /// In a restricted subtree: the doc or an ancestor is a boundary.
+    within_restricted: bool,
+    /// The doc has a parent the caller can't read. `parent_id` is then
+    /// `null`, so the hidden parent's id never reaches the client, and the
+    /// sidebar shows the doc under "Shared with you".
+    parent_hidden: bool,
+}
+
+/// The caller's access to every doc of their workspace, known to cover
+/// `listed_docs` and their parents (a parent the snapshot doesn't know
+/// would be taken for hidden). Listings filter through it; on error they
+/// answer 500 rather than an unfiltered list.
+async fn caller_visibility(
+    state: &AppState,
+    ctx: &AuthContext,
+    listed_docs: &[Document],
+) -> Result<Arc<Visibility>, Response> {
+    let covered_ids: Vec<Uuid> = listed_docs
+        .iter()
+        .flat_map(|doc| std::iter::once(doc.id).chain(doc.parent_id))
+        .collect();
+    visibility_covering_ids(state, ctx, &covered_ids).await
+}
+
+/// The caller's access to every doc of their workspace, known to cover
+/// `doc_ids` where they are in it. 500 on error.
+pub(super) async fn visibility_covering_ids(
+    state: &AppState,
+    ctx: &AuthContext,
+    doc_ids: &[Uuid],
+) -> Result<Arc<Visibility>, Response> {
+    let Some(acl) = state.acl.as_ref() else {
+        return Err(internal());
+    };
+    acl.visibility_covering(ctx.workspace_id, ctx.user_id, doc_ids)
+        .await
+        .map_err(|e| {
+            tracing::error!(error=?e, "visibility");
+            internal()
+        })
+}
+
+/// 409 `doc.hidden_descendants` when the caller can't read one of
+/// `subtree_ids`: archiving or purging them would hide or destroy pages
+/// they can't see. An archived page they only view counts, since viewers
+/// can't read archived pages. Says only that *something* is hidden, never
+/// what. Ids outside the workspace are not the caller's to judge, and are
+/// skipped.
+async fn refuse_hidden_descendants(
+    state: &AppState,
+    ctx: &AuthContext,
+    subtree_ids: &[Uuid],
+) -> Result<(), Response> {
+    let visibility = visibility_covering_ids(state, ctx, subtree_ids).await?;
+    let any_hidden = subtree_ids
+        .iter()
+        .any(|doc_id| visibility.covers(*doc_id) && !visibility.readable(*doc_id));
+    if any_hidden {
+        return Err(json_err(StatusCode::CONFLICT, "doc.hidden_descendants", ""));
+    }
+    Ok(())
+}
+
+/// `doc` as a listing shows it to the caller. A parent they can't read
+/// is nulled, so its id never reaches the client; the flag says so.
+fn listed_response(doc: &Document, visibility: &Visibility) -> (DocResponse, bool) {
+    let parent_hidden = doc
+        .parent_id
+        .is_some_and(|parent_id| !visibility.readable(parent_id));
+    let mut doc_response = unfiltered_response(doc);
+    if parent_hidden {
+        doc_response.parent_id = None;
+    }
+    (doc_response, parent_hidden)
+}
+
+/// `doc` as a single-doc answer shows it to the caller: every route that
+/// answers with one doc builds it here. A parent they can't read is
+/// nulled, so its id never reaches the client (a page shared from inside a
+/// hidden restricted folder must not name it). 500 on error.
+async fn caller_doc_response(
+    state: &AppState,
+    ctx: &AuthContext,
+    doc: &Document,
+) -> Result<DocResponse, Response> {
+    let mut doc_response = unfiltered_response(doc);
+    let Some(parent_id) = doc.parent_id else {
+        return Ok(doc_response);
+    };
+    let Some(acl) = state.acl.as_ref() else {
+        return Err(internal());
+    };
+    match acl
+        .effective_role(ctx.workspace_id, parent_id, ctx.user_id)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => doc_response.parent_id = None,
+        Err(e) => {
+            tracing::error!(error=?e, "doc response parent acl");
+            return Err(internal());
+        }
+    }
+    Ok(doc_response)
+}
+
+/// [`caller_doc_response`] as a JSON answer with `status`.
+async fn doc_answer(
+    state: &AppState,
+    ctx: &AuthContext,
+    status: StatusCode,
+    doc: &Document,
+) -> Response {
+    match caller_doc_response(state, ctx, doc).await {
+        Ok(doc_response) => (status, Json(doc_response)).into_response(),
+        Err(response) => response,
+    }
+}
+
 async fn list(State(state): State<AppState>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
@@ -115,12 +259,49 @@ async fn list(State(state): State<AppState>, req: Request) -> Response {
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
-    match docs.list_alive(ctx.workspace_id).await {
-        Ok(list) => Json(list.iter().map(to_response).collect::<Vec<_>>()).into_response(),
+    let alive_docs = match docs.list_alive(ctx.workspace_id).await {
+        Ok(alive_docs) => alive_docs,
         Err(e) => {
             tracing::error!(error=?e, "list");
-            internal()
+            return internal();
         }
+    };
+    let visibility = match caller_visibility(&state, &ctx, &alive_docs).await {
+        Ok(visibility) => visibility,
+        Err(response) => return response,
+    };
+    let listed: Vec<ListedDoc> = alive_docs
+        .iter()
+        .filter_map(|doc| {
+            let role = visibility.effective_role(doc.id)?;
+            let access = visibility.access(doc.id)?;
+            let (doc_response, parent_hidden) = listed_response(doc, &visibility);
+            Some(ListedDoc {
+                doc: doc_response,
+                effective_role: role.as_str(),
+                within_restricted: access.restriction_root.is_some(),
+                parent_hidden,
+            })
+        })
+        .collect();
+    Json(listed).into_response()
+}
+
+/// Where a create, from-template or move puts a page: under a parent, the
+/// caller must be able to edit there (see
+/// `restricted::require_editable_parent`); at the top level, their
+/// workspace role must be editor or owner.
+async fn require_editable_destination(
+    state: &AppState,
+    ctx: &AuthContext,
+    parent_id: Option<Uuid>,
+) -> Result<(), Response> {
+    match parent_id {
+        Some(parent_id) => crate::restricted::require_editable_parent(state, ctx, parent_id).await,
+        None if ctx.role == WorkspaceRole::Viewer => {
+            Err(json_err(StatusCode::FORBIDDEN, "acl.editor_required", ""))
+        }
+        None => Ok(()),
     }
 }
 
@@ -136,12 +317,17 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
-    if ctx.role == WorkspaceRole::Viewer {
-        return json_err(StatusCode::FORBIDDEN, "acl.editor_required", "");
-    }
     let Ok(body) = read_json::<CreateRequest>(req).await else {
         return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
     };
+    if let Err(response) = require_editable_destination(&state, &ctx, body.parent_id).await {
+        return response;
+    }
+    if let Err(response) =
+        crate::restricted::require_readable_anchors(&state, &ctx, &[body.after_id]).await
+    {
+        return response;
+    }
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
@@ -159,7 +345,19 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
         )
         .await
     {
-        Ok(d) => (StatusCode::CREATED, Json(to_response(&d))).into_response(),
+        Ok(d) => {
+            if let Err(response) = crate::restricted::ensure_creator_can_edit(
+                &state,
+                ctx.workspace_id,
+                d.id,
+                ctx.user_id,
+            )
+            .await
+            {
+                return response;
+            }
+            doc_answer(&state, &ctx, StatusCode::CREATED, &d).await
+        }
         // The key collided with one written outside placement, such as by
         // an older release during an upgrade. Retrying can succeed.
         Err(knot_storage::DocStoreError::Conflict) => {
@@ -184,13 +382,13 @@ async fn get_one(
     Path(doc_id): Path<Uuid>,
     req: Request,
 ) -> Response {
-    if req.extensions().get::<AuthContext>().is_none() {
+    let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
-    }
+    };
     let Some(role) = req.extensions().get::<EffectiveDocRole>().copied() else {
         return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
     };
-    let Some(docs) = state.docs.clone() else {
+    let (Some(docs), Some(acl)) = (state.docs.clone(), state.acl.clone()) else {
         return internal();
     };
     let doc = match docs.get(doc_id).await {
@@ -206,19 +404,73 @@ async fn get_one(
         #[serde(flatten)]
         doc: DocResponse,
         effective_role: String,
+        /// In a restricted subtree: the doc or an ancestor is a boundary.
+        within_restricted: bool,
+        /// The nearest boundary, when the caller can read it.
+        restriction_root_id: Option<String>,
         #[serde(flatten)]
         archive: ArchiveInfo,
     }
-    let archive = match archive_info(&state, &doc).await {
+    // Cached by the middleware's lookup a moment ago.
+    let access = match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
+        Ok(Some(access)) => access,
+        Ok(None) => return json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""),
+        Err(e) => {
+            tracing::error!(error=?e, "get acl");
+            return internal();
+        }
+    };
+    let mut archive = match archive_info(&state, &doc).await {
         Ok(info) => info,
         Err(e) => {
             tracing::error!(error = %e, "get archive info");
             return internal();
         }
     };
+    // Ids and titles of docs the caller can't read are never sent: a page
+    // shared from inside a hidden restricted folder must not name it.
+    let readable = |other_id: Uuid| {
+        let acl = acl.clone();
+        async move {
+            acl.effective_role(ctx.workspace_id, other_id, ctx.user_id)
+                .await
+                .map(|other_role| other_role.is_some())
+        }
+    };
+    let doc_response = match caller_doc_response(&state, &ctx, &doc).await {
+        Ok(doc_response) => doc_response,
+        Err(response) => return response,
+    };
+    let restriction_root_id = match access.restriction_root {
+        Some(root_id) if root_id == doc_id => Some(root_id),
+        Some(root_id) => match readable(root_id).await {
+            Ok(true) => Some(root_id),
+            Ok(false) => None,
+            Err(e) => {
+                tracing::error!(error=?e, "get restriction root acl");
+                return internal();
+            }
+        },
+        None => None,
+    };
+    if let Some(root_id) = archive.archive_root_id.filter(|root_id| *root_id != doc_id) {
+        match readable(root_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                archive.archive_root_id = None;
+                archive.archive_root_title = None;
+            }
+            Err(e) => {
+                tracing::error!(error=?e, "get archive root acl");
+                return internal();
+            }
+        }
+    }
     Json(GetResponse {
-        doc: to_response(&doc),
+        doc: doc_response,
         effective_role: role.0.as_str().into(),
+        within_restricted: access.restriction_root.is_some(),
+        restriction_root_id: restriction_root_id.map(|root_id| root_id.to_string()),
         archive,
     })
     .into_response()
@@ -313,7 +565,7 @@ async fn rename(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Re
         )
         .await
     {
-        Ok(d) => Json(to_response(&d)).into_response(),
+        Ok(d) => doc_answer(&state, &ctx, StatusCode::OK, &d).await,
         Err(knot_storage::DocStoreError::NotFound) => {
             json_err(StatusCode::NOT_FOUND, "doc.not_found", "")
         }
@@ -354,22 +606,49 @@ async fn move_doc(
 
     // Spec §6.1: `parent_id` in the request body is the *target* parent. An
     // explicit `null` (or omitted field, since serde collapses both to
-    // `None`) moves the doc to the workspace root. `move_placed` will surface
-    // `DocStoreError::NotFound` if the document doesn't exist, or if the
-    // target parent is not a page of this workspace, so we skip a pre-flight
-    // existence check here.
+    // `None`) moves the doc to the workspace root. A target parent the
+    // caller can't read answers like one no page has (`doc.not_found`), and
+    // so does an anchor (`doc.bad_anchor`).
     let new_parent = body.parent_id;
+    if let Err(response) = require_editable_destination(&state, &ctx, new_parent).await {
+        return response;
+    }
+    if let Err(response) =
+        crate::restricted::require_readable_anchors(&state, &ctx, &[body.after_id, body.before_id])
+            .await
+    {
+        return response;
+    }
     let placement = match (body.after_id, body.before_id) {
         (Some(after), _) => Placement::After(after),
         (None, Some(before)) => Placement::Before(before),
         (None, None) => Placement::Last,
     };
+    // Into a restricted subtree, out of one, or between two: owners only.
+    // Storage decides whether the move crosses, under the move's lock.
+    let allow_boundary_cross = role.0 == WorkspaceRole::Owner;
 
     match docs
-        .move_placed(ctx.workspace_id, doc_id, ctx.user_id, new_parent, placement)
+        .move_placed(
+            ctx.workspace_id,
+            doc_id,
+            ctx.user_id,
+            new_parent,
+            placement,
+            allow_boundary_cross,
+        )
         .await
     {
-        Ok(d) => Json(to_response(&d)).into_response(),
+        Ok(d) => {
+            // The invalidation evicts the subtree on every replica,
+            // asynchronously; evict here too, so a move into or out of a
+            // restricted subtree shows in this replica's next answer.
+            crate::archive::evict_local_subtree(&state, doc_id).await;
+            doc_answer(&state, &ctx, StatusCode::OK, &d).await
+        }
+        Err(knot_storage::DocStoreError::RestrictionBoundary) => {
+            json_err(StatusCode::FORBIDDEN, "acl.restricted_move", "")
+        }
         Err(knot_storage::DocStoreError::NotFound) => {
             json_err(StatusCode::NOT_FOUND, "doc.not_found", "")
         }
@@ -436,9 +715,16 @@ async fn duplicate(
     // On a task of its own (P16): dropping this handler, on the request
     // timeout or when the client goes away, can't stop a duplicate halfway.
     // The answer comes once the copy is stored, before its refresh.
-    let answer = crate::duplicate::start(state, ctx, role.0, doc_id, body.include_subpages, permit);
+    let answer = crate::duplicate::start(
+        state.clone(),
+        ctx.clone(),
+        role.0,
+        doc_id,
+        body.include_subpages,
+        permit,
+    );
     match answer.await {
-        Ok(Ok(top)) => (StatusCode::CREATED, Json(to_response(&top))).into_response(),
+        Ok(Ok(top)) => doc_answer(&state, &ctx, StatusCode::CREATED, &top).await,
         Ok(Err(e)) => duplicate_error(e),
         Err(_) => {
             tracing::error!("duplicate task ended without an answer");
@@ -468,6 +754,7 @@ fn duplicate_error(e: DuplicateError) -> Response {
             json_err(StatusCode::FORBIDDEN, "acl.editor_required", "")
         }
         DuplicateError::NotFound => json_err(StatusCode::NOT_FOUND, "doc.not_found", ""),
+        DuplicateError::Destination(response) => response,
         DuplicateError::IsTemplate => {
             json_err(StatusCode::UNPROCESSABLE_ENTITY, "doc.is_template", "")
         }
@@ -514,6 +801,17 @@ async fn archive(
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
+    // Archived descendants count too: a purge of this doc would take them.
+    let descendant_ids = match docs.descendant_ids(doc_id).await {
+        Ok(descendant_ids) => descendant_ids,
+        Err(e) => {
+            tracing::error!(error=?e, "archive descendants");
+            return internal();
+        }
+    };
+    if let Err(response) = refuse_hidden_descendants(&state, &ctx, &descendant_ids).await {
+        return response;
+    }
     match docs.archive(ctx.workspace_id, doc_id, ctx.user_id).await {
         Ok(archived_ids) => {
             crate::archive::evict_local(&state, &archived_ids).await;
@@ -574,6 +872,13 @@ async fn restore(
         Err(knot_storage::DocStoreError::RestoreConflict) => {
             json_err(StatusCode::CONFLICT, "doc.restore_conflict", "")
         }
+        // Its parent is archived, and the top level it would go to is
+        // outside the restricted subtree it was in.
+        Err(knot_storage::DocStoreError::RestoreRestrictedParentArchived) => json_err(
+            StatusCode::CONFLICT,
+            "doc.restore_restricted_parent_archived",
+            "",
+        ),
         Err(e) => {
             tracing::error!(error=?e, "restore");
             internal()
@@ -595,6 +900,19 @@ async fn purge(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Req
     }
     if req.extensions().get::<DocArchived>().is_none() {
         return json_err(StatusCode::CONFLICT, "doc.not_archived", "");
+    }
+    let Some(docs) = state.docs.clone() else {
+        return internal();
+    };
+    let subtree_ids = match docs.subtree_ids(doc_id).await {
+        Ok(subtree_ids) => subtree_ids,
+        Err(e) => {
+            tracing::error!(error=?e, "purge subtree");
+            return internal();
+        }
+    };
+    if let Err(response) = refuse_hidden_descendants(&state, &ctx, &subtree_ids).await {
+        return response;
     }
     match crate::archive::purge_doc(
         &state,
@@ -625,12 +943,21 @@ struct ArchiveEntry {
     title: String,
     parent_id: Option<Uuid>,
     parent_title: Option<String>,
-    subpage_count: i64,
+    /// The readable subpages archived together with it.
+    subpage_count: usize,
     archived_at: chrono::DateTime<chrono::Utc>,
     archived_by: Option<PersonRef>,
     purge_at: chrono::DateTime<chrono::Utc>,
     /// A purge has started and not finished (it is retried hourly).
     purging: bool,
+    /// The parent exists but the caller can't read it; `parent_id` and
+    /// `parent_title` are then null, as they are at the top level.
+    parent_hidden: bool,
+    /// The caller's role on the page, which on a restricted page need not
+    /// be the workspace role (purge takes an owner).
+    effective_role: &'static str,
+    /// The archived subpages the caller can open, for links to them.
+    subpage_ids: Vec<Uuid>,
 }
 
 async fn list_archive(State(state): State<AppState>, req: Request) -> Response {
@@ -645,32 +972,66 @@ async fn list_archive(State(state): State<AppState>, req: Request) -> Response {
         return internal();
     };
     let retention = crate::archive::retention(&state);
-    match docs.list_archive_roots(ctx.workspace_id).await {
-        Ok(roots) => Json(
-            roots
-                .into_iter()
-                .map(|root| ArchiveEntry {
-                    id: root.id,
-                    title: root.title,
-                    parent_id: root.parent_id,
-                    parent_title: root.parent_title,
-                    subpage_count: root.subpage_count,
-                    archived_at: root.archived_at,
-                    archived_by: root
-                        .archived_by
-                        .zip(root.archived_by_name)
-                        .map(|(id, display_name)| PersonRef { id, display_name }),
-                    purge_at: root.archived_at + retention,
-                    purging: root.purging,
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+    let roots = match docs.list_archive_roots(ctx.workspace_id).await {
+        Ok(roots) => roots,
         Err(e) => {
             tracing::error!(error=?e, "list_archive");
-            internal()
+            return internal();
         }
-    }
+    };
+    let covered_ids: Vec<Uuid> = roots
+        .iter()
+        .flat_map(|root| {
+            std::iter::once(root.id)
+                .chain(root.parent_id)
+                .chain(root.subpage_ids.iter().copied())
+        })
+        .collect();
+    let visibility = match visibility_covering_ids(&state, &ctx, &covered_ids).await {
+        Ok(visibility) => visibility,
+        Err(response) => return response,
+    };
+    // Only what the caller could restore, and nothing named that they
+    // can't read: a parent may be a hidden restricted folder.
+    let entries: Vec<ArchiveEntry> = roots
+        .into_iter()
+        .filter_map(|root| {
+            let role = visibility
+                .access(root.id)
+                .map(|access| access.role)
+                .filter(|role| matches!(role, WorkspaceRole::Owner | WorkspaceRole::Editor))?;
+            Some((root, role))
+        })
+        .map(|(root, role)| {
+            let parent_readable = root
+                .parent_id
+                .is_some_and(|parent_id| visibility.readable(parent_id));
+            let openable_subpage_ids: Vec<Uuid> = root
+                .subpage_ids
+                .iter()
+                .copied()
+                .filter(|subpage_id| visibility.readable(*subpage_id))
+                .collect();
+            ArchiveEntry {
+                id: root.id,
+                title: root.title,
+                parent_id: root.parent_id.filter(|_| parent_readable),
+                parent_title: root.parent_title.filter(|_| parent_readable),
+                subpage_count: openable_subpage_ids.len(),
+                archived_at: root.archived_at,
+                archived_by: root
+                    .archived_by
+                    .zip(root.archived_by_name)
+                    .map(|(id, display_name)| PersonRef { id, display_name }),
+                purge_at: root.archived_at + retention,
+                purging: root.purging,
+                parent_hidden: root.parent_id.is_some() && !parent_readable,
+                effective_role: role.as_str(),
+                subpage_ids: openable_subpage_ids,
+            }
+        })
+        .collect();
+    Json(entries).into_response()
 }
 
 #[derive(Deserialize)]
@@ -704,7 +1065,7 @@ async fn set_template_inline(
         .set_template(ctx.workspace_id, doc_id, ctx.user_id, body.is_template)
         .await
     {
-        Ok(d) => Json(to_response(&d)).into_response(),
+        Ok(d) => doc_answer(&state, &ctx, StatusCode::OK, &d).await,
         Err(knot_storage::DocStoreError::NotFound) => {
             json_err(StatusCode::NOT_FOUND, "doc.not_found", "")
         }
@@ -715,6 +1076,54 @@ async fn set_template_inline(
     }
 }
 
+#[derive(Deserialize)]
+struct SetRestrictedRequest {
+    restricted: bool,
+}
+
+/// `PUT /api/docs/{id}/restricted`: make the doc a restriction boundary, or
+/// stop it being one. Owner on the doc only; see
+/// `DocStore::set_restricted` for what restricting also does.
+#[tracing::instrument(skip_all, name = "docs.set_restricted")]
+async fn set_restricted_inline(
+    State(state): State<AppState>,
+    Path(doc_id): Path<Uuid>,
+    req: Request,
+) -> Response {
+    let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
+        return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
+    };
+    let Some(role) = req.extensions().get::<EffectiveDocRole>().copied() else {
+        return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
+    };
+    if role.0 != WorkspaceRole::Owner {
+        return json_err(StatusCode::FORBIDDEN, "acl.owner_required", "");
+    }
+    let Ok(body) = read_json::<SetRestrictedRequest>(req).await else {
+        return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
+    };
+    let Some(docs) = state.docs.clone() else {
+        return internal();
+    };
+    let doc = match docs
+        .set_restricted(ctx.workspace_id, doc_id, ctx.user_id, body.restricted)
+        .await
+    {
+        Ok(d) => d,
+        Err(knot_storage::DocStoreError::NotFound) => {
+            return json_err(StatusCode::NOT_FOUND, "doc.not_found", "");
+        }
+        Err(e) => {
+            tracing::error!(error=?e, "set_restricted");
+            return internal();
+        }
+    };
+    // The invalidation evicts the subtree on every replica, asynchronously;
+    // evict here too so this replica reads its own write right away.
+    crate::archive::evict_local_subtree(&state, doc_id).await;
+    doc_answer(&state, &ctx, StatusCode::OK, &doc).await
+}
+
 async fn list_templates(State(state): State<AppState>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
@@ -722,13 +1131,23 @@ async fn list_templates(State(state): State<AppState>, req: Request) -> Response
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
-    match docs.list_templates(ctx.workspace_id).await {
-        Ok(list) => Json(list.iter().map(to_response).collect::<Vec<_>>()).into_response(),
+    let templates = match docs.list_templates(ctx.workspace_id).await {
+        Ok(templates) => templates,
         Err(e) => {
             tracing::error!(error=?e, "list_templates");
-            internal()
+            return internal();
         }
-    }
+    };
+    let visibility = match caller_visibility(&state, &ctx, &templates).await {
+        Ok(visibility) => visibility,
+        Err(response) => return response,
+    };
+    let listed: Vec<DocResponse> = templates
+        .iter()
+        .filter(|template| visibility.readable(template.id))
+        .map(|template| listed_response(template, &visibility).0)
+        .collect();
+    Json(listed).into_response()
 }
 
 #[derive(Deserialize)]
@@ -741,7 +1160,8 @@ struct FromTemplateRequest {
 /// template. Intentionally drops the source template's comments,
 /// history, and CRDT lineage — templates exist to be instantiated, not
 /// linked. ACL: read on the template (enforced by the route layer);
-/// write on the destination parent is enforced inline below.
+/// edit on the destination parent, or the workspace role at the top level,
+/// is enforced inline below.
 #[tracing::instrument(skip_all, name = "docs.from_template")]
 async fn create_from_template_inline(
     State(state): State<AppState>,
@@ -751,15 +1171,15 @@ async fn create_from_template_inline(
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
-    // The route layer gives us read access on the template; that's the
-    // gate for "can use as a template". Writing into the workspace tree
-    // requires editor+.
-    if ctx.role == WorkspaceRole::Viewer {
-        return json_err(StatusCode::FORBIDDEN, "acl.editor_required", "");
-    }
     let Ok(body) = read_json::<FromTemplateRequest>(req).await else {
         return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
     };
+    // The route layer gives us read access on the template; that's the
+    // gate for "can use as a template". Writing into the tree requires
+    // editor+ where the copy goes.
+    if let Err(response) = require_editable_destination(&state, &ctx, body.parent_id).await {
+        return response;
+    }
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
@@ -808,6 +1228,16 @@ async fn create_from_template_inline(
             return internal();
         }
     };
+    if let Err(response) = crate::restricted::ensure_creator_can_edit(
+        &state,
+        ctx.workspace_id,
+        new_doc.id,
+        ctx.user_id,
+    )
+    .await
+    {
+        return response;
+    }
 
     // Import the template's markdown into the new doc via the room
     // actor (mirrors POST /api/docs/{id}/markdown).
@@ -842,7 +1272,7 @@ async fn create_from_template_inline(
         return internal();
     }
     match rx.await {
-        Ok(Ok(_)) => (StatusCode::CREATED, Json(to_response(&new_doc))).into_response(),
+        Ok(Ok(_)) => doc_answer(&state, &ctx, StatusCode::CREATED, &new_doc).await,
         Ok(Err(e)) => {
             tracing::warn!(error=?e, "from_template apply");
             json_err(StatusCode::UNPROCESSABLE_ENTITY, "markdown.apply", "")

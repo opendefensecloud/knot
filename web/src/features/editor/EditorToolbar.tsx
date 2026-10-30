@@ -18,6 +18,7 @@ import {
   List,
   ListChecks,
   ListOrdered,
+  Lock,
   Paperclip,
   Rows3,
   Table as TableIcon,
@@ -82,12 +83,17 @@ export function EditorToolbar({
     staleTime: 30_000,
     enabled: linkOpen && linkMode === "doc",
   });
+  const docList = useMemo(() => (docs.data && "ok" in docs.data ? docs.data.ok : []), [docs.data]);
   const docMatches = useMemo(() => {
-    const data = docs.data && "ok" in docs.data ? docs.data.ok : [];
     const q = docQuery.trim().toLowerCase();
-    const filtered = q ? data.filter((d) => d.title.toLowerCase().includes(q)) : data;
+    const filtered = q ? docList.filter((d) => d.title.toLowerCase().includes(q)) : docList;
     return filtered.slice(0, 8);
-  }, [docs.data, docQuery]);
+  }, [docList, docQuery]);
+  // A link's text is stored in this page: a restricted target's title would
+  // reach everyone who can read this page. That holds inside a restricted
+  // page too: who may read differs from one branch of it to the next, and
+  // from one restricted page to another. So a restricted target is always
+  // linked as "Restricted page".
   const notify = useUi((s) => s.notify);
 
   // Every `active` below reads editor.isActive(...) during render, but
@@ -389,17 +395,19 @@ export function EditorToolbar({
                       <li key={d.id}>
                         <button
                           type="button"
-                          className="block w-full text-left px-2 py-1.5 rounded text-sm text-fg hover:bg-muted focus:bg-muted focus:outline-none"
+                          className="flex w-full items-center gap-1.5 text-left px-2 py-1.5 rounded text-sm text-fg hover:bg-muted focus:bg-muted focus:outline-none"
                           onClick={() => {
                             const href = `knot://doc/${d.id}`;
                             // If no text is selected, insert the doc title as the
-                            // link's text. Otherwise wrap the current selection.
+                            // link's text (or "Restricted page", see above).
+                            // Otherwise wrap the current selection.
                             const { from, to } = editor.state.selection;
                             if (from === to) {
+                              const text = d.within_restricted ? "Restricted page" : d.title || "Untitled";
                               c()
                                 .insertContent({
                                   type: "text",
-                                  text: d.title || "Untitled",
+                                  text,
                                   marks: [{ type: "link", attrs: { href } }],
                                 })
                                 .run();
@@ -409,7 +417,17 @@ export function EditorToolbar({
                             setLinkOpen(false);
                           }}
                         >
-                          {d.title || <span className="text-fg-muted">Untitled</span>}
+                          <span className="min-w-0 truncate">
+                            {d.title || <span className="text-fg-muted">Untitled</span>}
+                          </span>
+                          {d.within_restricted && (
+                            <Lock
+                              size={12}
+                              role="img"
+                              aria-label="Restricted"
+                              className="shrink-0 text-fg-muted"
+                            />
+                          )}
                         </button>
                       </li>
                     ))

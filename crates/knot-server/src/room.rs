@@ -9,6 +9,11 @@
 //! `user_id` is the authenticated user behind the socket. Every update the
 //! connection forwards carries it, so the room persists live edits under
 //! their author and credits that user as a contributor.
+//!
+//! `acl_epoch_at_check` is the doc's ACL epoch (`Rooms::acl_epoch`), read at
+//! upgrade before the access check. Once joined, a different epoch means a
+//! revoke landed between that check and the join and may have missed this
+//! connection, which is then closed with 4403 before it is sent anything.
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::StreamExt;
@@ -26,6 +31,7 @@ pub async fn serve(
     user_id: Uuid,
     socket: WebSocket,
     can_write: bool,
+    acl_epoch_at_check: u64,
     shutdown: CancellationToken,
 ) {
     let join_started = std::time::Instant::now();
@@ -70,7 +76,17 @@ pub async fn serve(
         Ok(Ok(j)) => j,
         _ => return,
     };
-    let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
+    // The join race: a revoke between the upgrade's access check and this
+    // join found no connection to revoke. It bumped the epoch before it
+    // revoked anything, so the change shows here: revoke this connection as
+    // the revoke would have. It is sent nothing; the writer closes it with
+    // 4403 and the read loop below stops at once.
+    if rooms.acl_epoch(doc_id) != acl_epoch_at_check {
+        revoked.cancel();
+    }
+    if !revoked.is_cancelled() {
+        let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
+    }
     // Ask the client for what WE lack (standard y-protocol: both sides send
     // SyncStep1). The web provider applies edits made while its socket was
     // down to its local doc without queueing them, and its own SyncStep1 only
@@ -82,7 +98,7 @@ pub async fn serve(
     // fixed by this alone. Not sent to viewers: they cannot have edits to
     // upload, and their reply (at least the whole delete set) would only be
     // dropped below.
-    if can_write {
+    if can_write && !revoked.is_cancelled() {
         let _ = out_tx.send(encode_sync_step1(&joined.state_vector)).await;
     }
     // Server-side share of "open a doc, wait for content": includes the
@@ -118,6 +134,9 @@ pub async fn serve(
             biased;
             _ = shutdown.cancelled() => break,
             _ = done.cancelled() => break,
+            // Forward nothing more from a revoked connection: the room may
+            // still hold it (one revoked for the join race) until it leaves.
+            _ = revoked.cancelled() => break,
             m = stream.next() => match m {
                 Some(Ok(m)) => m,
                 _ => break,

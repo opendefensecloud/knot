@@ -26,6 +26,13 @@ pub struct DocTask {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A task as "My tasks" lists it: the row and the title of its doc.
+#[derive(Debug, Clone)]
+pub struct AssignedTask {
+    pub task: DocTask,
+    pub doc_title: String,
+}
+
 /// Input shape from the markdown extractor — id is derived from doc_id +
 /// item_index by the store.
 #[derive(Debug, Clone, Default)]
@@ -68,13 +75,16 @@ pub trait TaskStore: Send + Sync + 'static {
         items: &[DocTaskInput],
     ) -> Result<()>;
 
-    /// All open (uncompleted) tasks for a user across the workspace.
+    /// A user's open tasks across the workspace (all of them with
+    /// `include_completed`), with their docs' titles. Tasks in archived docs
+    /// and in the `hidden` docs (those the user can't read) are left out.
     async fn list_for_assignee(
         &self,
         workspace_id: Uuid,
         user_id: Uuid,
         include_completed: bool,
-    ) -> Result<Vec<DocTask>>;
+        hidden: &[Uuid],
+    ) -> Result<Vec<AssignedTask>>;
 
     /// All tasks in a doc, useful for the per-doc rendering surface.
     async fn list_for_doc(&self, doc_id: Uuid) -> Result<Vec<DocTask>>;
@@ -191,32 +201,27 @@ impl TaskStore for PgTaskStore {
         workspace_id: Uuid,
         user_id: Uuid,
         include_completed: bool,
-    ) -> Result<Vec<DocTask>> {
-        let rows: Vec<DocTask> = if include_completed {
-            sqlx::query_as::<_, DocTask>(
-                "SELECT id, workspace_id, doc_id, item_index, text, assignee_user_id, checked, completed_at, due_at, created_at, updated_at \
-                 FROM doc_tasks \
-                 WHERE workspace_id = $1 AND assignee_user_id = $2 \
-                 AND EXISTS (SELECT 1 FROM documents d WHERE d.id = doc_tasks.doc_id AND d.archived_at IS NULL) \
-                 ORDER BY checked, due_at NULLS LAST, updated_at DESC",
-            )
-            .bind(workspace_id)
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, DocTask>(
-                "SELECT id, workspace_id, doc_id, item_index, text, assignee_user_id, checked, completed_at, due_at, created_at, updated_at \
-                 FROM doc_tasks \
-                 WHERE workspace_id = $1 AND assignee_user_id = $2 AND completed_at IS NULL \
-                 AND EXISTS (SELECT 1 FROM documents d WHERE d.id = doc_tasks.doc_id AND d.archived_at IS NULL) \
-                 ORDER BY due_at NULLS LAST, updated_at DESC",
-            )
-            .bind(workspace_id)
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await?
-        };
+        hidden: &[Uuid],
+    ) -> Result<Vec<AssignedTask>> {
+        // `$3` (include_completed) keeps completed tasks and sorts checked
+        // ones last; without it the order is by due date alone.
+        let rows: Vec<AssignedTask> = sqlx::query_as::<_, AssignedTask>(
+            "SELECT t.id, t.workspace_id, t.doc_id, t.item_index, t.text, t.assignee_user_id, t.checked, \
+                    t.completed_at, t.due_at, t.created_at, t.updated_at, d.title AS doc_title \
+             FROM doc_tasks t \
+             JOIN documents d ON d.id = t.doc_id \
+             WHERE t.workspace_id = $1 AND t.assignee_user_id = $2 \
+             AND ($3 OR t.completed_at IS NULL) \
+             AND d.archived_at IS NULL \
+             AND NOT (d.id = ANY($4)) \
+             ORDER BY ($3 AND t.checked), t.due_at NULLS LAST, t.updated_at DESC",
+        )
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(include_completed)
+        .bind(hidden)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 
@@ -247,6 +252,16 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for DocTask {
             due_at: row.try_get("due_at")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AssignedTask {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> std::result::Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(AssignedTask {
+            task: DocTask::from_row(row)?,
+            doc_title: row.try_get("doc_title")?,
         })
     }
 }

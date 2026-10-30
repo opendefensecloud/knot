@@ -265,6 +265,16 @@ async fn change_role(
         tracing::error!(error=?e, "update_role");
         return internal();
     }
+    // The workspace role is the member's base role in every doc, so drop
+    // this replica's cache wholesale (role changes are rare), at once: a
+    // demoted owner must not restrict a page, and so take it over, on a
+    // cached owner role. Every replica's listener follows the workspace-wide
+    // `member-role` invalidation, evicting too and closing open sockets for
+    // a re-check.
+    if let Some(acl) = state.acl.as_ref() {
+        acl.evict_all();
+        acl.run_pending_tasks().await;
+    }
     if let Some(pool) = state.pool.as_ref() {
         audit::record(
             pool,
@@ -315,6 +325,15 @@ async fn remove_member(
     if let Err(e) = workspaces.remove_member(ws.id, user_id).await {
         tracing::error!(error=?e, "remove_member");
         return internal();
+    }
+    // The member's grants are gone and inherited grants reach whole
+    // subtrees, so drop this replica's cache wholesale (member removal is
+    // rare) rather than let a cached access outlive a re-invite. Every
+    // replica's listener follows the `member-remove` invalidations, the
+    // workspace-wide one closing open sockets for a re-check.
+    if let Some(acl) = state.acl.as_ref() {
+        acl.evict_all();
+        acl.run_pending_tasks().await;
     }
     if let Some(pool) = state.pool.as_ref() {
         audit::record(

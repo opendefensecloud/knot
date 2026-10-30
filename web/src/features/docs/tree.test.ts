@@ -11,10 +11,13 @@ import {
   insertIndex,
   keyboardMove,
   projectDrop,
+  restrictionCrossingText,
   rowDescription,
   type FlatRow,
   type MoveArgs,
+  type TreeNode,
   type Zone,
+  withoutSubtree,
 } from "./tree";
 
 function doc(id: string, parent: string | null, sort_key: string): Doc {
@@ -30,12 +33,16 @@ function doc(id: string, parent: string | null, sort_key: string): Doc {
     is_template: false,
     archived_at: null,
     archive_root_id: null,
+    restricted: false,
+    within_restricted: false,
+    parent_hidden: false,
+    effective_role: null,
   };
 }
 
 describe("buildTree", () => {
   it("returns empty for empty input", () => {
-    expect(buildTree([])).toEqual([]);
+    expect(buildTree([])).toEqual({ roots: [], shared: [] });
   });
 
   it("groups children under parents", () => {
@@ -43,7 +50,7 @@ describe("buildTree", () => {
       doc("a", null, "m"),
       doc("b", "a", "m"),
       doc("c", "a", "n"),
-    ]);
+    ]).roots;
     expect(t).toHaveLength(1);
     expect(t[0]!.id).toBe("a");
     expect(t[0]!.children.map((n) => n.id)).toEqual(["b", "c"]);
@@ -54,7 +61,7 @@ describe("buildTree", () => {
       doc("a", null, "n"),
       doc("b", null, "m"),
       doc("c", null, "z"),
-    ]);
+    ]).roots;
     expect(t.map((n) => n.id)).toEqual(["b", "a", "c"]);
   });
 
@@ -62,31 +69,44 @@ describe("buildTree", () => {
     const t = buildTree([
       doc("a", null, "m"),
       doc("b", "missing-parent", "m"),
-    ]);
+    ]).roots;
     expect(t.map((n) => n.id).sort()).toEqual(["a", "b"]);
+  });
+
+  it("puts pages whose parent is hidden under shared, as roots of their own", () => {
+    const sharedPage = { ...doc("s", null, "m"), parent_hidden: true, within_restricted: true };
+    const { roots, shared } = buildTree([
+      doc("a", null, "m"),
+      sharedPage,
+      doc("s1", "s", "m"),
+      { ...doc("r", null, "a"), parent_hidden: true },
+    ]);
+    expect(roots.map((n) => n.id)).toEqual(["a"]);
+    expect(shared.map((n) => n.id)).toEqual(["r", "s"]);
+    expect(shared[1]!.children.map((n) => n.id)).toEqual(["s1"]);
   });
 });
 
-function countNodes(nodes: ReturnType<typeof buildTree>): number {
+function countNodes(nodes: TreeNode[]): number {
   return nodes.reduce((acc, n) => acc + 1 + countNodes(n.children), 0);
 }
 
 describe("buildTree totality (no doc ever vanishes)", () => {
   it("keeps every doc for a self-loop", () => {
-    expect(countNodes(buildTree([doc("a", "a", "m"), doc("b", null, "n")]))).toBe(2);
+    expect(countNodes(buildTree([doc("a", "a", "m"), doc("b", null, "n")]).roots)).toBe(2);
   });
   it("keeps every doc for a 2-cycle", () => {
-    expect(countNodes(buildTree([doc("a", "b", "m"), doc("b", "a", "n")]))).toBe(2);
+    expect(countNodes(buildTree([doc("a", "b", "m"), doc("b", "a", "n")]).roots)).toBe(2);
   });
   it("keeps every doc for a 3-cycle with a child", () => {
-    const t = buildTree([doc("a", "b", "m"), doc("b", "c", "n"), doc("c", "a", "o"), doc("d", "a", "p")]);
+    const t = buildTree([doc("a", "b", "m"), doc("b", "c", "n"), doc("c", "a", "o"), doc("d", "a", "p")]).roots;
     expect(countNodes(t)).toBe(4);
     const ids = new Set<string>();
     (function walk(ns: typeof t) { ns.forEach((n) => { ids.add(n.id); walk(n.children); }); })(t);
     expect(ids.size).toBe(4);
   });
   it("keeps a doc whose parent is missing", () => {
-    expect(countNodes(buildTree([doc("a", "ghost", "m")]))).toBe(1);
+    expect(countNodes(buildTree([doc("a", "ghost", "m")]).roots)).toBe(1);
   });
 });
 
@@ -101,17 +121,17 @@ describe("descendantIds", () => {
 describe("applyOptimisticMove", () => {
   it("nests a doc under a new parent (into)", () => {
     const next = applyOptimisticMove([doc("a", null, "a"), doc("b", null, "b")], "b", { parent_id: "a" });
-    const t = buildTree(next);
+    const t = buildTree(next).roots;
     expect(t).toHaveLength(1);
     expect(t[0]!.children.map((n) => n.id)).toEqual(["b"]);
   });
   it("reorders a sibling before another", () => {
     const docs = [doc("a", null, "a"), doc("b", null, "b"), doc("c", null, "c")];
-    expect(buildTree(applyOptimisticMove(docs, "c", { parent_id: null, before_id: "a" })).map((n) => n.id)).toEqual(["c", "a", "b"]);
+    expect(buildTree(applyOptimisticMove(docs, "c", { parent_id: null, before_id: "a" })).roots.map((n) => n.id)).toEqual(["c", "a", "b"]);
   });
   it("reorders a sibling after another", () => {
     const docs = [doc("a", null, "a"), doc("b", null, "b"), doc("c", null, "c")];
-    expect(buildTree(applyOptimisticMove(docs, "a", { parent_id: null, after_id: "b" })).map((n) => n.id)).toEqual(["b", "a", "c"]);
+    expect(buildTree(applyOptimisticMove(docs, "a", { parent_id: null, after_id: "b" })).roots.map((n) => n.id)).toEqual(["b", "a", "c"]);
   });
 });
 
@@ -137,7 +157,7 @@ describe("moveArgs", () => {
 
 /** The sidebar's rows for `docs`, as DocTree draws them. */
 function rows(docs: Doc[], collapsed: string[] = [], activeId?: string): FlatRow[] {
-  return flattenVisible(buildTree(docs), new Set(collapsed), activeId);
+  return flattenVisible(buildTree(docs).roots, new Set(collapsed), activeId);
 }
 
 const byKey = (a: Doc, b: Doc) => (a.sort_key < b.sort_key ? -1 : a.sort_key > b.sort_key ? 1 : 0);
@@ -224,9 +244,83 @@ describe("INDENT", () => {
 
 describe("countDescendants", () => {
   it("counts subpages at any depth", () => {
-    const [a, b] = buildTree(tree1);
+    const [a, b] = buildTree(tree1).roots;
     expect(countDescendants(a!)).toBe(4);
     expect(countDescendants(b!)).toBe(0);
+  });
+});
+
+describe("restrictionCrossingText", () => {
+  const docs: Doc[] = [
+    doc("plain", null, "a"),
+    { ...doc("secret", null, "b"), restricted: true, within_restricted: true },
+    { ...doc("inside", "secret", "a"), within_restricted: true },
+    { ...doc("other", null, "c"), restricted: true, within_restricted: true },
+  ];
+  it("asks before a move into a restricted page", () => {
+    expect(restrictionCrossingText(docs, "plain", "secret")).toBe(
+      'Moving "plain" into "secret" limits who can see it to people with access there.',
+    );
+  });
+  it("asks before a move out of one", () => {
+    expect(restrictionCrossingText(docs, "inside", null)).toBe(
+      'Moving "inside" here makes it visible to everyone in the workspace.',
+    );
+    expect(restrictionCrossingText(docs, "inside", "plain")).toBe(
+      'Moving "inside" here makes it visible to everyone in the workspace.',
+    );
+  });
+  it("asks before a move from one restricted page into another", () => {
+    expect(restrictionCrossingText(docs, "inside", "other")).toBe(
+      'Moving "inside" into "other" changes who can see it to the people with access there.',
+    );
+  });
+  it("asks before a move into a restricted page nested in its own", () => {
+    const nested: Doc[] = [
+      ...docs,
+      { ...doc("inner", "secret", "b"), restricted: true, within_restricted: true },
+      { ...doc("deep", "inner", "a"), within_restricted: true },
+    ];
+    expect(restrictionCrossingText(nested, "inside", "deep")).toBe(
+      'Moving "inside" into "deep" changes who can see it to the people with access there.',
+    );
+    expect(restrictionCrossingText(nested, "deep", "secret")).toBe(
+      'Moving "deep" into "secret" changes who can see it to the people with access there.',
+    );
+  });
+  it("counts each page shared with the user as a restricted area of its own", () => {
+    // Their restricted page is hidden, so it can't be told whether two of
+    // them share one.
+    const shared: Doc[] = [
+      ...docs,
+      { ...doc("shared1", null, "d"), within_restricted: true, parent_hidden: true },
+      { ...doc("shared1a", "shared1", "a"), within_restricted: true },
+      { ...doc("shared1b", "shared1", "b"), within_restricted: true },
+      { ...doc("shared2", null, "e"), within_restricted: true, parent_hidden: true },
+    ];
+    expect(restrictionCrossingText(shared, "shared1a", "shared1b")).toBeNull();
+    expect(restrictionCrossingText(shared, "shared1a", "shared2")).toBe(
+      'Moving "shared1a" into "shared2" changes who can see it to the people with access there.',
+    );
+    expect(restrictionCrossingText(shared, "inside", "shared1")).toBe(
+      'Moving "inside" into "shared1" changes who can see it to the people with access there.',
+    );
+  });
+  it("doesn't ask for a move within the same restricted page, nor for a restricted page", () => {
+    const same: Doc[] = [...docs, { ...doc("inside2", "secret", "b"), within_restricted: true }];
+    expect(restrictionCrossingText(same, "inside", "inside2")).toBeNull();
+    expect(restrictionCrossingText(same, "inside", "secret")).toBeNull();
+    expect(restrictionCrossingText(docs, "plain", null)).toBeNull();
+    expect(restrictionCrossingText(docs, "secret", "plain")).toBeNull();
+    expect(restrictionCrossingText(docs, "other", "secret")).toBeNull();
+  });
+});
+
+describe("withoutSubtree", () => {
+  it("drops the page and every listed page below it", () => {
+    const docs = [doc("A1a", "A1", "a"), ...tree1];
+    expect(withoutSubtree(docs, "A").map((d) => d.id)).toEqual(["B", "C", "C1", "D"]);
+    expect(withoutSubtree(docs, "missing")).toEqual(docs);
   });
 });
 
@@ -239,6 +333,10 @@ describe("rowDescription", () => {
     [1, 3, "level 2, 3 subpages"],
   ])("depth %i with %i descendants → %s", (depth, n, want) => {
     expect(rowDescription(row(depth, n))).toBe(want);
+  });
+  it("says when the page is in a restricted area", () => {
+    expect(rowDescription(row(0, 0), true)).toBe("level 1, restricted");
+    expect(rowDescription(row(1, 3), true)).toBe("level 2, 3 subpages, restricted");
   });
 });
 
@@ -421,9 +519,62 @@ describe("projectDrop: edge cases", () => {
   });
 });
 
+describe("drops and moves need edit rights on the destination", () => {
+  // A (editable), V (view only) ─ V1, W (editable), for a workspace viewer
+  // who may not add pages at the top level.
+  const roleDocs: Doc[] = [
+    { ...doc("A", null, "a"), effective_role: "owner" },
+    { ...doc("V", null, "b"), effective_role: "viewer" },
+    { ...doc("V1", "V", "a"), effective_role: "viewer" },
+    { ...doc("W", null, "c"), effective_role: "editor" },
+    { ...doc("W1", "W", "a"), effective_role: "editor" },
+  ];
+
+  it("has no drop into a page the user can only view", () => {
+    const f = rows(roleDocs, [], "W1");
+    expect(projectDrop(f, roleDocs, "W1", "V", "into", 0, "viewer")).toBeNull();
+    expect(projectDrop(f, roleDocs, "W1", "V1", "below", 0, "viewer")).toBeNull();
+    expect(projectDrop(f, roleDocs, "W1", "A", "into", 0, "viewer")?.args).toEqual({ parent_id: "A" });
+  });
+
+  it("has no drop at the top level without a workspace role that adds pages", () => {
+    const f = rows(roleDocs, [], "W1");
+    expect(projectDrop(f, roleDocs, "W1", "W", "above", -1, "viewer")).toBeNull();
+    expect(projectDrop(f, roleDocs, "W1", "W", "above", -1, "editor")?.args).toEqual({
+      parent_id: null,
+      after_id: "V",
+    });
+  });
+
+  it("has no keyboard move under a page the user can only view", () => {
+    const f = rows(roleDocs);
+    expect(keyboardMove(f, roleDocs, "W1", "outdent", "viewer")).toBeNull();
+    expect(keyboardMove(f, roleDocs, "W", "indent", "editor")).toBeNull();
+    expect(keyboardMove(f, roleDocs, "W1", "outdent", "editor")).toEqual({ parent_id: null, after_id: "W" });
+  });
+});
+
 describe("keyboardMove", () => {
   const km = (id: string, cmd: "up" | "down" | "indent" | "outdent", flat = rows(tree1)) =>
     keyboardMove(flat, tree1, id, cmd);
+
+  it("never moves a page whose parent is hidden, nor anchors on one", () => {
+    // A; S (shared: its parent is hidden) ─ S1; drawn in that order.
+    const docs = [
+      doc("A", null, "a"),
+      { ...doc("S", null, "b"), parent_hidden: true },
+      doc("S1", "S", "a"),
+    ];
+    const { roots, shared } = buildTree(docs);
+    const flat = flattenVisible([...roots, ...shared], new Set());
+    for (const cmd of ["up", "down", "indent", "outdent"] as const) {
+      expect(keyboardMove(flat, docs, "S", cmd)).toBeNull();
+    }
+    // A's next row is S, which isn't a top-level sibling: nothing to pass.
+    expect(keyboardMove(flat, docs, "A", "down")).toBeNull();
+    // S1 can still move out of S, to the top level after A (a real sibling).
+    expect(keyboardMove(flat, docs, "S1", "outdent")).toEqual({ parent_id: null, after_id: "A" });
+  });
 
   it("does nothing past the first and last rows", () => {
     expect(km("A", "up")).toBeNull();

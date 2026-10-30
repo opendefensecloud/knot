@@ -1,14 +1,17 @@
-//! Resolve the effective role for (doc_id, user_id).
+//! Resolve the effective access of one user to one document.
 //!
 //! Algorithm:
-//! 1. Look up the user's workspace role (Owner > Editor > Viewer > non-member).
-//! 2. Walk grants from the doc up to root via GrantStore::list_inherited.
-//!    The doc's own grants are always considered; ancestors only contribute
-//!    grants with inherit=true.
-//! 3. Filter to grants matching `user:<user_id>` and take the max role.
-//! 4. Return the max of (workspace_role, grant_role), or None if neither
-//!    yields a role (user is not a workspace member AND has no explicit
-//!    grant on the doc or its ancestors).
+//! 1. Look up the user's workspace role. A non-member gets no access, even
+//!    with grants left behind on the doc or its ancestors.
+//! 2. Load the doc's ancestor chain, root first, together with the user's
+//!    grants on it via `GrantStore::chain_for_principal`.
+//! 3. Fold the chain with the restricted-documents rule
+//!    (`rule::access_along_path`): outside a restricted subtree the role is
+//!    the max of the workspace role, the user's grants on the doc and their
+//!    inherit=true grants on ancestors; from a restricted doc downwards only
+//!    grants on that boundary and below count.
+
+use std::collections::HashSet;
 
 use knot_storage::{
     DocStore, DocStoreError, GrantStore, GrantStoreError, WorkspaceRole, WorkspaceStore,
@@ -16,6 +19,8 @@ use knot_storage::{
 };
 use thiserror::Error;
 use uuid::Uuid;
+
+use crate::rule::{self, AclNode, PrincipalGrant};
 
 pub type EffectiveRole = WorkspaceRole;
 
@@ -26,6 +31,9 @@ pub type EffectiveRole = WorkspaceRole;
 pub struct DocAccess {
     pub role: WorkspaceRole,
     pub archived: bool,
+    /// The nearest restricted ancestor-or-self: `Some` exactly when the doc
+    /// lies in a restricted subtree.
+    pub restriction_root: Option<Uuid>,
 }
 
 impl DocAccess {
@@ -58,14 +66,19 @@ fn rank(r: WorkspaceRole) -> u8 {
     }
 }
 
-fn max(a: WorkspaceRole, b: WorkspaceRole) -> WorkspaceRole {
+/// The higher of two roles (Owner > Editor > Viewer).
+pub(crate) fn max(a: WorkspaceRole, b: WorkspaceRole) -> WorkspaceRole {
     if rank(a) >= rank(b) { a } else { b }
 }
 
+/// The user's access to `doc_id`, or `None` when they have none.
+///
+/// `_docs` is no longer read: the chain query loads every flag the rule
+/// needs. It stays in the signature so callers do not change.
 pub async fn resolve(
     workspaces: &dyn WorkspaceStore,
     grants: &dyn GrantStore,
-    docs: &dyn DocStore,
+    _docs: &dyn DocStore,
     workspace_id: Uuid,
     doc_id: Uuid,
     user_id: Uuid,
@@ -74,28 +87,46 @@ pub async fn resolve(
     // Without this, `get_member_role(workspace_id, user_id)` returns the
     // caller's role in their OWN workspace for ANY doc_id — granting a member
     // of one workspace read/write access to documents in every other workspace
-    // by UUID. We re-assert the doc's workspace here (the cache key is
-    // (doc_id, user_id), and a doc maps to exactly one workspace, so this does
-    // not poison other users' entries).
-    let archived = match docs.get(doc_id).await? {
-        Some(doc) if doc.workspace_id == workspace_id => doc.archived_at.is_some(),
-        _ => return Ok(None),
-    };
-    let workspace_role = workspaces.get_member_role(workspace_id, user_id).await?;
+    // by UUID. The chain query filters every step by `workspace_id`, so a
+    // missing or foreign doc yields an empty chain and no access. The cache
+    // key is (workspace_id, doc_id, user_id), so a `None` cached for a
+    // foreign workspace never shadows the doc's real workspace.
     let principal = format!("user:{user_id}");
-    let inherited = grants.list_inherited(workspace_id, doc_id).await?;
-    let grant_role = inherited
+    let (chain, principal_grants) = grants
+        .chain_for_principal(workspace_id, doc_id, &principal)
+        .await?;
+    if chain.is_empty() {
+        return Ok(None);
+    }
+    // A parent cycle makes the walk repeat ids until its depth cap. The
+    // batched evaluator gives such docs no access, so fail closed here too.
+    let mut seen_ids = HashSet::with_capacity(chain.len());
+    if !chain.iter().all(|node| seen_ids.insert(node.id)) {
+        return Ok(None);
+    }
+    let workspace_role = workspaces.get_member_role(workspace_id, user_id).await?;
+    let path: Vec<AclNode> = chain
         .into_iter()
-        .filter(|g| g.principal == principal)
-        .map(|g| g.role)
-        .reduce(max);
-    let role = match (workspace_role, grant_role) {
-        (None, None) => None,
-        (Some(w), None) => Some(w),
-        (None, Some(g)) => Some(g),
-        (Some(w), Some(g)) => Some(max(w, g)),
-    };
-    Ok(role.map(|role| DocAccess { role, archived }))
+        .map(|node| AclNode {
+            id: node.id,
+            parent_id: node.parent_id,
+            restricted: node.restricted,
+            archived: node.archived,
+        })
+        .collect();
+    let principal_grants: Vec<PrincipalGrant> = principal_grants
+        .into_iter()
+        .map(|grant| PrincipalGrant {
+            doc_id: grant.doc_id,
+            role: grant.role,
+            inherit: grant.inherit,
+        })
+        .collect();
+    Ok(rule::access_along_path(
+        &path,
+        &principal_grants,
+        workspace_role,
+    ))
 }
 
 #[cfg(test)]
@@ -106,24 +137,48 @@ mod tests {
     };
 
     async fn ctx() -> (PgWorkspaceStore, PgGrantStore, PgDocStore, Uuid, Uuid) {
+        let (ws_s, gs, ds, ws, user, _pool) = ctx_with_pool().await;
+        (ws_s, gs, ds, ws, user)
+    }
+
+    async fn ctx_with_pool() -> (
+        PgWorkspaceStore,
+        PgGrantStore,
+        PgDocStore,
+        Uuid,
+        Uuid,
+        sqlx::PgPool,
+    ) {
         let pool = knot_test_support::fresh_db().await.pool;
 
         let ws_s = PgWorkspaceStore::new(pool.clone());
         let us = PgUserStore::new(pool.clone());
         let ds = PgDocStore::new(pool.clone());
-        let gs = PgGrantStore::new(pool);
+        let gs = PgGrantStore::new(pool.clone());
         let w = ws_s.create("default", "W").await.unwrap();
         let u = us.create_local("a@x.test", "A", "$h$").await.unwrap();
         ws_s.add_member(w.id, u.id, WorkspaceRole::Viewer)
             .await
             .unwrap();
-        (ws_s, gs, ds, w.id, u.id)
+        (ws_s, gs, ds, w.id, u.id, pool)
+    }
+
+    async fn mark_restricted(pool: &sqlx::PgPool, doc_id: Uuid) {
+        sqlx::query("UPDATE documents SET restricted = true WHERE id = $1")
+            .bind(doc_id)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     #[test]
     fn archived_docs_are_read_only_and_hidden_from_viewers() {
         use WorkspaceRole::{Editor, Owner, Viewer};
-        let access = |role, archived| DocAccess { role, archived };
+        let access = |role, archived| DocAccess {
+            role,
+            archived,
+            restriction_root: None,
+        };
         assert!(access(Owner, false).can_write());
         assert!(access(Editor, false).can_write());
         assert!(!access(Viewer, false).can_write());
@@ -153,14 +208,16 @@ mod tests {
             live_access,
             Some(DocAccess {
                 role: WorkspaceRole::Viewer,
-                archived: false
+                archived: false,
+                restriction_root: None,
             })
         );
         assert_eq!(
             gone_access,
             Some(DocAccess {
                 role: WorkspaceRole::Viewer,
-                archived: true
+                archived: true,
+                restriction_root: None,
             })
         );
     }
@@ -261,5 +318,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r2, None, "non-member of B has no access even in B's scope");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restricted_doc_hides_from_workspace_owner() {
+        let (ws_s, gs, ds, ws, creator, pool) = ctx_with_pool().await;
+        let workspace_owner = PgUserStore::new(pool.clone())
+            .create_local("owner@x.test", "O", "$h$")
+            .await
+            .unwrap();
+        ws_s.add_member(ws, workspace_owner.id, WorkspaceRole::Owner)
+            .await
+            .unwrap();
+        let boundary = ds.create(ws, None, "Secret", "m", creator).await.unwrap();
+        let child = ds
+            .create(ws, Some(boundary.id), "Inside", "m", creator)
+            .await
+            .unwrap();
+        mark_restricted(&pool, boundary.id).await;
+
+        for doc_id in [boundary.id, child.id] {
+            let access = resolve(&ws_s, &gs, &ds, ws, doc_id, workspace_owner.id)
+                .await
+                .unwrap();
+            assert_eq!(access, None, "workspace owner must not see {doc_id}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grant_inside_restricted_subtree_gives_access() {
+        let (ws_s, gs, ds, ws, user, pool) = ctx_with_pool().await;
+        let boundary = ds.create(ws, None, "Secret", "m", user).await.unwrap();
+        let child = ds
+            .create(ws, Some(boundary.id), "Inside", "m", user)
+            .await
+            .unwrap();
+        mark_restricted(&pool, boundary.id).await;
+        gs.put(
+            ws,
+            boundary.id,
+            &format!("user:{user}"),
+            WorkspaceRole::Viewer,
+            true,
+            user,
+        )
+        .await
+        .unwrap();
+
+        for doc_id in [boundary.id, child.id] {
+            let access = resolve(&ws_s, &gs, &ds, ws, doc_id, user).await.unwrap();
+            assert_eq!(
+                access,
+                Some(DocAccess {
+                    role: WorkspaceRole::Viewer,
+                    archived: false,
+                    restriction_root: Some(boundary.id),
+                })
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removed_member_with_grant_gets_none() {
+        let (ws_s, gs, ds, ws, user) = ctx().await;
+        let doc = ds.create(ws, None, "X", "m", user).await.unwrap();
+        gs.put(
+            ws,
+            doc.id,
+            &format!("user:{user}"),
+            WorkspaceRole::Owner,
+            true,
+            user,
+        )
+        .await
+        .unwrap();
+        ws_s.remove_member(ws, user).await.unwrap();
+
+        let access = resolve(&ws_s, &gs, &ds, ws, doc.id, user).await.unwrap();
+        assert_eq!(access, None, "a grant alone must not outlive membership");
     }
 }

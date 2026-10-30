@@ -1,7 +1,14 @@
 import * as v from "valibot";
 
 import { apiFetch, type ApiResult } from "../../lib/api";
-import { ArchiveEntry, Doc, DocContributors, DocWithRole, parse } from "../../lib/validators";
+import {
+  ArchiveEntry,
+  Doc,
+  DocAccessInfo,
+  DocContributors,
+  DocWithRole,
+  parse,
+} from "../../lib/validators";
 
 export type DocCreate = { title?: string; parent_id?: string; after_id?: string };
 export type DocPatch = { title?: string; icon?: string };
@@ -25,6 +32,23 @@ export const docsApi = {
     const r = await apiFetch<unknown>(`/api/docs/${encodeURIComponent(id)}/contributors`);
     if ("error" in r) return r;
     return { ok: parse(DocContributors, r.ok) };
+  },
+  /** Who can see the doc and through which grant (any reader). */
+  async access(id: string): Promise<ApiResult<DocAccessInfo>> {
+    const r = await apiFetch<unknown>(`/api/docs/${encodeURIComponent(id)}/access`);
+    if ("error" in r) return r;
+    return { ok: parse(DocAccessInfo, r.ok) };
+  },
+  /** Make the doc a restriction boundary, or stop it being one (owners).
+   *  Restricting also makes the caller an owner of the doc and revokes the
+   *  public links in its subtree. */
+  async setRestricted(id: string, restricted: boolean): Promise<ApiResult<Doc>> {
+    const r = await apiFetch<unknown>(`/api/docs/${encodeURIComponent(id)}/restricted`, {
+      method: "PUT",
+      body: { restricted },
+    });
+    if ("error" in r) return r;
+    return { ok: parse(Doc, r.ok) };
   },
   create(body: DocCreate) {
     return apiFetch<unknown>("/api/docs", { method: "POST", body });

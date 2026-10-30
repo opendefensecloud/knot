@@ -1,11 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SessionProvider } from "../../auth/SessionContext";
 import type { ConnStatus } from "../../components/StatusDot";
+import { useUi } from "../../stores/ui";
 
 // The editor needs a WebSocket; a stand-in that shows what it was given and
 // can report a revoked connection, as KnotProvider does on close 4403.
@@ -25,11 +26,13 @@ vi.mock("../editor/KnotEditor", () => ({
   },
 }));
 
+import { archiveErrorText } from "./archive";
 import DocPage from "./DocPage";
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   editorScript.reportUnauthorised = false;
   editorScript.mounts = 0;
 });
@@ -98,14 +101,16 @@ function server(role: Role, docs: Record<string, unknown[]>) {
   });
 }
 
-function renderDoc(id: string) {
+function renderDoc(id: string, client = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
   render(
-    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+    <QueryClientProvider client={client}>
       <SessionProvider>
         <MemoryRouter initialEntries={[`/doc/${id}`]}>
           <Routes>
             <Route path="/" element={<p>home</p>} />
-            <Route path="/doc/:id" element={<DocPage />} />
+            <Route path="/doc/:id" element={<DocPage />}>
+              <Route path="permissions" element={<p>permissions</p>} />
+            </Route>
           </Routes>
         </MemoryRouter>
       </SessionProvider>
@@ -156,6 +161,44 @@ describe("DocPage — archived", () => {
     expect(banner).toHaveTextContent("Part of “Runbook”, which is in the archive");
     expect(within(banner).getByRole("link", { name: "Runbook" })).toHaveAttribute("href", "/doc/d1");
     expect(within(banner).queryByRole("button")).toBeNull();
+  });
+
+  it("names no folder it can't show when the archived root is hidden", async () => {
+    // The server nulls the root's id and title when the user can't read it.
+    const subpage = docBody("d2", "Step 1", "editor", {
+      ...archivedRoot,
+      archive_root_id: null,
+      archive_root_title: null,
+    });
+    vi.stubGlobal("fetch", server("editor", { d2: [subpage] }));
+    renderDoc("d2");
+
+    const banner = await screen.findByTestId("archived-banner");
+    expect(banner).toHaveTextContent("In the archive with a page above it");
+    expect(banner).not.toHaveTextContent("a folder");
+    expect(within(banner).queryByRole("link")).toBeNull();
+    expect(within(banner).queryByRole("button")).toBeNull();
+  });
+
+  it("says why a permanent deletion was refused for hidden subpages", async () => {
+    const notify = vi.spyOn(useUi.getState(), "notify");
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const answer = server("owner", { d1: [docBody("d1", "Runbook", "owner", archivedRoot)] });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) =>
+        url === "/api/docs/d1/purge" && init?.method === "POST"
+          ? json({ error: { code: "doc.hidden_descendants", message: "", details: {} } }, 409)
+          : answer(url),
+      ),
+    );
+    renderDoc("d1");
+
+    const banner = await screen.findByTestId("archived-banner");
+    fireEvent.click(within(banner).getByRole("button", { name: "Delete permanently" }));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith("error", archiveErrorText("doc.hidden_descendants")),
+    );
   });
 
   it("stays on a page whose connection was revoked because it was archived", async () => {
@@ -216,5 +259,132 @@ describe("DocPage — export menu", () => {
     renderDoc("d1");
 
     expect(await screen.findByTestId("doc-export")).toHaveAttribute("aria-haspopup", "menu");
+  });
+});
+
+describe("DocPage — restricted", () => {
+  const restrictedBoundary = { restricted: true, within_restricted: true, restriction_root_id: "d1" };
+
+  it("shows owners a Restricted chip that opens the permissions", async () => {
+    vi.stubGlobal(
+      "fetch",
+      server("viewer", { d1: [{ ...docBody("d1", "Payroll", "owner", null), ...restrictedBoundary }] }),
+    );
+    renderDoc("d1");
+
+    const chip = await screen.findByTestId("restricted-chip");
+    expect(chip).toHaveTextContent("Restricted");
+    expect(chip).toHaveAttribute("href", "/doc/d1/permissions");
+  });
+
+  it("shows other readers the chip without a link", async () => {
+    vi.stubGlobal(
+      "fetch",
+      server("owner", {
+        d2: [{ ...docBody("d2", "Salaries", "viewer", null), within_restricted: true, restriction_root_id: null }],
+      }),
+    );
+    renderDoc("d2");
+
+    const chip = await screen.findByTestId("restricted-chip");
+    expect(chip).toHaveTextContent("Restricted");
+    expect(chip).not.toHaveAttribute("href");
+  });
+
+  it("shows no chip on a page outside any restricted page", async () => {
+    vi.stubGlobal("fetch", server("owner", { d1: [docBody("d1", "Runbook", "owner", null)] }));
+    renderDoc("d1");
+
+    await screen.findByTestId("doc-title");
+    expect(screen.queryByTestId("restricted-chip")).toBeNull();
+  });
+
+  it("says the same thing for a page that doesn't exist and one the user can't read", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        url === "/api/docs/d1"
+          ? json({ error: { code: "acl.no_grant", message: "", details: {} } }, 403)
+          : server("editor", {})(url),
+      ),
+    );
+    renderDoc("d1");
+
+    expect(
+      await screen.findByText("This page doesn't exist or you don't have access to it."),
+    ).toBeInTheDocument();
+  });
+
+  it("refreshes the sidebar and forgets the page before leaving one it lost access to", async () => {
+    editorScript.reportUnauthorised = true;
+    let served = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url === "/api/docs/d1") {
+          served += 1;
+          return served === 1
+            ? json(docBody("d1", "Runbook", "editor", null))
+            : json({ error: { code: "acl.no_grant", message: "", details: {} } }, 403);
+        }
+        return server("editor", {})(url);
+      }),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const remove = vi.spyOn(client, "removeQueries");
+    renderDoc("d1", client);
+
+    expect(await screen.findByText("home")).toBeInTheDocument();
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["docs"] });
+    expect(remove).toHaveBeenCalledWith({ queryKey: ["doc", "d1"] });
+  });
+
+  it("leaves with a sidebar list that no longer opens the lost page or its subpages", async () => {
+    // The landing page opens the list's first page: a stale list would send
+    // the user straight back to the page they lost.
+    editorScript.reportUnauthorised = true;
+    let served = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url === "/api/docs/d1") {
+          served += 1;
+          return served === 1
+            ? json(docBody("d1", "Runbook", "editor", null))
+            : json({ error: { code: "acl.no_grant", message: "", details: {} } }, 403);
+        }
+        return server("editor", {})(url);
+      }),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["docs"], {
+      ok: [
+        { ...docBody("d1", "Runbook", "editor", null), restricted: true, within_restricted: true },
+        { ...docBody("d3", "Step", "editor", null), parent_id: "d1", within_restricted: true },
+        docBody("d2", "Handbook", "editor", null),
+      ],
+    });
+    let listedWhenHome: string[] | null = null;
+    function Home() {
+      const cached = client.getQueryData<{ ok: { id: string }[] }>(["docs"]);
+      listedWhenHome ??= cached ? cached.ok.map((d) => d.id) : [];
+      return <p>home</p>;
+    }
+    render(
+      <QueryClientProvider client={client}>
+        <SessionProvider>
+          <MemoryRouter initialEntries={["/doc/d1"]}>
+            <Routes>
+              <Route path="/" element={<Home />} />
+              <Route path="/doc/:id" element={<DocPage />} />
+            </Routes>
+          </MemoryRouter>
+        </SessionProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("home")).toBeInTheDocument();
+    expect(listedWhenHome).toEqual(["d2"]);
   });
 });

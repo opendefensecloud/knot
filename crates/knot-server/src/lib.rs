@@ -36,6 +36,7 @@ pub mod metrics;
 pub mod protocol;
 pub mod reindex;
 pub mod release_notes;
+pub mod restricted;
 pub mod room;
 pub mod routes;
 pub mod security_headers;
@@ -259,6 +260,57 @@ pub fn router_with_state(state: AppState) -> Router {
     .with_state(state)
 }
 
+/// The ACL listener's hooks (`knot_docs::spawn_listener`).
+///
+/// `on_invalidate`: the access to `doc_id` changed, so close every socket
+/// open on it, the page's own (`Rooms::revoke_all_for_doc`) and its boards'
+/// (`BoardRooms::revoke_for_doc`), with 4403. Each client re-checks its
+/// access before it reconnects. The listener calls it for the doc and each
+/// descendant, so a restrict reaches the whole subtree.
+///
+/// `on_invalidate_all`: access may have changed anywhere, unheard (the
+/// listener lost its connection, or could not walk a subtree) or for one
+/// member in every doc (a role change, a removal). End every doc and board
+/// room here (`Rooms::restart_all`, `BoardRooms::restart_all`): each socket
+/// closes with 1012, and its client reconnects through the upgrade's access
+/// check, which only refuses those who lost their access.
+pub fn revoke_doc_sockets(state: &AppState) -> knot_docs::InvalidationHooks {
+    let rooms = state.rooms_v2.clone();
+    let board_rooms = state.board_rooms.clone();
+    let on_invalidate = {
+        let rooms = rooms.clone();
+        let board_rooms = board_rooms.clone();
+        Arc::new(move |doc_id| {
+            if let Some(rooms) = rooms.clone() {
+                tokio::spawn(async move {
+                    rooms.revoke_all_for_doc(doc_id).await;
+                });
+            }
+            if let Some(board_rooms) = board_rooms.clone() {
+                tokio::spawn(async move {
+                    board_rooms.revoke_for_doc(doc_id).await;
+                });
+            }
+        })
+    };
+    let on_invalidate_all = Arc::new(move || {
+        if let Some(rooms) = rooms.clone() {
+            tokio::spawn(async move {
+                rooms.restart_all().await;
+            });
+        }
+        if let Some(board_rooms) = board_rooms.clone() {
+            tokio::spawn(async move {
+                board_rooms.restart_all().await;
+            });
+        }
+    });
+    knot_docs::InvalidationHooks {
+        on_invalidate,
+        on_invalidate_all,
+    }
+}
+
 /// Whether a collab connection may write (`Ok(true)`), may only read
 /// (`Ok(false)`), or is refused. Viewers read; editors and owners write,
 /// except on archived docs, which open read-only for them and not at all
@@ -292,6 +344,15 @@ async fn collab_upgrade(
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
     };
+    let rooms = match state.rooms_v2.as_ref() {
+        Some(r) => r.clone(),
+        None => {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+        }
+    };
+    // Before the access check: a revoke after this read and before the
+    // join, which could miss the connection, changes it (`room::serve`).
+    let acl_epoch_at_check = rooms.acl_epoch(doc_id);
     let can_write = match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
         Ok(access) => match collab_write_access(access) {
             Ok(can_write) => can_write,
@@ -301,18 +362,21 @@ async fn collab_upgrade(
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
     };
-    let rooms = match state.rooms_v2.as_ref() {
-        Some(r) => r.clone(),
-        None => {
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
-        }
-    };
     let shutdown = state.shutdown.clone();
     let ws = ws
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
-        crate::room::serve(rooms, doc_id, ctx.user_id, socket, can_write, shutdown).await;
+        crate::room::serve(
+            rooms,
+            doc_id,
+            ctx.user_id,
+            socket,
+            can_write,
+            acl_epoch_at_check,
+            shutdown,
+        )
+        .await;
     })
     .into_response()
 }
@@ -337,11 +401,16 @@ async fn collab_board_upgrade(
     let Some(acl) = state.acl.as_ref().cloned() else {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
     };
+    let Some(board_rooms) = state.board_rooms.as_ref().cloned() else {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+    };
     // Resolve the parent doc and gate on its ACL (editor+ for v1).
     let board = match boards.get(board_id).await {
         Ok(b) => b,
         Err(_) => return (axum::http::StatusCode::NOT_FOUND, "board.not_found").into_response(),
     };
+    // Before the access check, as in `collab_upgrade`.
+    let acl_epoch_at_check = board_rooms.acl_epoch(board.doc_id);
     // The board socket only exists for editing, so it needs write access:
     // refused for viewers and for every board of an archived doc (whose
     // read-only preview shows boards through their cached SVG).
@@ -358,15 +427,21 @@ async fn collab_board_upgrade(
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
     }
-    let Some(board_rooms) = state.board_rooms.as_ref().cloned() else {
-        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
-    };
+    let doc_id = board.doc_id;
     let shutdown = state.shutdown.clone();
     let ws = ws
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
-        crate::board_room_shim::serve(board_rooms, board_id, socket, shutdown).await;
+        crate::board_room_shim::serve(
+            board_rooms,
+            board_id,
+            doc_id,
+            acl_epoch_at_check,
+            socket,
+            shutdown,
+        )
+        .await;
     })
     .into_response()
 }
@@ -384,6 +459,7 @@ mod collab_access_tests {
             Some(DocAccess {
                 role,
                 archived: false,
+                restriction_root: None,
             })
         };
         assert_eq!(collab_write_access(live(Owner)), Ok(true));
@@ -397,6 +473,7 @@ mod collab_access_tests {
             Some(DocAccess {
                 role,
                 archived: true,
+                restriction_root: None,
             })
         };
         assert_eq!(collab_write_access(archived(Owner)), Ok(false));

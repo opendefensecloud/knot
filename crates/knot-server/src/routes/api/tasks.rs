@@ -59,12 +59,27 @@ async fn list_mine(
     let Some(tasks) = state.tasks.clone() else {
         return internal();
     };
-    let Some(docs) = state.docs.clone() else {
+    let Some(acl) = state.acl.clone() else {
         return internal();
     };
 
+    // Tasks in docs the caller can't read are left out in SQL. A cached
+    // snapshot may predate a doc and miss it from the hidden set, so the
+    // rows are checked again against one that covers their docs.
+    let hidden_ids = match acl.visibility(ctx.workspace_id, ctx.user_id).await {
+        Ok(visibility) => visibility.hidden_ids(),
+        Err(e) => {
+            tracing::error!(error=?e, "tasks visibility");
+            return internal();
+        }
+    };
     let rows = match tasks
-        .list_for_assignee(ctx.workspace_id, ctx.user_id, q.include_completed)
+        .list_for_assignee(
+            ctx.workspace_id,
+            ctx.user_id,
+            q.include_completed,
+            &hidden_ids,
+        )
         .await
     {
         Ok(r) => r,
@@ -73,28 +88,36 @@ async fn list_mine(
             return internal();
         }
     };
+    let listed_doc_ids: Vec<Uuid> = rows.iter().map(|row| row.task.doc_id).collect();
+    let visibility = match acl
+        .visibility_covering(ctx.workspace_id, ctx.user_id, &listed_doc_ids)
+        .await
+    {
+        Ok(visibility) => visibility,
+        Err(e) => {
+            tracing::error!(error=?e, "tasks visibility");
+            return internal();
+        }
+    };
 
-    // Hydrate doc titles in one shot. Tasks are usually scoped to a small
-    // set of docs, so a per-row lookup is fine for v1; if it bites we can
-    // switch to a JOIN inside the storage layer.
-    let mut out: Vec<TaskRow> = Vec::with_capacity(rows.len());
-    for t in rows {
-        let title = match docs.get(t.doc_id).await {
-            Ok(Some(d)) => d.title,
-            _ => "(deleted)".to_string(),
-        };
-        out.push(TaskRow {
-            id: t.id,
-            doc_id: t.doc_id.to_string(),
-            doc_title: title,
-            item_index: t.item_index,
-            text: t.text,
-            checked: t.checked,
-            completed_at: t.completed_at.map(|d| d.to_rfc3339()),
-            due_at: t.due_at.map(|d| d.to_rfc3339()),
-            updated_at: t.updated_at.to_rfc3339(),
-        });
-    }
+    let out: Vec<TaskRow> = rows
+        .into_iter()
+        .filter(|row| visibility.readable(row.task.doc_id))
+        .map(|row| {
+            let task = row.task;
+            TaskRow {
+                id: task.id,
+                doc_id: task.doc_id.to_string(),
+                doc_title: row.doc_title,
+                item_index: task.item_index,
+                text: task.text,
+                checked: task.checked,
+                completed_at: task.completed_at.map(|d| d.to_rfc3339()),
+                due_at: task.due_at.map(|d| d.to_rfc3339()),
+                updated_at: task.updated_at.to_rfc3339(),
+            }
+        })
+        .collect();
 
     axum::Json(out).into_response()
 }

@@ -11,6 +11,11 @@
 //! returns 400 `auth.oidc.state_mismatch`.  This covers the "missing flow"
 //! branch that executes before any code-exchange attempt.
 //!
+//! **`removed_member_reprovisioned_via_oidc_does_not_regain_restricted_access`**
+//! — removing a member drops their page grants, so the callback's re-provision
+//! of a known identity (a fresh Viewer membership) does not revive access to a
+//! restricted page.
+//!
 //! ## What is NOT tested here (and why)
 //!
 //! The full state-string mismatch path (flow cookie present but
@@ -182,5 +187,186 @@ async fn oidc_callback_no_client_returns_503_even_with_flow_cookie() {
     assert_eq!(
         v["error"]["code"], "auth.oidc.disabled",
         "error code must be auth.oidc.disabled, got: {v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: a removed member re-provisioned via OIDC does not regain access to
+// a restricted page.
+//
+// The callback itself needs a live IdP (see the module docs), so this test
+// reproduces its two effects for a known identity whose membership is gone:
+// `add_member(ws, user, Viewer)` (the callback's re-provision branch) and a
+// session minted exactly as the callback mints it.
+// ---------------------------------------------------------------------------
+
+/// A `"sid=…; csrf=…"` cookie header and its CSRF token for a session minted
+/// the way the OIDC callback mints it.
+async fn oidc_session(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    workspace_id: uuid::Uuid,
+) -> (String, String) {
+    let token = knot_auth::SessionToken::generate();
+    let session_hash = knot_auth::csrf::hash_session_id(&state.session_key, token.as_bytes());
+    state
+        .sessions
+        .as_ref()
+        .unwrap()
+        .create(
+            &session_hash,
+            user_id,
+            workspace_id,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let (sid_cookie, csrf_cookie) =
+        knot_server::auth::cookies::build_session_cookies(state, &token);
+    let sid_pair = sid_cookie.split(';').next().unwrap().to_string();
+    let csrf_pair = csrf_cookie.split(';').next().unwrap().to_string();
+    let csrf_token = csrf_pair.trim_start_matches("csrf=").to_string();
+    (format!("{sid_pair}; {csrf_pair}"), csrf_token)
+}
+
+/// One JSON request as the session `(cookie, csrf)`.
+async fn send_as(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    session: &(String, String),
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("cookie", &session.0)
+        .header("x-csrf-token", &session.1);
+    let request_body = match body {
+        Some(json_body) => {
+            builder = builder.header("content-type", "application/json");
+            Body::from(json_body.to_string())
+        }
+        None => Body::empty(),
+    };
+    let response = app
+        .oneshot(builder.body(request_body).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json_body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json_body)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_member_reprovisioned_via_oidc_does_not_regain_restricted_access() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let mut state = AppState::with_pool(pool);
+    state.hasher = Arc::new(Hasher::fast_for_tests());
+    state.throttle = Arc::new(Throttle::new());
+    state.session_key = b"test-key-32-bytes-aaaaaaaaaaaaaa".to_vec();
+    state.cookie_secure = false;
+    let workspaces = state.workspaces.clone().unwrap();
+    let users = state.users.clone().unwrap();
+
+    let workspace = workspaces.create("default", "W").await.unwrap();
+    let alice = users
+        .create_local("alice@oidc.test", "Alice", "$h$")
+        .await
+        .unwrap();
+    workspaces
+        .add_member(workspace.id, alice.id, knot_storage::WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    let bob = users
+        .create_oidc("bob@oidc.test", "Bob", "https://idp.test", "bob-subject")
+        .await
+        .unwrap();
+    workspaces
+        .add_member(workspace.id, bob.id, knot_storage::WorkspaceRole::Editor)
+        .await
+        .unwrap();
+    let app = router_with_state(state.clone());
+    let alice_session = oidc_session(&state, alice.id, workspace.id).await;
+    let bob_session = oidc_session(&state, bob.id, workspace.id).await;
+
+    let (status, created) = send_as(
+        app.clone(),
+        "POST",
+        "/api/docs",
+        &alice_session,
+        Some(serde_json::json!({"title": "Private"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let doc_id = created["id"].as_str().unwrap().to_string();
+    let (status, _) = send_as(
+        app.clone(),
+        "PUT",
+        &format!("/api/docs/{doc_id}/restricted"),
+        &alice_session,
+        Some(serde_json::json!({"restricted": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_as(
+        app.clone(),
+        "PUT",
+        &format!("/api/docs/{doc_id}/grants/user:{}", bob.id),
+        &alice_session,
+        Some(serde_json::json!({"role": "editor", "inherit": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Warm Bob's cached access.
+    let (status, _) = send_as(
+        app.clone(),
+        "GET",
+        &format!("/api/docs/{doc_id}"),
+        &bob_session,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bob reads through his grant");
+
+    let (status, _) = send_as(
+        app.clone(),
+        "DELETE",
+        &format!("/api/workspace/members/{}", bob.id),
+        &alice_session,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "alice removes bob");
+
+    // The callback's re-provision branch for a known identity without a
+    // membership, then a fresh login session.
+    workspaces
+        .add_member(workspace.id, bob.id, knot_storage::WorkspaceRole::Viewer)
+        .await
+        .unwrap();
+    let bob_reprovisioned = oidc_session(&state, bob.id, workspace.id).await;
+
+    let (status, _) = send_as(
+        app.clone(),
+        "GET",
+        &format!("/api/docs/{doc_id}"),
+        &bob_reprovisioned,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the old grant is gone");
+    let (status, listed) = send_as(app.clone(), "GET", "/api/docs", &bob_reprovisioned, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["id"] != doc_id.as_str()),
+        "the restricted page is hidden after re-provisioning: {listed}"
     );
 }

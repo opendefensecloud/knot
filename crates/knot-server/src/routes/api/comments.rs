@@ -11,7 +11,7 @@
 //! DELETE /api/docs/{doc_id}/comments/{comment_id}/reactions/{emoji}  → 204
 //!
 //! PATCH  /api/docs/{doc_id}/comments/{comment_id} { body } → 200 (author only)
-//! DELETE /api/docs/{doc_id}/comments/{comment_id}          → 204 (author or workspace owner)
+//! DELETE /api/docs/{doc_id}/comments/{comment_id}          → 204 (author or doc owner)
 
 use axum::{
     Json, Router,
@@ -126,6 +126,8 @@ fn extract_mentions(body: &str) -> Vec<String> {
 
 /// Fire-and-forget mention notification via Postgres LISTEN/NOTIFY channel
 /// `comment_mentions`. Payload: JSON `{type, doc_id, comment_id, user_ids}`.
+/// Mentioned members who can't read the doc (a restricted one) are left
+/// out, so the notification doesn't reveal it to them.
 async fn broadcast_mentions(state: &AppState, doc_id: Uuid, comment_id: Uuid, body: &str) {
     let handles = extract_mentions(body);
     if handles.is_empty() {
@@ -147,15 +149,22 @@ async fn broadcast_mentions(state: &AppState, doc_id: Uuid, comment_id: Uuid, bo
         Ok(None) => return,
         Err(_) => return,
     };
+    let Some(acl) = state.acl.clone() else {
+        return;
+    };
     let members = match workspaces.list_members(ws_id).await {
         Ok(m) => m,
         Err(_) => return,
     };
-    let user_ids: Vec<Uuid> = members
+    let mut user_ids: Vec<Uuid> = Vec::new();
+    for mentioned in members
         .into_iter()
         .filter(|m| handles.contains(&m.display_name.to_lowercase()))
-        .map(|m| m.user_id)
-        .collect();
+    {
+        if let Ok(Some(_)) = acl.effective_role(ws_id, doc_id, mentioned.user_id).await {
+            user_ids.push(mentioned.user_id);
+        }
+    }
     if user_ids.is_empty() {
         return;
     }
@@ -609,7 +618,7 @@ async fn edit_comment(
     }
 }
 
-/// DELETE /api/docs/{doc_id}/comments/{comment_id} — author or workspace owner
+/// DELETE /api/docs/{doc_id}/comments/{comment_id} — author or doc owner
 async fn delete_comment(
     State(state): State<AppState>,
     Path((doc_id, comment_id)): Path<(Uuid, Uuid)>,
@@ -641,14 +650,19 @@ async fn delete_comment(
     if existing.doc_id != doc_id {
         return json_err(StatusCode::NOT_FOUND, "comment.not_found", "");
     }
-    // Allow if author OR workspace owner.
+    // Allow if author OR owner of the doc. The effective doc role, not the
+    // workspace role: inside a restricted doc a workspace owner may hold a
+    // lesser grant, and moderates only if that grant is Owner.
     let is_author = existing.author_id == ctx.user_id;
-    let is_workspace_owner = ctx.role == WorkspaceRole::Owner;
-    if !is_author && !is_workspace_owner {
+    let is_doc_owner = matches!(
+        req.extensions().get::<EffectiveDocRole>(),
+        Some(EffectiveDocRole(WorkspaceRole::Owner))
+    );
+    if !is_author && !is_doc_owner {
         return json_err(
             StatusCode::FORBIDDEN,
             "comment.not_author",
-            "only author or workspace owner can delete",
+            "only author or doc owner can delete",
         );
     }
 

@@ -30,6 +30,7 @@ This directory is knot's planning log. Every non-trivial change lands as a **pla
 | 19 | 2026-06-03 | Comments & Mentions | [plans/2026-06-03-comments.md](plans/2026-06-03-comments.md) | [2026-06-03-plan19-outcome.md](research/2026-06-03-plan19-outcome.md) |
 | 22 | 2026-06-03 | UI Modernization | [plans/2026-06-03-ui-modernization.md](plans/2026-06-03-ui-modernization.md) | [2026-06-03-plan22-outcome.md](research/2026-06-03-plan22-outcome.md) |
 | 25 | 2026-06-03 | Excalidraw Boards | [plans/2026-06-03-excalidraw-boards.md](plans/2026-06-03-excalidraw-boards.md) | [2026-06-03-plan25-outcome.md](research/2026-06-03-plan25-outcome.md) |
+| — | 2026-10-30 | Restricted documents (private subtrees; [spec](specs/2026-10-30-restricted-documents-design.md)) | [plans/2026-10-30-restricted-documents.md](plans/2026-10-30-restricted-documents.md) | [2026-10-30-restricted-documents-outcome.md](research/2026-10-30-restricted-documents-outcome.md) |
 
 > Plan numbers reflect execution order, not always file date. Plans 1–4 predate the plan-driven workflow and don't have outcome docs.
 

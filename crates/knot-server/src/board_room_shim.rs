@@ -1,5 +1,10 @@
 //! WebSocket → BoardRoom shim. Mirrors `room::serve` but against the
 //! `BoardRooms` registry, since boards have their own y-protocol session.
+//!
+//! A board's access is its page's (`doc_id`). `acl_epoch_at_check` is the
+//! page's ACL epoch (`BoardRooms::acl_epoch`), read at upgrade before the
+//! access check; once joined, a different epoch closes the connection with
+//! 4403 before it is sent anything, as in `room::serve`.
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::StreamExt;
@@ -14,10 +19,12 @@ use crate::protocol::{YSyncMessage, decode, encode_sync_step1, encode_sync_step2
 pub async fn serve(
     rooms: Arc<knot_crdt::BoardRooms>,
     board_id: Uuid,
+    doc_id: Uuid,
+    acl_epoch_at_check: u64,
     socket: WebSocket,
     shutdown: CancellationToken,
 ) {
-    let handle = match rooms.acquire(board_id).await {
+    let handle = match rooms.acquire(board_id, doc_id).await {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error=?e, %board_id, "board room acquire failed; closing socket");
@@ -26,12 +33,17 @@ pub async fn serve(
     };
     let conn_id: ConnId = Uuid::new_v4();
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(256);
+    // Cancelled by the board room when an ACL change on the page revokes
+    // this connection, and with the room's own when `revoke_for_doc`
+    // revokes them all; the writer then closes the socket with 4403.
+    let revoked = handle.revoked.child_token();
     // Cancelled by the board room when it refuses an update this connection
     // sent (it nests the board too deep, or it doesn't decode); the writer
     // then closes with 4422.
     let refused = CancellationToken::new();
     let conn_handle = || ConnHandle {
         tx: out_tx.clone(),
+        revoked: revoked.clone(),
         refused: refused.clone(),
     };
 
@@ -52,21 +64,27 @@ pub async fn serve(
         Ok(Ok(j)) => j,
         _ => return,
     };
-    let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
-    // Ask the client for what we lack, exactly as `room::serve` does: the
-    // board provider has the same offline gap (edits made while the socket is
-    // down are applied locally but never sent) and the same SyncStep1 answer.
-    // Sent as its own WS message — BoardProvider decodes one y-protocol
-    // message per frame.
-    let _ = out_tx.send(encode_sync_step1(&joined.state_vector)).await;
+    // The join race, as in `room::serve`: a revoke that missed this
+    // connection shows as a changed epoch. It is sent nothing.
+    if rooms.acl_epoch(doc_id) != acl_epoch_at_check {
+        revoked.cancel();
+    }
+    if !revoked.is_cancelled() {
+        let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
+        // Ask the client for what we lack, exactly as `room::serve` does: the
+        // board provider has the same offline gap (edits made while the
+        // socket is down are applied locally but never sent) and the same
+        // SyncStep1 answer. Sent as its own WS message — BoardProvider
+        // decodes one y-protocol message per frame.
+        let _ = out_tx.send(encode_sync_step1(&joined.state_vector)).await;
+    }
 
     let (sink, mut stream) = socket.split();
     // As in `room::serve`: whichever half ends the session cancels `done` so
-    // the other stops. Boards have no ACL revocation of their own, so the
-    // writer's revoke signal is never raised here. A refused sender is
-    // closed with 4422. When the board room ends (it evicts itself after
-    // refusing an update it had applied, which nested the board too deep,
-    // or its actor stops), its token closes every other connection with
+    // the other stops. A revoked connection is closed with 4403, and a
+    // refused sender with 4422. When the board room ends (it evicts itself
+    // after refusing an update it had applied, which nested the board too
+    // deep, or its actor stops), its token closes every other connection with
     // 1012, so each client reconnects to a fresh board room and re-sends
     // its edits.
     let done = CancellationToken::new();
@@ -74,7 +92,7 @@ pub async fn serve(
         sink,
         out_rx,
         shutdown.clone(),
-        CancellationToken::new(),
+        revoked.clone(),
         refused.clone(),
         handle.shutdown.clone(),
         done.clone(),
@@ -85,6 +103,9 @@ pub async fn serve(
             biased;
             _ = shutdown.cancelled() => break,
             _ = done.cancelled() => break,
+            // A board room takes updates from any connection: forward
+            // nothing more from a revoked one.
+            _ = revoked.cancelled() => break,
             m = stream.next() => match m {
                 Some(Ok(m)) => m,
                 _ => break,

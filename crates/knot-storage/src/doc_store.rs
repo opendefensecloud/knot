@@ -9,6 +9,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::audit;
+use crate::grant_store::ChainNode;
 use crate::invalidations;
 use crate::placement::{self, Placement};
 
@@ -33,6 +34,9 @@ pub struct Document {
     /// The doc the user archived; equals `id` on that doc and points at it
     /// from every descendant archived with it. Set iff `archived_at` is.
     pub archive_root_id: Option<Uuid>,
+    /// A restriction boundary: inside this doc's subtree the workspace role
+    /// stops applying and only explicit grants give access.
+    pub restricted: bool,
 }
 
 /// One entry of the archive list: a doc someone archived, with what the
@@ -48,8 +52,8 @@ pub struct ArchivedRoot {
     pub archived_at: DateTime<Utc>,
     pub archived_by: Option<Uuid>,
     pub archived_by_name: Option<String>,
-    /// Descendants archived together with it.
-    pub subpage_count: i64,
+    /// Descendants archived together with it, in no particular order.
+    pub subpage_ids: Vec<Uuid>,
     /// A purge has started and is not finished; it can't be restored.
     pub purging: bool,
 }
@@ -91,6 +95,15 @@ pub enum DocStoreError {
     /// copies are gone. Trying again can succeed.
     #[error("duplicate conflict")]
     DuplicateConflict,
+    /// A move would take the page into a restricted subtree, out of one, or
+    /// from one into another, and the caller may not cross boundaries.
+    #[error("restriction boundary")]
+    RestrictionBoundary,
+    /// Restore would send the doc to the top level (its parent is still
+    /// archived), taking it out of the restricted subtree it was in.
+    /// Restoring the archived ancestor first avoids that.
+    #[error("restore would leave the restricted subtree")]
+    RestoreRestrictedParentArchived,
 }
 
 /// One page of a live subtree (see `DocStore::live_subtree`).
@@ -101,6 +114,8 @@ pub struct SubtreeRow {
     pub title: String,
     pub icon: Option<String>,
     pub sort_key: String,
+    /// The page is a restriction boundary of its own.
+    pub restricted: bool,
 }
 
 #[async_trait]
@@ -145,12 +160,29 @@ pub trait DocStore: Send + Sync + 'static {
         placement: Placement,
         created_by: Uuid,
     ) -> Result<Document, DocStoreError>;
+    /// `create_placed` for a page that is a restriction boundary from the
+    /// start: it is inserted restricted, with what `set_restricted` writes
+    /// (`created_by`'s inheriting `owner` grant, the `doc.restrict` audit
+    /// entry and the `restrict` invalidation), in the create's transaction.
+    /// No other transaction ever sees the page unrestricted. Errors as for
+    /// `create_placed`.
+    async fn create_placed_restricted(
+        &self,
+        workspace_id: Uuid,
+        parent_id: Option<Uuid>,
+        title: &str,
+        placement: Placement,
+        created_by: Uuid,
+    ) -> Result<Document, DocStoreError>;
     /// Move a page to `placement` among the children of `parent_id` (the top
     /// level when `None`), choosing its key in the same transaction. `Cycle`
     /// when `parent_id` is the page or one of its descendants; `BadAnchor`
     /// as for `create_placed`, and also when the anchor is the page itself;
     /// `Archived` when the page or the parent is in the archive; `NotFound`
-    /// when either is not a page of the workspace.
+    /// when either is not a page of the workspace. Unless
+    /// `allow_boundary_cross`, `RestrictionBoundary` when the old and the new
+    /// parent are in different restricted subtrees (or one is in none),
+    /// checked under the move lock.
     async fn move_placed(
         &self,
         workspace_id: Uuid,
@@ -158,6 +190,7 @@ pub trait DocStore: Send + Sync + 'static {
         actor: Uuid,
         parent_id: Option<Uuid>,
         placement: Placement,
+        allow_boundary_cross: bool,
     ) -> Result<Document, DocStoreError>;
     /// Move the doc and its live subtree to the archive. Returns the ids
     /// stamped, the doc first. Descendants already archived on their own
@@ -172,7 +205,9 @@ pub trait DocStore: Send + Sync + 'static {
     /// the ids restored. If the root's parent is still archived, the root
     /// goes to the top level instead. `Conflict` when the key it gets there
     /// was taken by a writer that skips the group's lock; `RestoreConflict`
-    /// when the root was restored, moved and archived again meanwhile.
+    /// when the root was restored, moved and archived again meanwhile;
+    /// `RestoreRestrictedParentArchived` when going to the top level would
+    /// take it out of a restricted subtree.
     async fn restore(
         &self,
         workspace_id: Uuid,
@@ -241,6 +276,33 @@ pub trait DocStore: Send + Sync + 'static {
         actor: Uuid,
         is_template: bool,
     ) -> Result<Document, DocStoreError>;
+    /// Make the doc a restriction boundary, or stop it being one. Restricting
+    /// also gives `actor` an inheriting `owner` grant on it, so they keep
+    /// access, and revokes the active share links of the doc and every
+    /// descendant. One transaction, with the audit (`doc.restrict` /
+    /// `doc.unrestrict`) and the ACL invalidation (`restrict` /
+    /// `unrestrict`). Idempotent. `NotFound` when the doc is not in the
+    /// workspace.
+    async fn set_restricted(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        actor: Uuid,
+        restricted: bool,
+    ) -> Result<Document, DocStoreError>;
+    /// Every doc of the workspace (archived and templates included), for
+    /// ACL folding.
+    async fn acl_nodes(&self, workspace_id: Uuid) -> Result<Vec<ChainNode>, DocStoreError>;
+    /// Whether any doc of the workspace is a restriction boundary.
+    async fn has_restricted(&self, workspace_id: Uuid) -> Result<bool, DocStoreError>;
+    /// The nearest restriction boundary at or above `doc_id`: the doc itself
+    /// when it is one. `None` outside a restricted subtree, and for a doc
+    /// that is not in the workspace.
+    async fn restriction_root(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+    ) -> Result<Option<Uuid>, DocStoreError>;
 }
 
 #[derive(Clone)]
@@ -253,7 +315,8 @@ impl PgDocStore {
         Self { pool }
     }
 
-    /// One attempt of `create_placed`.
+    /// One attempt of `create_placed`, or of `create_placed_restricted`
+    /// when `restricted`.
     async fn create_placed_once(
         &self,
         workspace_id: Uuid,
@@ -261,12 +324,21 @@ impl PgDocStore {
         title: &str,
         placement: Placement,
         created_by: Uuid,
+        restricted: bool,
     ) -> Result<Document, DocStoreError> {
         let mut tx = crate::begin(&self.pool).await?;
         // The group lock also refuses an archived parent, in place of
         // `lock_live_parent`: taking both would deadlock two creates.
         let sort_key = placement::place(&mut tx, workspace_id, parent_id, placement, None).await?;
-        commit_create(tx, workspace_id, parent_id, title, &sort_key, created_by).await
+        let new_page = NewPage {
+            workspace_id,
+            parent_id,
+            title,
+            sort_key: &sort_key,
+            created_by,
+            restricted,
+        };
+        commit_create(tx, new_page).await
     }
 
     /// One attempt of `move_placed`.
@@ -277,6 +349,7 @@ impl PgDocStore {
         actor: Uuid,
         parent_id: Option<Uuid>,
         placement: Placement,
+        allow_boundary_cross: bool,
     ) -> Result<Document, DocStoreError> {
         let mut tx = crate::begin(&self.pool).await?;
         placement::lock_move(&mut tx, workspace_id, doc_id, parent_id).await?;
@@ -284,6 +357,9 @@ impl PgDocStore {
         // workspace, which a cycle with this one would need, has committed
         // (and this check sees it) or waits for this transaction.
         reject_cycle(&mut tx, doc_id, parent_id).await?;
+        if !allow_boundary_cross {
+            reject_boundary_cross(&mut tx, workspace_id, doc_id, parent_id).await?;
+        }
         let sort_key =
             placement::place(&mut tx, workspace_id, parent_id, placement, Some(doc_id)).await?;
         commit_move(tx, workspace_id, doc_id, actor, parent_id, &sort_key).await
@@ -353,6 +429,15 @@ impl PgDocStore {
             }
             Some(_) => {}
         }
+        // The top level is outside every restricted subtree: going there
+        // would show the doc to the whole workspace.
+        if parent_archived
+            && restriction_root_of(&mut *tx, workspace_id, expected_parent)
+                .await?
+                .is_some()
+        {
+            return Err(DocStoreError::RestoreRestrictedParentArchived);
+        }
         let restored: Vec<Uuid> = sqlx::query_scalar(
             "UPDATE documents
                 SET archived_at = NULL, archived_by = NULL,
@@ -408,6 +493,7 @@ pub(crate) type DocRow = (
     bool,
     Option<Uuid>,
     Option<Uuid>,
+    bool,
 );
 pub(crate) fn doc_from_row(r: DocRow) -> Document {
     Document {
@@ -424,6 +510,7 @@ pub(crate) fn doc_from_row(r: DocRow) -> Document {
         is_template: r.10,
         archived_by: r.11,
         archive_root_id: r.12,
+        restricted: r.13,
     }
 }
 /// Shared SELECT column list, spliced into query strings with `format!`.
@@ -434,7 +521,7 @@ pub(crate) fn doc_from_row(r: DocRow) -> Document {
 /// `SUBTREE_IDS_SQL` and the group conditions of `siblings_sql`), never
 /// caller-supplied, and every runtime value remains a `$N` bind. Keep it
 /// that way: interpolating anything else here would defeat the check.
-pub(crate) const COLS: &str = "id, workspace_id, parent_id, title, sort_key, icon, created_by, created_at, updated_at, archived_at, is_template, archived_by, archive_root_id";
+pub(crate) const COLS: &str = "id, workspace_id, parent_id, title, sort_key, icon, created_by, created_at, updated_at, archived_at, is_template, archived_by, archive_root_id, restricted";
 
 #[async_trait]
 impl DocStore for PgDocStore {
@@ -503,6 +590,85 @@ impl DocStore for PgDocStore {
         Ok(doc)
     }
 
+    async fn set_restricted(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        actor: Uuid,
+        restricted: bool,
+    ) -> Result<Document, DocStoreError> {
+        let mut tx = crate::begin(&self.pool).await?;
+        // The row lock also orders this against the grant store's
+        // last-owner check, which locks the same row.
+        let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
+            "UPDATE documents SET restricted = $3, updated_at = now()
+             WHERE workspace_id = $1 AND id = $2
+             RETURNING {COLS}"
+        )))
+        .bind(workspace_id)
+        .bind(doc_id)
+        .bind(restricted)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DocStoreError::NotFound)?;
+        let doc = doc_from_row(row);
+        if restricted {
+            // Inside the boundary the workspace role stops applying, so
+            // without this grant the actor would lock themselves out.
+            sqlx::query(
+                "INSERT INTO document_grants (doc_id, principal, role, inherit, granted_by)
+                 VALUES ($1, $2, 'owner', true, $3)
+                 ON CONFLICT (doc_id, principal) DO UPDATE
+                 SET role = 'owner', inherit = true,
+                     granted_at = now(), granted_by = EXCLUDED.granted_by",
+            )
+            .bind(doc_id)
+            .bind(format!("user:{actor}"))
+            .bind(actor)
+            .execute(&mut *tx)
+            .await?;
+            // Public links never reach into a restricted subtree. Archived
+            // descendants are included: their links would come back on
+            // restore. `UNION` ends the walk on a parent cycle.
+            sqlx::query(
+                "WITH RECURSIVE subtree AS (
+                     SELECT id FROM documents WHERE workspace_id = $1 AND id = $2
+                     UNION
+                     SELECT d.id FROM documents d JOIN subtree s ON d.parent_id = s.id
+                      WHERE d.workspace_id = $1
+                 )
+                 UPDATE share_tokens SET revoked_at = now()
+                  WHERE revoked_at IS NULL AND doc_id IN (SELECT id FROM subtree)",
+            )
+            .bind(workspace_id)
+            .bind(doc_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        audit::record_in_tx(
+            &mut tx,
+            workspace_id,
+            Some(actor),
+            if restricted {
+                "doc.restrict"
+            } else {
+                "doc.unrestrict"
+            },
+            "doc",
+            doc_id,
+        )
+        .await?;
+        invalidations::record_in_tx(
+            &mut tx,
+            workspace_id,
+            doc_id,
+            if restricted { "restrict" } else { "unrestrict" },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(doc)
+    }
+
     async fn get(&self, doc_id: Uuid) -> Result<Option<Document>, DocStoreError> {
         let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "SELECT {COLS} FROM documents WHERE id = $1"
@@ -523,7 +689,15 @@ impl DocStore for PgDocStore {
     ) -> Result<Document, DocStoreError> {
         let mut tx = crate::begin(&self.pool).await?;
         lock_live_parent(&mut tx, workspace_id, parent_id).await?;
-        commit_create(tx, workspace_id, parent_id, title, sort_key, created_by).await
+        let new_page = NewPage {
+            workspace_id,
+            parent_id,
+            title,
+            sort_key,
+            created_by,
+            restricted: false,
+        };
+        commit_create(tx, new_page).await
     }
 
     async fn rename(
@@ -599,7 +773,21 @@ impl DocStore for PgDocStore {
         created_by: Uuid,
     ) -> Result<Document, DocStoreError> {
         placement::retry_on_deadlock(|| {
-            self.create_placed_once(workspace_id, parent_id, title, placement, created_by)
+            self.create_placed_once(workspace_id, parent_id, title, placement, created_by, false)
+        })
+        .await
+    }
+
+    async fn create_placed_restricted(
+        &self,
+        workspace_id: Uuid,
+        parent_id: Option<Uuid>,
+        title: &str,
+        placement: Placement,
+        created_by: Uuid,
+    ) -> Result<Document, DocStoreError> {
+        placement::retry_on_deadlock(|| {
+            self.create_placed_once(workspace_id, parent_id, title, placement, created_by, true)
         })
         .await
     }
@@ -611,9 +799,17 @@ impl DocStore for PgDocStore {
         actor: Uuid,
         parent_id: Option<Uuid>,
         placement: Placement,
+        allow_boundary_cross: bool,
     ) -> Result<Document, DocStoreError> {
         placement::retry_on_deadlock(|| {
-            self.move_placed_once(workspace_id, doc_id, actor, parent_id, placement)
+            self.move_placed_once(
+                workspace_id,
+                doc_id,
+                actor,
+                parent_id,
+                placement,
+                allow_boundary_cross,
+            )
         })
         .await
     }
@@ -752,18 +948,18 @@ impl DocStore for PgDocStore {
         // Sorted as siblings are; the walk below keeps that order within
         // each parent. `d.id <> $2` stops at the root should a parent cycle
         // run through it (the only kind reachable from it).
-        let rows: Vec<(Uuid, Uuid, String, Option<String>, String)> = sqlx::query_as(
+        let rows: Vec<(Uuid, Uuid, String, Option<String>, String, bool)> = sqlx::query_as(
             "WITH RECURSIVE sub AS (
-                 SELECT id, parent_id, title, icon, sort_key FROM documents
+                 SELECT id, parent_id, title, icon, sort_key, restricted FROM documents
                   WHERE workspace_id = $1 AND parent_id = $2
                     AND archived_at IS NULL AND NOT is_template
                  UNION ALL
-                 SELECT d.id, d.parent_id, d.title, d.icon, d.sort_key
+                 SELECT d.id, d.parent_id, d.title, d.icon, d.sort_key, d.restricted
                    FROM documents d JOIN sub s ON d.parent_id = s.id
                   WHERE d.workspace_id = $1 AND d.id <> $2
                     AND d.archived_at IS NULL AND NOT d.is_template
              )
-             SELECT id, parent_id, title, icon, sort_key FROM sub
+             SELECT id, parent_id, title, icon, sort_key, restricted FROM sub
               ORDER BY sort_key COLLATE \"C\", id",
         )
         .bind(workspace_id)
@@ -771,13 +967,14 @@ impl DocStore for PgDocStore {
         .fetch_all(&self.pool)
         .await?;
         let mut children: HashMap<Uuid, Vec<SubtreeRow>> = HashMap::new();
-        for (id, parent_id, title, icon, sort_key) in rows {
+        for (id, parent_id, title, icon, sort_key, restricted) in rows {
             children.entry(parent_id).or_default().push(SubtreeRow {
                 id,
                 parent_id,
                 title,
                 icon,
                 sort_key,
+                restricted,
             });
         }
         // Depth first, from a stack holding each level in reverse.
@@ -847,14 +1044,14 @@ impl DocStore for PgDocStore {
             DateTime<Utc>,
             Option<Uuid>,
             Option<String>,
-            i64,
+            Vec<Uuid>,
             bool,
         );
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT d.id, d.workspace_id, d.title, d.parent_id, p.title, d.archived_at,
                     d.archived_by, u.display_name,
-                    (SELECT count(*) FROM documents s
-                      WHERE s.archive_root_id = d.id AND s.id <> d.id),
+                    ARRAY(SELECT s.id FROM documents s
+                           WHERE s.archive_root_id = d.id AND s.id <> d.id),
                     d.purge_requested_at IS NOT NULL
                FROM documents d
                LEFT JOIN documents p ON p.id = d.parent_id
@@ -876,7 +1073,7 @@ impl DocStore for PgDocStore {
                 archived_at: r.5,
                 archived_by: r.6,
                 archived_by_name: r.7,
-                subpage_count: r.8,
+                subpage_ids: r.8,
                 purging: r.9,
             })
             .collect())
@@ -899,6 +1096,100 @@ impl DocStore for PgDocStore {
         .fetch_all(&self.pool)
         .await?)
     }
+
+    async fn acl_nodes(&self, workspace_id: Uuid) -> Result<Vec<ChainNode>, DocStoreError> {
+        let rows: Vec<(Uuid, Option<Uuid>, bool, bool)> = sqlx::query_as(
+            "SELECT id, parent_id, restricted, archived_at IS NOT NULL
+             FROM documents WHERE workspace_id = $1",
+        )
+        .bind(workspace_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, parent_id, restricted, archived)| ChainNode {
+                id,
+                parent_id,
+                restricted,
+                archived,
+            })
+            .collect())
+    }
+
+    async fn has_restricted(&self, workspace_id: Uuid) -> Result<bool, DocStoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM documents WHERE workspace_id = $1 AND restricted)",
+        )
+        .bind(workspace_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    async fn restriction_root(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+    ) -> Result<Option<Uuid>, DocStoreError> {
+        Ok(restriction_root_of(&self.pool, workspace_id, Some(doc_id)).await?)
+    }
+}
+
+/// The nearest restriction boundary at or above `doc_id`: the doc itself
+/// when it is one. `None` for `None` (the top level), outside a restricted
+/// subtree, and for a doc that is not in `workspace_id`. The walk up keeps
+/// to the workspace, stops at the first boundary, and is capped at depth
+/// 10000 so a parent cycle can't run it forever.
+pub(crate) async fn restriction_root_of(
+    executor: impl sqlx::PgExecutor<'_>,
+    workspace_id: Uuid,
+    doc_id: Option<Uuid>,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let Some(doc_id) = doc_id else {
+        return Ok(None);
+    };
+    sqlx::query_scalar(
+        "WITH RECURSIVE chain AS (
+             SELECT id, parent_id, restricted, 0 AS depth
+             FROM documents WHERE id = $2 AND workspace_id = $1
+             UNION ALL
+             SELECT d.id, d.parent_id, d.restricted, c.depth + 1
+             FROM documents d JOIN chain c ON d.id = c.parent_id
+             WHERE d.workspace_id = $1 AND NOT c.restricted AND c.depth < 10000
+         )
+         SELECT id FROM chain WHERE restricted ORDER BY depth LIMIT 1",
+    )
+    .bind(workspace_id)
+    .bind(doc_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Fails with `RestrictionBoundary` when moving `doc_id` under `parent_id`
+/// changes the restricted subtree it is in: into one, out of one, or from
+/// one into another. The doc's own flag doesn't count, since it moves with
+/// the doc, so this compares the boundaries above the old and the new
+/// parent. Called with the move's locks held: the doc's row is locked, so
+/// its parent can't change meanwhile, and so is every other move into a
+/// parent of the workspace.
+async fn reject_boundary_cross(
+    tx: &mut sqlx::PgConnection,
+    workspace_id: Uuid,
+    doc_id: Uuid,
+    parent_id: Option<Uuid>,
+) -> Result<(), DocStoreError> {
+    let old_parent: Option<Uuid> =
+        sqlx::query_scalar("SELECT parent_id FROM documents WHERE workspace_id = $1 AND id = $2")
+            .bind(workspace_id)
+            .bind(doc_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DocStoreError::NotFound)?;
+    let old_root = restriction_root_of(&mut *tx, workspace_id, old_parent).await?;
+    let new_root = restriction_root_of(&mut *tx, workspace_id, parent_id).await?;
+    if old_root != new_root {
+        return Err(DocStoreError::RestrictionBoundary);
+    }
+    Ok(())
 }
 
 /// Lock `doc_id` for a purge step; fails unless it is an archive root.
@@ -1032,41 +1323,75 @@ async fn reject_cycle(
     Ok(())
 }
 
-/// The end of a create, once its parent is locked and its key chosen:
-/// inserts the page, records the audit entry and the ACL invalidation, and
-/// commits. `Conflict` when the key is taken in the group.
-async fn commit_create(
-    mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+/// A page `commit_create` inserts.
+struct NewPage<'a> {
     workspace_id: Uuid,
     parent_id: Option<Uuid>,
-    title: &str,
-    sort_key: &str,
+    title: &'a str,
+    sort_key: &'a str,
     created_by: Uuid,
+    /// Inserted as a restriction boundary, with what `set_restricted` writes.
+    restricted: bool,
+}
+
+/// The end of a create, once its parent is locked and its key chosen:
+/// inserts the page, records the audit entry and the ACL invalidation, and
+/// commits. A restricted page also gets its creator's inheriting `owner`
+/// grant, the `doc.restrict` audit entry and the `restrict` invalidation, as
+/// `set_restricted` writes them; a new page has no share links to revoke.
+/// `Conflict` when the key is taken in the group.
+async fn commit_create(
+    mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    page: NewPage<'_>,
 ) -> Result<Document, DocStoreError> {
     let row = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
-        "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
-         VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by, restricted)
+         VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING {COLS}"
     )))
-    .bind(workspace_id)
-    .bind(parent_id)
-    .bind(title)
-    .bind(sort_key)
-    .bind(created_by)
+    .bind(page.workspace_id)
+    .bind(page.parent_id)
+    .bind(page.title)
+    .bind(page.sort_key)
+    .bind(page.created_by)
+    .bind(page.restricted)
     .fetch_one(&mut *tx)
     .await
     .map_err(map_unique)?;
     let doc = doc_from_row(row);
     audit::record_in_tx(
         &mut tx,
-        workspace_id,
-        Some(created_by),
+        page.workspace_id,
+        Some(page.created_by),
         "doc.create",
         "doc",
         doc.id,
     )
     .await?;
-    invalidations::record_in_tx(&mut tx, workspace_id, doc.id, "create").await?;
+    invalidations::record_in_tx(&mut tx, page.workspace_id, doc.id, "create").await?;
+    if page.restricted {
+        // Inside the boundary the workspace role stops applying, so without
+        // this grant the creator would be locked out of their own page.
+        sqlx::query(
+            "INSERT INTO document_grants (doc_id, principal, role, inherit, granted_by)
+             VALUES ($1, $2, 'owner', true, $3)",
+        )
+        .bind(doc.id)
+        .bind(format!("user:{}", page.created_by))
+        .bind(page.created_by)
+        .execute(&mut *tx)
+        .await?;
+        audit::record_in_tx(
+            &mut tx,
+            page.workspace_id,
+            Some(page.created_by),
+            "doc.restrict",
+            "doc",
+            doc.id,
+        )
+        .await?;
+        invalidations::record_in_tx(&mut tx, page.workspace_id, doc.id, "restrict").await?;
+    }
     tx.commit().await?;
     Ok(doc)
 }

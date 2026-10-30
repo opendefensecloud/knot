@@ -4,8 +4,9 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SessionProvider } from "../../auth/SessionContext";
+import { useUi } from "../../stores/ui";
 
-import { daysUntil, purgeConfirmText } from "./archive";
+import { archiveErrorText, daysUntil, purgeConfirmText } from "./archive";
 import ArchivePage from "./ArchivePage";
 
 afterEach(() => {
@@ -132,6 +133,61 @@ describe("ArchivePage", () => {
     expect(row).toHaveTextContent("Being deleted permanently");
     expect(within(row).queryByRole("button", { name: "Restore" })).toBeNull();
     expect(within(row).getByRole("button", { name: "Delete permanently" })).toBeInTheDocument();
+  });
+
+  it("doesn't call a page whose parent is hidden a top-level page", async () => {
+    vi.stubGlobal(
+      "fetch",
+      server("editor", [
+        { ...folderEntry, parent_id: null, parent_title: null, parent_hidden: true },
+        { ...folderEntry, id: "top", title: "Top", parent_id: null, parent_title: null },
+      ]),
+    );
+    renderPage();
+
+    const hiddenParentRow = await screen.findByTestId("archive-row-folder");
+    expect(hiddenParentRow).toHaveTextContent("in a page you can't see");
+    expect(hiddenParentRow).not.toHaveTextContent("top level");
+    expect(screen.getByTestId("archive-row-top")).toHaveTextContent("top level");
+  });
+
+  it("offers permanent deletion by the role on the page when the archive says it", async () => {
+    // A workspace editor who owns an archived restricted page, and a page
+    // a workspace owner may only edit.
+    vi.stubGlobal(
+      "fetch",
+      server("editor", [
+        { ...folderEntry, effective_role: "owner" },
+        { ...folderEntry, id: "edited", title: "Edited", effective_role: "editor" },
+      ]),
+    );
+    renderPage();
+
+    const ownedRow = await screen.findByTestId("archive-row-folder");
+    expect(within(ownedRow).getByRole("button", { name: "Delete permanently" })).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("archive-row-edited")).queryByRole("button", { name: "Delete permanently" }),
+    ).toBeNull();
+  });
+
+  it("says why a permanent deletion was refused for hidden subpages", async () => {
+    const notify = vi.spyOn(useUi.getState(), "notify");
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const answer = server("owner", [folderEntry]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) =>
+        url === "/api/docs/folder/purge" && init?.method === "POST"
+          ? json({ error: { code: "doc.hidden_descendants", message: "", details: {} } }, 409)
+          : answer(url, init),
+      ),
+    );
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Delete permanently" }));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith("error", archiveErrorText("doc.hidden_descendants")),
+    );
   });
 
   it("says so when the archive is empty", async () => {

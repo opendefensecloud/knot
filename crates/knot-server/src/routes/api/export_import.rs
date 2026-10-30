@@ -22,6 +22,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
+use knot_docs::Visibility;
 use knot_storage::Placement;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -88,6 +89,12 @@ struct DocEntry {
     /// Path inside the zip that holds this doc's markdown body.
     /// E.g. `docs/Meeting-notes.md`.
     path: String,
+    /// Import creates this doc restricted, with the importer as its owner.
+    /// Set on restriction boundaries, and on a root of the export that sat
+    /// inside a restricted subtree, so the copy is no more visible than the
+    /// original was. Absent from older exports.
+    #[serde(default)]
+    restricted: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -143,19 +150,24 @@ async fn export_workspace(State(state): State<AppState>, req: Request) -> Respon
         Ok(d) => d,
         Err(_) => return internal(),
     };
-    write_export_zip(
-        &state,
-        ctx.workspace_id,
-        all_docs,
-        /*reparent_roots=*/ false,
-    )
-    .await
+    // Owning the workspace doesn't open restricted pages: only the pages the
+    // owner can read go into the export.
+    let all_ids: Vec<Uuid> = all_docs.iter().map(|d| d.id).collect();
+    let visibility = match super::docs::visibility_covering_ids(&state, &ctx, &all_ids).await {
+        Ok(visibility) => visibility,
+        Err(response) => return response,
+    };
+    let readable_docs: Vec<_> = all_docs
+        .into_iter()
+        .filter(|d| visibility.readable(d.id))
+        .collect();
+    write_export_zip(&state, ctx.workspace_id, readable_docs, &visibility).await
 }
 
 /// Single-doc export. With `descendants=true`, includes every descendant
-/// of `doc_id` in the workspace tree. Either way the root doc(s) of the
-/// returned zip have their `parent_id` cleared so an import grafts the
-/// subtree under whatever target the caller specifies.
+/// of `doc_id` in the workspace tree that the caller can read. Either way
+/// the root doc(s) of the returned zip have their `parent_id` cleared so an
+/// import grafts the subtree under whatever target the caller specifies.
 async fn export_doc(
     State(state): State<AppState>,
     Path(doc_id): Path<Uuid>,
@@ -185,40 +197,29 @@ async fn export_doc(
         Ok(d) => d,
         Err(_) => return internal(),
     };
-    let subset: Vec<_> = if q.descendants {
-        let ids = collect_subtree_ids(doc_id, &all_docs);
-        // Per-descendant ACL re-check. Parent-readable + child-private is a
-        // legal grant in knot today, and we don't want subtree export to
-        // leak the child. Skip descendants the caller can't read; the
-        // tree shape gets pruned at the lowest readable ancestor.
-        let mut keep: Vec<knot_storage::Document> = Vec::new();
-        for d in all_docs.into_iter().filter(|d| ids.contains(&d.id)) {
-            if d.id == doc_id {
-                keep.push(d);
-                continue;
-            }
-            match acl
-                .effective_role(ctx.workspace_id, d.id, ctx.user_id)
-                .await
-            {
-                Ok(Some(_)) => keep.push(d),
-                _ => continue,
-            }
-        }
-        keep
+    let subtree_ids = if q.descendants {
+        collect_subtree_ids(doc_id, &all_docs)
     } else {
-        all_docs.into_iter().filter(|d| d.id == doc_id).collect()
+        HashSet::from([doc_id])
     };
+    let subset_ids: Vec<Uuid> = subtree_ids.iter().copied().collect();
+    let visibility = match super::docs::visibility_covering_ids(&state, &ctx, &subset_ids).await {
+        Ok(visibility) => visibility,
+        Err(response) => return response,
+    };
+    // Per-descendant ACL re-check: a subpage can be restricted, or the
+    // caller's grant may not inherit, and subtree export must not leak it.
+    // The root passed the check above; skip descendants the caller can't
+    // read.
+    let subset: Vec<_> = all_docs
+        .into_iter()
+        .filter(|d| subtree_ids.contains(&d.id))
+        .filter(|d| d.id == doc_id || visibility.readable(d.id))
+        .collect();
     if subset.is_empty() {
         return json_err(StatusCode::NOT_FOUND, "doc.not_found", "");
     }
-    write_export_zip(
-        &state,
-        ctx.workspace_id,
-        subset,
-        /*reparent_roots=*/ true,
-    )
-    .await
+    write_export_zip(&state, ctx.workspace_id, subset, &visibility).await
 }
 
 /// BFS collect of `root` + descendants from the flat doc list. Single O(N)
@@ -250,11 +251,13 @@ fn collect_subtree_ids(
     out
 }
 
+/// The zip of `all_docs`, each of which the caller can read (`visibility`
+/// is theirs).
 async fn write_export_zip(
     state: &AppState,
     workspace_id: Uuid,
     all_docs: Vec<knot_storage::Document>,
-    reparent_roots: bool,
+    visibility: &Visibility,
 ) -> Response {
     let Some(cache) = state.markdown_cache.clone() else {
         return internal();
@@ -269,15 +272,20 @@ async fn write_export_zip(
         return internal();
     };
 
-    // For subtree/single exports, manifest parent_ids that don't point at a
-    // doc inside the subset become None so import grafts cleanly under the
-    // import's target parent.
+    // Manifest parent_ids that don't point at a doc inside the export become
+    // None, so import grafts cleanly under the import's target parent, and a
+    // parent the caller can't read is never named.
     let included_ids: std::collections::HashSet<Uuid> = all_docs.iter().map(|d| d.id).collect();
-    let resolve_parent = |d: &knot_storage::Document| -> Option<String> {
-        match d.parent_id {
-            Some(p) if !reparent_roots || included_ids.contains(&p) => Some(p.to_string()),
-            _ => None,
-        }
+    let resolve_parent = |d: &knot_storage::Document| -> Option<Uuid> {
+        d.parent_id.filter(|p| included_ids.contains(p))
+    };
+    // A root of the export that sat inside a restricted subtree is restricted
+    // on import too; below a root, the root's flag (or a doc's own) covers it.
+    let restricted_on_import = |d: &knot_storage::Document| -> bool {
+        let within_restricted = visibility
+            .access(d.id)
+            .is_some_and(|access| access.restriction_root.is_some());
+        d.restricted || (resolve_parent(d).is_none() && within_restricted)
     };
 
     // index.json — captures tree + lookup tables.
@@ -349,10 +357,11 @@ async fn write_export_zip(
             let doc_path = doc_path_for.get(&d.id).cloned().unwrap_or_default();
             manifest.docs.push(DocEntry {
                 id: d.id.to_string(),
-                parent_id: resolve_parent(d),
+                parent_id: resolve_parent(d).map(|p| p.to_string()),
                 title: d.title.clone(),
                 sort_key: d.sort_key.clone(),
                 path: doc_path.clone(),
+                restricted: restricted_on_import(d),
             });
             // Markdown body — best-effort from the cache. Missing cache entry
             // means the doc has never been exported; we skip the body rather
@@ -452,14 +461,13 @@ async fn import(
     let Some(workspaces) = state.workspaces.clone() else {
         return internal();
     };
-    let Some(acl) = state.acl.clone() else {
-        return internal();
-    };
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
     // ACL: with no parent_id, owner on the workspace is required.
-    // With a parent_id, editor+ on that parent is sufficient.
+    // With a parent_id, editor+ on that parent is sufficient. As for create
+    // and move, a parent in another workspace, or one the caller can't
+    // read, is refused like an id no page has.
     match q.parent_id {
         None => {
             match workspaces
@@ -471,28 +479,10 @@ async fn import(
             }
         }
         Some(parent) => {
-            // As for create and move: a page of another workspace is no
-            // parent here, and is refused like an id no page has.
-            match docs.get(parent).await {
-                Ok(Some(doc)) if doc.workspace_id == ctx.workspace_id => {}
-                Ok(_) => return json_err(StatusCode::NOT_FOUND, "doc.not_found", ""),
-                Err(e) => {
-                    tracing::error!(error=?e, "import: read parent");
-                    return internal();
-                }
-            }
-            match acl
-                .effective_role(ctx.workspace_id, parent, ctx.user_id)
-                .await
+            if let Err(response) =
+                crate::restricted::require_editable_parent(&state, &ctx, parent).await
             {
-                Ok(Some(WorkspaceRole::Owner | WorkspaceRole::Editor)) => {}
-                _ => return json_err(StatusCode::FORBIDDEN, "acl.editor_required", ""),
-            }
-            if let Some(r) =
-                crate::archive::refuse_if_archived(&state, ctx.workspace_id, parent, ctx.user_id)
-                    .await
-            {
-                return r;
+                return response;
             }
         }
     }
@@ -552,12 +542,19 @@ async fn import(
     //    keys only set the order (see `creation_order`), because they
     //    collide with the pages of an earlier import of the same export.
     let docs_sorted = creation_order(&manifest.docs);
+    let mut imported_root_ids: Vec<Uuid> = Vec::new();
+    let mut restricted_subtrees = RestrictedSubtrees::default();
     for d in &docs_sorted {
+        if !restricted_subtrees.admit(d) {
+            tracing::warn!(old_id=?d.id, "import: doc skipped, its restricted subtree lost a page");
+            continue;
+        }
         // Reject malformed doc ids before letting them flow through the
         // remap. They'd be harmless (the doc_remap key is never used as a
         // filesystem path on import — only as an interned manifest key),
         // but defense in depth.
         if Uuid::parse_str(&d.id).is_err() {
+            restricted_subtrees.failed(d);
             continue;
         }
         // Roots of the import (no parent_id, or parent_id not in the
@@ -567,8 +564,13 @@ async fn import(
             .as_ref()
             .and_then(|p| doc_remap.get(p).copied())
             .or(q.parent_id);
-        match docs
-            .create_placed(
+        let is_import_root = new_parent == q.parent_id;
+        // A restricted page is created restricted, in one transaction, so
+        // neither its title nor anything later put below it or into it is
+        // ever readable to the whole workspace. That makes the importer its
+        // owner.
+        let created = if d.restricted {
+            docs.create_placed_restricted(
                 ctx.workspace_id,
                 new_parent,
                 &d.title,
@@ -576,13 +578,47 @@ async fn import(
                 ctx.user_id,
             )
             .await
-        {
+        } else {
+            docs.create_placed(
+                ctx.workspace_id,
+                new_parent,
+                &d.title,
+                Placement::Last,
+                ctx.user_id,
+            )
+            .await
+        };
+        match created {
             Ok(created) => {
                 doc_remap.insert(d.id.clone(), created.id);
+                if is_import_root {
+                    imported_root_ids.push(created.id);
+                }
+                // This replica reads the new boundary right away, not once
+                // the invalidation's NOTIFY comes back.
+                if d.restricted {
+                    crate::archive::evict_local(&state, &[created.id]).await;
+                }
             }
             Err(e) => {
                 tracing::warn!(error=?e, old_id=?d.id, "import: create doc failed");
+                restricted_subtrees.failed(d);
             }
+        }
+    }
+    // Under a parent the importer edits through a grant that doesn't
+    // inherit, they couldn't edit what they imported; an owner grant on
+    // each root covers the pages below it.
+    for root_id in &imported_root_ids {
+        if let Err(response) = crate::restricted::ensure_creator_can_edit(
+            &state,
+            ctx.workspace_id,
+            *root_id,
+            ctx.user_id,
+        )
+        .await
+        {
+            return response;
         }
     }
 
@@ -830,6 +866,46 @@ fn read_zip_entry<R: Read + std::io::Seek>(
     Some(out)
 }
 
+/// Which docs of the manifest import may still create, as it goes through
+/// them in `creation_order`. A doc whose parent wasn't created is grafted
+/// onto the import target, except in a restricted subtree of the manifest:
+/// only the boundary carries the flag, so a subpage grafted there would be
+/// readable to the whole workspace. Such a subpage is skipped, with
+/// everything below it.
+#[derive(Default)]
+struct RestrictedSubtrees {
+    /// Manifest ids of the docs seen so far that are restricted or have a
+    /// restricted ancestor in the manifest.
+    within_restricted: HashSet<String>,
+    /// Manifest ids of the docs in `within_restricted` that weren't created,
+    /// and of everything below them.
+    dropped: HashSet<String>,
+}
+
+impl RestrictedSubtrees {
+    /// Notes `entry`, after its parent (if in the manifest) was noted;
+    /// `false` when it must be skipped because its parent was dropped.
+    fn admit(&mut self, entry: &DocEntry) -> bool {
+        let parent = entry.parent_id.as_deref();
+        if entry.restricted || parent.is_some_and(|p| self.within_restricted.contains(p)) {
+            self.within_restricted.insert(entry.id.clone());
+        }
+        if parent.is_some_and(|p| self.dropped.contains(p)) {
+            self.dropped.insert(entry.id.clone());
+            return false;
+        }
+        true
+    }
+
+    /// `entry`, admitted, wasn't created: in a restricted subtree, the
+    /// docs below it are skipped.
+    fn failed(&mut self, entry: &DocEntry) {
+        if self.within_restricted.contains(&entry.id) {
+            self.dropped.insert(entry.id.clone());
+        }
+    }
+}
+
 /// The order import creates docs in: by depth in the manifest's tree, so
 /// parents come before children, then by `sort_key` byte by byte (the
 /// sidebar's order, `COLLATE "C"`), then by manifest index. Each doc is
@@ -910,6 +986,7 @@ fn creation_order(entries: &[DocEntry]) -> Vec<DocEntry> {
             title: e.title.clone(),
             sort_key: e.sort_key.clone(),
             path: e.path.clone(),
+            restricted: e.restricted,
         })
         .collect();
     // Stable, so equal keys keep their manifest order.
@@ -1135,6 +1212,55 @@ fn internal() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A manifest entry with `id` under `parent_id`.
+    fn manifest_doc(id: &str, parent_id: Option<&str>, restricted: bool) -> DocEntry {
+        DocEntry {
+            id: id.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            title: id.to_string(),
+            sort_key: "a".to_string(),
+            path: format!("docs/{id}.md"),
+            restricted,
+        }
+    }
+
+    #[test]
+    fn restricted_subtrees_drop_below_a_lost_page_in_a_restricted_subtree() {
+        let vault = manifest_doc("vault", None, true);
+        let plans = manifest_doc("plans", Some("vault"), false);
+        let notes = manifest_doc("notes", Some("plans"), false);
+        let open = manifest_doc("open", None, false);
+        let leaf = manifest_doc("leaf", Some("open"), false);
+
+        // Every page created: nothing is skipped.
+        let mut all_created = RestrictedSubtrees::default();
+        for entry in [&vault, &plans, &notes, &open, &leaf] {
+            assert!(all_created.admit(entry), "{} admitted", entry.id);
+        }
+
+        // The boundary is lost: its whole subtree goes.
+        let mut boundary_lost = RestrictedSubtrees::default();
+        assert!(boundary_lost.admit(&vault));
+        boundary_lost.failed(&vault);
+        assert!(!boundary_lost.admit(&plans));
+        assert!(!boundary_lost.admit(&notes));
+        assert!(boundary_lost.admit(&open));
+
+        // A subpage of the boundary is lost: only what is below it goes.
+        let mut subpage_lost = RestrictedSubtrees::default();
+        assert!(subpage_lost.admit(&vault));
+        assert!(subpage_lost.admit(&plans));
+        subpage_lost.failed(&plans);
+        assert!(!subpage_lost.admit(&notes));
+
+        // Outside every restricted subtree, children of a lost page are
+        // still admitted, to be grafted onto the import target.
+        let mut unrestricted_lost = RestrictedSubtrees::default();
+        assert!(unrestricted_lost.admit(&open));
+        unrestricted_lost.failed(&open);
+        assert!(unrestricted_lost.admit(&leaf));
+    }
 
     /// Build the three uuid → path tables used by rewrite_for_export
     /// for a single doc/board/blob trio.
@@ -1418,6 +1544,7 @@ mod tests {
             title: id.to_string(),
             sort_key: key.to_string(),
             path: format!("docs/{id}.md"),
+            restricted: false,
         }
     }
 

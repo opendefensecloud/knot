@@ -47,8 +47,12 @@ async fn upsert_then_list_returns_rows() {
     store.upsert_for_doc(ws_id, doc_id, &items).await.unwrap();
     let in_doc = store.list_for_doc(doc_id).await.unwrap();
     assert_eq!(in_doc.len(), 2);
-    let mine = store.list_for_assignee(ws_id, user_id, true).await.unwrap();
+    let mine = store
+        .list_for_assignee(ws_id, user_id, true, &[])
+        .await
+        .unwrap();
     assert_eq!(mine.len(), 2);
+    assert!(mine.iter().all(|assigned| assigned.doc_title == "Doc"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -72,11 +76,11 @@ async fn list_excludes_completed_by_default() {
     ];
     store.upsert_for_doc(ws_id, doc_id, &items).await.unwrap();
     let open_only = store
-        .list_for_assignee(ws_id, user_id, false)
+        .list_for_assignee(ws_id, user_id, false, &[])
         .await
         .unwrap();
     assert_eq!(open_only.len(), 1);
-    assert_eq!(open_only[0].text, "Open");
+    assert_eq!(open_only[0].task.text, "Open");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -257,4 +261,66 @@ async fn unchanged_checked_preserves_completed_at_across_reindex() {
         .completed_at
         .expect("expected completed_at preserved across reindex");
     assert_eq!(first, second);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_for_assignee_skips_hidden_docs_and_carries_titles() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let workspace = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
+        .await
+        .unwrap();
+    let assignee = PgUserStore::new(pool.clone())
+        .create_local("a@x.test", "A", "$h$")
+        .await
+        .unwrap();
+    PgWorkspaceStore::new(pool.clone())
+        .add_member(workspace.id, assignee.id, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+    let docs = PgDocStore::new(pool.clone());
+    let first_key = sort_key_between(None, None);
+    let visible_doc = docs
+        .create(workspace.id, None, "Visible", &first_key, assignee.id)
+        .await
+        .unwrap();
+    let second_key = sort_key_between(Some(&first_key), None);
+    let hidden_doc = docs
+        .create(workspace.id, None, "Hidden", &second_key, assignee.id)
+        .await
+        .unwrap();
+    let store = PgTaskStore::new(pool);
+    for doc_id in [visible_doc.id, hidden_doc.id] {
+        store
+            .upsert_for_doc(
+                workspace.id,
+                doc_id,
+                &[DocTaskInput {
+                    item_index: 0,
+                    text: "Do it".into(),
+                    assignee_user_id: Some(assignee.id),
+                    checked: false,
+                    due_at: None,
+                }],
+            )
+            .await
+            .unwrap();
+    }
+
+    for include_completed in [false, true] {
+        let listed = store
+            .list_for_assignee(
+                workspace.id,
+                assignee.id,
+                include_completed,
+                &[hidden_doc.id],
+            )
+            .await
+            .unwrap();
+        let listed: Vec<(Uuid, String)> = listed
+            .into_iter()
+            .map(|assigned| (assigned.task.doc_id, assigned.doc_title))
+            .collect();
+        assert_eq!(listed, vec![(visible_doc.id, "Visible".to_string())]);
+    }
 }

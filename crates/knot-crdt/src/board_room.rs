@@ -31,6 +31,13 @@ pub struct InMsg {
 
 pub struct ConnHandle {
     pub tx: mpsc::Sender<Vec<u8>>,
+    /// Cancelled by the board room when the connection's access to the
+    /// board's page is revoked ([`Event::Revoke`]), as
+    /// `room::ConnHandle::revoked` is; the WS shim then closes the socket
+    /// with 4403. The shim makes it a child of [`BoardRoomHandle::revoked`],
+    /// which revokes every connection at once. As for a refused connection,
+    /// the board room ignores everything a revoked one still sends.
+    pub revoked: CancellationToken,
     /// Cancelled by the board room when it refuses an update the
     /// connection sent while the room holds it, as `room::ConnHandle::refused`
     /// is; the WS shim then closes the socket with 4422. The board room
@@ -43,9 +50,15 @@ pub struct ConnHandle {
 }
 
 impl ConnHandle {
+    /// Whether the board room refused or revoked this connection.
+    fn is_shut_out(&self) -> bool {
+        self.refused.is_cancelled() || self.revoked.is_cancelled()
+    }
+
     pub fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
         Self {
             tx,
+            revoked: CancellationToken::new(),
             refused: CancellationToken::new(),
         }
     }
@@ -63,6 +76,9 @@ pub enum Event {
         from: ConnId,
         payload: Vec<u8>,
     },
+    /// The access of every connection ends: each is told to close (4403)
+    /// through its `revoked` token, as `room::Event::Revoke` does.
+    Revoke,
     Shutdown,
 }
 
@@ -82,16 +98,27 @@ pub struct BoardRoom {
 
 pub struct BoardRoomHandle {
     pub tx: mpsc::Sender<Event>,
+    /// The page the board belongs to, whose ACL decides who may edit it:
+    /// [`crate::BoardRooms::revoke_for_doc`] finds the board rooms to
+    /// revoke by it.
+    pub doc_id: Uuid,
     /// The board room's lifetime, as `RoomHandle::shutdown`: the room
     /// cancels it when it evicts itself, and its actor whenever it ends;
     /// the registry then boots a fresh room on the next join, and every WS
     /// shim of the room closes its socket so the client reconnects to it.
     pub shutdown: CancellationToken,
+    /// Cancelled when the access to the board's page changes
+    /// ([`crate::BoardRooms::revoke_for_doc`]), which then evicts the room.
+    /// Each WS shim makes its connection's [`ConnHandle::revoked`] a child
+    /// of it, so every socket closes with 4403 (checked before the room's
+    /// end, 1012) and its client re-checks its access before it reconnects.
+    pub revoked: CancellationToken,
 }
 
 impl BoardRoom {
     pub async fn spawn(
         board_id: Uuid,
+        doc_id: Uuid,
         engine: Arc<dyn Engine>,
         store: Arc<dyn knot_storage::BoardStore>,
         bus: Arc<dyn Bus>,
@@ -146,7 +173,12 @@ impl BoardRoom {
             last_applied_seq,
         };
         tokio::spawn(room.run());
-        Ok(BoardRoomHandle { tx, shutdown })
+        Ok(BoardRoomHandle {
+            tx,
+            doc_id,
+            shutdown,
+            revoked: CancellationToken::new(),
+        })
     }
 
     #[tracing::instrument(skip_all, fields(board_id = %self.board_id))]
@@ -176,7 +208,7 @@ impl BoardRoom {
                         // out locally also fits under PgBus's cross-pod size limit;
                         // otherwise large presence would silently fail across pods.
                         if crate::presence::is_oversize(&payload) { continue; }
-                        if self.is_refused(&from) { continue; }
+                        if self.is_shut_out(&from) { continue; }
                         let mut to_close: Vec<ConnId> = Vec::new();
                         for (cid, conn) in self.served() {
                             if *cid == from { continue; }
@@ -188,6 +220,17 @@ impl BoardRoom {
                         // Bus fan-out to other pods — payload is still owned
                         // (the loop above clones per conn, not a move).
                         let _ = self.bus.publish_presence(self.board_id, payload).await;
+                    }
+                    Some(Event::Revoke) => {
+                        // Tell every connection to close (the WS shim sends
+                        // 4403). Unlike a page room, keep their handles
+                        // until they leave: a board room takes updates from
+                        // any connection, so only a held, revoked handle
+                        // makes it ignore what they still send
+                        // ([`Self::is_shut_out`]).
+                        for conn in self.conns.values() {
+                            conn.revoked.cancel();
+                        }
                     }
                     Some(Event::Shutdown) | None => break,
                 },
@@ -248,10 +291,12 @@ impl BoardRoom {
         handle: ConnHandle,
         reply: oneshot::Sender<Result<JoinState, EngineError>>,
     ) {
-        // A re-join (client SyncStep1) queued behind an update the room
-        // refused still carries the connection's cancelled handle. Refuse it
-        // by dropping `reply`, as `Room::on_join` does.
-        if handle.refused.is_cancelled() {
+        // A re-join (client SyncStep1) racing a revoke, or queued behind an
+        // update the room refused, still carries the connection's cancelled
+        // handle. Refuse it by dropping `reply`, as `Room::on_join` does: no
+        // board state for someone whose access just ended or who was just
+        // refused.
+        if handle.is_shut_out() {
             return;
         }
         self.conns.insert(conn_id, handle);
@@ -261,9 +306,10 @@ impl BoardRoom {
     #[tracing::instrument(skip(self, m), fields(board_id = %self.board_id, bytes = m.bytes.len()))]
     async fn on_inbound(&mut self, m: InMsg) {
         // A board room takes updates from any connection, except one it
-        // refused: that one can keep sending until its socket is torn down.
-        if self.is_refused(&m.from) {
-            tracing::debug!(conn = %m.from, "dropping a board update from a refused connection");
+        // refused or revoked: that one can keep sending until its socket is
+        // torn down.
+        if self.is_shut_out(&m.from) {
+            tracing::debug!(conn = %m.from, "dropping a board update from a refused or revoked connection");
             return;
         }
         // The same rules as `Room::on_inbound`: nothing of an update that
@@ -369,7 +415,7 @@ impl BoardRoom {
     /// page room, a board room takes updates from any connection, joined
     /// or not, so dropping the connection would not stop what it still
     /// sends. The room keeps its handle, with `refused` cancelled, until
-    /// the connection leaves: [`Self::is_refused`] then makes it ignore
+    /// the connection leaves: [`Self::is_shut_out`] then makes it ignore
     /// everything the connection sends (a re-join, an update, presence),
     /// and [`Self::served`] leaves it out of every fan-out, so that it is
     /// never dropped as a slow or closed consumer before it leaves.
@@ -381,19 +427,15 @@ impl BoardRoom {
     }
 
     /// Whether `from` is a connection the board room refused
-    /// ([`Self::refuse_sender`]).
-    fn is_refused(&self, from: &ConnId) -> bool {
-        self.conns
-            .get(from)
-            .is_some_and(|conn| conn.refused.is_cancelled())
+    /// ([`Self::refuse_sender`]) or revoked ([`Event::Revoke`]).
+    fn is_shut_out(&self, from: &ConnId) -> bool {
+        self.conns.get(from).is_some_and(ConnHandle::is_shut_out)
     }
 
     /// The connections the board room sends to: every one it holds except
-    /// those it refused.
+    /// those it refused or revoked.
     fn served(&self) -> impl Iterator<Item = (&ConnId, &ConnHandle)> {
-        self.conns
-            .iter()
-            .filter(|(_, conn)| !conn.refused.is_cancelled())
+        self.conns.iter().filter(|(_, conn)| !conn.is_shut_out())
     }
 
     /// Refuse an inbound update the live doc already holds, all of it or
@@ -497,7 +539,7 @@ mod tests {
         let sub = bus.subscribe(board_id).await.unwrap();
         let store: Arc<dyn knot_storage::BoardStore> = Arc::new(NoopBoardStore);
         let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
-        let h = BoardRoom::spawn(board_id, engine, store, bus, sub)
+        let h = BoardRoom::spawn(board_id, Uuid::new_v4(), engine, store, bus, sub)
             .await
             .unwrap();
         h.shutdown.cancel();
@@ -515,7 +557,7 @@ mod tests {
         let sub = bus.subscribe(board_id).await.unwrap();
         let store: Arc<dyn knot_storage::BoardStore> = Arc::new(NoopBoardStore);
         let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
-        let h = BoardRoom::spawn(board_id, engine, store, bus, sub)
+        let h = BoardRoom::spawn(board_id, Uuid::new_v4(), engine, store, bus, sub)
             .await
             .unwrap();
         let mut conns = Vec::new();
@@ -575,6 +617,105 @@ mod tests {
         h.shutdown.cancel();
     }
 
+    /// An ACL change must reach board sockets that are already open, as it
+    /// does page sockets: the board room tells each connection to close
+    /// (4403) through its `revoked` token, refuses a re-join on a revoked
+    /// handle, and ignores whatever a revoked connection still sends,
+    /// although a board room otherwise takes updates from any connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoke_signals_each_conn_and_refuses_join() {
+        use yrs::{Map, ReadTxn, StateVector, Transact};
+
+        let board_id = Uuid::new_v4();
+        let bus = Arc::new(MemBus::new());
+        let sub = bus.subscribe(board_id).await.unwrap();
+        let store: Arc<dyn knot_storage::BoardStore> = Arc::new(NoopBoardStore);
+        let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
+        let h = BoardRoom::spawn(board_id, Uuid::new_v4(), engine, store, bus, sub)
+            .await
+            .unwrap();
+        let join = |handle: ConnHandle, conn_id: ConnId| {
+            let room_tx = h.tx.clone();
+            async move {
+                let (reply, joined) = oneshot::channel();
+                room_tx
+                    .send(Event::Join {
+                        conn_id,
+                        handle,
+                        reply,
+                    })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(10), joined)
+                    .await
+                    .expect("the board room never answered the join")
+            }
+        };
+
+        let revoked_conn = Uuid::new_v4();
+        let (revoked_tx, _revoked_rx) = mpsc::channel(64);
+        let revoked_handle = ConnHandle::new(revoked_tx.clone());
+        let revoked = revoked_handle.revoked.clone();
+        join(revoked_handle, revoked_conn).await.unwrap().unwrap();
+
+        h.tx.send(Event::Revoke).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), revoked.cancelled())
+            .await
+            .expect("the revoked connection was never told to close");
+
+        // A client SyncStep1 racing the revoke re-joins with the cancelled
+        // handle: no board state for it.
+        let rejoin = ConnHandle {
+            tx: revoked_tx,
+            revoked: revoked.clone(),
+            refused: CancellationToken::new(),
+        };
+        assert!(
+            join(rejoin, revoked_conn).await.is_err(),
+            "a revoked connection was sent the board state"
+        );
+
+        // Connections that join after the revoke are served as usual, and
+        // nothing the revoked one still sends reaches them.
+        let (peer_tx, mut peer_rx) = mpsc::channel(64);
+        join(ConnHandle::new(peer_tx), Uuid::new_v4())
+            .await
+            .unwrap()
+            .unwrap();
+        let writer = Uuid::new_v4();
+        let (writer_tx, _writer_rx) = mpsc::channel(64);
+        join(ConnHandle::new(writer_tx), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        let update = |key: &str| {
+            let doc = yrs::Doc::new();
+            let elements = doc.get_or_insert_map("elements");
+            elements.insert(&mut doc.transact_mut(), key, "rect");
+            doc.transact()
+                .encode_state_as_update_v1(&StateVector::default())
+        };
+        let sentinel = update("sentinel");
+        for (from, bytes) in [
+            (revoked_conn, update("after the revoke")),
+            (writer, sentinel.clone()),
+        ] {
+            h.tx.send(Event::Inbound(InMsg { from, bytes }))
+                .await
+                .unwrap();
+        }
+        let fanned = tokio::time::timeout(std::time::Duration::from_secs(10), peer_rx.recv())
+            .await
+            .expect("the board room stopped fanning out")
+            .expect("peer channel closed");
+        assert_eq!(
+            fanned,
+            wrap_sync_update(&sentinel),
+            "an update from a revoked connection was fanned out"
+        );
+        h.shutdown.cancel();
+    }
+
     /// As for `Room`: however the actor ends, its token is cancelled, so the
     /// WS shims close their sockets and the registry boots a fresh room.
     #[tokio::test(flavor = "multi_thread")]
@@ -584,7 +725,7 @@ mod tests {
         let sub = bus.subscribe(board_id).await.unwrap();
         let store: Arc<dyn knot_storage::BoardStore> = Arc::new(NoopBoardStore);
         let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
-        let h = BoardRoom::spawn(board_id, engine, store, bus, sub)
+        let h = BoardRoom::spawn(board_id, Uuid::new_v4(), engine, store, bus, sub)
             .await
             .unwrap();
         h.tx.send(Event::Shutdown).await.unwrap();

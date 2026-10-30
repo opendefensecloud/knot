@@ -220,13 +220,20 @@ async fn placement_rebalances_invalid_neighbours() {
             Op::MoveIn(anchor) => {
                 let mover = w.page("new").await;
                 w.store
-                    .move_placed(w.ws, mover, w.user, Some(parent), placement(anchor))
+                    .move_placed(w.ws, mover, w.user, Some(parent), placement(anchor), true)
                     .await
                     .map(drop)
             }
             Op::MoveOwn(title, anchor) => w
                 .store
-                .move_placed(w.ws, ids[title], w.user, Some(parent), placement(anchor))
+                .move_placed(
+                    w.ws,
+                    ids[title],
+                    w.user,
+                    Some(parent),
+                    placement(anchor),
+                    true,
+                )
                 .await
                 .map(drop),
         };
@@ -299,7 +306,7 @@ async fn rebalance_concurrent_with_sibling_move_both_succeed() {
         let (store, ws, user) = (w.store.clone(), w.ws, w.user);
         tokio::spawn(async move {
             store
-                .move_placed(ws, sibling, user, Some(other_parent), Placement::Last)
+                .move_placed(ws, sibling, user, Some(other_parent), Placement::Last, true)
                 .await
         })
     };
@@ -349,7 +356,7 @@ async fn swapping_nesting_moves_do_not_deadlock() {
         let (store, ws, user) = (w.store.clone(), w.ws, w.user);
         tokio::spawn(async move {
             store
-                .move_placed(ws, d, user, Some(p), Placement::Last)
+                .move_placed(ws, d, user, Some(p), Placement::Last, true)
                 .await
         })
     };
@@ -358,7 +365,7 @@ async fn swapping_nesting_moves_do_not_deadlock() {
         let (store, ws, user) = (w.store.clone(), w.ws, w.user);
         tokio::spawn(async move {
             store
-                .move_placed(ws, p, user, Some(d), Placement::Last)
+                .move_placed(ws, p, user, Some(d), Placement::Last, true)
                 .await
         })
     };
@@ -401,7 +408,7 @@ async fn disjoint_moves_do_not_close_a_parent_cycle() {
         let (store, ws, user) = (w.store.clone(), w.ws, w.user);
         tokio::spawn(async move {
             store
-                .move_placed(ws, doc, user, Some(parent), Placement::Last)
+                .move_placed(ws, doc, user, Some(parent), Placement::Last, true)
                 .await
         })
     };
@@ -475,11 +482,11 @@ async fn moves_into_and_out_of_a_parent_cycle_finish() {
     let outside = w.page("Outside").await;
 
     store
-        .move_placed(w.ws, page, w.user, Some(a), Placement::Last)
+        .move_placed(w.ws, page, w.user, Some(a), Placement::Last, true)
         .await
         .expect("a page into the cycle");
     store
-        .move_placed(w.ws, a, w.user, Some(outside), Placement::Last)
+        .move_placed(w.ws, a, w.user, Some(outside), Placement::Last, true)
         .await
         .expect("a page of the cycle out of it");
 
@@ -627,7 +634,7 @@ async fn anchors_must_be_live_non_template_siblings() {
         for placement in [Placement::After(anchor), Placement::Before(anchor)] {
             let moved = w
                 .store
-                .move_placed(w.ws, mover, w.user, None, placement)
+                .move_placed(w.ws, mover, w.user, None, placement, true)
                 .await;
             assert!(
                 matches!(moved, Err(DocStoreError::BadAnchor)),
@@ -638,7 +645,7 @@ async fn anchors_must_be_live_non_template_siblings() {
     assert_eq!(w.group(None).await, before, "nothing changed");
 
     w.store
-        .move_placed(w.ws, mover, w.user, None, Placement::Before(live))
+        .move_placed(w.ws, mover, w.user, None, Placement::Before(live), true)
         .await
         .expect("a live sibling is an anchor");
     let created = w
@@ -678,7 +685,7 @@ async fn move_placed_retries_once_after_a_deadlock() {
     let (store, ws, user) = (w.store.clone(), w.ws, w.user);
     deadlocks_once(&w.pool, w.ws, blocker, async move {
         store
-            .move_placed(ws, mover, user, None, Placement::First)
+            .move_placed(ws, mover, user, None, Placement::First, true)
             .await
     })
     .await;
@@ -816,7 +823,7 @@ async fn writes_under_a_parent_outside_the_workspace_are_not_found() {
                 .await
                 .map(drop),
             w.store
-                .move_placed(w.ws, mover, w.user, Some(parent), Placement::Last)
+                .move_placed(w.ws, mover, w.user, Some(parent), Placement::Last, true)
                 .await
                 .map(drop),
             w.store
@@ -867,7 +874,14 @@ async fn move_into_a_foreign_page_under_the_moved_page_is_not_found() {
 
     let moved = w
         .store
-        .move_placed(w.ws, mover, w.user, Some(foreign_child), Placement::Last)
+        .move_placed(
+            w.ws,
+            mover,
+            w.user,
+            Some(foreign_child),
+            Placement::Last,
+            true,
+        )
         .await;
 
     assert!(

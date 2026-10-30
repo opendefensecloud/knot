@@ -81,7 +81,15 @@ describe("docsApi.duplicate", () => {
     expect(spy.mock.calls[0]?.[1]?.method).toBe("POST");
     expect(JSON.parse(spy.mock.calls[0]?.[1]?.body as string)).toEqual({ include_subpages: true });
     if (!("ok" in r)) throw new Error("expected ok");
-    expect(r.ok).toEqual({ ...COPY, archived_at: null, archive_root_id: null });
+    expect(r.ok).toEqual({
+      ...COPY,
+      archived_at: null,
+      archive_root_id: null,
+      restricted: false,
+      within_restricted: false,
+      parent_hidden: false,
+      effective_role: null,
+    });
   });
 
   it("passes the error envelope through on 413", async () => {
@@ -103,5 +111,53 @@ describe("docsApi.duplicate", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ ...COPY, id: 7 }, 201));
 
     await expect(docsApi.duplicate("d1", { include_subpages: false })).rejects.toThrow();
+  });
+});
+
+describe("docsApi.setRestricted", () => {
+  it("PUTs the flag to the doc's restricted sub-resource", async () => {
+    const spy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse({ ...COPY, id: "d1", restricted: true }));
+
+    const r = await docsApi.setRestricted("d/1", true);
+
+    expect(spy.mock.calls[0]?.[0]).toBe("/api/docs/d%2F1/restricted");
+    expect(spy.mock.calls[0]?.[1]?.method).toBe("PUT");
+    expect(JSON.parse(spy.mock.calls[0]?.[1]?.body as string)).toEqual({ restricted: true });
+    if (!("ok" in r)) throw new Error("expected ok");
+    expect(r.ok.restricted).toBe(true);
+  });
+
+  it("passes the error envelope through on 403", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({ error: { code: "acl.owner_required", message: "", details: {} } }, 403),
+    );
+
+    const r = await docsApi.setRestricted("d1", false);
+
+    if (!("error" in r)) throw new Error("expected error");
+    expect(r.error.code).toBe("acl.owner_required");
+  });
+});
+
+describe("docsApi.access", () => {
+  it("GETs the doc's access sub-resource and returns the parsed body", async () => {
+    const body = {
+      restricted: true,
+      restriction_root_id: "d1",
+      restriction_root_title: "Plan",
+      people: [
+        { principal: "user:u1", role: "owner", inherit: true, source_doc_id: "d1", source_title: "Plan" },
+      ],
+    };
+    const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(body));
+
+    const r = await docsApi.access("d/1");
+
+    expect(spy.mock.calls[0]?.[0]).toBe("/api/docs/d%2F1/access");
+    expect(spy.mock.calls[0]?.[1]?.method).toBe("GET");
+    if (!("ok" in r)) throw new Error("expected ok");
+    expect(r.ok).toEqual(body);
   });
 });
