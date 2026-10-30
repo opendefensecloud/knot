@@ -958,3 +958,305 @@ async fn purge_leaves_database_held_bytes_to_the_cascade() {
         "metadata (and with it the bytes) cascaded"
     );
 }
+
+// ---- Restricted documents: archive, purge, restore and the archive list
+// must neither act on nor name pages the caller can't see.
+
+impl World {
+    /// Mark `doc_id` restricted as `who`; the actor becomes its owner.
+    async fn restrict(&self, who: &Session, doc_id: &str) {
+        let (status, body) = self
+            .send(
+                who,
+                "PUT",
+                &format!("/api/docs/{doc_id}/restricted"),
+                Some(json!({"restricted": true})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "restrict {doc_id}: {body}");
+    }
+
+    /// Give `grantee` `role` on `doc_id`, inheriting to its subpages.
+    async fn grant(&self, who: &Session, doc_id: &str, grantee: &Session, role: &str) {
+        let (status, body) = self
+            .send(
+                who,
+                "PUT",
+                &format!("/api/docs/{doc_id}/grants/user:{}", grantee.user_id),
+                Some(json!({"role": role, "inherit": true})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "grant on {doc_id}: {body}");
+    }
+
+    async fn is_archived(&self, doc_id: &str) -> bool {
+        self.state
+            .docs
+            .as_ref()
+            .unwrap()
+            .get(doc_id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn archive_with_hidden_restricted_descendant_is_409() {
+    let world = world().await;
+    let editor = world.member("ed@archive.test", "Ed", "editor").await;
+    let folder = world.create_doc(&world.owner, "Folder", None).await;
+    let secret = world
+        .create_doc(&world.owner, "Secret", Some(&folder))
+        .await;
+    world.restrict(&world.owner, &secret).await;
+
+    let (status, body) = world.archive(&editor, &folder).await;
+
+    assert_eq!(
+        (status, error_code(&body)),
+        (StatusCode::CONFLICT, "doc.hidden_descendants"),
+        "{body}"
+    );
+    assert!(!world.is_archived(&folder).await);
+    assert!(!world.is_archived(&secret).await);
+    assert!(
+        !body.to_string().contains(&secret),
+        "the hidden page is not named: {body}"
+    );
+    let (status, body) = world.archive(&world.owner, &folder).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the owner of every page below may: {body}"
+    );
+    assert!(world.is_archived(&secret).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn purge_with_hidden_restricted_descendant_is_409() {
+    let world = world().await;
+    let co_owner = world.member("co@archive.test", "Co", "owner").await;
+    let folder = world.create_doc(&world.owner, "Folder", None).await;
+    let secret = world
+        .create_doc(&world.owner, "Secret", Some(&folder))
+        .await;
+    world.restrict(&world.owner, &secret).await;
+    assert_eq!(
+        world.archive(&world.owner, &folder).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let purge = format!("/api/docs/{folder}/purge");
+
+    let (status, body) = world.send(&co_owner, "POST", &purge, None).await;
+
+    assert_eq!(
+        (status, error_code(&body)),
+        (StatusCode::CONFLICT, "doc.hidden_descendants"),
+        "{body}"
+    );
+    assert!(doc_exists(&world, &secret).await);
+    let (status, body) = world.send(&world.owner, "POST", &purge, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(!doc_exists(&world, &secret).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_refuses_to_reparent_out_of_restricted_subtree() {
+    let world = world().await;
+    let boundary = world.create_doc(&world.owner, "Boundary", None).await;
+    world.restrict(&world.owner, &boundary).await;
+    let parent = world
+        .create_doc(&world.owner, "Parent", Some(&boundary))
+        .await;
+    let child = world.create_doc(&world.owner, "Child", Some(&parent)).await;
+    assert_eq!(
+        world.archive(&world.owner, &child).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        world.archive(&world.owner, &parent).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let restore = |doc: &str| format!("/api/docs/{doc}/restore");
+
+    let (status, body) = world
+        .send(&world.owner, "POST", &restore(&child), None)
+        .await;
+
+    assert_eq!(
+        (status, error_code(&body)),
+        (
+            StatusCode::CONFLICT,
+            "doc.restore_restricted_parent_archived"
+        ),
+        "{body}"
+    );
+    assert!(world.is_archived(&child).await, "still in the archive");
+    let docs = world.state.docs.as_ref().unwrap();
+    let child_doc = docs.get(child.parse().unwrap()).await.unwrap().unwrap();
+    assert_eq!(
+        child_doc.parent_id.map(|id| id.to_string()),
+        Some(parent.clone()),
+        "not moved to the top level"
+    );
+    // Restoring the archived ancestor first makes room for it.
+    for doc in [&parent, &child] {
+        let (status, body) = world.send(&world.owner, "POST", &restore(doc), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "restore {doc}: {body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn archive_list_hides_restricted_roots_and_parent_titles() {
+    let world = world().await;
+    let editor = world.member("ed@archive.test", "Ed", "editor").await;
+    // A hidden folder: Ed may edit one page in it, and only see another.
+    let boundary = world.create_doc(&world.owner, "Hidden Folder", None).await;
+    world.restrict(&world.owner, &boundary).await;
+    let shared = world
+        .create_doc(&world.owner, "Shared Page", Some(&boundary))
+        .await;
+    world.grant(&world.owner, &shared, &editor, "editor").await;
+    let seen = world
+        .create_doc(&world.owner, "Seen Page", Some(&boundary))
+        .await;
+    world.grant(&world.owner, &seen, &editor, "viewer").await;
+    let private = world
+        .create_doc(&world.owner, "Private Page", Some(&boundary))
+        .await;
+    // An open folder with one hidden subpage.
+    let folder = world.create_doc(&world.owner, "Open Folder", None).await;
+    world.create_doc(&world.owner, "Plain", Some(&folder)).await;
+    let inner = world
+        .create_doc(&world.owner, "Inner Secret", Some(&folder))
+        .await;
+    world.restrict(&world.owner, &inner).await;
+    for doc in [&shared, &seen, &private, &folder] {
+        assert_eq!(
+            world.archive(&world.owner, doc).await.0,
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    let (status, list) = world
+        .send(&editor, "GET", "/api/workspace/archive", None)
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let entries = list.as_array().unwrap();
+    let ids: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{list}");
+    assert!(ids.contains(&shared.as_str()) && ids.contains(&folder.as_str()));
+    assert_eq!(entry_of(entries, &shared)["parent_id"], Value::Null);
+    assert_eq!(entry_of(entries, &shared)["parent_title"], Value::Null);
+    assert_eq!(entry_of(entries, &folder)["subpage_count"], json!(1));
+    for hidden in [&boundary, &private, &inner] {
+        assert!(
+            !list.to_string().contains(hidden.as_str()),
+            "{hidden} named"
+        );
+    }
+    for title in ["Hidden Folder", "Private Page", "Inner Secret", "Seen Page"] {
+        assert!(!list.to_string().contains(title), "{title} named: {list}");
+    }
+    // The owner, who holds every grant, still sees it all.
+    let (_, list) = world
+        .send(&world.owner, "GET", "/api/workspace/archive", None)
+        .await;
+    let entries = list.as_array().unwrap();
+    assert_eq!(entries.len(), 4, "{list}");
+    assert_eq!(
+        entry_of(entries, &shared)["parent_title"],
+        json!("Hidden Folder")
+    );
+    assert_eq!(entry_of(entries, &folder)["subpage_count"], json!(2));
+}
+
+fn entry_of<'a>(entries: &'a [Value], doc_id: &str) -> &'a Value {
+    entries
+        .iter()
+        .find(|entry| entry["id"] == json!(doc_id))
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn archive_banner_does_not_name_unreadable_root() {
+    let world = world().await;
+    let editor = world.member("ed@archive.test", "Ed", "editor").await;
+    let boundary = world.create_doc(&world.owner, "Hidden Folder", None).await;
+    world.restrict(&world.owner, &boundary).await;
+    let child = world
+        .create_doc(&world.owner, "Shared Page", Some(&boundary))
+        .await;
+    world.grant(&world.owner, &child, &editor, "editor").await;
+    assert_eq!(
+        world.archive(&world.owner, &boundary).await.0,
+        StatusCode::NO_CONTENT
+    );
+
+    let (status, body) = world
+        .send(&editor, "GET", &format!("/api/docs/{child}"), None)
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["archived_at"].is_string(), "{body}");
+    assert_eq!(body["archive_root_id"], Value::Null);
+    assert_eq!(body["archive_root_title"], Value::Null);
+    assert!(!body.to_string().contains(&boundary), "{body}");
+    assert!(!body.to_string().contains("Hidden Folder"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn my_tasks_skip_restricted_docs() {
+    let world = world().await;
+    let editor = world.member("ed@archive.test", "Ed", "editor").await;
+    let live = world.create_doc(&world.owner, "Live", None).await;
+    let secret = world.create_doc(&world.owner, "Secret", None).await;
+    let secret_child = world
+        .create_doc(&world.owner, "Secret child", Some(&secret))
+        .await;
+    let pool = world.state.pool.clone().unwrap();
+    let workspace_id: Uuid = sqlx::query_scalar("SELECT id FROM workspaces LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    for doc in [&live, &secret, &secret_child] {
+        let doc_id: Uuid = doc.parse().unwrap();
+        sqlx::query(
+            "INSERT INTO doc_tasks (id, workspace_id, doc_id, item_index, text, assignee_user_id)
+             VALUES ($1, $2, $3, 0, 'do it', $4)",
+        )
+        .bind(format!("{doc_id}:0"))
+        .bind(workspace_id)
+        .bind(doc_id)
+        .bind(editor.user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    world.restrict(&world.owner, &secret).await;
+
+    let (status, tasks) = world
+        .send(&editor, "GET", "/api/workspace/tasks", None)
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let listed: Vec<(&str, &str)> = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["doc_id"].as_str().unwrap(),
+                t["doc_title"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(listed, vec![(live.as_str(), "Live")]);
+}

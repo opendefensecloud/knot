@@ -17,9 +17,9 @@ use knot_markdown::RENDERER_VERSION;
 use knot_server::AppState;
 use knot_server::routes::api::markdown::{export_markdown_only, refresh_markdown_and_index};
 use knot_storage::{
-    DocTask, DocTaskInput, MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore,
-    PgMarkdownCache, PgSnapshotStore, PgTaskStore, PgUpdatesStore, SnapshotStore, TaskStore,
-    TaskStoreError, UpdatesStore, WorkspaceRole,
+    AssignedTask, DocTask, DocTaskInput, MarkdownCacheEntry, MarkdownCacheError,
+    MarkdownCacheStore, PgMarkdownCache, PgSnapshotStore, PgTaskStore, PgUpdatesStore,
+    SnapshotStore, TaskStore, TaskStoreError, UpdatesStore, WorkspaceRole,
 };
 use sqlx::PgPool;
 use tokio::sync::mpsc;
@@ -459,9 +459,10 @@ impl TaskStore for FlakyTasks {
         workspace_id: Uuid,
         user_id: Uuid,
         include_completed: bool,
-    ) -> Result<Vec<DocTask>, TaskStoreError> {
+        hidden: &[Uuid],
+    ) -> Result<Vec<AssignedTask>, TaskStoreError> {
         self.inner
-            .list_for_assignee(workspace_id, user_id, include_completed)
+            .list_for_assignee(workspace_id, user_id, include_completed, hidden)
             .await
     }
 

@@ -3,7 +3,8 @@
 pub mod acl;
 pub mod cache;
 pub mod listener;
+pub mod rule;
 
 pub use acl::{DocAccess, EffectiveRole, resolve};
-pub use cache::AclCache;
-pub use listener::spawn_listener;
+pub use cache::{AclCache, Visibility};
+pub use listener::{InvalidationHooks, spawn_listener};

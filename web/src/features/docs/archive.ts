@@ -21,11 +21,21 @@ export function archiveConfirmText(title: string, subpageCount: number, retentio
   );
 }
 
-/** Why moving to the archive failed, from the server's error code. */
+/** Why moving to the archive failed, from the server's error code. Also
+ *  says why a restore was refused for its restricted subtree. */
 export function archiveErrorText(code: string): string {
   if (code.startsWith("acl.")) return "You don't have permission to do that.";
   if (code === "doc.archived") return "It is already in the archive.";
+  if (code === "doc.hidden_descendants") {
+    return "This page has subpages you can't see. Ask their owners to move them first.";
+  }
+  if (code === "doc.restore_restricted_parent_archived") return "Restore the archived parent page first.";
   return "Couldn't move it to the archive.";
+}
+
+/** Why a permanent deletion failed, from the server's error code. */
+export function purgeErrorText(code: string, fallback: string): string {
+  return code === "doc.hidden_descendants" || code.startsWith("acl.") ? archiveErrorText(code) : fallback;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;

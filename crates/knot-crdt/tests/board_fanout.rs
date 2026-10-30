@@ -93,12 +93,26 @@ async fn edit_on_one_room_reaches_a_conn_on_another_room() {
     let sub_a: Subscription = bus.subscribe(board_id).await.unwrap();
     let sub_b: Subscription = bus.subscribe(board_id).await.unwrap();
 
-    let room_a = BoardRoom::spawn(board_id, engine.clone(), store.clone(), bus.clone(), sub_a)
-        .await
-        .unwrap();
-    let room_b = BoardRoom::spawn(board_id, engine.clone(), store.clone(), bus.clone(), sub_b)
-        .await
-        .unwrap();
+    let room_a = BoardRoom::spawn(
+        board_id,
+        Uuid::new_v4(),
+        engine.clone(),
+        store.clone(),
+        bus.clone(),
+        sub_a,
+    )
+    .await
+    .unwrap();
+    let room_b = BoardRoom::spawn(
+        board_id,
+        Uuid::new_v4(),
+        engine.clone(),
+        store.clone(),
+        bus.clone(),
+        sub_b,
+    )
+    .await
+    .unwrap();
 
     // Connect a client to room B so it can receive the cross-pod fan-out.
     let mut rx_b = join_conn(&room_b).await;
@@ -136,12 +150,26 @@ async fn presence_on_one_room_reaches_a_conn_on_another_room() {
     let sub_a: Subscription = bus.subscribe(board_id).await.unwrap();
     let sub_b: Subscription = bus.subscribe(board_id).await.unwrap();
 
-    let room_a = BoardRoom::spawn(board_id, engine.clone(), store.clone(), bus.clone(), sub_a)
-        .await
-        .unwrap();
-    let room_b = BoardRoom::spawn(board_id, engine.clone(), store.clone(), bus.clone(), sub_b)
-        .await
-        .unwrap();
+    let room_a = BoardRoom::spawn(
+        board_id,
+        Uuid::new_v4(),
+        engine.clone(),
+        store.clone(),
+        bus.clone(),
+        sub_a,
+    )
+    .await
+    .unwrap();
+    let room_b = BoardRoom::spawn(
+        board_id,
+        Uuid::new_v4(),
+        engine.clone(),
+        store.clone(),
+        bus.clone(),
+        sub_b,
+    )
+    .await
+    .unwrap();
 
     // Connect a client to room B.
     let mut rx_b = join_conn(&room_b).await;
@@ -180,7 +208,7 @@ async fn catch_up_tick_recovers_a_missed_update() {
     let engine: Arc<dyn Engine> = Arc::new(YrsEngine);
     let sub: Subscription = bus.subscribe(board_id).await.unwrap();
 
-    let room = BoardRoom::spawn(board_id, engine, store, bus, sub)
+    let room = BoardRoom::spawn(board_id, Uuid::new_v4(), engine, store, bus, sub)
         .await
         .unwrap();
     let mut rx = join_conn(&room).await;
@@ -198,4 +226,79 @@ async fn catch_up_tick_recovers_a_missed_update() {
     assert!(got.is_some(), "conn did not receive the recovered update");
 
     room.shutdown.cancel();
+}
+
+/// Join a connection to `room` and return its `revoked` token.
+async fn join_revocable(
+    room: &knot_crdt::board_room::BoardRoomHandle,
+) -> (
+    tokio_util::sync::CancellationToken,
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    // The WS shim makes each connection's token a child of the room's.
+    let revoked = room.revoked.child_token();
+    let handle = ConnHandle {
+        tx,
+        revoked: revoked.clone(),
+        refused: tokio_util::sync::CancellationToken::new(),
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    room.tx
+        .send(Event::Join {
+            conn_id: Uuid::new_v4(),
+            handle,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    let _ = reply_rx.await.unwrap().unwrap();
+    (revoked, rx)
+}
+
+/// An ACL change on a page closes the sockets of its boards (4403) and only
+/// of its boards, and bumps the page's ACL epoch even when none of its
+/// boards is open. The next join boots a fresh board room, which a grantee
+/// can join again.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_for_doc_revokes_only_that_docs_board_rooms() {
+    let (pg_store, board_id) = setup_board().await;
+    let store: Arc<dyn BoardStore> = pg_store;
+    let other_board_id = Uuid::new_v4();
+    let (doc_id, other_doc_id) = (Uuid::new_v4(), Uuid::new_v4());
+    let rooms = knot_crdt::BoardRooms::new(Arc::new(YrsEngine), store, Arc::new(MemBus::new()));
+
+    let room = rooms.acquire(board_id, doc_id).await.unwrap();
+    let other_room = rooms.acquire(other_board_id, other_doc_id).await.unwrap();
+    let (revoked, _rx) = join_revocable(&room).await;
+    let (other_revoked, _other_rx) = join_revocable(&other_room).await;
+
+    let epoch_before = rooms.acl_epoch(doc_id);
+    rooms.revoke_for_doc(doc_id).await;
+    assert!(revoked.is_cancelled(), "the page's board socket stays open");
+    assert!(
+        room.shutdown.is_cancelled(),
+        "the revoked board room was not evicted"
+    );
+    assert!(
+        !other_revoked.is_cancelled(),
+        "another page's board socket was revoked"
+    );
+    assert_ne!(rooms.acl_epoch(doc_id), epoch_before, "epoch not bumped");
+
+    let unopened_doc_id = Uuid::new_v4();
+    let unopened_epoch = rooms.acl_epoch(unopened_doc_id);
+    rooms.revoke_for_doc(unopened_doc_id).await;
+    assert_ne!(
+        rooms.acl_epoch(unopened_doc_id),
+        unopened_epoch,
+        "a revoke with no board room open must bump the epoch too"
+    );
+
+    let fresh = rooms.acquire(board_id, doc_id).await.unwrap();
+    assert!(!Arc::ptr_eq(&fresh, &room), "the revoked room was reused");
+    let (fresh_revoked, _fresh_rx) = join_revocable(&fresh).await;
+    assert!(!fresh_revoked.is_cancelled());
+    fresh.shutdown.cancel();
+    other_room.shutdown.cancel();
 }

@@ -100,6 +100,11 @@ async fn seeded() -> (AppState, Uuid, Uuid, Uuid, String) {
 }
 
 async fn login(app: &axum::Router) -> (String, String) {
+    login_as(app, "alice@example.com", "hunter22").await
+}
+
+/// Log in as `email` and return `(sid=…, csrf token)`.
+async fn login_as(app: &axum::Router, email: &str, password: &str) -> (String, String) {
     let r = app
         .clone()
         .oneshot(
@@ -108,8 +113,7 @@ async fn login(app: &axum::Router) -> (String, String) {
                 .uri("/auth/login")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({"email": "alice@example.com", "password": "hunter22"})
-                        .to_string(),
+                    serde_json::json!({"email": email, "password": password}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -241,4 +245,84 @@ async fn list_templates_endpoint_returns_marked_doc() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0]["id"].as_str().unwrap(), tpl_id.to_string());
     assert!(list[0]["is_template"].as_bool().unwrap());
+}
+
+/// `GET /api/workspace/templates` as the given session.
+async fn list_templates(app: &axum::Router, sid: &str, csrf: &str) -> Vec<serde_json::Value> {
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/workspace/templates")
+                .header("cookie", format!("{sid}; csrf={csrf}"))
+                .header("x-csrf-token", csrf)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let bytes = r.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restricted_template_not_listed_for_non_grantee() {
+    let (state, ws_id, tpl_id, owner_id, _md) = seeded().await;
+    let bob_hash = state.hasher.hash("bobpass1").unwrap();
+    let bob = state
+        .users
+        .as_ref()
+        .unwrap()
+        .create_local("bob@example.com", "Bob", &bob_hash)
+        .await
+        .unwrap();
+    state
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .add_member(ws_id, bob.id, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+    let open_template = state
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(ws_id, None, "Open template", "n", owner_id)
+        .await
+        .unwrap();
+    state
+        .docs
+        .as_ref()
+        .unwrap()
+        .set_template(ws_id, open_template.id, owner_id, true)
+        .await
+        .unwrap();
+    state
+        .docs
+        .as_ref()
+        .unwrap()
+        .set_restricted(ws_id, tpl_id, owner_id, true)
+        .await
+        .unwrap();
+    let app = router_with_state(state);
+
+    let (bob_sid, bob_csrf) = login_as(&app, "bob@example.com", "bobpass1").await;
+    let bob_ids: Vec<String> = list_templates(&app, &bob_sid, &bob_csrf)
+        .await
+        .iter()
+        .map(|template| template["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(bob_ids, vec![open_template.id.to_string()]);
+
+    // The owner, who holds the restricted template's owner grant, sees both.
+    let (alice_sid, alice_csrf) = login(&app).await;
+    let alice_templates = list_templates(&app, &alice_sid, &alice_csrf).await;
+    assert_eq!(alice_templates.len(), 2);
+    let restricted_entry = alice_templates
+        .iter()
+        .find(|template| template["id"] == tpl_id.to_string().as_str())
+        .expect("restricted template listed for its owner");
+    assert_eq!(restricted_entry["restricted"], true);
 }

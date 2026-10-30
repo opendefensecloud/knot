@@ -3,7 +3,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use knot_storage::{DocStore, PgDocStore};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -704,18 +703,27 @@ async fn heal_keeps_rendered_root_order_with_template_children() {
 /// and the children of templates, which it leaves out), sorted by key in
 /// code-unit order with a stable sort, as `buildTree` does
 /// (web/src/features/docs/tree.ts).
+///
+/// The rows come from `list_alive`'s query rather than the store itself: the
+/// store selects every current column, and this runs against the schema from
+/// before later migrations added some.
 async fn sidebar_roots(pool: &PgPool, ws: Uuid) -> Vec<Uuid> {
-    let docs = PgDocStore::new(pool.clone())
-        .list_alive(ws)
-        .await
-        .expect("list_alive");
-    let listed: BTreeSet<Uuid> = docs.iter().map(|d| d.id).collect();
+    let docs: Vec<(Uuid, Option<Uuid>, String)> = sqlx::query_as(
+        r#"SELECT id, parent_id, sort_key FROM documents
+            WHERE workspace_id = $1 AND archived_at IS NULL AND NOT is_template
+            ORDER BY parent_id NULLS FIRST, sort_key COLLATE "C", id"#,
+    )
+    .bind(ws)
+    .fetch_all(pool)
+    .await
+    .expect("list_alive rows");
+    let listed: BTreeSet<Uuid> = docs.iter().map(|(id, _, _)| *id).collect();
     let mut roots: Vec<_> = docs
         .into_iter()
-        .filter(|d| d.parent_id.is_none_or(|p| !listed.contains(&p)))
+        .filter(|(_, parent_id, _)| parent_id.is_none_or(|p| !listed.contains(&p)))
         .collect();
-    roots.sort_by(|a, b| a.sort_key.as_bytes().cmp(b.sort_key.as_bytes()));
-    roots.into_iter().map(|d| d.id).collect()
+    roots.sort_by(|a, b| a.2.as_bytes().cmp(b.2.as_bytes()));
+    roots.into_iter().map(|(id, _, _)| id).collect()
 }
 
 /// Where keys tie across the groups of a root list, the sidebar shows the

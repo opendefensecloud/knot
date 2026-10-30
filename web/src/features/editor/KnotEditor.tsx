@@ -22,8 +22,10 @@ import {
   setEditorRef,
 } from "./CommentsHighlightExtension";
 import { EditorToolbar } from "./EditorToolbar";
+import { setReadableDocIds } from "./InternalLinkExtension";
 import { KnotProvider, type CommentChangeMsg, type MentionMsg, type ProviderStatus } from "./KnotProvider";
 import { looksLikeMarkdown, markdownToHtml } from "./markdownPaste";
+import { useReadableDocIds } from "./readableDocIds";
 
 type Pair = { doc: Y.Doc; provider: KnotProvider };
 
@@ -128,6 +130,10 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
         position_y_end: c.position_y_end as string,
       }));
   }, [commentsForHighlight.data]);
+
+  // The pages the user can open, for the locked style on doc links to any
+  // other page: the sidebar's list, the templates and the archive.
+  const readableDocIds = useReadableDocIds();
 
   const [presence, setPresence] = useState<Array<{ name: string; color: string }>>([]);
 
@@ -346,6 +352,13 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
     storage.doc = pair.doc;
     refreshHighlights(editor);
   }, [editor, highlightComments, activeCommentId, pair.doc]);
+
+  // Push the readable pages into the doc-link decorations. Guarded like the
+  // highlight effect above: the outgoing editor may already be destroyed.
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    setReadableDocIds(editor, readableDocIds);
+  }, [editor, readableDocIds]);
 
   // Re-decorate when the Yjs doc fires an update — the local doc change
   // already triggers a PM tr (docChanged), but a peer update arrives via

@@ -8,6 +8,47 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Upgrading
+- Two database migrations run on upgrade (the Helm chart's migrate hook
+  applies them). Rolling back to 0.9.1 needs a database restore: 0.9.1
+  doesn't start on a database with migrations it doesn't know.
+  - `20261030120000_restricted_docs` adds the restricted flag. It also
+    deletes page grants still held by people who are no longer members of
+    the workspace, so inviting them again doesn't bring that access back.
+  - `20261030130000_acl_invalidations_workspace_wide` lets one access
+    change cover a whole workspace, for role changes and removed members.
+- During a rolling upgrade, a 0.9.1 replica clears its access cache on a
+  workspace-wide change, but its open editor connections stay up until
+  they reconnect. Finish the rollout before changing member roles.
+
+### Added
+- Restricted pages. An owner of a page can turn on "Restrict access" in its
+  Permissions dialog, and from then on only the people added there can see
+  the page and its subpages. Workspace roles stop applying inside,
+  including the workspace owner's.
+  - Restricting a page makes you its owner and revokes the public links of
+    the page and its subpages. A restricted page can't lose its last owner,
+    and pages inside one can't get public links.
+  - Add someone with "Inherit" unticked to share just that one page. A
+    page shared with you whose parent you can't see shows under "Shared
+    with you" in the sidebar, without its parent's name.
+  - Restricted pages show a lock in the sidebar and a "Restricted" chip on
+    the page. "People with access" in the dialog lists who can see the
+    page, and where their access comes from.
+  - A page you can't see answers exactly like one that doesn't exist, and
+    it is left out of the sidebar, search, templates, the archive, My
+    tasks and workspace export.
+  - Moving a page into or out of a restricted page needs owner access to
+    it, and the sidebar asks before such a move. Archiving or deleting a
+    page with subpages you can't see is refused.
+  - Duplicating a page skips the subpages you can't see, and copies of
+    restricted pages stay restricted. Workspace export and import keep
+    restrictions.
+  - Removing a member now also removes their page grants, so inviting them
+    again doesn't bring their old access back.
+  - `knot-server admin restricted-list` and `knot-server admin grant`
+    recover a restricted page whose owners have all left the workspace.
+
 ## [0.9.1] - 2026-10-29
 
 A search box for the Members page, and fixes to links in the editor: page

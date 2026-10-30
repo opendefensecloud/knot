@@ -30,6 +30,10 @@ pub struct PageCopy {
     pub parent: Option<Uuid>,
     pub title: String,
     pub icon: Option<String>,
+    /// The copy is a restriction boundary, as its page is. The plan's actor
+    /// gets an inheriting `owner` grant on it, so they can open what they
+    /// copied.
+    pub restricted: bool,
     /// The page's content as one Yjs update.
     pub state: Vec<u8>,
 }
@@ -115,6 +119,14 @@ async fn apply_once(
         })?;
     for (page, key) in plan.pages.iter().zip(subpage_keys(&plan.pages)) {
         insert_page(&mut tx, plan, page, &key).await?;
+    }
+    // Inside a restricted copy the workspace role stops applying, so without
+    // this grant the actor would lose what they copied. Other grants are not
+    // copied.
+    for page in std::iter::once(&plan.top).chain(&plan.pages) {
+        if page.restricted {
+            insert_owner_grant(&mut tx, plan.actor, page.new_id).await?;
+        }
     }
     let mut pages = Vec::with_capacity(plan.pages.len() + 1);
     for page in std::iter::once(&plan.top).chain(&plan.pages) {
@@ -211,8 +223,9 @@ async fn insert_page(
     sort_key: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO documents (id, workspace_id, parent_id, title, sort_key, icon, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO documents (id, workspace_id, parent_id, title, sort_key, icon, created_by,
+                                restricted)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(page.new_id)
     .bind(plan.ws)
@@ -221,6 +234,26 @@ async fn insert_page(
     .bind(sort_key)
     .bind(&page.icon)
     .bind(plan.actor)
+    .bind(page.restricted)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// `actor`'s inheriting `owner` grant on the copy `doc_id`, as restricting a
+/// page gives its restrictor.
+async fn insert_owner_grant(
+    conn: &mut PgConnection,
+    actor: Uuid,
+    doc_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO document_grants (doc_id, principal, role, inherit, granted_by)
+         VALUES ($1, $2, 'owner', true, $3)",
+    )
+    .bind(doc_id)
+    .bind(format!("user:{actor}"))
+    .bind(actor)
     .execute(&mut *conn)
     .await?;
     Ok(())

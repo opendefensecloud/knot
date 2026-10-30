@@ -22,8 +22,9 @@ use knot_server::duplicate::{
 };
 use knot_server::{AppState, router_with_state};
 use knot_storage::{
-    BlobStore, BlobStoreError, DocStore, DocTask, DocTaskInput, PgDocStore, PgSnapshotStore,
-    PgUpdatesStore, SnapshotStore, TaskStore, TaskStoreError, UpdatesStore, WorkspaceRole,
+    AssignedTask, BlobStore, BlobStoreError, DocStore, DocTask, DocTaskInput, PgDocStore,
+    PgSnapshotStore, PgUpdatesStore, SnapshotStore, TaskStore, TaskStoreError, UpdatesStore,
+    WorkspaceRole,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Notify, Semaphore};
@@ -1000,9 +1001,10 @@ impl TaskStore for GatedTasks {
         workspace_id: Uuid,
         user_id: Uuid,
         include_completed: bool,
-    ) -> Result<Vec<DocTask>, TaskStoreError> {
+        hidden: &[Uuid],
+    ) -> Result<Vec<AssignedTask>, TaskStoreError> {
         self.inner
-            .list_for_assignee(workspace_id, user_id, include_completed)
+            .list_for_assignee(workspace_id, user_id, include_completed, hidden)
             .await
     }
 
@@ -1748,6 +1750,12 @@ async fn byline_credits_the_duplicating_user() {
 /// Spec D: comments, history, share links and grants stay with the source.
 /// A copied grant would widen who can reach the copy, and a copied share
 /// link would publish it.
+/// A copy starts its own life: no comments, history or public links. Nor
+/// grants: who may see the original says nothing about who may see a copy
+/// someone else made of it. The copier's own `owner` grant on a copy of a
+/// restricted page is the one exception (see
+/// `duplicate_of_boundary_stays_restricted_and_actor_is_owner`); this page
+/// is not restricted, so its copy has no grant at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn comments_history_shares_and_grants_are_not_copied() {
     let w = world().await;
@@ -1872,11 +1880,11 @@ async fn copied_tasks_are_indexed() {
         assert_eq!(tasks, listed(original).await);
     }
     let mine: Vec<Uuid> = tasks
-        .list_for_assignee(w.workspace_id, owner, false)
+        .list_for_assignee(w.workspace_id, owner, false, &[])
         .await
         .unwrap()
         .into_iter()
-        .map(|t| t.doc_id)
+        .map(|assigned| assigned.task.doc_id)
         .collect();
     assert!(
         mine.contains(&top) && mine.contains(&child_copy),
@@ -2141,4 +2149,207 @@ async fn purge_job_removes_stale_copies() {
         "a running duplicate's copy stays"
     );
     assert_eq!(w.pending().await, HashSet::from([recent]));
+}
+
+// ---------------------------------------------------------------------------
+// Restricted pages (spec: restricted documents, "Duplicate")
+// ---------------------------------------------------------------------------
+
+impl World {
+    /// `PUT /api/docs/{doc_id}/restricted` as `who`, which must succeed.
+    async fn restrict(&self, who: &Session, doc_id: Uuid) {
+        let response = send_json(
+            &self.app,
+            who,
+            "PUT",
+            &format!("/api/docs/{doc_id}/restricted"),
+            json!({"restricted": true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "restrict {doc_id}");
+    }
+
+    /// Grant `grantee` `role` on `doc_id`, as the owner.
+    async fn grant(&self, doc_id: Uuid, grantee: &Session, role: &str, inherit: bool) {
+        let response = send_json(
+            &self.app,
+            &self.owner,
+            "PUT",
+            &format!("/api/docs/{doc_id}/grants/user:{}", grantee.user_id),
+            json!({"role": role, "inherit": inherit}),
+        )
+        .await;
+        assert!(response.status().is_success(), "grant on {doc_id}");
+    }
+
+    /// `GET` `uri` as `who`: its status and body.
+    async fn fetch_as(&self, who: &Session, uri: &str) -> (StatusCode, Vec<u8>) {
+        let response = send_raw(&self.app, Some(who), "GET", uri, None, Vec::new()).await;
+        let status = response.status();
+        (status, body_bytes(response).await)
+    }
+
+    /// The titles of the pages `who` created.
+    async fn titles_created_by(&self, who: &Session) -> Vec<String> {
+        sqlx::query_scalar("SELECT title FROM documents WHERE created_by = $1 ORDER BY title")
+            .bind(who.user_id)
+            .fetch_all(self.pool())
+            .await
+            .unwrap()
+    }
+
+    /// The children of `parent` as stored, whoever can read them.
+    async fn stored_children(&self, parent: Uuid) -> Vec<Uuid> {
+        sqlx::query_scalar("SELECT id FROM documents WHERE parent_id = $1 ORDER BY sort_key")
+            .bind(parent)
+            .fetch_all(self.pool())
+            .await
+            .unwrap()
+    }
+}
+
+/// Subpages the user can't read are left out of the copy, and so is every
+/// page below them, even one the user can read through a grant of its own:
+/// its parent is not copied.
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_skips_unreadable_restricted_subpages() {
+    let w = world().await;
+    let editor = w.member("editor@duplicate.test", "editor").await;
+    let source = w.create_doc(&w.owner, "Handbook", None).await;
+    w.create_doc(&w.owner, "Visible chapter", Some(source))
+        .await;
+    let secret = w.create_doc(&w.owner, "Secret chapter", Some(source)).await;
+    let below_secret = w
+        .create_doc(&w.owner, "Below the secret", Some(secret))
+        .await;
+    w.restrict(&w.owner, secret).await;
+    // Readable on its own, but its restricted parent is not.
+    w.grant(below_secret, &editor, "editor", true).await;
+
+    let response = w.duplicate(&editor, source, Some(true)).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let top = id_of(&body_json(response).await);
+
+    let copied_children = w.stored_children(top).await;
+    assert_eq!(copied_children.len(), 1, "only the readable chapter");
+    assert_eq!(w.doc(copied_children[0]).await["title"], "Visible chapter");
+    assert!(w.stored_children(copied_children[0]).await.is_empty());
+    assert_eq!(
+        w.titles_created_by(&editor).await,
+        ["Handbook (copy)", "Visible chapter"],
+        "nothing of the restricted chapter is copied"
+    );
+}
+
+/// A copy of a restricted page is restricted too, and its copier owns it:
+/// the workspace role, the owner's included, gives no access to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_of_boundary_stays_restricted_and_actor_is_owner() {
+    let w = world().await;
+    let editor = w.member("editor@duplicate.test", "editor").await;
+    let member = w.member("member@duplicate.test", "editor").await;
+    let boundary = w.create_doc(&w.owner, "Board minutes", None).await;
+    let child = w.create_doc(&w.owner, "January", Some(boundary)).await;
+    w.restrict(&w.owner, boundary).await;
+    w.grant(boundary, &editor, "editor", true).await;
+
+    let response = w.duplicate(&editor, boundary, Some(true)).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let copy = body_json(response).await;
+    assert_eq!(copy["restricted"], true, "{copy}");
+    let copy_id = id_of(&copy);
+    let copied_children = w.stored_children(copy_id).await;
+    assert_eq!(copied_children.len(), 1);
+    assert_ne!(copied_children[0], child);
+
+    for doc_id in [copy_id, copied_children[0]] {
+        for outsider in [&member, &w.owner] {
+            let (status, body) = w.fetch_as(outsider, &format!("/api/docs/{doc_id}")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{doc_id}");
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], "acl.no_grant");
+        }
+    }
+    let (status, grants) = w
+        .fetch_as(&editor, &format!("/api/docs/{copy_id}/grants"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let grants: Value = serde_json::from_slice(&grants).unwrap();
+    assert_eq!(
+        grants.as_array().unwrap().len(),
+        1,
+        "no other grant is copied: {grants}"
+    );
+    assert_eq!(grants[0]["principal"], format!("user:{}", editor.user_id));
+    assert_eq!(grants[0]["role"], "owner");
+    assert_eq!(grants[0]["inherit"], true);
+}
+
+/// A board and a file that belong to a restricted page are shown by an
+/// unrestricted one. Its copy keeps referencing them rather than getting
+/// copies of its own, which the whole workspace could read.
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_does_not_rehome_restricted_board_or_blob() {
+    let w = world().await;
+    let member = w.member("member@duplicate.test", "editor").await;
+    let secret = w.create_doc(&w.owner, "Secret", None).await;
+    let board = w.board(secret).await;
+    let file = w.upload(secret).await;
+    w.restrict(&w.owner, secret).await;
+    let source = w.create_doc(&w.owner, "Public", None).await;
+    let content = page(|txn, fragment| {
+        node(txn, fragment, "image", &[("src", blob_url(file))]);
+        node(
+            txn,
+            fragment,
+            "excalidraw_board",
+            &[("board_id", board.to_string())],
+        );
+    });
+    w.set_content(source, &content).await;
+
+    let copy = id_of(&w.duplicate_ok(source, None).await);
+
+    assert!(w.boards_of(copy).await.is_empty(), "the board stays");
+    assert!(w.blobs_of(copy).await.is_empty(), "the file stays");
+    let copy_content = w.stored(copy).await;
+    assert_eq!(
+        attr_values(&copy_content, "image", "src"),
+        vec![blob_url(file)]
+    );
+    assert_eq!(
+        attr_values(&copy_content, "excalidraw_board", "board_id"),
+        vec![board.to_string()]
+    );
+    for uri in [format!("/api/boards/{board}/svg"), blob_url(file)] {
+        let (status, _) = w.fetch_as(&member, &uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+}
+
+/// A copy goes under the source's parent, so the user needs to be able to
+/// edit there, not to hold an editor workspace role: a viewer with an editor
+/// grant on the parent may copy its subpage. A parent the user can't read
+/// answers as an unknown one.
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_under_a_parent_needs_editor_there() {
+    let w = world().await;
+    let viewer = w.member("viewer@duplicate.test", "viewer").await;
+    let parent = w.create_doc(&w.owner, "Team", None).await;
+    let source = w.create_doc(&w.owner, "Notes", Some(parent)).await;
+    w.grant(parent, &viewer, "editor", true).await;
+
+    let response = w.duplicate(&viewer, source, None).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Only the subpage readable: its restricted parent is hidden.
+    let hidden_parent = w.create_doc(&w.owner, "Hidden", None).await;
+    let deep = w.create_doc(&w.owner, "Deep", Some(hidden_parent)).await;
+    w.restrict(&w.owner, hidden_parent).await;
+    w.grant(deep, &viewer, "editor", true).await;
+    let pages = w.counts().await;
+    let response = w.duplicate(&viewer, deep, None).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(error_code(response).await, "doc.not_found");
+    assert_eq!(w.counts().await, pages);
 }

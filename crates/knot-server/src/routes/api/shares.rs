@@ -1,5 +1,5 @@
 //! Share token management (owner-only):
-//! POST   /api/docs/{doc_id}/shares           { expires_at? } → 201
+//! POST   /api/docs/{doc_id}/shares           { expires_at? } → 201 (409 share.restricted)
 //! GET    /api/docs/{doc_id}/shares           → 200 [ShareResponse, ...]
 //! DELETE /api/docs/{doc_id}/shares/{share_id} → 204
 
@@ -55,6 +55,27 @@ async fn require_owner(state: &AppState, ctx: &AuthContext, doc_id: Uuid) -> Opt
     }
 }
 
+/// 409 `share.restricted` when the doc is in a restricted subtree: a public
+/// link would expose it to anyone, past the grants that guard it.
+async fn refuse_if_restricted(
+    state: &AppState,
+    ctx: &AuthContext,
+    doc_id: Uuid,
+) -> Option<Response> {
+    let Some(acl) = state.acl.clone() else {
+        return Some(json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", ""));
+    };
+    match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
+        Ok(Some(access)) if access.restriction_root.is_some() => Some(json_err(
+            StatusCode::CONFLICT,
+            "share.restricted",
+            "pages in a restricted subtree can't be shared publicly",
+        )),
+        Ok(_) => None,
+        Err(_) => Some(json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "")),
+    }
+}
+
 fn url_for(state: &AppState, token: &str) -> String {
     format!("{}/p/{}", state.base_url.trim_end_matches('/'), token)
 }
@@ -71,6 +92,9 @@ async fn create(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Re
     if let Some(r) =
         crate::archive::refuse_if_archived(&state, ctx.workspace_id, doc_id, ctx.user_id).await
     {
+        return r;
+    }
+    if let Some(r) = refuse_if_restricted(&state, &ctx, doc_id).await {
         return r;
     }
     let bytes = match axum::body::to_bytes(req.into_body(), 4096).await {

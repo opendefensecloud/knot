@@ -35,18 +35,26 @@ import { placementParent, type Placement } from "./placement";
 import {
   buildTree,
   applyOptimisticMove,
+  canAddUnder,
   countDescendants,
   describeMove,
   dropZone,
   flattenVisible,
   keyboardMove,
   projectDrop,
+  restrictionCrossingText,
   INDENT,
   type FlatRow,
   type MoveArgs,
   type TreeNode,
 } from "./tree";
 import { TreeRow, type Drop, type MoveCmd, type TreeState } from "./TreeRow";
+
+/** What a refused move says, by the server's error code. */
+function moveErrorText(code: string): string {
+  if (code === "acl.restricted_move") return "Only an owner of this page can move it out of a restricted area.";
+  return "Couldn't move";
+}
 
 const SCREEN_READER_INSTRUCTIONS = {
   draggable: "Drag to move. Use the row menu or Alt with the arrow keys to move by keyboard.",
@@ -93,7 +101,6 @@ export function DocTree() {
 
   const { workspace } = useEffectiveRole();
   const canEdit = workspace === "owner" || workspace === "editor";
-  const isOwner = workspace === "owner";
   const [pickerOpen, setPickerOpen] = useState(false);
 
   const list = useQuery({
@@ -150,12 +157,12 @@ export function DocTree() {
       const title = prev && "ok" in prev ? prev.ok.find((d) => d.id === a.id)?.title : undefined;
       return { prev, title: title ?? "" };
     },
-    onError: (_e, _a, ctx) => {
+    onError: (error, _a, ctx) => {
       // The list from before this move goes back only when no move is queued
       // after it: that list lacks the later moves' optimistic updates. Either
       // way the refetch after the last queued move shows the server's list.
       if (ctx?.prev && pendingMoves() === 1) qc.setQueryData(["docs"], ctx.prev);
-      notify("error", "Couldn't move");
+      notify("error", moveErrorText(error.message));
       setAnnouncement(`Couldn't move “${ctx?.title ?? ""}”.`);
     },
     onSettled: () => {
@@ -185,9 +192,21 @@ export function DocTree() {
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const docs = useMemo(() => (list.data && "ok" in list.data ? list.data.ok : []), [list.data]);
   const tree = useMemo(() => buildTree(docs), [docs]);
+  // The rows in on-screen order: the workspace's pages, then those shared
+  // with the user ("Shared with you"), as one list for moves to plan in.
   const flat = useMemo(
-    () => flattenVisible(tree, collapsed, draggingId ?? undefined),
+    () => flattenVisible([...tree.roots, ...tree.shared], collapsed, draggingId ?? undefined),
     [tree, collapsed, draggingId],
+  );
+  // Rows are drop targets when there is a page the user may drag: a
+  // workspace viewer can still own a restricted page and rearrange in it.
+  const dragEnabled = useMemo(
+    () =>
+      docs.some((d) => {
+        const role = d.effective_role ?? workspace;
+        return !d.parent_hidden && (role === "owner" || role === "editor");
+      }),
+    [docs, workspace],
   );
   const rows = useMemo(() => new Map(flat.map((r) => [r.id, r])), [flat]);
   const [dropped] = useState(lastDrop);
@@ -232,7 +251,7 @@ export function DocTree() {
     }
     const id = String(activeId);
     const zone = dropZone(hit.pointerY, hit.rect, hit.id === id);
-    const projection = projectDrop(flat, docs, id, hit.id, zone, Math.trunc(delta.x / INDENT));
+    const projection = projectDrop(flat, docs, id, hit.id, zone, Math.trunc(delta.x / INDENT), workspace);
     showDrop(projection && { overId: hit.id, zone, projection });
   }
 
@@ -252,9 +271,16 @@ export function DocTree() {
   // another parent, or back under the old one when the move fails.
   const refocus = useRef<string | null>(null);
 
+  /** Whether a move that changes who can see the page goes ahead: asks first. */
+  function confirmCrossing(id: string, args: MoveArgs): boolean {
+    const question = restrictionCrossingText(docs, id, args.parent_id);
+    return question === null || window.confirm(question);
+  }
+
   function moveBy(id: string, cmd: MoveCmd) {
-    const args = keyboardMove(flat, docs, id, cmd);
+    const args = keyboardMove(flat, docs, id, cmd, workspace);
     if (!args) return;
+    if (!confirmCrossing(id, args)) return;
     // Indenting into a collapsed page opens it: the page stays in view, with focus.
     if (args.parent_id !== null && collapsed.has(args.parent_id)) toggle(args.parent_id);
     setAnnouncement(describeMove(flat, docs, id, args));
@@ -387,8 +413,8 @@ export function DocTree() {
 
   const state: TreeState = {
     openId,
-    canEdit,
-    isOwner,
+    workspaceRole: workspace,
+    dragEnabled,
     retentionDays,
     rows,
     collapsed,
@@ -396,7 +422,7 @@ export function DocTree() {
     onNewChild: (pid) => create.mutate(pid),
     draggingId,
     drop,
-    planMove: (id, cmd) => keyboardMove(flat, docs, id, cmd),
+    planMove: (id, cmd) => keyboardMove(flat, docs, id, cmd, workspace),
     onMove: moveBy,
     onDuplicate: startDuplicate,
     copying,
@@ -427,7 +453,7 @@ export function DocTree() {
       {list.data && "error" in list.data && (
         <div className="px-3 py-2 text-sm text-destructive">Failed.</div>
       )}
-      {list.data && "ok" in list.data && tree.length === 0 && (
+      {list.data && "ok" in list.data && tree.roots.length === 0 && tree.shared.length === 0 && (
         <p className="px-3 py-2 text-sm text-fg-muted">No documents yet.</p>
       )}
       {list.data && "ok" in list.data && (
@@ -451,14 +477,17 @@ export function DocTree() {
           onDragEnd={(e) => {
             // Released near the press: no drop. Judged on the same delta as
             // the drop line, so a drop line shown is a drop made.
-            const d = nearPress(e.delta) ? null : dropRef.current;
+            const projected = nearPress(e.delta) ? null : dropRef.current;
             const id = String(e.active.id);
+            // A drop that changes who can see the page asks first; declined,
+            // it is no drop.
+            const d = projected && confirmCrossing(id, projected.projection.args) ? projected : null;
             // A click on the row's link whose pointer slipped far enough to
             // start a drag: it opens the page, as the link does. The browser
             // can't: the button went up over the drag ghost, which is gone
             // by the time the click would follow, so it sends no click.
             const opens =
-              !d &&
+              !projected &&
               slip.isClick() &&
               (rowLink(treeRef.current, id)?.contains(e.activatorEvent.target as Node) ?? false);
             dropped.set(d);
@@ -475,10 +504,27 @@ export function DocTree() {
           }}
           onDragCancel={endDrag}
         >
-          <TreeList listRef={treeRef} disabled={!canEdit}>
-            {tree.map((n) => (
+          <TreeList listRef={treeRef} disabled={!dragEnabled}>
+            {tree.roots.map((n) => (
               <TreeRow key={n.id} node={n} depth={0} tree={state} />
             ))}
+            {/* Inside the list, so its rows are in the tree's bounds and
+                take part in drops like the rest. */}
+            {tree.shared.length > 0 && (
+              <li data-testid="tree-shared" className="mt-3">
+                <h3
+                  id="tree-shared-heading"
+                  className="px-1 pb-1 text-[11px] font-semibold uppercase tracking-wider text-fg-muted"
+                >
+                  Shared with you
+                </h3>
+                <ul aria-labelledby="tree-shared-heading" className="list-none p-0 m-0">
+                  {tree.shared.map((n) => (
+                    <TreeRow key={n.id} node={n} depth={0} tree={state} />
+                  ))}
+                </ul>
+              </li>
+            )}
           </TreeList>
           <DragOverlay dropAnimation={null}>
             {dragged && (
@@ -516,7 +562,16 @@ export function DocTree() {
           onClose={() => setPickerOpen(false)}
           current={(() => {
             const c = openId ? docs.find((d) => d.id === openId) : undefined;
-            return c ? { id: c.id, parent_id: c.parent_id, title: c.title } : null;
+            if (!c) return null;
+            return {
+              id: c.id,
+              parent_id: c.parent_id,
+              title: c.title,
+              canNest: canAddUnder(docs, c.id, workspace),
+              // A page shared with the user has a parent they can't see: the
+              // list says `parent_id: null`, which would be the top level.
+              canSibling: !c.parent_hidden && canAddUnder(docs, c.parent_id, workspace),
+            };
           })()}
           onPickBlank={(parentId) => {
             setPickerOpen(false);
@@ -771,6 +826,16 @@ export function makeAnnouncements(
   };
 }
 
+/** The open page, for "New document" to place the new one by: under it
+ *  (`canNest`) or next to it (`canSibling`), where the user may add pages. */
+export type PickerCurrent = {
+  id: string;
+  parent_id: string | null;
+  title: string;
+  canNest: boolean;
+  canSibling: boolean;
+};
+
 /** Modal for "New document": choose Blank or one of the workspace templates. */
 export function NewDocPicker({
   onClose,
@@ -781,10 +846,17 @@ export function NewDocPicker({
   onClose: () => void;
   onPickBlank: (parentId: string | null) => void;
   onPickTemplate: (templateId: string, title: string, parentId: string | null) => void;
-  current: { id: string; parent_id: string | null; title: string } | null;
+  current: PickerCurrent | null;
 }) {
-  const [placement, setPlacement] = useState<Placement>("nested");
-  const parentId = placementParent(placement, current);
+  // Neither place allowed: the new page goes to the top level, as with no
+  // page open.
+  const defaultPlacement: Placement | null = current?.canNest ? "nested" : current?.canSibling ? "sibling" : null;
+  const [chosenPlacement, setPlacement] = useState<Placement | null>(defaultPlacement);
+  // The rights can change while the picker is open (the list refetches): a
+  // place no longer offered falls back to the first one that is.
+  const chosenAllowed = chosenPlacement === "nested" ? current?.canNest : chosenPlacement === "sibling" && current?.canSibling;
+  const placement = chosenAllowed ? chosenPlacement : defaultPlacement;
+  const parentId = placement === null ? null : placementParent(placement, current);
   const templates = useQuery({
     queryKey: ["templates"],
     queryFn: () => docsApi.listTemplates(),
@@ -819,26 +891,35 @@ export function NewDocPicker({
               <legend className="px-1 text-[11px] font-semibold uppercase tracking-wider text-fg-muted">
                 Location
               </legend>
-              <label className="flex items-center gap-2 py-1 text-sm text-fg cursor-pointer">
-                <input
-                  type="radio"
-                  name="new-doc-location"
-                  data-testid="new-doc-loc-nested"
-                  checked={placement === "nested"}
-                  onChange={() => setPlacement("nested")}
-                />
-                <span className="truncate">Nested under &quot;{current.title}&quot;</span>
-              </label>
-              <label className="flex items-center gap-2 py-1 text-sm text-fg cursor-pointer">
-                <input
-                  type="radio"
-                  name="new-doc-location"
-                  data-testid="new-doc-loc-sibling"
-                  checked={placement === "sibling"}
-                  onChange={() => setPlacement("sibling")}
-                />
-                <span className="truncate">Same level as &quot;{current.title}&quot;</span>
-              </label>
+              {current.canNest && (
+                <label className="flex items-center gap-2 py-1 text-sm text-fg cursor-pointer">
+                  <input
+                    type="radio"
+                    name="new-doc-location"
+                    data-testid="new-doc-loc-nested"
+                    checked={placement === "nested"}
+                    onChange={() => setPlacement("nested")}
+                  />
+                  <span className="truncate">Nested under &quot;{current.title}&quot;</span>
+                </label>
+              )}
+              {current.canSibling && (
+                <label className="flex items-center gap-2 py-1 text-sm text-fg cursor-pointer">
+                  <input
+                    type="radio"
+                    name="new-doc-location"
+                    data-testid="new-doc-loc-sibling"
+                    checked={placement === "sibling"}
+                    onChange={() => setPlacement("sibling")}
+                  />
+                  <span className="truncate">Same level as &quot;{current.title}&quot;</span>
+                </label>
+              )}
+              {placement === null && (
+                <p data-testid="new-doc-loc-top" className="m-0 py-1 text-sm text-fg-muted">
+                  At the top level of the workspace.
+                </p>
+              )}
             </fieldset>
           )}
           <button

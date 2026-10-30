@@ -1,17 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Eye, FileCode, History, LayoutTemplate, MessageSquare, Pencil, Share2 } from "lucide-react";
+import { Eye, FileCode, History, LayoutTemplate, Lock, MessageSquare, Pencil, Share2 } from "lucide-react";
 import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties } from "react";
 import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
 
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { StatusDot, SyncStatus, type ConnStatus } from "../../components/StatusDot";
 import { IconButton } from "../../components/ui/IconButton";
+import type { ApiError } from "../../lib/api";
+import type { Doc } from "../../lib/validators";
 import { useUi } from "../../stores/ui";
 
 import { CommentSidebar } from "../comments/CommentSidebar";
 import { MarkdownView } from "../editor/MarkdownView";
 import { ExportMenu } from "../export/ExportMenu";
-import { purgeConfirmText } from "./archive";
+import { archiveErrorText, purgeConfirmText, purgeErrorText } from "./archive";
 import { ArchivedBanner } from "./ArchivedBanner";
 import { Breadcrumb } from "./Breadcrumb";
 import { DocByline } from "./DocByline";
@@ -20,6 +22,7 @@ import { editModeKey } from "./editMode";
 import { HistoryDrawer } from "./HistoryDrawer";
 import { DocWidthToggle } from "./DocWidthToggle";
 import { ImportMarkdownButton } from "./ImportMarkdownButton";
+import { withoutSubtree } from "./tree";
 
 // DocPage starts this download on mount (see the effect below) so the ~750 KB
 // editor chunk overlaps the doc-metadata request instead of waiting for it.
@@ -177,19 +180,34 @@ export default function DocPage() {
         return;
       }
       notify("error", "You no longer have access to this document.");
+      // The sidebar may still list the page (a restrict hides it), and the
+      // page's metadata must not linger in the cache. The landing page
+      // opens the list's first page, so the page and its subpages leave the
+      // cached list before it mounts, and the list is fetched again.
+      qc.setQueryData<{ ok: Doc[] } | { error: ApiError }>(["docs"], (cached) =>
+        cached && "ok" in cached ? { ok: withoutSubtree(cached.ok, id!) } : cached,
+      );
+      void qc.invalidateQueries({ queryKey: ["docs"] });
+      qc.removeQueries({ queryKey: ["doc", id] });
       void nav("/", { replace: true });
     })();
     return () => {
       cancelled = true;
     };
-  }, [status, notify, nav, refetchDoc]);
+  }, [status, notify, nav, refetchDoc, qc, id]);
 
   if (!id) return null;
   if (doc.isLoading) {
     return <div className="doc-shell text-fg-muted">Loading…</div>;
   }
   if (!doc.data || "error" in doc.data) {
-    return <div className="doc-shell text-fg-muted">Document not found.</div>;
+    // The same for a missing page and one the user can't read: the server
+    // answers both alike, and so does this.
+    return (
+      <div className="doc-shell text-fg-muted">
+        This page doesn&apos;t exist or you don&apos;t have access to it.
+      </div>
+    );
   }
 
   const meta = doc.data.ok;
@@ -208,7 +226,12 @@ export default function DocPage() {
     const r = await docsApi.restore(id!);
     setArchiveBusy(false);
     if ("error" in r) {
-      notify("error", "Couldn't restore");
+      notify(
+        "error",
+        r.error.code === "doc.restore_restricted_parent_archived"
+          ? archiveErrorText(r.error.code)
+          : "Couldn't restore",
+      );
       return;
     }
     notify("info", "Restored");
@@ -225,7 +248,7 @@ export default function DocPage() {
     setArchiveBusy(false);
     if ("error" in r) {
       leaving.current = false;
-      notify("error", "Couldn't delete permanently");
+      notify("error", purgeErrorText(r.error.code, "Couldn't delete permanently"));
       return;
     }
     notify("info", "Deleted permanently");
@@ -281,6 +304,7 @@ export default function DocPage() {
               targeting `data-testid="status-dot"` still find it; SyncStatus
               is the user-facing affordance now. */}
           <span className="sr-only"><StatusDot status={status} /></span>
+          {meta.within_restricted && <RestrictedChip linksToPermissions={isDocOwner} />}
           {isDocOwner && (
             <Link
               to="permissions"
@@ -388,5 +412,36 @@ export default function DocPage() {
       )}
       {commentSidebarOpen && id && !archived && <CommentSidebar docId={id} />}
     </section>
+  );
+}
+
+const CHIP_CLASS =
+  "inline-flex items-center gap-1 h-6 px-2 rounded-full bg-muted text-[12px] font-medium text-fg-muted";
+
+/** Marks a page in a restricted subtree. Owners can open the permissions
+ *  from it. */
+function RestrictedChip({ linksToPermissions }: { linksToPermissions: boolean }) {
+  const content = (
+    <>
+      <Lock size={12} aria-hidden />
+      <span>Restricted</span>
+    </>
+  );
+  if (linksToPermissions) {
+    return (
+      <Link
+        to="permissions"
+        data-testid="restricted-chip"
+        title="Only people with access can see this page"
+        className={`${CHIP_CLASS} no-underline hover:text-fg transition-colors`}
+      >
+        {content}
+      </Link>
+    );
+  }
+  return (
+    <span data-testid="restricted-chip" title="Only people with access can see this page" className={CHIP_CLASS}>
+      {content}
+    </span>
   );
 }

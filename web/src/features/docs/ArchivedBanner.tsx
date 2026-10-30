@@ -12,7 +12,8 @@ function formatDate(iso: string): string {
  * Shown above an archived doc (#37). On the doc someone archived it says
  * who and when, when it will be purged, and offers Restore (and, for
  * owners, Delete permanently). A subpage that went into the archive with
- * its folder points at that folder instead: it comes back with it.
+ * its folder points at that folder instead: it comes back with it. When
+ * the user can't read that folder, it is not named.
  */
 export function ArchivedBanner({
   doc,
@@ -54,6 +55,11 @@ export function ArchivedBanner({
             )}
           </div>
         </>
+      ) : doc.archive_root_id === null ? (
+        // The server names no root the user can't read: no link, no title.
+        <p className="m-0 flex-1 min-w-0">
+          In the archive with a page above it. It comes back when that page is restored.
+        </p>
       ) : (
         <p className="m-0 flex-1 min-w-0">
           Part of “

@@ -202,7 +202,8 @@ export default function MembersPage() {
                   <td className="px-4 py-2 whitespace-nowrap">
                     <button
                       onClick={() => {
-                        if (window.confirm(`Remove ${m.email}?`)) remove.mutate(m.user_id);
+                        const question = `Remove ${m.email}? They also lose every page-level grant, including access to restricted pages.`;
+                        if (window.confirm(question)) remove.mutate(m.user_id);
                       }}
                       className="h-8 px-2.5 rounded text-destructive text-[13px] font-medium hover:bg-destructive/10 transition-colors"
                     >

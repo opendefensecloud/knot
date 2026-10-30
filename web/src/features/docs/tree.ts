@@ -1,3 +1,4 @@
+import type { Role } from "../../auth/useEffectiveRole";
 import type { Doc } from "../../lib/validators";
 
 export type TreeNode = Doc & { children: TreeNode[] };
@@ -7,11 +8,28 @@ function bySortKey(a: Doc, b: Doc): number {
   return a.sort_key < b.sort_key ? -1 : a.sort_key > b.sort_key ? 1 : 0;
 }
 
+/** Stands in for the real parent of a page whose parent the user can't see
+ *  (`parent_hidden`: the server sends `parent_id: null`). Doc ids are UUIDs,
+ *  so it can't clash. Such a page is never a top-level sibling: no move may
+ *  anchor on it there, and it doesn't take part in top-level order. */
+const HIDDEN_PARENT = ":hidden";
+
+/** A page's real parent as far as moves go: `HIDDEN_PARENT` when it is hidden. */
+function realParentOf(d: Doc): string | null {
+  return d.parent_hidden ? HIDDEN_PARENT : (d.parent_id ?? null);
+}
+
+/** The sidebar's two sections: the workspace's pages, and the pages shared
+ *  with the user whose parent they can't see ("Shared with you"), each a
+ *  root of its own there. */
+export type Tree = { roots: TreeNode[]; shared: TreeNode[] };
+
 /** Build a tree from a flat doc list. Sorts siblings by sort_key
  *  (LexoRank-style, lexicographic). Orphans (parent_id missing) become
- *  top-level. TOTAL: no doc can ever be dropped from the output, even if
- *  parent cycles exist. Cycle members are promoted to roots. */
-export function buildTree(docs: Doc[]): TreeNode[] {
+ *  top-level. Pages whose parent is hidden (`parent_hidden`) go to `shared`
+ *  instead of `roots`. TOTAL: no doc can ever be dropped from the output,
+ *  even if parent cycles exist. Cycle members are promoted to roots. */
+export function buildTree(docs: Doc[]): Tree {
   const byId = new Map<string, TreeNode>();
   docs.forEach((d) => byId.set(d.id, { ...d, children: [] }));
   const roots: TreeNode[] = [];
@@ -47,7 +65,26 @@ export function buildTree(docs: Doc[]): TreeNode[] {
     nodes.forEach((n) => sortRec(n.children));
   }
   sortRec(roots);
-  return roots;
+  return {
+    roots: roots.filter((n) => !n.parent_hidden),
+    shared: roots.filter((n) => n.parent_hidden),
+  };
+}
+
+/** `docs` without page `id` and every listed page below it. */
+export function withoutSubtree(docs: Doc[], id: string): Doc[] {
+  const removed = new Set([id]);
+  // Parents can be listed after their children: repeat until nothing changes.
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const d of docs) {
+      if (!removed.has(d.id) && d.parent_id !== null && removed.has(d.parent_id)) {
+        removed.add(d.id);
+        grew = true;
+      }
+    }
+  }
+  return docs.filter((d) => !removed.has(d.id));
 }
 
 /** Optimistically apply a move to the flat doc list. Sets the moved doc's
@@ -76,7 +113,7 @@ export function applyOptimisticMove(
     updated = { ...moved, parent_id: parent, sort_key: i >= 0 ? rest[i]!.sort_key : moved.sort_key };
     insertAt = i >= 0 ? i + 1 : rest.length;
   } else {
-    const sibs = rest.filter((d) => (d.parent_id ?? null) === parent);
+    const sibs = rest.filter((d) => realParentOf(d) === parent);
     const last = sibs[sibs.length - 1];
     updated = { ...moved, parent_id: parent, sort_key: last ? last.sort_key : moved.sort_key };
     insertAt = last ? rest.findIndex((d) => d.id === last.id) + 1 : rest.length;
@@ -84,6 +121,45 @@ export function applyOptimisticMove(
   const out = [...rest];
   out.splice(insertAt, 0, updated);
   return out;
+}
+
+/** The restricted page that decides who can see page `id`: the nearest
+ *  restricted one at or above it, as far as the list shows. Null outside
+ *  every restricted page. A page in a restricted subtree whose parent isn't
+ *  listed (one shared with the user) has a restricted page the user can't
+ *  see, so it stands for one of its own: two of them may share theirs, but
+ *  nothing tells. */
+function restrictionRootOf(byId: ReadonlyMap<string, Doc>, id: string): string | null {
+  const seen = new Set<string>();
+  for (let page = byId.get(id); page && !seen.has(page.id); ) {
+    seen.add(page.id);
+    if (page.restricted) return page.id;
+    if (!page.within_restricted) return null;
+    const parent = page.parent_id === null ? undefined : byId.get(page.parent_id);
+    if (!parent) return `${HIDDEN_PARENT}:${page.id}`;
+    page = parent;
+  }
+  return null;
+}
+
+/** The question to ask before a move that changes who can see the page:
+ *  into a restricted subtree, out of one to where the workspace can see it,
+ *  or from one into another (a restricted page nested in its own counts as
+ *  another). Null when the page stays under the same restricted page, or
+ *  outside all of them. A page that is itself restricted keeps its own
+ *  access wherever it goes, so it never asks. */
+export function restrictionCrossingText(docs: Doc[], movedId: string, parentId: string | null): string | null {
+  const byId = new Map(docs.map((d) => [d.id, d]));
+  const moved = byId.get(movedId);
+  if (!moved || moved.restricted) return null;
+  const parent = parentId === null ? undefined : byId.get(parentId);
+  const fromRoot = restrictionRootOf(byId, movedId);
+  const toRoot = parentId === null ? null : restrictionRootOf(byId, parentId);
+  if (fromRoot === toRoot) return null;
+  if (toRoot === null) return `Moving "${moved.title}" here makes it visible to everyone in the workspace.`;
+  // From one restricted page into another the audience may grow or shrink.
+  const change = fromRoot === null ? "limits who can see it to" : "changes who can see it to the";
+  return `Moving "${moved.title}" into "${parent?.title ?? ""}" ${change} people with access there.`;
 }
 
 // ---- Projection model ------------------------------------------------------
@@ -122,11 +198,13 @@ export function countDescendants(node: TreeNode): number {
   return node.children.reduce((sum, child) => sum + 1 + countDescendants(child), 0);
 }
 
-/** What a screen reader hears about a row: "level 2, 3 subpages". */
-export function rowDescription(row: FlatRow): string {
+/** What a screen reader hears about a row: "level 2, 3 subpages", and
+ *  ", restricted" for a page in a restricted subtree. */
+export function rowDescription(row: FlatRow, withinRestricted = false): string {
   const level = `level ${row.depth + 1}`;
   const n = row.descendantCount;
-  return n === 0 ? level : `${level}, ${n} ${n === 1 ? "subpage" : "subpages"}`;
+  const described = n === 0 ? level : `${level}, ${n} ${n === 1 ? "subpage" : "subpages"}`;
+  return withinRestricted ? `${described}, restricted` : described;
 }
 
 /** The rows in on-screen order. The children of collapsed rows are left out,
@@ -186,15 +264,35 @@ type Moving = {
   home: number;
   docs: Doc[];
   realParent: Map<string, string | null>;
+  /** Whether the user may add pages under `parent` (null: the top level). */
+  canHold: (parent: string | null) => boolean;
 };
 
-function moving(flat: FlatRow[], docs: Doc[], id: string): Moving | null {
+/** Whether a role may add pages: an editor's or an owner's. */
+function addsPages(role: Role | null): boolean {
+  return role === "owner" || role === "editor";
+}
+
+/** Whether the user may add pages under `parent`, and so move one there:
+ *  by their role on it, and at the top level by their workspace role. A
+ *  page the list gives no role takes the workspace role. Without a
+ *  workspace role (`undefined`: the caller doesn't say) the server decides. */
+export function canAddUnder(docs: Doc[], parent: string | null, workspaceRole?: Role | null): boolean {
+  if (workspaceRole === undefined) return true;
+  if (parent === null) return addsPages(workspaceRole);
+  return addsPages(docs.find((d) => d.id === parent)?.effective_role ?? workspaceRole);
+}
+
+function moving(flat: FlatRow[], docs: Doc[], id: string, workspaceRole?: Role | null): Moving | null {
   const home = flat.findIndex((r) => r.id === id);
   const page = flat[home];
-  const realParent = new Map(docs.map((d) => [d.id, d.parent_id ?? null]));
-  if (!page || !realParent.has(id)) return null;
+  const realParent = new Map(docs.map((d) => [d.id, realParentOf(d)]));
+  // A page whose parent is hidden doesn't move: the user can't see where it
+  // is, and moving it to the top level would declassify it.
+  if (!page || !realParent.has(id) || realParent.get(id) === HIDDEN_PARENT) return null;
+  const canHold = (parent: string | null) => canAddUnder(docs, parent, workspaceRole);
   // The subtree goes too, in case `flat` wasn't flattened around `id`.
-  return { items: withoutRow(flat, id), page, home, docs, realParent };
+  return { items: withoutRow(flat, id), page, home, docs, realParent, canHold };
 }
 
 /** The rendered parent and previous sibling of a row put at `depth` in gap
@@ -239,7 +337,7 @@ export function insertIndex(sibs: readonly string[], args: MoveArgs): number {
 function isNoop(m: Moving, args: MoveArgs): boolean {
   if (m.realParent.get(m.page.id) !== args.parent_id) return false;
   const sibs = m.docs
-    .filter((d) => (d.parent_id ?? null) === args.parent_id)
+    .filter((d) => realParentOf(d) === args.parent_id)
     .sort(bySortKey)
     .map((d) => d.id);
   return insertIndex(sibs.filter((id) => id !== m.page.id), args) === sibs.indexOf(m.page.id);
@@ -258,14 +356,16 @@ function projectGap(m: Moving, g: number, wanted: number): Projection | null {
   if (slot.parent === home.parent && slot.prev === home.prev) return null;
   // 2-3. The projected parent and position, anchored on real siblings.
   const args = anchored(m, g, depth, slot.parent);
-  // 4. Same real parent and position: nothing to send.
-  return isNoop(m, args) ? null : { depth, minDepth, maxDepth, args };
+  // 4. Same real parent and position: nothing to send. A parent the user
+  // can't add pages under takes no drop: the server would refuse it.
+  return isNoop(m, args) || !m.canHold(args.parent_id) ? null : { depth, minDepth, maxDepth, args };
 }
 
 /** Where dropping `activeId` would put it, or null when nothing would change
- *  (P11). `flat` is `flattenVisible(tree, collapsed, activeId)`, `docs` the
- *  doc list the tree was built from, `depthDelta` the horizontal drag in
- *  `INDENT`s. */
+ *  (P11) or the user can't add pages there. `flat` is
+ *  `flattenVisible(tree, collapsed, activeId)`, `docs` the doc list the tree
+ *  was built from, `depthDelta` the horizontal drag in `INDENT`s,
+ *  `workspaceRole` the user's (see `canAddUnder`). */
 export function projectDrop(
   flat: FlatRow[],
   docs: Doc[],
@@ -273,8 +373,9 @@ export function projectDrop(
   overId: string,
   zone: Zone,
   depthDelta: number,
+  workspaceRole?: Role | null,
 ): Projection | null {
-  const m = moving(flat, docs, activeId);
+  const m = moving(flat, docs, activeId, workspaceRole);
   if (!m) return null;
   const wanted = m.page.depth + depthDelta;
   // On one's own row both halves are the gap the page sits in.
@@ -286,7 +387,7 @@ export function projectDrop(
   // Into: the last child, wherever the pointer is horizontally.
   const args: MoveArgs = { parent_id: over.id };
   const depth = over.depth + 1;
-  return isNoop(m, args) ? null : { depth, minDepth: depth, maxDepth: depth, args };
+  return isNoop(m, args) || !m.canHold(over.id) ? null : { depth, minDepth: depth, maxDepth: depth, args };
 }
 
 /** The menu and Alt+arrow moves of `id`, or null when it can't move that way.
@@ -300,8 +401,9 @@ export function keyboardMove(
   docs: Doc[],
   id: string,
   cmd: "up" | "down" | "indent" | "outdent",
+  workspaceRole?: Role | null,
 ): MoveArgs | null {
-  const m = moving(flat, docs, id);
+  const m = moving(flat, docs, id, workspaceRole);
   if (!m) return null;
   const { items, home } = m;
   const depth = m.page.depth;
@@ -354,7 +456,7 @@ export function describeMove(flat: FlatRow[], docs: Doc[], id: string, args: Mov
   for (let i = pi + 1; i < items.length && items[i]!.depth >= depth; i++) {
     if (items[i]!.depth === depth) sibs.push(items[i]!.id);
   }
-  const realParent = new Map(docs.map((d) => [d.id, d.parent_id ?? null]));
+  const realParent = new Map(docs.map((d) => [d.id, realParentOf(d)]));
   const real = sibs.filter((s) => realParent.get(s) === args.parent_id);
   // A parent with subpages but no visible row under it is collapsed. (In
   // `flat` the moved page itself still counts as visible.)

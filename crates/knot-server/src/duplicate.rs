@@ -6,9 +6,14 @@
 //! - the content of every page, copied from its current state without
 //!   booting a room (P18), with its references to the copied pages, boards
 //!   and files pointed at their copies (P14);
+//! - only the subpages the user can read, and none below one they can't
+//!   (restricted documents). A copy of a restricted page is restricted too,
+//!   and the user gets `owner` on it;
 //! - the boards and files those pages show, when the user can read the page
 //!   they belong to (P19). Each gets a copy of its own, so the copy never
-//!   depends on the original. Other references stay as they are;
+//!   depends on the original, unless its page is not copied and lies in
+//!   another restriction boundary than the copy: a copy would let other
+//!   people see it. Other references stay as they are;
 //! - the objects of files kept outside the database, copied before the
 //!   transaction, once their ids are recorded in `blob_copy_pending` (P16).
 //!   Nothing is deleted on the request path: if the transaction doesn't
@@ -25,13 +30,16 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
+use axum::response::Response;
 use knot_crdt::{DocHandle, Engine, YrsEngine};
+use knot_docs::{DocAccess, Visibility};
 use knot_markdown::remap::{Refs, Remap, references, remap_refs};
 use knot_storage::duplicate::{
     BlobCopy, BoardCopy, DuplicatePlan, PageCopy, apply_duplicate, record_pending_copies,
 };
 use knot_storage::{
-    BlobStoreError, Board, BoardStore, BoardStoreError, DocStoreError, Document, WorkspaceRole,
+    BlobStoreError, Board, BoardStore, BoardStoreError, DocStoreError, Document, SubtreeRow,
+    WorkspaceRole,
 };
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tracing::Instrument;
@@ -60,6 +68,11 @@ pub enum DuplicateError {
     /// No such page in the user's workspace.
     #[error("not found")]
     NotFound,
+    /// The user can't put a page under the source's parent, where the copy
+    /// goes: the answer of `restricted::require_editable_parent` (404, 403
+    /// or 409), passed on as it is.
+    #[error("the source's parent refuses the copy")]
+    Destination(Response),
     #[error("the page is a template")]
     IsTemplate,
     #[error("the page is in the archive")]
@@ -90,6 +103,8 @@ struct Page {
     parent: Option<Uuid>,
     title: String,
     icon: Option<String>,
+    /// Its page is a restriction boundary, and so is the copy.
+    restricted: bool,
     /// Its current content, transient. Remapped in place before it is
     /// stored.
     content: DocHandle,
@@ -182,8 +197,7 @@ pub async fn check(
     doc_role: WorkspaceRole,
     source_id: Uuid,
 ) -> Result<Document, DuplicateError> {
-    // P15: the copy is a new page, so the workspace role counts too.
-    if doc_role == WorkspaceRole::Viewer || ctx.role == WorkspaceRole::Viewer {
+    if doc_role == WorkspaceRole::Viewer {
         return Err(DuplicateError::EditorRequired);
     }
     let docs = state
@@ -194,6 +208,16 @@ pub async fn check(
         Some(doc) if doc.workspace_id == ctx.workspace_id => doc,
         _ => return Err(DuplicateError::NotFound),
     };
+    // P15: the copy is a new page next to the source. Under a parent, the
+    // user must be able to edit there; at the top level, the workspace role
+    // counts.
+    match source.parent_id {
+        Some(parent_id) => crate::restricted::require_editable_parent(state, ctx, parent_id)
+            .await
+            .map_err(DuplicateError::Destination)?,
+        None if ctx.role == WorkspaceRole::Viewer => return Err(DuplicateError::EditorRequired),
+        None => {}
+    }
     if source.is_template {
         return Err(DuplicateError::IsTemplate);
     }
@@ -226,13 +250,29 @@ pub async fn run(
         .boards
         .as_deref()
         .ok_or_else(|| not_configured("boards"))?;
+    let acl = state.acl.as_ref().ok_or_else(|| not_configured("acl"))?;
     let ws = ctx.workspace_id;
 
-    let subpages = if include_subpages {
+    let live_subpages = if include_subpages {
         docs.live_subtree(ws, source_id).await.map_err(internal)?
     } else {
         Vec::new()
     };
+    let listed_ids: Vec<Uuid> = source
+        .parent_id
+        .into_iter()
+        .chain(live_subpages.iter().map(|row| row.id))
+        .collect();
+    let visibility = acl
+        .visibility_covering(ws, ctx.user_id, &listed_ids)
+        .await
+        .map_err(internal)?;
+    let subpages = readable_subpages(live_subpages, &visibility);
+    // The restriction boundary the copy goes into, as its parent's.
+    let destination_root = source
+        .parent_id
+        .and_then(|parent_id| visibility.access(parent_id))
+        .and_then(|parent_access| parent_access.restriction_root);
     if 1 + subpages.len() > MAX_DUPLICATE_PAGES {
         return Err(DuplicateError::TooLarge);
     }
@@ -248,14 +288,19 @@ pub async fn run(
         source.parent_id,
         format!("{} (copy)", source.title),
         source.icon.clone(),
+        source.restricted,
     ))
-    .chain(
-        subpages
-            .into_iter()
-            .map(|row| (row.id, Some(page_ids[&row.parent_id]), row.title, row.icon)),
-    );
+    .chain(subpages.into_iter().map(|row| {
+        (
+            row.id,
+            Some(page_ids[&row.parent_id]),
+            row.title,
+            row.icon,
+            row.restricted,
+        )
+    }));
     let mut pages = Vec::with_capacity(page_ids.len());
-    for (id, parent, title, icon) in outline {
+    for (id, parent, title, icon, restricted) in outline {
         let (content, _seq) = current_snapshot(&state, id).await.map_err(internal)?;
         let refs = references(content.inner());
         pages.push(Page {
@@ -263,14 +308,20 @@ pub async fn run(
             parent,
             title,
             icon,
+            restricted,
             content,
             refs,
         });
     }
 
-    let boards = choose_boards(&state, board_store, &ctx, &pages, &page_ids).await?;
+    let copy = CopyTargets {
+        pages: &pages,
+        page_ids: &page_ids,
+        destination_root,
+    };
+    let boards = choose_boards(&state, board_store, &ctx, &copy).await?;
     let bytes_in_db = blob_store.bytes_deleted_with_metadata();
-    let blobs = choose_blobs(&state, &ctx, &pages, &page_ids, bytes_in_db).await?;
+    let blobs = choose_blobs(&state, &ctx, &copy, bytes_in_db).await?;
     let bytes = blobs
         .iter()
         .fold(0i64, |sum, blob| sum.saturating_add(blob.source.byte_size));
@@ -312,6 +363,7 @@ pub async fn run(
             parent: page.parent,
             title: page.title.clone(),
             icon: page.icon.clone(),
+            restricted: page.restricted,
             state: engine
                 .encode_state_as_update(&page.content, None)
                 .map_err(internal)?,
@@ -355,6 +407,15 @@ pub async fn run(
         files = plan.blobs.len(),
         "duplicate"
     );
+    // Copies of restricted pages already carry the user's `owner` grant.
+    // The top copy can still be out of their reach when their access to its
+    // parent came from a grant that doesn't inherit.
+    if crate::restricted::ensure_creator_can_edit(&state, ws, outcome.top.id, ctx.user_id)
+        .await
+        .is_err()
+    {
+        return Err(internal("creator owner grant"));
+    }
 
     let mut contents: HashMap<Uuid, DocHandle> = pages
         .into_iter()
@@ -376,37 +437,89 @@ pub async fn run(
     })
 }
 
-/// Whether `doc_id` is a page of `ctx`'s workspace that its user can read:
-/// the rule the page export applies to the files it embeds (P19).
-async fn readable(
+/// The live subpages, from `live_subtree`, that the user can read, in their
+/// order. One below a page left out is left out too, even when the user can
+/// read it: its parent has no copy to go under. The rows are depth first, so
+/// a parent is decided before its children.
+fn readable_subpages(rows: Vec<SubtreeRow>, visibility: &Visibility) -> Vec<SubtreeRow> {
+    let mut left_out: HashSet<Uuid> = HashSet::new();
+    rows.into_iter()
+        .filter(|row| {
+            if left_out.contains(&row.parent_id) || !visibility.readable(row.id) {
+                left_out.insert(row.id);
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+/// `ctx`'s user's access to `doc_id`, a page of their workspace, when they
+/// can read it: the rule the page export applies to the files it embeds
+/// (P19).
+async fn readable_access(
     state: &AppState,
     ctx: &AuthContext,
     doc_id: Uuid,
-) -> Result<bool, DuplicateError> {
+) -> Result<Option<DocAccess>, DuplicateError> {
     let acl = state
         .acl
         .as_ref()
         .ok_or_else(|| internal("acl not configured"))?;
     Ok(acl
-        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
+        .access(ctx.workspace_id, doc_id, ctx.user_id)
         .await
         .map_err(internal)?
-        .is_some())
+        .filter(|access| access.can_read()))
+}
+
+/// The pages of a copy, as [`choose_boards`] and [`choose_blobs`] give them
+/// boards and files.
+struct CopyTargets<'a> {
+    pages: &'a [Page],
+    /// Each copied page's copy.
+    page_ids: &'a HashMap<Uuid, Uuid>,
+    /// The restriction boundary the copy goes into (`None`: none).
+    destination_root: Option<Uuid>,
+}
+
+impl CopyTargets<'_> {
+    /// The page of the copy that gets the copy of a board or file of
+    /// `owner_doc`, which `showing_page` shows: the copy of `owner_doc`
+    /// when it is copied too, else `showing_page`. `None` when its page is
+    /// not copied and it or the copy lies in a restricted subtree: a copy
+    /// could let people who can't read its page see it. The reference
+    /// stays then. Even one shared boundary is not enough, because inside
+    /// it readers differ by branch, through their grants.
+    fn owner_of_copy(
+        &self,
+        owner_doc: Uuid,
+        owner_access: DocAccess,
+        showing_page: &Page,
+    ) -> Option<Uuid> {
+        match self.page_ids.get(&owner_doc) {
+            Some(copied_owner) => Some(*copied_owner),
+            None if owner_access.restriction_root.is_some() || self.destination_root.is_some() => {
+                None
+            }
+            None => Some(showing_page.new_id),
+        }
+    }
 }
 
 /// The boards the pages show that `ctx`'s user can read, once each. Each
 /// copy belongs to the copy of the board's own page when that page is
-/// copied too, else to the copy of the first page that shows it.
+/// copied too, else to the copy of the first page that shows it (see
+/// [`CopyTargets::owner_of_copy`]).
 async fn choose_boards(
     state: &AppState,
     store: &dyn BoardStore,
     ctx: &AuthContext,
-    pages: &[Page],
-    page_ids: &HashMap<Uuid, Uuid>,
+    copy: &CopyTargets<'_>,
 ) -> Result<Vec<PlannedBoard>, DuplicateError> {
     let mut seen = HashSet::new();
     let mut chosen = Vec::new();
-    for page in pages {
+    for page in copy.pages {
         for id in sorted(&page.refs.boards) {
             if !seen.insert(id) {
                 continue;
@@ -417,12 +530,15 @@ async fn choose_boards(
                 Err(BoardStoreError::NotFound) => continue,
                 Err(e) => return Err(internal(e)),
             };
-            if !readable(state, ctx, board.doc_id).await? {
+            let Some(owner_access) = readable_access(state, ctx, board.doc_id).await? else {
                 continue;
-            }
+            };
+            let Some(new_doc_id) = copy.owner_of_copy(board.doc_id, owner_access, page) else {
+                continue;
+            };
             chosen.push(PlannedBoard {
                 new_id: Uuid::new_v4(),
-                new_doc_id: page_ids.get(&board.doc_id).copied().unwrap_or(page.new_id),
+                new_doc_id,
                 source: board,
             });
         }
@@ -435,8 +551,7 @@ async fn choose_boards(
 async fn choose_blobs(
     state: &AppState,
     ctx: &AuthContext,
-    pages: &[Page],
-    page_ids: &HashMap<Uuid, Uuid>,
+    copy: &CopyTargets<'_>,
     bytes_in_db: bool,
 ) -> Result<Vec<BlobCopy>, DuplicateError> {
     let meta = state
@@ -445,7 +560,7 @@ async fn choose_blobs(
         .ok_or_else(|| internal("blob_meta not configured"))?;
     let mut seen = HashSet::new();
     let mut chosen = Vec::new();
-    for page in pages {
+    for page in copy.pages {
         for id in sorted(&page.refs.blobs) {
             if !seen.insert(id) {
                 continue;
@@ -453,14 +568,18 @@ async fn choose_blobs(
             let Some(source) = meta.find(id).await.map_err(internal)? else {
                 continue;
             };
-            if source.workspace_id != ctx.workspace_id
-                || !readable(state, ctx, source.doc_id).await?
-            {
+            if source.workspace_id != ctx.workspace_id {
                 continue;
             }
+            let Some(owner_access) = readable_access(state, ctx, source.doc_id).await? else {
+                continue;
+            };
+            let Some(new_doc_id) = copy.owner_of_copy(source.doc_id, owner_access, page) else {
+                continue;
+            };
             chosen.push(BlobCopy {
                 new_id: Uuid::new_v4(),
-                new_doc_id: page_ids.get(&source.doc_id).copied().unwrap_or(page.new_id),
+                new_doc_id,
                 source,
                 bytes_in_db,
             });

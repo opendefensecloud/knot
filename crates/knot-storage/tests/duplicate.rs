@@ -161,6 +161,7 @@ fn page(parent: Option<Uuid>, title: &str, state: &[u8]) -> PageCopy {
         parent,
         title: title.into(),
         icon: Some("📄".into()),
+        restricted: false,
         state: state.to_vec(),
     }
 }
@@ -497,7 +498,7 @@ async fn source_moved_or_archived_meanwhile_is_a_conflict() {
             }
             "source moved" => {
                 w.store
-                    .move_placed(w.ws, s, w.owner, Some(q), Placement::Last)
+                    .move_placed(w.ws, s, w.owner, Some(q), Placement::Last, true)
                     .await
                     .unwrap();
             }
@@ -686,6 +687,58 @@ async fn racing_an_unlocked_writer_for_the_key_is_a_conflict() {
     );
 }
 
+/// A copy of a restricted page is stored restricted, and its actor gets an
+/// inheriting `owner` grant on it, as restricting a page gives; a copy of an
+/// unrestricted page gets no grant.
+#[tokio::test(flavor = "multi_thread")]
+async fn restricted_copies_stay_restricted_with_the_actor_as_owner() {
+    let w = world().await;
+    let source = w.seed(None, "S", "m").await;
+    let top = page(None, "S (copy)", b"top");
+    let mut boundary = page(Some(top.new_id), "Secret", b"secret");
+    boundary.restricted = true;
+    let below = page(Some(boundary.new_id), "Below", b"below");
+    let plan = DuplicatePlan {
+        pages: vec![boundary.clone(), below.clone()],
+        top,
+        ..plan_for(&w, source, None)
+    };
+
+    apply_duplicate(&w.pool, &plan).await.unwrap();
+
+    let restricted: Vec<(Uuid, bool)> =
+        sqlx::query_as("SELECT id, restricted FROM documents WHERE id = ANY($1) ORDER BY title")
+            .bind(vec![plan.top.new_id, boundary.new_id, below.new_id])
+            .fetch_all(&w.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        restricted,
+        [
+            (below.new_id, false),
+            (plan.top.new_id, false),
+            (boundary.new_id, true)
+        ]
+    );
+    let grants: Vec<(Uuid, String, String, bool)> = sqlx::query_as(
+        "SELECT doc_id, principal, role, inherit FROM document_grants
+          WHERE doc_id = ANY($1)",
+    )
+    .bind(vec![plan.top.new_id, boundary.new_id, below.new_id])
+    .fetch_all(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        grants,
+        [(
+            boundary.new_id,
+            format!("user:{}", w.actor),
+            "owner".to_string(),
+            true
+        )]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn live_subtree_skips_archived_and_template_subtrees() {
     let w = world().await;
@@ -698,7 +751,7 @@ async fn live_subtree_skips_archived_and_template_subtrees() {
     let b2 = w.seed(Some(b), "B2", "z").await;
     let b1 = w.seed(Some(b), "B1", "a").await;
     let a1 = w.seed(Some(a), "A1", "m").await;
-    sqlx::query("UPDATE documents SET icon = '🌲' WHERE id = $1")
+    sqlx::query("UPDATE documents SET icon = '🌲', restricted = true WHERE id = $1")
         .bind(a1)
         .execute(&w.pool)
         .await
@@ -738,8 +791,10 @@ async fn live_subtree_skips_archived_and_template_subtrees() {
             title: "A1".into(),
             icon: Some("🌲".into()),
             sort_key: "m".into(),
+            restricted: true,
         }
     );
+    assert!(!rows[0].restricted);
     assert_eq!(rows[0].parent_id, root);
     assert!(w.store.live_subtree(w.ws, a1).await.unwrap().is_empty());
 }

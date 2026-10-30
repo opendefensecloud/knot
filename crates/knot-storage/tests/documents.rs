@@ -1,6 +1,6 @@
 use knot_storage::{
-    DocStore, DocStoreError, PgDocStore, PgUserStore, PgWorkspaceStore, UserStore, WorkspaceRole,
-    WorkspaceStore, sort_key_between,
+    ChainNode, DocStore, DocStoreError, PgDocStore, PgUserStore, PgWorkspaceStore, Placement,
+    UserStore, WorkspaceRole, WorkspaceStore, sort_key_between,
 };
 use uuid::Uuid;
 
@@ -406,6 +406,40 @@ async fn restore_under_archived_parent_goes_to_top_level() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_refuses_top_level_fallback_out_of_restricted_subtree() {
+    let (store, ws, user) = setup().await;
+    let boundary = store.create(ws, None, "Boundary", "m", user).await.unwrap();
+    store
+        .set_restricted(ws, boundary.id, user, true)
+        .await
+        .unwrap();
+    let folder = store
+        .create(ws, Some(boundary.id), "Folder", "m", user)
+        .await
+        .unwrap();
+    let child = store
+        .create(ws, Some(folder.id), "Child", "m", user)
+        .await
+        .unwrap();
+    store.archive(ws, child.id, user).await.unwrap();
+    store.archive(ws, folder.id, user).await.unwrap();
+
+    let refused = store.restore(ws, child.id, user).await.unwrap_err();
+
+    assert!(
+        matches!(refused, DocStoreError::RestoreRestrictedParentArchived),
+        "{refused:?}"
+    );
+    let kept = store.get(child.id).await.unwrap().unwrap();
+    assert_eq!(kept.parent_id, Some(folder.id), "not moved");
+    assert!(kept.archived_at.is_some(), "still archived");
+    store.restore(ws, folder.id, user).await.unwrap();
+    store.restore(ws, child.id, user).await.unwrap();
+    let back = store.get(child.id).await.unwrap().unwrap();
+    assert_eq!(back.parent_id, Some(folder.id));
+}
+
 /// A restore running while an archive of the parent holds the parent's row
 /// lock must wait for it and then see the parent archived. Reading the
 /// parent unlocked left the restored doc live under an archived parent,
@@ -705,7 +739,7 @@ async fn list_archive_roots_reports_roots_only() {
     let folder_entry = &roots[0];
     assert_eq!(folder_entry.parent_id, Some(parent.id));
     assert_eq!(folder_entry.parent_title.as_deref(), Some("Parent"));
-    assert_eq!(folder_entry.subpage_count, 2);
+    assert_eq!(folder_entry.subpage_ids.len(), 2);
     assert_eq!(folder_entry.archived_by, Some(user));
     assert_eq!(folder_entry.archived_by_name.as_deref(), Some("A"));
     assert_eq!(roots[1].parent_title, None);
@@ -954,4 +988,196 @@ async fn siblings_include_archived_so_sort_keys_are_not_reused() {
         .create(ws, Some(parent.id), "C2", &next, user)
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn acl_nodes_cover_archived_and_templates_and_has_restricted() {
+    let (store, ws, user, pool) = setup_with_pool().await;
+    let other_ws = PgWorkspaceStore::new(pool.clone())
+        .create("other", "O")
+        .await
+        .unwrap();
+    let root = store.create(ws, None, "Root", "a", user).await.unwrap();
+    let child = store
+        .create(ws, Some(root.id), "Child", "a", user)
+        .await
+        .unwrap();
+    let archived = store.create(ws, None, "Gone", "b", user).await.unwrap();
+    let template = store.create(ws, None, "Tpl", "c", user).await.unwrap();
+    store.archive(ws, archived.id, user).await.unwrap();
+    store
+        .set_template(ws, template.id, user, true)
+        .await
+        .unwrap();
+    store
+        .create(other_ws.id, None, "Foreign", "a", user)
+        .await
+        .unwrap();
+
+    assert!(!store.has_restricted(ws).await.unwrap());
+    sqlx::query("UPDATE documents SET restricted = true WHERE id = $1")
+        .bind(child.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(store.has_restricted(ws).await.unwrap());
+    assert!(!store.has_restricted(other_ws.id).await.unwrap());
+
+    let mut nodes = store.acl_nodes(ws).await.unwrap();
+    nodes.sort_by_key(|node| node.id);
+    let mut expected = vec![
+        ChainNode {
+            id: root.id,
+            parent_id: None,
+            restricted: false,
+            archived: false,
+        },
+        ChainNode {
+            id: child.id,
+            parent_id: Some(root.id),
+            restricted: true,
+            archived: false,
+        },
+        ChainNode {
+            id: archived.id,
+            parent_id: None,
+            restricted: false,
+            archived: true,
+        },
+        ChainNode {
+            id: template.id,
+            parent_id: None,
+            restricted: false,
+            archived: false,
+        },
+    ];
+    expected.sort_by_key(|node| node.id);
+    assert_eq!(nodes, expected);
+}
+
+async fn mark_restricted(pool: &sqlx::PgPool, doc_id: Uuid) {
+    sqlx::query("UPDATE documents SET restricted = true WHERE id = $1")
+        .bind(doc_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restriction_root_is_the_nearest_restricted_ancestor_or_self() {
+    let (store, ws, user, pool) = setup_with_pool().await;
+    let outer = store.create(ws, None, "Outer", "a", user).await.unwrap();
+    let middle = store
+        .create(ws, Some(outer.id), "Middle", "a", user)
+        .await
+        .unwrap();
+    let inner = store
+        .create(ws, Some(middle.id), "Inner", "a", user)
+        .await
+        .unwrap();
+    let leaf = store
+        .create(ws, Some(inner.id), "Leaf", "a", user)
+        .await
+        .unwrap();
+
+    assert_eq!(store.restriction_root(ws, leaf.id).await.unwrap(), None);
+    mark_restricted(&pool, outer.id).await;
+    assert_eq!(
+        store.restriction_root(ws, leaf.id).await.unwrap(),
+        Some(outer.id)
+    );
+    mark_restricted(&pool, inner.id).await;
+    assert_eq!(
+        store.restriction_root(ws, leaf.id).await.unwrap(),
+        Some(inner.id),
+        "the innermost boundary wins"
+    );
+    assert_eq!(
+        store.restriction_root(ws, inner.id).await.unwrap(),
+        Some(inner.id),
+        "a boundary is its own root"
+    );
+    assert_eq!(
+        store.restriction_root(ws, middle.id).await.unwrap(),
+        Some(outer.id)
+    );
+
+    // Another workspace's id, and an id no doc has, are in no subtree.
+    let other_ws = PgWorkspaceStore::new(pool.clone())
+        .create("other", "O")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.restriction_root(other_ws.id, leaf.id).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        store.restriction_root(ws, Uuid::new_v4()).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn move_placed_refuses_a_boundary_crossing_unless_allowed() {
+    let (store, ws, user, pool) = setup_with_pool().await;
+    let boundary = store.create(ws, None, "Secret", "a", user).await.unwrap();
+    let other_boundary = store.create(ws, None, "Other", "b", user).await.unwrap();
+    let open = store.create(ws, None, "Open", "c", user).await.unwrap();
+    let inside = store
+        .create(ws, Some(boundary.id), "Inside", "a", user)
+        .await
+        .unwrap();
+    let inside_sibling = store
+        .create(ws, Some(boundary.id), "Inside 2", "b", user)
+        .await
+        .unwrap();
+    mark_restricted(&pool, boundary.id).await;
+    mark_restricted(&pool, other_boundary.id).await;
+
+    // Out to the top level, out under an open page, into another boundary,
+    // and in from outside: each crosses a boundary.
+    for (doc, target) in [
+        (inside.id, None),
+        (inside.id, Some(open.id)),
+        (inside.id, Some(other_boundary.id)),
+        (open.id, Some(boundary.id)),
+    ] {
+        let result = store
+            .move_placed(ws, doc, user, target, Placement::Last, false)
+            .await;
+        assert!(
+            matches!(result, Err(DocStoreError::RestrictionBoundary)),
+            "{doc} to {target:?}: {result:?}"
+        );
+    }
+    assert_eq!(
+        store.get(inside.id).await.unwrap().unwrap().parent_id,
+        Some(boundary.id),
+        "a refused move changes nothing"
+    );
+
+    // Within one boundary, and moving the boundary itself between open
+    // places, cross nothing.
+    store
+        .move_placed(
+            ws,
+            inside_sibling.id,
+            user,
+            Some(inside.id),
+            Placement::Last,
+            false,
+        )
+        .await
+        .unwrap();
+    store
+        .move_placed(ws, boundary.id, user, Some(open.id), Placement::Last, false)
+        .await
+        .unwrap();
+
+    // Allowed, the crossing goes through.
+    let moved = store
+        .move_placed(ws, inside.id, user, None, Placement::Last, true)
+        .await
+        .unwrap();
+    assert_eq!(moved.parent_id, None);
 }

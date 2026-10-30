@@ -29,7 +29,7 @@ pub use contributors::{
     Contributor, ContributorStore, ContributorStoreError, DocByline, PersonRef, PgContributorStore,
 };
 pub use doc_store::{ArchivedRoot, DocStore, DocStoreError, Document, PgDocStore, SubtreeRow};
-pub use grant_store::{Grant, GrantStore, GrantStoreError, PgGrantStore};
+pub use grant_store::{ChainNode, Grant, GrantStore, GrantStoreError, PgGrantStore};
 pub use markdown_cache::{
     MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore, PgMarkdownCache,
     STALE_RENDERER_VERSION,
@@ -42,7 +42,7 @@ pub use share_tokens::{PgShareTokenStore, ShareStoreError, ShareToken, ShareToke
 pub use snapshot_store::{
     DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStore, SnapshotStoreError,
 };
-pub use tasks::{DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError};
+pub use tasks::{AssignedTask, DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError};
 pub use updates_store::{DocUpdate, PgUpdatesStore, UpdatesStore, UpdatesStoreError};
 pub use user_store::{PgUserStore, User, UserStore, UserStoreError};
 pub use workspace_store::{

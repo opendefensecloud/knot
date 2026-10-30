@@ -274,16 +274,8 @@ async fn run_server(cfg: Config) {
     if let (Some(pool), Some(acl), Some(docs)) =
         (state.pool.clone(), state.acl.clone(), state.docs.clone())
     {
-        let rooms_for_revoke = state.rooms_v2.clone();
-        let on_invalidate: std::sync::Arc<dyn Fn(uuid::Uuid) + Send + Sync> =
-            std::sync::Arc::new(move |doc_id| {
-                if let Some(r) = rooms_for_revoke.clone() {
-                    tokio::spawn(async move {
-                        r.revoke_all_for_doc(doc_id).await;
-                    });
-                }
-            });
-        let _handle = knot_docs::spawn_listener(pool, acl, docs, on_invalidate);
+        let socket_hooks = knot_server::revoke_doc_sockets(&state);
+        let _handle = knot_docs::spawn_listener(pool, acl, docs, socket_hooks);
         tracing::info!("acl listener spawned");
     }
     if let (Some(pool), Some(rooms)) = (state.pool.clone(), state.rooms_v2.clone()) {

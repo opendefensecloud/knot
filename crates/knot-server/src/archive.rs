@@ -117,6 +117,12 @@ pub async fn purge_doc(
             rooms.revoke_and_evict(*id).await;
         }
     }
+    if let Some(board_rooms) = state.board_rooms.as_ref() {
+        for id in &deleted {
+            // The same for the page's open boards.
+            board_rooms.revoke_for_doc(*id).await;
+        }
+    }
     metrics::counter!("knot_docs_purged_total", "trigger" => trigger.label()).increment(1);
     tracing::info!(%doc_id, docs = deleted.len(), trigger = trigger.label(), "archive purge");
     Ok(())
@@ -157,6 +163,26 @@ pub async fn evict_local(state: &AppState, doc_ids: &[Uuid]) {
         acl.evict_doc(*doc_id);
     }
     acl.run_pending_tasks().await;
+}
+
+/// `evict_local` for `doc_id` and every descendant: after a write that
+/// changes access to a whole subtree (a move, a grant, the restrict toggle)
+/// is committed, so this replica reads it right away. If the descendants
+/// can't be listed, the whole cache goes instead.
+pub async fn evict_local_subtree(state: &AppState, doc_id: Uuid) {
+    let mut changed_ids = vec![doc_id];
+    if let Some(docs) = state.docs.as_ref() {
+        match docs.descendant_ids(doc_id).await {
+            Ok(descendants) => changed_ids.extend(descendants),
+            Err(e) => {
+                tracing::warn!(error=?e, %doc_id, "descendants for eviction; evicting all");
+                if let Some(acl) = state.acl.as_ref() {
+                    acl.evict_all();
+                }
+            }
+        }
+    }
+    evict_local(state, &changed_ids).await;
 }
 
 /// Advisory-lock key that keeps the purge job to one replica at a time

@@ -829,7 +829,7 @@ impl Room {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{MemBus, YrsEngine};
 
@@ -852,7 +852,7 @@ mod tests {
         (conn_id, rx)
     }
 
-    struct NoopUpdates;
+    pub(crate) struct NoopUpdates;
     #[async_trait::async_trait]
     impl knot_storage::UpdatesStore for NoopUpdates {
         async fn insert_batch(
@@ -952,7 +952,7 @@ mod tests {
         }
     }
 
-    struct NoopSnapshots;
+    pub(crate) struct NoopSnapshots;
     #[async_trait::async_trait]
     impl knot_storage::SnapshotStore for NoopSnapshots {
         async fn insert(

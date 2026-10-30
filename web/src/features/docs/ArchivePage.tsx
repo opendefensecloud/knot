@@ -15,18 +15,28 @@ import { Button } from "../../components/ui/Button";
 import type { ArchiveEntry } from "../../lib/validators";
 import { useUi } from "../../stores/ui";
 
-import { daysUntil, purgeConfirmText } from "./archive";
+import { archiveErrorText, daysUntil, purgeConfirmText, purgeErrorText } from "./archive";
 import { docsApi } from "./docs.api";
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
 
+/** Where the page was: its parent, or the top level. A parent the user
+ *  can't see is not named. */
+function parentText(entry: ArchiveEntry): string {
+  if (entry.parent_title) return `in ${entry.parent_title}`;
+  if (entry.parent_hidden || entry.parent_id !== null) return "in a page you can't see";
+  return "top level";
+}
+
 export default function ArchivePage() {
   const qc = useQueryClient();
   const notify = useUi((s) => s.notify);
   const { workspace: role } = useEffectiveRole();
-  const isOwner = role === "owner";
+  /** Permanent deletion takes an owner of the page: the role on it when the
+   *  archive says, else the workspace role. */
+  const canPurge = (entry: ArchiveEntry) => (entry.effective_role ?? role) === "owner";
   // One action at a time per row; the id of the row whose action is running.
   const [busyId, setBusyId] = useState<string | null>(null);
 
@@ -49,7 +59,12 @@ export default function ArchivePage() {
     const r = await docsApi.restore(entry.id);
     setBusyId(null);
     if ("error" in r) {
-      notify("error", `Couldn't restore "${entry.title}"`);
+      notify(
+        "error",
+        r.error.code === "doc.restore_restricted_parent_archived"
+          ? archiveErrorText(r.error.code)
+          : `Couldn't restore "${entry.title}"`,
+      );
       return;
     }
     notify("info", `Restored "${entry.title}"`);
@@ -62,7 +77,7 @@ export default function ArchivePage() {
     const r = await docsApi.purge(entry.id);
     setBusyId(null);
     if ("error" in r) {
-      notify("error", `Couldn't delete "${entry.title}"`);
+      notify("error", purgeErrorText(r.error.code, `Couldn't delete "${entry.title}"`));
       return;
     }
     notify("info", `Deleted "${entry.title}" permanently`);
@@ -106,7 +121,7 @@ export default function ArchivePage() {
                 <div className="min-w-0 flex-1">
                   <div className="text-sm font-medium text-fg truncate">{entry.title}</div>
                   <div className="text-xs text-fg-muted mt-1">
-                    {entry.parent_title ? `in ${entry.parent_title}` : "top level"}
+                    {parentText(entry)}
                     {entry.subpage_count > 0 &&
                       ` · +${entry.subpage_count} ${entry.subpage_count === 1 ? "subpage" : "subpages"}`}
                   </div>
@@ -135,7 +150,7 @@ export default function ArchivePage() {
                       Restore
                     </Button>
                   )}
-                  {isOwner && (
+                  {canPurge(entry) && (
                     <Button
                       size="sm"
                       variant="destructive"

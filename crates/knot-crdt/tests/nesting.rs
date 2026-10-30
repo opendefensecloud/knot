@@ -870,6 +870,7 @@ async fn board_on(board_id: Uuid, store: &StoredBoard) -> knot_crdt::BoardRoomHa
         .unwrap();
     knot_crdt::BoardRoom::spawn(
         board_id,
+        Uuid::new_v4(),
         Arc::new(YrsEngine),
         Arc::new(store.clone()),
         bus,
@@ -1551,6 +1552,7 @@ async fn a_refused_board_connection_stays_refused() {
         let refused = CancellationToken::new();
         let handle = || knot_crdt::board_room::ConnHandle {
             tx: tx.clone(),
+            revoked: CancellationToken::new(),
             refused: refused.clone(),
         };
         let conn = Uuid::new_v4();

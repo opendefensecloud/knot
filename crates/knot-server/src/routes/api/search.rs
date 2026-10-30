@@ -1,8 +1,10 @@
 //! GET /api/search?q=<query>&limit=<n>
 //!
 //! Searches docs in the user's workspace by title + body. ACL-filtered:
-//! re-checks `effective_role` on each candidate so revoked grants don't
-//! leak through the FTS layer.
+//! the docs the caller can't read are excluded in SQL, so they can't crowd
+//! out readable hits, and `effective_role` is re-checked on each candidate
+//! as defence in depth. A hit's `parent_id` is nulled when the caller can't
+//! read the parent, so a hidden restricted page's id never reaches them.
 
 use std::collections::HashSet;
 
@@ -13,6 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::AuthContext;
@@ -58,8 +61,20 @@ async fn search(
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "");
     };
 
-    // Pull a bit more than the final limit so the ACL filter has room.
-    let raw = match search.search(ctx.workspace_id, &q, limit * 2).await {
+    // A cached snapshot may predate a doc, which is then not in the hidden
+    // set; the per-hit re-check below still drops it if unreadable.
+    let hidden_ids = match acl.visibility(ctx.workspace_id, ctx.user_id).await {
+        Ok(visibility) => visibility.hidden_ids(),
+        Err(e) => {
+            tracing::error!(error=?e, "search visibility");
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "");
+        }
+    };
+    // Pull a bit more than the final limit so the per-hit re-check has room.
+    let raw = match search
+        .search(ctx.workspace_id, &q, limit * 2, &hidden_ids)
+        .await
+    {
         Ok(r) => r,
         Err(_) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", ""),
     };
@@ -79,6 +94,31 @@ async fn search(
         }
         if allowed.len() >= limit as usize {
             break;
+        }
+    }
+
+    // A snapshot older than a hit (a doc made since it was cached) would
+    // hide that hit's parent wrongly, so cover hits and parents alike.
+    let listed_ids: Vec<Uuid> = allowed
+        .iter()
+        .flat_map(|hit| std::iter::once(hit.doc_id).chain(hit.parent_id))
+        .collect();
+    let visibility = match acl
+        .visibility_covering(ctx.workspace_id, ctx.user_id, &listed_ids)
+        .await
+    {
+        Ok(visibility) => visibility,
+        Err(e) => {
+            tracing::error!(error=?e, "search visibility");
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "");
+        }
+    };
+    for hit in &mut allowed {
+        if hit
+            .parent_id
+            .is_some_and(|parent_id| !visibility.readable(parent_id))
+        {
+            hit.parent_id = None;
         }
     }
     Json(SearchResponse { results: allowed }).into_response()

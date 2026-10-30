@@ -51,6 +51,15 @@ const docSchema = v.object({
   archived_at: v.fallback(v.nullable(v.string()), null),
   /** The doc the user archived; set on it and on every subpage that went with it. */
   archive_root_id: v.fallback(v.nullable(v.string()), null),
+  /** The doc is a restriction boundary: only people granted access see it. */
+  restricted: v.fallback(v.boolean(), false),
+  /** The doc or an ancestor is a restriction boundary. */
+  within_restricted: v.fallback(v.boolean(), false),
+  /** The parent is a page the user can't see; `parent_id` is then null and
+   *  the sidebar lists the doc under "Shared with you". */
+  parent_hidden: v.fallback(v.boolean(), false),
+  /** The user's role on this doc (GET /api/docs only; null elsewhere). */
+  effective_role: v.fallback(v.nullable(v.picklist(["owner", "editor", "viewer"])), null),
 });
 export type Doc = v.InferOutput<typeof docSchema>;
 export const Doc = docSchema;
@@ -74,6 +83,11 @@ const docWithRoleSchema = v.object({
   purge_at: v.fallback(v.nullable(v.string()), null),
   archive_root_id: v.fallback(v.nullable(v.string()), null),
   archive_root_title: v.fallback(v.nullable(v.string()), null),
+  restricted: v.fallback(v.boolean(), false),
+  within_restricted: v.fallback(v.boolean(), false),
+  /** The nearest restriction boundary (this doc or an ancestor); null
+   *  outside a restricted subtree and when the user can't see it. */
+  restriction_root_id: v.fallback(v.nullable(v.string()), null),
 });
 export type DocWithRole = v.InferOutput<typeof docWithRoleSchema>;
 export const DocWithRole = docWithRoleSchema;
@@ -90,6 +104,14 @@ const archiveEntrySchema = v.object({
   purge_at: v.string(),
   /** A permanent deletion has started and not finished; it can't be restored. */
   purging: v.fallback(v.boolean(), false),
+  /** The parent is a page the user can't see; `parent_id` and
+   *  `parent_title` are then null, as they are for a top-level page. */
+  parent_hidden: v.fallback(v.boolean(), false),
+  /** The user's role on this page, which a restricted page sets apart
+   *  from the workspace role; null when the server doesn't say. */
+  effective_role: v.fallback(v.nullable(v.picklist(["owner", "editor", "viewer"])), null),
+  /** The subpages archived with it that the user can open. */
+  subpage_ids: v.fallback(v.array(v.string()), []),
 });
 export type ArchiveEntry = v.InferOutput<typeof archiveEntrySchema>;
 export const ArchiveEntry = archiveEntrySchema;
@@ -101,6 +123,31 @@ const grantSchema = v.object({
 });
 export type Grant = v.InferOutput<typeof grantSchema>;
 export const Grant = grantSchema;
+
+/**
+ * GET /api/docs/{id}/access: who can see the doc, for the permissions
+ * dialog. `people` are the grants that apply: the doc's own, then the
+ * inheriting grants of its ancestors, nearest first, stopping at the
+ * restriction boundary. Docs the user can't read are never named, so a
+ * `source_*` or `restriction_root_*` pair is null for them.
+ */
+const docAccessPersonSchema = v.object({
+  principal: v.string(),
+  role: v.picklist(["owner", "editor", "viewer"]),
+  inherit: v.boolean(),
+  source_doc_id: v.nullable(v.string()),
+  source_title: v.nullable(v.string()),
+});
+export type DocAccessPerson = v.InferOutput<typeof docAccessPersonSchema>;
+
+const docAccessInfoSchema = v.object({
+  restricted: v.boolean(),
+  restriction_root_id: v.nullable(v.string()),
+  restriction_root_title: v.nullable(v.string()),
+  people: v.array(docAccessPersonSchema),
+});
+export type DocAccessInfo = v.InferOutput<typeof docAccessInfoSchema>;
+export const DocAccessInfo = docAccessInfoSchema;
 
 /**
  * GET /api/docs/{id}/contributors. Names only — the server joins `users` for

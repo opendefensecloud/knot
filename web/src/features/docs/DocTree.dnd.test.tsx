@@ -41,6 +41,10 @@ function doc(id: string, title: string, parent_id: string | null) {
     is_template: false,
     archived_at: null,
     archive_root_id: null,
+    restricted: false,
+    within_restricted: false,
+    parent_hidden: false,
+    effective_role: null as "owner" | "editor" | "viewer" | null,
   };
 }
 
@@ -456,6 +460,97 @@ function mouseDrag(id: string, y: number, path: [number, number][], init: MouseE
 // Alpha (0-28) > Alpha one (28-56); Beta (56-84); Gamma (84-112). A trackpad
 // click easily slips a few px: past the mouse sensor's 6px, a drag starts.
 // Less than one INDENT of travel that moves nothing is still a click.
+/** Plain; Secret (restricted) > Secret child. */
+const BOUNDARY: ReturnType<typeof doc>[] = [
+  { ...doc("plain", "Plain", null), sort_key: "a", effective_role: "owner" },
+  { ...doc("secret", "Secret", null), sort_key: "b", restricted: true, within_restricted: true, effective_role: "owner" },
+  { ...doc("secret-child", "Secret child", "secret"), within_restricted: true, effective_role: "owner" },
+];
+
+describe("DocTree — drops across a restriction boundary", () => {
+  it("asks before moving a page into a restricted page, and sends nothing when declined", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const fetchMock = renderTree("editor", BOUNDARY);
+    await editorRows(BOUNDARY.length);
+    layOut();
+    // Plain (row 0) onto the middle of Secret (row 1).
+    fireEvent.mouseDown(screen.getByTestId("doc-row-plain"), { button: 0, clientX: 100, clientY: 14 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 22 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 42 });
+    expect(screen.getByTestId("tree-row-secret")).toHaveAttribute("data-drop-zone", "into");
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 42 });
+
+    expect(confirm).toHaveBeenCalledWith(
+      'Moving "Plain" into "Secret" limits who can see it to people with access there.',
+    );
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+  });
+
+  it("moves the page into the restricted page once confirmed", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const fetchMock = renderTree("editor", BOUNDARY);
+    await editorRows(BOUNDARY.length);
+    layOut();
+    fireEvent.mouseDown(screen.getByTestId("doc-row-plain"), { button: 0, clientX: 100, clientY: 14 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 22 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 42 });
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 42 });
+
+    await waitFor(() => expect(moves(fetchMock)).toEqual([{ id: "plain", body: { parent_id: "secret" } }]));
+  });
+
+  it("asks before moving a page out of a restricted page to the top level", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const fetchMock = renderTree("editor", BOUNDARY);
+    await editorRows(BOUNDARY.length);
+    layOut();
+    // Secret child (row 2), one level left on its own row.
+    fireEvent.mouseDown(screen.getByTestId("doc-row-secret-child"), { button: 0, clientX: 100, clientY: 70 });
+    fireEvent.mouseMove(document, { clientX: 92, clientY: 70 });
+    fireEvent.mouseMove(document, { clientX: 86, clientY: 70 });
+    fireEvent.mouseUp(document, { clientX: 86, clientY: 70 });
+
+    expect(confirm).toHaveBeenCalledWith(
+      'Moving "Secret child" here makes it visible to everyone in the workspace.',
+    );
+    await waitFor(() =>
+      expect(moves(fetchMock)).toEqual([{ id: "secret-child", body: { parent_id: null, after_id: "secret" } }]),
+    );
+  });
+
+  it("offers no drop into a page the user can only view", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const viewOnly = BOUNDARY.map((page) => (page.id === "plain" ? page : { ...page, effective_role: "viewer" as const }));
+    const fetchMock = renderTree("editor", viewOnly);
+    await editorRows(1);
+    layOut();
+    fireEvent.mouseDown(screen.getByTestId("doc-row-plain"), { button: 0, clientX: 100, clientY: 14 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 22 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 42 });
+    expect(screen.getByTestId("tree-row-secret")).not.toHaveAttribute("data-drop-zone");
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 42 });
+
+    expect(confirm).not.toHaveBeenCalled();
+    await settle();
+    expect(moves(fetchMock)).toEqual([]);
+  });
+
+  it("doesn't ask for a move that stays on the same side of the boundary", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const fetchMock = renderTree("editor", NESTED);
+    await editorRows();
+    layOut();
+    fireEvent.mouseDown(screen.getByTestId("doc-row-grandchild"), { button: 0, clientX: 100, clientY: 70 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 62 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 14 });
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 14 });
+
+    await waitFor(() => expect(moves(fetchMock)).toEqual([{ id: "grandchild", body: { parent_id: "folder" } }]));
+    expect(confirm).not.toHaveBeenCalled();
+  });
+});
+
 describe("DocTree — a click that slips", () => {
   it.each([
     ["sideways", "beta", 70, 7],

@@ -620,6 +620,18 @@ describe("DocTree — refused moves (P12)", () => {
     });
   });
 
+  it("says that only an owner can move a page out of a restricted area", async () => {
+    renderTree(server({ refuse: { status: 403, code: "acl.restricted_move" } }));
+    await editorRows();
+
+    fireEvent.click(within(openMenu("alpha")).getByTestId("ctx-move-down"));
+    await waitFor(() =>
+      expect(screen.getByTestId("toast-error")).toHaveTextContent(
+        "Only an owner of this page can move it out of a restricted area.",
+      ),
+    );
+  });
+
   it.each([
     [422, "doc.bad_anchor"],
     [409, "doc.move_cycle"],

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Member } from "../../lib/validators";
@@ -75,5 +75,29 @@ describe("MembersPage search", () => {
     expect(search).toHaveValue("");
     expect(screen.queryByTestId("members-empty")).not.toBeInTheDocument();
     expect(screen.getByTestId("member-u1")).toBeInTheDocument();
+  });
+});
+
+describe("MembersPage remove", () => {
+  beforeEach(() => {
+    vi.spyOn(workspaceApi, "listMembers").mockResolvedValue({ ok: MEMBERS });
+  });
+
+  it("warns that a removed member loses their page grants too", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const remove = vi.spyOn(workspaceApi, "remove");
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MembersPage />
+      </QueryClientProvider>,
+    );
+
+    const row = await screen.findByTestId("member-u2");
+    fireEvent.click(within(row).getByRole("button", { name: "Remove" }));
+    expect(confirm).toHaveBeenCalledWith(
+      "Remove bob@example.org? They also lose every page-level grant, including access to restricted pages.",
+    );
+    expect(remove).not.toHaveBeenCalled();
   });
 });

@@ -53,6 +53,10 @@ async fn make_doc(state: &AppState, workspace_id: Uuid, user_id: Uuid, title: &s
 }
 
 async fn login_owner(app: &axum::Router) -> (String, String) {
+    login_as(app, "alice@example.com").await
+}
+
+async fn login_as(app: &axum::Router, email: &str) -> (String, String) {
     let r = app
         .clone()
         .oneshot(
@@ -61,8 +65,7 @@ async fn login_owner(app: &axum::Router) -> (String, String) {
                 .uri("/auth/login")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({"email": "alice@example.com", "password": "hunter22"})
-                        .to_string(),
+                    serde_json::json!({"email": email, "password": "hunter22"}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -95,6 +98,73 @@ async fn login_owner(app: &axum::Router) -> (String, String) {
         .unwrap()
         .to_string();
     (sid_kv, csrf_val)
+}
+
+/// Add a member with `role`, whose password is the seeded one.
+async fn add_member(
+    state: &AppState,
+    workspace_id: Uuid,
+    email: &str,
+    name: &str,
+    role: WorkspaceRole,
+) -> Uuid {
+    let hash = state.hasher.hash("hunter22").unwrap();
+    let user = state
+        .users
+        .as_ref()
+        .unwrap()
+        .create_local(email, name, &hash)
+        .await
+        .unwrap();
+    state
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .add_member(workspace_id, user.id, role)
+        .await
+        .unwrap();
+    user.id
+}
+
+/// A page under `parent_id`, after its last child.
+async fn make_child(
+    state: &AppState,
+    workspace_id: Uuid,
+    user_id: Uuid,
+    parent_id: Uuid,
+    title: &str,
+) -> Uuid {
+    let docs = state.docs.as_ref().unwrap();
+    let last = docs
+        .siblings(workspace_id, Some(parent_id))
+        .await
+        .unwrap()
+        .pop();
+    let key = sort_key_between(last.as_ref().map(|d| d.sort_key.as_str()), None);
+    docs.create(workspace_id, Some(parent_id), title, &key, user_id)
+        .await
+        .unwrap()
+        .id
+}
+
+/// Mark `doc_id` restricted; `actor` becomes its owner.
+async fn restrict(state: &AppState, workspace_id: Uuid, doc_id: Uuid, actor: Uuid) {
+    state
+        .docs
+        .as_ref()
+        .unwrap()
+        .set_restricted(workspace_id, doc_id, actor, true)
+        .await
+        .unwrap();
+}
+
+fn hit_ids(body: &serde_json::Value) -> Vec<String> {
+    body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["doc_id"].as_str().unwrap().to_string())
+        .collect()
 }
 
 /// Percent-encodes spaces only — sufficient for single-word test queries.
@@ -260,4 +330,110 @@ async fn multi_word_prefix_is_and() {
     let results = body["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["title"], "Alphabet Soup");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_never_returns_restricted_doc_to_non_grantee() {
+    let (state, ws, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    add_member(&state, ws, "bob@example.com", "Bob", WorkspaceRole::Owner).await;
+    let open_doc = make_doc(&state, ws, alice, "Quarterly open").await;
+    let secret = make_doc(&state, ws, alice, "Quarterly secret").await;
+    let secret_child = make_child(&state, ws, alice, secret, "Child page").await;
+    state
+        .markdown_cache
+        .as_ref()
+        .unwrap()
+        .put(secret_child, 1, "the quarterly numbers live here")
+        .await
+        .unwrap();
+    restrict(&state, ws, secret, alice).await;
+    let app = router_with_state(state);
+
+    let (bob_sid, _) = login_as(&app, "bob@example.com").await;
+    let (status, body) = do_search(&app, &bob_sid, "quarterly").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        hit_ids(&body),
+        vec![open_doc.to_string()],
+        "a workspace owner without a grant sees neither the boundary nor its subpage: {body}"
+    );
+
+    let (alice_sid, _) = login_owner(&app).await;
+    let (_, body) = do_search(&app, &alice_sid, "quarterly").await;
+    let mut alice_hits = hit_ids(&body);
+    alice_hits.sort();
+    let mut expected = vec![
+        open_doc.to_string(),
+        secret.to_string(),
+        secret_child.to_string(),
+    ];
+    expected.sort();
+    assert_eq!(alice_hits, expected, "the grantee sees all three: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_is_not_starved_by_restricted_hits() {
+    let (state, ws, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    add_member(&state, ws, "bob@example.com", "Bob", WorkspaceRole::Editor).await;
+    for index in 0..45 {
+        let restricted_doc = make_doc(&state, ws, alice, &format!("Zebra {index}")).await;
+        restrict(&state, ws, restricted_doc, alice).await;
+    }
+    let readable = make_doc(&state, ws, alice, "Plain").await;
+    state
+        .markdown_cache
+        .as_ref()
+        .unwrap()
+        .put(readable, 1, "a zebra crossing in the body")
+        .await
+        .unwrap();
+    let app = router_with_state(state);
+
+    let (bob_sid, _) = login_as(&app, "bob@example.com").await;
+    let (status, body) = do_search(&app, &bob_sid, "zebra").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(hit_ids(&body), vec![readable.to_string()], "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deep_grantee_search_hit_has_no_parent_id() {
+    let (state, ws, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    let bob = add_member(&state, ws, "bob@example.com", "Bob", WorkspaceRole::Editor).await;
+    let vault = make_doc(&state, ws, alice, "Vault").await;
+    let deep = make_child(&state, ws, alice, vault, "Deep note").await;
+    restrict(&state, ws, vault, alice).await;
+    state
+        .grants
+        .as_ref()
+        .unwrap()
+        .put(
+            ws,
+            deep,
+            &format!("user:{bob}"),
+            WorkspaceRole::Viewer,
+            true,
+            alice,
+        )
+        .await
+        .unwrap();
+    let app = router_with_state(state);
+
+    let (bob_sid, _) = login_as(&app, "bob@example.com").await;
+    let (status, body) = do_search(&app, &bob_sid, "deep").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(hit_ids(&body), vec![deep.to_string()], "{body}");
+    assert!(body["results"][0]["parent_id"].is_null(), "{body}");
+    assert!(
+        !body.to_string().contains(&vault.to_string()),
+        "the hidden boundary's id never reaches the grantee: {body}"
+    );
+
+    let (alice_sid, _) = login_owner(&app).await;
+    let (_, body) = do_search(&app, &alice_sid, "deep").await;
+    assert_eq!(
+        body["results"][0]["parent_id"],
+        vault.to_string(),
+        "a reader of the parent still gets it: {body}"
+    );
 }
