@@ -8,6 +8,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-30
+
+Restricted pages: an owner can make a page and its subpages visible only
+to the people they add, workspace owners included. Removing a member now
+also removes their page grants.
+
 ### Upgrading
 - Two database migrations run on upgrade (the Helm chart's migrate hook
   applies them). Rolling back to 0.9.1 needs a database restore: 0.9.1
@@ -44,10 +50,22 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   - Duplicating a page skips the subpages you can't see, and copies of
     restricted pages stay restricted. Workspace export and import keep
     restrictions.
-  - Removing a member now also removes their page grants, so inviting them
-    again doesn't bring their old access back.
   - `knot-server admin restricted-list` and `knot-server admin grant`
     recover a restricted page whose owners have all left the workspace.
+    (#63)
+
+### Changed
+- Removing a member also removes their page grants, so inviting them again
+  (or their next SSO login) doesn't bring their old access back. Changing a
+  member's role or removing them takes effect at once on every replica, and
+  open pages reconnect to check access again. (#63)
+- Deleting someone else's comment takes owner access to the page, not to
+  the workspace. A workspace owner who is only an editor on a restricted
+  page can't delete others' comments there; someone with an owner grant on
+  a page can. (#63)
+- Public links are served with `Cache-Control: private, no-cache` instead
+  of `public, max-age=60`, so a revoked link stops working at once, also
+  behind a shared cache. (#63)
 
 ## [0.9.1] - 2026-10-29
 
@@ -839,7 +857,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/opendefensecloud/knot/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/opendefensecloud/knot/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/opendefensecloud/knot/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/opendefensecloud/knot/compare/v0.8.0...v0.8.1
