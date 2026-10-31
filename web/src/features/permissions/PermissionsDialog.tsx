@@ -9,6 +9,8 @@ import { docsApi } from "../docs/docs.api";
 import { grantsApi } from "../docs/grants.api";
 import { workspaceApi } from "../workspace/workspace.api";
 
+import { MemberPicker } from "./MemberPicker";
+
 function toLocalInput(iso: string): string {
   // Convert ISO string to the `YYYY-MM-DDTHH:mm` format expected by
   // <input type="datetime-local">.
@@ -16,6 +18,9 @@ function toLocalInput(iso: string): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
+
+/** Stable while members load, so the picker's sort isn't redone each render. */
+const NO_MEMBERS: Member[] = [];
 
 const RESTRICT_CONFIRM =
   "Only people you add will keep access to this page and its subpages. You will be added as an owner.";
@@ -123,11 +128,11 @@ export default function PermissionsDialog() {
     queryKey: ["members"],
     queryFn: () => workspaceApi.listMembers(),
   });
+  const memberList = members.data && "ok" in members.data ? members.data.ok : NO_MEMBERS;
+  const membersFailed = members.isError || (members.data !== undefined && !("ok" in members.data));
   // Grants name users by `user:<uuid>`; resolve that against the member list
   // so the table shows people, not ids.
-  const memberById = new Map<string, Member>(
-    members.data && "ok" in members.data ? members.data.ok.map((m) => [m.user_id, m]) : [],
-  );
+  const memberById = new Map<string, Member>(memberList.map((m) => [m.user_id, m]));
 
   const shares = useQuery({
     queryKey: ["shares", id],
@@ -491,19 +496,15 @@ export default function PermissionsDialog() {
 
         <h3 className="text-[13px] font-semibold uppercase tracking-wider text-fg-muted mb-2">Add</h3>
         <div className="flex flex-wrap gap-2 mb-4 items-center">
-          <select
-            data-testid="grant-user"
+          <MemberPicker
+            testId="grant-user"
+            members={memberList}
+            loading={members.isPending}
+            failed={membersFailed}
             value={addUser}
-            onChange={(e) => setAddUser(e.target.value)}
-            className={`${selectCls} flex-1 min-w-[180px]`}
-          >
-            <option value="">Choose…</option>
-            {members.data && "ok" in members.data && members.data.ok.map((m) => (
-              <option key={m.user_id} value={m.user_id}>
-                {m.display_name} ({m.email})
-              </option>
-            ))}
-          </select>
+            onChange={setAddUser}
+            className="flex-1 min-w-[180px]"
+          />
           <select
             data-testid="grant-role"
             value={addRole}

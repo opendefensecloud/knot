@@ -97,7 +97,8 @@ test("restricting hides a page from workspace editors; a subpage grant shows und
   // The owner grants the editor Viewer on C alone, without inheritance.
   await owner.goto(`/doc/${ids[CHILD_TITLE]}/permissions`);
   await expect(owner.getByTestId("permissions-dialog")).toBeVisible();
-  await owner.getByTestId("grant-user").selectOption(editorMember!.user_id);
+  await owner.getByTestId("grant-user").fill(editorMember!.email);
+  await owner.getByTestId(`grant-user-option-${editorMember!.user_id}`).click();
   await owner.getByTestId("grant-role").selectOption("viewer");
   await owner.getByLabel("Inherit").uncheck();
   const grantRes = owner.waitForResponse(

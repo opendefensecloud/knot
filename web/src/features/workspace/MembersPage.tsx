@@ -6,6 +6,7 @@ import type { Member } from "../../lib/validators";
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { useUi } from "../../stores/ui";
 
+import { memberMatches } from "./memberSearch";
 import { workspaceApi } from "./workspace.api";
 
 // Case-insensitive substring match on email, display name and role, so
@@ -13,12 +14,7 @@ import { workspaceApi } from "./workspace.api";
 export function filterMembers(members: Member[], query: string): Member[] {
   const q = query.trim().toLowerCase();
   if (!q) return members;
-  return members.filter(
-    (m) =>
-      m.email.toLowerCase().includes(q) ||
-      m.display_name.toLowerCase().includes(q) ||
-      m.role.includes(q),
-  );
+  return members.filter((m) => memberMatches(m, q) || m.role.includes(q));
 }
 
 export default function MembersPage() {

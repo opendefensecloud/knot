@@ -10,6 +10,7 @@ import type React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 
+import { memberMatches } from "../workspace/memberSearch";
 import { workspaceApi } from "../workspace/workspace.api";
 
 interface MentionState {
@@ -43,10 +44,7 @@ export function useMentionPicker(value: string, onChange: (v: string) => void) {
   const mention = parseMention(value, cursor);
 
   const filtered = mention
-    ? memberList.filter((m) =>
-        m.display_name.toLowerCase().includes(mention.query.toLowerCase()) ||
-        m.email.toLowerCase().includes(mention.query.toLowerCase()),
-      )
+    ? memberList.filter((m) => memberMatches(m, mention.query))
     : [];
 
   function pick(displayName: string) {
