@@ -62,6 +62,10 @@ type Stub = {
   access?: Partial<DocAccessInfo>;
   /** Answer to any PUT or DELETE; defaults to 204. */
   write?: { status: number; body?: unknown };
+  /** `GET /api/workspace/members`; defaults to Ada alone. */
+  members?: { user_id: string; email: string; display_name: string; role: string }[] | "error";
+  /** Holds back the members answer until it resolves. */
+  membersGate?: Promise<void>;
 };
 
 function renderDialog(stub: Stub = {}) {
@@ -94,7 +98,13 @@ function renderDialog(stub: Stub = {}) {
       ]);
     }
     if (url.endsWith("/api/workspace/members")) {
-      return json([{ user_id: ADA, email: "ada@example.com", display_name: "Ada Lovelace", role: "editor" }]);
+      if (stub.members === "error") {
+        return json({ error: { code: "internal", message: "", details: {} } }, 500);
+      }
+      const memberList = stub.members ?? [
+        { user_id: ADA, email: "ada@example.com", display_name: "Ada Lovelace", role: "editor" },
+      ];
+      return (stub.membersGate ?? Promise.resolve()).then(() => json(memberList));
     }
     if (url.endsWith("/shares")) return json([]);
     if (url.endsWith("/api/docs/d1/access")) return json(currentAccess);
@@ -276,9 +286,9 @@ describe("PermissionsDialog access", () => {
       },
     });
 
-    const select = await screen.findByTestId("grant-user");
-    await within(select).findByText("Ada Lovelace (ada@example.com)");
-    fireEvent.change(select, { target: { value: ADA } });
+    const picker = await screen.findByTestId("grant-user");
+    fireEvent.focus(picker);
+    fireEvent.mouseDown(await screen.findByTestId(`grant-user-option-${ADA}`));
     fireEvent.click(screen.getByTestId("grant-add"));
 
     expect(await screen.findByText("Only workspace members can be added.")).toBeTruthy();
@@ -290,6 +300,142 @@ describe("PermissionsDialog access", () => {
     expect(
       await screen.findByText('Untick "Inherit" to share only this page, not its subpages.'),
     ).toBeTruthy();
+  });
+});
+
+const BOB = "33333333-3333-3333-3333-333333333333";
+const ZOE = "44444444-4444-4444-4444-444444444444";
+/** Deliberately out of order, with one lower-case name. */
+const MANY_MEMBERS = [
+  { user_id: ZOE, email: "zoe@example.com", display_name: "Zoe Zhang", role: "viewer" },
+  { user_id: ADA, email: "ada@example.com", display_name: "Ada Lovelace", role: "editor" },
+  { user_id: BOB, email: "bob@corp.test", display_name: "bob Builder", role: "editor" },
+];
+
+describe("PermissionsDialog member picker", () => {
+  it("lists members alphabetically by name", async () => {
+    renderDialog({ members: MANY_MEMBERS });
+    const picker = await screen.findByTestId("grant-user");
+    fireEvent.focus(picker);
+    await waitFor(() => expect(within(screen.getByRole("listbox")).getAllByRole("option")).toHaveLength(3));
+
+    expect(within(screen.getByRole("listbox")).getAllByRole("option").map((option) => option.dataset.testid)).toEqual([
+      `grant-user-option-${ADA}`,
+      `grant-user-option-${BOB}`,
+      `grant-user-option-${ZOE}`,
+    ]);
+  });
+
+  it("filters by name or email as you type", async () => {
+    renderDialog({ members: MANY_MEMBERS });
+    const picker = await screen.findByTestId("grant-user");
+    await screen.findByText("Ada Lovelace");
+
+    fireEvent.change(picker, { target: { value: "ZHANG" } });
+    expect(within(screen.getByRole("listbox")).getAllByRole("option").map((option) => option.dataset.testid)).toEqual([
+      `grant-user-option-${ZOE}`,
+    ]);
+
+    fireEvent.change(picker, { target: { value: "corp.test" } });
+    expect(within(screen.getByRole("listbox")).getAllByRole("option").map((option) => option.dataset.testid)).toEqual([
+      `grant-user-option-${BOB}`,
+    ]);
+
+    fireEvent.change(picker, { target: { value: "nobody" } });
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("No matching members");
+  });
+
+  it("starts a new search when you type over a picked member", async () => {
+    renderDialog({ members: MANY_MEMBERS });
+    const picker = await screen.findByTestId("grant-user");
+    fireEvent.focus(picker);
+    fireEvent.mouseDown(await screen.findByTestId(`grant-user-option-${ZOE}`));
+    expect(picker).toHaveValue("Zoe Zhang (zoe@example.com)");
+
+    fireEvent.keyDown(picker, { key: "b" });
+    expect(picker).toHaveValue("b");
+    expect(screen.getByTestId("grant-add")).toBeDisabled();
+    expect(within(screen.getByRole("listbox")).getAllByRole("option").map((option) => option.dataset.testid)).toEqual([
+      `grant-user-option-${BOB}`,
+    ]);
+
+    fireEvent.mouseDown(screen.getByTestId(`grant-user-option-${BOB}`));
+    fireEvent.keyDown(picker, { key: "Backspace" });
+    expect(picker).toHaveValue("");
+    expect(within(screen.getByRole("listbox")).getAllByRole("option")).toHaveLength(3);
+  });
+
+  it("highlights the first member after arrowing while members were loading", async () => {
+    let releaseMembers = () => {};
+    const membersGate = new Promise<void>((resolve) => { releaseMembers = resolve; });
+    renderDialog({ members: MANY_MEMBERS, membersGate });
+    const picker = await screen.findByTestId("grant-user");
+
+    fireEvent.focus(picker);
+    expect(screen.getByRole("status")).toHaveTextContent("Loading members…");
+    fireEvent.keyDown(picker, { key: "ArrowDown" });
+    fireEvent.keyDown(picker, { key: "ArrowDown" });
+    releaseMembers();
+    await screen.findByTestId(`grant-user-option-${ADA}`);
+    fireEvent.keyDown(picker, { key: "Enter" });
+
+    expect(picker).toHaveValue("Ada Lovelace (ada@example.com)");
+  });
+
+  it("ignores hover reports from a pointer that didn't move", async () => {
+    renderDialog({ members: MANY_MEMBERS });
+    const picker = await screen.findByTestId("grant-user");
+    fireEvent.focus(picker);
+    const zoe = await screen.findByTestId(`grant-user-option-${ZOE}`);
+
+    fireEvent.mouseMove(zoe, { clientX: 10, clientY: 50 });
+    expect(zoe).toHaveAttribute("aria-selected", "true");
+    // Arrowing scrolls the list; the row now under the resting pointer
+    // reports the same coordinates and must not take the highlight back.
+    fireEvent.keyDown(picker, { key: "ArrowUp" });
+    fireEvent.mouseMove(screen.getByTestId(`grant-user-option-${BOB}`), { clientX: 10, clientY: 50 });
+    fireEvent.mouseMove(zoe, { clientX: 10, clientY: 50 });
+    expect(screen.getByTestId(`grant-user-option-${BOB}`)).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("clears unpicked text on blur and opens on ArrowUp", async () => {
+    renderDialog({ members: MANY_MEMBERS });
+    const picker = await screen.findByTestId("grant-user");
+    await screen.findByText("Ada Lovelace");
+
+    fireEvent.change(picker, { target: { value: "Zoe" } });
+    fireEvent.blur(picker);
+    expect(picker).toHaveValue("");
+    expect(screen.queryByRole("listbox")).toBeNull();
+
+    fireEvent.keyDown(picker, { key: "ArrowUp" });
+    expect(within(screen.getByRole("listbox")).getAllByRole("option")).toHaveLength(3);
+  });
+
+  it("says when the member list couldn't be loaded", async () => {
+    renderDialog({ members: "error" });
+    const picker = await screen.findByTestId("grant-user");
+    fireEvent.focus(picker);
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Couldn't load members");
+  });
+
+  it("picks with arrow keys and Enter, then grants that member", async () => {
+    const calls = renderDialog({ members: MANY_MEMBERS });
+    const picker = await screen.findByTestId("grant-user");
+    await screen.findByText("Ada Lovelace");
+
+    fireEvent.change(picker, { target: { value: "example.com" } });
+    fireEvent.keyDown(picker, { key: "ArrowDown" });
+    fireEvent.keyDown(picker, { key: "Enter" });
+
+    expect(picker).toHaveValue("Zoe Zhang (zoe@example.com)");
+    expect(screen.queryByRole("listbox")).toBeNull();
+    fireEvent.click(screen.getByTestId("grant-add"));
+    await waitFor(() =>
+      expect(calls.some((call) => call.method === "PUT" && call.url.endsWith(`/grants/${encodeURIComponent(`user:${ZOE}`)}`))).toBe(true),
+    );
   });
 });
 
