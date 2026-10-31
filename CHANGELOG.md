@@ -8,6 +8,23 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-10-31
+
+A searchable member list in the Permissions dialog, so adding someone to a
+page stays quick in workspaces with many members.
+
+### Upgrading
+- Nothing to do. This release changes only the web app: no database
+  migrations, no configuration or Helm chart changes, and rolling back to
+  0.9.3 works as is.
+
+### Changed
+- The member list under "Add" in a page's Permissions dialog is now a
+  search field. Type part of a name or email to narrow it, then pick with
+  the mouse, or with the arrow keys and Enter. Members are listed
+  alphabetically by name, and the list opens above the field when there's
+  no room below it. (#66)
+
 ## [0.9.3] - 2026-10-30
 
 The release notes for 0.9.2 in knot itself. 0.9.2 was built before its
@@ -873,7 +890,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.4...HEAD
+[0.9.4]: https://github.com/opendefensecloud/knot/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/opendefensecloud/knot/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/opendefensecloud/knot/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/opendefensecloud/knot/compare/v0.9.0...v0.9.1
