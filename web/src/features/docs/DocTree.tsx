@@ -2,7 +2,7 @@ import { useMutation, useMutationState, useQuery, useQueryClient } from "@tansta
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 
-import { FileText, FilePlus, LayoutTemplate, Plus, X } from "lucide-react";
+import { ChevronsDownUp, ChevronsUpDown, FileText, FilePlus, LayoutTemplate, Plus, X } from "lucide-react";
 
 import {
   DndContext,
@@ -41,6 +41,7 @@ import {
   dropZone,
   flattenVisible,
   keyboardMove,
+  parentIds,
   projectDrop,
   restrictionCrossingText,
   INDENT,
@@ -198,6 +199,16 @@ export function DocTree() {
     () => flattenVisible([...tree.roots, ...tree.shared], collapsed, draggingId ?? undefined),
     [tree, collapsed, draggingId],
   );
+  // "Collapse all" closes every page with subpages; once none is open, the
+  // same button expands them all again.
+  const parents = useMemo(() => parentIds([...tree.roots, ...tree.shared]), [tree]);
+  const allCollapsed = useMemo(
+    () => [...parents].every((id) => collapsed.has(id)),
+    [parents, collapsed],
+  );
+  const toggleAll = useCallback(() => {
+    setCollapsed(allCollapsed ? new Set() : parents);
+  }, [allCollapsed, parents]);
   // Rows are drop targets when there is a page the user may drag: a
   // workspace viewer can still own a restricted page and rearrange in it.
   const dragEnabled = useMemo(
@@ -436,16 +447,32 @@ export function DocTree() {
         <span className="text-[11px] font-semibold uppercase tracking-wider text-fg-muted">
           Documents
         </span>
-        {canEdit && (
-          <IconButton
-            data-testid="new-doc"
-            label="New document"
-            size="sm"
-            onClick={() => setPickerOpen(true)}
-          >
-            <Plus size={14} aria-hidden />
-          </IconButton>
-        )}
+        <div className="flex items-center gap-0.5">
+          {parents.size > 0 && (
+            <IconButton
+              data-testid="toggle-all"
+              label={allCollapsed ? "Expand all" : "Collapse all"}
+              size="sm"
+              onClick={toggleAll}
+            >
+              {allCollapsed ? (
+                <ChevronsUpDown size={14} aria-hidden />
+              ) : (
+                <ChevronsDownUp size={14} aria-hidden />
+              )}
+            </IconButton>
+          )}
+          {canEdit && (
+            <IconButton
+              data-testid="new-doc"
+              label="New document"
+              size="sm"
+              onClick={() => setPickerOpen(true)}
+            >
+              <Plus size={14} aria-hidden />
+            </IconButton>
+          )}
+        </div>
       </div>
       {list.isLoading && (
         <div className="px-3 py-2 text-sm text-fg-muted">Loading…</div>

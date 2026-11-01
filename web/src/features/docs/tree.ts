@@ -198,6 +198,20 @@ export function countDescendants(node: TreeNode): number {
   return node.children.reduce((sum, child) => sum + 1 + countDescendants(child), 0);
 }
 
+/** The pages (at any depth) that have subpages: the rows "Collapse all" closes. */
+export function parentIds(tree: TreeNode[]): Set<string> {
+  const out = new Set<string>();
+  const walk = (nodes: TreeNode[]) => {
+    for (const n of nodes) {
+      if (n.children.length === 0) continue;
+      out.add(n.id);
+      walk(n.children);
+    }
+  };
+  walk(tree);
+  return out;
+}
+
 /** What a screen reader hears about a row: "level 2, 3 subpages", and
  *  ", restricted" for a page in a restricted subtree. */
 export function rowDescription(row: FlatRow, withinRestricted = false): string {
