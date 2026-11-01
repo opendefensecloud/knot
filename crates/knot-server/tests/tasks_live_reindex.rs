@@ -103,11 +103,15 @@ async fn doc_edit_with_mention_lands_in_task_index_without_http() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     loop {
         let rows = tasks_store
-            .list_for_assignee(ws.id, user.id, false)
+            .list_for_assignee(ws.id, user.id, false, &[])
             .await
             .unwrap();
         if let Some(row) = rows.first() {
-            assert!(row.text.contains("ship it"), "got: {:?}", row.text);
+            assert!(
+                row.task.text.contains("ship it"),
+                "got: {:?}",
+                row.task.text
+            );
             return;
         }
         if tokio::time::Instant::now() >= deadline {

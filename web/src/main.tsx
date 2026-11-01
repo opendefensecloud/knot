@@ -9,11 +9,15 @@ import { SessionProvider } from "./auth/SessionContext";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { queryClient } from "./lib/queryClient";
 import { router } from "./routes";
-import { readInitialSidebarWidth, readInitialSkin, stampSidebarWidth, stampSkin } from "./stores/ui";
+import { watchSkinEnvironment } from "./stores/skinWatcher";
+import { readInitialSidebarWidth, stampSidebarWidth, stampSkin, useUi } from "./stores/ui";
 
 // Stamp data-skin + data-theme before first paint so a dark-skin user
-// never sees the light palette flash in before React hydrates.
-stampSkin(readInitialSkin());
+// never sees the light palette flash in before React hydrates. The stamp
+// is the skin the store resolved on load, not just the one picked by hand,
+// so a sun-mode user opening a laptop after dark gets the dark skin at
+// first paint.
+stampSkin(useUi.getState().skin);
 
 // Stamped before first paint, like the theme above, so a wide-mode user
 // never sees the narrow column flash in before React hydrates.
@@ -26,6 +30,9 @@ document.documentElement.setAttribute("data-doc-width", initialDocWidth);
 // And the sidebar width, so a user who dragged the sidebar wider never sees
 // it open at the default 260px first. AppShell keeps it current from here.
 stampSidebarWidth(readInitialSidebarWidth());
+
+// Runs for the whole app lifetime, including the login, setup and share pages.
+watchSkinEnvironment();
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

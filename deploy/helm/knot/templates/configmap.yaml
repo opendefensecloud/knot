@@ -16,6 +16,7 @@ data:
   KNOT_LOG_FORMAT: {{ .Values.logFormat | quote }}
   KNOT_BASE_URL: {{ .Values.baseUrl | quote }}
   KNOT_DB_MAX_CONNECTIONS: {{ .Values.database.maxConnections | quote }}
+  KNOT_ARCHIVE_RETENTION_DAYS: {{ .Values.archive.retentionDays | quote }}
   {{- if .Values.oidc.enabled }}
   KNOT_OIDC_ENABLED: "true"
   KNOT_OIDC_ISSUER: {{ .Values.oidc.issuer | quote }}

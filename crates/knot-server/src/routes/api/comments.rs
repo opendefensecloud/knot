@@ -11,7 +11,7 @@
 //! DELETE /api/docs/{doc_id}/comments/{comment_id}/reactions/{emoji}  → 204
 //!
 //! PATCH  /api/docs/{doc_id}/comments/{comment_id} { body } → 200 (author only)
-//! DELETE /api/docs/{doc_id}/comments/{comment_id}          → 204 (author or workspace owner)
+//! DELETE /api/docs/{doc_id}/comments/{comment_id}          → 204 (author or doc owner)
 
 use axum::{
     Json, Router,
@@ -31,7 +31,7 @@ static MENTION_RE: std::sync::LazyLock<Regex> =
     std::sync::LazyLock::new(|| Regex::new(r"(?:^|\s)@(\w+)").expect("valid mention regex"));
 
 use crate::AppState;
-use crate::auth::{AuthContext, EffectiveDocRole};
+use crate::auth::{AuthContext, EffectiveDocRole, require_viewer};
 use crate::http_error::json_err;
 
 // ---------------------------------------------------------------------------
@@ -113,20 +113,6 @@ fn require_editor(req: &Request<Body>) -> Option<Response> {
         }
         Some(_) => None,
     }
-}
-
-fn require_viewer(req: &Request<Body>) -> Option<Response> {
-    if req.extensions().get::<AuthContext>().is_none() {
-        return Some(json_err(
-            StatusCode::UNAUTHORIZED,
-            "auth.session_required",
-            "",
-        ));
-    }
-    if req.extensions().get::<EffectiveDocRole>().is_none() {
-        return Some(json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""));
-    }
-    None
 }
 
 fn internal() -> Response {
@@ -257,6 +243,25 @@ async fn emit_comment_notifications(
             });
         }
     }
+
+    // Recipients who can't read the doc (a restricted one) are left out, so
+    // the notification doesn't reveal it to them. A lookup error drops the
+    // recipient too: a missed notification is cheaper than a leaked title.
+    let Some(acl) = state.acl.clone() else {
+        return;
+    };
+    let readable = futures::future::join_all(batch.iter().map(|n| {
+        let acl = acl.clone();
+        async move {
+            matches!(
+                acl.effective_role(n.workspace_id, doc_id, n.user_id).await,
+                Ok(Some(_))
+            )
+        }
+    }))
+    .await;
+    let mut readable = readable.into_iter();
+    batch.retain(|_| readable.next().unwrap_or(false));
 
     if batch.is_empty() {
         return;
@@ -735,7 +740,7 @@ async fn edit_comment(
     }
 }
 
-/// DELETE /api/docs/{doc_id}/comments/{comment_id} — author or workspace owner
+/// DELETE /api/docs/{doc_id}/comments/{comment_id} — author or doc owner
 async fn delete_comment(
     State(state): State<AppState>,
     Path((doc_id, comment_id)): Path<(Uuid, Uuid)>,
@@ -767,14 +772,19 @@ async fn delete_comment(
     if existing.doc_id != doc_id {
         return json_err(StatusCode::NOT_FOUND, "comment.not_found", "");
     }
-    // Allow if author OR workspace owner.
+    // Allow if author OR owner of the doc. The effective doc role, not the
+    // workspace role: inside a restricted doc a workspace owner may hold a
+    // lesser grant, and moderates only if that grant is Owner.
     let is_author = existing.author_id == ctx.user_id;
-    let is_workspace_owner = ctx.role == WorkspaceRole::Owner;
-    if !is_author && !is_workspace_owner {
+    let is_doc_owner = matches!(
+        req.extensions().get::<EffectiveDocRole>(),
+        Some(EffectiveDocRole(WorkspaceRole::Owner))
+    );
+    if !is_author && !is_doc_owner {
         return json_err(
             StatusCode::FORBIDDEN,
             "comment.not_author",
-            "only author or workspace owner can delete",
+            "only author or doc owner can delete",
         );
     }
 

@@ -2,6 +2,7 @@ import { Menu } from "lucide-react";
 import { useEffect, useLayoutEffect, type CSSProperties } from "react";
 import { Outlet } from "react-router-dom";
 
+import { WhatsNewCard } from "../features/about/WhatsNewCard";
 import { DocTree } from "../features/docs/DocTree";
 import { useViewport } from "../hooks/useViewport";
 import { parseSidebarWidth, stampSidebarWidth, useUi } from "../stores/ui";
@@ -110,6 +111,7 @@ export function AppShell() {
       <main className={`overflow-y-auto bg-bg ${mobile ? "h-dvh" : ""}`}>
         <Outlet />
       </main>
+      <WhatsNewCard />
       <Toast />
       <CommandPalette />
     </div>

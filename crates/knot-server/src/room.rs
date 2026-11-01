@@ -5,22 +5,33 @@
 //! `can_write` is the effective-role gate decided at upgrade: Viewers may
 //! connect and hydrate (read), but their inbound CRDT updates are dropped so
 //! a read-only grant cannot mutate the document over the socket.
+//!
+//! `user_id` is the authenticated user behind the socket. Every update the
+//! connection forwards carries it, so the room persists live edits under
+//! their author and credits that user as a contributor.
+//!
+//! `acl_epoch_at_check` is the doc's ACL epoch (`Rooms::acl_epoch`), read at
+//! upgrade before the access check. Once joined, a different epoch means a
+//! revoke landed between that check and the join and may have missed this
+//! connection, which is then closed with 4403 before it is sent anything.
 
-use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures::{SinkExt, StreamExt};
+use axum::extract::ws::{Message, WebSocket};
+use futures::StreamExt;
 use knot_crdt::{ConnHandle, ConnId, Event, InMsg};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::protocol::{YSyncMessage, decode, encode_sync_step2};
+use crate::protocol::{YSyncMessage, decode, encode_sync_step1, encode_sync_step2};
 
 pub async fn serve(
     rooms: Arc<knot_crdt::Rooms>,
     doc_id: Uuid,
+    user_id: Uuid,
     socket: WebSocket,
     can_write: bool,
+    acl_epoch_at_check: u64,
     shutdown: CancellationToken,
 ) {
     let join_started = std::time::Instant::now();
@@ -32,7 +43,20 @@ pub async fn serve(
         }
     };
     let conn_id: ConnId = Uuid::new_v4();
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(256);
+    // Cancelled by the room when an ACL change revokes this connection, and
+    // with the room's own when a purge revokes them all; the writer then
+    // closes the socket with 4403.
+    let revoked = handle.revoked.child_token();
+    // Cancelled by the room when it refuses an update this connection sent
+    // (it nests the page too deep, or it doesn't decode); the writer then
+    // closes with 4422.
+    let refused = CancellationToken::new();
+    let conn_handle = || ConnHandle {
+        tx: out_tx.clone(),
+        revoked: revoked.clone(),
+        refused: refused.clone(),
+    };
 
     // Join — receive hydrated state as bytes; wrap in sync_step_2 frame.
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -40,7 +64,7 @@ pub async fn serve(
         .tx
         .send(Event::Join {
             conn_id,
-            handle: ConnHandle { tx: out_tx.clone() },
+            handle: conn_handle(),
             reply: reply_tx,
         })
         .await
@@ -48,58 +72,71 @@ pub async fn serve(
     {
         return;
     }
-    let initial = match reply_rx.await {
-        Ok(Ok(b)) => encode_sync_step2(&b),
+    let joined = match reply_rx.await {
+        Ok(Ok(j)) => j,
         _ => return,
     };
-    let _ = out_tx.send(initial).await;
+    // The join race: a revoke between the upgrade's access check and this
+    // join found no connection to revoke. It bumped the epoch before it
+    // revoked anything, so the change shows here: revoke this connection as
+    // the revoke would have. It is sent nothing; the writer closes it with
+    // 4403 and the read loop below stops at once.
+    if rooms.acl_epoch(doc_id) != acl_epoch_at_check {
+        revoked.cancel();
+    }
+    if !revoked.is_cancelled() {
+        let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
+    }
+    // Ask the client for what WE lack (standard y-protocol: both sides send
+    // SyncStep1). The web provider applies edits made while its socket was
+    // down to its local doc without queueing them, and its own SyncStep1 only
+    // fetches what the client lacks — so without this ask, offline edits never
+    // reach the server, and every later edit that builds on them is parked as
+    // pending by yrs and stays invisible to everyone else. The provider
+    // already answers a server SyncStep1 with
+    // `encodeStateAsUpdate(doc, serverSV)`, so already-deployed bundles are
+    // fixed by this alone. Not sent to viewers: they cannot have edits to
+    // upload, and their reply (at least the whole delete set) would only be
+    // dropped below.
+    if can_write && !revoked.is_cancelled() {
+        let _ = out_tx.send(encode_sync_step1(&joined.state_vector)).await;
+    }
     // Server-side share of "open a doc, wait for content": includes the
     // hydrate of a cold room (see knot_room_hydrate_seconds) and the wait for
     // the room actor's reply.
     metrics::histogram!("knot_collab_initial_sync_seconds")
         .record(join_started.elapsed().as_secs_f64());
 
-    let (mut sink, mut stream) = socket.split();
-    let writer_shutdown = shutdown.clone();
-    let writer = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                // Server is draining (SIGTERM): tell the client we're going
-                // away so it reconnects elsewhere, rather than being severed.
-                _ = writer_shutdown.cancelled() => {
-                    let _ = sink
-                        .send(Message::Close(Some(CloseFrame {
-                            code: 1001,
-                            reason: "server.shutdown".into(),
-                        })))
-                        .await;
-                    return;
-                }
-                maybe = out_rx.recv() => match maybe {
-                    Some(bytes) => {
-                        if sink.send(Message::Binary(bytes.into())).await.is_err() {
-                            return;
-                        }
-                    }
-                    // Channel closed — likely an ACL revoke. Send 4403.
-                    None => {
-                        let _ = sink
-                            .send(Message::Close(Some(CloseFrame {
-                                code: 4403,
-                                reason: "acl.revoked".into(),
-                            })))
-                            .await;
-                        return;
-                    }
-                },
-            }
-        }
-    });
+    let (sink, mut stream) = socket.split();
+    // Cancelled by whichever half ends the session first, so the other one
+    // stops too: the writer on a revoke, a refusal, the room's end, a server
+    // shutdown or a dead socket; this read loop when the client goes away.
+    let done = CancellationToken::new();
+    // The room's own token, cancelled when the room ends: it evicts itself
+    // after refusing an update it had applied, which nested the page too
+    // deep (this connection's or another one's), it is evicted, or its
+    // actor stops. The writer then closes with 1012 so the client reconnects
+    // to a fresh room and re-sends its edits; this session's room would no
+    // longer apply, persist or share them. A refused sender gets 4422, and
+    // a revoked connection 4403 (both checked first).
+    let writer = tokio::spawn(crate::ws_writer::run(
+        sink,
+        out_rx,
+        shutdown.clone(),
+        revoked.clone(),
+        refused.clone(),
+        handle.shutdown.clone(),
+        done.clone(),
+    ));
 
     loop {
         let msg = tokio::select! {
+            biased;
             _ = shutdown.cancelled() => break,
+            _ = done.cancelled() => break,
+            // Forward nothing more from a revoked connection: the room may
+            // still hold it (one revoked for the join race) until it leaves.
+            _ = revoked.cancelled() => break,
             m = stream.next() => match m {
                 Some(Ok(m)) => m,
                 _ => break,
@@ -115,12 +152,12 @@ pub async fn serve(
                             .tx
                             .send(Event::Join {
                                 conn_id,
-                                handle: ConnHandle { tx: out_tx.clone() },
+                                handle: conn_handle(),
                                 reply: rtx,
                             })
                             .await;
-                        if let Ok(Ok(state)) = rrx.await {
-                            let _ = out_tx.send(encode_sync_step2(&state)).await;
+                        if let Ok(Ok(joined)) = rrx.await {
+                            let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
                         }
                     }
                     Ok(YSyncMessage::SyncStep2(inner)) | Ok(YSyncMessage::Update(inner)) => {
@@ -131,6 +168,7 @@ pub async fn serve(
                                 .tx
                                 .send(Event::Inbound(InMsg {
                                     from: conn_id,
+                                    by_user: Some(user_id),
                                     bytes: inner,
                                 }))
                                 .await;
@@ -152,6 +190,9 @@ pub async fn serve(
             _ => {}
         }
     }
+    // Stop the writer before waiting for it: this function still holds a
+    // sender, so the channel alone would never end it.
+    done.cancel();
     let _ = handle.tx.send(Event::Leave(conn_id)).await;
     let _ = writer.await;
 }

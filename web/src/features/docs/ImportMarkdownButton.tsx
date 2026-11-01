@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { FileUp } from "lucide-react";
 import { useRef, useState } from "react";
 
@@ -43,6 +44,7 @@ export function ImportMarkdownButton({
   docTitle: string;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const qc = useQueryClient();
   const notify = useUi((s) => s.notify);
   const [busy, setBusy] = useState(false);
 
@@ -72,8 +74,10 @@ export function ImportMarkdownButton({
       notify("error", messageFor(r.error.code));
       return;
     }
-    // No refetch needed: the room actor fans the replace out over the same
-    // WebSocket the editor is already on, exactly as a history restore does.
+    // The content needs no refetch: the room actor fans the replace out over
+    // the same WebSocket the editor is already on, exactly as a history
+    // restore does. The byline does: the import is credited to the importer.
+    void qc.invalidateQueries({ queryKey: ["contributors", docId] });
     notify("info", `Imported "${file.name}"`);
   }
 

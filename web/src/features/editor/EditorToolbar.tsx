@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
 
 import type { Editor } from "@tiptap/react";
 import { useQuery } from "@tanstack/react-query";
@@ -18,6 +18,7 @@ import {
   List,
   ListChecks,
   ListOrdered,
+  Lock,
   Paperclip,
   Rows3,
   Table as TableIcon,
@@ -30,6 +31,7 @@ import {
 
 import { boardsApi } from "../../lib/boards.api";
 import { useUi } from "../../stores/ui";
+import { applyLinkUrl, toolbarLinkState } from "./toolbarLink";
 
 type ToolbarBtnProps = {
   testId: string;
@@ -65,10 +67,18 @@ export function EditorToolbar({
   editor,
   docId,
   onUploadFiles,
+  trailing,
+  trailingVisible = true,
 }: {
   editor: Editor | null;
   docId: string;
   onUploadFiles?: (files: File[]) => void;
+  /** Document controls (Edit, Comments) shown at the row's end once the
+   *  header's action row has scrolled away. */
+  trailing?: ReactNode;
+  /** The slot is always laid out while `trailing` is set; this only toggles
+   *  visibility, so crossing the scroll threshold never re-wraps the row. */
+  trailingVisible?: boolean;
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [linkOpen, setLinkOpen] = useState(false);
@@ -81,13 +91,28 @@ export function EditorToolbar({
     staleTime: 30_000,
     enabled: linkOpen && linkMode === "doc",
   });
+  const docList = useMemo(() => (docs.data && "ok" in docs.data ? docs.data.ok : []), [docs.data]);
   const docMatches = useMemo(() => {
-    const data = docs.data && "ok" in docs.data ? docs.data.ok : [];
     const q = docQuery.trim().toLowerCase();
-    const filtered = q ? data.filter((d) => d.title.toLowerCase().includes(q)) : data;
+    const filtered = q ? docList.filter((d) => d.title.toLowerCase().includes(q)) : docList;
     return filtered.slice(0, 8);
-  }, [docs.data, docQuery]);
+  }, [docList, docQuery]);
+  // A link's text is stored in this page: a restricted target's title would
+  // reach everyone who can read this page. That holds inside a restricted
+  // page too: who may read differs from one branch of it to the next, and
+  // from one restricted page to another. So a restricted target is always
+  // linked as "Restricted page".
   const notify = useUi((s) => s.notify);
+
+  // Every `active` below reads editor.isActive(...) during render, but
+  // Tiptap 3's useEditor doesn't re-render on transactions. Without this the
+  // pressed states only caught up when something unrelated re-rendered.
+  const [, rerender] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => {
+    if (!editor) return;
+    editor.on("transaction", rerender);
+    return () => { editor.off("transaction", rerender); };
+  }, [editor]);
 
   if (!editor) return null;
   const c = () => editor.chain().focus();
@@ -98,11 +123,15 @@ export function EditorToolbar({
     // `relative` moved to the inner row (it anchors the link popover) — on the
     // outer element it only ever lost to `sticky` by Tailwind's emit order,
     // which is not a contract worth depending on.
+    // `data-sticky-band` lets the reading-position and add-comment code find
+    // whichever band covers the top. On a phone, `pl-7` keeps Bold clear of
+    // AppShell's fixed menu button.
     <div
       data-testid="editor-toolbar"
+      data-sticky-band
       className="sticky top-0 z-10 py-2 mb-4 bg-bg/80 backdrop-blur border-b border-border"
     >
-      <div className="measure relative flex items-center gap-0.5 flex-wrap">
+      <div className="measure relative flex items-center gap-0.5 flex-wrap max-sm:pl-7">
         <Btn testId="toolbar-bold" label="Bold" active={editor.isActive("bold")}
           onClick={() => c().toggleBold().run()}>
           <Bold size={15} aria-hidden />
@@ -286,9 +315,9 @@ export function EditorToolbar({
         <Btn
           testId="toolbar-link"
           label="Link"
-          active={editor.isActive("link")}
+          active={toolbarLinkState(editor).active}
           onClick={() => {
-            const current = editor.getAttributes("link").href as string | undefined;
+            const current = toolbarLinkState(editor).href;
             setLinkUrl(current ?? "");
             setLinkMode(current?.startsWith("knot://doc/") ? "doc" : "url");
             setDocQuery("");
@@ -338,7 +367,7 @@ export function EditorToolbar({
                   type="button"
                   className="h-8 px-2.5 rounded bg-accent text-accent-fg text-[13px] font-medium hover:opacity-90 transition-opacity"
                   onClick={() => {
-                    if (linkUrl) c().extendMarkRange("link").setLink({ href: linkUrl }).run();
+                    if (linkUrl) applyLinkUrl(editor, linkUrl);
                     else c().unsetLink().run();
                     setLinkOpen(false);
                   }}
@@ -378,17 +407,19 @@ export function EditorToolbar({
                       <li key={d.id}>
                         <button
                           type="button"
-                          className="block w-full text-left px-2 py-1.5 rounded text-sm text-fg hover:bg-muted focus:bg-muted focus:outline-none"
+                          className="flex w-full items-center gap-1.5 text-left px-2 py-1.5 rounded text-sm text-fg hover:bg-muted focus:bg-muted focus:outline-none"
                           onClick={() => {
                             const href = `knot://doc/${d.id}`;
                             // If no text is selected, insert the doc title as the
-                            // link's text. Otherwise wrap the current selection.
+                            // link's text (or "Restricted page", see above).
+                            // Otherwise wrap the current selection.
                             const { from, to } = editor.state.selection;
                             if (from === to) {
+                              const text = d.within_restricted ? "Restricted page" : d.title || "Untitled";
                               c()
                                 .insertContent({
                                   type: "text",
-                                  text: d.title || "Untitled",
+                                  text,
                                   marks: [{ type: "link", attrs: { href } }],
                                 })
                                 .run();
@@ -398,7 +429,17 @@ export function EditorToolbar({
                             setLinkOpen(false);
                           }}
                         >
-                          {d.title || <span className="text-fg-muted">Untitled</span>}
+                          <span className="min-w-0 truncate">
+                            {d.title || <span className="text-fg-muted">Untitled</span>}
+                          </span>
+                          {d.within_restricted && (
+                            <Lock
+                              size={12}
+                              role="img"
+                              aria-label="Restricted"
+                              className="shrink-0 text-fg-muted"
+                            />
+                          )}
                         </button>
                       </li>
                     ))
@@ -408,6 +449,16 @@ export function EditorToolbar({
             )}
           </div>
           </LinkPopoverWrap>
+        )}
+        {trailing && (
+          <div
+            data-testid="toolbar-doc-controls"
+            className={`ml-auto flex items-center pl-1 border-l border-border transition-opacity duration-150 ease-swift motion-reduce:transition-none ${
+              trailingVisible ? "" : "invisible opacity-0"
+            }`}
+          >
+            {trailing}
+          </div>
         )}
       </div>
     </div>

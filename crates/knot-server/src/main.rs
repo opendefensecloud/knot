@@ -29,6 +29,9 @@ enum Cmd {
     Admin(admin::AdminArgs),
     /// Run pending Postgres migrations and exit.
     Migrate,
+    /// Export every page offline to DOCX and ODT and report failures and
+    /// fallbacks. Does not migrate; meant for a staging copy.
+    ExportCheck,
 }
 
 #[tokio::main]
@@ -55,6 +58,12 @@ async fn main() {
                 process::exit(1);
             }
         },
+        Cmd::ExportCheck => {
+            if let Err(e) = knot_server::export_check::run(cfg).await {
+                eprintln!("export-check: {e}");
+                process::exit(1);
+            }
+        }
         Cmd::Migrate => {
             if cfg.database_url.is_empty() {
                 eprintln!("migrate: KNOT_DATABASE_URL must be set");
@@ -252,22 +261,21 @@ async fn run_server(cfg: Config) {
         }
     };
     if let Some(rx) = reindex_rx {
-        knot_server::reindex::spawn(state.clone(), rx);
+        knot_server::reindex::spawn_with_sweep(state.clone(), rx);
         tracing::info!("reindex worker spawned");
+    }
+    if state.pool.is_some() {
+        knot_server::archive::spawn_purge_job(state.clone());
+        tracing::info!(
+            retention_days = cfg.archive_retention_days,
+            "archive purge job spawned"
+        );
     }
     if let (Some(pool), Some(acl), Some(docs)) =
         (state.pool.clone(), state.acl.clone(), state.docs.clone())
     {
-        let rooms_for_revoke = state.rooms_v2.clone();
-        let on_invalidate: std::sync::Arc<dyn Fn(uuid::Uuid) + Send + Sync> =
-            std::sync::Arc::new(move |doc_id| {
-                if let Some(r) = rooms_for_revoke.clone() {
-                    tokio::spawn(async move {
-                        r.revoke_all_for_doc(doc_id).await;
-                    });
-                }
-            });
-        let _handle = knot_docs::spawn_listener(pool, acl, docs, on_invalidate);
+        let socket_hooks = knot_server::revoke_doc_sockets(&state);
+        let _handle = knot_docs::spawn_listener(pool, acl, docs, socket_hooks);
         tracing::info!("acl listener spawned");
     }
     if let (Some(pool), Some(rooms)) = (state.pool.clone(), state.rooms_v2.clone()) {

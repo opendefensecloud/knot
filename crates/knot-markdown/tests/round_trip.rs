@@ -285,6 +285,37 @@ fn round_trip_all_fixtures() {
     }
 }
 
+/// Every fixture in the directory round-trips byte for byte, so a new
+/// fixture is covered without being listed.
+#[test]
+fn round_trip_fixture_directory() {
+    let mut names: Vec<String> = fs::read_dir(fixtures_dir())
+        .expect("read fixtures dir")
+        .map(|entry| entry.expect("fixture entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .map(|path| {
+            path.file_name()
+                .expect("fixture name")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    assert!(
+        !names.is_empty(),
+        "no fixtures in {}",
+        fixtures_dir().display()
+    );
+    for name in &names {
+        let raw = fixture(name);
+        let (doc, _initial) = knot_markdown::from_markdown::parse(&raw)
+            .unwrap_or_else(|e| panic!("parse {name}: {e:?}"));
+        let got = knot_markdown::to_markdown::serialise(&YrsEngine, &doc)
+            .unwrap_or_else(|e| panic!("serialise {name}: {e:?}"));
+        assert_eq!(got, raw, "round-trip mismatch for {name}");
+    }
+}
+
 #[test]
 fn boards_sentinel_parses_to_excalidraw_board() {
     use yrs::XmlOut;

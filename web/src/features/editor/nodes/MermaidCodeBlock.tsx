@@ -8,6 +8,7 @@ import {
 import { Eye, Pencil } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 
+import { getMermaid } from "../../../lib/mermaid";
 import { sanitizeSvg } from "../../../lib/sanitize";
 
 /**
@@ -62,26 +63,6 @@ export const MermaidCodeBlock = CodeBlock.extend({
     };
   },
 });
-
-type MermaidApi = {
-  initialize: (opts: Record<string, unknown>) => void;
-  render: (id: string, src: string) => Promise<{ svg: string }>;
-};
-
-let cached: MermaidApi | null = null;
-async function getMermaid(): Promise<MermaidApi> {
-  if (cached) return cached;
-  const mod = await import("mermaid");
-  const m = (mod.default ?? mod) as MermaidApi;
-  m.initialize({
-    startOnLoad: false,
-    securityLevel: "strict",
-    theme: "default",
-    fontFamily: "'Inter Variable', Inter, system-ui, sans-serif",
-  });
-  cached = m;
-  return m;
-}
 
 function MermaidNodeView(props: ReactNodeViewProps) {
   const { node } = props;

@@ -1,10 +1,18 @@
-//! doc_markdown_cache: lazy-fill on export, invalidated by seq drift.
+//! doc_markdown_cache: lazy-fill on export, invalidated by seq drift. Each
+//! row also records the version of the renderer that wrote it, so a newer
+//! renderer can find and refresh the rows an older one wrote.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
+
+/// The renderer version of a row that [`MarkdownCacheStore::put`], an old
+/// release or [`MarkdownCacheStore::mark_stale`] wrote: what the row's
+/// trigger gives a write that doesn't name a version. Every renderer since
+/// is newer, so the refresh sweep renders such a row again.
+pub const STALE_RENDERER_VERSION: i32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownCacheEntry {
@@ -35,6 +43,10 @@ pub trait MarkdownCacheStore: Send + Sync + 'static {
     /// better than nothing.
     async fn get(&self, doc_id: Uuid) -> Result<Option<MarkdownCacheEntry>, MarkdownCacheError>;
 
+    /// Write a render unconditionally. The row is marked as written by
+    /// renderer version 1 ([`STALE_RENDERER_VERSION`]), so the refresh sweep
+    /// renders it again: this is what releases before `renderer_version`
+    /// wrote.
     async fn put(
         &self,
         doc_id: Uuid,
@@ -42,8 +54,66 @@ pub trait MarkdownCacheStore: Send + Sync + 'static {
         markdown: &str,
     ) -> Result<(), MarkdownCacheError>;
 
+    /// Write a render by `renderer_version`, unless the row already holds a
+    /// render of a later seq. Returns whether a row was written; when it
+    /// wasn't, this render is older than the cached one, and the caller
+    /// skips the task reindex too.
+    ///
+    /// Either way the render returned, so the refresh sweep's unfinished
+    /// attempts at the page by this renderer, or an older one, are cleared
+    /// ([`start_sweep_attempt`](Self::start_sweep_attempt)): a page whose
+    /// sweep renders were cut short by no fault of its own (deploys, a
+    /// shutdown) is swept again once any render of it, an edit's too,
+    /// finishes.
+    async fn put_rendered(
+        &self,
+        doc_id: Uuid,
+        rendered_at_seq: i64,
+        markdown: &str,
+        renderer_version: i32,
+    ) -> Result<bool, MarkdownCacheError>;
+
+    /// Live pages whose cached Markdown is missing or was written by a
+    /// renderer older than `current`, in id order after `after`, at most
+    /// `limit` of them.
+    async fn stale_ids(
+        &self,
+        current: i32,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<Uuid>, MarkdownCacheError>;
+
+    /// Mark the page's cached render as an old renderer's
+    /// ([`STALE_RENDERER_VERSION`]), so the refresh sweep renders it and
+    /// reindexes its tasks again: for a refresh whose task write failed
+    /// after [`put_rendered`](Self::put_rendered) marked the row current.
+    /// The render, its seq and `updated_at` stay. A page without a row is
+    /// stale already and is left as it is.
+    async fn mark_stale(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError>;
+
     /// Invalidate (delete) the cached row for a doc.
     async fn invalidate(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError>;
+
+    /// Records that the refresh sweep starts rendering `doc_id` with
+    /// `renderer_version`, and returns whether it should: not when that
+    /// renderer started the page `max_attempts` times already without
+    /// finishing ([`finish_sweep_attempt`](Self::finish_sweep_attempt), or
+    /// any render of the page that [`put_rendered`](Self::put_rendered)
+    /// writes). A render that never finishes panicked, or the process died
+    /// during it, as on a page that overflows the stack: skipping the page
+    /// after a restart keeps it from killing every replica in turn, on every
+    /// boot.
+    async fn start_sweep_attempt(
+        &self,
+        doc_id: Uuid,
+        renderer_version: i32,
+        max_attempts: i32,
+    ) -> Result<bool, MarkdownCacheError>;
+
+    /// Records that the refresh sweep's render of `doc_id` returned, whether
+    /// it succeeded or failed: a page still stale is tried again on the
+    /// sweep's next pass.
+    async fn finish_sweep_attempt(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError>;
 }
 
 #[derive(Clone)]
@@ -120,8 +190,129 @@ impl MarkdownCacheStore for PgMarkdownCache {
         Ok(())
     }
 
+    async fn put_rendered(
+        &self,
+        doc_id: Uuid,
+        rendered_at_seq: i64,
+        markdown: &str,
+        renderer_version: i32,
+    ) -> Result<bool, MarkdownCacheError> {
+        let mut tx = crate::begin(&self.pool).await?;
+        // The row's trigger stamps this version on the insert and on the
+        // update alike; it lasts only until the transaction ends.
+        sqlx::query("SELECT set_config('knot.renderer_version', $1::text, true)")
+            .bind(renderer_version)
+            .execute(&mut *tx)
+            .await?;
+        let written = sqlx::query(
+            "INSERT INTO doc_markdown_cache (doc_id, rendered_at_seq, markdown_text)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (doc_id) DO UPDATE
+             SET rendered_at_seq = EXCLUDED.rendered_at_seq,
+                 markdown_text = EXCLUDED.markdown_text,
+                 updated_at = now()
+             WHERE doc_markdown_cache.rendered_at_seq <= EXCLUDED.rendered_at_seq",
+        )
+        .bind(doc_id)
+        .bind(rendered_at_seq)
+        .bind(markdown)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        sqlx::query(
+            "DELETE FROM doc_markdown_sweep_attempts
+             WHERE doc_id = $1 AND renderer_version <= $2",
+        )
+        .bind(doc_id)
+        .bind(renderer_version)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(written)
+    }
+
+    async fn stale_ids(
+        &self,
+        current: i32,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<Uuid>, MarkdownCacheError> {
+        // Walks documents_pkey and probes the cache by its primary key, so
+        // it needs no index of its own.
+        //
+        // Not a prepared statement: Postgres may switch a prepared one to a
+        // generic plan after five runs, and in that plan `$2 IS NULL OR
+        // d.id > $2` is no index condition, so every tick scans the pkey
+        // from the lowest id (15.8 ms against 4.8 ms per tick at 50k
+        // pages). An unnamed statement is planned with the cursor's value
+        // each time, so the scan starts at the cursor.
+        let ids = sqlx::query_scalar(
+            "SELECT d.id
+             FROM documents d
+             LEFT JOIN doc_markdown_cache c ON c.doc_id = d.id
+             WHERE d.archived_at IS NULL
+               AND (c.doc_id IS NULL OR c.renderer_version < $1)
+               AND ($2::uuid IS NULL OR d.id > $2)
+             ORDER BY d.id
+             LIMIT $3",
+        )
+        .persistent(false)
+        .bind(current)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids)
+    }
+
+    async fn mark_stale(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError> {
+        // The trigger gives the update this version anyway: nothing sets
+        // one in its transaction.
+        sqlx::query("UPDATE doc_markdown_cache SET renderer_version = $2 WHERE doc_id = $1")
+            .bind(doc_id)
+            .bind(STALE_RENDERER_VERSION)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn invalidate(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError> {
         sqlx::query("DELETE FROM doc_markdown_cache WHERE doc_id = $1")
+            .bind(doc_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn start_sweep_attempt(
+        &self,
+        doc_id: Uuid,
+        renderer_version: i32,
+        max_attempts: i32,
+    ) -> Result<bool, MarkdownCacheError> {
+        // One more attempt, unless this renderer is out of them: then no row
+        // comes back. An older renderer's attempts don't count.
+        let started = sqlx::query_scalar::<_, i32>(
+            "INSERT INTO doc_markdown_sweep_attempts AS a (doc_id, renderer_version, attempts)
+             VALUES ($1, $2, 1)
+             ON CONFLICT (doc_id) DO UPDATE
+             SET attempts = CASE WHEN a.renderer_version = EXCLUDED.renderer_version
+                                 THEN a.attempts + 1 ELSE 1 END,
+                 renderer_version = EXCLUDED.renderer_version
+             WHERE a.renderer_version <> EXCLUDED.renderer_version OR a.attempts < $3
+             RETURNING a.attempts",
+        )
+        .bind(doc_id)
+        .bind(renderer_version)
+        .bind(max_attempts)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(started.is_some())
+    }
+
+    async fn finish_sweep_attempt(&self, doc_id: Uuid) -> Result<(), MarkdownCacheError> {
+        sqlx::query("DELETE FROM doc_markdown_sweep_attempts WHERE doc_id = $1")
             .bind(doc_id)
             .execute(&self.pool)
             .await?;

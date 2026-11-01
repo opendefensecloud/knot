@@ -26,6 +26,13 @@ pub struct DocTask {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A task as "My tasks" lists it: the row and the title of its doc.
+#[derive(Debug, Clone)]
+pub struct AssignedTask {
+    pub task: DocTask,
+    pub doc_title: String,
+}
+
 /// Input shape from the markdown extractor — id is derived from doc_id +
 /// item_index by the store.
 #[derive(Debug, Clone, Default)]
@@ -69,13 +76,27 @@ pub trait TaskStore: Send + Sync + 'static {
         actor_id: Option<Uuid>,
     ) -> Result<()>;
 
-    /// All open (uncompleted) tasks for a user across the workspace.
+    /// [`upsert_for_doc`](Self::upsert_for_doc) for a refresh that isn't an
+    /// edit: it inserts, updates and deletes only the rows whose values
+    /// change, so a row that stays the same keeps its `updated_at` and
+    /// `/tasks` (newest first) doesn't reshuffle.
+    async fn sync_for_doc_quiet(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        items: &[DocTaskInput],
+    ) -> Result<()>;
+
+    /// A user's open tasks across the workspace (all of them with
+    /// `include_completed`), with their docs' titles. Tasks in archived docs
+    /// and in the `hidden` docs (those the user can't read) are left out.
     async fn list_for_assignee(
         &self,
         workspace_id: Uuid,
         user_id: Uuid,
         include_completed: bool,
-    ) -> Result<Vec<DocTask>>;
+        hidden: &[Uuid],
+    ) -> Result<Vec<AssignedTask>>;
 
     /// All tasks in a doc, useful for the per-doc rendering surface.
     async fn list_for_doc(&self, doc_id: Uuid) -> Result<Vec<DocTask>>;
@@ -89,20 +110,17 @@ impl PgTaskStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
-}
 
-fn task_id(doc_id: Uuid, item_index: i32) -> String {
-    format!("{doc_id}:{item_index}")
-}
-
-#[async_trait]
-impl TaskStore for PgTaskStore {
-    async fn upsert_for_doc(
+    /// Replace the task set for `doc_id` with `items`. With `quiet`, a row
+    /// whose values stay the same is left as it is, and nobody is notified:
+    /// a refresh nobody made assigns nothing.
+    async fn write_for_doc(
         &self,
         workspace_id: Uuid,
         doc_id: Uuid,
         items: &[DocTaskInput],
         actor_id: Option<Uuid>,
+        quiet: bool,
     ) -> Result<()> {
         let mut tx = crate::begin(&self.pool).await?;
 
@@ -128,7 +146,8 @@ impl TaskStore for PgTaskStore {
         }
 
         // Upsert each task. `completed_at` flips to NOW() when `checked`
-        // transitions false → true, and to NULL on true → false.
+        // transitions false → true, and to NULL on true → false. `$9`
+        // (quiet) skips the update of a row whose values are the same.
         for item in items {
             let id = task_id(doc_id, item.item_index);
             sqlx::query(
@@ -144,7 +163,10 @@ impl TaskStore for PgTaskStore {
                      WHEN EXCLUDED.checked THEN NOW() \
                      ELSE NULL \
                    END, \
-                   updated_at = NOW()",
+                   updated_at = NOW() \
+                 WHERE NOT $9 \
+                    OR (doc_tasks.text, doc_tasks.assignee_user_id, doc_tasks.checked, doc_tasks.due_at) \
+                       IS DISTINCT FROM (EXCLUDED.text, EXCLUDED.assignee_user_id, EXCLUDED.checked, EXCLUDED.due_at)",
             )
             .bind(&id)
             .bind(workspace_id)
@@ -154,6 +176,7 @@ impl TaskStore for PgTaskStore {
             .bind(item.assignee_user_id)
             .bind(item.checked)
             .bind(item.due_at)
+            .bind(quiet)
             .execute(&mut *tx)
             .await?;
 
@@ -169,8 +192,9 @@ impl TaskStore for PgTaskStore {
             // backlog of *completed* work. The still-open backlog is
             // handled separately, by the seed migration that pre-populates
             // dedupe rows for currently-unchecked assigned tasks (see
-            // migrations/20260907120000_notifications_kind_check_and_task_assigned_seed.sql).
-            if let Some(assignee) = item.assignee_user_id
+            // migrations/20261101120100_notifications_kind_check_and_task_assigned_seed.sql).
+            if !quiet
+                && let Some(assignee) = item.assignee_user_id
                 && Some(assignee) != actor_id
                 && !item.checked
             {
@@ -208,36 +232,61 @@ impl TaskStore for PgTaskStore {
         tx.commit().await?;
         Ok(())
     }
+}
+
+fn task_id(doc_id: Uuid, item_index: i32) -> String {
+    format!("{doc_id}:{item_index}")
+}
+
+#[async_trait]
+impl TaskStore for PgTaskStore {
+    async fn upsert_for_doc(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        items: &[DocTaskInput],
+        actor_id: Option<Uuid>,
+    ) -> Result<()> {
+        self.write_for_doc(workspace_id, doc_id, items, actor_id, false)
+            .await
+    }
+
+    async fn sync_for_doc_quiet(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        items: &[DocTaskInput],
+    ) -> Result<()> {
+        self.write_for_doc(workspace_id, doc_id, items, None, true)
+            .await
+    }
 
     async fn list_for_assignee(
         &self,
         workspace_id: Uuid,
         user_id: Uuid,
         include_completed: bool,
-    ) -> Result<Vec<DocTask>> {
-        let rows: Vec<DocTask> = if include_completed {
-            sqlx::query_as::<_, DocTask>(
-                "SELECT id, workspace_id, doc_id, item_index, text, assignee_user_id, checked, completed_at, due_at, created_at, updated_at \
-                 FROM doc_tasks \
-                 WHERE workspace_id = $1 AND assignee_user_id = $2 \
-                 ORDER BY checked, due_at NULLS LAST, updated_at DESC",
-            )
-            .bind(workspace_id)
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, DocTask>(
-                "SELECT id, workspace_id, doc_id, item_index, text, assignee_user_id, checked, completed_at, due_at, created_at, updated_at \
-                 FROM doc_tasks \
-                 WHERE workspace_id = $1 AND assignee_user_id = $2 AND completed_at IS NULL \
-                 ORDER BY due_at NULLS LAST, updated_at DESC",
-            )
-            .bind(workspace_id)
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await?
-        };
+        hidden: &[Uuid],
+    ) -> Result<Vec<AssignedTask>> {
+        // `$3` (include_completed) keeps completed tasks and sorts checked
+        // ones last; without it the order is by due date alone.
+        let rows: Vec<AssignedTask> = sqlx::query_as::<_, AssignedTask>(
+            "SELECT t.id, t.workspace_id, t.doc_id, t.item_index, t.text, t.assignee_user_id, t.checked, \
+                    t.completed_at, t.due_at, t.created_at, t.updated_at, d.title AS doc_title \
+             FROM doc_tasks t \
+             JOIN documents d ON d.id = t.doc_id \
+             WHERE t.workspace_id = $1 AND t.assignee_user_id = $2 \
+             AND ($3 OR t.completed_at IS NULL) \
+             AND d.archived_at IS NULL \
+             AND NOT (d.id = ANY($4)) \
+             ORDER BY ($3 AND t.checked), t.due_at NULLS LAST, t.updated_at DESC",
+        )
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(include_completed)
+        .bind(hidden)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 
@@ -267,7 +316,7 @@ fn hex_prefix(digest: &[u8]) -> String {
 /// `pub` (and re-exported from the crate root) purely so
 /// `crates/knot-storage/tests/notifications.rs` can assert this agrees,
 /// byte for byte, with the SQL expression the seed migration
-/// (`migrations/20260907120000_notifications_kind_check_and_task_assigned_seed.sql`)
+/// (`migrations/20261101120100_notifications_kind_check_and_task_assigned_seed.sql`)
 /// uses to pre-populate the same keys: `encode(substring(sha256(convert_to(text,
 /// 'UTF8')) from 1 for 8), 'hex')`. If the two ever disagree the seed
 /// migration is silently useless — it inserts rows under keys the runtime
@@ -294,6 +343,16 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for DocTask {
             due_at: row.try_get("due_at")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AssignedTask {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> std::result::Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(AssignedTask {
+            task: DocTask::from_row(row)?,
+            doc_title: row.try_get("doc_title")?,
         })
     }
 }

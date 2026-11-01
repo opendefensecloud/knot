@@ -120,6 +120,25 @@ oidc:
   extraAudiences: '^\d{18}$'   # trust any 18-digit Zitadel id (project, grants, …)
 ```
 
+## Archive retention
+
+Deleting a document moves it, with its subpages, to the archive. Editors
+can open and restore archived documents; owners can also delete them
+permanently ahead of time. An hourly job on one replica (Postgres advisory
+lock) permanently deletes whatever has been in the archive for longer than
+`archive.retentionDays` (default 30, `KNOT_ARCHIVE_RETENTION_DAYS`),
+including the documents' attachments in the S3 bucket.
+
+```yaml
+archive:
+  retentionDays: 30
+```
+
+Permanent deletion covers the live database and blob storage only. Database
+backups and point-in-time recovery keep purged content for as long as you
+keep them; size their retention accordingly if you rely on deletions
+taking effect.
+
 ## S3 blob backend
 
 knot stores attachments in either Postgres `bytea` (default, 10 MB hard cap, no extra infrastructure) or an S3-compatible bucket (recommended for workspaces with more than a few hundred attachments). The backend is selected at runtime — the same image handles both — and you can switch by changing `blob.backend` and rolling the deployment.
@@ -147,6 +166,8 @@ When `blob.backend=s3`, the chart writes the non-secret S3 config (bucket, endpo
 
 EKS users with IRSA: knot uses static creds out of the box. For IRSA, expose the role's STS-derived credentials via a tool like `eks-iam-injector` that writes them to env, or use a sidecar that refreshes the secret.
 
+The credentials need `s3:DeleteObject` as well as read and write: knot deletes the files of the archived pages it purges (with "Delete permanently" or after the retention period), and the hourly job deletes the files of a Duplicate that didn't finish. When the bucket refuses a delete, the purge keeps the page and the hourly job tries again; until it gets through, "Delete permanently" fails for that page and it can't be restored.
+
 ## Upgrading
 
 ```bash
@@ -155,12 +176,33 @@ helm upgrade knot ./deploy/helm/knot -n knot -f my-values.yaml
 
 The `pre-upgrade` Job re-runs `knot-server migrate` before the new pods land, so any new migrations in the release are applied first. Failed migrations halt the upgrade — fix the cause and re-run.
 
+Before rolling out a release that changes page export, run `knot-server export-check` against a staging copy of the production database: it exports every page to DOCX and ODT offline (no migration, no writes), prints the fallback counts, and exits 1 if any page fails.
+
+Before rolling out a release that changes the Markdown writer, page order keys or the task list, run the real-data compatibility check from a source checkout against a restored backup or staging copy, taken before the upgrade or after it: `KNOT_COMPAT_DATABASE_URL=postgres://… cargo test -p knot-server --test markdown_compat -- --ignored --nocapture`. It connects read-only and runs no migrations. For every live page it compares the Markdown export and the `/tasks` listing of the release before with this one's, and reports the pages that change by bug class, with the first diff of each. It also reports the page-order groups the upgrade migration repairs, how many pages the background refresh renders again, and how many pages have a parent in another workspace, with the first few of them. Earlier releases let a create, move or import write such a link; this release refuses new ones but leaves existing ones as they are, so they are reported only and don't fail the check. It also lists, reported only, the pages nested deeper than this release follows: those whose export writes a part nested more than 128 levels of quotes, list items and table cells as one paragraph of text, and those nested so deep that deleting their deep part (in the editor, or by a Markdown replace or a history restore) can still overflow the server's stack, as in earlier releases. It fails if a page that exported correctly before, or a task that was listed correctly, would change outside the named bug classes, if a page whose export changes would lose any of its text, if a page's new export fails, if the `/tasks` listing would no longer list one task per checkbox, or if a page can't be read (its stored state doesn't decode, or the database user lacks a privilege the check needs), since that page wasn't compared; the report lists the failing pages.
+
+### Upgrading from 0.8.1
+
+The `pre-upgrade` Job applies five migrations:
+
+- `20261023120000_user_last_seen_version` records the release each user last saw, for the "knot was updated" card.
+- `20261024120000_heal_sort_keys` repairs page order keys where two pages at one level share a key, or a key is invalid or over 64 characters, keeping the order the sidebar shows, and then makes keys unique at the top level too (before, two top-level pages could share a key). It rewrites only the sibling groups that need it, changes nothing else about those pages, and rewrites no key on a database that needs no repair.
+- `20261024120100_markdown_renderer_version` records which Markdown writer made each cached render, and marks every existing one as the old writer's.
+- `20261024120200_blob_copy_pending` adds the table where Duplicate records the files it copies to S3 until its copy commits. The hourly purge job deletes copies that never committed.
+- `20261025120000_markdown_sweep_attempts` adds the table where the one-time refresh below notes each page it starts rendering. A page whose render never finishes (it panicked, or the process died during it) is tried once more and then skipped until someone edits it, so a page that crashes the server can't crash every replica on every start.
+
+After the new pods start, one replica (Postgres advisory lock) refreshes, once, the cached Markdown and the task listing of every page outside the archive, about ten pages every two seconds (at most some 18,000 an hour), without opening the pages for editing. Search, share links, zip export and My Tasks catch up as it runs. A healthy page's Markdown doesn't change, and its tasks keep their place in My Tasks. Once it finds no more pages it looks again every 10 minutes, which also picks up renders that old pods write during the rollout.
+
+During the rollout, pods still on 0.8.1 can answer `409 doc.sort_key_conflict` when someone creates or moves a page, because the new constraint also refuses the repeated top-level keys they can write. A retry can succeed once a new pod answers it. Don't run workspace imports until every pod runs the new version.
+
+With the S3 blob backend, make sure knot's credentials allow `s3:DeleteObject` (see [S3 blob backend](#s3-blob-backend)). Earlier releases ignored a refused delete when they purged an archived page, deleting the page and leaving its files in the bucket; this release keeps the page and retries.
+
 ## Operational notes
 
 - **Healthchecks** — readiness `/api/readyz`, liveness `/api/healthz`. Disable with `probes.enabled=false` if you want to debug a wedged pod.
 - **Image size** — the runtime image is `scratch` + a static musl binary (mimalloc allocator). Expect ~20 MB.
 - **Resources** — defaults `100m/128Mi` requests, `1000m/512Mi` limits. Right-size based on workspace volume.
 - **Replicas** — knot's CRDT room actor is per-pod and discovers peers via Postgres `LISTEN/NOTIFY`, so `replicaCount > 1` works without sticky sessions. Each room is hosted by exactly one pod at a time; failover takes one TCP roundtrip.
+- **Request body size** — image uploads and Word/OpenDocument exports (which upload the page's diagram pictures) send up to 10 MiB. A reverse proxy or ingress in front of knot must allow request bodies of at least 10 MiB. With ingress-nginx (default 1 MiB), set `nginx.ingress.kubernetes.io/proxy-body-size: 10m` in `ingress.annotations`.
 
 ## Uninstall
 

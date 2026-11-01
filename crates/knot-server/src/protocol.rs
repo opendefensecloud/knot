@@ -57,6 +57,13 @@ pub fn decode(buf: &[u8]) -> Result<YSyncMessage, DecodeError> {
     }
 }
 
+/// Server→client SyncStep1: "here is my state vector, send me what I lack".
+/// Sent once on join so a reconnecting client uploads edits it made while
+/// offline (see `room::serve`).
+pub fn encode_sync_step1(state_vector: &[u8]) -> Vec<u8> {
+    encode_sync(SYNC_STEP_1, state_vector)
+}
+
 pub fn encode_sync_step2(payload: &[u8]) -> Vec<u8> {
     encode_sync(SYNC_STEP_2, payload)
 }
@@ -148,6 +155,17 @@ mod tests {
         match decoded {
             YSyncMessage::SyncStep2(p) => assert_eq!(p, payload),
             other => panic!("expected SyncStep2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_sync_step1() {
+        let sv = vec![0x01, 0x02, 0x03];
+        let encoded = encode_sync_step1(&sv);
+        assert_eq!(&encoded[..3], &[MSG_SYNC, SYNC_STEP_1, 3]);
+        match decode(&encoded).expect("decode") {
+            YSyncMessage::SyncStep1(p) => assert_eq!(p, sv),
+            other => panic!("expected SyncStep1, got {other:?}"),
         }
     }
 }

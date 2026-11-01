@@ -13,16 +13,57 @@ use axum::{
     response::Response,
     routing::get,
 };
+use knot_storage::ShareToken;
 use uuid::Uuid;
 
 use crate::AppState;
 use crate::routes::api::blobs::safe_inline_content_type;
+
+/// `Cache-Control` of every successful `/p/*` response. A link stops working
+/// when it is revoked, expires, or its doc moves into a restricted subtree,
+/// so no shared cache may keep a copy, and browsers revalidate each time.
+const PUBLIC_CACHE_CONTROL: &str = "private, no-cache";
+
+/// What a dead page link says. A page link whose doc is in a restricted
+/// subtree says the same (see [`alive_share`]).
+const DEAD_LINK_MESSAGE: &str = "This link has expired or been revoked.";
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/p/{token}", get(public_doc))
         .route("/p/{token}/boards/{id}/svg", get(public_board_svg))
         .route("/p/{token}/blobs/{id}", get(public_blob))
+}
+
+/// The alive share behind `token`, or the response refusing it: the
+/// `dead_link` response when the token is unknown, revoked, expired or its
+/// doc archived, and when its doc is in a restricted subtree. Each route
+/// thus answers a restricted doc exactly like a dead link, so it doesn't
+/// reveal that the doc still exists. The restriction is checked on every
+/// request rather than only when the link is created, because a shared doc
+/// can be moved into a restricted subtree.
+async fn alive_share(
+    state: &AppState,
+    token: &str,
+    dead_link: fn() -> Response,
+) -> Result<ShareToken, Response> {
+    let Some(shares) = state.shares.clone() else {
+        return Err(gone("internal"));
+    };
+    let Some(docs) = state.docs.clone() else {
+        return Err(gone("internal"));
+    };
+    let Some(share) = shares.find_alive(token).await.ok().flatten() else {
+        return Err(dead_link());
+    };
+    match docs
+        .restriction_root(share.workspace_id, share.doc_id)
+        .await
+    {
+        Ok(None) => Ok(share),
+        Ok(Some(_)) => Err(dead_link()),
+        Err(_) => Err(gone("internal")),
+    }
 }
 
 async fn public_doc(State(state): State<AppState>, Path(token): Path<String>) -> Response {
@@ -36,8 +77,9 @@ async fn public_doc(State(state): State<AppState>, Path(token): Path<String>) ->
         return gone("internal");
     };
 
-    let Some(share) = shares.find_alive(&token).await.ok().flatten() else {
-        return gone("This link has expired or been revoked.");
+    let share = match alive_share(&state, &token, || gone(DEAD_LINK_MESSAGE)).await {
+        Ok(share) => share,
+        Err(refusal) => return refusal,
     };
     let doc = match docs.get(share.doc_id).await {
         Ok(Some(d)) => d,
@@ -50,13 +92,17 @@ async fn public_doc(State(state): State<AppState>, Path(token): Path<String>) ->
 
     // Resolve any `knot://doc/<uuid>` references in the markdown to share
     // tokens (when the target doc also has an active share). Build the map
-    // up-front because the pulldown event mapper is synchronous.
+    // up-front because the pulldown event mapper is synchronous. A target in
+    // a restricted subtree is left out, so its link renders as `#`: its
+    // share (made before it was moved in) is refused anyway, and the token
+    // must not leak. A failed check leaves it out too.
     let referenced_docs = collect_doc_link_targets(&cached.markdown_text);
     let mut doc_link_map: HashMap<Uuid, String> = HashMap::new();
     if !referenced_docs.is_empty() {
         for id in referenced_docs {
             if let Ok(tokens) = shares.list_active(id).await
                 && let Some(t) = tokens.into_iter().next()
+                && let Ok(None) = docs.restriction_root(t.workspace_id, t.doc_id).await
             {
                 doc_link_map.insert(id, t.token);
             }
@@ -67,7 +113,7 @@ async fn public_doc(State(state): State<AppState>, Path(token): Path<String>) ->
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::CACHE_CONTROL, "public, max-age=60")
+        .header(header::CACHE_CONTROL, PUBLIC_CACHE_CONTROL)
         .body(Body::from(html))
         .unwrap()
 }
@@ -216,9 +262,6 @@ async fn public_blob(
     State(state): State<AppState>,
     Path((token, blob_id)): Path<(String, Uuid)>,
 ) -> Response {
-    let Some(shares) = state.shares.clone() else {
-        return gone("internal");
-    };
     let Some(blob_meta) = state.blob_meta.clone() else {
         return gone("internal");
     };
@@ -226,8 +269,9 @@ async fn public_blob(
         return gone("internal");
     };
 
-    let Some(share) = shares.find_alive(&token).await.ok().flatten() else {
-        return not_found();
+    let share = match alive_share(&state, &token, not_found).await {
+        Ok(share) => share,
+        Err(refusal) => return refusal,
     };
     let meta = match blob_meta.find(blob_id).await {
         Ok(Some(m)) => m,
@@ -251,7 +295,7 @@ async fn public_blob(
         .header(header::CONTENT_TYPE, ct)
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::CONTENT_DISPOSITION, disposition)
-        .header(header::CACHE_CONTROL, "public, max-age=60")
+        .header(header::CACHE_CONTROL, PUBLIC_CACHE_CONTROL)
         .header(header::CONTENT_LENGTH, meta.byte_size)
         .body(Body::from(bytes))
         .unwrap()
@@ -261,15 +305,13 @@ async fn public_board_svg(
     State(state): State<AppState>,
     Path((token, board_id)): Path<(String, Uuid)>,
 ) -> Response {
-    let Some(shares) = state.shares.clone() else {
-        return gone("internal");
-    };
     let Some(boards) = state.boards.clone() else {
         return gone("internal");
     };
 
-    let Some(share) = shares.find_alive(&token).await.ok().flatten() else {
-        return not_found();
+    let share = match alive_share(&state, &token, not_found).await {
+        Ok(share) => share,
+        Err(refusal) => return refusal,
     };
     let board = match boards.get(board_id).await {
         Ok(b) => b,
@@ -287,7 +329,7 @@ async fn public_board_svg(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")
-        .header(header::CACHE_CONTROL, "public, max-age=60")
+        .header(header::CACHE_CONTROL, PUBLIC_CACHE_CONTROL)
         // Defense-in-depth: an SVG opened as a top-level document can run
         // embedded <script>. nosniff + a script-free CSP neutralize that even
         // if the stored SVG is malicious.

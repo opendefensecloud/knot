@@ -1,116 +1,136 @@
-//! LexoRank-style sort_key generation. Single-bucket base-36 (0-9a-z).
+//! Sort keys: the strings that order a page among its siblings.
 //!
-//! Properties:
-//! - `between(None, None) -> "m"` (start with a middle anchor so future
-//!   inserts on both sides remain cheap).
-//! - `between(Some(a), None)` returns something > a.
-//! - `between(None, Some(b))` returns something < b.
-//! - `between(Some(a), Some(b))` where a < b returns a key in (a, b).
-//! - Returned keys never end in '0' (so we can always append a digit).
-
-const MIN: char = '0';
-const MAX: char = 'z';
-const MID: char = 'm';
+//! A key is a base-36 fraction over `[0-9a-z]`, compared code unit by code
+//! unit (`COLLATE "C"`, the order the sidebar sorts in). A valid key matches
+//! `^[0-9a-z]*[1-9a-z]$`. It never ends in `'0'`, so another key always fits
+//! between two valid keys.
+//!
+//! - `between(None, None)` is `"m"`.
+//! - `between(Some(a), Some(b))` with `a < b` returns a valid key strictly
+//!   between them, `between(Some(a), None)` one above `a`, and
+//!   `between(None, Some(b))` one below `b`.
+//! - Invalid or unordered neighbours give an `Err`, never a panic.
+//! - `spread(n)` gives `n` evenly spaced keys, for rewriting a whole group.
+//!
+//! The generator is the fractional-index midpoint (rocicorp
+//! "fractional-indexing", without its integer head).
 
 /// Base-36 alphabet: '0'..='9' then 'a'..='z'. Index → char.
 const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
-/// Map a base-36 char to its ordinal [0, 36).
-fn ord(c: char) -> u8 {
-    match c {
-        '0'..='9' => c as u8 - b'0',
-        'a'..='z' => c as u8 - b'a' + 10,
-        _ => panic!("not a base36 char: {c}"),
+/// The first key of an empty group, leaving room on both sides.
+const MID: &str = "m";
+
+/// Why no key could be generated between two neighbours.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum KeyError {
+    /// A neighbour is not a valid key: empty, a character outside
+    /// `[0-9a-z]`, or a trailing `'0'`.
+    #[error("invalid sort key {0:?}")]
+    Invalid(String),
+    /// The lower neighbour is not below the upper one.
+    #[error("sort keys are not in order")]
+    Unordered,
+}
+
+/// Whether `k` matches `^[0-9a-z]*[1-9a-z]$`.
+pub fn is_valid(k: &str) -> bool {
+    k.bytes()
+        .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+        && k.bytes().last().is_some_and(|c| c != b'0')
+}
+
+/// A valid key strictly between `a` and `b`, where `None` is an open end.
+///
+/// `Invalid` when a neighbour is not a valid key, `Unordered` when `a >= b`.
+pub fn between(a: Option<&str>, b: Option<&str>) -> Result<String, KeyError> {
+    for k in [a, b].into_iter().flatten() {
+        if !is_valid(k) {
+            return Err(KeyError::Invalid(k.to_string()));
+        }
     }
-}
-
-/// Map an ordinal [0, 36) back to a base-36 char.
-fn chr(o: u8) -> char {
-    ALPHABET[o as usize] as char
-}
-
-/// Midpoint of two base-36 chars, in the base-36 ordinal space.
-/// Rounds down; result is always in [ord(a), ord(b)].
-fn mid(a: char, b: char) -> char {
-    let av = ord(a) as u16;
-    let bv = ord(b) as u16;
-    chr(((av + bv) / 2) as u8)
-}
-
-fn is_base36(s: &str) -> bool {
-    s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='z'))
-}
-
-pub fn between(a: Option<&str>, b: Option<&str>) -> String {
     match (a, b) {
-        (None, None) => MID.to_string(),
-        (Some(a), None) => append_or_grow(a),
-        (None, Some(b)) => decrement(b),
-        (Some(a), Some(b)) => {
-            assert!(a < b, "between: a must be < b ({a} >= {b})");
-            assert!(is_base36(a) && is_base36(b), "base36 only");
-            interpolate(a, b)
-        }
+        (Some(a), Some(b)) if a >= b => Err(KeyError::Unordered),
+        (None, None) => Ok(MID.to_string()),
+        _ => Ok(midpoint(a.unwrap_or("").as_bytes(), b.map(str::as_bytes))),
     }
 }
 
-fn append_or_grow(a: &str) -> String {
-    let mut s = a.to_string();
-    let last = s.chars().last().unwrap_or(MIN);
-    if last < MAX {
-        s.push(mid(last, MAX));
-    } else {
-        s.push(MID);
+/// The value in [0, 36) of a byte of a validated key.
+fn digit(c: u8) -> usize {
+    match c {
+        b'0'..=b'9' => (c - b'0') as usize,
+        b'a'..=b'z' => (c - b'a') as usize + 10,
+        _ => unreachable!("keys are validated before use"),
     }
-    s
 }
 
-fn decrement(b: &str) -> String {
-    let bytes = b.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() + 1);
-    for &c in bytes {
-        let ch = c as char;
-        if ch > MIN {
-            out.push(mid(MIN, ch) as u8);
-            return String::from_utf8(out).unwrap();
-        }
-        out.push(c);
+/// The midpoint of valid keys `a < b`. `a` reads as padded with `'0'`, so an
+/// empty `a` is the bottom end; a missing `b` is the top end.
+fn midpoint(mut a: &[u8], mut b: Option<&[u8]>) -> String {
+    let mut out = Vec::new();
+    if let Some(upper) = b {
+        // Keep the common prefix. It is shorter than `b`: otherwise `b` is a
+        // prefix of `a` (so `b <= a`) or `a` plus '0's (so it ends in '0').
+        let n = upper
+            .iter()
+            .zip(a.iter().chain(std::iter::repeat(&b'0')))
+            .take_while(|(x, y)| x == y)
+            .count();
+        out.extend_from_slice(&upper[..n]);
+        a = a.get(n..).unwrap_or_default();
+        b = Some(&upper[n..]);
     }
-    out.push(MID as u8);
-    String::from_utf8(out).unwrap()
-}
-
-fn interpolate(a: &str, b: &str) -> String {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < a_chars.len() && i < b_chars.len() && a_chars[i] == b_chars[i] {
-        out.push(a_chars[i]);
-        i += 1;
-    }
-    let ac = a_chars.get(i).copied().unwrap_or(MIN);
-    let bc = b_chars.get(i).copied().unwrap_or(MAX);
-    let m = mid(ac, bc);
-    if m != ac && m != bc {
-        out.push(m);
-        return out;
-    }
-    out.push(ac);
-    i += 1;
     loop {
-        let ac = a_chars.get(i).copied().unwrap_or(MIN);
-        if ac < MAX {
-            let m = mid(ac, MAX);
-            if m != ac {
-                out.push(m);
-                return out;
-            }
-            // mid floored to ac (e.g. mid('y','z')='y'); copy ac and descend.
+        // Past the prefix, a's first digit is below b's.
+        let da = a.first().map_or(0, |&c| digit(c));
+        let db = b.map_or(ALPHABET.len(), |b| digit(b[0]));
+        if db - da > 1 {
+            // A digit strictly between the two. It is above da, so not '0'.
+            out.push(ALPHABET[(da + db).div_ceil(2)]);
+            break;
         }
-        out.push(ac);
-        i += 1;
+        if let Some(b) = b.filter(|b| b.len() > 1) {
+            // b's first digit alone: below b, which goes on, and above a.
+            out.push(b[0]);
+            break;
+        }
+        // Adjacent digits: keep a's, then find room above the rest of `a`.
+        out.push(ALPHABET[da]);
+        a = a.get(1..).unwrap_or_default();
+        b = None;
     }
+    String::from_utf8(out).expect("keys are ASCII")
+}
+
+/// `n` evenly spaced valid keys in ascending order, for rewriting a group.
+///
+/// With `w` the smallest width where `36^w > 2(n+1)`, key `i` (from 1) is
+/// `floor(i * 36^w / (n+1))` written as `w` base-36 digits, left-padded with
+/// `'0'`, with its trailing `'0'`s stripped. At a fixed width, stripping
+/// keeps the keys distinct and in order. The heal migration's SQL computes
+/// the same keys.
+pub fn spread(n: usize) -> Vec<String> {
+    let slots = n as u128 + 1;
+    let mut width = 1u32;
+    while 36u128.pow(width) <= 2 * slots {
+        width += 1;
+    }
+    let space = 36u128.pow(width);
+    (1..slots)
+        .map(|i| {
+            let mut v = i * space / slots;
+            let mut key = vec![b'0'; width as usize];
+            for c in key.iter_mut().rev() {
+                *c = ALPHABET[(v % 36) as usize];
+                v /= 36;
+            }
+            while key.last() == Some(&b'0') {
+                key.pop();
+            }
+            String::from_utf8(key).expect("keys are ASCII")
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -118,19 +138,19 @@ mod tests {
     use super::*;
 
     fn check_between(a: Option<&str>, b: Option<&str>) {
-        let r = between(a, b);
+        let r = between(a, b).unwrap();
         if let Some(av) = a {
             assert!(av < r.as_str(), "expected {av} < {r}");
         }
         if let Some(bv) = b {
             assert!(r.as_str() < bv, "expected {r} < {bv}");
         }
-        assert!(is_base36(&r), "{r} not base36");
+        assert!(is_valid(&r), "{r} not valid");
     }
 
     #[test]
     fn empty_returns_middle() {
-        assert_eq!(between(None, None), "m");
+        assert_eq!(between(None, None).unwrap(), "m");
     }
 
     #[test]
@@ -153,7 +173,7 @@ mod tests {
 
     #[test]
     fn distant_chars_pick_midpoint() {
-        let r = between(Some("a"), Some("z"));
+        let r = between(Some("a"), Some("z")).unwrap();
         assert!("a" < r.as_str() && r.as_str() < "z");
     }
 
@@ -162,9 +182,50 @@ mod tests {
         let mut a = "a".to_string();
         let b = "z";
         for _ in 0..50 {
-            let next = between(Some(&a), Some(b));
+            let next = between(Some(&a), Some(b)).unwrap();
             assert!(a.as_str() < next.as_str() && next.as_str() < b);
             a = next;
         }
+    }
+
+    #[test]
+    fn invalid_inputs_are_errors_not_panics() {
+        for bad in ["", "0", "00", "m0", "M", "-"] {
+            let err = Err(KeyError::Invalid(bad.to_string()));
+            assert_eq!(between(Some(bad), None), err, "after {bad:?}");
+            assert_eq!(between(None, Some(bad)), err, "before {bad:?}");
+            assert_eq!(between(Some(bad), Some("z")), err, "{bad:?} as a");
+            assert_eq!(between(Some("1"), Some(bad)), err, "{bad:?} as b");
+        }
+        assert_eq!(between(Some("m"), Some("m")), Err(KeyError::Unordered));
+        assert_eq!(between(Some("n"), Some("m")), Err(KeyError::Unordered));
+    }
+
+    #[test]
+    fn spread_is_sorted_valid_distinct() {
+        for n in [1, 2, 10, 35, 36, 100, 5000] {
+            let keys = spread(n);
+            assert_eq!(keys.len(), n, "spread({n})");
+            assert!(keys.iter().all(|k| is_valid(k)), "spread({n}): {keys:?}");
+            assert!(
+                keys.windows(2).all(|w| w[0] < w[1]),
+                "spread({n}) is not strictly ascending"
+            );
+        }
+        // The heal migration's SQL reproduces this formula, so pin it.
+        assert_eq!(spread(1), ["i"]);
+        assert_eq!(spread(2), ["c", "o"]);
+        assert_eq!(
+            spread(10),
+            ["3", "6", "9", "d", "g", "j", "m", "q", "t", "w"]
+        );
+        let all_digits: Vec<String> = ALPHABET[1..]
+            .iter()
+            .map(|&c| (c as char).to_string())
+            .collect();
+        assert_eq!(spread(35), all_digits);
+        let s36 = spread(36);
+        assert_eq!((s36[0].as_str(), s36[35].as_str()), ("0z", "z"));
+        assert!(spread(5000).iter().all(|k| k.len() <= 3));
     }
 }

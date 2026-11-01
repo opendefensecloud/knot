@@ -20,7 +20,8 @@ export type ProviderStatus =
   | "connected"
   | "offline"
   | "unauthorised"
-  | "conflict";
+  | "conflict"
+  | "refused";
 
 export type CommentChangeMsg = { doc_id: string };
 
@@ -109,6 +110,13 @@ export class KnotProvider {
       }
       if (e.code === 4408 || e.code === 4500) {
         this.setStatus("conflict");
+        return;
+      }
+      // The server refused an update this doc sent. The doc still holds it,
+      // so a reconnect would send it again and be refused again; a reload
+      // starts over from the server's state.
+      if (e.code === 4422) {
+        this.setStatus("refused");
         return;
       }
       this.setStatus("offline");

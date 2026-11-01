@@ -50,7 +50,7 @@ completed.
 ### 1. Schema
 
 One additive migration, plus a second one landing in the same review pass
-(`migrations/20260907120000_notifications_kind_check_and_task_assigned_seed.sql`)
+(`migrations/20261101120100_notifications_kind_check_and_task_assigned_seed.sql`)
 that constrains `kind` and pre-seeds `task_assigned` dedupe rows — see the note
 at the end of §2. No backfill of *visible* notifications: mentions, replies,
 and shares that happened before this ships stay unnotified. `task_assigned` is

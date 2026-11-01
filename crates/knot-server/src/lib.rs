@@ -24,18 +24,25 @@ use uuid::Uuid;
 const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 pub mod admin;
+pub mod archive;
 pub mod auth;
 pub mod board_room_shim;
 pub mod comments_listener;
+pub mod duplicate;
+pub mod export;
+pub mod export_check;
 pub mod http_error;
 pub mod metrics;
 pub mod notifications_sweep;
 pub mod protocol;
 pub mod reindex;
+pub mod release_notes;
+pub mod restricted;
 pub mod room;
 pub mod routes;
 pub mod security_headers;
 pub mod static_files;
+mod ws_writer;
 
 use auth::SessionDeps;
 
@@ -61,6 +68,7 @@ pub struct AppState {
     pub board_rooms: Option<Arc<knot_crdt::BoardRooms>>,
     pub tasks: Option<Arc<dyn knot_storage::TaskStore>>,
     pub notifications: Option<Arc<dyn NotificationStore>>,
+    pub contributors: Option<Arc<dyn knot_storage::ContributorStore>>,
     pub hasher: Arc<Hasher>,
     pub throttle: Arc<Throttle>,
     pub session_key: Vec<u8>,
@@ -69,10 +77,23 @@ pub struct AppState {
     pub oidc_enabled: bool,
     pub oidc: Option<Arc<knot_auth::oidc::OidcClient>>,
     pub config: Arc<Config>,
+    /// The release this binary reports to what's-new: `KNOT_BUILD_VERSION`
+    /// ("dev" unless built with `KNOT_VERSION`). A field so tests can pose
+    /// as a release build.
+    pub build_version: &'static str,
     /// Cancelled on SIGTERM/SIGINT so in-flight collab sockets send a clean
     /// 1001 Close and the process can drain within the grace period instead
     /// of being SIGKILLed mid-rollout.
     pub shutdown: tokio_util::sync::CancellationToken,
+    /// Page exports (DOCX/ODT) running at once in this process.
+    pub export_permits: Arc<tokio::sync::Semaphore>,
+    /// How long an export waits for a permit before it is refused as busy.
+    pub export_busy_wait: std::time::Duration,
+    /// Duplicates running at once in this process, each until the refresh
+    /// of its copy ends.
+    pub duplicate_permits: Arc<tokio::sync::Semaphore>,
+    /// How long a duplicate waits for a permit before it is refused as busy.
+    pub duplicate_busy_wait: std::time::Duration,
 }
 
 impl AppState {
@@ -98,6 +119,7 @@ impl AppState {
             board_rooms: None,
             tasks: None,
             notifications: None,
+            contributors: None,
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
@@ -106,7 +128,14 @@ impl AppState {
             oidc_enabled: false,
             oidc: None,
             config: Arc::new(Config::default()),
+            build_version: env!("KNOT_BUILD_VERSION"),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            export_permits: Arc::new(tokio::sync::Semaphore::new(export::MAX_CONCURRENT_EXPORTS)),
+            export_busy_wait: export::BUSY_WAIT,
+            duplicate_permits: Arc::new(tokio::sync::Semaphore::new(
+                duplicate::MAX_CONCURRENT_DUPLICATES,
+            )),
+            duplicate_busy_wait: duplicate::BUSY_WAIT,
         }
     }
 
@@ -141,6 +170,8 @@ impl AppState {
             Arc::new(knot_storage::PgTaskStore::new(pool.clone()));
         let notifications: Arc<dyn NotificationStore> =
             Arc::new(PgNotificationStore::new(pool.clone()));
+        let contributors: Arc<dyn knot_storage::ContributorStore> =
+            Arc::new(knot_storage::PgContributorStore::new(pool.clone()));
         Self {
             pool: Some(pool),
             users: Some(users),
@@ -162,6 +193,7 @@ impl AppState {
             board_rooms: None,
             tasks: Some(tasks),
             notifications: Some(notifications),
+            contributors: Some(contributors),
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
@@ -170,7 +202,14 @@ impl AppState {
             oidc_enabled: false,
             oidc: None,
             config: Arc::new(Config::default()),
+            build_version: env!("KNOT_BUILD_VERSION"),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            export_permits: Arc::new(tokio::sync::Semaphore::new(export::MAX_CONCURRENT_EXPORTS)),
+            export_busy_wait: export::BUSY_WAIT,
+            duplicate_permits: Arc::new(tokio::sync::Semaphore::new(
+                duplicate::MAX_CONCURRENT_DUPLICATES,
+            )),
+            duplicate_busy_wait: duplicate::BUSY_WAIT,
         }
     }
 
@@ -227,6 +266,70 @@ pub fn router_with_state(state: AppState) -> Router {
     .with_state(state)
 }
 
+/// The ACL listener's hooks (`knot_docs::spawn_listener`).
+///
+/// `on_invalidate`: the access to `doc_id` changed, so close every socket
+/// open on it, the page's own (`Rooms::revoke_all_for_doc`) and its boards'
+/// (`BoardRooms::revoke_for_doc`), with 4403. Each client re-checks its
+/// access before it reconnects. The listener calls it for the doc and each
+/// descendant, so a restrict reaches the whole subtree.
+///
+/// `on_invalidate_all`: access may have changed anywhere, unheard (the
+/// listener lost its connection, or could not walk a subtree) or for one
+/// member in every doc (a role change, a removal). End every doc and board
+/// room here (`Rooms::restart_all`, `BoardRooms::restart_all`): each socket
+/// closes with 1012, and its client reconnects through the upgrade's access
+/// check, which only refuses those who lost their access.
+pub fn revoke_doc_sockets(state: &AppState) -> knot_docs::InvalidationHooks {
+    let rooms = state.rooms_v2.clone();
+    let board_rooms = state.board_rooms.clone();
+    let on_invalidate = {
+        let rooms = rooms.clone();
+        let board_rooms = board_rooms.clone();
+        Arc::new(move |doc_id| {
+            if let Some(rooms) = rooms.clone() {
+                tokio::spawn(async move {
+                    rooms.revoke_all_for_doc(doc_id).await;
+                });
+            }
+            if let Some(board_rooms) = board_rooms.clone() {
+                tokio::spawn(async move {
+                    board_rooms.revoke_for_doc(doc_id).await;
+                });
+            }
+        })
+    };
+    let on_invalidate_all = Arc::new(move || {
+        if let Some(rooms) = rooms.clone() {
+            tokio::spawn(async move {
+                rooms.restart_all().await;
+            });
+        }
+        if let Some(board_rooms) = board_rooms.clone() {
+            tokio::spawn(async move {
+                board_rooms.restart_all().await;
+            });
+        }
+    });
+    knot_docs::InvalidationHooks {
+        on_invalidate,
+        on_invalidate_all,
+    }
+}
+
+/// Whether a collab connection may write (`Ok(true)`), may only read
+/// (`Ok(false)`), or is refused. Viewers read; editors and owners write,
+/// except on archived docs, which open read-only for them and not at all
+/// for viewers.
+pub fn collab_write_access(
+    access: Option<knot_docs::DocAccess>,
+) -> Result<bool, axum::http::StatusCode> {
+    match access {
+        Some(access) if access.can_read() => Ok(access.can_write()),
+        _ => Err(axum::http::StatusCode::FORBIDDEN),
+    }
+}
+
 #[tracing::instrument(skip_all, name = "collab.upgrade", fields(doc_id = %doc_id))]
 async fn collab_upgrade(
     Path(doc_id): Path<Uuid>,
@@ -247,23 +350,21 @@ async fn collab_upgrade(
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
     };
-    let can_write = match acl
-        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
-        .await
-    {
-        // Viewers may connect (read/hydrate) but cannot write; Owner/Editor can.
-        Ok(Some(role)) => {
-            use knot_storage::WorkspaceRole;
-            matches!(role, WorkspaceRole::Owner | WorkspaceRole::Editor)
-        }
-        Ok(None) => return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response(),
-        Err(_) => {
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
-        }
-    };
     let rooms = match state.rooms_v2.as_ref() {
         Some(r) => r.clone(),
         None => {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+        }
+    };
+    // Before the access check: a revoke after this read and before the
+    // join, which could miss the connection, changes it (`room::serve`).
+    let acl_epoch_at_check = rooms.acl_epoch(doc_id);
+    let can_write = match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
+        Ok(access) => match collab_write_access(access) {
+            Ok(can_write) => can_write,
+            Err(status) => return (status, "acl.no_grant").into_response(),
+        },
+        Err(_) => {
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
     };
@@ -272,7 +373,16 @@ async fn collab_upgrade(
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
-        crate::room::serve(rooms, doc_id, socket, can_write, shutdown).await;
+        crate::room::serve(
+            rooms,
+            doc_id,
+            ctx.user_id,
+            socket,
+            can_write,
+            acl_epoch_at_check,
+            shutdown,
+        )
+        .await;
     })
     .into_response()
 }
@@ -297,35 +407,87 @@ async fn collab_board_upgrade(
     let Some(acl) = state.acl.as_ref().cloned() else {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
     };
+    let Some(board_rooms) = state.board_rooms.as_ref().cloned() else {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+    };
     // Resolve the parent doc and gate on its ACL (editor+ for v1).
     let board = match boards.get(board_id).await {
         Ok(b) => b,
         Err(_) => return (axum::http::StatusCode::NOT_FOUND, "board.not_found").into_response(),
     };
+    // Before the access check, as in `collab_upgrade`.
+    let acl_epoch_at_check = board_rooms.acl_epoch(board.doc_id);
+    // The board socket only exists for editing, so it needs write access:
+    // refused for viewers and for every board of an archived doc (whose
+    // read-only preview shows boards through their cached SVG).
     match acl
-        .effective_role(ctx.workspace_id, board.doc_id, ctx.user_id)
+        .access(ctx.workspace_id, board.doc_id, ctx.user_id)
         .await
     {
-        Ok(Some(role)) => {
-            use knot_storage::WorkspaceRole;
-            if !matches!(role, WorkspaceRole::Owner | WorkspaceRole::Editor) {
-                return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response();
-            }
+        Ok(Some(access)) if access.can_write() => {}
+        Ok(Some(access)) if access.archived && access.can_read() => {
+            return (axum::http::StatusCode::CONFLICT, "doc.archived").into_response();
         }
-        Ok(None) => return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response(),
+        Ok(_) => return (axum::http::StatusCode::FORBIDDEN, "acl.no_grant").into_response(),
         Err(_) => {
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
         }
     }
-    let Some(board_rooms) = state.board_rooms.as_ref().cloned() else {
-        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
-    };
+    let doc_id = board.doc_id;
     let shutdown = state.shutdown.clone();
     let ws = ws
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
-        crate::board_room_shim::serve(board_rooms, board_id, socket, shutdown).await;
+        crate::board_room_shim::serve(
+            board_rooms,
+            board_id,
+            doc_id,
+            acl_epoch_at_check,
+            socket,
+            shutdown,
+        )
+        .await;
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod collab_access_tests {
+    use super::collab_write_access;
+    use axum::http::StatusCode;
+    use knot_docs::DocAccess;
+    use knot_storage::WorkspaceRole::{Editor, Owner, Viewer};
+
+    #[test]
+    fn live_doc_writable_for_editors_read_only_for_viewers() {
+        let live = |role| {
+            Some(DocAccess {
+                role,
+                archived: false,
+                restriction_root: None,
+            })
+        };
+        assert_eq!(collab_write_access(live(Owner)), Ok(true));
+        assert_eq!(collab_write_access(live(Editor)), Ok(true));
+        assert_eq!(collab_write_access(live(Viewer)), Ok(false));
+    }
+
+    #[test]
+    fn archived_doc_read_only_for_editors_refused_for_viewers() {
+        let archived = |role| {
+            Some(DocAccess {
+                role,
+                archived: true,
+                restriction_root: None,
+            })
+        };
+        assert_eq!(collab_write_access(archived(Owner)), Ok(false));
+        assert_eq!(collab_write_access(archived(Editor)), Ok(false));
+        assert_eq!(
+            collab_write_access(archived(Viewer)),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(collab_write_access(None), Err(StatusCode::FORBIDDEN));
+    }
 }

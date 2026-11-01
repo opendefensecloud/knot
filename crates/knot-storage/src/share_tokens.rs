@@ -44,7 +44,9 @@ pub trait ShareTokenStore: Send + Sync {
     async fn list_active(&self, doc_id: Uuid) -> Result<Vec<ShareToken>>;
 
     /// Look up a token by its public string. Only returns Some when the
-    /// token is alive: not revoked AND (no expiry OR expiry in the future).
+    /// token is alive: not revoked AND (no expiry OR expiry in the future)
+    /// AND its doc is not in the archive (an archived doc's links act
+    /// revoked until it is restored).
     async fn find_alive(&self, token: &str) -> Result<Option<ShareToken>>;
 
     /// Mark a token revoked. Returns true if a row was updated (the token
@@ -134,6 +136,7 @@ impl ShareTokenStore for PgShareTokenStore {
             "SELECT id, token, workspace_id, doc_id, expires_at, revoked_at, created_by, created_at \
              FROM share_tokens \
              WHERE token = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()) \
+             AND EXISTS (SELECT 1 FROM documents d WHERE d.id = share_tokens.doc_id AND d.archived_at IS NULL) \
              LIMIT 1",
         )
         .bind(token)

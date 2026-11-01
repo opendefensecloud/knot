@@ -33,10 +33,21 @@ export const SKINS: readonly Skin[] = [
 
 export const DEFAULT_SKIN_ID = "light";
 
+/** What the automatic modes show until the user picks a light and a dark
+ *  skin of their own. */
+export const DEFAULT_LIGHT_SKIN_ID = "light";
+export const DEFAULT_DARK_SKIN_ID = "dark";
+
 const byId = new Map(SKINS.map((skin) => [skin.id, skin]));
 
 export function findSkin(id: string | null | undefined): Skin | undefined {
   return id == null ? undefined : byId.get(id);
+}
+
+/** Whether `id` is a known skin of `scheme`. An automatic mode's light slot
+ *  takes only light skins and its dark slot only dark ones. */
+export function isSkinOfScheme(id: string | null | undefined, scheme: Scheme): boolean {
+  return findSkin(id)?.scheme === scheme;
 }
 
 /** Which of `light` / `dark` a skin id belongs to, for `data-theme` and

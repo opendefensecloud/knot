@@ -601,7 +601,7 @@ async fn assigning_an_already_checked_task_notifies_nobody() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sql_and_rust_task_assigned_dedupe_keys_agree() {
     // Finding 1c's seed migration
-    // (migrations/20260907120000_notifications_kind_check_and_task_assigned_seed.sql)
+    // (migrations/20261101120100_notifications_kind_check_and_task_assigned_seed.sql)
     // reproduces `task_assigned_dedupe_key` in raw SQL — `encode(substring(
     // sha256(convert_to(text, 'UTF8')) from 1 for 8), 'hex')` — so it can
     // pre-populate dedupe rows for tasks that already existed when this

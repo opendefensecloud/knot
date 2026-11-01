@@ -43,14 +43,443 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   an existing comment does not yet carry a `mentions` field, so adding
   `@Christian Hüning` in an edit still notifies nobody — only the create path
   is fixed here.
-- **A document title longer than about fifteen characters was cut off behind
-  the tool icons.** On the desktop column the title shared its line with the
-  header's action row, and the row's ~490px left the title only 208px of the
-  712px measure — an `<input>` never wraps, so everything past that was
-  simply clipped. The title now takes the whole column and the action row
-  sits beneath it, so any title up to roughly 45 characters is shown in full.
-  Narrow screens already laid the header out this way; it is now the layout
-  at every width. (#29)
+
+## [0.9.5] - 2026-11-01
+
+Edit and Comments stay within reach while you read a long page, so you can
+start editing or commenting where you are without scrolling back to the
+top. The documents tree can also be collapsed or expanded in one click.
+
+### Upgrading
+- Nothing to do. This release changes only the web app: no database
+  migrations, no configuration or Helm chart changes, and rolling back to
+  0.9.4 works as is.
+
+### Added
+- Edit and Comments stay within reach in long documents. Once the row of
+  buttons under the title scrolls out of view, a slim bar with the page
+  title, Edit (⌘E) and Comments appears at the top of the page. While you
+  edit, the same two buttons sit at the end of the formatting toolbar.
+  (#70)
+- "Collapse all" and "Expand all" in the documents tree. The button next
+  to "New document" closes every page that has subpages, and opens them
+  all again once none is open. (#69)
+
+### Changed
+- ⌘E / Ctrl+E no longer toggles inline code; it only switches between
+  viewing and editing. Use the toolbar's inline-code button or backticks.
+  (#70)
+
+### Fixed
+- Switching between viewing and editing, or opening and closing the
+  comments panel, no longer moves the text you're reading. (#70)
+- Starting to edit partway down a page puts the cursor where you were
+  reading, so you can type straight away. (#70)
+- ⌘E while typing no longer also turns the text around the cursor into
+  inline code. (#70)
+- ⌘E does nothing on an archived page, as the page is read-only. (#70)
+- On phones, the menu button no longer covers the toolbar's Bold button.
+  (#70)
+
+## [0.9.4] - 2026-10-31
+
+A searchable member list in the Permissions dialog, so adding someone to a
+page stays quick in workspaces with many members.
+
+### Upgrading
+- Nothing to do. This release changes only the web app: no database
+  migrations, no configuration or Helm chart changes, and rolling back to
+  0.9.3 works as is.
+
+### Changed
+- The member list under "Add" in a page's Permissions dialog is now a
+  search field. Type part of a name or email to narrow it, then pick with
+  the mouse, or with the arrow keys and Enter. Members are listed
+  alphabetically by name, and the list opens above the field when there's
+  no room below it. (#66)
+
+## [0.9.3] - 2026-10-30
+
+The release notes for 0.9.2 in knot itself. 0.9.2 was built before its
+notes were written, so its "What's new" card and release notes page left
+that release out. There are no other changes.
+
+### Upgrading
+- Nothing to do. This release changes only the release notes built into
+  the server: no database migrations, no configuration or Helm chart
+  changes, and rolling back to 0.9.2 works as is.
+
+### Fixed
+- The "knot was updated" card and the release notes page list 0.9.2 with
+  its date. If you updated from 0.9.1 or earlier, the card shows the
+  restricted pages that came with 0.9.2. (#64)
+
+## [0.9.2] - 2026-10-30
+
+Restricted pages: an owner can make a page and its subpages visible only
+to the people they add, workspace owners included. Removing a member now
+also removes their page grants.
+
+### Upgrading
+- Two database migrations run on upgrade (the Helm chart's migrate hook
+  applies them). Rolling back to 0.9.1 needs a database restore: 0.9.1
+  doesn't start on a database with migrations it doesn't know.
+  - `20261030120000_restricted_docs` adds the restricted flag. It also
+    deletes page grants still held by people who are no longer members of
+    the workspace, so inviting them again doesn't bring that access back.
+  - `20261030130000_acl_invalidations_workspace_wide` lets one access
+    change cover a whole workspace, for role changes and removed members.
+- During a rolling upgrade, a 0.9.1 replica clears its access cache on a
+  workspace-wide change, but its open editor connections stay up until
+  they reconnect. Finish the rollout before changing member roles.
+
+### Added
+- Restricted pages. An owner of a page can turn on "Restrict access" in its
+  Permissions dialog, and from then on only the people added there can see
+  the page and its subpages. Workspace roles stop applying inside,
+  including the workspace owner's.
+  - Restricting a page makes you its owner and revokes the public links of
+    the page and its subpages. A restricted page can't lose its last owner,
+    and pages inside one can't get public links.
+  - Add someone with "Inherit" unticked to share just that one page. A
+    page shared with you whose parent you can't see shows under "Shared
+    with you" in the sidebar, without its parent's name.
+  - Restricted pages show a lock in the sidebar and a "Restricted" chip on
+    the page. "People with access" in the dialog lists who can see the
+    page, and where their access comes from.
+  - A page you can't see answers exactly like one that doesn't exist, and
+    it is left out of the sidebar, search, templates, the archive, My
+    tasks and workspace export.
+  - Moving a page into or out of a restricted page needs owner access to
+    it, and the sidebar asks before such a move. Archiving or deleting a
+    page with subpages you can't see is refused.
+  - Duplicating a page skips the subpages you can't see, and copies of
+    restricted pages stay restricted. Workspace export and import keep
+    restrictions.
+  - `knot-server admin restricted-list` and `knot-server admin grant`
+    recover a restricted page whose owners have all left the workspace.
+    (#63)
+
+### Changed
+- Removing a member also removes their page grants, so inviting them again
+  (or their next SSO login) doesn't bring their old access back. Changing a
+  member's role or removing them takes effect at once on every replica, and
+  open pages reconnect to check access again. (#63)
+- Deleting someone else's comment takes owner access to the page, not to
+  the workspace. A workspace owner who is only an editor on a restricted
+  page can't delete others' comments there; someone with an owner grant on
+  a page can. (#63)
+- Public links are served with `Cache-Control: private, no-cache` instead
+  of `public, max-age=60`, so a revoked link stops working at once, also
+  behind a shared cache. (#63)
+
+## [0.9.1] - 2026-10-29
+
+A search box for the Members page, and fixes to links in the editor: page
+links, @-mentions and dates work as links again, and text typed after a
+pasted link is no longer underlined.
+
+### Upgrading
+- Nothing to do. This release changes only the web app: no database
+  migrations, no configuration or Helm chart changes, and rolling back to
+  0.9.0 works as is.
+
+### Added
+- A search box above the Members table filters it by name, email or role
+  as you type, and shows how many members match. Escape clears it. (#58)
+
+### Changed
+- Page links, @-mentions and dates in the editor show as coloured pills, so
+  you can tell them apart from links to the web at a glance. Their styles
+  were always meant to do this, but never matched what the editor renders,
+  so they looked like any other link. (#61)
+
+### Fixed
+- Page links, @-mentions and dates in the editor work as links again:
+  - In Safari, typing right after one no longer turns it into plain text.
+    This change was saved for everyone working on the page.
+  - Clicking a page link opens the page, and clicking a date in edit mode
+    opens its date picker. Both clicks did nothing.
+  - Copying one within knot pastes it as a link, not as plain text.
+  - The link popover's Document tab now links selected text to a page. It
+    did nothing before. (#61)
+- Text typed after a link pasted from a web page, Google Docs or Word is no
+  longer underlined. The link brought the source page's underline along,
+  and the underline carried on past the link's end. Pasted links now drop
+  it; links copied or dragged within knot keep an underline you gave them.
+  Links pasted before this release keep theirs, and so does text typed
+  after them. (#60)
+- The page Permissions dialog lists people by name and email instead of a
+  raw `user:<id>`. A grant for someone who has left the workspace shows as
+  "Former member". (#57)
+- The editor toolbar's buttons show at once what the caret is in (a heading,
+  bold text, a table). They could stay on the previous state until something
+  else on the page changed. (#59)
+
+## [0.9.0] - 2026-10-28
+
+Version info and release notes in the app, Word and ODT export, page
+duplication, skins that follow the system or the sun, and a large round of
+fixes to page order, sidebar drag and drop, and Markdown round trips.
+
+### Upgrading
+- Five database migrations run on upgrade (the Helm chart's migrate hook
+  applies them). Rolling back to 0.8.1 needs a database restore: 0.8.1
+  doesn't start on a database with migrations it doesn't know.
+- One migration repairs page order keys that were shared by two pages at one
+  level, invalid, or longer than 64 characters, keeping the order the sidebar
+  showed. It locks the `documents` table until it commits, so on a large
+  database, page requests wait while the migrate job runs. Afterwards no two
+  top-level pages can share a key. (#52)
+- After the upgrade, one replica renders the cached Markdown and task listing
+  of every page outside the archive again, about ten pages every two seconds.
+  Search, share links, zip export and My Tasks catch up as it runs. Healthy
+  pages don't change, and their tasks keep their place in My Tasks. (#52)
+- During a rolling upgrade, old pods can answer `409 doc.sort_key_conflict`
+  when someone creates or moves a page, until they are replaced. Don't run
+  workspace imports during the rollout. (#52)
+- On S3, knot's credentials now need `s3:DeleteObject`. When the bucket
+  refuses to delete an archived page's files, the purge keeps the page and
+  tries again on the next hourly run; it used to delete the page and leave its
+  files behind. Until it gets through, "Delete permanently" fails for that
+  page and it can't be restored. (#52)
+- Everyone with an account sees the "knot was updated" card once. (#45)
+- To see what the upgrade changes on your data first, run the real-data
+  compatibility check from the Helm chart's README (Upgrading) against a
+  restored backup or a staging copy. (#52)
+
+### Added
+- The sidebar shows the running version. It opens an About page with the
+  version, build commit, release date and release notes.
+  `GET /api/release-notes`. (#45)
+- After an upgrade, a card names the new version and how many releases you
+  missed. Opening the notes or dismissing the card hides it on every device
+  until the next upgrade. New users start caught up; development builds never
+  show it. `GET /api/whats-new`, `POST /api/whats-new/seen`. (#45)
+- Word (DOCX) and OpenDocument (ODT) export from the page header's download
+  menu, with diagrams as pictures. `GET /api/docs/{id}/export/diagrams`,
+  `POST /api/docs/{id}/export/{docx|odt}`. (#46)
+- Skins can switch on their own (Settings → Appearance). Follow system uses
+  your light or dark skin with the operating system; Follow the sun uses the
+  light skin from sunrise to sunset, locating you by time zone or a place you
+  type in. Nothing leaves the browser, and the choice is saved per browser.
+  The skin now also syncs across open tabs. (#49)
+- Duplicate… in the sidebar's page menu copies a page, optionally with its
+  subpages, right after it as `<title> (copy)`. The copy gets its own
+  drawings, images and files, and links between copied pages point at the
+  copies. Up to 200 pages and 200 MB of files.
+  `POST /api/docs/{id}/duplicate`; a server makes two copies at a time and
+  answers `503 doc.duplicate_busy` with `Retry-After` when no slot frees up
+  within five seconds. (#52)
+- Move up, Move down, Indent and Outdent in the sidebar's page menu, and Alt
+  with the arrow keys on a sidebar page, move pages without dragging. (#52)
+- Screen readers hear each sidebar page's level and number of subpages, how
+  to move it, and where a moved page ended up, instead of page ids. (#52)
+
+### Changed
+- The sidebar's keyboard drag (Space or Enter to pick up, arrows, Space or
+  Enter to drop) is gone. Use Alt with the arrow keys or the page menu. (#52)
+- An `after_id` or `before_id` on create or move that isn't a live sibling at
+  the target level, or is the moved page itself, returns `422 doc.bad_anchor`
+  instead of putting the page last. (#52)
+- Restore returns `409 doc.sort_key_conflict` or `409 doc.restore_conflict`
+  instead of a 500. Both can succeed on a retry. (#52)
+- A `parent_id` outside your workspace on create, move and
+  create-from-template returns `404 doc.not_found` (it used to be accepted),
+  and so does a workspace import `?parent_id=` that is unknown or in another
+  workspace (was `403 acl.editor_required`). (#52)
+
+### Fixed
+- Creating the eighth page under one parent failed with "Couldn't create
+  document", and at the top level silently gave two pages the same key, so
+  their order could change. Adding pages after the same page failed the same
+  way, a broken order key could crash the request, and every page added at
+  the end made the keys one character longer. Pages two people create at one
+  level at the same moment no longer collide. (#52)
+- Sidebar drag and drop lands where the drop line shows. Nesting no longer
+  depends on mouse speed, a page can leave its parent when that parent is the
+  last page, and dragging left or right picks the level. Releasing on the
+  starting page no longer reloads it, a drop outside the tree cancels, a drop
+  that changes nothing sends nothing, and on touch screens a drag starts
+  after a short press, so scrolling works. (#52)
+- Two pages moved at the same moment could end up inside each other's
+  subpages, in a loop, and moving or archiving one of them then hung a
+  database connection. Moves into a page now take turns, and moving or
+  archiving a page of such a loop finishes. (#52)
+- Restoring a page whose top-level place was taken, or that was restored,
+  moved and archived again at the same time, failed with an internal error.
+  (#52)
+- Workspace import skipped a page whose order key was taken and moved its
+  subpages up. Imports now keep the export's order with fresh keys, so the
+  same export can be imported twice. (#52)
+- A line break (Shift+Enter) in a list item was stored in a broken shape by
+  history restore, templates, and Markdown or zip import (Markdown import
+  also did it in tight lists). Markdown export then failed for the page, and
+  with it search, share links, zip export, My Tasks, history preview and
+  restore, and using the page as a template. Images and drawings in items of
+  a tight list were lost on the same paths. (#52)
+- Markdown export, history restore, templates and import keep nested
+  checklists; list items and quotes with several paragraphs, images, rules or
+  lists; checkboxes in numbered lists; and empty list items. An HTML comment
+  between two lines of a list no longer merges them. (#52)
+- Markdown import keeps the line breaks of a code block in a list item or
+  quote, keeps images and drawings in table cells where they are, and no
+  longer stores a lone `>` as a broken empty quote. (#52)
+- A page with content damaged by an earlier import, or content knot doesn't
+  know, exports that content as text instead of failing the whole page. (#52)
+- My Tasks lists exactly the page's checkboxes. Checklists in table cells and
+  checkboxes in numbered lists were missing, a bullet starting with `[ ]` was
+  listed, a nested checklist showed as one task, and a toggle from My Tasks
+  could check the wrong item. (#52)
+- On S3, a file the bucket refused to hand out (a 403 or a server error) was
+  served as the bucket's error message instead of failing. (#52)
+
+Thanks to @szEvEz, whose #42 found the list export, page order and sidebar
+drag and drop bugs above, asked for Duplicate, and proposed the first fixes.
+
+### Security
+- Any editor could crash the whole server for everyone with a
+  workspace-import zip whose pages are each other's parent, or that has a
+  very deep chain of parents. The bug predates this release. (#52)
+- Any editor could crash the whole server for everyone by exporting a page
+  nested a few thousand levels deep, made with a crafted Markdown upload or
+  editor update. The bug predates this release. Markdown import and export
+  now follow at most 128 levels of quotes, list items and table cells and turn
+  anything deeper into one paragraph of its text, so no text is lost. An
+  editor update that nests a page past 512 levels is refused with close code
+  4422; the editor then shows "Changes refused" and stops reconnecting until
+  the page is reloaded. Two cases remain known limitations (#53): a single
+  crafted update whose own apply nests and deletes deep enough, and deleting
+  the deep part of a page already stored deeper. (#52)
+- Create, move, create-from-template and workspace import accepted a parent
+  page from another workspace and put the page under it. They now return
+  `404 doc.not_found`. The bug predates this release. (#52)
+- Dependency fixes:
+  - `tokio` 1.53.3: RUSTSEC-2026-0386, a use-after-free through `AsyncFd`'s
+    safe constructors. knot reaches it only through its dependencies. (#47)
+  - `ctutils` 0.4.5: RUSTSEC-2026-0385, constant-time helpers that could
+    compile to branches on secrets. Used only by the Postgres client's
+    password authentication, not by knot's session or CSRF signing. (#45)
+  - `pulldown-cmark` 0.13.5: RUSTSEC-2026-0414. Not affected: knot never
+    enables wiki links. (#52)
+  - `dompurify` 3.4.17: six advisories in modes and hooks that neither knot's
+    sanitiser nor mermaid uses. Not affected. (#55)
+  - `source-map-js` 1.2.2 and `postcss-selector-parser` 6.1.5: denial of
+    service from crafted inputs. Both run only when the web app is built, on
+    knot's own sources. (#55)
+  - Development tooling only, not shipped: `vite` 7.3.7, `vitest` 4.1.12,
+    `undici` 7.30.1, `shell-quote` 1.12.0, `brace-expansion` 1.1.21 and
+    5.0.12, `zod` 4.6.7. (#55)
+- Acknowledged, not fixed:
+  - RUSTSEC-2026-0387 (`crypto-bigint` 0.5.5, timing side channels), in
+    `deny.toml`. Not affected: it only verifies OIDC ID-token signatures,
+    which involve public values only. The fix needs a major version
+    `openidconnect` doesn't support yet. (#47)
+  - GHSA-238p-pmpm-9mq7 (`katex` 0.16.47 through mermaid, low), in
+    `web/SECURITY-NOTES.md`. It matters only if something else on the page
+    already allows prototype pollution. The fix needs mermaid 12, which
+    changes the look of every existing diagram. (#55)
+
+## [0.8.1] - 2026-10-21
+
+### Upgrading
+- knot no longer trusts the `emSign ECC Root CA - G3` root certificate. If your
+  OIDC provider, S3 endpoint or Postgres server presents a certificate that
+  chains to it, knot can no longer connect to it. Chrome is removing the same
+  root. (#43)
+
+### Security
+- **eMudhra CA key compromise** (RUSTSEC-2026-0381, RUSTSEC-2026-0382). The
+  private keys of eight eMudhra intermediate CAs can be recovered from their
+  public certificates, so anyone can issue a certificate for any hostname that
+  knot accepted. This affected knot's connections to the OIDC provider, the S3
+  blob backend and Postgres. An attacker in the network path to the OIDC
+  provider could substitute their own signing keys when knot starts and then
+  sign in as any user, or capture the client secret and users' authorization
+  codes at login. knot's trusted roots are compiled into the binary and it
+  checks neither revocation nor Certificate Transparency, so eMudhra's
+  revocation and the browser blocks did not protect it, and there is no CA
+  bundle to update: upgrading is the only fix. `rustls-webpki` 0.103.16
+  rejects chains through the eight intermediates and `webpki-roots` 1.0.10
+  drops the root. The Postgres change-notification connection was not
+  affected: it trusts only `sslrootcert`. (#43)
+- `rustls` 0.23.46 fixes RUSTSEC-2026-0346, RUSTSEC-2026-0347,
+  RUSTSEC-2026-0348 and RUSTSEC-2026-0349. (#43)
+- `ammonia` 4.1.8 fixes RUSTSEC-2026-0373. knot was not affected: its
+  sanitizer does not allow `style` attributes. (#43)
+- RUSTSEC-2026-0367, RUSTSEC-2026-0368 and RUSTSEC-2026-0369 (`zip`
+  extraction) are acknowledged in `deny.toml`. knot was not affected: it reads
+  import archives in memory and never extracts them to disk. The fix needs
+  zip 9. (#43)
+
+## [0.8.0] - 2026-10-13
+
+### Upgrading
+- Two database migrations run on upgrade (the Helm chart's migrate hook applies
+  them).
+- Pages deleted in earlier versions move to the archive with a 30-day
+  retention starting at the upgrade, and are then permanently deleted unless
+  restored. To change the period, set `KNOT_ARCHIVE_RETENTION_DAYS` (Helm
+  `archive.retentionDays`) before upgrading.
+- Subpages of previously deleted pages are moved to the top level, where the
+  sidebar already showed them.
+- Contributor lists count edits from this version on only.
+
+### Added
+- Page byline showing who created the page and who has edited it, with their
+  last edit. `GET /api/docs/{id}/contributors`. (#35)
+- Resizable table columns. Widths are stored as proportions, so tables fill the
+  page width on any screen. Widths are not kept through Markdown export/import.
+  (#38)
+- Document archive. Deleting a page moves it and its subpages to the archive,
+  where editors and owners can preview and restore it, and owners can delete
+  it permanently. Archived pages are purged after `KNOT_ARCHIVE_RETENTION_DAYS`
+  (default 30). `GET /api/workspace/archive`, `POST /api/docs/{id}/purge`.
+  (#39)
+
+### Changed
+- Archived pages are read-only. Writes return `409 doc.archived`, open editors
+  switch to read-only, and share links stop working. Archived pages are left
+  out of search, My Tasks and workspace export. (#39)
+- Tables with columns resized in earlier versions now fill the page width
+  instead of keeping fixed pixel widths. (#38)
+- A link now ends where its text ends. Retyping a link's last character, or
+  typing over all of its text, gives plain text. (#40)
+
+### Fixed
+- Edits made while offline never reached the server and were lost on reload.
+  Boards had the same problem. (#35)
+- Revoking access did not disconnect open editors, and their edits kept being
+  saved. (#35)
+- Live edits were stored without an author, and batched edits were credited to
+  the first author in the batch. (#35)
+- An open editor wrote an autolink edit in response to another user's typing.
+  (#35)
+- Editors could not delete pages; only owners could. (#39)
+- Deleting a page left its subpages at the top level of the sidebar and in
+  search. (#39)
+- The sidebar row menu could not be used with the keyboard. (#39)
+- A page whose access changed while it was open showed "You no longer have
+  access" even when you could still read it. (#39)
+- Column resizing did not work on existing pages. (#38)
+- Long URLs in table cells overflowed into the next column. (#38)
+- Text typed after a pasted link, or at the edge of any link, became part of
+  the link. (#40)
+- Pasting a URL over selected text left the new link selected, so the next
+  keystroke replaced it. (#40)
+- The toolbar Link button opened empty with the cursor at a link's edge, and
+  applying the empty value removed the link. With nothing selected, Apply now
+  inserts the URL as link text. (#40)
+- Typing or pasting `https://…` opened the date picker, which took the
+  keyboard focus. (#40)
+
+### Security
+- `ammonia` 4.1.7 fixes RUSTSEC-2021-0157. knot was not affected: its
+  sanitizer does not allow `style` attributes. (#38)
+- RUSTSEC-2024-0449 (`unsafe-libyaml`, unmaintained) is acknowledged in
+  `deny.toml`. It has no known vulnerability and only parses the operator's
+  own config file. (#38)
+
 ## [0.7.0] - 2026-10-02
 
 ### Added
@@ -534,7 +963,15 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/opendefensecloud/knot/compare/v0.9.4...v0.9.5
+[0.9.4]: https://github.com/opendefensecloud/knot/compare/v0.9.3...v0.9.4
+[0.9.3]: https://github.com/opendefensecloud/knot/compare/v0.9.2...v0.9.3
+[0.9.2]: https://github.com/opendefensecloud/knot/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/opendefensecloud/knot/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/opendefensecloud/knot/compare/v0.8.1...v0.9.0
+[0.8.1]: https://github.com/opendefensecloud/knot/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/opendefensecloud/knot/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/opendefensecloud/knot/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/opendefensecloud/knot/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/opendefensecloud/knot/compare/v0.4.0...v0.5.0

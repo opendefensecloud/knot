@@ -12,6 +12,10 @@ schema.gen: ## regenerate Rust + TS schema from tools/schema.json
 	$(CARGO) run --quiet -p schemagen -- --lang rust --out crates/knot-markdown/src/schema.rs
 	$(CARGO) run --quiet -p schemagen -- --lang ts   --out web/src/features/editor/schema.ts
 
+.PHONY: tz.gen
+tz.gen: ## regenerate web/src/lib/tzCoords.generated.ts (TZDATA=<extracted tzdata dir>)
+	node tools/gen-tz-coords.mjs "$(TZDATA)"
+
 .PHONY: dev.preflight
 dev.preflight: ## sanity-check .env against the config validator
 	@if [ ! -f .env ]; then \

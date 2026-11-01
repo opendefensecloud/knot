@@ -27,6 +27,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          # Without this, setup-node takes whatever 24.x the runner image has
+          # cached, which lags Node security releases by days to weeks (24.21.0
+          # was still cached after 24.22.1 shipped the CVE-2026-111497 fix).
+          check-latest: true
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
@@ -89,6 +93,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          check-latest: true # see fmt-and-lint
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
@@ -110,6 +115,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          check-latest: true # see fmt-and-lint
           cache: pnpm
           # This job installs in both web/ and e2e/, so key the cache on both
           # lockfiles. Without a path, setup-node looks for pnpm-lock.yaml at the

@@ -93,3 +93,50 @@ async fn create_oidc_email_collision_reports_email_exists() {
         "got {err:?} — expected EmailExists because email constraint wins"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn last_seen_version_starts_null_and_is_compare_and_set() {
+    let s = fresh_store().await;
+    let u = s.create_local("a@x.test", "A", "$h$").await.unwrap();
+    // Users created after the migration have seen nothing yet.
+    assert_eq!(s.last_seen_version(u.id).await.unwrap(), None);
+
+    assert!(
+        s.set_last_seen_version(u.id, None, "0.8.1").await.unwrap(),
+        "NULL -> 0.8.1 must be written"
+    );
+    assert_eq!(
+        s.last_seen_version(u.id).await.unwrap().as_deref(),
+        Some("0.8.1")
+    );
+
+    // A writer that read a stale value loses: nothing is overwritten.
+    assert!(!s.set_last_seen_version(u.id, None, "0.9.0").await.unwrap());
+    assert!(
+        !s.set_last_seen_version(u.id, Some("0.8.0"), "0.9.0")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        s.last_seen_version(u.id).await.unwrap().as_deref(),
+        Some("0.8.1")
+    );
+
+    assert!(
+        s.set_last_seen_version(u.id, Some("0.8.1"), "0.9.0")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        s.last_seen_version(u.id).await.unwrap().as_deref(),
+        Some("0.9.0")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn last_seen_version_of_unknown_user_is_none() {
+    let s = fresh_store().await;
+    let ghost = uuid::Uuid::new_v4();
+    assert_eq!(s.last_seen_version(ghost).await.unwrap(), None);
+    assert!(!s.set_last_seen_version(ghost, None, "0.8.1").await.unwrap());
+}

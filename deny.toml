@@ -24,6 +24,19 @@ ignore = [
     # Drop when: rsa 0.10.0 final ships AND openidconnect widens to ^0.10.
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack; direct dep of openidconnect 4.0.1; verification-only path; no stable fix published" },
 
+    # crypto-bigint < 0.7.6 has secret-dependent branches in operations meant
+    # to be constant-time. Path: openidconnect 4.0.1 (the current latest) ->
+    # p256 0.13 / p384 0.13 -> ecdsa 0.16 / elliptic-curve 0.13 ->
+    # crypto-bigint ^0.5. The fix exists only in 0.7.6; no 0.5.x patch is
+    # published and elliptic-curve 0.13 cannot reach 0.7.
+    # Reachability: ES256/ES384 ID-token signature VERIFICATION only. knot
+    # authenticates to the provider with a client secret and holds no EC
+    # private key, so the affected arithmetic only ever sees public values
+    # (public keys, signatures, hashes); a timing leak reveals nothing secret.
+    # Drop when: openidconnect moves to elliptic-curve 0.14 (crypto-bigint
+    # >= 0.7.6).
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint timing branches; via openidconnect 4.0.1 -> p256/p384 0.13; verification-only on public values; fix only in 0.7.6" },
+
     # quick-xml < 0.41 parses S3 API responses (two DoS advisories: quadratic
     # duplicate-attribute scanning and unbounded namespace allocation).
     # Path: rust-s3 0.37.2 -> quick-xml ^0.38, and aws-creds 0.39.1 -> ^0.38.
@@ -39,6 +52,31 @@ ignore = [
     # not help. Unmaintained-only: no known vulnerability.
     # Drop when: yrs replaces or vendors smallstr.
     { id = "RUSTSEC-2026-0215", reason = "smallstr unmaintained; pinned at ^0.3 by yrs through 0.27.3; no vulnerability, no successor crate" },
+
+    # unsafe-libyaml is unmaintained (repository archived; it is a c2rust
+    # translation of libyaml). Path: knot-config -> figment 0.10.19 (feature
+    # "yaml") -> serde_yaml 0.9.34 (itself deprecated) -> unsafe-libyaml
+    # 0.2.11. figment 0.10.19 is the current latest and its Yaml provider is
+    # built on serde_yaml, so no bump reaches a safe-Rust parser.
+    # Unmaintained-only: no known vulnerability. Reachability: parses only the
+    # operator-supplied config file named by KNOT_CONFIG, never user input.
+    # Drop when: figment moves its Yaml provider off serde_yaml, or knot drops
+    # YAML config files.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; via figment's Yaml provider (serde_yaml); parses only the operator's KNOT_CONFIG file; no vulnerability" },
+
+    # zip < 9 extracts archives unsafely: ZipArchive::extract and
+    # ZipStreamReader::extract keep SUID/SGID bits, create symlinks whose
+    # targets lie outside the destination, and apply permissions through them.
+    # zip is a DIRECT dependency of knot-server (workspace export/import),
+    # pinned at ^8; the fixes exist only in the 9.0 major, which Renovate raises
+    # from the Dependency Dashboard rather than on its own.
+    # Reachability: none. Import opens the upload with ZipArchive::new over an
+    # in-memory buffer and reads entries by name; export only writes through
+    # ZipWriter. Nothing calls extract() or writes to the filesystem.
+    # Drop when: knot-server moves to zip >= 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip extract() keeps SUID/SGID bits; fix only in zip 9; knot reads archives in memory and never extracts" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract() symlinks escape the destination; fix only in zip 9; knot reads archives in memory and never extracts" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract() chmods through symlinks; fix only in zip 9; knot reads archives in memory and never extracts" },
 ]
 
 [licenses]

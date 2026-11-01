@@ -1,10 +1,21 @@
 # Frontend dependency audit notes
 
-`make audit.web` runs `pnpm audit --prod`. As of the 0.2.0 dependency refresh
-both it and a full (dev-inclusive) `pnpm audit` report **zero** advisories.
+`make audit.web` runs `pnpm audit --prod`. Both it and a full (dev-inclusive)
+`pnpm audit` report **one** advisory, accepted below; anything else is new.
 
 Keep it that way: re-run both after any dependency change, and prefer bumping a
 parent over adding an override.
+
+## Accepted advisories
+
+- **katex** `0.16.47`, GHSA-238p-pmpm-9mq7 (low): a prototype pollution that
+  already exists elsewhere on the page can bypass KaTeX's `trust` restrictions.
+  The fix is in `0.18.2`, but every mermaid 11.x release asks for `^0.16`, and
+  only mermaid 12 moves to `^0.18`. Forcing `0.18` under mermaid 11 is a
+  combination mermaid never shipped. Mermaid 12 makes ELK the default layout
+  and changes the default look, so every existing diagram re-lays out, and it
+  would sit beside the mermaid 11 copy that `@excalidraw/mermaid-to-excalidraw`
+  keeps. This advisory goes away with a deliberate mermaid 12 upgrade.
 
 ## How the remaining risk is held down
 
@@ -24,7 +35,7 @@ no parent bump can reach a patched release and an override is the only fix:
 - **lodash-es** — `chevrotain` and `@chevrotain/{gast,cst-dts-gen}` hard-pin
   `4.17.21`. Overridden to `^4.18.1`, which patches the `_.template` code
   injection and both prototype-pollution advisories.
-- **dompurify** — floored at `^3.4.13` regardless of what mermaid or Excalidraw
+- **dompurify** — floored at `^3.4.17` regardless of what mermaid or Excalidraw
   request. This is knot's HTML/SVG sanitiser (`src/lib/sanitize.ts`), whose
   output feeds `dangerouslySetInnerHTML` in `ExcalidrawBoardView.tsx` and
   `MermaidCodeBlock.tsx` over SVG authored by other workspace users, so it is

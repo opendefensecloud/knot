@@ -1,6 +1,18 @@
 import { create } from "zustand";
 
-import { DEFAULT_SKIN_ID, findSkin, schemeOf } from "../styles/skins";
+import type { LatLon } from "../lib/sun";
+import {
+  SKIN_KEYS,
+  currentSkin,
+  hasStoredSlot,
+  isLatLon,
+  readManualSkin,
+  readSkinPrefs,
+  writePref,
+  type SkinMode,
+  type SkinPrefs,
+} from "../styles/skinPrefs";
+import { DEFAULT_SKIN_ID, findSkin, isSkinOfScheme, schemeOf } from "../styles/skins";
 
 export type Toast = {
   id: number;
@@ -66,11 +78,35 @@ type UiState = {
   // and the sidebar scroll-into-view + focus ring.
   activeCommentId: string | null;
   setActiveCommentId: (id: string | null) => void;
-  // Skin — the palette + typography set. `theme` is its light/dark
-  // scheme, kept in the store so consumers can branch on it cheaply.
+  // Skin — the palette + typography set. `skin` is the one showing and
+  // `theme` its light/dark scheme, kept in the store so consumers can
+  // branch on it cheaply. `skinMode` says which skin shows: `manualSkin`,
+  // picked by hand, or in an automatic mode `lightSkin` or `darkSkin`, by
+  // the system's appearance or by the sun at `sunLocation` (the time
+  // zone's when null).
   skin: string;
   theme: Theme;
+  skinMode: SkinMode;
+  manualSkin: string;
+  lightSkin: string;
+  darkSkin: string;
+  sunLocation: LatLon | null;
+  /** Picks a skin by hand, which also switches to manual mode. */
   setSkin: (id: string) => void;
+  setSkinMode: (mode: SkinMode) => void;
+  // Each slot ignores a skin of the other scheme.
+  setLightSkin: (id: string) => void;
+  setDarkSkin: (id: string) => void;
+  /** A typed location, or null to go back to the time zone's. Ignores a
+   *  location out of range. */
+  setSunLocation: (loc: LatLon | null) => void;
+  /** Re-resolves the skin showing at `now`, for the watcher that follows
+   *  the system and the sun. Writes no storage, and touches neither the
+   *  store nor `<html>` when the skin showing stays the same. */
+  refreshSkin: (now?: Date) => void;
+  /** Takes the preferences as stored, e.g. after another tab changed them,
+   *  without writing any back. */
+  adoptStoredSkinPrefs: () => void;
   // Document width — a global reading preference, not a document property.
   docWidth: DocWidth;
   setDocWidth: (w: DocWidth) => void;
@@ -83,19 +119,8 @@ type UiState = {
 
 let nextId = 1;
 
-/** Exported for tests and for the pre-paint stamp in main.tsx. Falls
- *  back to the default skin for anything unknown, and honours the old
- *  `knot.theme = "dark"` preference from before skins existed. */
-export function readInitialSkin(): string {
-  try {
-    const stored = localStorage.getItem("knot.skin");
-    if (findSkin(stored)) return stored!;
-    if (localStorage.getItem("knot.theme") === "dark") return "dark";
-  } catch {
-    /* storage unavailable */
-  }
-  return DEFAULT_SKIN_ID;
-}
+/** The skin picked by hand. Exported for tests. */
+export const readInitialSkin = readManualSkin;
 
 /** Exported for tests: the storage read has to survive a disabled or
  *  throwing Storage, which `readInitialTheme` above does not. */
@@ -174,14 +199,35 @@ export function stampSkin(id: string) {
   }
 }
 
-function applySkin(id: string) {
-  stampSkin(id);
-  try {
-    localStorage.setItem("knot.skin", id);
-  } catch {
-    /* storage unavailable — the skin still applies for this session */
-  }
+type SkinPrefsState = Pick<UiState, "skinMode" | "manualSkin" | "lightSkin" | "darkSkin" | "sunLocation">;
+
+/** The store field for each automatic mode's slot. */
+const SLOT_FIELD = { light: "lightSkin", dark: "darkSkin" } as const;
+
+function prefsOf(s: SkinPrefsState): SkinPrefs {
+  return { mode: s.skinMode, manual: s.manualSkin, light: s.lightSkin, dark: s.darkSkin, location: s.sunLocation };
 }
+
+function stateOf(p: SkinPrefs): SkinPrefsState {
+  return { skinMode: p.mode, manualSkin: p.manual, lightSkin: p.light, darkSkin: p.dark, sunLocation: p.location };
+}
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+/** A preference change made in this tab, plus the skin it shows. That skin
+ *  is stamped even when it is the one already showing, as picking a skin
+ *  always has been; only refreshSkin, which runs on every re-check, skips
+ *  an unchanged one. The setters persist the change themselves. */
+function withSkinShowing(s: UiState, change: Partial<SkinPrefsState>): Partial<UiState> {
+  const skin = currentSkin(prefsOf({ ...s, ...change }));
+  stampSkin(skin);
+  return { ...change, skin, theme: schemeOf(skin) };
+}
+
+// One read of storage for the whole initial skin state, and the skin it
+// resolves to, which main.tsx stamps before first paint.
+const initialSkinPrefs = readSkinPrefs();
+const initialSkin = currentSkin(initialSkinPrefs);
 
 export const useUi = create<UiState>((set, get) => ({
   sidebarOpen: true,
@@ -202,12 +248,63 @@ export const useUi = create<UiState>((set, get) => ({
   clearPendingAnchor: () => set({ pendingAnchor: null }),
   activeCommentId: null,
   setActiveCommentId: (id) => set({ activeCommentId: id }),
-  skin: readInitialSkin(),
-  theme: schemeOf(readInitialSkin()),
+  skin: initialSkin,
+  theme: schemeOf(initialSkin),
+  ...stateOf(initialSkinPrefs),
   setSkin: (id) => {
-    const skinId = findSkin(id) ? id : DEFAULT_SKIN_ID;
-    applySkin(skinId);
-    set({ skin: skinId, theme: schemeOf(skinId) });
+    const manualSkin = findSkin(id) ? id : DEFAULT_SKIN_ID;
+    writePref(SKIN_KEYS.manual, manualSkin);
+    writePref(SKIN_KEYS.mode, "manual");
+    set(withSkinShowing(get(), { manualSkin, skinMode: "manual" }));
+  },
+  setSkinMode: (mode) => {
+    const s = get();
+    if (mode === s.skinMode) return;
+    const change: Partial<SkinPrefsState> = { skinMode: mode };
+    if (mode === "manual") {
+      // The skin showing becomes the one picked by hand, so nothing jumps.
+      change.manualSkin = s.skin;
+      writePref(SKIN_KEYS.manual, s.skin);
+    } else {
+      // The first time into an automatic mode, the skin showing fills its
+      // scheme's slot: a Nord user who follows the sun gets Nord at night.
+      const scheme = schemeOf(s.skin);
+      if (!hasStoredSlot(scheme)) {
+        change[SLOT_FIELD[scheme]] = s.skin;
+        writePref(SKIN_KEYS[scheme], s.skin);
+      }
+    }
+    writePref(SKIN_KEYS.mode, mode);
+    set(withSkinShowing(s, change));
+  },
+  setLightSkin: (id) => {
+    if (!isSkinOfScheme(id, "light")) return;
+    writePref(SKIN_KEYS.light, id);
+    set(withSkinShowing(get(), { lightSkin: id }));
+  },
+  setDarkSkin: (id) => {
+    if (!isSkinOfScheme(id, "dark")) return;
+    writePref(SKIN_KEYS.dark, id);
+    set(withSkinShowing(get(), { darkSkin: id }));
+  },
+  setSunLocation: (loc) => {
+    // Turns away a location storage wouldn't read back, so what shows now
+    // still shows after a reload.
+    if (loc && !isLatLon(loc)) return;
+    // Two decimals is about a kilometre, closer than sunrise needs.
+    const sunLocation = loc && { lat: round2(loc.lat), lon: round2(loc.lon) };
+    writePref(SKIN_KEYS.location, sunLocation && JSON.stringify(sunLocation));
+    set(withSkinShowing(get(), { sunLocation }));
+  },
+  refreshSkin: (now) => {
+    const skin = currentSkin(prefsOf(get()), now);
+    if (skin === get().skin) return;
+    stampSkin(skin);
+    set({ skin, theme: schemeOf(skin) });
+  },
+  adoptStoredSkinPrefs: () => {
+    set(stateOf(readSkinPrefs()));
+    get().refreshSkin();
   },
   docWidth: readInitialDocWidth(),
   setDocWidth: (w) => { applyDocWidth(w); set({ docWidth: w }); },

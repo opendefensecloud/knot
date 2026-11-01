@@ -223,6 +223,10 @@ class DateTimePopup {
 /** Plugin key used so the click handler can find the shared popup instance. */
 const dateTimePluginKey = new PluginKey("knotDateTime");
 
+/** A URL scheme and its slashes so far (`https:/`, `file://`), ending right
+ *  before the `/` that would trigger the picker. */
+const URL_SCHEME_BEFORE_SLASHES = /[a-z][a-z0-9+.-]*:\/*$/i;
+
 export const DateTimeExtension = Extension.create({
   name: "knotDateTime",
 
@@ -269,6 +273,10 @@ export const DateTimeExtension = Extension.create({
       key: dateTimePluginKey,
       props: {
         handleClickOn(view, _pos, _node, _nodePos, event) {
+          // prosemirror-view calls this in read mode too, and Apply and
+          // Clear write to the shared doc.
+          if (!view.editable) return false;
+          if (event.button !== 0 || event.shiftKey || event.altKey) return false;
           const target = event.target as HTMLElement | null;
           const anchor = target?.closest("a") as HTMLAnchorElement | null;
           if (!anchor) return false;
@@ -324,7 +332,14 @@ export const DateTimeExtension = Extension.create({
         allow: ({ state, range }) => {
           if (range.from < 1) return false;
           const before = state.doc.textBetween(range.from - 1, range.from, "\n", "\0");
-          return before === "/";
+          if (before !== "/") return false;
+          // `https://` and `file:///` contain a `//` too. After a scheme the
+          // user is writing (or has just pasted) a URL, and the picker takes
+          // keyboard focus, so whatever they typed next would land in its
+          // date field.
+          const blockStart = state.doc.resolve(range.from).start();
+          const textBefore = state.doc.textBetween(blockStart, range.from - 1, "\n", "\0");
+          return !URL_SCHEME_BEFORE_SLASHES.test(textBefore);
         },
         items: () => [{ iso: "" }],
         command: ({ editor, range }) => {

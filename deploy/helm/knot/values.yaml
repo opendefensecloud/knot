@@ -125,6 +125,14 @@ blob:
     # AWS creds via existingSecret with AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
     existingSecretName: ""
 
+# Deleted documents go to the archive, where editors can restore them, and
+# are permanently deleted (with their attachments, including S3 objects)
+# this many days later by an hourly job. Owners can delete permanently
+# sooner from the archive page. Database backups keep purged content for as
+# long as you keep the backups.
+archive:
+  retentionDays: 30
+
 resources:
   requests:
     cpu: 100m

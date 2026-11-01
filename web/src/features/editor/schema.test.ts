@@ -107,9 +107,9 @@ const REGISTERED_EXTENSIONS = [
  * one that arrived with a dependency bump.
  */
 const EDITOR_ONLY_ATTRS: Record<string, string[]> = {
-  // prosemirror-tables records a dragged column width here. It does ride in
-  // the CRDT (one collaborator's drag is visible to everyone), but markdown
-  // has no column-width concept, so the canonical schema omits it.
+  // A column's relative width (see columnWidths.ts). It does ride in the
+  // CRDT (one collaborator's drag is visible to everyone), but markdown has
+  // no column-width concept, so the canonical schema omits it.
   table_cell: ["colwidth"],
   table_header: ["colwidth"],
   // Tiptap's OrderedList ships the HTML `type` attribute (1/a/A/i/I). Nothing

@@ -42,6 +42,7 @@ const TABLES = [
   "board_snapshots",
   "board_updates",
   "boards",
+  "doc_contributors",
   "doc_markdown_cache",
   "doc_snapshots",
   "doc_tasks",

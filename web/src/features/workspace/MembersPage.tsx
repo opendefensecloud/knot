@@ -1,10 +1,21 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
+import type { Member } from "../../lib/validators";
+
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { useUi } from "../../stores/ui";
 
+import { memberMatches } from "./memberSearch";
 import { workspaceApi } from "./workspace.api";
+
+// Case-insensitive substring match on email, display name and role, so
+// "anna", "@example.org" and "owner" all narrow the list.
+export function filterMembers(members: Member[], query: string): Member[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return members;
+  return members.filter((m) => memberMatches(m, q) || m.role.includes(q));
+}
 
 export default function MembersPage() {
   const qc = useQueryClient();
@@ -21,6 +32,7 @@ export default function MembersPage() {
   const [inviteRole, setInviteRole] = useState<"owner" | "editor" | "viewer">("editor");
   const [invitePassword, setInvitePassword] = useState("");
   const [inviteName, setInviteName] = useState("");
+  const [query, setQuery] = useState("");
 
   const invite = useMutation({
     mutationFn: async () =>
@@ -64,6 +76,9 @@ export default function MembersPage() {
   if (!members.data || "error" in members.data) {
     return <main className="mx-auto max-w-[760px] px-6 py-8 text-fg-muted">Failed to load members.</main>;
   }
+
+  const all = members.data.ok;
+  const shown = filterMembers(all, query);
 
   const inputCls = "h-9 px-3 rounded border border-border bg-bg text-fg placeholder:text-fg-muted focus:outline-none focus:ring-2 focus:ring-accent text-sm";
   const selectCls = "h-9 px-2 rounded border border-border bg-bg text-fg focus:outline-none focus:ring-2 focus:ring-accent text-sm";
@@ -125,6 +140,21 @@ export default function MembersPage() {
           </form>
         </section>
       )}
+      <div className="mb-3 flex items-center gap-3">
+        <input
+          data-testid="members-search"
+          type="search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Escape") setQuery(""); }}
+          placeholder="Search members by name, email or role…"
+          aria-label="Search members"
+          className={`${inputCls} flex-1`}
+        />
+        <span data-testid="members-count" className="text-[13px] text-fg-muted whitespace-nowrap" aria-live="polite">
+          {query.trim() ? `${shown.length} of ${all.length}` : `${all.length} ${all.length === 1 ? "member" : "members"}`}
+        </span>
+      </div>
       <div className="bg-surface border border-border rounded-lg overflow-hidden">
         <table data-testid="members-table" className="w-full border-collapse text-sm">
           <thead>
@@ -136,7 +166,14 @@ export default function MembersPage() {
             </tr>
           </thead>
           <tbody>
-            {members.data.ok.map((m) => (
+            {shown.length === 0 && (
+              <tr className="border-t border-border">
+                <td colSpan={isOwner ? 4 : 3} data-testid="members-empty" className="px-4 py-6 text-center text-fg-muted">
+                  No members match “{query.trim()}”.
+                </td>
+              </tr>
+            )}
+            {shown.map((m) => (
               <tr key={m.user_id} data-testid={`member-${m.user_id}`} className="border-t border-border">
                 <td className="px-4 py-2 text-fg">{m.email}</td>
                 <td className="px-4 py-2 text-fg">{m.display_name}</td>
@@ -161,7 +198,8 @@ export default function MembersPage() {
                   <td className="px-4 py-2 whitespace-nowrap">
                     <button
                       onClick={() => {
-                        if (window.confirm(`Remove ${m.email}?`)) remove.mutate(m.user_id);
+                        const question = `Remove ${m.email}? They also lose every page-level grant, including access to restricted pages.`;
+                        if (window.confirm(question)) remove.mutate(m.user_id);
                       }}
                       className="h-8 px-2.5 rounded text-destructive text-[13px] font-medium hover:bg-destructive/10 transition-colors"
                     >

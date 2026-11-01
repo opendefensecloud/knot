@@ -71,11 +71,8 @@ async fn a_cancelled_fetch_does_not_strand_its_connection() {
     let store = PgUpdatesStore::new(pool.clone());
     let blob = vec![7u8; 4096];
     for _ in 0..2 {
-        let batch: Vec<Vec<u8>> = (0..125).map(|_| blob.clone()).collect();
-        store
-            .insert_batch(doc.id, Some(u.id), &batch)
-            .await
-            .unwrap();
+        let batch: Vec<_> = (0..125).map(|_| (Some(u.id), blob.clone())).collect();
+        store.insert_batch(doc.id, &batch).await.unwrap();
     }
 
     let obs = observer(&db.url).await;

@@ -60,3 +60,31 @@ export function sanitizeEditorFragment(html: string): DocumentFragment {
     RETURN_DOM_FRAGMENT: true,
   });
 }
+
+/** What a CHANGELOG.md section can render to: prose, lists, code, links and
+ *  tables. Its own `##` and `###` headings split it up, so only `####` and
+ *  below appear inside a section. */
+const RELEASE_NOTES_ALLOWED_TAGS = [
+  "p", "br", "hr",
+  "h4", "h5", "h6",
+  "blockquote", "pre", "code",
+  "ul", "ol", "li",
+  "strong", "em", "del",
+  "a",
+  "table", "thead", "tbody", "tr", "th", "td",
+];
+
+/**
+ * Sanitize the release notes from GET /api/release-notes before injecting
+ * them via `dangerouslySetInnerHTML`.
+ *
+ * The server renders them from the CHANGELOG.md compiled into its binary and
+ * sanitizes them already, so this is defence in depth: the page never trusts
+ * a response with raw HTML, whatever it claims to contain.
+ */
+export function sanitizeReleaseNotes(html: string): string {
+  return DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: RELEASE_NOTES_ALLOWED_TAGS,
+    ALLOWED_ATTR: ["href", "title", "start"],
+  });
+}

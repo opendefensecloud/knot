@@ -7,11 +7,13 @@ import { useUi } from "../stores/ui";
 
 import { AppShell } from "./AppShell";
 
-// The tree fetches documents and reads the session, and the palette runs
-// searches on timers; neither has anything to do with how the shell lays
-// itself out, which is all these tests look at.
+// The tree fetches documents and reads the session, the palette runs
+// searches on timers, and the upgrade card asks the server what's new; none
+// of that has anything to do with how the shell lays itself out, which is
+// all these tests look at.
 vi.mock("../features/docs/DocTree", () => ({ DocTree: () => null }));
 vi.mock("./CommandPalette", () => ({ CommandPalette: () => null }));
+vi.mock("../features/about/WhatsNewCard", () => ({ WhatsNewCard: () => null }));
 
 const realWidth = window.innerWidth;
 

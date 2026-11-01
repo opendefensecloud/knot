@@ -36,8 +36,9 @@ There is **no Redis**. Cross-pod CRDT update fan-out and ACL revocation both rid
 | `knot-config`     | figment-based `KNOT_*` env loader (default → file → env) |
 | `knot-storage`    | sqlx stores (users, workspaces, docs, grants, snapshots, updates) + migrations |
 | `knot-crdt`       | yrs `Engine`, `Rooms` registry, `Room` actor, `PgBus` over LISTEN/NOTIFY |
-| `knot-docs`       | ACL evaluation engine + ACL invalidation listener |
+| `knot-docs`       | ACL evaluation engine (one rule, per doc via `acl::resolve` and per workspace via the cached `Visibility`; restricted subtrees ignore workspace roles) + ACL invalidation listener |
 | `knot-markdown`   | Markdown ↔ ProseMirror round-trip (canonical schema) |
+| `knot-export`     | Page → DOCX/ODT (pure; walks the Y.Doc) |
 | `knot-obs`        | structured logging, OTLP traces, Prometheus exporter, well-known metric describes |
 | `knot-test-support` | `fresh_db()` against the dev-compose Postgres (NEVER testcontainers) |
 | `tools/schemagen` | generates `schema.rs` (server) + `schema.ts` (client) from `tools/schema.json` |
