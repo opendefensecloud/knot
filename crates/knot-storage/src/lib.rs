@@ -1,5 +1,6 @@
 //! Storage layer for knot — Postgres pool + storage traits.
 
+pub mod api_token_store;
 pub mod audit;
 pub mod blobs;
 pub mod boards;
@@ -24,6 +25,10 @@ pub mod updates_store;
 pub mod user_store;
 pub mod workspace_store;
 
+pub use api_token_store::{
+    API_SCOPES, ApiToken, ApiTokenError, ApiTokenSecret, ApiTokenStore, PgApiTokenStore,
+    api_token_hash,
+};
 pub use blobs::{BlobMeta, BlobMetadata, BlobStore, BlobStoreError, PgBytesStore, S3Store};
 pub use boards::{Board, BoardStore, BoardStoreError, PgBoardStore};
 pub use comments::{Comment, CommentStore, CommentStoreError, PgCommentStore, Reaction};

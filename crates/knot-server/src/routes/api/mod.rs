@@ -3,7 +3,7 @@
 use axum::{Router, middleware};
 
 use crate::AppState;
-use crate::auth::{csrf_mw, require_session_mw};
+use crate::auth::{csrf_mw, require_session_mw, token_scope_mw};
 
 pub mod blobs;
 pub mod boards;
@@ -20,6 +20,7 @@ pub mod search;
 pub mod shares;
 pub mod suggestions;
 pub mod tasks;
+pub mod tokens;
 pub mod whats_new;
 pub mod workspace;
 
@@ -35,6 +36,8 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(notifications::router())
         .merge(export_import::router())
         .merge(whats_new::router())
+        .merge(tokens::router())
+        .layer(middleware::from_fn(token_scope_mw))
         .layer(middleware::from_fn(csrf_mw))
         .layer(middleware::from_fn(require_session_mw))
 }

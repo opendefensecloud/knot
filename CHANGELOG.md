@@ -164,6 +164,19 @@ top. The documents tree can also be collapsed or expanded in one click.
 - On phones, the menu button no longer covers the toolbar's Bold button.
   (#70)
 
+### Added
+- Personal API tokens: bearer authentication on `/api/*` for scripts
+  and bot accounts. Every workspace member can mint their own tokens
+  (scoped to read, create, write, delete, in any combination) under
+  `/api/tokens`, and revoke them at any time. A token acts as its user —
+  workspace role and per-page access still apply on top of the token's
+  scopes. The token string is shown once at creation; only its hash is
+  stored. Tokens bypass CSRF (no cookies are involved), cannot manage
+  tokens, and never authenticate the real-time collab sockets or the
+  `/auth/*` routes.
+  - One database migration on upgrade:
+    `20261101120000_api_tokens`.
+
 ## [0.9.4] - 2026-10-31
 
 A searchable member list in the Permissions dialog, so adding someone to a

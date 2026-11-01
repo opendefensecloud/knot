@@ -2,10 +2,12 @@ pub mod context;
 pub mod cookies;
 pub mod require_session;
 pub mod session_loader;
+pub mod token_scopes;
 
-pub use context::AuthContext;
+pub use context::{AuthContext, TokenAuth};
 pub use require_session::require_session_mw;
 pub use session_loader::{SID_COOKIE, SessionDeps, session_loader_mw};
+pub use token_scopes::token_scope_mw;
 
 pub mod csrf;
 pub use csrf::{CSRF_COOKIE, CSRF_HEADER, csrf_mw};

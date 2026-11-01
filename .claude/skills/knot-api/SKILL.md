@@ -44,6 +44,40 @@ Keep the password in an env var, never in argv/history. Failed logins are thrott
   With Claude in Chrome, use `javascript_tool` on a logged-in knot tab.
 - **Break-glass local admin** (needs deploy access, not HTTP): `knot-server admin create` inside the pod/container mints a local-password owner even when SSO is the primary login.
 
+## API tokens (bot accounts, no session needed)
+
+Every workspace member can mint personal API tokens and call the API
+with `Authorization: Bearer <token>` — no cookies, no CSRF header. Tokens
+act as their user (workspace role + per-page access still apply) and
+carry a scope subset: `read`, `create`, `write`, `delete`.
+
+```bash
+# Mint (session-authed, needs CSRF header as above) → secret shown ONCE
+TOKEN_ID=$(curl -sf -b "$JAR" -H "X-CSRF-Token: $CSRF" \
+  -X POST "$KNOT/api/tokens" -H 'Content-Type: application/json' \
+  -d '{"name":"docs-bot","scopes":["read","create","write"]}' \
+  | tee /dev/stderr | jq -r .id)            # tee: keep the token_secret!
+# revoke later: curl -sf -b "$JAR" -H "X-CSRF-Token: $CSRF" -X DELETE "$KNOT/api/tokens/$TOKEN_ID"
+
+TOKEN='knot_…'                              # from token_secret in the 201 body
+curl -sf -H "Authorization: Bearer $TOKEN" "$KNOT/api/docs"
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  -X POST "$KNOT/api/docs" -H 'Content-Type: application/json' \
+  -d '{"title":"Bot page"}'
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  -X POST "$KNOT/api/docs/$DOC_ID/markdown" \
+  -H 'Content-Type: text/markdown' --data-binary page.md
+```
+
+Scope rules: GET/HEAD/OPTIONS need `read` · DELETE needs `delete` · POST
+`/api/docs` and `from-template`/`duplicate` need `create` · `purge` needs
+`delete` · everything else unsafe needs `write`. Tokens cannot manage
+tokens (`/api/tokens` → 403), don't authenticate `/collab/*` sockets or
+`/auth/*`, and a bad/revoked token is a hard 401. Revoking the member or
+removing them from the workspace kills their tokens. Bot accounts are
+ordinary invited users — give the bot its own account with a random
+password, then mint its token from that account.
+
 ## Endpoint quick reference
 
 | Action | Call |
@@ -74,6 +108,7 @@ Keep the password in an env var, never in argv/history. Failed logins are thrott
 | Diagrams to render for that export | `GET /api/docs/{id}/export/diagrams` → `{"limits":{…}, "diagrams":[{"key","kind":"mermaid","source"} \| {"key","kind":"board","board_id","label"}]}` |
 | Upload attachment | `POST /api/docs/{id}/blobs` · fetch: `GET /api/blobs/{id}` |
 | Workspace info | `GET /api/workspace` · templates: `GET /api/workspace/templates` |
+| **API tokens** | Mint: `POST /api/tokens` `{"name","scopes":["read",…]}` → 201 incl. `token_secret` (shown once) · list own: `GET /api/tokens` · revoke: `DELETE /api/tokens/{id}` → 204 — session-authed only |
 
 ## Core recipes
 

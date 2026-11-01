@@ -22,6 +22,15 @@ pub use crate::auth::cookies::CSRF_COOKIE;
 pub const CSRF_HEADER: &str = "x-csrf-token";
 
 pub async fn csrf_mw(req: Request<Body>, next: Next) -> Response {
+    // Token-authed requests carry no cookies, so there is nothing to
+    // ride: CSRF does not apply. They are marked by the TokenAuth extension.
+    if req
+        .extensions()
+        .get::<super::context::TokenAuth>()
+        .is_some()
+    {
+        return next.run(req).await;
+    }
     let safe = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     if safe {
         return next.run(req).await;

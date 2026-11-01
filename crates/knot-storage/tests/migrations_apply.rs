@@ -29,6 +29,7 @@ async fn migrations_apply_cleanly() {
 
     let expected: &[&str] = &[
         "acl_invalidations",
+        "api_tokens",
         "audit_events",
         "blob_bytes",
         "blob_copy_pending",

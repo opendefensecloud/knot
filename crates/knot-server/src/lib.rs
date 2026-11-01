@@ -12,11 +12,11 @@ use knot_auth::{Hasher, Throttle};
 use knot_config::Config;
 use knot_docs::AclCache;
 use knot_storage::{
-    BlobMeta, BlobStore, CommentStore, DocStore, GrantStore, MarkdownCacheStore, NotificationStore,
-    PgBytesStore, PgCommentStore, PgDocStore, PgGrantStore, PgMarkdownCache, PgNotificationStore,
-    PgSearchStore, PgSessionStore, PgShareTokenStore, PgSuggestionStore, PgUserStore,
-    PgWorkspaceStore, Pool, SearchStore, SessionStore, ShareTokenStore, SuggestionStore, UserStore,
-    WorkspaceStore,
+    ApiTokenStore, BlobMeta, BlobStore, CommentStore, DocStore, GrantStore, MarkdownCacheStore,
+    NotificationStore, PgApiTokenStore, PgBytesStore, PgCommentStore, PgDocStore, PgGrantStore,
+    PgMarkdownCache, PgNotificationStore, PgSearchStore, PgSessionStore, PgShareTokenStore,
+    PgSuggestionStore, PgUserStore, PgWorkspaceStore, Pool, SearchStore, SessionStore,
+    ShareTokenStore, SuggestionStore, UserStore, WorkspaceStore,
 };
 use uuid::Uuid;
 
@@ -55,6 +55,8 @@ pub struct AppState {
     pub users: Option<Arc<dyn UserStore>>,
     pub workspaces: Option<Arc<dyn WorkspaceStore>>,
     pub sessions: Option<Arc<dyn SessionStore>>,
+    /// Personal API tokens (bearer auth + their management routes).
+    pub tokens: Option<Arc<dyn ApiTokenStore>>,
     pub docs: Option<Arc<dyn DocStore>>,
     pub grants: Option<Arc<dyn GrantStore>>,
     pub acl: Option<Arc<AclCache>>,
@@ -108,6 +110,7 @@ impl AppState {
             users: None,
             workspaces: None,
             sessions: None,
+            tokens: None,
             docs: None,
             grants: None,
             acl: None,
@@ -154,6 +157,7 @@ impl AppState {
         let users: Arc<dyn UserStore> = Arc::new(PgUserStore::new(pool.clone()));
         let workspaces: Arc<dyn WorkspaceStore> = Arc::new(PgWorkspaceStore::new(pool.clone()));
         let sessions: Arc<dyn SessionStore> = Arc::new(PgSessionStore::new(pool.clone()));
+        let tokens: Arc<dyn ApiTokenStore> = Arc::new(PgApiTokenStore::new(pool.clone()));
         let docs: Arc<dyn DocStore> = Arc::new(PgDocStore::new(pool.clone()));
         let grants: Arc<dyn GrantStore> = Arc::new(PgGrantStore::new(pool.clone()));
         let acl = Arc::new(AclCache::new(
@@ -184,6 +188,7 @@ impl AppState {
             users: Some(users),
             workspaces: Some(workspaces),
             sessions: Some(sessions),
+            tokens: Some(tokens),
             docs: Some(docs),
             grants: Some(grants),
             acl: Some(acl),
@@ -224,6 +229,7 @@ impl AppState {
     pub fn session_deps(&self) -> Option<SessionDeps> {
         Some(SessionDeps {
             sessions: self.sessions.clone()?,
+            tokens: self.tokens.clone()?,
             workspaces: self.workspaces.clone()?,
             session_key: self.session_key.clone(),
         })
