@@ -8,25 +8,42 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-11-01
+
+Edit and Comments stay within reach while you read a long page, so you can
+start editing or commenting where you are without scrolling back to the
+top. The documents tree can also be collapsed or expanded in one click.
+
+### Upgrading
+- Nothing to do. This release changes only the web app: no database
+  migrations, no configuration or Helm chart changes, and rolling back to
+  0.9.4 works as is.
+
 ### Added
 - Edit and Comments stay within reach in long documents. Once the row of
   buttons under the title scrolls out of view, a slim bar with the page
   title, Edit (⌘E) and Comments appears at the top of the page. While you
   edit, the same two buttons sit at the end of the formatting toolbar.
+  (#70)
+- "Collapse all" and "Expand all" in the documents tree. The button next
+  to "New document" closes every page that has subpages, and opens them
+  all again once none is open. (#69)
 
 ### Changed
 - ⌘E / Ctrl+E no longer toggles inline code; it only switches between
   viewing and editing. Use the toolbar's inline-code button or backticks.
+  (#70)
 
 ### Fixed
 - Switching between viewing and editing, or opening and closing the
-  comments panel, no longer moves the text you're reading.
+  comments panel, no longer moves the text you're reading. (#70)
 - Starting to edit partway down a page puts the cursor where you were
-  reading, so you can type straight away.
+  reading, so you can type straight away. (#70)
 - ⌘E while typing no longer also turns the text around the cursor into
-  inline code.
-- ⌘E does nothing on an archived page, as the page is read-only.
+  inline code. (#70)
+- ⌘E does nothing on an archived page, as the page is read-only. (#70)
 - On phones, the menu button no longer covers the toolbar's Bold button.
+  (#70)
 
 ## [0.9.4] - 2026-10-31
 
@@ -910,7 +927,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/opendefensecloud/knot/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/opendefensecloud/knot/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/opendefensecloud/knot/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/opendefensecloud/knot/compare/v0.9.1...v0.9.2
