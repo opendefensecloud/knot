@@ -10,6 +10,7 @@ import {
   flattenVisible,
   insertIndex,
   keyboardMove,
+  parentIds,
   projectDrop,
   restrictionCrossingText,
   rowDescription,
@@ -247,6 +248,12 @@ describe("countDescendants", () => {
     const [a, b] = buildTree(tree1).roots;
     expect(countDescendants(a!)).toBe(4);
     expect(countDescendants(b!)).toBe(0);
+  });
+});
+
+describe("parentIds", () => {
+  it("is every page with subpages, at any depth", () => {
+    expect(parentIds(buildTree(tree1).roots)).toEqual(new Set(["A", "A2", "C"]));
   });
 });
 
