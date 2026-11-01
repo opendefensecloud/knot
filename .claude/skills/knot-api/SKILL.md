@@ -53,6 +53,7 @@ carry a scope subset: `read`, `create`, `write`, `delete`.
 
 ```bash
 # Mint (session-authed, needs CSRF header as above) → secret shown ONCE
+# In the web app this is Settings → API tokens, same call.
 TOKEN_ID=$(curl -sf -b "$JAR" -H "X-CSRF-Token: $CSRF" \
   -X POST "$KNOT/api/tokens" -H 'Content-Type: application/json' \
   -d '{"name":"docs-bot","scopes":["read","create","write"]}' \

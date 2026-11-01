@@ -174,6 +174,10 @@ top. The documents tree can also be collapsed or expanded in one click.
   stored. Tokens bypass CSRF (no cookies are involved), cannot manage
   tokens, and never authenticate the real-time collab sockets or the
   `/auth/*` routes.
+  - Settings → API tokens has the same thing in the web app: mint with
+    a name and permission checkboxes, copy the secret once, see each
+    token's scopes and last use, and revoke. Minting over the API keeps
+    working as before.
   - One database migration on upgrade:
     `20261101120000_api_tokens`.
 

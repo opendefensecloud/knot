@@ -33,6 +33,7 @@ const ATTEMPTS = 8;
 const LOCK_TIMEOUT = "4s";
 
 const TABLES = [
+  "api_tokens",
   "comment_reactions",
   "comments",
   "suggestion_replies",

@@ -38,6 +38,29 @@ const memberSchema = v.object({
 export type Member = v.InferOutput<typeof memberSchema>;
 export const Member = memberSchema;
 
+/** Scope vocabulary of personal API tokens — must match `API_SCOPES` server-side. */
+export const API_TOKEN_SCOPES = ["read", "create", "write", "delete"] as const;
+export type ApiTokenScope = (typeof API_TOKEN_SCOPES)[number];
+
+const apiTokenSchema = v.object({
+  id: v.string(),
+  name: v.string(),
+  scopes: v.array(v.picklist(API_TOKEN_SCOPES)),
+  created_at: v.string(),
+  last_used_at: v.nullable(v.string()),
+  revoked_at: v.nullable(v.string()),
+});
+export type ApiToken = v.InferOutput<typeof apiTokenSchema>;
+export const ApiToken = apiTokenSchema;
+
+/** The 201 body of `POST /api/tokens`: the row plus the once-only secret. */
+const createdApiTokenSchema = v.object({
+  ...apiTokenSchema.entries,
+  token_secret: v.string(),
+});
+export type CreatedApiToken = v.InferOutput<typeof createdApiTokenSchema>;
+export const CreatedApiToken = createdApiTokenSchema;
+
 const docSchema = v.object({
   id: v.string(),
   workspace_id: v.string(),
