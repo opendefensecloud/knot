@@ -2,9 +2,9 @@
 //! `knot_test_support::fresh_db` against the dev compose Postgres.
 
 use knot_storage::{
-    DocStore, DocTaskInput, NewNotification, NotificationKind, NotificationStore, PgDocStore,
-    PgNotificationStore, PgTaskStore, PgUserStore, PgWorkspaceStore, TaskStore, UserStore,
-    WorkspaceRole, WorkspaceStore, sort_key_between, task_assigned_dedupe_key,
+    DocStore, DocTaskInput, NewNotification, Notification, NotificationKind, NotificationStore,
+    PgDocStore, PgNotificationStore, PgTaskStore, PgUserStore, PgWorkspaceStore, TaskStore,
+    TaskWrite, UserStore, WorkspaceRole, WorkspaceStore, sort_key_between,
 };
 use uuid::Uuid;
 
@@ -108,7 +108,7 @@ async fn emit_then_list_returns_the_row_with_actor_and_doc_title() {
             .unwrap()
     );
 
-    let rows = store.list(bob, false, 50, None).await.unwrap();
+    let rows = store.list(bob, ws, &[], false, 50, None).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].kind, "mention");
     assert_eq!(rows[0].actor_display_name.as_deref(), Some("Alice"));
@@ -116,7 +116,13 @@ async fn emit_then_list_returns_the_row_with_actor_and_doc_title() {
     assert!(rows[0].read_at.is_none());
 
     // Alice is the actor, not a recipient.
-    assert!(store.list(alice, false, 50, None).await.unwrap().is_empty());
+    assert!(
+        store
+            .list(alice, ws, &[], false, 50, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -127,7 +133,14 @@ async fn emit_is_idempotent_on_dedupe_key() {
 
     assert!(store.emit(&n).await.unwrap(), "first emit inserts");
     assert!(!store.emit(&n).await.unwrap(), "second emit is deduped");
-    assert_eq!(store.list(bob, false, 50, None).await.unwrap().len(), 1);
+    assert_eq!(
+        store
+            .list(bob, ws, &[], false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -141,7 +154,13 @@ async fn self_notification_is_dropped() {
             .await
             .unwrap()
     );
-    assert!(store.list(alice, false, 50, None).await.unwrap().is_empty());
+    assert!(
+        store
+            .list(alice, ws, &[], false, 50, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -153,21 +172,34 @@ async fn unread_count_caps_and_mark_read_clears() {
             .await
             .unwrap();
     }
-    assert_eq!(store.unread_count(bob, 100).await.unwrap(), 3);
+    assert_eq!(store.unread_count(bob, ws, &[], 100).await.unwrap(), 3);
     // The cap actually binds: with 3 unread rows, a cap below that count
     // must clip the result rather than merely bounding it from above.
-    assert_eq!(store.unread_count(bob, 2).await.unwrap(), 2);
+    assert_eq!(store.unread_count(bob, ws, &[], 2).await.unwrap(), 2);
 
-    let rows = store.list(bob, true, 50, None).await.unwrap();
+    let rows = store.list(bob, ws, &[], true, 50, None).await.unwrap();
     let first = rows[0].id;
     assert_eq!(store.mark_read(bob, &[first]).await.unwrap(), 1);
-    assert_eq!(store.unread_count(bob, 100).await.unwrap(), 2);
+    assert_eq!(store.unread_count(bob, ws, &[], 100).await.unwrap(), 2);
 
     assert_eq!(store.mark_all_read(bob).await.unwrap(), 2);
-    assert_eq!(store.unread_count(bob, 100).await.unwrap(), 0);
+    assert_eq!(store.unread_count(bob, ws, &[], 100).await.unwrap(), 0);
     // Reading does not delete.
-    assert_eq!(store.list(bob, false, 50, None).await.unwrap().len(), 3);
-    assert!(store.list(bob, true, 50, None).await.unwrap().is_empty());
+    assert_eq!(
+        store
+            .list(bob, ws, &[], false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(
+        store
+            .list(bob, ws, &[], true, 50, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -177,10 +209,10 @@ async fn mark_read_cannot_touch_another_users_rows() {
         .emit(&mention_for(ws, doc, bob, alice, Uuid::new_v4()))
         .await
         .unwrap();
-    let bobs = store.list(bob, true, 50, None).await.unwrap();
+    let bobs = store.list(bob, ws, &[], true, 50, None).await.unwrap();
 
     assert_eq!(store.mark_read(alice, &[bobs[0].id]).await.unwrap(), 0);
-    assert_eq!(store.unread_count(bob, 100).await.unwrap(), 1);
+    assert_eq!(store.unread_count(bob, ws, &[], 100).await.unwrap(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -192,9 +224,12 @@ async fn list_pages_backwards_on_the_cursor() {
             .await
             .unwrap();
     }
-    let page1 = store.list(bob, false, 2, None).await.unwrap();
+    let page1 = store.list(bob, ws, &[], false, 2, None).await.unwrap();
     assert_eq!(page1.len(), 2);
-    let page2 = store.list(bob, false, 2, Some(page1[1].id)).await.unwrap();
+    let page2 = store
+        .list(bob, ws, &[], false, 2, Some(page1[1].id))
+        .await
+        .unwrap();
     assert_eq!(page2.len(), 1);
     assert!(page2[0].id < page1[1].id, "ids descend across pages");
 }
@@ -208,7 +243,7 @@ async fn prune_drops_read_rows_past_ninety_days_and_everything_past_one_eighty()
             .await
             .unwrap();
     }
-    let rows = store.list(bob, false, 50, None).await.unwrap();
+    let rows = store.list(bob, ws, &[], false, 50, None).await.unwrap();
     // Row 0: read, 100 days old  -> pruned.
     // Row 1: unread, 100 days old -> kept.
     // Row 2: unread, 200 days old -> pruned.
@@ -217,59 +252,28 @@ async fn prune_drops_read_rows_past_ninety_days_and_everything_past_one_eighty()
     backdate(&store, rows[2].id, 200, false).await;
 
     assert_eq!(store.prune(chrono::Utc::now()).await.unwrap(), 2);
-    let left = store.list(bob, false, 50, None).await.unwrap();
+    let left = store.list(bob, ws, &[], false, 50, None).await.unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].id, rows[1].id);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn prune_never_touches_task_assigned_even_when_read_and_old() {
-    // task_assigned is the one kind whose persisted row is the *only*
-    // thing suppressing a re-notification: PgTaskStore::upsert_for_doc
-    // re-derives it from doc_tasks on every reindex and relies on the
-    // dedupe row already existing. If retention pruned it like every other
-    // kind, the next edit of a document — any edit, unrelated to the task
-    // — would re-notify the assignee about a months-old, unchanged
-    // assignment. A same-age `mention` row is the control: it must still
-    // go, proving this isn't just a floor that swallowed everything.
-    let (store, ws, doc, alice, bob) = setup().await;
-    store
-        .emit(&mention_for(ws, doc, bob, alice, Uuid::new_v4()))
-        .await
-        .unwrap();
-    store
-        .emit(&NewNotification {
-            workspace_id: ws,
-            user_id: bob,
-            actor_id: None,
-            kind: NotificationKind::TaskAssigned,
-            doc_id: Some(doc),
-            target_kind: "task".into(),
-            target_id: format!("{doc}:0"),
-            dedupe_key: format!("task_assigned:{doc}:deadbeefcafebabe:{bob}"),
-            data: serde_json::json!({ "excerpt": "old task" }),
-        })
-        .await
-        .unwrap();
+async fn pruning_a_read_assignment_does_not_bring_it_back() {
+    // Whether a task is newly assigned is read from the task rows the
+    // write replaces, not from the notification, so retention may delete a
+    // `task_assigned` row like any other: the next edit of the doc doesn't
+    // notify the assignee again.
+    let f = task_fixture().await;
+    let ship = task(0, "ship it", f.bob, false);
+    f.write(std::slice::from_ref(&ship)).await;
+    let rows = f.inbox(f.bob).await;
+    assert_eq!(rows.len(), 1);
+    backdate(&f.notifications, rows[0].id, 200, true).await;
 
-    let rows = store.list(bob, false, 50, None).await.unwrap();
-    let task_assigned = rows.iter().find(|r| r.kind == "task_assigned").unwrap().id;
-    let mention = rows.iter().find(|r| r.kind == "mention").unwrap().id;
-    // Both read, both well past the 90-day read-row threshold.
-    backdate(&store, task_assigned, 200, true).await;
-    backdate(&store, mention, 200, true).await;
-
-    assert_eq!(
-        store.prune(chrono::Utc::now()).await.unwrap(),
-        1,
-        "only the mention row should be deleted"
-    );
-    let left = store.list(bob, false, 50, None).await.unwrap();
-    assert_eq!(left.len(), 1);
-    assert_eq!(
-        left[0].id, task_assigned,
-        "the read, 200-day-old task_assigned row must survive prune"
-    );
+    assert_eq!(f.notifications.prune(chrono::Utc::now()).await.unwrap(), 1);
+    f.write(&[ship, task(1, "an unrelated line", f.carol, true)])
+        .await;
+    assert!(f.inbox(f.bob).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -280,11 +284,17 @@ async fn deleting_a_doc_cascades_its_notifications() {
         .await
         .unwrap();
     hard_delete_doc(&store, doc).await;
-    assert!(store.list(bob, false, 50, None).await.unwrap().is_empty());
+    assert!(
+        store
+            .list(bob, ws, &[], false, 50, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
+async fn assigning_a_task_notifies_once_through_a_reorder_and_an_edit() {
     let pool = knot_test_support::fresh_db().await.pool;
     let ws = PgWorkspaceStore::new(pool.clone())
         .create("default", "W")
@@ -351,13 +361,13 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
             ws.id,
             doc.id,
             &[ship.clone(), review.clone()],
-            Some(alice.id),
+            TaskWrite::Edit(Some(alice.id)),
         )
         .await
         .unwrap();
     assert_eq!(
         notifications
-            .list(bob.id, false, 50, None)
+            .list(bob.id, ws.id, &[], false, 50, None)
             .await
             .unwrap()
             .len(),
@@ -365,7 +375,7 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
     );
     assert_eq!(
         notifications
-            .list(carol.id, false, 50, None)
+            .list(carol.id, ws.id, &[], false, 50, None)
             .await
             .unwrap()
             .len(),
@@ -389,12 +399,12 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
         },
     ];
     tasks
-        .upsert_for_doc(ws.id, doc.id, &swapped, Some(alice.id))
+        .upsert_for_doc(ws.id, doc.id, &swapped, TaskWrite::Edit(Some(alice.id)))
         .await
         .unwrap();
     assert_eq!(
         notifications
-            .list(bob.id, false, 50, None)
+            .list(bob.id, ws.id, &[], false, 50, None)
             .await
             .unwrap()
             .len(),
@@ -403,7 +413,7 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
     );
     assert_eq!(
         notifications
-            .list(carol.id, false, 50, None)
+            .list(carol.id, ws.id, &[], false, 50, None)
             .await
             .unwrap()
             .len(),
@@ -411,27 +421,27 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
         "reordering a list must not re-notify"
     );
 
-    // Editing the text is a new task as far as the key is concerned.
-    // "ship it" now lives at item_index 1, still assigned to bob.
+    // Editing the text is still the same task: no second notification,
+    // and the unread one shows the new text. "ship it" now lives at
+    // item_index 1, still assigned to bob.
     let edited = vec![DocTaskInput {
         text: "ship it today".into(),
         ..swapped[1].clone()
     }];
     tasks
-        .upsert_for_doc(ws.id, doc.id, &edited, Some(alice.id))
+        .upsert_for_doc(ws.id, doc.id, &edited, TaskWrite::Edit(Some(alice.id)))
         .await
         .unwrap();
+    let bobs = notifications
+        .list(bob.id, ws.id, &[], false, 50, None)
+        .await
+        .unwrap();
+    assert_eq!(bobs.len(), 1, "editing an assigned task must not re-notify");
+    assert_eq!(bobs[0].data["excerpt"], "ship it today");
+    assert_eq!(bobs[0].target_id, format!("{}:1", doc.id));
     assert_eq!(
         notifications
-            .list(bob.id, false, 50, None)
-            .await
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_eq!(
-        notifications
-            .list(carol.id, false, 50, None)
+            .list(carol.id, ws.id, &[], false, 50, None)
             .await
             .unwrap()
             .len(),
@@ -476,14 +486,14 @@ async fn assignment_with_no_known_actor_still_notifies() {
                 checked: false,
                 due_at: None,
             }],
-            None,
+            TaskWrite::Edit(None),
         )
         .await
         .unwrap();
 
     assert_eq!(
         PgNotificationStore::new(pool)
-            .list(alice.id, false, 50, None)
+            .list(alice.id, ws.id, &[], false, 50, None)
             .await
             .unwrap()
             .len(),
@@ -523,14 +533,14 @@ async fn assigning_a_task_to_yourself_notifies_nobody() {
                 checked: false,
                 due_at: None,
             }],
-            Some(alice.id),
+            TaskWrite::Edit(Some(alice.id)),
         )
         .await
         .unwrap();
 
     assert!(
         PgNotificationStore::new(pool)
-            .list(alice.id, false, 50, None)
+            .list(alice.id, ws.id, &[], false, 50, None)
             .await
             .unwrap()
             .is_empty()
@@ -583,14 +593,14 @@ async fn assigning_an_already_checked_task_notifies_nobody() {
                 checked: true,
                 due_at: None,
             }],
-            Some(alice.id),
+            TaskWrite::Edit(Some(alice.id)),
         )
         .await
         .unwrap();
 
     assert!(
         PgNotificationStore::new(pool)
-            .list(bob.id, false, 50, None)
+            .list(bob.id, ws.id, &[], false, 50, None)
             .await
             .unwrap()
             .is_empty(),
@@ -598,32 +608,187 @@ async fn assigning_an_already_checked_task_notifies_nobody() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn sql_and_rust_task_assigned_dedupe_keys_agree() {
-    // Finding 1c's seed migration
-    // (migrations/20261101120100_notifications_kind_check_and_task_assigned_seed.sql)
-    // reproduces `task_assigned_dedupe_key` in raw SQL — `encode(substring(
-    // sha256(convert_to(text, 'UTF8')) from 1 for 8), 'hex')` — so it can
-    // pre-populate dedupe rows for tasks that already existed when this
-    // feature ships. If the SQL and Rust ever disagree, the seed inserts
-    // rows under keys the runtime will never look up again, and the whole
-    // point of the migration (a silent upgrade) silently fails instead.
-    // The non-ASCII and empty-string cases matter because sha256 operates
-    // on UTF-8 bytes, not chars, and an empty task text is a valid input.
-    let (store, _ws, doc, _alice, bob) = setup().await;
-    for text in ["follow up", "Jörg follow up 日本語 🎉", ""] {
-        let rust_key = task_assigned_dedupe_key(doc, text, bob);
-        let (sql_key,): (String,) = sqlx::query_as(
-            "SELECT 'task_assigned:' || $1::uuid || ':' || \
-                encode(substring(sha256(convert_to($2, 'UTF8')) from 1 for 8), 'hex') || \
-                ':' || $3::uuid",
-        )
-        .bind(doc)
-        .bind(text)
-        .bind(bob)
-        .fetch_one(store.pool())
+/// A doc Alice owns, with Bob and Carol as editors, for the `task_assigned`
+/// tests below.
+struct TaskFixture {
+    ws: Uuid,
+    doc: Uuid,
+    alice: Uuid,
+    bob: Uuid,
+    carol: Uuid,
+    tasks: PgTaskStore,
+    notifications: PgNotificationStore,
+}
+
+impl TaskFixture {
+    /// Index `items` as the doc's tasks, as the live-edit reindex does:
+    /// with no known actor.
+    async fn write(&self, items: &[DocTaskInput]) {
+        self.tasks
+            .upsert_for_doc(self.ws, self.doc, items, TaskWrite::Edit(None))
+            .await
+            .unwrap();
+    }
+
+    async fn inbox(&self, user: Uuid) -> Vec<Notification> {
+        self.notifications
+            .list(user, self.ws, &[], false, 50, None)
+            .await
+            .unwrap()
+    }
+}
+
+async fn task_fixture() -> TaskFixture {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
         .await
         .unwrap();
-        assert_eq!(rust_key, sql_key, "mismatch for text = {text:?}");
+    let users = PgUserStore::new(pool.clone());
+    let ws_store = PgWorkspaceStore::new(pool.clone());
+    let mut ids = Vec::new();
+    for (email, name, role) in [
+        ("alice@x.test", "Alice", WorkspaceRole::Owner),
+        ("bob@x.test", "Bob", WorkspaceRole::Editor),
+        ("carol@x.test", "Carol", WorkspaceRole::Editor),
+    ] {
+        let user = users.create_local(email, name, "$h$").await.unwrap();
+        ws_store.add_member(ws.id, user.id, role).await.unwrap();
+        ids.push(user.id);
     }
+    let doc = PgDocStore::new(pool.clone())
+        .create(ws.id, None, "Doc", &sort_key_between(None, None), ids[0])
+        .await
+        .unwrap();
+    TaskFixture {
+        ws: ws.id,
+        doc: doc.id,
+        alice: ids[0],
+        bob: ids[1],
+        carol: ids[2],
+        tasks: PgTaskStore::new(pool.clone()),
+        notifications: PgNotificationStore::new(pool),
+    }
+}
+
+fn task(item_index: i32, text: &str, assignee: Uuid, checked: bool) -> DocTaskInput {
+    DocTaskInput {
+        item_index,
+        text: text.into(),
+        assignee_user_id: Some(assignee),
+        checked,
+        due_at: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn typing_an_assigned_task_notifies_once_with_the_text_it_ends_up_with() {
+    // The reindex runs every 2s while someone types, so the assignee
+    // usually lands before the text is finished. Each flush is an edit of
+    // the same task, not a new one.
+    let f = task_fixture().await;
+    for text in [
+        "",
+        "Rev",
+        "Review the",
+        "Review the spec",
+        "Review the spec.",
+    ] {
+        f.write(&[task(0, text, f.bob, false)]).await;
+    }
+    let rows = f.inbox(f.bob).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].data["excerpt"], "Review the spec.");
+    assert!(rows[0].read_at.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rewriting_an_assigned_task_into_another_one_notifies_again() {
+    let f = task_fixture().await;
+    f.write(&[task(0, "ship it", f.bob, false)]).await;
+    f.write(&[task(0, "book the venue for friday", f.bob, false)])
+        .await;
+    let rows = f.inbox(f.bob).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].data["excerpt"], "book the venue for friday");
+    assert_eq!(rows[1].data["excerpt"], "ship it");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_added_beside_an_edited_one_still_notifies() {
+    let f = task_fixture().await;
+    f.write(&[task(0, "ship it", f.bob, false)]).await;
+    f.write(&[
+        task(0, "book the venue", f.bob, false),
+        task(1, "ship it now", f.bob, false),
+    ])
+    .await;
+    let excerpts: Vec<String> = f
+        .inbox(f.bob)
+        .await
+        .iter()
+        .map(|n| n.data["excerpt"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(excerpts, ["book the venue", "ship it now"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reopening_a_completed_task_does_not_notify() {
+    let f = task_fixture().await;
+    f.write(&[task(0, "ship it", f.bob, true)]).await;
+    f.write(&[task(0, "ship it", f.bob, false)]).await;
+    assert!(f.inbox(f.bob).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handing_a_task_to_someone_else_notifies_them() {
+    let f = task_fixture().await;
+    f.write(&[task(0, "ship it", f.bob, false)]).await;
+    f.write(&[task(0, "ship it", f.carol, false)]).await;
+    assert_eq!(f.inbox(f.bob).await.len(), 1);
+    assert_eq!(f.inbox(f.carol).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_leaves_a_read_notification_as_it_was() {
+    let f = task_fixture().await;
+    f.write(&[task(0, "ship it", f.bob, false)]).await;
+    let id = f.inbox(f.bob).await[0].id;
+    f.notifications.mark_read(f.bob, &[id]).await.unwrap();
+    f.write(&[task(0, "ship it today", f.bob, false)]).await;
+    let rows = f.inbox(f.bob).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].data["excerpt"], "ship it");
+    assert!(rows[0].read_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_sync_notifies_nobody() {
+    // The refresh sweep re-renders pages nobody edited; whatever it finds
+    // assigned was assigned by an edit that already had its chance.
+    let f = task_fixture().await;
+    f.tasks
+        .sync_for_doc_quiet(f.ws, f.doc, &[task(0, "ship it", f.bob, false)])
+        .await
+        .unwrap();
+    assert!(f.inbox(f.bob).await.is_empty());
+    // Nor does the next edit treat the swept assignment as new.
+    f.write(&[task(0, "ship it", f.bob, false)]).await;
+    assert!(f.inbox(f.bob).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_actor_on_an_assignment_is_whoever_edited() {
+    let f = task_fixture().await;
+    f.tasks
+        .upsert_for_doc(
+            f.ws,
+            f.doc,
+            &[task(0, "ship it", f.bob, false)],
+            TaskWrite::Edit(Some(f.alice)),
+        )
+        .await
+        .unwrap();
+    let rows = f.inbox(f.bob).await;
+    assert_eq!(rows[0].actor_id, Some(f.alice));
 }

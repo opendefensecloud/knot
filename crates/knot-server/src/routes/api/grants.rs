@@ -120,12 +120,15 @@ pub(super) async fn put_inline(
         )
         .await
     {
-        Ok(()) => {
+        // Only a grant the principal didn't have shares the page; a role
+        // change doesn't.
+        Ok(newly_granted) => {
             // The invalidation evicts the subtree on every replica,
             // asynchronously; evict here too, so the grantee's next request
             // to this replica sees the grant.
             crate::archive::evict_local_subtree(&state, doc_id).await;
-            if let Some(rest) = principal.strip_prefix("user:")
+            if newly_granted
+                && let Some(rest) = principal.strip_prefix("user:")
                 && let Ok(grantee) = Uuid::parse_str(rest)
             {
                 emit_doc_shared(&state, doc_id, grantee, ctx.user_id).await;
@@ -361,7 +364,8 @@ fn internal() -> Response {
 }
 
 /// Tell the grantee a document was shared with them. Best-effort: a failure
-/// here must not fail the grant that already committed.
+/// here must not fail the grant that already committed. Keyed on the time
+/// of the share, so that sharing again after a revoke notifies again.
 async fn emit_doc_shared(state: &AppState, doc_id: Uuid, grantee: Uuid, actor: Uuid) {
     let (Some(notifications), Some(docs)) = (state.notifications.clone(), state.docs.clone())
     else {
@@ -378,7 +382,10 @@ async fn emit_doc_shared(state: &AppState, doc_id: Uuid, grantee: Uuid, actor: U
         doc_id: Some(doc_id),
         target_kind: "document".into(),
         target_id: doc_id.to_string(),
-        dedupe_key: format!("share:{doc_id}:{grantee}"),
+        dedupe_key: format!(
+            "share:{doc_id}:{grantee}:{}",
+            chrono::Utc::now().timestamp_micros()
+        ),
         data: serde_json::json!({ "doc_title": doc.title }),
     };
     if let Err(e) = notifications.emit(&n).await {

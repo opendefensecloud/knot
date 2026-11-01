@@ -92,18 +92,29 @@ pub trait NotificationStore: Send + Sync + 'static {
     /// Insert several. Returns how many rows were actually created.
     async fn emit_many(&self, ns: &[NewNotification]) -> Result<usize>;
 
-    /// Newest first. `cursor` is the last id of the previous page.
+    /// A user's notifications in a workspace, newest first, leaving out
+    /// those about the `hidden` docs (the ones the user can't read).
+    /// `cursor` is the last id of the previous page.
     async fn list(
         &self,
         user_id: Uuid,
+        workspace_id: Uuid,
+        hidden: &[Uuid],
         unread_only: bool,
         limit: i64,
         cursor: Option<i64>,
     ) -> Result<Vec<Notification>>;
 
-    /// Unread rows, counted no further than `cap` so an ignored inbox
-    /// cannot turn the polled endpoint into a sequential scan.
-    async fn unread_count(&self, user_id: Uuid, cap: i64) -> Result<i64>;
+    /// Unread rows, as [`list`](Self::list) would list them, counted no
+    /// further than `cap` so an ignored inbox cannot turn the polled
+    /// endpoint into a sequential scan.
+    async fn unread_count(
+        &self,
+        user_id: Uuid,
+        workspace_id: Uuid,
+        hidden: &[Uuid],
+        cap: i64,
+    ) -> Result<i64>;
 
     async fn mark_read(&self, user_id: Uuid, ids: &[i64]) -> Result<u64>;
     async fn mark_all_read(&self, user_id: Uuid) -> Result<u64>;
@@ -173,6 +184,8 @@ impl NotificationStore for PgNotificationStore {
     async fn list(
         &self,
         user_id: Uuid,
+        workspace_id: Uuid,
+        hidden: &[Uuid],
         unread_only: bool,
         limit: i64,
         cursor: Option<i64>,
@@ -182,6 +195,8 @@ impl NotificationStore for PgNotificationStore {
              WHERE n.user_id = $1 \
                AND ($2 = false OR n.read_at IS NULL) \
                AND ($3::bigint IS NULL OR n.id < $3) \
+               AND n.workspace_id = $5 \
+               AND (n.doc_id IS NULL OR NOT (n.doc_id = ANY($6))) \
              ORDER BY n.id DESC LIMIT $4"
         );
         let rows = sqlx::query_as::<_, Notification>(sqlx::AssertSqlSafe(sql))
@@ -189,18 +204,31 @@ impl NotificationStore for PgNotificationStore {
             .bind(unread_only)
             .bind(cursor)
             .bind(limit)
+            .bind(workspace_id)
+            .bind(hidden)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows)
     }
 
-    async fn unread_count(&self, user_id: Uuid, cap: i64) -> Result<i64> {
+    async fn unread_count(
+        &self,
+        user_id: Uuid,
+        workspace_id: Uuid,
+        hidden: &[Uuid],
+        cap: i64,
+    ) -> Result<i64> {
         let (n,): (i64,) = sqlx::query_as(
             "SELECT count(*)::bigint FROM \
-               (SELECT 1 FROM notifications WHERE user_id = $1 AND read_at IS NULL LIMIT $2) t",
+               (SELECT 1 FROM notifications \
+                WHERE user_id = $1 AND read_at IS NULL AND workspace_id = $3 \
+                  AND (doc_id IS NULL OR NOT (doc_id = ANY($4))) \
+                LIMIT $2) t",
         )
         .bind(user_id)
         .bind(cap)
+        .bind(workspace_id)
+        .bind(hidden)
         .fetch_one(&self.pool)
         .await?;
         Ok(n)
@@ -232,25 +260,13 @@ impl NotificationStore for PgNotificationStore {
     }
 
     async fn prune(&self, now: DateTime<Utc>) -> Result<u64> {
-        // `task_assigned` is excluded: unlike the other four kinds, its
-        // persisted row is not just an inbox entry, it is the *only* thing
-        // suppressing a re-notification. `PgTaskStore::upsert_for_doc`
-        // re-derives `task_assigned` from `doc_tasks` on every reindex and
-        // relies on `notifications_dedupe` to no-op when it already
-        // notified about an assignment. Pruning a read `task_assigned` row
-        // after 90 days would let the next edit of that document — however
-        // unrelated to this task — re-notify the assignee about an
-        // unchanged, months-old assignment. The other four kinds derive
-        // from a one-time write event and never re-emit, so ordinary
-        // retention is safe for them. These rows are tiny, so keeping them
-        // indefinitely costs nothing worth reclaiming.
+        // Every kind, `task_assigned` included: whether a task is newly
+        // assigned is read from the task rows an edit replaces
+        // (`PgTaskStore`), so deleting its notification can't bring it back.
         let res = sqlx::query(
             "DELETE FROM notifications \
-             WHERE kind <> 'task_assigned' \
-               AND ( \
-                 (read_at IS NOT NULL AND created_at < $1 - interval '90 days') \
-                 OR created_at < $1 - interval '180 days' \
-               )",
+             WHERE (read_at IS NOT NULL AND created_at < $1 - interval '90 days') \
+                OR created_at < $1 - interval '180 days'",
         )
         .bind(now)
         .execute(&self.pool)

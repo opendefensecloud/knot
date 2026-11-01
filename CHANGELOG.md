@@ -8,41 +8,43 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Upgrading
+- One database migration runs on upgrade (the Helm chart's migrate hook
+  applies it). Rolling back to 0.9.5 needs a database restore: 0.9.5
+  doesn't start on a database with migrations it doesn't know.
+  - `20261101120000_notifications` adds the inbox's table. Mentions,
+    replies, shares and task assignments from before the upgrade aren't
+    notified. A task that went overdue in the 7 days before it is, as any
+    overdue task is.
+- Every replica now checks for overdue tasks every 15 minutes and deletes
+  old notifications: read ones after 90 days, all after 180. There is
+  nothing to configure.
+
 ### Added
-- **Notifications and an inbox.** An `@mention` in a comment used to fire a
-  `pg_notify('comment_mentions', …)` that no process in the codebase ever
-  listened for, into a `MSG_MENTION` frame the frontend reserved and never
-  received. Mentioning a colleague did nothing they would ever see. Five events
-  now write to a `notifications` table — mentions, replies in threads you are
-  part of, task assignment, overdue tasks, and documents shared with you — read
-  through an Inbox in the sidebar with an unread badge and a `/notifications`
-  page. Delivery is a 30-second poll that also refreshes on window focus; the
-  table is shaped as an outbox (`emailed_at`) so email can arrive later without
-  a migration. Idempotency is a unique index on `(user_id, dedupe_key)` rather
-  than application logic, which is what lets the overdue sweep run on every
-  replica with no leader election.
-- **Two checklist items with identical text assigned to the same person notify
-  once.** The notification's dedupe key is content-addressed precisely so that
-  reordering a checklist does not re-notify everyone; the cost is that identical
-  text collides. The assignee still sees both items on `/tasks`.
-- **Self-assignment is not suppressed when you assign yourself by typing.** The
-  guard that drops self-notifications needs to know who acted, but the path a
-  live edit takes does not carry that: WebSocket updates are persisted with no
-  user id, and the channel feeding the reindex worker carries only a document
-  id. Editing a checklist item that assigns you a task will notify you about it;
-  the guard does work on the import paths.
+- An Inbox in the sidebar, with an unread badge, and a full list under
+  `/notifications`. You hear about mentions in comments, replies in threads
+  you're part of, tasks assigned to you, your tasks going overdue, and
+  pages shared with you. Opening a notification takes you to the page, or
+  to the comment thread. The badge refreshes every 30 seconds and when you
+  come back to the tab; the list loads when you open it.
+  `GET /api/notifications`,
+  `GET /api/notifications/unread_count`, `POST /api/notifications/read`.
+  - A task notifies its assignee once. Small edits, moving or reopening it
+    don't notify again, and an unread notification shows the task's
+    current text; rewriting a task in different words counts as a new
+    task. Copying a page (duplicate, template, workspace import) notifies
+    nobody about the tasks it brings along.
+  - Notifications about pages you can no longer see (restricted, archived,
+    or unshared since) leave your inbox and your badge.
+  - Assigning yourself a task by typing it notifies you too, as the editor
+    doesn't tell the server who typed what.
 
 ### Fixed
-- **Members whose display name contains a space could not be mentioned when
-  opening a thread or replying.** Comment mentions were resolved server-side
-  by matching `@(\w+)` against member display names, so `@Christian Hüning`
-  captured `Christian`, matched nobody, and silently notified no one. The
-  mention picker now sends the user ids it resolved, unioned with whatever the
-  regex still matches so a hand-typed second name is never dropped; the regex
-  remains as the sole path for comments written before this release. Editing
-  an existing comment does not yet carry a `mentions` field, so adding
-  `@Christian Hüning` in an edit still notifies nobody — only the create path
-  is fixed here.
+- Members whose display name contains a space can be mentioned in a new
+  comment or reply. The server matched `@Christian Hüning` as
+  `@Christian`, found nobody, and told nobody; the mention picker now
+  sends who it picked. Adding a mention while editing a comment still
+  matches by name only.
 
 ## [0.9.5] - 2026-11-01
 

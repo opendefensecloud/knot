@@ -6,8 +6,9 @@
 //!
 //! Rows are addressed to exactly one recipient, so ownership needs no join.
 //! Document *access* is a separate question: a notification can outlive the
-//! grant that made it visible, so rows carrying a `doc_id` are re-checked
-//! against `effective_role` and filtered, never 403'd.
+//! grant that made it visible (a page restricted, archived or unshared
+//! since), so the list and the count both leave out rows about docs the
+//! caller can't read now. Filtered, never 403'd.
 
 use axum::{
     Json, Router,
@@ -18,6 +19,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::AuthContext;
@@ -92,8 +94,26 @@ async fn list(State(state): State<AppState>, Query(q): Query<ListQuery>, req: Re
     let unread_only = q.filter.as_deref() == Some("unread");
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
+    // Rows about docs the caller can't read are left out in SQL, so a page
+    // isn't cut short by them. A cached snapshot may predate a doc and miss
+    // it from the hidden set, so the rows are checked again against one
+    // that covers their docs.
+    let hidden_ids = match acl.visibility(ctx.workspace_id, ctx.user_id).await {
+        Ok(visibility) => visibility.hidden_ids(),
+        Err(e) => {
+            tracing::error!(error=?e, "notifications visibility");
+            return internal();
+        }
+    };
     let rows = match notifications
-        .list(ctx.user_id, unread_only, limit, q.cursor)
+        .list(
+            ctx.user_id,
+            ctx.workspace_id,
+            &hidden_ids,
+            unread_only,
+            limit,
+            q.cursor,
+        )
         .await
     {
         Ok(r) => r,
@@ -107,40 +127,22 @@ async fn list(State(state): State<AppState>, Query(q): Query<ListQuery>, req: Re
     } else {
         None
     };
-
-    // Filter, don't fail: access can be revoked after the row is written.
-    // Rows are independent (each keyed by its own doc_id), so the checks run
-    // concurrently rather than one `.await` per row in sequence — a
-    // cache-cold page of up to `MAX_LIMIT` rows would otherwise serialize
-    // that many round trips through `acl::resolve` behind one response.
-    let checks = futures::future::join_all(rows.iter().map(|r| {
-        let acl = &acl;
-        async move {
-            match r.doc_id {
-                Some(doc_id) => Some(
-                    acl.effective_role(ctx.workspace_id, doc_id, ctx.user_id)
-                        .await,
-                ),
-                None => None,
-            }
+    let listed_doc_ids: Vec<Uuid> = rows.iter().filter_map(|r| r.doc_id).collect();
+    let visibility = match acl
+        .visibility_covering(ctx.workspace_id, ctx.user_id, &listed_doc_ids)
+        .await
+    {
+        Ok(visibility) => visibility,
+        Err(e) => {
+            tracing::error!(error=?e, "notifications visibility");
+            return internal();
         }
-    }))
-    .await;
+    };
 
     let mut items = Vec::with_capacity(rows.len());
-    for (r, check) in rows.into_iter().zip(checks) {
-        match check {
-            None => {}                  // no doc_id: nothing to re-check, keep.
-            Some(Ok(Some(_))) => {}     // access confirmed, keep.
-            Some(Ok(None)) => continue, // access revoked: drop the row silently.
-            Some(Err(e)) => {
-                // An ACL lookup failure is a database problem, not a stale
-                // grant — fail the whole request rather than silently
-                // dropping the row, which would look like data loss to the
-                // user.
-                tracing::error!(error=?e, "notifications acl check");
-                return internal();
-            }
+    for r in rows {
+        if r.doc_id.is_some_and(|doc_id| !visibility.readable(doc_id)) {
+            continue;
         }
         items.push(NotificationRow {
             id: r.id,
@@ -159,25 +161,25 @@ async fn list(State(state): State<AppState>, Query(q): Query<ListQuery>, req: Re
     Json(ListResponse { items, next_cursor }).into_response()
 }
 
-// Unlike `list`, this does not re-check `effective_role` per row, so the
-// count can in principle include rows for documents the caller can no
-// longer read — the badge could read higher than what `list` returns.
-// That's unreachable today: v0.1 is single-workspace-per-deployment, and
-// workspace membership alone grants a role on every doc in it, so a
-// request that reaches this handler can never hit the `effective_role ->
-// None` branch. It becomes reachable once a deployment can hold multiple
-// workspaces; the fix then is a `workspace_members` join inside the
-// existing `LIMIT` subquery in the store, not per-row ACL calls here,
-// which would reintroduce the sequential-scan risk the cap exists to
-// avoid.
+/// The badge: unread rows, counted as `list` lists them.
 async fn unread_count(State(state): State<AppState>, req: Request) -> Response {
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
-    let Some(notifications) = state.notifications.clone() else {
+    let (Some(notifications), Some(acl)) = (state.notifications.clone(), state.acl.clone()) else {
         return internal();
     };
-    match notifications.unread_count(ctx.user_id, UNREAD_CAP).await {
+    let hidden_ids = match acl.visibility(ctx.workspace_id, ctx.user_id).await {
+        Ok(visibility) => visibility.hidden_ids(),
+        Err(e) => {
+            tracing::error!(error=?e, "notifications visibility");
+            return internal();
+        }
+    };
+    match notifications
+        .unread_count(ctx.user_id, ctx.workspace_id, &hidden_ids, UNREAD_CAP)
+        .await
+    {
         Ok(n) => Json(CountResponse {
             count: n,
             capped: is_capped(n, UNREAD_CAP),

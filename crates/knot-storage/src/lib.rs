@@ -48,8 +48,7 @@ pub use snapshot_store::{
     DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStore, SnapshotStoreError,
 };
 pub use tasks::{
-    AssignedTask, DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError,
-    task_assigned_dedupe_key,
+    AssignedTask, DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError, TaskWrite,
 };
 pub use updates_store::{DocUpdate, PgUpdatesStore, UpdatesStore, UpdatesStoreError};
 pub use user_store::{PgUserStore, User, UserStore, UserStoreError};

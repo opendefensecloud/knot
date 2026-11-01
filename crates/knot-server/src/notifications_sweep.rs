@@ -19,12 +19,13 @@ pub struct SweepOutcome {
 }
 
 /// Emit `task_due` for every open, assigned, task that went overdue in the
-/// last 7 days, then prune.
+/// last 7 days, then prune. Tasks on archived pages and of people no longer
+/// in the workspace are left out, as `/tasks` leaves them out; a page the
+/// assignee can't read is left out of their inbox when it is read.
 ///
-/// The dedupe key is content-addressed exactly like `task_assigned`'s
-/// (`task_due:<doc_id>:<sha256(text)[..16]>:<assignee>:<date>`, computed with
-/// the same SQL sha256 expression `PgTaskStore` uses at
-/// `crates/knot-storage/src/tasks.rs`) rather than keyed on `doc_tasks.id`.
+/// The dedupe key is content-addressed like `task_assigned`'s
+/// (`task_due:<doc_id>:<sha256(text)[..16]>:<assignee>:<date>`) rather than
+/// keyed on `doc_tasks.id`.
 /// `doc_tasks.id` is `"<doc_id>:<item_index>"`, so inserting a checklist
 /// item above an overdue one shifts every later item's id — an id-keyed
 /// dedupe key would treat that reorder as a brand-new task and re-notify
@@ -59,6 +60,9 @@ pub async fn run_once(pool: &PgPool, now: DateTime<Utc>) -> Result<SweepOutcome,
                   ':' || t.assignee_user_id || ':' || $2, \
                 jsonb_build_object('excerpt', t.text, 'due_at', t.due_at) \
          FROM doc_tasks t \
+         JOIN documents d ON d.id = t.doc_id AND d.archived_at IS NULL \
+         JOIN workspace_members m \
+           ON m.workspace_id = t.workspace_id AND m.user_id = t.assignee_user_id \
          WHERE t.assignee_user_id IS NOT NULL \
            AND t.checked = false \
            AND t.due_at IS NOT NULL \

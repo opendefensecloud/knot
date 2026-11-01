@@ -23,7 +23,7 @@ export default function NotificationsPage() {
     if (path) void nav(path);
   }
 
-  const items = list.data?.items ?? [];
+  const items = list.data ?? [];
 
   return (
     <div data-testid="notifications-page" className="max-w-3xl mx-auto px-6 py-8">
@@ -58,7 +58,15 @@ export default function NotificationsPage() {
       </div>
 
       {list.isPending && <p className="text-[13px] text-fg-muted">Loading…</p>}
-      {!list.isPending && items.length === 0 && (
+      {list.isError && (
+        <p className="text-[13px] text-destructive">
+          Couldn't load your notifications.{" "}
+          <button type="button" onClick={() => void list.refetch()} className="underline">
+            Try again
+          </button>
+        </p>
+      )}
+      {list.isSuccess && items.length === 0 && (
         <p className="text-[13px] text-fg-muted">Nothing here yet.</p>
       )}
 
@@ -95,6 +103,17 @@ export default function NotificationsPage() {
           );
         })}
       </ul>
+      {list.hasNextPage && (
+        <button
+          type="button"
+          data-testid="notifications-load-more"
+          disabled={list.isFetchingNextPage}
+          onClick={() => void list.fetchNextPage()}
+          className="mt-3 h-7 px-2 rounded text-[13px] text-fg-muted hover:text-fg hover:bg-muted"
+        >
+          {list.isFetchingNextPage ? "Loading…" : "Load more"}
+        </button>
+      )}
     </div>
   );
 }

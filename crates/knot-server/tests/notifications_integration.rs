@@ -164,7 +164,7 @@ async fn patch_json(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mention_in_a_comment_notifies_the_mentioned_user_only() {
-    let (state, _ws, doc, alice, bob) = seeded().await;
+    let (state, ws, doc, alice, bob) = seeded().await;
     let cookie = login(&state, "alice@example.com").await;
 
     let (status, _) = post_json(
@@ -177,7 +177,10 @@ async fn mention_in_a_comment_notifies_the_mentioned_user_only() {
     assert_eq!(status, StatusCode::CREATED);
 
     let notifications = state.notifications.as_ref().unwrap();
-    let bobs = notifications.list(bob, false, 50, None).await.unwrap();
+    let bobs = notifications
+        .list(bob, ws, &[], false, 50, None)
+        .await
+        .unwrap();
     assert_eq!(bobs.len(), 1);
     assert_eq!(bobs[0].kind, "mention");
     assert_eq!(bobs[0].doc_id, Some(doc));
@@ -185,7 +188,7 @@ async fn mention_in_a_comment_notifies_the_mentioned_user_only() {
     // The author gets nothing.
     assert!(
         notifications
-            .list(alice, false, 50, None)
+            .list(alice, ws, &[], false, 50, None)
             .await
             .unwrap()
             .is_empty()
@@ -194,7 +197,7 @@ async fn mention_in_a_comment_notifies_the_mentioned_user_only() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reply_notifies_thread_participants_but_not_the_replier() {
-    let (state, _ws, doc, alice, bob) = seeded().await;
+    let (state, ws, doc, alice, bob) = seeded().await;
     let alice_cookie = login(&state, "alice@example.com").await;
     let bob_cookie = login(&state, "bob@example.com").await;
 
@@ -219,12 +222,15 @@ async fn reply_notifies_thread_participants_but_not_the_replier() {
     assert_eq!(status, StatusCode::CREATED);
 
     let notifications = state.notifications.as_ref().unwrap();
-    let alices = notifications.list(alice, false, 50, None).await.unwrap();
+    let alices = notifications
+        .list(alice, ws, &[], false, 50, None)
+        .await
+        .unwrap();
     assert_eq!(alices.len(), 1);
     assert_eq!(alices[0].kind, "reply");
     assert!(
         notifications
-            .list(bob, false, 50, None)
+            .list(bob, ws, &[], false, 50, None)
             .await
             .unwrap()
             .is_empty()
@@ -233,7 +239,7 @@ async fn reply_notifies_thread_participants_but_not_the_replier() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mentioned_participant_gets_one_row_not_two() {
-    let (state, _ws, doc, alice, bob) = seeded().await;
+    let (state, ws, doc, alice, bob) = seeded().await;
     let alice_cookie = login(&state, "alice@example.com").await;
     let bob_cookie = login(&state, "bob@example.com").await;
 
@@ -259,7 +265,7 @@ async fn a_mentioned_participant_gets_one_row_not_two() {
         .notifications
         .as_ref()
         .unwrap()
-        .list(alice, false, 50, None)
+        .list(alice, ws, &[], false, 50, None)
         .await
         .unwrap();
     assert_eq!(rows.len(), 1, "mention wins; no duplicate reply row");
@@ -269,7 +275,7 @@ async fn a_mentioned_participant_gets_one_row_not_two() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn editing_a_comment_does_not_notify_thread_participants() {
-    let (state, _ws, doc, alice, bob) = seeded().await;
+    let (state, ws, doc, alice, bob) = seeded().await;
     let alice_cookie = login(&state, "alice@example.com").await;
     let bob_cookie = login(&state, "bob@example.com").await;
 
@@ -298,7 +304,7 @@ async fn editing_a_comment_does_not_notify_thread_participants() {
     let notifications = state.notifications.as_ref().unwrap();
     assert_eq!(
         notifications
-            .list(alice, false, 50, None)
+            .list(alice, ws, &[], false, 50, None)
             .await
             .unwrap()
             .len(),
@@ -317,7 +323,10 @@ async fn editing_a_comment_does_not_notify_thread_participants() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let bobs = notifications.list(bob, false, 50, None).await.unwrap();
+    let bobs = notifications
+        .list(bob, ws, &[], false, 50, None)
+        .await
+        .unwrap();
     assert!(
         bobs.is_empty(),
         "editing a comment must not fan out reply notifications to thread participants; got {bobs:?}"
@@ -326,7 +335,7 @@ async fn editing_a_comment_does_not_notify_thread_participants() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn editing_a_comment_to_add_a_mention_notifies_exactly_once() {
-    let (state, _ws, doc, alice, bob) = seeded().await;
+    let (state, ws, doc, alice, bob) = seeded().await;
     let _ = alice;
     let alice_cookie = login(&state, "alice@example.com").await;
 
@@ -344,7 +353,7 @@ async fn editing_a_comment_to_add_a_mention_notifies_exactly_once() {
     let notifications = state.notifications.as_ref().unwrap();
     assert!(
         notifications
-            .list(bob, false, 50, None)
+            .list(bob, ws, &[], false, 50, None)
             .await
             .unwrap()
             .is_empty()
@@ -360,7 +369,10 @@ async fn editing_a_comment_to_add_a_mention_notifies_exactly_once() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let bobs = notifications.list(bob, false, 50, None).await.unwrap();
+    let bobs = notifications
+        .list(bob, ws, &[], false, 50, None)
+        .await
+        .unwrap();
     assert_eq!(bobs.len(), 1);
     assert_eq!(bobs[0].kind, "mention");
 
@@ -375,7 +387,10 @@ async fn editing_a_comment_to_add_a_mention_notifies_exactly_once() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let bobs = notifications.list(bob, false, 50, None).await.unwrap();
+    let bobs = notifications
+        .list(bob, ws, &[], false, 50, None)
+        .await
+        .unwrap();
     assert_eq!(
         bobs.len(),
         1,
@@ -385,7 +400,7 @@ async fn editing_a_comment_to_add_a_mention_notifies_exactly_once() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn granting_access_notifies_the_grantee() {
-    let (state, _ws, doc, _alice, bob) = seeded().await;
+    let (state, ws, doc, _alice, bob) = seeded().await;
     let cookie = login(&state, "alice@example.com").await;
 
     let app = router_with_state(state.clone());
@@ -410,7 +425,7 @@ async fn granting_access_notifies_the_grantee() {
         .notifications
         .as_ref()
         .unwrap()
-        .list(bob, false, 50, None)
+        .list(bob, ws, &[], false, 50, None)
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -456,7 +471,7 @@ async fn explicit_mention_ids_reach_a_user_whose_name_has_a_space() {
         .notifications
         .as_ref()
         .unwrap()
-        .list(carol.id, false, 50, None)
+        .list(carol.id, ws, &[], false, 50, None)
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -505,7 +520,7 @@ async fn explicit_and_typed_mentions_union_instead_of_either_or() {
     let notifications = state.notifications.as_ref().unwrap();
     assert_eq!(
         notifications
-            .list(carol.id, false, 50, None)
+            .list(carol.id, ws, &[], false, 50, None)
             .await
             .unwrap()
             .len(),
@@ -514,7 +529,7 @@ async fn explicit_and_typed_mentions_union_instead_of_either_or() {
     );
     assert_eq!(
         notifications
-            .list(bob, false, 50, None)
+            .list(bob, ws, &[], false, 50, None)
             .await
             .unwrap()
             .len(),
@@ -525,7 +540,7 @@ async fn explicit_and_typed_mentions_union_instead_of_either_or() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_id_for_a_non_member_is_ignored() {
-    let (state, _ws, doc, _alice, _bob) = seeded().await;
+    let (state, ws, doc, _alice, _bob) = seeded().await;
     let cookie = login(&state, "alice@example.com").await;
 
     // A real user who is not a member of this workspace.
@@ -552,7 +567,7 @@ async fn an_id_for_a_non_member_is_ignored() {
             .notifications
             .as_ref()
             .unwrap()
-            .list(outsider.id, false, 50, None)
+            .list(outsider.id, ws, &[], false, 50, None)
             .await
             .unwrap()
             .is_empty(),
@@ -562,7 +577,7 @@ async fn an_id_for_a_non_member_is_ignored() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_comment_without_the_field_still_resolves_by_display_name() {
-    let (state, _ws, doc, _alice, bob) = seeded().await;
+    let (state, ws, doc, _alice, bob) = seeded().await;
     let cookie = login(&state, "alice@example.com").await;
 
     let (status, _) = post_json(
@@ -578,7 +593,7 @@ async fn a_comment_without_the_field_still_resolves_by_display_name() {
             .notifications
             .as_ref()
             .unwrap()
-            .list(bob, false, 50, None)
+            .list(bob, ws, &[], false, 50, None)
             .await
             .unwrap()
             .len(),
@@ -668,12 +683,47 @@ async fn the_inbox_is_per_user() {
     assert!(list["items"].as_array().unwrap().is_empty());
 }
 
+/// `method` on `uri` with an optional JSON body; just the status.
+async fn send(
+    state: &AppState,
+    cookie: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> StatusCode {
+    let app = router_with_state(state.clone());
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf_from(cookie));
+    let request = match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())),
+        None => builder.body(Body::empty()),
+    };
+    app.oneshot(request.unwrap()).await.unwrap().status()
+}
+
+/// What `user` sees: the list's length and the badge.
+async fn inbox_and_badge(state: &AppState, cookie: &str) -> (usize, i64) {
+    let (_, list) = get_json(state, cookie, "/api/notifications").await;
+    let (_, count) = get_json(state, cookie, "/api/notifications/unread_count").await;
+    (
+        list["items"].as_array().unwrap().len(),
+        count["count"].as_i64().unwrap(),
+    )
+}
+
+/// A page restricted after Bob was mentioned on it drops out of his inbox,
+/// and out of his badge with it: the badge never counts what the list
+/// can't show.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_row_for_a_doc_the_user_cannot_read_is_filtered_out() {
-    let (state, _ws, doc, _alice, bob) = seeded().await;
+async fn a_page_restricted_since_leaves_the_inbox_and_the_badge() {
+    let (state, _ws, doc, _alice, _bob) = seeded().await;
     let alice_cookie = login(&state, "alice@example.com").await;
     let bob_cookie = login(&state, "bob@example.com").await;
-
     post_json(
         &state,
         &alice_cookie,
@@ -681,68 +731,119 @@ async fn a_row_for_a_doc_the_user_cannot_read_is_filtered_out() {
         serde_json::json!({ "body": "hey @Bob" }),
     )
     .await;
-    assert_eq!(
-        get_json(&state, &bob_cookie, "/api/notifications").await.1["items"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(inbox_and_badge(&state, &bob_cookie).await, (1, 1));
 
-    // A notification pointing at a document Bob cannot read. Workspace
-    // membership grants a role on every doc in that workspace
-    // (knot_docs::acl::resolve), so the way to be unable to read a doc is
-    // for it to live in another workspace — which is exactly the tenancy
-    // guard at acl.rs:59-62, and the same `effective_role` -> None branch a
-    // revoked grant produces.
-    let other_ws = state
-        .workspaces
+    let status = send(
+        &state,
+        &alice_cookie,
+        "PUT",
+        &format!("/api/docs/{doc}/restricted"),
+        Some(serde_json::json!({ "restricted": true })),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(inbox_and_badge(&state, &bob_cookie).await, (0, 0));
+}
+
+/// Viewers can't read archived pages, so their notifications about one
+/// leave the inbox and the badge when it is archived.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_archived_since_leaves_a_viewers_inbox_and_badge() {
+    let (state, ws, doc, _alice, _bob) = seeded().await;
+    let hash = state.hasher.hash("hunter22").unwrap();
+    let vera = state
+        .users
         .as_ref()
         .unwrap()
-        .create("other", "Other")
-        .await
-        .unwrap();
-    let other_doc = state
-        .docs
-        .as_ref()
-        .unwrap()
-        .create(other_ws.id, None, "Elsewhere", "m", bob)
+        .create_local("vera@example.com", "Vera", &hash)
         .await
         .unwrap();
     state
-        .notifications
+        .workspaces
         .as_ref()
         .unwrap()
-        .emit(&knot_storage::NewNotification {
-            workspace_id: other_ws.id,
-            user_id: bob,
-            actor_id: None,
-            kind: knot_storage::NotificationKind::DocShared,
-            doc_id: Some(other_doc.id),
-            target_kind: "document".into(),
-            target_id: other_doc.id.to_string(),
-            dedupe_key: format!("share:{}:{bob}", other_doc.id),
-            data: serde_json::json!({}),
-        })
+        .add_member(ws, vera.id, WorkspaceRole::Viewer)
         .await
         .unwrap();
+    let alice_cookie = login(&state, "alice@example.com").await;
+    let vera_cookie = login(&state, "vera@example.com").await;
+    post_json(
+        &state,
+        &alice_cookie,
+        &format!("/api/docs/{doc}/comments"),
+        serde_json::json!({ "body": "hey @Vera" }),
+    )
+    .await;
+    assert_eq!(inbox_and_badge(&state, &vera_cookie).await, (1, 1));
 
-    // Two rows exist for Bob; the endpoint returns only the readable one.
-    assert_eq!(
+    let status = send(
+        &state,
+        &alice_cookie,
+        "DELETE",
+        &format!("/api/docs/{doc}"),
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(inbox_and_badge(&state, &vera_cookie).await, (0, 0));
+}
+
+/// Rows about pages the caller can't read are left out before the page
+/// limit, so they can't push readable rows off the first page.
+#[tokio::test(flavor = "multi_thread")]
+async fn hidden_rows_do_not_crowd_readable_ones_off_the_first_page() {
+    let (state, ws, doc, alice, bob) = seeded().await;
+    let alice_cookie = login(&state, "alice@example.com").await;
+    let bob_cookie = login(&state, "bob@example.com").await;
+    post_json(
+        &state,
+        &alice_cookie,
+        &format!("/api/docs/{doc}/comments"),
+        serde_json::json!({ "body": "hey @Bob" }),
+    )
+    .await;
+    let secret = state
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(ws, None, "Secret", "n", alice)
+        .await
+        .unwrap();
+    let status = send(
+        &state,
+        &alice_cookie,
+        "PUT",
+        &format!("/api/docs/{}/restricted", secret.id),
+        Some(serde_json::json!({ "restricted": true })),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    // Newer than the mention, about a page Bob can't read.
+    for n in 0..3 {
         state
             .notifications
             .as_ref()
             .unwrap()
-            .list(bob, false, 50, None)
+            .emit(&knot_storage::NewNotification {
+                workspace_id: ws,
+                user_id: bob,
+                actor_id: Some(alice),
+                kind: knot_storage::NotificationKind::Mention,
+                doc_id: Some(secret.id),
+                target_kind: "comment".into(),
+                target_id: Uuid::new_v4().to_string(),
+                dedupe_key: format!("mention:hidden-{n}"),
+                data: serde_json::json!({}),
+            })
             .await
-            .unwrap()
-            .len(),
-        2
-    );
-    let items = get_json(&state, &bob_cookie, "/api/notifications").await.1;
-    let items = items["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1, "the unreadable row is filtered, not 403'd");
-    assert_eq!(items[0]["kind"], "mention");
+            .unwrap();
+    }
+
+    let (_, list) = get_json(&state, &bob_cookie, "/api/notifications?limit=1").await;
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["doc_id"], doc.to_string());
+    assert_eq!(inbox_and_badge(&state, &bob_cookie).await, (1, 1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -804,4 +905,44 @@ async fn mark_read_with_all_true_clears_the_whole_inbox() {
         items.iter().all(|i| i["read"] == true),
         "every row must now be marked read: {items:?}"
     );
+}
+
+/// Sharing notifies when access is granted: changing the role of a grant
+/// Bob already has doesn't, and sharing again after a revoke does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_role_change_is_not_a_share_but_a_share_after_a_revoke_is() {
+    let (state, ws, doc, _alice, bob) = seeded().await;
+    let cookie = login(&state, "alice@example.com").await;
+    let grant = format!("/api/docs/{doc}/grants/user:{bob}");
+    let shares = || async {
+        state
+            .notifications
+            .as_ref()
+            .unwrap()
+            .list(bob, ws, &[], false, 50, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.kind == "doc_shared")
+            .count()
+    };
+    let put = |role: &'static str| {
+        send(
+            &state,
+            &cookie,
+            "PUT",
+            &grant,
+            Some(serde_json::json!({ "role": role, "inherit": true })),
+        )
+    };
+
+    assert_eq!(put("editor").await, StatusCode::NO_CONTENT);
+    assert_eq!(shares().await, 1);
+    assert_eq!(put("viewer").await, StatusCode::NO_CONTENT);
+    assert_eq!(shares().await, 1, "a role change is not a new share");
+
+    let status = send(&state, &cookie, "DELETE", &grant, None).await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(put("viewer").await, StatusCode::NO_CONTENT);
+    assert_eq!(shares().await, 2, "sharing again after a revoke notifies");
 }

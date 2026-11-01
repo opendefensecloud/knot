@@ -19,7 +19,7 @@ use knot_server::routes::api::markdown::{export_markdown_only, refresh_markdown_
 use knot_storage::{
     AssignedTask, DocTask, DocTaskInput, MarkdownCacheEntry, MarkdownCacheError,
     MarkdownCacheStore, PgMarkdownCache, PgSnapshotStore, PgTaskStore, PgUpdatesStore,
-    SnapshotStore, TaskStore, TaskStoreError, UpdatesStore, WorkspaceRole,
+    SnapshotStore, TaskStore, TaskStoreError, TaskWrite, UpdatesStore, WorkspaceRole,
 };
 use sqlx::PgPool;
 use tokio::sync::mpsc;
@@ -197,7 +197,7 @@ impl Harness {
             })
             .collect();
         PgTaskStore::new(self.pool().clone())
-            .upsert_for_doc(self.ws, doc, &inputs, None)
+            .upsert_for_doc(self.ws, doc, &inputs, TaskWrite::Edit(None))
             .await
             .unwrap();
         sqlx::query(
@@ -437,11 +437,11 @@ impl TaskStore for FlakyTasks {
         workspace_id: Uuid,
         doc_id: Uuid,
         items: &[DocTaskInput],
-        actor_id: Option<Uuid>,
+        write: TaskWrite,
     ) -> Result<(), TaskStoreError> {
         self.write()?;
         self.inner
-            .upsert_for_doc(workspace_id, doc_id, items, actor_id)
+            .upsert_for_doc(workspace_id, doc_id, items, write)
             .await
     }
 

@@ -1,7 +1,7 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { ApiResult } from "../../lib/api";
-import { notificationsApi, type NotificationList, type UnreadCount } from "../../lib/notifications.api";
+import { notificationsApi, type UnreadCount } from "../../lib/notifications.api";
 
 /** Delivery is polling, not push — see the spec's §6. Window focus covers
  *  most of the perceived latency; this is the ceiling. */
@@ -36,10 +36,17 @@ export function useUnreadCount() {
   });
 }
 
+/** The inbox, newest first, a page at a time (`fetchNextPage` loads the
+ *  next one). Fetched again whenever a list mounts, so opening the inbox
+ *  never shows a list older than the badge next to it. */
 export function useNotificationList(filter: "all" | "unread") {
-  return useQuery<NotificationList>({
+  return useInfiniteQuery({
     queryKey: ["notifications", "list", filter],
-    queryFn: async () => unwrapResult(await notificationsApi.list(filter)),
+    queryFn: async ({ pageParam }) => unwrapResult(await notificationsApi.list(filter, pageParam)),
+    initialPageParam: undefined as number | undefined,
+    getNextPageParam: (page) => page.next_cursor ?? undefined,
+    select: (data) => data.pages.flatMap((page) => page.items),
+    refetchOnMount: "always",
   });
 }
 

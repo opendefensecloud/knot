@@ -133,8 +133,6 @@ pub struct Refresh {
     /// Each page of the copy, its content and the seq of the update that
     /// holds it.
     pages: Vec<(Uuid, DocHandle, i64)>,
-    /// The user who duplicated the page.
-    actor_id: Uuid,
 }
 
 impl Refresh {
@@ -142,9 +140,7 @@ impl Refresh {
     /// the refresh sweep renders it and indexes its tasks later.
     pub async fn run(self, state: &AppState) {
         for (doc_id, content, seq) in self.pages {
-            if let Err(e) =
-                refresh_markdown_from(state, doc_id, &content, seq, Some(self.actor_id)).await
-            {
+            if let Err(e) = refresh_markdown_from(state, doc_id, &content, seq).await {
                 tracing::warn!(error = ?e, %doc_id, "duplicate: refresh of the copy failed");
             }
         }
@@ -434,7 +430,6 @@ pub async fn run(
                 Some((*doc_id, content, *seq))
             })
             .collect(),
-        actor_id: ctx.user_id,
     };
     Ok(Copied {
         top: outcome.top,

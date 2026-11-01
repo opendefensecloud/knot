@@ -1,12 +1,13 @@
 -- notifications
--- Created 2026-09-07
+-- Created 2026-11-01
 
 CREATE TABLE notifications (
   id            bigserial PRIMARY KEY,
   workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   user_id       uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   actor_id      uuid NULL REFERENCES users(id) ON DELETE SET NULL,
-  kind          text NOT NULL,
+  kind          text NOT NULL
+                CHECK (kind IN ('mention', 'reply', 'task_assigned', 'task_due', 'doc_shared')),
   doc_id        uuid NULL REFERENCES documents(id) ON DELETE CASCADE,
   target_kind   text NOT NULL,
   target_id     text NOT NULL,

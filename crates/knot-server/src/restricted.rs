@@ -164,7 +164,7 @@ pub async fn ensure_creator_can_edit(
         )
         .await
     {
-        Ok(()) => {}
+        Ok(_) => {}
         // Removed from the workspace since the snapshot: no page to keep.
         Err(GrantStoreError::NotMember) => return Ok(()),
         Err(e) => {

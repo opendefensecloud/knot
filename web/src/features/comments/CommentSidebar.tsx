@@ -82,6 +82,18 @@ export function CommentSidebar({ docId }: { docId: string }) {
   const comments: Comment[] = list.data && "ok" in list.data ? list.data.ok : [];
   const groups = groupByThread(comments);
 
+  // A thread a link opened (a notification) may have been resolved since,
+  // and is only listed with the resolved ones: show those, once per visit.
+  // Set while rendering, not in an effect: it settles in one extra render.
+  const threadLink = useUi((s) => s.threadLink);
+  const [handledLink, setHandledLink] = useState<typeof threadLink>(null);
+  if (list.isSuccess && threadLink && threadLink !== handledLink) {
+    setHandledLink(threadLink);
+    if (!showResolved && !groups.some((g) => g.threadId === threadLink.threadId)) {
+      setShowResolved(true);
+    }
+  }
+
   return (
     <div
       role="dialog"

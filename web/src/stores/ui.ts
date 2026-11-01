@@ -78,6 +78,11 @@ type UiState = {
   // and the sidebar scroll-into-view + focus ring.
   activeCommentId: string | null;
   setActiveCommentId: (id: string | null) => void;
+  // The thread a link (a notification's `?thread=`) last opened, a new
+  // object per visit: the sidebar shows resolved threads for it once, if
+  // that is where the thread is.
+  threadLink: { threadId: string } | null;
+  openThreadLink: (threadId: string) => void;
   // Skin — the palette + typography set. `skin` is the one showing and
   // `theme` its light/dark scheme, kept in the store so consumers can
   // branch on it cheaply. `skinMode` says which skin shows: `manualSkin`,
@@ -248,6 +253,9 @@ export const useUi = create<UiState>((set, get) => ({
   clearPendingAnchor: () => set({ pendingAnchor: null }),
   activeCommentId: null,
   setActiveCommentId: (id) => set({ activeCommentId: id }),
+  threadLink: null,
+  openThreadLink: (threadId) =>
+    set({ commentSidebarOpen: true, activeCommentId: threadId, threadLink: { threadId } }),
   skin: initialSkin,
   theme: schemeOf(initialSkin),
   ...stateOf(initialSkinPrefs),

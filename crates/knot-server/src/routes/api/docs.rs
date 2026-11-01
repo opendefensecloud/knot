@@ -1241,13 +1241,15 @@ async fn create_from_template_inline(
 
     // Import the template's markdown into the new doc via the room
     // actor (mirrors POST /api/docs/{id}/markdown).
-    let update_bytes = match knot_markdown::from_markdown::parse(&md) {
-        Ok((_doc, bytes)) => bytes,
+    let (page, update_bytes) = match knot_markdown::from_markdown::parse(&md) {
+        Ok(parsed) => parsed,
         Err(e) => {
             tracing::warn!(error=?e, "from_template parse");
             return json_err(StatusCode::UNPROCESSABLE_ENTITY, "markdown.parse", "");
         }
     };
+    // The template's assigned tasks are copied, not assigned anew.
+    crate::routes::api::markdown::index_copied_tasks(&state, new_doc.id, &page).await;
     let Some(rooms) = state.rooms_v2.clone() else {
         return internal();
     };

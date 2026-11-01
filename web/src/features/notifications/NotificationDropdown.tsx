@@ -24,7 +24,7 @@ export function NotificationDropdown({ onClose }: { onClose: () => void }) {
     if (path) void nav(path);
   }
 
-  const items = (list.data?.items ?? []).slice(0, 10);
+  const items = (list.data ?? []).slice(0, 10);
 
   return (
     <div
@@ -32,7 +32,11 @@ export function NotificationDropdown({ onClose }: { onClose: () => void }) {
       data-testid="notifications-dropdown"
       className="absolute left-2 right-2 top-full z-50 mt-1 rounded-md border border-border bg-surface shadow-lg overflow-hidden"
     >
-      {items.length === 0 && (
+      {list.isPending && <p className="px-3 py-3 text-[12px] text-fg-muted m-0">Loading…</p>}
+      {list.isError && (
+        <p className="px-3 py-3 text-[12px] text-destructive m-0">Couldn't load your notifications.</p>
+      )}
+      {list.isSuccess && items.length === 0 && (
         <p className="px-3 py-3 text-[12px] text-fg-muted m-0">Nothing here yet.</p>
       )}
       <ul className="m-0 p-0 list-none max-h-[320px] overflow-y-auto">

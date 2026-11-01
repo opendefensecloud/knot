@@ -217,7 +217,12 @@ pub async fn refresh_markdown_and_index(
     doc_id: Uuid,
     actor_id: Option<Uuid>,
 ) -> Result<String, RefreshError> {
-    refresh_markdown_inner(state, doc_id, TaskIndex::Edit { actor_id }).await
+    refresh_markdown_inner(
+        state,
+        doc_id,
+        TaskIndex::Write(knot_storage::TaskWrite::Edit(actor_id)),
+    )
+    .await
 }
 
 /// Export the doc to markdown WITHOUT re-running the task indexer.
@@ -246,23 +251,38 @@ pub(crate) async fn refresh_markdown_quietly(
 enum TaskIndex {
     /// Leaves them as they are, and so marks the cache row stale.
     Skip,
-    /// Rewrites them all, as after an edit (`upsert_for_doc`), by
-    /// `actor_id` when known.
-    Edit { actor_id: Option<Uuid> },
+    /// Rewrites them all (`upsert_for_doc`), as after an edit or for a copy.
+    Write(knot_storage::TaskWrite),
     /// Writes only the rows whose values change (`sync_for_doc_quiet`).
     Quiet,
 }
 
 /// [`refresh_markdown_and_index`] for a page whose state the caller already
-/// holds, `page` at `seq`: a copy Duplicate just stored, by `actor_id`.
+/// holds, `page` at `seq`: a copy Duplicate just stored. Its tasks are a
+/// copy's, so nobody is notified about them.
 pub(crate) async fn refresh_markdown_from(
     state: &AppState,
     doc_id: Uuid,
     page: &knot_crdt::DocHandle,
     seq: i64,
-    actor_id: Option<Uuid>,
 ) -> Result<String, RefreshError> {
-    render_and_index(state, doc_id, page, seq, TaskIndex::Edit { actor_id }).await
+    let copy = TaskIndex::Write(knot_storage::TaskWrite::Copy);
+    render_and_index(state, doc_id, page, seq, copy).await
+}
+
+/// Writes the task rows of a copied page, `page`, before its content goes
+/// to the room (from-template, workspace import), so they arrive assigned
+/// without notifying anyone: the reindex that follows the room's update
+/// finds them already recorded. Best effort; failures are logged.
+pub(crate) async fn index_copied_tasks(
+    state: &AppState,
+    doc_id: Uuid,
+    page: &knot_crdt::DocHandle,
+) {
+    if let (Some(tasks), Some(docs)) = (state.tasks.as_deref(), state.docs.as_deref()) {
+        let copy = TaskIndex::Write(knot_storage::TaskWrite::Copy);
+        index_tasks(tasks, docs, doc_id, page, copy).await;
+    }
 }
 
 async fn refresh_markdown_inner(
@@ -368,9 +388,9 @@ async fn index_tasks(
                 .sync_for_doc_quiet(workspace_id, doc_id, &inputs)
                 .await
         }
-        TaskIndex::Edit { actor_id } => {
+        TaskIndex::Write(write) => {
             tasks
-                .upsert_for_doc(workspace_id, doc_id, &inputs, actor_id)
+                .upsert_for_doc(workspace_id, doc_id, &inputs, write)
                 .await
         }
         TaskIndex::Skip => return false,

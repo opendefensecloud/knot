@@ -326,3 +326,86 @@ async fn restricted_template_not_listed_for_non_grantee() {
         .expect("restricted template listed for its owner");
     assert_eq!(restricted_entry["restricted"], true);
 }
+
+/// A template's assigned tasks are copied into the new page, not assigned
+/// anew: nobody is notified, neither by the instantiation nor by the
+/// reindex the room's update triggers afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn instantiating_a_template_notifies_nobody() {
+    let (state, ws_id, tpl_id, _owner, _md) = seeded().await;
+    let hash = state.hasher.hash("hunter22").unwrap();
+    let bob = state
+        .users
+        .as_ref()
+        .unwrap()
+        .create_local("bob@example.com", "Bob", &hash)
+        .await
+        .unwrap();
+    state
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .add_member(ws_id, bob.id, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+    let assigned = format!("- [ ] [Bob](knot://user/{}) take minutes\n", bob.id);
+    let (_doc, update_bytes) = knot_markdown::from_markdown::parse(&assigned).unwrap();
+    let room = state
+        .rooms_v2
+        .as_ref()
+        .unwrap()
+        .acquire(tpl_id)
+        .await
+        .unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    room.tx
+        .send(Event::ReplaceWithMarkdown {
+            update_bytes,
+            by_user: None,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().expect("replace");
+
+    let app = router_with_state(state.clone());
+    let (sid, csrf) = login(&app).await;
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/docs/from-template/{tpl_id}"))
+                .header("cookie", format!("{sid}; csrf={csrf}"))
+                .header("x-csrf-token", &csrf)
+                .header("content-type", "application/json")
+                .body(Body::from("{}".to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let bytes = r.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let new_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+
+    let tasks = state
+        .tasks
+        .as_ref()
+        .unwrap()
+        .list_for_doc(new_id)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].assignee_user_id, Some(bob.id));
+    // What the reindex worker runs once the room's update lands.
+    knot_server::routes::api::markdown::refresh_markdown_and_index(&state, new_id, None)
+        .await
+        .unwrap();
+    let notified: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications WHERE user_id = $1")
+        .bind(bob.id)
+        .fetch_one(state.pool.as_ref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(notified, 0);
+}

@@ -23,8 +23,8 @@ use knot_server::duplicate::{
 use knot_server::{AppState, router_with_state};
 use knot_storage::{
     AssignedTask, BlobStore, BlobStoreError, DocStore, DocTask, DocTaskInput, PgDocStore,
-    PgSnapshotStore, PgUpdatesStore, SnapshotStore, TaskStore, TaskStoreError, UpdatesStore,
-    WorkspaceRole,
+    PgSnapshotStore, PgUpdatesStore, SnapshotStore, TaskStore, TaskStoreError, TaskWrite,
+    UpdatesStore, WorkspaceRole,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Notify, Semaphore};
@@ -976,7 +976,7 @@ impl TaskStore for GatedTasks {
         workspace_id: Uuid,
         doc_id: Uuid,
         items: &[DocTaskInput],
-        actor_id: Option<Uuid>,
+        write: TaskWrite,
     ) -> Result<(), TaskStoreError> {
         if self.armed.load(Ordering::SeqCst) {
             self.entered.notify_one();
@@ -984,7 +984,7 @@ impl TaskStore for GatedTasks {
             drop(self.open.acquire().await);
         }
         self.inner
-            .upsert_for_doc(workspace_id, doc_id, items, actor_id)
+            .upsert_for_doc(workspace_id, doc_id, items, write)
             .await
     }
 
@@ -1839,6 +1839,53 @@ async fn comments_history_shares_and_grants_are_not_copied() {
     // The copy's whole history is the one update that holds its content.
     assert_eq!(updates.since(copy, 0).await.unwrap().len(), 1);
     assert!(w.markdown(copy).await.contains("Second draft."));
+}
+
+/// The tasks of a copy arrive assigned: their assignees were told when the
+/// tasks were assigned, and aren't told again about the copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn copied_tasks_notify_nobody() {
+    let w = world().await;
+    let bob = w.member("bob@example.com", "editor").await;
+    let source = w.create_doc(&w.owner, "Plan", None).await;
+    w.set_markdown(
+        source,
+        &format!("- [ ] [Bob](knot://user/{}) ship it\n", bob.user_id),
+    )
+    .await;
+    let inbox = |user: Uuid| {
+        let pool = w.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM notifications WHERE user_id = $1 AND kind = 'task_assigned'",
+            )
+            .bind(user)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(inbox(bob.user_id).await, 1, "assigning the task notifies");
+
+    let copy = id_of(&w.duplicate_ok(source, Some(false)).await);
+    w.wait_for_refreshes().await;
+    assert!(
+        !w.state
+            .tasks
+            .as_ref()
+            .unwrap()
+            .list_for_doc(copy)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(inbox(bob.user_id).await, 1, "duplicating it does not");
+
+    // Nor does the next edit-time refresh of the copy.
+    knot_server::routes::api::markdown::refresh_markdown_and_index(&w.state, copy, None)
+        .await
+        .unwrap();
+    assert_eq!(inbox(bob.user_id).await, 1);
 }
 
 /// A copy is a copy: its checklist items are tasks again, for the same

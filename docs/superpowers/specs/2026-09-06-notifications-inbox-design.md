@@ -49,15 +49,11 @@ completed.
 
 ### 1. Schema
 
-One additive migration, plus a second one landing in the same review pass
-(`migrations/20261101120100_notifications_kind_check_and_task_assigned_seed.sql`)
-that constrains `kind` and pre-seeds `task_assigned` dedupe rows — see the note
-at the end of §2. No backfill of *visible* notifications: mentions, replies,
-and shares that happened before this ships stay unnotified. `task_assigned` is
-the one exception, and only in the dedupe sense: the seed migration inserts
-already-`read_at` rows for tasks assigned before this shipped, purely so the
-first reindex of an old document doesn't mistake pre-existing assignments for
-new ones (see §2).
+One additive migration (`migrations/20261101120000_notifications.sql`). No
+backfill: mentions, replies, assignments and shares that happened before this
+ships stay unnotified. Assignments need no seeding to stay that way — §2 tells
+a new assignment from an old one by the task rows an edit replaces, and an
+upgraded deployment's `doc_tasks` already holds its old ones.
 
 ```sql
 CREATE TABLE notifications (
@@ -130,46 +126,71 @@ Five sources:
 | --- | --- | --- |
 | `mention` | `routes/api/comments.rs`, replacing `broadcast_mentions` | `mention:<comment_id>` |
 | `reply` | same request path | `reply:<comment_id>` |
-| `doc_shared` | grant create in `routes/api/grants.rs` | `share:<doc_id>:<grantee>` |
+| `doc_shared` | a new grant in `routes/api/grants.rs` (not a role change) | `share:<doc_id>:<grantee>:<time of the share>` |
 | `task_assigned` | `knot_storage::tasks` reindex upsert | `task_assigned:<doc_id>:<sha256(text)[..16]>:<assignee>` |
-| `task_due` | periodic sweep (§4) | `task_due:<doc_id>:<sha256(text)[..16]>:<assignee>:<due date>` |
+| `task_due` | periodic sweep (§4) | `task_due:<doc_id>:<sha256(text)[..16]>:<assignee>:<sweep date>` |
 
 **Reply recipients** are the distinct authors of non-deleted comments in the
 thread, minus the actor, minus anyone already receiving a `mention` row for the
 same comment. Being mentioned in a reply to your own thread produces one
 notification, not two.
 
-**The `task_assigned` hazard.** `doc_tasks.id` is `"<doc_id>:<item_index>"`, and
-`upsert_for_doc` (`crates/knot-storage/src/tasks.rs:95-140`) deletes rows that
-fell out of the new id set and re-inserts the rest on *every* reindex — which
-runs on every document edit. Keying the notification off the row id or off "row
-inserted with an assignee" would re-notify every assignee every time anyone
-reordered a list. Hence the content-addressed key: reordering a list does not
-re-notify, and editing a task's text does. That trade is deliberate — an edited
-task is arguably a new task, and the alternative (tracking identity across
-reorders) is a much larger change to a table whose id scheme documents itself as
-intentionally unstable.
+**What counts as a new assignment.** `doc_tasks.id` is
+`"<doc_id>:<item_index>"`, and `upsert_for_doc` deletes rows that fell out of
+the new id set and re-inserts the rest on *every* reindex — which runs every two
+seconds while a document is being edited. Neither the row id nor "row inserted
+with an assignee" says whether a task is new: a reorder changes every id, and a
+task is often assigned before its text is typed, so the text changes on every
+flush while it is written.
 
-`task_due` (§4) faces the identical hazard for the identical reason — it is
-also computed from `doc_tasks` rows keyed by that same unstable id — and uses
-the same content-addressed scheme.
+So `upsert_for_doc` reads the doc's task rows before replacing them and compares,
+assignee by assignee (`assignment_changes` in `crates/knot-storage/src/tasks.rs`):
 
-Two consequences of that key are accepted rather than fixed.
+1. A task with the same assignee and text as an old row is that task — moved,
+   reopened, or unchanged. No notification.
+2. Of the rest, a task whose text is *similar* to a still-unmatched old row of
+   the same assignee is that task, edited: what the two texts share at their
+   start and end covers at least half of the shorter one. No new notification;
+   an unread one moves along with the edit, so it shows the text the task has
+   now.
+3. Any other open task is newly assigned, and notifies.
 
-**An assignee only sees their historical backlog, not a burst of it, on
-upgrade.** `task_assigned` re-derives from existing state rather than a write
-event, so on a deployment where `notifications` starts empty but `doc_tasks`
-already has assignments, the first reindex of each old document would
-otherwise notify every assignee about their entire back catalogue at once.
-Two guards exist for this: `upsert_for_doc` only ever notifies for an
-*unchecked* item (a task completed before this shipped, or between shipping
-and its next reindex, must not surface as a fresh assignment), and the
-migration landing alongside this one pre-seeds already-`read_at` dedupe rows
-for every currently-unchecked assigned task, computing the exact same
-`dedupe_key` in SQL so the first real reindex after deploy finds the row
-already there and no-ops. `crates/knot-storage/tests/notifications.rs` pins
-both: that a checked task never notifies, and that the SQL and Rust forms of
-the key agree byte-for-byte.
+Typing, fixing a typo or adding words keeps a task; rewriting it into different
+words makes it a new one, which is what it reads as. Handing a task to someone
+else notifies them. The quiet refresh sweep (a re-render nobody edited) never
+notifies.
+
+A copied page's tasks notify nobody: Duplicate writes them as a copy
+(`TaskWrite::Copy`), and from-template and workspace import write the parsed
+copy's task rows as a copy before its content reaches the room, so the reindex
+that follows finds every assignment already recorded.
+
+Of several unmatched rows, a changed task is paired with the one it is most like
+(the share of the longer text the two have in common), the closest pairs first,
+so that a task added next to an edited one doesn't take that one's row.
+
+The `dedupe_key` stays content-addressed: two replicas indexing the same edit
+compute the same key and write one row. It also means a fresh assignment whose
+key already has a row stays silent, which is accepted:
+
+- **Handing a task back.** Bob is notified about "ship it", it goes to Carol,
+  then back to Bob: Bob's earlier row holds the key, so he isn't told again
+  until retention has removed it.
+- **Delete and undo.** Only the rows the write replaces are compared, so a
+  task that leaves one reindex and comes back in a later one (deleted, then
+  undone more than two seconds later) counts as new. For a task that was
+  notified, its row holds the key and nothing is written. For one that never
+  was (assigned before the upgrade, copied, self-assigned on an import, or
+  pruned), it notifies once. Remembering removed assignments for a while would
+  close this; it isn't worth a table yet.
+- **An edit right after a duplicate.** Duplicate answers once the copy is
+  stored and writes the copy's task rows in the background afterwards, as main
+  designed it, so a long copy can't outlast the request. An edit of a copied
+  page before its rows are written indexes it as an edit, and notifies its
+  assignees.
+
+`task_due` (§4) is computed from the same unstably-keyed rows and uses the same
+content-addressed key, for the same reorder reason.
 
 **Identical task text does not notify twice.** Two checklist items reading
 "Follow up", assigned to the same person in the same document, hash to the same
@@ -253,29 +274,23 @@ existing listener tasks in `main.rs`. Two jobs:
 
 1. **Overdue tasks** — `doc_tasks WHERE due_at < now() AND due_at > now() -
    interval '7 days' AND NOT checked AND assignee_user_id IS NOT NULL`,
-   emitting `task_due`. The 7-day floor exists for the same upgrade reason as
-   §2's `task_assigned` seed: on an existing deployment, `doc_tasks` already
+   emitting `task_due`. The 7-day floor exists for an upgrade reason: on an
+   existing deployment, `doc_tasks` already
    has tasks that went overdue at any point in the workspace's history, while
    `notifications` starts out empty. Without the floor, the first sweep after
    this ships would treat the *entire* historical backlog of overdue work as
    newly overdue and fire a `task_due` burst for all of it; a task that has
    been sitting overdue for months is still visible on `/tasks` without
    needing a push. The dedupe key is content-addressed exactly like
-   `task_assigned`'s — `task_due:<doc_id>:<sha256(text)[..16]>:<assignee>:<due
+   `task_assigned`'s — `task_due:<doc_id>:<sha256(text)[..16]>:<assignee>:<sweep
    date>` — rather than keyed on `t.id`, for the identical reorder reason: an
    id-keyed key would re-fire whenever a list edit shifted a later item's
    `item_index`. The date suffix still makes an overdue task notify once per
    day, not once per sweep.
 2. **Retention** — delete read rows older than 90 days, and any row older than
-   180 days, **except `task_assigned` rows, which are never pruned by this
-   query.** Every other kind derives from a one-time write event and never
-   re-emits, so ordinary retention is safe. `task_assigned` is the exception:
-   its persisted row is the *only* thing suppressing the reindex-triggered
-   re-notify described in §2, so deleting a read row after 90 days would let
-   a later, unrelated edit of the same document re-notify the assignee about
-   a months-old, unchanged assignment. These rows are small in number and
-   tiny individually, so keeping them indefinitely costs nothing worth
-   reclaiming.
+   180 days, of every kind. Deleting a `task_assigned` row can't bring the
+   assignment back: §2 decides what is new from the task rows, not from the
+   notification.
 
 Every replica runs both. The unique index plus `ON CONFLICT DO NOTHING` makes
 concurrent sweeps idempotent, so no leader election, no advisory locks, and no
@@ -297,11 +312,15 @@ separate question, re-checked on read below.
 - `POST /api/notifications/read` — body `{"ids": […]}` or `{"all": true}`.
 
 **Stale access.** A notification can outlive your access to the document it
-points at. The list handler re-checks `effective_role` for rows carrying a
-`doc_id` and filters them out of the response, the same defensive re-check
-`routes/api/search.rs:1-5` performs on FTS candidates. Revoking a grant does not
-have to rewrite anyone's inbox, and a revoked user's stale rows are unreachable
-rather than 403-producing.
+points at: the page restricted, archived (for a viewer) or unshared since. The
+list and the count both take the caller's cached visibility snapshot
+(`AclCache::visibility`) and leave out rows about its hidden docs in SQL, as
+`/api/workspace/tasks` does, so the badge never counts what the list can't show
+and hidden rows can't fill a page. The list checks its rows again against a
+snapshot covering their docs, for docs newer than the cached one. Both are
+scoped to the caller's workspace. Revoking a grant does not have to rewrite
+anyone's inbox, and a revoked user's stale rows are unreachable rather than
+403-producing.
 
 ### 6. Transport: polling
 
@@ -359,16 +378,14 @@ beside the existing metrics. The sweep logs its emit and prune counts at debug.
   swapped positions; assert no new rows. This is §2's hazard as an executable
   assertion, and it is the test most likely to catch a future change to the task
   id scheme.
-- Editing a task's text does emit — the documented other half of that trade.
+- Editing a task's text, and typing it flush by flush, does not emit again; the
+  unread notification shows the final text. Rewriting it into different words
+  does emit. Reopening a completed task does not; handing it to someone else
+  notifies them. A quiet sync notifies nobody.
 - A task that lands **checked** (never notified while open — e.g. imported
   already done) does not emit `task_assigned`.
-- The SQL dedupe-key expression the seed migration uses and
-  `task_assigned_dedupe_key` in Rust agree byte-for-byte, ASCII and non-ASCII
-  text alike — the seed migration is silently useless if they ever diverge.
-- Retention prunes read rows past 90 days and everything past 180, **except**
-  a read `task_assigned` row of the same age, which must survive; a same-age
-  `mention` row in the same test is the control that proves the exclusion is
-  kind-specific, not a floor that swallowed the whole prune.
+- Retention prunes read rows past 90 days and everything past 180; pruning a
+  read `task_assigned` row doesn't make the next edit re-notify.
 - Deleting a document cascades its notifications away.
 
 **`crates/knot-server/tests/notifications_sweep.rs`**
@@ -376,6 +393,7 @@ beside the existing metrics. The sweep logs its emit and prune counts at debug.
 - Sweep: an overdue task emits once, a second sweep in the same day no-ops, the
   next day emits again.
 - A checked task is never overdue.
+- Only a task that went overdue in the last 7 days notifies.
 - **Reorder characterisation for `task_due`:** an overdue task notifies once;
   inserting an unrelated item above it (shifting its `doc_tasks.id`) and
   sweeping again the same day must not produce a second `task_due` — the same

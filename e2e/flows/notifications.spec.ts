@@ -12,6 +12,7 @@ test.beforeAll(reset);
  *     → their badge shows 1
  *     → the dropdown lists it; clicking lands on the doc with the thread open
  *     → the badge clears
+ *   a thread resolved before its notification is opened still opens
  *
  * The mentioned member's display name contains a space, which the server's
  * @(\w+) fallback can never resolve — so this also proves the picker is
@@ -90,9 +91,46 @@ test("a mention reaches the mentioned user's inbox", async ({ browser }) => {
   await expect(row).toHaveAttribute("data-kind", "mention");
   await row.click();
 
-  await mara.waitForURL(new RegExp(`/doc/${docId}\\?thread=`));
+  await mara.waitForURL(new RegExp(`/doc/${docId}`));
   await expect(mara.getByTestId("comment-sidebar")).toBeVisible();
+  const activeThread = mara.locator("[data-testid^='comment-thread-'][data-active='true']");
+  await expect(activeThread).toBeVisible();
+  // The link's ?thread= is dropped once used.
+  await expect(mara).not.toHaveURL(/thread=/);
   await expect(mara.getByTestId("inbox-badge")).toHaveCount(0);
+
+  // A second thread mentioning Mara, resolved before she opens it.
+  await editor.click();
+  await owner.keyboard.press("End");
+  await owner.keyboard.type(" and that");
+  for (let i = 0; i < "that".length; i++) {
+    await owner.keyboard.press("Shift+ArrowLeft");
+  }
+  await owner.getByTestId("add-comment-float").click();
+  const second = owner.getByTestId("comment-composer-input-new");
+  await second.click();
+  await second.pressSequentially("this too @Mara");
+  await owner.getByTestId("mention-item").first().click();
+  await owner.getByTestId("comment-composer-submit-new").click();
+  const resolveButtons = owner.locator("[data-testid^='comment-resolve-']");
+  // Both threads listed, the new one last.
+  await expect(resolveButtons).toHaveCount(2);
+  const resolve = resolveButtons.last();
+  const resolvedThreadId = ((await resolve.getAttribute("data-testid")) ?? "").replace(
+    "comment-resolve-",
+    "",
+  );
+  expect(resolvedThreadId).toBeTruthy();
+  await resolve.click();
+
+  await mara.goto("/");
+  await mara.getByTestId("sidebar-inbox").click();
+  await mara.getByTestId("notification-row").first().click();
+  await mara.waitForURL(new RegExp(`/doc/${docId}`));
+  await expect(mara.getByTestId(`comment-thread-${resolvedThreadId}`)).toHaveAttribute(
+    "data-active",
+    "true",
+  );
 
   // The full page renders too.
   await mara.goto("/notifications");

@@ -5,8 +5,8 @@ use chrono::{Duration, Utc};
 use knot_server::notifications_sweep;
 use knot_storage::{
     DocStore, DocTaskInput, NewNotification, NotificationKind, NotificationStore, PgDocStore,
-    PgNotificationStore, PgTaskStore, PgUserStore, PgWorkspaceStore, TaskStore, UserStore,
-    WorkspaceRole, WorkspaceStore, sort_key_between,
+    PgNotificationStore, PgTaskStore, PgUserStore, PgWorkspaceStore, TaskStore, TaskWrite,
+    UserStore, WorkspaceRole, WorkspaceStore, sort_key_between,
 };
 use uuid::Uuid;
 
@@ -50,7 +50,7 @@ async fn overdue_task_emits_once_per_day_even_across_concurrent_sweeps() {
                 checked: false,
                 due_at: Some(Utc::now() - Duration::days(1)),
             }],
-            Some(alice.id),
+            TaskWrite::Edit(Some(alice.id)),
         )
         .await
         .unwrap();
@@ -58,7 +58,7 @@ async fn overdue_task_emits_once_per_day_even_across_concurrent_sweeps() {
     let notifications = PgNotificationStore::new(pool.clone());
     // The assignment itself notified once; count from there.
     let before = notifications
-        .list(bob.id, false, 50, None)
+        .list(bob.id, ws.id, &[], false, 50, None)
         .await
         .unwrap()
         .len();
@@ -72,7 +72,10 @@ async fn overdue_task_emits_once_per_day_even_across_concurrent_sweeps() {
     let total = a.unwrap().due_emitted + b.unwrap().due_emitted;
     assert_eq!(total, 1, "concurrent sweeps must produce exactly one row");
 
-    let rows = notifications.list(bob.id, false, 50, None).await.unwrap();
+    let rows = notifications
+        .list(bob.id, ws.id, &[], false, 50, None)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), before + 1);
     assert!(rows.iter().any(|r| r.kind == "task_due"));
 
@@ -135,7 +138,7 @@ async fn task_due_survives_a_reorder_without_re_notifying() {
             ws.id,
             doc.id,
             std::slice::from_ref(&overdue),
-            Some(alice.id),
+            TaskWrite::Edit(Some(alice.id)),
         )
         .await
         .unwrap();
@@ -159,7 +162,12 @@ async fn task_due_survives_a_reorder_without_re_notifying() {
         ..overdue.clone()
     };
     tasks
-        .upsert_for_doc(ws.id, doc.id, &[inserted_above, shifted], Some(alice.id))
+        .upsert_for_doc(
+            ws.id,
+            doc.id,
+            &[inserted_above, shifted],
+            TaskWrite::Edit(Some(alice.id)),
+        )
         .await
         .unwrap();
 
@@ -170,7 +178,7 @@ async fn task_due_survives_a_reorder_without_re_notifying() {
     );
 
     let due_rows = PgNotificationStore::new(pool)
-        .list(bob.id, false, 50, None)
+        .list(bob.id, ws.id, &[], false, 50, None)
         .await
         .unwrap()
         .into_iter()
@@ -222,7 +230,7 @@ async fn a_checked_task_is_never_overdue() {
                 checked: true,
                 due_at: Some(Utc::now() - Duration::days(3)),
             }],
-            Some(alice.id),
+            TaskWrite::Edit(Some(alice.id)),
         )
         .await
         .unwrap();
@@ -277,7 +285,11 @@ async fn run_once_prunes_via_the_notification_store_and_reports_the_count() {
         })
         .await
         .unwrap();
-    let row_id = notifications.list(bob.id, false, 50, None).await.unwrap()[0].id;
+    let row_id = notifications
+        .list(bob.id, ws.id, &[], false, 50, None)
+        .await
+        .unwrap()[0]
+        .id;
 
     // Backdate past the 180-day everything-goes threshold. Issued as raw
     // SQL against the pool directly — mirroring the `backdate` helper in
@@ -299,10 +311,139 @@ async fn run_once_prunes_via_the_notification_store_and_reports_the_count() {
     );
     assert!(
         notifications
-            .list(bob.id, false, 50, None)
+            .list(bob.id, ws.id, &[], false, 50, None)
             .await
             .unwrap()
             .is_empty(),
         "the backdated row must actually be gone"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_tasks_that_went_overdue_this_week_notify() {
+    // A deployment that upgrades has tasks overdue since long before
+    // notifications existed; the sweep leaves those to `/tasks`.
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
+        .await
+        .unwrap();
+    let alice = PgUserStore::new(pool.clone())
+        .create_local("alice@x.test", "Alice", "$h$")
+        .await
+        .unwrap();
+    let bob = PgUserStore::new(pool.clone())
+        .create_local("bob@x.test", "Bob", "$h$")
+        .await
+        .unwrap();
+    let ws_store = PgWorkspaceStore::new(pool.clone());
+    ws_store
+        .add_member(ws.id, alice.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    ws_store
+        .add_member(ws.id, bob.id, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+    let doc = PgDocStore::new(pool.clone())
+        .create(ws.id, None, "Doc", &sort_key_between(None, None), alice.id)
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let overdue_since = |item_index: i32, text: &str, days: i64| DocTaskInput {
+        item_index,
+        text: text.into(),
+        assignee_user_id: Some(bob.id),
+        checked: false,
+        due_at: Some(now - Duration::days(days)),
+    };
+    PgTaskStore::new(pool.clone())
+        .upsert_for_doc(
+            ws.id,
+            doc.id,
+            &[
+                overdue_since(0, "six days late", 6),
+                overdue_since(1, "eight days late", 8),
+            ],
+            TaskWrite::Edit(Some(alice.id)),
+        )
+        .await
+        .unwrap();
+
+    let out = notifications_sweep::run_once(&pool, now).await.unwrap();
+    assert_eq!(out.due_emitted, 1);
+    let due: Vec<_> = PgNotificationStore::new(pool)
+        .list(bob.id, ws.id, &[], false, 50, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.kind == "task_due")
+        .collect();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].data["excerpt"], "six days late");
+}
+
+/// Overdue tasks on archived pages, and tasks of people no longer in the
+/// workspace, aren't swept: `/tasks` leaves both out, and nobody can act
+/// on them.
+#[tokio::test(flavor = "multi_thread")]
+async fn archived_pages_and_former_members_are_not_swept() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
+        .await
+        .unwrap();
+    let users = PgUserStore::new(pool.clone());
+    let ws_store = PgWorkspaceStore::new(pool.clone());
+    let mut ids = Vec::new();
+    for (email, role) in [
+        ("alice@x.test", WorkspaceRole::Owner),
+        ("bob@x.test", WorkspaceRole::Editor),
+        ("carol@x.test", WorkspaceRole::Editor),
+    ] {
+        let user = users.create_local(email, email, "$h$").await.unwrap();
+        ws_store.add_member(ws.id, user.id, role).await.unwrap();
+        ids.push(user.id);
+    }
+    let (alice, bob, carol) = (ids[0], ids[1], ids[2]);
+    let docs = PgDocStore::new(pool.clone());
+    let first_key = sort_key_between(None, None);
+    let archived = docs
+        .create(ws.id, None, "Old", &first_key, alice)
+        .await
+        .unwrap();
+    let live = docs
+        .create(
+            ws.id,
+            None,
+            "Live",
+            &sort_key_between(Some(&first_key), None),
+            alice,
+        )
+        .await
+        .unwrap();
+    let overdue = |assignee: Uuid| DocTaskInput {
+        item_index: 0,
+        text: "overdue thing".into(),
+        assignee_user_id: Some(assignee),
+        checked: false,
+        due_at: Some(Utc::now() - Duration::days(1)),
+    };
+    let tasks = PgTaskStore::new(pool.clone());
+    tasks
+        .upsert_for_doc(ws.id, archived.id, &[overdue(bob)], TaskWrite::Copy)
+        .await
+        .unwrap();
+    tasks
+        .upsert_for_doc(ws.id, live.id, &[overdue(carol)], TaskWrite::Copy)
+        .await
+        .unwrap();
+    docs.archive(ws.id, archived.id, alice).await.unwrap();
+    ws_store.remove_member(ws.id, carol).await.unwrap();
+
+    let out = notifications_sweep::run_once(&pool, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(out.due_emitted, 0);
 }
