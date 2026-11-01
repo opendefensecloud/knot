@@ -34,7 +34,7 @@ export function computeAddCommentPos({
 }: {
   caret: Caret;
   host: Host;
-  /** Live `getBoundingClientRect().bottom` of the sticky toolbar, or null in view mode. */
+  /** Live bottom of the sticky band covering the top (dock or toolbar), or null if none is up. */
   toolbarBottom: number | null;
   buttonWidth?: number;
 }): { top: number; left: number } {

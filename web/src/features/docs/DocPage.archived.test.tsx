@@ -138,6 +138,17 @@ describe("DocPage — archived", () => {
     expect(editor).toHaveAttribute("data-edit-mode", "false");
   });
 
+  it("ignores ⌘E on an archived page", async () => {
+    vi.stubGlobal("fetch", server("editor", { d1: [docBody("d1", "Runbook", "editor", archivedRoot)] }));
+    renderDoc("d1");
+
+    const editor = await screen.findByTestId("editor");
+    // Claimed (preventDefault) but inert: it never reaches the browser.
+    expect(fireEvent.keyDown(window, { key: "e", ctrlKey: true })).toBe(false);
+    expect(editor).toHaveAttribute("data-edit-mode", "false");
+    expect(window.sessionStorage.getItem("knot.editMode.d1")).not.toBe("1");
+  });
+
   it("offers owners permanent deletion too, and no share or template controls", async () => {
     vi.stubGlobal("fetch", server("owner", { d1: [docBody("d1", "Runbook", "owner", archivedRoot)] }));
     renderDoc("d1");
