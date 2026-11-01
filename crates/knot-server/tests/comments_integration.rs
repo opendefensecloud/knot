@@ -1012,7 +1012,7 @@ async fn workspace_owner_with_editor_grant_cannot_delete_others_comment_in_restr
 
 /// `@bob @carol` on a restricted doc only Carol was granted notifies Carol.
 #[tokio::test(flavor = "multi_thread")]
-async fn mention_broadcast_skips_members_without_access() {
+async fn mention_notification_skips_members_without_access() {
     let (state, ws_id, doc_id, alice) = state_with_seeded(WorkspaceRole::Owner).await;
     add_bob(&state, ws_id, WorkspaceRole::Editor).await;
     let carol = add_member(
@@ -1031,10 +1031,7 @@ async fn mention_broadcast_skips_members_without_access() {
         .await
         .unwrap();
     grant(&state, ws_id, doc_id, carol, WorkspaceRole::Viewer, alice).await;
-    let mut listener = sqlx::postgres::PgListener::connect_with(state.pool.as_ref().unwrap())
-        .await
-        .unwrap();
-    listener.listen("comment_mentions").await.unwrap();
+    let pool = state.pool.clone().unwrap();
     let app = router_with_state(state);
     let (sid_alice, csrf_alice) = login(&app, "alice@example.com").await;
 
@@ -1048,15 +1045,16 @@ async fn mention_broadcast_skips_members_without_access() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{comment}");
 
-    let notification = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
-        .await
-        .expect("a mention notification")
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_str(notification.payload()).unwrap();
-    assert_eq!(payload["comment_id"], comment["id"]);
+    let recipients: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM notifications WHERE kind = 'mention' AND target_id = $1",
+    )
+    .bind(comment["id"].as_str().unwrap())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        payload["user_ids"],
-        serde_json::json!([carol]),
-        "Bob, a workspace editor without a grant, is not told: {payload}"
+        recipients,
+        vec![carol],
+        "Bob, a workspace editor without a grant, is not told"
     );
 }

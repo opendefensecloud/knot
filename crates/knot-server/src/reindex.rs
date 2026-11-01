@@ -142,7 +142,11 @@ async fn refresh_caught(
     let state = state.clone();
     let task = tokio::spawn(async move {
         match refresh {
-            Refresh::Edit => refresh_markdown_and_index(&state, doc_id).await,
+            // The dirty-doc channel carries only a doc id, so there is no
+            // editor identity to forward: a `task_assigned` notification
+            // from this refresh has no actor, and is never suppressed as a
+            // self-assignment.
+            Refresh::Edit => refresh_markdown_and_index(&state, doc_id, None).await,
             Refresh::Sweep => refresh_markdown_quietly(&state, doc_id).await,
         }
     });

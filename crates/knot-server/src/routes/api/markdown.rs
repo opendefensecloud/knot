@@ -207,11 +207,22 @@ async fn room_snapshot(
 /// (state export + markdown serialise), because failures there mean
 /// callers got no usable text to return. A failed task write marks the
 /// cache row stale, so the refresh sweep tries the page again.
+///
+/// `actor_id` is whoever's edit triggered this refresh, forwarded to the
+/// task indexer so a fresh `task_assigned` notification can name an actor
+/// and self-assignment can be suppressed. Pass `None` when the caller has
+/// no edit to attribute (e.g. a plain export) or genuinely doesn't know.
 pub async fn refresh_markdown_and_index(
     state: &AppState,
     doc_id: Uuid,
+    actor_id: Option<Uuid>,
 ) -> Result<String, RefreshError> {
-    refresh_markdown_inner(state, doc_id, TaskIndex::Edit).await
+    refresh_markdown_inner(
+        state,
+        doc_id,
+        TaskIndex::Write(knot_storage::TaskWrite::Edit(actor_id)),
+    )
+    .await
 }
 
 /// Export the doc to markdown WITHOUT re-running the task indexer.
@@ -240,21 +251,38 @@ pub(crate) async fn refresh_markdown_quietly(
 enum TaskIndex {
     /// Leaves them as they are, and so marks the cache row stale.
     Skip,
-    /// Rewrites them all, as after an edit (`upsert_for_doc`).
-    Edit,
+    /// Rewrites them all (`upsert_for_doc`), as after an edit or for a copy.
+    Write(knot_storage::TaskWrite),
     /// Writes only the rows whose values change (`sync_for_doc_quiet`).
     Quiet,
 }
 
 /// [`refresh_markdown_and_index`] for a page whose state the caller already
-/// holds, `page` at `seq`: a copy Duplicate just stored.
+/// holds, `page` at `seq`: a copy Duplicate just stored. Its tasks are a
+/// copy's, so nobody is notified about them.
 pub(crate) async fn refresh_markdown_from(
     state: &AppState,
     doc_id: Uuid,
     page: &knot_crdt::DocHandle,
     seq: i64,
 ) -> Result<String, RefreshError> {
-    render_and_index(state, doc_id, page, seq, TaskIndex::Edit).await
+    let copy = TaskIndex::Write(knot_storage::TaskWrite::Copy);
+    render_and_index(state, doc_id, page, seq, copy).await
+}
+
+/// Writes the task rows of a copied page, `page`, before its content goes
+/// to the room (from-template, workspace import), so they arrive assigned
+/// without notifying anyone: the reindex that follows the room's update
+/// finds them already recorded. Best effort; failures are logged.
+pub(crate) async fn index_copied_tasks(
+    state: &AppState,
+    doc_id: Uuid,
+    page: &knot_crdt::DocHandle,
+) {
+    if let (Some(tasks), Some(docs)) = (state.tasks.as_deref(), state.docs.as_deref()) {
+        let copy = TaskIndex::Write(knot_storage::TaskWrite::Copy);
+        index_tasks(tasks, docs, doc_id, page, copy).await;
+    }
 }
 
 async fn refresh_markdown_inner(
@@ -354,12 +382,18 @@ async fn index_tasks(
             return false;
         }
     };
-    let written = if task_index == TaskIndex::Quiet {
-        tasks
-            .sync_for_doc_quiet(workspace_id, doc_id, &inputs)
-            .await
-    } else {
-        tasks.upsert_for_doc(workspace_id, doc_id, &inputs).await
+    let written = match task_index {
+        TaskIndex::Quiet => {
+            tasks
+                .sync_for_doc_quiet(workspace_id, doc_id, &inputs)
+                .await
+        }
+        TaskIndex::Write(write) => {
+            tasks
+                .upsert_for_doc(workspace_id, doc_id, &inputs, write)
+                .await
+        }
+        TaskIndex::Skip => return false,
     };
     match written {
         Ok(()) => true,
@@ -419,7 +453,9 @@ pub(super) async fn export_inline(
     if req.extensions().get::<EffectiveDocRole>().is_none() {
         return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
     }
-    let text = match refresh_markdown_and_index(&state, doc_id).await {
+    // A plain export doesn't edit the doc, so there's no actor to
+    // attribute a `task_assigned` notification to.
+    let text = match refresh_markdown_and_index(&state, doc_id, None).await {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error=?e, %doc_id, "md export refresh");
@@ -542,7 +578,7 @@ pub(super) async fn import_inline(
 
     match applied {
         Ok(_seq) => {
-            let _ = refresh_markdown_and_index(&state, doc_id).await;
+            let _ = refresh_markdown_and_index(&state, doc_id, Some(ctx.user_id)).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {

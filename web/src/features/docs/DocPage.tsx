@@ -10,7 +10,7 @@ import {
   useState,
   type CSSProperties,
 } from "react";
-import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
+import { Link, Outlet, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { StatusDot, SyncStatus, type ConnStatus } from "../../components/StatusDot";
@@ -138,6 +138,9 @@ export default function DocPage() {
   const closeCommentSidebar = useUi((s) => s.closeCommentSidebar);
   const viewport = useViewport();
 
+  const openThreadLink = useUi((s) => s.openThreadLink);
+
+
   const doc = useQuery({
     queryKey: ["doc", id],
     queryFn: () => docsApi.get(id!),
@@ -146,6 +149,26 @@ export default function DocPage() {
   const { refetch: refetchDoc } = doc;
   const docMeta = doc.data && "ok" in doc.data ? doc.data.ok : null;
   const archived = Boolean(docMeta?.archived_at);
+
+  // Arriving from a notification: /doc/:id?thread=<uuid>. The sidebar's
+  // existing active-thread machinery (CommentThread.tsx) does the scrolling
+  // and the focus ring — this just opens the sidebar and points it at the
+  // thread, once the doc is known (an archived page has no comments
+  // sidebar). The param is then dropped, so following the same link again
+  // opens the thread again, and a reload doesn't.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const threadParam = searchParams.get("thread");
+  useEffect(() => {
+    if (!threadParam || !docMeta) return;
+    if (!archived) openThreadLink(threadParam);
+    setSearchParams(
+      (params) => {
+        params.delete("thread");
+        return params;
+      },
+      { replace: true },
+    );
+  }, [threadParam, docMeta, archived, openThreadLink, setSearchParams]);
   const isArchiveRoot = archived && docMeta?.archive_root_id === docMeta?.id;
   // Only for the subpage count in the "Delete permanently" prompt.
   const archiveList = useQuery({

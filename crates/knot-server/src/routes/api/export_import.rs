@@ -721,10 +721,12 @@ async fn import(
         if rewritten.trim().is_empty() {
             continue;
         }
-        let update_bytes = match knot_markdown::from_markdown::parse(&rewritten) {
-            Ok((_doc, bytes)) => bytes,
+        let (page, update_bytes) = match knot_markdown::from_markdown::parse(&rewritten) {
+            Ok(parsed) => parsed,
             Err(_) => continue,
         };
+        // Imported tasks arrive assigned; nobody is notified about them.
+        super::markdown::index_copied_tasks(&state, new_doc_id, &page).await;
         let room = match rooms.acquire(new_doc_id).await {
             Ok(h) => h,
             Err(e) => {
@@ -745,7 +747,9 @@ async fn import(
         if matches!(rx.await, Ok(Ok(_))) {
             // Best-effort: kick the indexer so /tasks reflects the imported
             // tree without waiting for someone to hit each markdown export.
-            let _ = super::markdown::refresh_markdown_and_index(&state, new_doc_id).await;
+            let _ =
+                super::markdown::refresh_markdown_and_index(&state, new_doc_id, Some(ctx.user_id))
+                    .await;
         }
     }
 

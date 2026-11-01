@@ -63,13 +63,14 @@ export function CommentSidebar({ docId }: { docId: string }) {
   });
 
   const createThread = useMutation({
-    mutationFn: (body: string) =>
+    mutationFn: (v: { body: string; mentions: string[] }) =>
       commentsApi.createThread(
         docId,
-        body,
+        v.body,
         pendingAnchor?.positionY ?? null,
         pendingAnchor?.positionYEnd ?? null,
         pendingAnchor?.anchorText ?? null,
+        v.mentions,
       ),
     onSuccess: async (r) => {
       if ("error" in r) { notify("error", "Couldn't post comment"); return; }
@@ -80,6 +81,18 @@ export function CommentSidebar({ docId }: { docId: string }) {
 
   const comments: Comment[] = list.data && "ok" in list.data ? list.data.ok : [];
   const groups = groupByThread(comments);
+
+  // A thread a link opened (a notification) may have been resolved since,
+  // and is only listed with the resolved ones: show those, once per visit.
+  // Set while rendering, not in an effect: it settles in one extra render.
+  const threadLink = useUi((s) => s.threadLink);
+  const [handledLink, setHandledLink] = useState<typeof threadLink>(null);
+  if (list.isSuccess && threadLink && threadLink !== handledLink) {
+    setHandledLink(threadLink);
+    if (!showResolved && !groups.some((g) => g.threadId === threadLink.threadId)) {
+      setShowResolved(true);
+    }
+  }
 
   return (
     <div
@@ -118,7 +131,7 @@ export function CommentSidebar({ docId }: { docId: string }) {
             placeholder="Start a new thread…"
             submitLabel="Comment"
             isPending={createThread.isPending}
-            onSubmit={(body) => createThread.mutate(body)}
+            onSubmit={(body, mentions) => createThread.mutate({ body, mentions })}
             data-testid-input="comment-composer-input-new"
             data-testid-submit="comment-composer-submit-new"
           />

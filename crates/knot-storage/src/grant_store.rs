@@ -89,6 +89,8 @@ pub trait GrantStore: Send + Sync + 'static {
     /// a restricted doc; `NotMember` when `principal` is a `user:` who is
     /// not a member of `workspace_id`. The membership check is ordered
     /// against `WorkspaceStore::remove_member`, so no grant outlives it.
+    /// Returns whether the grant is new, rather than a change of one the
+    /// principal had.
     async fn put(
         &self,
         workspace_id: Uuid,
@@ -97,7 +99,7 @@ pub trait GrantStore: Send + Sync + 'static {
         role: WorkspaceRole,
         inherit: bool,
         granted_by: Uuid,
-    ) -> Result<(), GrantStoreError>;
+    ) -> Result<bool, GrantStoreError>;
     /// [`GrantStore::put`] for the break-glass `knot-server admin grant`,
     /// which has no acting user: the row's `granted_by` is NULL, and the
     /// grant is audited as `admin.grant` (actor NULL, `data.break_glass`,
@@ -267,7 +269,7 @@ impl GrantStore for PgGrantStore {
         role: WorkspaceRole,
         inherit: bool,
         granted_by: Uuid,
-    ) -> Result<(), GrantStoreError> {
+    ) -> Result<bool, GrantStoreError> {
         let mut tx = crate::begin(&self.pool).await?;
         let grant = NewGrant {
             workspace_id,
@@ -277,7 +279,7 @@ impl GrantStore for PgGrantStore {
             inherit,
             granted_by: Some(granted_by),
         };
-        upsert_in_tx(&mut tx, &grant).await?;
+        let inserted = upsert_in_tx(&mut tx, &grant).await?;
         audit::record_in_tx(
             &mut tx,
             workspace_id,
@@ -288,7 +290,7 @@ impl GrantStore for PgGrantStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(inserted)
     }
 
     async fn put_break_glass(
@@ -442,27 +444,33 @@ struct NewGrant<'principal> {
 
 /// Upsert `grant` and record its invalidation, after the membership check
 /// and the last-owner guard. The caller audits it and commits.
-async fn upsert_in_tx(tx: &mut PgConnection, grant: &NewGrant<'_>) -> Result<(), GrantStoreError> {
+/// Returns whether the row is new: `xmax` is 0 for an inserted row, and set
+/// for one the conflict updated.
+async fn upsert_in_tx(
+    tx: &mut PgConnection,
+    grant: &NewGrant<'_>,
+) -> Result<bool, GrantStoreError> {
     require_member(tx, grant.workspace_id, grant.principal).await?;
     if grant.role != WorkspaceRole::Owner {
         refuse_last_owner_removal(tx, grant.doc_id, grant.principal).await?;
     }
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO document_grants (doc_id, principal, role, inherit, granted_by)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (doc_id, principal) DO UPDATE
          SET role = EXCLUDED.role, inherit = EXCLUDED.inherit,
-             granted_at = now(), granted_by = EXCLUDED.granted_by",
+             granted_at = now(), granted_by = EXCLUDED.granted_by
+         RETURNING (xmax = 0) AS inserted",
     )
     .bind(grant.doc_id)
     .bind(grant.principal)
     .bind(grant.role.as_str())
     .bind(grant.inherit)
     .bind(grant.granted_by)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
     invalidations::record_in_tx(tx, grant.workspace_id, grant.doc_id, "grant-change").await?;
-    Ok(())
+    Ok(sqlx::Row::get(&inserted, "inserted"))
 }
 
 /// `NotMember` unless a `user:` principal is a member of the workspace.

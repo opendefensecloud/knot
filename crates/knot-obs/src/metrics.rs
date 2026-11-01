@@ -78,6 +78,12 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         "Collab socket upgraded -> initial document state queued to the client"
     );
 
+    // Notifications
+    describe_counter!(
+        "knot_notifications_emitted_total",
+        "Notifications written to the inbox, by kind"
+    );
+
     // Export
     describe_counter!(
         "knot_export_total",

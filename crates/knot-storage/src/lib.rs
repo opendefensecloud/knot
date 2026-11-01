@@ -11,6 +11,7 @@ pub mod grant_store;
 pub mod invalidations;
 pub mod lexorank;
 pub mod markdown_cache;
+pub mod notifications;
 pub mod placement;
 pub mod pool;
 pub mod search;
@@ -34,6 +35,10 @@ pub use markdown_cache::{
     MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore, PgMarkdownCache,
     STALE_RENDERER_VERSION,
 };
+pub use notifications::{
+    NewNotification, Notification, NotificationKind, NotificationStore, NotificationStoreError,
+    PgNotificationStore,
+};
 pub use placement::Placement;
 pub use pool::{Pool, PoolError, begin, connect};
 pub use search::{PgSearchStore, SearchHit, SearchStore, SearchStoreError};
@@ -42,7 +47,9 @@ pub use share_tokens::{PgShareTokenStore, ShareStoreError, ShareToken, ShareToke
 pub use snapshot_store::{
     DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStore, SnapshotStoreError,
 };
-pub use tasks::{AssignedTask, DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError};
+pub use tasks::{
+    AssignedTask, DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError, TaskWrite,
+};
 pub use updates_store::{DocUpdate, PgUpdatesStore, UpdatesStore, UpdatesStoreError};
 pub use user_store::{PgUserStore, User, UserStore, UserStoreError};
 pub use workspace_store::{

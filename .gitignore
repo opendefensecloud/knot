@@ -23,3 +23,4 @@ Cargo.lock.bak
 # Env
 .env
 .env.local
+*.tsbuildinfo

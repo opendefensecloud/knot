@@ -19,7 +19,7 @@ use knot_server::routes::api::markdown::{export_markdown_only, refresh_markdown_
 use knot_storage::{
     AssignedTask, DocTask, DocTaskInput, MarkdownCacheEntry, MarkdownCacheError,
     MarkdownCacheStore, PgMarkdownCache, PgSnapshotStore, PgTaskStore, PgUpdatesStore,
-    SnapshotStore, TaskStore, TaskStoreError, UpdatesStore, WorkspaceRole,
+    SnapshotStore, TaskStore, TaskStoreError, TaskWrite, UpdatesStore, WorkspaceRole,
 };
 use sqlx::PgPool;
 use tokio::sync::mpsc;
@@ -197,7 +197,7 @@ impl Harness {
             })
             .collect();
         PgTaskStore::new(self.pool().clone())
-            .upsert_for_doc(self.ws, doc, &inputs)
+            .upsert_for_doc(self.ws, doc, &inputs, TaskWrite::Edit(None))
             .await
             .unwrap();
         sqlx::query(
@@ -437,9 +437,12 @@ impl TaskStore for FlakyTasks {
         workspace_id: Uuid,
         doc_id: Uuid,
         items: &[DocTaskInput],
+        write: TaskWrite,
     ) -> Result<(), TaskStoreError> {
         self.write()?;
-        self.inner.upsert_for_doc(workspace_id, doc_id, items).await
+        self.inner
+            .upsert_for_doc(workspace_id, doc_id, items, write)
+            .await
     }
 
     async fn sync_for_doc_quiet(
@@ -776,7 +779,9 @@ async fn refresh_older_than_the_cached_render_leaves_the_tasks() {
         .await;
     h.seed_tasks(doc, &[(0, "one", true)]).await;
 
-    let md = refresh_markdown_and_index(&h.state, doc).await.unwrap();
+    let md = refresh_markdown_and_index(&h.state, doc, None)
+        .await
+        .unwrap();
 
     assert_eq!(md, "- [ ] one\n");
     assert_eq!(
@@ -859,7 +864,9 @@ async fn sweep_retries_a_page_whose_edit_reindex_failed() {
 
     // An edit's refresh writes the render, then fails to write the tasks.
     tasks.fail_next(1);
-    let md = refresh_markdown_and_index(&h.state, doc).await.unwrap();
+    let md = refresh_markdown_and_index(&h.state, doc, None)
+        .await
+        .unwrap();
     assert_eq!(md, "- [ ] one\n");
     assert_eq!(tasks.failed(), 1);
     assert!(h.tasks(doc).await.is_empty());
@@ -994,7 +1001,9 @@ async fn sweep_takes_a_page_again_once_a_render_of_it_finishes() {
     let doc = h.page("a", "- [ ] one\n").await;
     h.seed_attempts(doc, RENDERER_VERSION, 2).await;
 
-    refresh_markdown_and_index(&h.state, doc).await.unwrap();
+    refresh_markdown_and_index(&h.state, doc, None)
+        .await
+        .unwrap();
     assert_eq!(h.attempts(doc).await, None, "the edit's render finished");
 
     // Stale again, as after a failed task write or an old pod's render.

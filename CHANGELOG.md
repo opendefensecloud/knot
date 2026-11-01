@@ -8,6 +8,44 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Upgrading
+- One database migration runs on upgrade (the Helm chart's migrate hook
+  applies it). Rolling back to 0.9.5 needs a database restore: 0.9.5
+  doesn't start on a database with migrations it doesn't know.
+  - `20261101120000_notifications` adds the inbox's table. Mentions,
+    replies, shares and task assignments from before the upgrade aren't
+    notified. A task that went overdue in the 7 days before it is, as any
+    overdue task is.
+- Every replica now checks for overdue tasks every 15 minutes and deletes
+  old notifications: read ones after 90 days, all after 180. There is
+  nothing to configure.
+
+### Added
+- An Inbox in the sidebar, with an unread badge, and a full list under
+  `/notifications`. You hear about mentions in comments, replies in threads
+  you're part of, tasks assigned to you, your tasks going overdue, and
+  pages shared with you. Opening a notification takes you to the page, or
+  to the comment thread. The badge refreshes every 30 seconds and when you
+  come back to the tab; the list loads when you open it.
+  `GET /api/notifications`,
+  `GET /api/notifications/unread_count`, `POST /api/notifications/read`.
+  - A task notifies its assignee once. Small edits, moving or reopening it
+    don't notify again, and an unread notification shows the task's
+    current text; rewriting a task in different words counts as a new
+    task. Copying a page (duplicate, template, workspace import) notifies
+    nobody about the tasks it brings along.
+  - Notifications about pages you can no longer see (restricted, archived,
+    or unshared since) leave your inbox and your badge.
+  - Assigning yourself a task by typing it notifies you too, as the editor
+    doesn't tell the server who typed what.
+
+### Fixed
+- Members whose display name contains a space can be mentioned in a new
+  comment or reply. The server matched `@Christian Hüning` as
+  `@Christian`, found nobody, and told nobody; the mention picker now
+  sends who it picked. Adding a mention while editing a comment still
+  matches by name only.
+
 ## [0.9.5] - 2026-11-01
 
 Edit and Comments stay within reach while you read a long page, so you can

@@ -202,6 +202,7 @@ With the S3 blob backend, make sure knot's credentials allow `s3:DeleteObject` (
 - **Image size** — the runtime image is `scratch` + a static musl binary (mimalloc allocator). Expect ~20 MB.
 - **Resources** — defaults `100m/128Mi` requests, `1000m/512Mi` limits. Right-size based on workspace volume.
 - **Replicas** — knot's CRDT room actor is per-pod and discovers peers via Postgres `LISTEN/NOTIFY`, so `replicaCount > 1` works without sticky sessions. Each room is hosted by exactly one pod at a time; failover takes one TCP roundtrip.
+- **Notifications** — every replica checks for overdue tasks and deletes old notifications every 15 minutes, with nothing to configure and no coordination needed between replicas. Read notifications are deleted after 90 days, all after 180, and a page's go with it when it is deleted for good. They hold short excerpts (comment text, task text), so an excerpt of a deleted comment stays in its recipients' inboxes until then. `knot_notifications_emitted_total{kind}` counts them as they are written.
 - **Request body size** — image uploads and Word/OpenDocument exports (which upload the page's diagram pictures) send up to 10 MiB. A reverse proxy or ingress in front of knot must allow request bodies of at least 10 MiB. With ingress-nginx (default 1 MiB), set `nginx.ingress.kubernetes.io/proxy-body-size: 10m` in `ingress.annotations`.
 
 ## Uninstall

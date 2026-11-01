@@ -12,10 +12,10 @@ use knot_auth::{Hasher, Throttle};
 use knot_config::Config;
 use knot_docs::AclCache;
 use knot_storage::{
-    BlobMeta, BlobStore, CommentStore, DocStore, GrantStore, MarkdownCacheStore, PgBytesStore,
-    PgCommentStore, PgDocStore, PgGrantStore, PgMarkdownCache, PgSearchStore, PgSessionStore,
-    PgShareTokenStore, PgUserStore, PgWorkspaceStore, Pool, SearchStore, SessionStore,
-    ShareTokenStore, UserStore, WorkspaceStore,
+    BlobMeta, BlobStore, CommentStore, DocStore, GrantStore, MarkdownCacheStore, NotificationStore,
+    PgBytesStore, PgCommentStore, PgDocStore, PgGrantStore, PgMarkdownCache, PgNotificationStore,
+    PgSearchStore, PgSessionStore, PgShareTokenStore, PgUserStore, PgWorkspaceStore, Pool,
+    SearchStore, SessionStore, ShareTokenStore, UserStore, WorkspaceStore,
 };
 use uuid::Uuid;
 
@@ -33,6 +33,7 @@ pub mod export;
 pub mod export_check;
 pub mod http_error;
 pub mod metrics;
+pub mod notifications_sweep;
 pub mod protocol;
 pub mod reindex;
 pub mod release_notes;
@@ -66,6 +67,7 @@ pub struct AppState {
     pub boards: Option<Arc<dyn knot_storage::BoardStore>>,
     pub board_rooms: Option<Arc<knot_crdt::BoardRooms>>,
     pub tasks: Option<Arc<dyn knot_storage::TaskStore>>,
+    pub notifications: Option<Arc<dyn NotificationStore>>,
     pub contributors: Option<Arc<dyn knot_storage::ContributorStore>>,
     pub hasher: Arc<Hasher>,
     pub throttle: Arc<Throttle>,
@@ -116,6 +118,7 @@ impl AppState {
             boards: None,
             board_rooms: None,
             tasks: None,
+            notifications: None,
             contributors: None,
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
@@ -165,6 +168,8 @@ impl AppState {
             Arc::new(knot_storage::PgBoardStore::new(pool.clone()));
         let tasks: Arc<dyn knot_storage::TaskStore> =
             Arc::new(knot_storage::PgTaskStore::new(pool.clone()));
+        let notifications: Arc<dyn NotificationStore> =
+            Arc::new(PgNotificationStore::new(pool.clone()));
         let contributors: Arc<dyn knot_storage::ContributorStore> =
             Arc::new(knot_storage::PgContributorStore::new(pool.clone()));
         Self {
@@ -187,6 +192,7 @@ impl AppState {
             boards: Some(boards),
             board_rooms: None,
             tasks: Some(tasks),
+            notifications: Some(notifications),
             contributors: Some(contributors),
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),

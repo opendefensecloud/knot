@@ -17,6 +17,7 @@ const PublicDoc = lazy(() => import("./features/public/PublicDoc"));
 const LibraryReturn = lazy(() => import("./features/boards/LibraryReturn"));
 const TasksPage = lazy(() => import("./features/tasks/TasksPage"));
 const TemplatesPage = lazy(() => import("./features/docs/TemplatesPage"));
+const NotificationsPage = lazy(() => import("./features/notifications/NotificationsPage"));
 const ArchivePage = lazy(() => import("./features/docs/ArchivePage"));
 const AboutPage = lazy(() => import("./features/about/AboutPage"));
 
@@ -70,6 +71,7 @@ export const router = createBrowserRouter([
           { path: "settings", element: <Lazy><SettingsPage /></Lazy> },
           { path: "tasks", element: <Lazy><TasksPage /></Lazy> },
           { path: "templates", element: <Lazy><TemplatesPage /></Lazy> },
+          { path: "notifications", element: <Lazy><NotificationsPage /></Lazy> },
           { path: "archive", element: <Lazy><ArchivePage /></Lazy> },
           { path: "about", element: <Lazy><AboutPage /></Lazy> },
         ],
