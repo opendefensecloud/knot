@@ -67,10 +67,18 @@ export function EditorToolbar({
   editor,
   docId,
   onUploadFiles,
+  trailing,
+  trailingVisible = true,
 }: {
   editor: Editor | null;
   docId: string;
   onUploadFiles?: (files: File[]) => void;
+  /** Document controls (Edit, Comments) shown at the row's end once the
+   *  header's action row has scrolled away. */
+  trailing?: ReactNode;
+  /** The slot is always laid out while `trailing` is set; this only toggles
+   *  visibility, so crossing the scroll threshold never re-wraps the row. */
+  trailingVisible?: boolean;
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [linkOpen, setLinkOpen] = useState(false);
@@ -115,11 +123,15 @@ export function EditorToolbar({
     // `relative` moved to the inner row (it anchors the link popover) — on the
     // outer element it only ever lost to `sticky` by Tailwind's emit order,
     // which is not a contract worth depending on.
+    // `data-sticky-band` lets the reading-position and add-comment code find
+    // whichever band covers the top. On a phone, `pl-7` keeps Bold clear of
+    // AppShell's fixed menu button.
     <div
       data-testid="editor-toolbar"
+      data-sticky-band
       className="sticky top-0 z-10 py-2 mb-4 bg-bg/80 backdrop-blur border-b border-border"
     >
-      <div className="measure relative flex items-center gap-0.5 flex-wrap">
+      <div className="measure relative flex items-center gap-0.5 flex-wrap max-sm:pl-7">
         <Btn testId="toolbar-bold" label="Bold" active={editor.isActive("bold")}
           onClick={() => c().toggleBold().run()}>
           <Bold size={15} aria-hidden />
@@ -437,6 +449,16 @@ export function EditorToolbar({
             )}
           </div>
           </LinkPopoverWrap>
+        )}
+        {trailing && (
+          <div
+            data-testid="toolbar-doc-controls"
+            className={`ml-auto flex items-center pl-1 border-l border-border transition-opacity duration-150 ease-swift motion-reduce:transition-none ${
+              trailingVisible ? "" : "invisible opacity-0"
+            }`}
+          >
+            {trailing}
+          </div>
         )}
       </div>
     </div>

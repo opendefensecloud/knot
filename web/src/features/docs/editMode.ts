@@ -14,3 +14,14 @@ export function markDocEditMode(id: string): void {
     /* sessionStorage unavailable — DocPage falls back to view mode */
   }
 }
+
+/**
+ * ⌘E / Ctrl+E, the edit-mode toggle. Shared by DocPage's window listener and
+ * the editor, which must keep the same chord away from its own keymap.
+ * Shift and Alt variants are left to other bindings.
+ */
+export function isEditModeShortcut(
+  e: Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "shiftKey" | "altKey" | "key">,
+): boolean {
+  return (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "e";
+}

@@ -8,6 +8,26 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Added
+- Edit and Comments stay within reach in long documents. Once the row of
+  buttons under the title scrolls out of view, a slim bar with the page
+  title, Edit (⌘E) and Comments appears at the top of the page. While you
+  edit, the same two buttons sit at the end of the formatting toolbar.
+
+### Changed
+- ⌘E / Ctrl+E no longer toggles inline code; it only switches between
+  viewing and editing. Use the toolbar's inline-code button or backticks.
+
+### Fixed
+- Switching between viewing and editing, or opening and closing the
+  comments panel, no longer moves the text you're reading.
+- Starting to edit partway down a page puts the cursor where you were
+  reading, so you can type straight away.
+- ⌘E while typing no longer also turns the text around the cursor into
+  inline code.
+- ⌘E does nothing on an archived page, as the page is read-only.
+- On phones, the menu button no longer covers the toolbar's Bold button.
+
 ## [0.9.4] - 2026-10-31
 
 A searchable member list in the Permissions dialog, so adding someone to a

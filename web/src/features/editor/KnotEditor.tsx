@@ -1,6 +1,15 @@
 import { type Editor } from "@tiptap/core";
 import { EditorContent, useEditor } from "@tiptap/react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  type MutableRefObject,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import * as Y from "yjs";
 import { useNavigate } from "react-router-dom";
 
@@ -13,6 +22,8 @@ import { commentsApi } from "../../lib/comments.api";
 import { useUi } from "../../stores/ui";
 
 import { encodeAnchorRange } from "../comments/anchor";
+import { isEditModeShortcut } from "../docs/editMode";
+import { stickyCoverBottom } from "../docs/readingAnchor";
 import { workspaceApi } from "../workspace/workspace.api";
 import { computeAddCommentPos } from "./addCommentPos";
 import { createExtensions } from "./extensions";
@@ -25,6 +36,7 @@ import { EditorToolbar } from "./EditorToolbar";
 import { setReadableDocIds } from "./InternalLinkExtension";
 import { KnotProvider, type CommentChangeMsg, type MentionMsg, type ProviderStatus } from "./KnotProvider";
 import { looksLikeMarkdown, markdownToHtml } from "./markdownPaste";
+import { type KnotEditorHandle, placeCaretAtReadingLine, revealCaretBelowBand } from "./readingCaret";
 import { useReadableDocIds } from "./readableDocIds";
 
 type Pair = { doc: Y.Doc; provider: KnotProvider };
@@ -35,6 +47,9 @@ export function KnotEditor({
   onPendingBytes,
   role,
   editMode,
+  toolbarTrailing,
+  toolbarTrailingVisible,
+  handleRef,
 }: {
   docId: string;
   onStatus: (s: ProviderStatus) => void;
@@ -44,6 +59,11 @@ export function KnotEditor({
   onPendingBytes?: (bytes: number) => void;
   role: "owner" | "editor" | "viewer";
   editMode: boolean;
+  /** Doc-level controls for the end of the formatting toolbar. */
+  toolbarTrailing?: ReactNode;
+  toolbarTrailingVisible?: boolean;
+  /** Filled while the editor is mounted, so DocPage can place the caret. */
+  handleRef?: MutableRefObject<KnotEditorHandle | null>;
 }) {
   const [pair, setPair] = useState<Pair | null>(null);
 
@@ -87,13 +107,39 @@ export function KnotEditor({
       </div>
     );
   }
-  return <EditorBody pair={pair} role={role} docId={docId} editMode={editMode} />;
+  return (
+    <EditorBody
+      pair={pair}
+      role={role}
+      docId={docId}
+      editMode={editMode}
+      toolbarTrailing={toolbarTrailing}
+      toolbarTrailingVisible={toolbarTrailingVisible}
+      handleRef={handleRef}
+    />
+  );
 }
 
 const IMAGE_RE = /^image\/(png|jpe?g|gif|webp)$/;
 function isImageType(t: string): boolean { return IMAGE_RE.test(t); }
 
-function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner" | "editor" | "viewer"; docId: string; editMode: boolean }) {
+function EditorBody({
+  pair,
+  role,
+  docId,
+  editMode,
+  toolbarTrailing,
+  toolbarTrailingVisible,
+  handleRef,
+}: {
+  pair: Pair;
+  role: "owner" | "editor" | "viewer";
+  docId: string;
+  editMode: boolean;
+  toolbarTrailing?: ReactNode;
+  toolbarTrailingVisible?: boolean;
+  handleRef?: MutableRefObject<KnotEditorHandle | null>;
+}) {
   const canEdit = role !== "viewer" && editMode;
   const navigate = useNavigate();
   const qc = useQueryClient();
@@ -241,6 +287,11 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
       editorProps: {
         handleDOMEvents: {
           keydown: (_view, event) => {
+            // ⌘E toggles edit mode (DocPage listens on window).
+            // @tiptap/extension-code binds the same chord to toggleCode;
+            // returning true skips ProseMirror's keymaps, and the event
+            // still bubbles to the window listener.
+            if (isEditModeShortcut(event)) return true;
             if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v") {
               plainPasteRef.current = event.shiftKey;
             }
@@ -292,15 +343,15 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
         const coords = ed.view.coordsAtPos(from);
         const host = ed.view.dom.parentElement ?? ed.view.dom;
         const hostRect = host.getBoundingClientRect();
-        // The toolbar is sticky, so its live rect is the only honest way to
-        // tell whether the button would land under it — a host-relative
-        // offset says nothing once the host has scrolled beneath it.
-        const toolbar = document.querySelector("[data-testid='editor-toolbar']");
+        // The toolbar and the view-mode dock are sticky, so their live rect
+        // is the only honest way to tell whether the button would land under
+        // one — a host-relative offset says nothing once the host has
+        // scrolled beneath it.
         setAddCommentPos(
           computeAddCommentPos({
             caret: { top: coords.top, bottom: coords.bottom, left: coords.left },
             host: { top: hostRect.top, left: hostRect.left, width: hostRect.width },
-            toolbarBottom: toolbar ? toolbar.getBoundingClientRect().bottom : null,
+            toolbarBottom: stickyCoverBottom(ed.view.dom.closest("[data-testid='doc-page']") ?? document),
           }),
         );
         setSelectionRange({ from, to });
@@ -319,10 +370,29 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
 
   // Reflect editMode toggles into the live editor without re-creating it
   // (re-creating would tear down the Y binding, awareness, and history).
-  useEffect(() => {
+  // A layout effect, so DocPage's own layout effect (it runs after this
+  // one) restores the reading position and places the caret against the
+  // final, editable layout.
+  useLayoutEffect(() => {
     if (!editor) return;
     if (editor.isEditable !== canEdit) editor.setEditable(canEdit);
   }, [editor, canEdit]);
+
+  useLayoutEffect(() => {
+    if (!handleRef || !editor) return;
+    const scope = () => editor.view.dom.closest("[data-testid='doc-page']") ?? document;
+    handleRef.current = {
+      placeCaretAtReadingLine: () => {
+        if (editor.isDestroyed || !editor.isEditable) return;
+        placeCaretAtReadingLine(editor.view, scope());
+      },
+      revealCaretBelowBand: () => {
+        if (editor.isDestroyed || !editor.isEditable) return;
+        revealCaretBelowBand(editor.view, scope());
+      },
+    };
+    return () => { handleRef.current = null; };
+  }, [editor, handleRef]);
 
   // Register the editor with the highlight extension's ref holder. The
   // plugin needs an editor reference to decode Y.RelativePositions; this
@@ -407,6 +477,8 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
           editor={editor}
           docId={docId}
           onUploadFiles={(files) => { void uploadAndInsert(files); }}
+          trailing={toolbarTrailing}
+          trailingVisible={toolbarTrailingVisible}
         />
       )}
       <div
