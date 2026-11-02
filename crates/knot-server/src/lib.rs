@@ -14,8 +14,9 @@ use knot_docs::AclCache;
 use knot_storage::{
     BlobMeta, BlobStore, CommentStore, DocStore, GrantStore, MarkdownCacheStore, NotificationStore,
     PgBytesStore, PgCommentStore, PgDocStore, PgGrantStore, PgMarkdownCache, PgNotificationStore,
-    PgSearchStore, PgSessionStore, PgShareTokenStore, PgUserStore, PgWorkspaceStore, Pool,
-    SearchStore, SessionStore, ShareTokenStore, UserStore, WorkspaceStore,
+    PgSearchStore, PgSessionStore, PgShareTokenStore, PgSuggestionStore, PgUserStore,
+    PgWorkspaceStore, Pool, SearchStore, SessionStore, ShareTokenStore, SuggestionStore, UserStore,
+    WorkspaceStore,
 };
 use uuid::Uuid;
 
@@ -59,6 +60,8 @@ pub struct AppState {
     pub search: Option<Arc<dyn SearchStore>>,
     pub shares: Option<Arc<dyn ShareTokenStore>>,
     pub comments: Option<Arc<dyn CommentStore>>,
+    /// Change suggestions and their reply threads.
+    pub suggestions: Option<Arc<dyn SuggestionStore>>,
     pub blob_store: Option<Arc<dyn BlobStore>>,
     pub blob_meta: Option<Arc<BlobMeta>>,
     pub snapshots: Option<Arc<dyn knot_storage::SnapshotStore>>,
@@ -110,6 +113,7 @@ impl AppState {
             search: None,
             shares: None,
             comments: None,
+            suggestions: None,
             blob_store: None,
             blob_meta: None,
             snapshots: None,
@@ -160,6 +164,7 @@ impl AppState {
         let search: Arc<dyn SearchStore> = Arc::new(PgSearchStore::new(pool.clone()));
         let shares: Arc<dyn ShareTokenStore> = Arc::new(PgShareTokenStore::new(pool.clone()));
         let comments: Arc<dyn CommentStore> = Arc::new(PgCommentStore::new(pool.clone()));
+        let suggestions: Arc<dyn SuggestionStore> = Arc::new(PgSuggestionStore::new(pool.clone()));
         let blob_store: Arc<dyn BlobStore> = Arc::new(PgBytesStore::new(pool.clone()));
         let blob_meta = Arc::new(BlobMeta::new(pool.clone()));
         let snapshots: Arc<dyn knot_storage::SnapshotStore> =
@@ -184,6 +189,7 @@ impl AppState {
             search: Some(search),
             shares: Some(shares),
             comments: Some(comments),
+            suggestions: Some(suggestions),
             blob_store: Some(blob_store),
             blob_meta: Some(blob_meta),
             snapshots: Some(snapshots),

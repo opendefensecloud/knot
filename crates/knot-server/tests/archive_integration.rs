@@ -305,6 +305,33 @@ async fn writes_to_archived_doc_are_rejected() {
             json!({"body": "hi", "anchor": null}),
         ),
         (
+            &editor,
+            "POST",
+            format!("/api/docs/{doc}/suggestions"),
+            json!({
+                "kind": "insert",
+                "position_y": "AA==",
+                "position_y_end": "AA==",
+                "original_text": "",
+                "context_before": "",
+                "proposed_text": "late",
+            }),
+        ),
+        (
+            owner,
+            "POST",
+            format!("/api/docs/{doc}/suggestions/{}/reject", Uuid::new_v4()),
+            json!({}),
+        ),
+        (
+            &editor,
+            "POST",
+            format!("/api/docs/{doc}/suggestions/{}/withdraw", Uuid::new_v4()),
+            json!({}),
+        ),
+        // Task 5: add `POST /api/docs/{doc}/suggestions/{uuid}/accept` with
+        // body {"seen_text": ""} here once the route exists (409 doc.archived).
+        (
             owner,
             "POST",
             format!("/api/docs/{doc}/template"),

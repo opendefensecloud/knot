@@ -60,6 +60,8 @@ ammonia = "4"
 # compare gets wrong). serde writes a Version as its "x.y.z" string.
 semver = { version = "1", features = ["serde"] }
 zip = { version = "9.2", default-features = false, features = ["deflate"] }
+# Validates suggestion anchors (Yjs RelativePositions) before they are stored.
+yrs.workspace = true
 
 # Allocator: mimalloc on all platforms knot actually runs on.
 # musl's default mallocng has known throughput cliffs under multi-threaded
@@ -78,7 +80,6 @@ mimalloc = "0.1"
 [dev-dependencies]
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
-yrs.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 knot-auth = { path = "../knot-auth", features = ["fast-params"] }
