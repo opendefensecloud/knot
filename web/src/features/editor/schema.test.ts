@@ -86,6 +86,9 @@ const REGISTERED_EXTENSIONS = [
   "paste",
   "starterKit",
   "strike",
+  // Plugin-only: blue decorations for pending change suggestions. Decorations
+  // are view-only, so nothing it does reaches the document.
+  "suggestionsHighlight",
   "tabindex",
   "table",
   "table_cell",

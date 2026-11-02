@@ -439,6 +439,72 @@
 }
 
 /* ---------------------------------------------------------------- */
+/* Suggestion highlights — pending changes painted by               */
+/* SuggestionsHighlight. Blue, so they never read as comments.      */
+/* ---------------------------------------------------------------- */
+
+.ProseMirror .suggestion-highlight {
+  background: rgb(37 99 235 / 0.12);               /* blue-600 @ 12% */
+  border-bottom: 2px solid rgb(37 99 235 / 0.55);
+  cursor: pointer;
+  transition: background-color 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.ProseMirror .suggestion-highlight:hover {
+  background: rgb(37 99 235 / 0.18);
+}
+.ProseMirror .suggestion-highlight--active {
+  background: rgb(37 99 235 / 0.24);
+  border-bottom-color: rgb(37 99 235 / 0.9);
+}
+[data-theme="dark"] .ProseMirror .suggestion-highlight {
+  background: rgb(37 99 235 / 0.22);
+  border-bottom-color: rgb(37 99 235 / 0.65);
+}
+[data-theme="dark"] .ProseMirror .suggestion-highlight--active {
+  background: rgb(37 99 235 / 0.4);
+  border-bottom-color: rgb(37 99 235 / 0.95);
+}
+
+/* The range in the open composer: a selection-style tint. */
+.ProseMirror .suggestion-draft {
+  background: rgb(37 99 235 / 0.28);
+}
+[data-theme="dark"] .ProseMirror .suggestion-draft {
+  background: rgb(37 99 235 / 0.4);
+}
+
+/* Insertion point: a small solid pill with a white "+". The "+" comes from
+   ::before so the widget has no text node and never reaches the document's
+   text, the clipboard or a test's docText. */
+.ProseMirror .suggestion-insert-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin: 0 1px;
+  border-radius: 9999px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  vertical-align: 0.1em;
+  cursor: pointer;
+  user-select: none;
+}
+.ProseMirror .suggestion-insert-marker::before {
+  content: "+";
+}
+.ProseMirror .suggestion-insert-marker--active {
+  box-shadow: 0 0 0 2px rgb(37 99 235 / 0.35);
+}
+.ProseMirror .suggestion-draft-marker {
+  cursor: default;
+  box-shadow: 0 0 0 2px rgb(37 99 235 / 0.28);
+}
+
+/* ---------------------------------------------------------------- */
 /* Width modes — measure cap + per-block breakout                   */
 /*                                                                  */
 /* In fixed mode --knot-measure equals the content box, so every    */
