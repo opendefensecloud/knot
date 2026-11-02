@@ -29,4 +29,5 @@ pub use presence::PRESENCE_MAX_BYTES;
 pub use registry::{AcquireError, Rooms};
 pub use room::{ConnHandle, ConnId, Event, InMsg, JoinState, Room, RoomHandle};
 pub use snapshot::{SnapshotPolicy, SnapshotState};
+pub use suggestions::{ApplySuggestionError, ApplySuggestionRequest, SuggestionKind};
 pub use writer::{Applied, PersistJob};

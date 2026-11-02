@@ -140,6 +140,32 @@ pub enum Event {
         by_user: Option<Uuid>,
         reply: oneshot::Sender<Result<i64, String>>,
     },
+    /// Apply an accepted change suggestion to the live doc
+    /// ([`crate::suggestions::apply_suggestion`]): resolve its anchors, check
+    /// the text the owner saw, replace the range and record the suggestion
+    /// id in [`crate::suggestions::APPLIED_MAP`], all in one transaction.
+    /// The room first catches up on updates other replicas persisted, so a
+    /// lagging room doesn't answer `AnchorLost` for text it hasn't seen yet.
+    /// The update is persisted and fanned out like `PatchTaskChecked`'s; a
+    /// refusal writes nothing. When persisting fails the room evicts itself,
+    /// so no live room keeps an applied marker that storage lacks.
+    ApplySuggestion {
+        request: crate::suggestions::ApplySuggestionRequest,
+        /// Attribution for the persisted update: the suggester, who wrote
+        /// the words, not the accepting owner.
+        by_user: Option<Uuid>,
+        reply: oneshot::Sender<Result<i64, crate::suggestions::ApplySuggestionError>>,
+    },
+    /// Whether the doc records `suggestion_id` as applied, after catching up
+    /// on persisted updates. The marker in the doc is the single source of
+    /// truth for "was this applied", which recovering a suggestion stuck in
+    /// `applying` relies on. When the catch-up read fails the room drops
+    /// `reply` unanswered rather than answer from a doc that may be stale:
+    /// the caller treats a dropped channel as "unknown, ask again later".
+    SuggestionApplied {
+        suggestion_id: Uuid,
+        reply: oneshot::Sender<bool>,
+    },
     Shutdown,
 }
 
@@ -170,14 +196,18 @@ pub struct Room {
     /// whether yrs applied all of it or rejected the rest. The live doc then
     /// holds the refused content, so the final flush must NOT snapshot it:
     /// the next join reloads the page from storage, which never got the
-    /// refused update.
+    /// refused update. Also set when the room evicts itself over an applied
+    /// suggestion it could not persist (`Room::evict_unpersisted`), so no
+    /// snapshot carries that unpersisted marker to storage.
     evicted: bool,
 }
 
 pub struct RoomHandle {
     pub tx: mpsc::Sender<Event>,
     /// The room's lifetime. Cancel it to stop the room. The room cancels it
-    /// itself when it evicts itself (`Room::refuse_applied`), and its actor
+    /// itself when it evicts itself (`Room::refuse_applied`, or
+    /// `Room::evict_unpersisted` for an applied suggestion it could not
+    /// persist), and its actor
     /// cancels it whenever it ends, panics included. Once it is cancelled the
     /// registry treats the room as gone and boots a fresh one on the next
     /// join, and every WS shim of the room, which watches it, closes its
@@ -286,7 +316,7 @@ impl Room {
                 biased;
                 _ = self.shutdown.cancelled() => break,
                 _ = catchup_tick.tick() => {
-                    self.replay_since_watermark().await;
+                    let _ = self.replay_since_watermark().await;
                 }
                 _ = idle_tick.tick() => {
                     let idle = self.snap_state.last_apply_at.elapsed();
@@ -536,6 +566,100 @@ impl Room {
                         };
                         let _ = reply.send(Ok(final_seq));
                     }
+                    Some(Event::ApplySuggestion { request, by_user, reply }) => {
+                        use crate::suggestions::{APPLIED_MAP, ApplySuggestionError, apply_suggestion};
+                        use std::sync::{Arc, Mutex};
+                        use yrs::Transact;
+                        // Catch up first: the anchored text may come from an
+                        // edit another replica persisted that this room's
+                        // bus hasn't delivered yet. A failed read is let
+                        // through: at worst it costs a spurious `AnchorLost`
+                        // or `Changed`, which writes nothing.
+                        let _ = self.replay_since_watermark().await;
+                        // Both roots BEFORE the mutable transaction (see
+                        // ReplaceWithMarkdown: they take their own write lock).
+                        let _frag = self.doc.inner().get_or_insert_xml_fragment("default");
+                        let applied = self.doc.inner().get_or_insert_map(APPLIED_MAP);
+
+                        let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+                        let captured_clone = captured.clone();
+                        let sub = self.doc.inner().observe_update_v1(move |_txn, e| {
+                            *captured_clone.lock().unwrap() = Some(e.update.clone());
+                        });
+                        let apply_result = {
+                            let mut txn = self.doc.inner().transact_mut();
+                            apply_suggestion(&applied, &mut txn, &request)
+                        };
+                        // Dropping the subscription must happen AFTER the
+                        // txn closes (Drop on TransactionMut flushes the
+                        // update notification).
+                        drop(sub);
+
+                        if let Err(e) = apply_result {
+                            // Every check runs before the first mutation, so
+                            // a refusal left the doc as it was.
+                            let _ = reply.send(Err(e));
+                            continue;
+                        }
+                        // An apply always records its marker, so it can't be
+                        // a no-op; if nothing was captured, the doc holds a
+                        // change we can't persist.
+                        let Some(update_bytes) = captured.lock().unwrap().take() else {
+                            let _ = reply.send(Err(ApplySuggestionError::Persist("no update".into())));
+                            self.evict_unpersisted(request.suggestion_id);
+                            continue;
+                        };
+                        metrics::counter!("knot_room_updates_total", "source" => "suggestion").increment(1);
+                        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
+                        let _ = self.persist_tx.send(crate::writer::PersistJob {
+                            bytes: update_bytes.clone(),
+                            by_user_id: by_user,
+                            persisted: Some(persisted_tx),
+                        }).await;
+                        let framed = wrap_sync_update(&update_bytes);
+                        let mut to_close: Vec<ConnId> = Vec::new();
+                        for (cid, conn) in &self.conns {
+                            match conn.tx.try_send(framed.clone()) {
+                                Ok(_) => {}
+                                Err(_) => to_close.push(*cid),
+                            }
+                        }
+                        for cid in to_close { self.conns.remove(&cid); }
+                        let final_seq = match persisted_rx.await {
+                            Ok(Ok(seq)) => seq,
+                            Ok(Err(e)) => {
+                                let _ = reply.send(Err(ApplySuggestionError::Persist(e)));
+                                self.evict_unpersisted(request.suggestion_id);
+                                continue;
+                            }
+                            Err(_) => {
+                                let _ = reply.send(Err(ApplySuggestionError::Persist("persist channel closed".into())));
+                                self.evict_unpersisted(request.suggestion_id);
+                                continue;
+                            }
+                        };
+                        let _ = reply.send(Ok(final_seq));
+                    }
+                    Some(Event::SuggestionApplied { suggestion_id, reply }) => {
+                        use crate::suggestions::{APPLIED_MAP, is_applied};
+                        use yrs::Transact;
+                        // Without the catch-up the doc may lag an apply
+                        // another replica persisted, and a stale "no" would
+                        // let the sweep release a row whose text is already
+                        // applied. Drop `reply` instead: the sweep skips the
+                        // row and asks again on its next run.
+                        if !self.replay_since_watermark().await {
+                            tracing::warn!(
+                                doc_id = %self.doc_id,
+                                %suggestion_id,
+                                "catch-up failed; leaving the applied check unanswered"
+                            );
+                            continue;
+                        }
+                        let applied = self.doc.inner().get_or_insert_map(APPLIED_MAP);
+                        let txn = self.doc.inner().transact();
+                        let _ = reply.send(is_applied(&applied, &txn, suggestion_id));
+                    }
                     Some(Event::Revoke) => {
                         // Tell every connection to close (the WS shim sends
                         // 4403) and drop them: from here on `on_inbound`
@@ -574,7 +698,7 @@ impl Room {
                     }
                 }
                 Some(_seq) = self.bus_updates_rx.recv() => {
-                    self.replay_since_watermark().await;
+                    let _ = self.replay_since_watermark().await;
                 }
                 Some(payload) = self.bus_presence_rx.recv() => {
                     let mut to_close: Vec<ConnId> = Vec::new();
@@ -591,9 +715,9 @@ impl Room {
 
         // Final flush: write a snapshot at the current seq so the next boot
         // is cheap. Best-effort. Skipped when the room evicted itself over a
-        // refused update (`refuse_applied`): the live doc holds that refused
-        // content, and a snapshot of it would be the one thing that
-        // persisted it.
+        // refused update (`refuse_applied`) or an unpersisted suggestion
+        // apply (`evict_unpersisted`): the live doc holds that content, and a
+        // snapshot of it would be the one thing that persisted it.
         if !self.evicted {
             let _ = crate::snapshot::write_snapshot(
                 self.doc_id,
@@ -606,7 +730,12 @@ impl Room {
         }
     }
 
-    async fn replay_since_watermark(&mut self) {
+    /// Apply the updates persisted past the room's watermark (other
+    /// replicas' edits the bus may not have delivered yet). Returns whether
+    /// the store read succeeded, i.e. whether the doc is now caught up with
+    /// storage as of the read; a failure is logged and leaves the doc as it
+    /// was.
+    async fn replay_since_watermark(&mut self) -> bool {
         match self
             .updates_store
             .since(self.doc_id, self.last_applied_seq)
@@ -642,8 +771,12 @@ impl Room {
                         }
                     }
                 }
+                true
             }
-            Err(e) => tracing::debug!(error=?e, "catch-up replay failed"),
+            Err(e) => {
+                tracing::debug!(error=?e, "catch-up replay failed");
+                false
+            }
         }
     }
 
@@ -824,6 +957,27 @@ impl Room {
         self.evicted = true;
         // Ends the actor (the loop's next turn) and closes every other
         // connection (see above).
+        self.shutdown.cancel();
+    }
+
+    /// Evict the room after it applied suggestion `suggestion_id` but could
+    /// not persist the change. The live doc then holds the new text and the
+    /// applied marker while storage holds neither, and no live room may keep
+    /// such a marker: a recovery sweep asking `SuggestionApplied` must see
+    /// what storage has. As in [`Self::refuse_applied`], the room ends
+    /// without its final snapshot and every connection is closed through
+    /// the room's token, so clients reconnect to a room reloaded from
+    /// storage. A client that got the fan-out pushes the text and the marker
+    /// back together in its resync, so they are persisted as a pair or not
+    /// at all.
+    fn evict_unpersisted(&mut self, suggestion_id: Uuid) {
+        tracing::warn!(
+            doc_id = %self.doc_id,
+            %suggestion_id,
+            "could not persist an applied suggestion; evicting the room"
+        );
+        metrics::counter!("knot_room_evicted_total").increment(1);
+        self.evicted = true;
         self.shutdown.cancel();
     }
 }
@@ -1947,5 +2101,478 @@ pub(crate) mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(10), h.shutdown.cancelled())
             .await
             .expect("the room's token was not cancelled when its actor ended");
+    }
+
+    /// The client id the suggestion tests build their seed content with, so
+    /// they can anchor on known item ids.
+    const SEED_CLIENT: u64 = 7;
+
+    /// The text the suggestion tests seed the page with. As a fresh doc of
+    /// [`SEED_CLIENT`], the paragraph is clock 0, its XmlText clock 1 and its
+    /// characters start at clock 2, so "world" is clocks 8..=12.
+    const SEED_TEXT: &str = "hello world";
+
+    /// Update bytes of a fresh doc of [`SEED_CLIENT`] holding
+    /// `paragraph > text`.
+    fn seed_paragraph(text: &str) -> Vec<u8> {
+        use yrs::{Doc, ReadTxn, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+        let doc = Doc::with_client_id(SEED_CLIENT);
+        let frag = doc.get_or_insert_xml_fragment("default");
+        {
+            let mut txn = doc.transact_mut();
+            let para = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            para.push_back(&mut txn, XmlTextPrelim::new(text));
+        }
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+    }
+
+    /// A range anchor (raw RelativePosition v1 bytes) tied to the seed
+    /// character at `clock`: before it (assoc ≥ 0) for a start, after it
+    /// (assoc < 0) for an end.
+    fn seed_anchor(clock: u32, assoc: yrs::Assoc) -> Vec<u8> {
+        use yrs::updates::encoder::Encode;
+        yrs::StickyIndex::from_id(
+            yrs::ID::new(yrs::block::ClientID::new(SEED_CLIENT), clock),
+            assoc,
+        )
+        .encode_v1()
+    }
+
+    /// A suggestion replacing "world" of [`SEED_TEXT`] with "there", as
+    /// accepted by an owner who saw `seen`.
+    fn replace_world(seen: &str) -> crate::ApplySuggestionRequest {
+        crate::ApplySuggestionRequest {
+            suggestion_id: Uuid::new_v4(),
+            kind: crate::SuggestionKind::Replace,
+            start: seed_anchor(8, yrs::Assoc::After),
+            end: seed_anchor(12, yrs::Assoc::Before),
+            seen_text: seen.into(),
+            proposed_text: "there".into(),
+        }
+    }
+
+    /// Spawns a room over `updates` with no snapshots and a lazy policy.
+    async fn spawn_suggestion_room(
+        doc_id: Uuid,
+        updates: Arc<dyn knot_storage::UpdatesStore>,
+    ) -> RoomHandle {
+        spawn_suggestion_room_with(doc_id, updates, Arc::new(NoopSnapshots)).await
+    }
+
+    /// [`spawn_suggestion_room`] over the given snapshot store.
+    async fn spawn_suggestion_room_with(
+        doc_id: Uuid,
+        updates: Arc<dyn knot_storage::UpdatesStore>,
+        snapshots: Arc<dyn knot_storage::SnapshotStore>,
+    ) -> RoomHandle {
+        let bus = Arc::new(MemBus::new());
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            updates,
+            snapshots,
+            crate::snapshot::SnapshotPolicy {
+                every_n: 1000,
+                idle: std::time::Duration::from_secs(60),
+            },
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn apply_update(h: &RoomHandle, update_bytes: Vec<u8>, by_user: Option<Uuid>) {
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::ApplyUpdate {
+            update_bytes,
+            by_user,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        rx.await.unwrap().expect("apply update");
+    }
+
+    async fn apply_suggestion(
+        h: &RoomHandle,
+        request: crate::ApplySuggestionRequest,
+        by_user: Option<Uuid>,
+    ) -> Result<i64, crate::ApplySuggestionError> {
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::ApplySuggestion {
+            request,
+            by_user,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .expect("the room never answered the apply")
+            .unwrap()
+    }
+
+    async fn suggestion_applied(h: &RoomHandle, suggestion_id: Uuid) -> bool {
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::SuggestionApplied {
+            suggestion_id,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        rx.await.unwrap()
+    }
+
+    /// The room's `default` fragment as XML.
+    async fn exported_page(h: &RoomHandle) -> String {
+        use yrs::{GetString, Transact, Update, updates::decoder::Decode};
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::ExportState(tx)).await.unwrap();
+        let (bytes, _) = rx.await.unwrap().unwrap();
+        let doc = yrs::Doc::new();
+        let frag = doc.get_or_insert_xml_fragment("default");
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(&bytes).unwrap())
+            .unwrap();
+        frag.get_string(&doc.transact())
+    }
+
+    /// An accepted suggestion lands as exactly one persisted update,
+    /// credited to the suggester, and the page shows the new text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_suggestion_persists_one_update_by_suggester() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let h = spawn_suggestion_room(
+            Uuid::new_v4(),
+            Arc::new(RecordingUpdates { seen: seen.clone() }),
+        )
+        .await;
+        let seeder = Uuid::new_v4();
+        apply_update(&h, seed_paragraph(SEED_TEXT), Some(seeder)).await;
+
+        let suggester = Uuid::new_v4();
+        let seq = apply_suggestion(&h, replace_world("world"), Some(suggester))
+            .await
+            .expect("apply suggestion");
+        assert!(seq > 0, "apply returned a non-positive seq: {seq}");
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![Some(seeder), Some(suggester)],
+            "the apply should persist one row by the suggester, got {recorded:?}"
+        );
+        assert_eq!(
+            exported_page(&h).await,
+            "<paragraph>hello there</paragraph>"
+        );
+        h.shutdown.cancel();
+    }
+
+    /// A refused apply (the text differs from what the owner saw) writes
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_suggestion_refusal_persists_nothing() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let h = spawn_suggestion_room(
+            Uuid::new_v4(),
+            Arc::new(RecordingUpdates { seen: seen.clone() }),
+        )
+        .await;
+        apply_update(&h, seed_paragraph(SEED_TEXT), Some(Uuid::new_v4())).await;
+
+        let err = apply_suggestion(&h, replace_world("wrold"), Some(Uuid::new_v4()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, crate::ApplySuggestionError::Changed);
+
+        // A round trip through the actor, so a stray persist would have been
+        // queued, then past the writer's batch interval.
+        let page = exported_page(&h).await;
+        tokio::time::sleep(crate::writer::BATCH_INTERVAL * 2).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "the refusal persisted a row");
+        assert_eq!(page, "<paragraph>hello world</paragraph>");
+        assert!(!h.shutdown.is_cancelled(), "a refusal evicted the room");
+        h.shutdown.cancel();
+    }
+
+    /// `SuggestionApplied` reads the marker the apply records in the doc.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suggestion_applied_reports_true_after_apply_false_before() {
+        let h = spawn_suggestion_room(Uuid::new_v4(), Arc::new(NoopUpdates)).await;
+        apply_update(&h, seed_paragraph(SEED_TEXT), None).await;
+
+        let request = replace_world("world");
+        let id = request.suggestion_id;
+        assert!(!suggestion_applied(&h, id).await);
+        apply_suggestion(&h, request.clone(), None)
+            .await
+            .expect("apply suggestion");
+        assert!(suggestion_applied(&h, id).await);
+        assert!(!suggestion_applied(&h, Uuid::new_v4()).await);
+        assert_eq!(
+            apply_suggestion(&h, request, None).await.unwrap_err(),
+            crate::ApplySuggestionError::AlreadyApplied
+        );
+        h.shutdown.cancel();
+    }
+
+    /// A replica whose room lags behind the edit that made the anchored text
+    /// catches up before resolving, rather than answering `AnchorLost`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_replays_bus_before_resolving() {
+        use knot_storage::{
+            DocStore, PgDocStore, PgUpdatesStore, PgUserStore, PgWorkspaceStore, UpdatesStore,
+            UserStore, WorkspaceStore,
+        };
+
+        let pool = knot_test_support::fresh_db().await.pool;
+        let ws = PgWorkspaceStore::new(pool.clone())
+            .create("d", "W")
+            .await
+            .unwrap();
+        let u = PgUserStore::new(pool.clone())
+            .create_local("a@x.test", "A", "$h$")
+            .await
+            .unwrap();
+        PgWorkspaceStore::new(pool.clone())
+            .add_member(ws.id, u.id, knot_storage::WorkspaceRole::Owner)
+            .await
+            .unwrap();
+        let d = PgDocStore::new(pool.clone())
+            .create(ws.id, None, "D", "m", u.id)
+            .await
+            .unwrap();
+
+        let updates = Arc::new(PgUpdatesStore::new(pool.clone()));
+        let h = spawn_suggestion_room(d.id, updates.clone()).await;
+        // One round trip, so the catch-up tick's immediate first run is past
+        // and the next one is seconds away.
+        exported_page(&h).await;
+
+        // Another replica's edit: in the store, but not on this room's bus.
+        updates
+            .insert_batch(d.id, &[(Some(u.id), seed_paragraph(SEED_TEXT))])
+            .await
+            .unwrap();
+
+        apply_suggestion(&h, replace_world("world"), Some(u.id))
+            .await
+            .expect("a lagging room should catch up before resolving");
+        assert_eq!(
+            exported_page(&h).await,
+            "<paragraph>hello there</paragraph>"
+        );
+        h.shutdown.cancel();
+    }
+
+    /// An updates store whose writes always fail.
+    struct FailingUpdates;
+    #[async_trait::async_trait]
+    impl knot_storage::UpdatesStore for FailingUpdates {
+        async fn insert_batch(
+            &self,
+            _: Uuid,
+            _: &[(Option<Uuid>, Vec<u8>)],
+        ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+            Err(knot_storage::UpdatesStoreError::Sqlx(
+                sqlx::Error::PoolClosed,
+            ))
+        }
+        async fn since(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+            Ok(vec![])
+        }
+        async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
+            Ok(0)
+        }
+        async fn delete_up_to(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<u64, knot_storage::UpdatesStoreError> {
+            Ok(0)
+        }
+    }
+
+    /// A snapshot store that counts the snapshots written to it and stores
+    /// none.
+    #[derive(Default)]
+    struct CountingSnapshots {
+        inserts: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl knot_storage::SnapshotStore for CountingSnapshots {
+        async fn insert(
+            &self,
+            _: Uuid,
+            _: i64,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<(), knot_storage::SnapshotStoreError> {
+            self.inserts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn latest(
+            &self,
+            _: Uuid,
+        ) -> Result<Option<knot_storage::DocSnapshot>, knot_storage::SnapshotStoreError> {
+            Ok(None)
+        }
+        async fn gc(
+            &self,
+            _: Uuid,
+            _: i64,
+            _: i32,
+        ) -> Result<u64, knot_storage::SnapshotStoreError> {
+            Ok(0)
+        }
+        async fn list(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<Vec<knot_storage::SnapshotMeta>, knot_storage::SnapshotStoreError> {
+            Ok(vec![])
+        }
+        async fn by_seq(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<Option<knot_storage::DocSnapshot>, knot_storage::SnapshotStoreError> {
+            Ok(None)
+        }
+    }
+
+    /// An apply the store didn't take evicts the room: no live room may keep
+    /// an applied marker that storage lacks, and the evicted room writes no
+    /// final snapshot, which would be the one thing that persisted it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persist_failure_evicts_room() {
+        let snapshots = Arc::new(CountingSnapshots::default());
+        let h =
+            spawn_suggestion_room_with(Uuid::new_v4(), Arc::new(FailingUpdates), snapshots.clone())
+                .await;
+        // The seed's own persist fails too; the live doc holds it anyway.
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::ApplyUpdate {
+            update_bytes: seed_paragraph(SEED_TEXT),
+            by_user: None,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        assert!(rx.await.unwrap().is_err());
+        assert!(!h.shutdown.is_cancelled());
+
+        let err = apply_suggestion(&h, replace_world("world"), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::ApplySuggestionError::Persist(_)),
+            "expected a persist error, got {err:?}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.shutdown.cancelled())
+            .await
+            .expect("a persist failure did not evict the room");
+        // The actor drops its receiver only after the final flush, so once
+        // the channel is closed any snapshot it meant to write is written.
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.tx.closed())
+            .await
+            .expect("the evicted room's actor did not end");
+        assert_eq!(
+            snapshots.inserts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the evicted room snapshotted its unpersisted marker"
+        );
+    }
+
+    /// An updates store that takes every write and whose catch-up reads fail
+    /// while `fail_since` is set.
+    #[derive(Default)]
+    struct FlakyReads {
+        next_seq: std::sync::atomic::AtomicI64,
+        fail_since: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl knot_storage::UpdatesStore for FlakyReads {
+        async fn insert_batch(
+            &self,
+            _: Uuid,
+            batch: &[(Option<Uuid>, Vec<u8>)],
+        ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+            Ok(batch
+                .iter()
+                .map(|_| {
+                    self.next_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1
+                })
+                .collect())
+        }
+        async fn since(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+            if self.fail_since.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(knot_storage::UpdatesStoreError::Sqlx(
+                    sqlx::Error::PoolClosed,
+                ));
+            }
+            Ok(vec![])
+        }
+        async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
+            Ok(self.next_seq.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        async fn delete_up_to(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<u64, knot_storage::UpdatesStoreError> {
+            Ok(0)
+        }
+    }
+
+    /// When the room can't catch up it leaves `SuggestionApplied`
+    /// unanswered rather than answer from a doc that may lag storage: a
+    /// stale "no" would let the sweep release a row whose text is applied.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn applied_check_unanswered_when_catch_up_fails() {
+        let updates = Arc::new(FlakyReads::default());
+        let h = spawn_suggestion_room(Uuid::new_v4(), updates.clone()).await;
+        apply_update(&h, seed_paragraph(SEED_TEXT), None).await;
+        let request = replace_world("world");
+        let id = request.suggestion_id;
+        apply_suggestion(&h, request, None).await.expect("apply");
+
+        updates
+            .fail_since
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::SuggestionApplied {
+            suggestion_id: id,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .expect("the room neither answered nor dropped the check");
+        assert!(answer.is_err(), "answered {answer:?} without catching up");
+        assert!(!h.shutdown.is_cancelled(), "a failed read evicted the room");
+
+        updates
+            .fail_since
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(suggestion_applied(&h, id).await);
+        h.shutdown.cancel();
     }
 }
