@@ -1,5 +1,6 @@
 import { create } from "zustand";
 
+import type { SuggestionLive } from "../features/suggestions/liveState";
 import type { LatLon } from "../lib/sun";
 import {
   SKIN_KEYS,
@@ -24,6 +25,19 @@ export type PendingAnchor = {
   positionY: string;
   positionYEnd: string;
   anchorText: string;
+};
+
+/** The comment sidebar's two tabs. */
+export type SidebarTab = "comments" | "suggestions";
+
+/** The selection a suggestion composer is open for: the anchors as encoded
+ *  when "Suggest change" was clicked, and the text they held then. */
+export type PendingSuggestion = {
+  kind: "replace" | "insert";
+  positionY: string;
+  positionYEnd: string;
+  originalText: string;
+  contextBefore: string;
 };
 
 /** The light/dark axis. Derived from the active skin; never set directly. */
@@ -69,7 +83,9 @@ type UiState = {
   togglePalette: () => void;
   // Comment sidebar
   commentSidebarOpen: boolean;
-  openCommentSidebar: () => void;
+  /** Opens the sidebar on `tab`, Comments unless told otherwise. A button
+   *  that should keep the last tab passes the current `sidebarTab`. */
+  openCommentSidebar: (tab?: SidebarTab) => void;
   closeCommentSidebar: () => void;
   pendingAnchor: PendingAnchor | null;
   setPendingAnchor: (a: PendingAnchor) => void;
@@ -83,6 +99,27 @@ type UiState = {
   // that is where the thread is.
   threadLink: { threadId: string } | null;
   openThreadLink: (threadId: string) => void;
+  // Which tab the sidebar shows. Global, so every comment entry point
+  // switches it back to "comments" (see openCommentSidebar).
+  sidebarTab: SidebarTab;
+  setSidebarTab: (t: SidebarTab) => void;
+  // The open suggestion composer's target; also drawn as the draft range.
+  pendingSuggestion: PendingSuggestion | null;
+  setPendingSuggestion: (p: PendingSuggestion) => void;
+  clearPendingSuggestion: () => void;
+  // The focused suggestion card — its highlight is emphasised in the page.
+  activeSuggestionId: string | null;
+  setActiveSuggestionId: (id: string | null) => void;
+  // The suggestion a link (a notification's `?suggestion=`, or a click on a
+  // highlight) last opened, a new object per visit, like `threadLink`.
+  suggestionLink: { suggestionId: string } | null;
+  /** Opens the sidebar on the Suggestions tab with `id` active. */
+  openSuggestionLink: (id: string) => void;
+  // Each pending suggestion's state in the live document, by id, as
+  // KnotEditor last classified it. Missing ids are unknown (e.g. the
+  // Markdown view, where no editor runs).
+  suggestionLive: Record<string, SuggestionLive>;
+  setSuggestionLive: (m: Record<string, SuggestionLive>) => void;
   // Skin — the palette + typography set. `skin` is the one showing and
   // `theme` its light/dark scheme, kept in the store so consumers can
   // branch on it cheaply. `skinMode` says which skin shows: `manualSkin`,
@@ -246,7 +283,7 @@ export const useUi = create<UiState>((set, get) => ({
   closePalette: () => set({ paletteOpen: false }),
   togglePalette: () => set((s) => ({ paletteOpen: !s.paletteOpen })),
   commentSidebarOpen: false,
-  openCommentSidebar: () => set({ commentSidebarOpen: true }),
+  openCommentSidebar: (tab = "comments") => set({ commentSidebarOpen: true, sidebarTab: tab }),
   closeCommentSidebar: () => set({ commentSidebarOpen: false }),
   pendingAnchor: null,
   setPendingAnchor: (a) => set({ pendingAnchor: a }),
@@ -255,7 +292,24 @@ export const useUi = create<UiState>((set, get) => ({
   setActiveCommentId: (id) => set({ activeCommentId: id }),
   threadLink: null,
   openThreadLink: (threadId) =>
-    set({ commentSidebarOpen: true, activeCommentId: threadId, threadLink: { threadId } }),
+    set({ commentSidebarOpen: true, sidebarTab: "comments", activeCommentId: threadId, threadLink: { threadId } }),
+  sidebarTab: "comments",
+  setSidebarTab: (t) => set({ sidebarTab: t }),
+  pendingSuggestion: null,
+  setPendingSuggestion: (p) => set({ pendingSuggestion: p }),
+  clearPendingSuggestion: () => set({ pendingSuggestion: null }),
+  activeSuggestionId: null,
+  setActiveSuggestionId: (id) => set({ activeSuggestionId: id }),
+  suggestionLink: null,
+  openSuggestionLink: (id) =>
+    set({
+      commentSidebarOpen: true,
+      sidebarTab: "suggestions",
+      activeSuggestionId: id,
+      suggestionLink: { suggestionId: id },
+    }),
+  suggestionLive: {},
+  setSuggestionLive: (m) => set({ suggestionLive: m }),
   skin: initialSkin,
   theme: schemeOf(initialSkin),
   ...stateOf(initialSkinPrefs),

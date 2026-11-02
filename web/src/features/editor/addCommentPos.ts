@@ -1,6 +1,12 @@
 /** "Add comment" at 12px plus px-2 gutters. Used as the right-clamp width. */
 export const ADD_COMMENT_BUTTON_WIDTH = 112;
 
+/** "Suggest change" at the same size, which sits right of "Add comment". */
+export const SUGGEST_CHANGE_BUTTON_WIDTH = 128;
+
+/** Both selection-float buttons and the 4px gap between them. */
+export const SELECTION_FLOAT_WIDTH = ADD_COMMENT_BUTTON_WIDTH + 4 + SUGGEST_CHANGE_BUTTON_WIDTH;
+
 /** Height reserved above the caret for the button, matching its 12px/py-0.5 box. */
 const BUTTON_HEIGHT = 32;
 /** Gap below the selection when the button can't sit above it. */

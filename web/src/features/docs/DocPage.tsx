@@ -139,6 +139,10 @@ export default function DocPage() {
   const viewport = useViewport();
 
   const openThreadLink = useUi((s) => s.openThreadLink);
+  const openSuggestionLink = useUi((s) => s.openSuggestionLink);
+  // The header and dock buttons reopen the sidebar on the tab it last showed.
+  const sidebarTab = useUi((s) => s.sidebarTab);
+  const reopenCommentSidebar = useCallback(() => openCommentSidebar(sidebarTab), [openCommentSidebar, sidebarTab]);
 
 
   const doc = useQuery({
@@ -169,6 +173,21 @@ export default function DocPage() {
       { replace: true },
     );
   }, [threadParam, docMeta, archived, openThreadLink, setSearchParams]);
+  // The same for a suggestion: /doc/:id?suggestion=<uuid> opens the
+  // Suggestions tab on that card (SuggestionsPanel shows resolved ones when
+  // it is not pending, and scrolls the page to its highlight).
+  const suggestionParam = searchParams.get("suggestion");
+  useEffect(() => {
+    if (!suggestionParam || !docMeta) return;
+    if (!archived) openSuggestionLink(suggestionParam);
+    setSearchParams(
+      (params) => {
+        params.delete("suggestion");
+        return params;
+      },
+      { replace: true },
+    );
+  }, [suggestionParam, docMeta, archived, openSuggestionLink, setSearchParams]);
   const isArchiveRoot = archived && docMeta?.archive_root_id === docMeta?.id;
   // Only for the subpage count in the "Delete permanently" prompt.
   const archiveList = useQuery({
@@ -395,7 +414,7 @@ export default function DocPage() {
       onToggleEdit={toggleEditMode}
       showComments={showCommentsInDock}
       commentsOpen={commentSidebarOpen}
-      onToggleComments={commentSidebarOpen ? closeCommentSidebar : openCommentSidebar}
+      onToggleComments={commentSidebarOpen ? closeCommentSidebar : reopenCommentSidebar}
       editToggleRef={dockEditToggleRef}
       commentsRef={dockCommentsRef}
       size={viewport === "mobile" ? "md" : "sm"}
@@ -563,7 +582,7 @@ export default function DocPage() {
               ref={actionCommentsRef}
               data-testid="open-comments"
               label="Comments"
-              onClick={openCommentSidebar}
+              onClick={reopenCommentSidebar}
             >
               <MessageSquare size={16} aria-hidden />
             </IconButton>
