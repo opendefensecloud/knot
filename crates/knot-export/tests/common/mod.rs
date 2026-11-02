@@ -155,7 +155,10 @@ pub fn noise(len: usize) -> Vec<u8> {
 /// `ZipArchive::by_name` only.
 pub fn unzip(bytes: &[u8]) -> HashMap<String, Vec<u8>> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("a zip archive");
-    let names: Vec<String> = zip.file_names().map(str::to_owned).collect();
+    let names: Vec<String> = zip
+        .file_names()
+        .map(|name| name.expect("utf-8 entry name").into_owned())
+        .collect();
     names
         .into_iter()
         .map(|name| {

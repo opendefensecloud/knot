@@ -539,7 +539,10 @@ async fn import_preserves_manifest_order() {
 /// The names of every file in `zip`.
 fn zip_names(zip: &[u8]) -> Vec<String> {
     let archive = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
-    archive.file_names().map(str::to_string).collect()
+    archive
+        .file_names()
+        .map(|name| name.unwrap().into_owned())
+        .collect()
 }
 
 /// The text of `index.json` in `zip`.

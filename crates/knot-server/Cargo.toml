@@ -59,7 +59,7 @@ ammonia = "4"
 # What's new: orders release versions ("0.10.0" > "0.9.0", which a string
 # compare gets wrong). serde writes a Version as its "x.y.z" string.
 semver = { version = "1", features = ["serde"] }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9.2", default-features = false, features = ["deflate"] }
 
 # Allocator: mimalloc on all platforms knot actually runs on.
 # musl's default mallocng has known throughput cliffs under multi-threaded

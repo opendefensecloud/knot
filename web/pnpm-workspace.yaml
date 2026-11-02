@@ -26,6 +26,16 @@ overrides:
   # knot's HTML/SVG sanitiser (src/lib/sanitize.ts). Keep it floored at the
   # patched release regardless of what mermaid or excalidraw ask for.
   dompurify@<3.4.17: "^3.4.17"
+  # mermaid 11 asks for katex ^0.16; GHSA for the trust-bypass via prototype
+  # pollution needs >=0.18.2. 0.18.11 is deprecated upstream (accidental
+  # breaking change), hence the ceiling. mermaid 12 moves to ^0.18 — drop this
+  # with that bump.
+  katex@<0.18.2: ">=0.18.2 <0.18.11"
+  # eslint and typescript-estree ask for minimatch ^10; GHSA-g3hv-75wg-m249
+  # (globParts amplification at optimizationLevel >= 2) is only fixed in 11.0.1.
+  # The 3.x line used by eslint-plugin-import predates optimizationLevel, so it
+  # does not carry the vulnerable code, and 11 drops the default export it needs.
+  minimatch@10: "^11.0.1"
 
 # pnpm >= 10 blocks dependency lifecycle scripts unless they are approved here.
 # esbuild is the only package in this tree whose install script is required.
