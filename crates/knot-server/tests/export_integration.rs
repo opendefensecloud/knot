@@ -525,8 +525,8 @@ fn zip_names(zip: &[u8], prefix: &str) -> Vec<String> {
     let archive = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
     archive
         .file_names()
+        .map(|name| name.unwrap().into_owned())
         .filter(|name| name.starts_with(prefix))
-        .map(str::to_string)
         .collect()
 }
 

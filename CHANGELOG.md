@@ -8,6 +8,25 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-11-02
+
+A dependency-only release that picks up fixed versions of `zip`, KaTeX and
+minimatch. Nothing to configure and no migrations: upgrading from 0.9.6 and
+rolling back to it are both a plain image swap.
+
+### Security
+- `zip` 9.2.2 fixes GHSA-m665-v7pm-7grj (critical, "zip cloaking"),
+  GHSA-hjqx-j4rw-g7xv, GHSA-q7v9-x93c-xqv3, GHSA-9hj8-73fh-9963 and
+  GHSA-8hxf-qr8p-62x4. knot was not affected: workspace import reads the
+  archive in memory by entry name and never extracts it to disk or uses the
+  streaming reader, and knot builds `zip` with deflate only, so the legacy
+  Shrink/Reduce/Implode decoders and AES entries aren't compiled in.
+- KaTeX 0.18.10 fixes GHSA-238p-pmpm-9mq7 (prototype pollution bypassing
+  KaTeX's `trust` setting), reached through mermaid's math rendering.
+- minimatch 11 fixes GHSA-g3hv-75wg-m249 for the copy eslint uses. It is a
+  build-time tool only and never ships in the image. The older minimatch 3
+  that `eslint-plugin-import` uses predates the affected code.
+
 ## [0.9.6] - 2026-11-02
 
 knot now tells you when something needs you. An Inbox in the sidebar
@@ -972,7 +991,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.6...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.7...HEAD
+[0.9.7]: https://github.com/opendefensecloud/knot/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/opendefensecloud/knot/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/opendefensecloud/knot/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/opendefensecloud/knot/compare/v0.9.3...v0.9.4

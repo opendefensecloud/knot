@@ -169,10 +169,10 @@ fn zip_first_entry_can_be_stored() {
     let bytes = z.finish().unwrap();
     let mut ar = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
     let first = ar.by_index(0).unwrap();
-    assert_eq!(first.name(), "mimetype");
+    assert_eq!(first.name().unwrap(), "mimetype");
     assert_eq!(first.compression(), zip::CompressionMethod::Stored);
     drop(first);
     let second = ar.by_index(1).unwrap();
-    assert_eq!(second.name(), "a.xml");
+    assert_eq!(second.name().unwrap(), "a.xml");
     assert_eq!(second.compression(), zip::CompressionMethod::Deflated);
 }

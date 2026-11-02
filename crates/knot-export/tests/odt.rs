@@ -216,7 +216,7 @@ fn mimetype_is_first_and_stored_and_manifest_is_complete() {
 
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
     let first = zip.by_index(0).expect("first entry");
-    assert_eq!(first.name(), "mimetype");
+    assert_eq!(first.name().unwrap(), "mimetype");
     assert_eq!(first.compression(), zip::CompressionMethod::Stored);
     drop(first);
 
