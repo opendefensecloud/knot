@@ -3,7 +3,7 @@ import * as Y from "yjs";
 
 import { FakeSocket } from "../../test/fakeSocket";
 
-import { KnotProvider } from "./KnotProvider";
+import { KnotProvider, type CommentChangeMsg } from "./KnotProvider";
 
 describe("KnotProvider", () => {
   it("constructs in 'connecting' state and destroys cleanly", () => {
@@ -35,16 +35,26 @@ describe("KnotProvider", () => {
     const seen: string[] = [];
     p.on("comments", (m) => seen.push(m.doc_id));
 
-    const json = new TextEncoder().encode(JSON.stringify({ doc_id: "doc-123" }));
-    const head = [5]; // MSG_COMMENTS
-    let len = json.length;
-    while (len >= 0x80) { head.push((len & 0x7f) | 0x80); len >>= 7; }
-    head.push(len);
-    const frame = new Uint8Array([...head, ...json]);
+    const frame = commentsFrame({ doc_id: "doc-123" });
 
     (p as unknown as { handleFrame(b: Uint8Array): void }).handleFrame(frame);
 
     expect(seen).toEqual(["doc-123"]);
+    p.destroy();
+  });
+
+  // Suggestion mutations reuse the comments frame with a `topic` field; the
+  // provider forwards the parsed JSON verbatim so KnotEditor can route it.
+  it("dispatches_topic_to_comments_listeners", () => {
+    const p = new KnotProvider({ url: "ws://127.0.0.1:1/never", doc: new Y.Doc() });
+    const seen: CommentChangeMsg[] = [];
+    p.on("comments", (m) => seen.push(m));
+
+    const frame = commentsFrame({ doc_id: "d", topic: "suggestions" });
+
+    (p as unknown as { handleFrame(b: Uint8Array): void }).handleFrame(frame);
+
+    expect(seen).toEqual([{ doc_id: "d", topic: "suggestions" }]);
     p.destroy();
   });
 
@@ -89,6 +99,16 @@ function syncUpdateMsg(payload: Uint8Array): Uint8Array {
   out.set(head, 0);
   out.set(payload, head.length);
   return out;
+}
+
+// MSG_COMMENTS=5, then varuint length + the JSON-encoded body.
+function commentsFrame(obj: unknown): Uint8Array {
+  const json = new TextEncoder().encode(JSON.stringify(obj));
+  const head = [5];
+  let len = json.length;
+  while (len >= 0x80) { head.push((len & 0x7f) | 0x80); len >>= 7; }
+  head.push(len);
+  return new Uint8Array([...head, ...json]);
 }
 
 function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
