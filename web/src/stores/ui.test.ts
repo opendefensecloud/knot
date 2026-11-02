@@ -17,6 +17,8 @@ describe("ui sidebar tabs", () => {
       activeSuggestionId: null,
       threadLink: null,
       suggestionLink: null,
+      pendingSuggestion: null,
+      suggestionLive: {},
     });
   });
 
@@ -67,6 +69,54 @@ describe("ui sidebar tabs", () => {
     expect(useUi.getState().pendingSuggestion).toEqual(p);
     useUi.getState().clearPendingSuggestion();
     expect(useUi.getState().pendingSuggestion).toBeNull();
+  });
+
+  it("leaving_the_suggestions_tab_drops_the_pending_suggestion", () => {
+    const p = {
+      kind: "replace" as const,
+      positionY: "AAA=",
+      positionYEnd: "AAE=",
+      originalText: "brave",
+      contextBefore: "a ",
+    };
+    const open = () => {
+      useUi.getState().setPendingSuggestion(p);
+      useUi.getState().openCommentSidebar("suggestions");
+      expect(useUi.getState().pendingSuggestion).toEqual(p);
+    };
+
+    open();
+    useUi.getState().setSidebarTab("suggestions");
+    expect(useUi.getState().pendingSuggestion).toEqual(p);
+    useUi.getState().setSidebarTab("comments");
+    expect(useUi.getState().pendingSuggestion).toBeNull();
+
+    open();
+    useUi.getState().closeCommentSidebar();
+    expect(useUi.getState().pendingSuggestion).toBeNull();
+
+    open();
+    useUi.getState().openCommentSidebar();
+    expect(useUi.getState().pendingSuggestion).toBeNull();
+
+    open();
+    useUi.getState().openThreadLink("t-1");
+    expect(useUi.getState().pendingSuggestion).toBeNull();
+  });
+
+  it("suggestion_live_keeps_entries_that_read_the_same", () => {
+    useUi.getState().setSuggestionLive({
+      a: { state: "same", currentText: "x", from: 1 },
+      b: { state: "same", currentText: "y", from: 5 },
+    });
+    const before = useUi.getState().suggestionLive;
+    useUi.getState().setSuggestionLive({
+      a: { state: "same", currentText: "x", from: 1 },
+      b: { state: "changed", currentText: "yy", from: 6 },
+    });
+    const after = useUi.getState().suggestionLive;
+    expect(after.a).toBe(before.a);
+    expect(after.b).toEqual({ state: "changed", currentText: "yy", from: 6 });
   });
 
   it("suggestion_live_is_replaced_whole", () => {
