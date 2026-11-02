@@ -11,6 +11,7 @@ pub mod protocol;
 pub mod registry;
 pub mod room;
 pub mod snapshot;
+pub mod suggestions;
 pub mod tasks;
 pub mod update_items;
 pub mod writer;
