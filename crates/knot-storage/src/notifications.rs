@@ -21,6 +21,10 @@ pub enum NotificationKind {
     TaskAssigned,
     TaskDue,
     DocShared,
+    /// A new change suggestion on a page the recipient owns.
+    Suggestion,
+    /// The recipient's suggestion was accepted or rejected.
+    SuggestionDecided,
 }
 
 impl NotificationKind {
@@ -31,6 +35,8 @@ impl NotificationKind {
             Self::TaskAssigned => "task_assigned",
             Self::TaskDue => "task_due",
             Self::DocShared => "doc_shared",
+            Self::Suggestion => "suggestion",
+            Self::SuggestionDecided => "suggestion_decided",
         }
     }
 }
