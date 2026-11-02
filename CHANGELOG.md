@@ -8,6 +8,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-11-02
+
+knot now tells you when something needs you. An Inbox in the sidebar
+collects mentions, replies, task assignments, overdue tasks and pages
+shared with you, with an unread badge so you don't have to go looking.
+
 ### Upgrading
 - One database migration runs on upgrade (the Helm chart's migrate hook
   applies it). Rolling back to 0.9.5 needs a database restore: 0.9.5
@@ -29,6 +35,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   come back to the tab; the list loads when you open it.
   `GET /api/notifications`,
   `GET /api/notifications/unread_count`, `POST /api/notifications/read`.
+  (#23)
   - A task notifies its assignee once. Small edits, moving or reopening it
     don't notify again, and an unread notification shows the task's
     current text; rewriting a task in different words counts as a new
@@ -44,7 +51,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   comment or reply. The server matched `@Christian Hüning` as
   `@Christian`, found nobody, and told nobody; the mention picker now
   sends who it picked. Adding a mention while editing a comment still
-  matches by name only.
+  matches by name only. (#23)
 
 ## [0.9.5] - 2026-11-01
 
@@ -965,7 +972,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.6...HEAD
+[0.9.6]: https://github.com/opendefensecloud/knot/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/opendefensecloud/knot/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/opendefensecloud/knot/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/opendefensecloud/knot/compare/v0.9.2...v0.9.3
