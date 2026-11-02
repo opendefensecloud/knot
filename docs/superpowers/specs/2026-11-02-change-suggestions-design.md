@@ -109,6 +109,15 @@ notifications and content pipeline.
   (history restore, `POST /markdown?mode=replace`, workspace import) clears
   the whole `default` fragment. After those, suggestions show as "text was
   removed". That is accepted for v1, as it is for comments.
+- **Retyping the end of a range shrinks it.** The end anchor is tied to the
+  last selected character. Yjs places text typed after a deleted character to
+  the right of its tombstone, so selecting the suggested words and retyping
+  them leaves only the untouched remainder inside the range. The card shows
+  that remainder as "Now". This is accepted for v1.
+- **Positions differ between client and server.** Room docs count offsets in
+  bytes, while Yjs clocks and the browser count UTF-16 units. The server must
+  resolve anchors in UTF-16 and convert, or umlauts and emoji before the range
+  shift the apply.
 - **The server has never decoded a RelativePosition.** Server-side apply
   needs a yrs resolver for the exact bytes the client encodes against the
   y-tiptap binding (`Y.XmlText` item + offset). `knot-crdt` already uses
