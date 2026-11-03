@@ -6,10 +6,12 @@
  * shows and what the owner's "seen text" is taken from.
  */
 
+import { yUndoPluginKey } from "@tiptap/y-tiptap";
 import { afterEach, describe, expect, it } from "vitest";
 import * as Y from "yjs";
 
 import { mountBoundEditor, type BoundEditor } from "../../test/boundEditor";
+import { placeSelection } from "../../test/editorInput";
 import { relativePositionFromBase64, relativePositionToBase64 } from "../comments/anchor";
 import { encodeSuggestionAnchors } from "./anchor";
 import { classifySuggestion, type ClassifiableSuggestion } from "./liveState";
@@ -135,17 +137,112 @@ describe("classifySuggestion", () => {
 
       expect(classifySuggestion(b.editor, b.ydoc, s)).toEqual({ state: "removed", currentText: "", from: null });
     });
+
+    // The server's rule E: an insertion whose anchored character is gone is
+    // refused as lost. Enter inside a line deletes the tail from the old
+    // paragraph's text and writes it anew into the next paragraph, so the
+    // tombstone of the character the insertion is tied to stays behind at
+    // the end of the first line, where Yjs still resolves it.
+    it(`an insert whose anchored character moved to a new paragraph is removed (${mode})`, () => {
+      bound = mountBoundEditor();
+      const b = bound;
+      b.editor.commands.insertContent("Please call me tomorrow.");
+      // "Please call me " is 1..16, "tomorrow" 16..24.
+      expect(b.editor.state.doc.textBetween(16, 24)).toBe("tomorrow");
+      const s = insertAt(b, 24);
+      expect(classifySuggestion(b.editor, b.ydoc, s)).toEqual({ state: "same", currentText: "", from: 24 });
+
+      if (keep) {
+        // Enter between "me" and " tomorrow", through the binding.
+        placeSelection(b, 15);
+        b.editor.commands.splitBlock();
+      } else {
+        // The same Y ops y-tiptap makes for it, untracked so they are
+        // collected.
+        const para = b.fragment.get(0) as Y.XmlElement;
+        const text = para.get(0) as Y.XmlText;
+        b.ydoc.transact(() => {
+          text.delete(14, 10);
+          const next = new Y.XmlElement("paragraph");
+          next.insert(0, [new Y.XmlText(" tomorrow.")]);
+          b.fragment.insert(1, [next]);
+        });
+      }
+      expect(b.editor.getText({ blockSeparator: "|" })).toBe("Please call me| tomorrow.");
+      // Yjs still resolves the anchor, to the end of the first line.
+      expect(yjsResolves(b, s)).toBe(true);
+
+      expect(classifySuggestion(b.editor, b.ydoc, s)).toEqual({ state: "removed", currentText: "", from: 15 });
+    });
   }
+
+  it("an insert whose anchored character was deleted stays removed after undo", () => {
+    // Undo writes the character anew rather than reviving the deleted one,
+    // and the server asks about the anchored character itself.
+    bound = mountBoundEditor();
+    const b = bound;
+    b.editor.commands.insertContent("Hello world");
+    const s = insertAt(b, 6);
+    // Its own undo step, not merged into the typing before it.
+    (yUndoPluginKey.getState(b.editor.state) as { undoManager: Y.UndoManager }).undoManager.stopCapturing();
+    b.editor.view.dispatch(b.editor.state.tr.delete(5, 6));
+    expect(classifySuggestion(b.editor, b.ydoc, s).state).toBe("removed");
+
+    b.editor.commands.undo();
+    expect(b.editor.state.doc.textContent).toBe("Hello world");
+    expect(classifySuggestion(b.editor, b.ydoc, s)).toEqual({ state: "removed", currentText: "", from: 6 });
+  });
+
+  it("a range split across two text nodes is removed", () => {
+    // The server refuses a range whose ends lie in different XmlTexts. Tie
+    // the start to "b" before a line break and the end to "e" after it.
+    bound = mountBoundEditor();
+    const b = bound;
+    b.editor.commands.setContent([
+      {
+        type: "paragraph",
+        content: [{ type: "text", text: "abc" }, { type: "hard_break" }, { type: "text", text: "def" }],
+      },
+    ] as never);
+    const para = b.fragment.get(0) as Y.XmlElement;
+    const before = para.get(0) as Y.XmlText;
+    const after = para.get(2) as Y.XmlText;
+    const s: ClassifiableSuggestion = {
+      kind: "replace",
+      position_y: relativePositionToBase64(Y.createRelativePositionFromTypeIndex(before, 1, 0)),
+      position_y_end: relativePositionToBase64(Y.createRelativePositionFromTypeIndex(after, 2, -1)),
+      original_text: "bcde",
+    };
+    // "b" is at 2, "e" ends at 7; the break between counts no text.
+    expect(b.editor.state.doc.textBetween(2, 7)).toBe("bcde");
+
+    expect(classifySuggestion(b.editor, b.ydoc, s)).toEqual({ state: "removed", currentText: "", from: 2 });
+  });
+
+  it("Shift+Enter inside a range shortens it to the text before the break", () => {
+    // y-tiptap keeps the text before the break in the old XmlText and writes
+    // the rest anew, so the end anchor's tombstone stays in the first text
+    // node: one node, which the server resolves the same way.
+    bound = mountBoundEditor();
+    const b = bound;
+    b.editor.commands.insertContent("Hello brave world");
+    const s = replaceOf(b, 7, 12);
+    placeSelection(b, 9);
+    b.editor.commands.setHardBreak();
+
+    expect(classifySuggestion(b.editor, b.ydoc, s)).toEqual({ state: "changed", currentText: "br", from: 7 });
+  });
 
   it("an anchor that resolves between blocks is removed", () => {
     bound = mountBoundEditor();
     const b = bound;
     twoParagraphs(b);
-    // Tied to the second paragraph element rather than to text: it decodes to
-    // position 7, between the two blocks, which no suggestion can apply at.
+    // Tied to the second paragraph element rather than to text: it would sit
+    // between the two blocks, which no suggestion can apply at, and the
+    // server only resolves anchors inside text.
     const between = relativePositionToBase64(Y.createRelativePositionFromTypeIndex(b.fragment, 1, 0));
     const s: ClassifiableSuggestion = { kind: "insert", position_y: between, position_y_end: between, original_text: "" };
-    expect(classifySuggestion(b.editor, b.ydoc, s)).toEqual({ state: "removed", currentText: "", from: 7 });
+    expect(classifySuggestion(b.editor, b.ydoc, s)).toEqual({ state: "removed", currentText: "", from: null });
   });
 
   it("an insert at the start of the page stays same", () => {

@@ -114,6 +114,10 @@ export const SuggestionCard = memo(function SuggestionCard({
   const setActiveSuggestionId = useUi((st) => st.setActiveSuggestionId);
   // Set after a 409 `suggestion.changed`; cleared on the next attempt.
   const [changedWhileLooking, setChangedWhileLooking] = useState(false);
+  // Set after a 409 `suggestion.anchor_lost`, likewise: the server could not
+  // find the text although this card still read it as there. Says so until
+  // the reclassification agrees, rather than leaving Accept to do nothing.
+  const [lostWhileLooking, setLostWhileLooking] = useState(false);
 
   // A decided suggestion's final status; null while it is still open.
   const decided = isOpenStatus(s.status) ? null : s.status;
@@ -122,13 +126,18 @@ export const SuggestionCard = memo(function SuggestionCard({
   const isOwner = role === "owner";
   const canReply = open && (role === "owner" || role === "editor");
   const isAuthor = s.author_id === currentUserId;
+  // The server lets an author withdraw only while they are still Editor+.
+  const canWithdraw = isAuthor && (role === "owner" || role === "editor");
   const isActive = activeSuggestionId === s.id;
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ["suggestions", docId] });
 
   const accept = useMutation({
     mutationFn: (seenText: string) => suggestionsApi.accept(docId, s.id, seenText),
-    onMutate: () => setChangedWhileLooking(false),
+    onMutate: () => {
+      setChangedWhileLooking(false);
+      setLostWhileLooking(false);
+    },
     onSuccess: async (r) => {
       if ("error" in r) {
         switch (r.error.code) {
@@ -138,9 +147,10 @@ export const SuggestionCard = memo(function SuggestionCard({
             setChangedWhileLooking(true);
             break;
           case "suggestion.anchor_lost":
+            setLostWhileLooking(true);
+            break;
           case "suggestion.not_pending":
-            // The refetch and reclassification tell the story: removed, or
-            // decided by someone else.
+            // The refetch tells the story: decided by someone else.
             break;
           default:
             notify("error", "Couldn't accept suggestion");
@@ -230,7 +240,7 @@ export const SuggestionCard = memo(function SuggestionCard({
 
   const notes: string[] = [];
   if (open && state === "changed") notes.push(NOTE_CHANGED);
-  if (open && state === "removed") notes.push(NOTE_REMOVED);
+  if (open && (state === "removed" || lostWhileLooking)) notes.push(NOTE_REMOVED);
   if (open && changedWhileLooking) notes.push(NOTE_CHANGED_WHILE_LOOKING);
 
   const rows = rowsFor(s, state, live);
@@ -336,7 +346,7 @@ export const SuggestionCard = memo(function SuggestionCard({
               Waiting for an owner
             </span>
           )}
-          {isAuthor && (
+          {canWithdraw && (
             <button
               type="button"
               data-testid={`suggestion-withdraw-${s.id}`}

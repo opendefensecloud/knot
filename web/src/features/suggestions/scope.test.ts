@@ -50,6 +50,19 @@ describe("suggestionScope", () => {
     expect(suggestionScope(b.editor.state)).toEqual({ ok: false, reason: "inline_atom" });
   });
 
+  it("refuses a selection over a line break in a code block", () => {
+    // A code block keeps its lines as one text with "\n" in it, which the
+    // server would replace as one plain range across lines.
+    const b = withContent([{ type: "code_block", content: [text("one\ntwo")] }]);
+    // "one" 1..4, "\n" at 4, "two" 5..8.
+    placeSelection(b, 2, 6);
+    expect(suggestionScope(b.editor.state)).toEqual({ ok: false, reason: "inline_atom" });
+
+    // Within one line it is a plain replace.
+    placeSelection(b, 5, 8);
+    expect(suggestionScope(b.editor.state)).toMatchObject({ ok: true, kind: "replace", text: "two" });
+  });
+
   it("scope_refuses_internal_link_marks", () => {
     for (const href of [
       "knot://doc/00000000-0000-0000-0000-000000000001",

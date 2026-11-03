@@ -6,7 +6,8 @@
  * disable "Suggest change" with a reason instead of letting the server refuse
  * later. Mentions, dates and page links are `link` marks with `knot://`
  * hrefs; replacing part of one would break the chip, so a selection touching
- * one is refused, and so is a caret inside one.
+ * one is refused, and so is a caret inside one. So is a selection over a
+ * line break: a hard break, or a newline in a code block.
  */
 
 import type { Mark } from "@tiptap/pm/model";
@@ -63,7 +64,8 @@ export function suggestionScope(state: EditorState): SuggestionScope {
       else if (node.isText && internalLink(node.marks)) atom = true;
       return !atom;
     });
-    if (atom) return { ok: false, reason: "inline_atom" };
+    // A code block holds its lines as one text with line breaks in it.
+    if (atom || /[\n\r]/.test(state.doc.textBetween(from, to))) return { ok: false, reason: "inline_atom" };
   }
 
   const blockStart = $from.start();

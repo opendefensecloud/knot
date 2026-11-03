@@ -176,6 +176,21 @@ describe("SuggestionCard", () => {
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["suggestions", "d1"] }));
   });
 
+  it("a_downgraded_author_does_not_see_withdraw", () => {
+    // The server only lets an Editor or Owner withdraw; a viewer now, the
+    // author would only get a refusal.
+    const live: SuggestionLive = { state: "same", currentText: "charlie", from: 3 };
+    for (const role of ["viewer", null] as const) {
+      renderCard(suggestion(), { role, userId: AUTHOR, live });
+      expect(screen.queryByTestId("suggestion-withdraw-s1"), String(role)).toBeNull();
+      cleanup();
+    }
+
+    // An author who owns the page now still may.
+    renderCard(suggestion(), { role: "owner", userId: AUTHOR, live });
+    expect(screen.getByTestId("suggestion-withdraw-s1")).toBeInTheDocument();
+  });
+
   it("accept_sends_current_text_as_seen_text", async () => {
     api.accept.mockResolvedValue({ ok: suggestion({ status: "accepted" }) });
     const { invalidate } = renderCard(suggestion(), {
@@ -223,10 +238,34 @@ describe("SuggestionCard", () => {
       });
       fireEvent.click(screen.getByTestId("suggestion-accept-s1"));
       await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["suggestions", "d1"] }));
-      expect(screen.queryByTestId("suggestion-note-s1")).toBeNull();
       expect(useUi.getState().toasts).toEqual([]);
       cleanup();
     }
+  });
+
+  it("accept_409_anchor_lost_says_the_text_was_removed", async () => {
+    // The card read the page as "same", the server could not find the text:
+    // the refusal is never silent, even before a reclassification agrees.
+    api.accept.mockResolvedValue({
+      error: { code: "suggestion.anchor_lost", message: "lost", details: {}, status: 409 },
+    });
+    renderCard(suggestion(), { live: { state: "same", currentText: "charlie", from: 3 } });
+    fireEvent.click(screen.getByTestId("suggestion-accept-s1"));
+    await waitFor(() =>
+      expect(screen.getByTestId("suggestion-note-s1")).toHaveTextContent(
+        "The text this suggestion was about was removed.",
+      ),
+    );
+    cleanup();
+
+    // Someone else deciding it first leaves no note; the refetch shows it.
+    api.accept.mockResolvedValue({
+      error: { code: "suggestion.not_pending", message: "decided", details: {}, status: 409 },
+    });
+    const { invalidate } = renderCard(suggestion(), { live: { state: "same", currentText: "charlie", from: 3 } });
+    fireEvent.click(screen.getByTestId("suggestion-accept-s1"));
+    await waitFor(() => expect(invalidate).toHaveBeenCalled());
+    expect(screen.queryByTestId("suggestion-note-s1")).toBeNull();
   });
 
   it("reject_and_reply_call_the_api", async () => {

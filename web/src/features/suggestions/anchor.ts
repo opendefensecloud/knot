@@ -173,50 +173,33 @@ function inLiveDocument(type: any, documentType: Y.XmlFragment): boolean {
 /**
  * y-tiptap's `relativePositionToAbsolutePosition` without its
  * `isMisresolvedTextPosition` check, which returns null for every item anchor
- * that lands on position 1 (the first character of the page), and with a
- * liveness check: an anchor inside a deleted text node or block is null.
+ * that lands on position 1 (the first character of the page), and with two
+ * checks the server makes too: an anchor inside a deleted text node or block
+ * is null, and so is one that resolves to anything but text (a block, or the
+ * paragraph next to a line break).
+ *
+ * Also returns the XmlText the anchor resolved into.
  */
 function relativeToAbsolute(
   y: Y.Doc,
   documentType: Y.XmlFragment,
   relPos: Y.RelativePosition,
   mapping: ProsemirrorMapping,
-): number | null {
+): { pos: number; text: Y.XmlText } | null {
   const decodedPos = Y.createAbsolutePositionFromRelativePosition(relPos, y);
   if (
     decodedPos === null ||
-    (decodedPos.type !== documentType && !Y.isParentOf(documentType, (decodedPos.type as any)._item))
+    !isXmlText(decodedPos.type) ||
+    !Y.isParentOf(documentType, (decodedPos.type as any)._item)
   ) {
     return null;
   }
   if (!inLiveDocument(decodedPos.type, documentType)) {
     return null;
   }
-  let type: any = decodedPos.type;
-  let pos = 0;
-  if (type.constructor === Y.XmlText) {
-    pos = decodedPos.index;
-  } else if (type._item === null || !type._item.deleted) {
-    let n: any = type._first;
-    let i = 0;
-    while (i < type._length && i < decodedPos.index && n !== null) {
-      if (!n.deleted) {
-        const t = n.content.type;
-        i++;
-        if (t instanceof Y.XmlText) {
-          pos += (t as any)._length;
-        } else {
-          const mapped: any = mapping.get(t);
-          if (mapped == null) {
-            return null;
-          }
-          pos += mapped.nodeSize as number;
-        }
-      }
-      n = n.right;
-    }
-    pos += 1; // increase because we go out of n
-  }
+  const text = decodedPos.type as Y.XmlText;
+  let type: any = text;
+  let pos = decodedPos.index;
   while (type !== documentType && type._item !== null) {
     const parent = type._item.parent;
     if (parent._item === null || !parent._item.deleted) {
@@ -244,10 +227,69 @@ function relativeToAbsolute(
     }
     type = parent;
   }
-  return pos - 1; // we don't count the most outer tag, because it is a fragment
+  return { pos: pos - 1, text }; // we don't count the most outer tag, because it is a fragment
 }
 
-/** Start ties to the first selected char (assoc 0), end to the last (assoc -1). Insert: from===to, both assoc -1. */
+/**
+ * Whether the character `rel` is tied to has been deleted. Its tombstone
+ * still resolves (to where it was, in the text that held it) whether its
+ * item was collected or kept. Like the server (`anchored_char_deleted`), this
+ * asks about that character itself: an undo that brings it back writes a new
+ * one, and the anchor stays lost. An anchor scoped to a whole text node (the
+ * start of a block) has no character and is never deleted here.
+ */
+function tiedToDeleted(rel: Y.RelativePosition, ydoc: Y.Doc): boolean {
+  if (rel.item === null) return false;
+  const struct = Y.getItem(ydoc.store, rel.item);
+  return !(struct instanceof Y.Item) || struct.deleted;
+}
+
+/** A decoded suggestion range; see `decodeSuggestionRange`. */
+export type SuggestionRange = {
+  from: number;
+  to: number;
+  /**
+   * The anchors still resolve, but the server would refuse them as lost:
+   * the two ends lie in different text nodes (a line break now splits the
+   * range), or the character an insertion point is tied to was deleted —
+   * e.g. by Enter before it, which moves the rest of the line into a new
+   * paragraph, leaving the anchor behind on the old one.
+   */
+  anchorLost: boolean;
+};
+
+/**
+ * `rel` if it resolves into text, else the same point tied to text directly
+ * next to it, else null.
+ *
+ * The walk above ties a point with no text on its side to the inline node or
+ * block there instead: a caret on the empty line between two line breaks,
+ * after a break that ends the paragraph, or before one that starts it. The
+ * server only resolves anchors inside an XmlText, so such an anchor would be
+ * refused as lost on accept while the card offered it as applicable.
+ */
+function textAnchor(rel: Y.RelativePosition, ydoc: Y.Doc, assoc: number): Y.RelativePosition | null {
+  const abs = Y.createAbsolutePositionFromRelativePosition(rel, ydoc);
+  if (abs === null) return null;
+  if (isXmlText(abs.type)) return rel;
+  if (!(abs.type instanceof Y.XmlElement || abs.type instanceof Y.XmlFragment)) return null;
+  const before: unknown = abs.index > 0 ? abs.type.get(abs.index - 1) : undefined;
+  const after: unknown = abs.index < abs.type.length ? abs.type.get(abs.index) : undefined;
+  // A point right after text ties to its last character, the way an
+  // insertion point always does; one right before text to its start.
+  if (before instanceof Y.XmlText && (assoc < 0 || !(after instanceof Y.XmlText))) {
+    return Y.createRelativePositionFromTypeIndex(before, before.length, -1);
+  }
+  if (after instanceof Y.XmlText) return Y.createRelativePositionFromTypeIndex(after, 0, assoc);
+  return null;
+}
+
+/**
+ * Start ties to the first selected char (assoc 0), end to the last (assoc -1). Insert: from===to, both assoc -1.
+ *
+ * Null when a position has no text to tie to (see `textAnchor`); the caller
+ * then says it couldn't suggest a change there.
+ */
 export function encodeSuggestionAnchors(
   editor: Editor,
   ydoc: Y.Doc,
@@ -259,9 +301,13 @@ export function encodeSuggestionAnchors(
 
   const fragment = ydoc.getXmlFragment("default");
   try {
-    const end = relativePositionToBase64(absoluteToRelative(to, fragment, mapping, -1));
-    const start = from === to ? end : relativePositionToBase64(absoluteToRelative(from, fragment, mapping, 0));
-    return { start, end };
+    const endRel = textAnchor(absoluteToRelative(to, fragment, mapping, -1), ydoc, -1);
+    if (endRel === null) return null;
+    const end = relativePositionToBase64(endRel);
+    if (from === to) return { start: end, end };
+    const startRel = textAnchor(absoluteToRelative(from, fragment, mapping, 0), ydoc, 0);
+    if (startRel === null) return null;
+    return { start: relativePositionToBase64(startRel), end };
   } catch {
     return null;
   }
@@ -270,28 +316,35 @@ export function encodeSuggestionAnchors(
 /**
  * Like decodeAnchorRange, but WITHOUT y-tiptap's isMisresolvedTextPosition check.
  *
- * Also returns null when either anchor no longer lies inside the current
- * document, or when the end resolves before the start: the server treats
- * that as a lost anchor too, so the range is not swapped into something that
- * looks valid.
+ * Also returns null when either anchor no longer lies inside text of the
+ * current document, or when the end resolves before the start: the server
+ * treats that as a lost anchor too, so the range is not swapped into
+ * something that looks valid. Where the anchors still resolve but the server
+ * would refuse them all the same, `anchorLost` says so and `from` still
+ * places the card.
+ *
+ * Equal anchors are an insertion point; a range's two anchors always differ.
  */
 export function decodeSuggestionRange(
   editor: Editor,
   ydoc: Y.Doc,
   startB64: string,
   endB64: string,
-): { from: number; to: number } | null {
+): SuggestionRange | null {
   const mapping = getMapping(editor);
   if (!mapping) return null;
 
   const fragment = ydoc.getXmlFragment("default");
   const size = editor.state.doc.content.size;
   try {
-    const from = relativeToAbsolute(ydoc, fragment, relativePositionFromBase64(startB64), mapping);
-    if (from === null || from < 0 || from > size) return null;
-    const to = startB64 === endB64 ? from : relativeToAbsolute(ydoc, fragment, relativePositionFromBase64(endB64), mapping);
-    if (to === null || to < from || to > size) return null;
-    return { from, to };
+    const startRel = relativePositionFromBase64(startB64);
+    const start = relativeToAbsolute(ydoc, fragment, startRel, mapping);
+    if (start === null || start.pos < 0 || start.pos > size) return null;
+    const from = start.pos;
+    if (startB64 === endB64) return { from, to: from, anchorLost: tiedToDeleted(startRel, ydoc) };
+    const end = relativeToAbsolute(ydoc, fragment, relativePositionFromBase64(endB64), mapping);
+    if (end === null || end.pos < from || end.pos > size) return null;
+    return { from, to: end.pos, anchorLost: end.text !== start.text };
   } catch {
     return null;
   }

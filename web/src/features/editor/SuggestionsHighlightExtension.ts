@@ -11,8 +11,9 @@
  *   - The range in the open composer (the draft) keeps a selection-style
  *     tint, or a marker when it is an insertion point, so the user can see
  *     what they are changing. It carries no suggestion id.
- *   - Like classifySuggestion, a range that collapsed or spans blocks, or a
- *     point outside a textblock, draws nothing, so the page and the card
+ *   - Like classifySuggestion, a range that collapsed, spans blocks or is
+ *     split by a line break, a point outside a textblock, or anchors the
+ *     server would refuse as lost, draw nothing, so the page and the card
  *     agree on what is still there.
  *
  * Nothing here writes to the document: decorations are view-only, so pending
@@ -178,13 +179,13 @@ function buildDecorations(pmDoc: ProseMirrorNode, storage: SuggestionsHighlightS
   // and inside a single textblock.
   const decodePoint = (startB64: string, endB64: string): number | null => {
     const range = decodeSuggestionRange(editor, ydoc, startB64, endB64);
-    if (!range) return null;
+    if (!range || range.anchorLost) return null;
     const from = Math.max(0, Math.min(range.from, docSize));
     return pmDoc.resolve(from).parent.isTextblock ? from : null;
   };
   const decodeRange = (startB64: string, endB64: string): { from: number; to: number } | null => {
     const range = decodeSuggestionRange(editor, ydoc, startB64, endB64);
-    if (!range) return null;
+    if (!range || range.anchorLost) return null;
     const from = Math.max(0, Math.min(range.from, docSize));
     const to = Math.max(0, Math.min(range.to, docSize));
     if (from >= to) return null;

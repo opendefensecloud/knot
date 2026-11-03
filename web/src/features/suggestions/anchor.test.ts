@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import * as Y from "yjs";
 
 import { mountBoundEditor, type BoundEditor } from "../../test/boundEditor";
+import { relativePositionToBase64 } from "../comments/anchor";
 import { decodeSuggestionRange, encodeSuggestionAnchors } from "./anchor";
 
 // ---------------------------------------------------------------------------
@@ -81,11 +82,19 @@ describe("suggestion anchors", () => {
 
     expect(anchors).not.toBeNull();
     expect(anchors!.start).toBe(anchors!.end);
-    expect(decodeSuggestionRange(editor, ydoc, anchors!.start, anchors!.end)).toEqual({ from: 6, to: 6 });
+    expect(decodeSuggestionRange(editor, ydoc, anchors!.start, anchors!.end)).toEqual({
+      from: 6,
+      to: 6,
+      anchorLost: false,
+    });
 
     // Text typed right after the point pushes nothing in front of it.
     editor.view.dispatch(editor.state.tr.insertText("!!", 6));
-    expect(decodeSuggestionRange(editor, ydoc, anchors!.start, anchors!.end)).toEqual({ from: 6, to: 6 });
+    expect(decodeSuggestionRange(editor, ydoc, anchors!.start, anchors!.end)).toEqual({
+      from: 6,
+      to: 6,
+      anchorLost: false,
+    });
   });
 
   it("edge_typing_stays_outside_range", () => {
@@ -116,7 +125,7 @@ describe("suggestion anchors", () => {
     expect(anchors).not.toBeNull();
 
     const range = decodeSuggestionRange(editor, ydoc, anchors!.start, anchors!.end);
-    expect(range).toEqual({ from: 1, to: 6 });
+    expect(range).toEqual({ from: 1, to: 6, anchorLost: false });
     expect(editor.state.doc.textBetween(range!.from, range!.to)).toBe("Hello");
   });
 
@@ -127,8 +136,79 @@ describe("suggestion anchors", () => {
     editor.view.dispatch(editor.state.tr.insertText("Once again: ", 1));
 
     const range = decodeSuggestionRange(editor, ydoc, anchors!.start, anchors!.end);
-    expect(range).toEqual({ from: 19, to: 24 });
+    expect(range).toEqual({ from: 19, to: 24, anchorLost: false });
     expect(editor.state.doc.textBetween(range!.from, range!.to)).toBe("world");
+  });
+
+  describe("an insertion point next to a line break", () => {
+    // A hard_break is an XmlElement between two XmlTexts. A caret with no
+    // text directly on either side would anchor to that element or to the
+    // paragraph, which the server's resolve_range always refuses as lost.
+    const br = { type: "hard_break" };
+    /** What the encoder used to send for each caret: tied to the break at
+     *  the caret, or to the end of the paragraph. */
+    type Legacy = (para: Y.XmlElement) => Y.RelativePosition;
+    const shapes: { name: string; content: unknown[]; caret: number; legacy: Legacy }[] = [
+      {
+        // "abc" 1..4, breaks at 4 and 5, "def" 6..9.
+        name: "on the empty line between two breaks",
+        content: [{ type: "text", text: "abc" }, br, br, { type: "text", text: "def" }],
+        caret: 5,
+        legacy: (para) => Y.createRelativePositionFromTypeIndex(para, 2, 0),
+      },
+      {
+        // "abc" 1..4, break at 4; the paragraph's content ends at 5.
+        name: "after a break at the end of the paragraph",
+        content: [{ type: "text", text: "abc" }, br],
+        caret: 5,
+        legacy: (para) => new Y.RelativePosition((para as unknown as { _item: Y.Item })._item.id, null, null),
+      },
+      {
+        // Break at 1, "abc" 2..5.
+        name: "before a break at the start of the paragraph",
+        content: [br, { type: "text", text: "abc" }],
+        caret: 1,
+        legacy: (para) => Y.createRelativePositionFromTypeIndex(para, 0, 0),
+      },
+    ];
+
+    for (const { name, content, caret, legacy } of shapes) {
+      it(`is refused ${name}`, () => {
+        bound = mountBoundEditor();
+        const { editor, ydoc } = bound;
+        editor.commands.setContent([{ type: "paragraph", content }] as never);
+
+        expect(encodeSuggestionAnchors(editor, ydoc, caret, caret)).toBeNull();
+      });
+
+      it(`an existing anchor ${name} does not decode`, () => {
+        bound = mountBoundEditor();
+        const { editor, ydoc, fragment } = bound;
+        editor.commands.setContent([{ type: "paragraph", content }] as never);
+        const para = fragment.get(0) as Y.XmlElement;
+        const rel = legacy(para);
+        const b64 = relativePositionToBase64(rel);
+        expect(Y.createAbsolutePositionFromRelativePosition(rel, ydoc)?.type).toBe(para);
+
+        expect(decodeSuggestionRange(editor, ydoc, b64, b64)).toBeNull();
+      });
+    }
+
+    it("still encodes a caret right after a break, before text", () => {
+      bound = mountBoundEditor();
+      const { editor, ydoc } = bound;
+      editor.commands.setContent([
+        { type: "paragraph", content: [{ type: "text", text: "abc" }, br, { type: "text", text: "def" }] },
+      ] as never);
+      // "abc" 1..4, break at 4, "def" 5..8.
+      const anchors = encodeSuggestionAnchors(editor, ydoc, 5, 5);
+      expect(anchors).not.toBeNull();
+      expect(decodeSuggestionRange(editor, ydoc, anchors!.start, anchors!.end)).toEqual({
+        from: 5,
+        to: 5,
+        anchorLost: false,
+      });
+    });
   });
 
   it("returns null when the ySync mapping is missing", () => {

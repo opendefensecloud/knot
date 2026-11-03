@@ -80,7 +80,9 @@ export function KnotEditor({
 
   // An open suggestion composer belongs to this page: its anchors mean
   // nothing in another one, where its draft range would be decoded against
-  // the wrong document. Leaving the page drops it.
+  // the wrong document. Leaving the page drops it. (The focused card and the
+  // last `?suggestion=` link are dropped by DocPage, next to where it sets
+  // them.)
   useEffect(() => () => { clearPendingSuggestion(); }, [docId, clearPendingSuggestion]);
 
   // Own the Y.Doc + KnotProvider lifecycle inside an effect so React 18
@@ -170,7 +172,7 @@ function EditorBody({
   const setPendingSuggestion = useUi((s) => s.setPendingSuggestion);
   const pendingSuggestion = useUi((s) => s.pendingSuggestion);
   const activeSuggestionId = useUi((s) => s.activeSuggestionId);
-  const openSuggestionLink = useUi((s) => s.openSuggestionLink);
+  const setActiveSuggestionId = useUi((s) => s.setActiveSuggestionId);
   const setSuggestionLive = useUi((s) => s.setSuggestionLive);
   const editorRef = useRef<Editor | null>(null);
   // ⌘⇧V / Ctrl+Shift+V is the conventional "paste without formatting". The
@@ -314,7 +316,12 @@ function EditorBody({
           setActiveCommentId(commentId);
           openCommentSidebar();
         },
-        onSelectSuggestion: (id) => { openSuggestionLink(id); },
+        // Focuses the card, like a click on it; not a link, so it never
+        // opens Resolved, and nothing is left to replay later.
+        onSelectSuggestion: (id) => {
+          setActiveSuggestionId(id);
+          openCommentSidebar("suggestions");
+        },
         navigate,
         fetchMembers: async () => {
           const r = await workspaceApi.listMembers();

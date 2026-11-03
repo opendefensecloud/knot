@@ -106,14 +106,18 @@ type UiState = {
   // The open suggestion composer's target; also drawn as the draft range.
   // Only lives while the Suggestions tab shows: leaving the tab or closing
   // the sidebar drops it, so no draft highlight stays without its composer.
+  // The focused card and the last link go the same way (LEFT_SUGGESTIONS).
   pendingSuggestion: PendingSuggestion | null;
   setPendingSuggestion: (p: PendingSuggestion) => void;
   clearPendingSuggestion: () => void;
   // The focused suggestion card — its highlight is emphasised in the page.
   activeSuggestionId: string | null;
   setActiveSuggestionId: (id: string | null) => void;
-  // The suggestion a link (a notification's `?suggestion=`, or a click on a
-  // highlight) last opened, a new object per visit, like `threadLink`.
+  /** Drops the focused card and the last link (see LEFT_SUGGESTIONS). */
+  clearSuggestionFocus: () => void;
+  // The suggestion a link (a notification's `?suggestion=`) last opened, a
+  // new object per visit, like `threadLink`. A click on a highlight only
+  // focuses its card (setActiveSuggestionId).
   suggestionLink: { suggestionId: string } | null;
   /** Opens the sidebar on the Suggestions tab with `id` active. */
   openSuggestionLink: (id: string) => void;
@@ -274,6 +278,12 @@ function withSkinShowing(s: UiState, change: Partial<SkinPrefsState>): Partial<U
 const initialSkinPrefs = readSkinPrefs();
 const initialSkin = currentSkin(initialSkinPrefs);
 
+/** What leaving the Suggestions tab (or the sidebar) drops: the composer's
+ *  draft, the focused card and the last `?suggestion=` link. Kept, the active
+ *  id would scroll the page back to an old highlight and the link open
+ *  Resolved again the next time the tab shows. */
+const LEFT_SUGGESTIONS = { pendingSuggestion: null, activeSuggestionId: null, suggestionLink: null } as const;
+
 export const useUi = create<UiState>((set, get) => ({
   sidebarOpen: true,
   toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
@@ -287,12 +297,12 @@ export const useUi = create<UiState>((set, get) => ({
   togglePalette: () => set((s) => ({ paletteOpen: !s.paletteOpen })),
   commentSidebarOpen: false,
   openCommentSidebar: (tab = "comments") =>
-    set((s) => ({
-      commentSidebarOpen: true,
-      sidebarTab: tab,
-      pendingSuggestion: tab === "suggestions" ? s.pendingSuggestion : null,
-    })),
-  closeCommentSidebar: () => set({ commentSidebarOpen: false, pendingSuggestion: null }),
+    set(
+      tab === "suggestions"
+        ? { commentSidebarOpen: true, sidebarTab: tab }
+        : { commentSidebarOpen: true, sidebarTab: tab, ...LEFT_SUGGESTIONS },
+    ),
+  closeCommentSidebar: () => set({ commentSidebarOpen: false, ...LEFT_SUGGESTIONS }),
   pendingAnchor: null,
   setPendingAnchor: (a) => set({ pendingAnchor: a }),
   clearPendingAnchor: () => set({ pendingAnchor: null }),
@@ -305,16 +315,16 @@ export const useUi = create<UiState>((set, get) => ({
       sidebarTab: "comments",
       activeCommentId: threadId,
       threadLink: { threadId },
-      pendingSuggestion: null,
+      ...LEFT_SUGGESTIONS,
     }),
   sidebarTab: "comments",
-  setSidebarTab: (t) =>
-    set((s) => ({ sidebarTab: t, pendingSuggestion: t === "suggestions" ? s.pendingSuggestion : null })),
+  setSidebarTab: (t) => set(t === "suggestions" ? { sidebarTab: t } : { sidebarTab: t, ...LEFT_SUGGESTIONS }),
   pendingSuggestion: null,
   setPendingSuggestion: (p) => set({ pendingSuggestion: p }),
   clearPendingSuggestion: () => set({ pendingSuggestion: null }),
   activeSuggestionId: null,
   setActiveSuggestionId: (id) => set({ activeSuggestionId: id }),
+  clearSuggestionFocus: () => set({ activeSuggestionId: null, suggestionLink: null }),
   suggestionLink: null,
   openSuggestionLink: (id) =>
     set({

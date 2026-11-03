@@ -6,7 +6,9 @@
  *   - changed: the anchors resolve inside one text block, but the text
  *              between them differs (the card shows both versions);
  *   - removed: the anchors no longer resolve, the range collapsed, or it no
- *              longer lies inside one text block. Accept is disabled.
+ *              longer lies inside one text node (a line break now splits
+ *              it), or the character an insertion is tied to was deleted.
+ *              Accept is disabled.
  *
  * The server repeats this decision on accept and refuses rather than guess,
  * so this only has to be right about what the card shows.
@@ -37,10 +39,12 @@ export function classifySuggestion(editor: Editor, ydoc: Y.Doc, s: ClassifiableS
   const removed: SuggestionLive = { state: "removed", currentText: "", from };
   const doc = editor.state.doc;
   const $from = doc.resolve(from);
-  // The decoder already returns null for an anchor inside a deleted block,
-  // but an anchor tied to a block rather than to text decodes to a position
-  // between blocks, where nothing can be applied. Checked for every kind.
+  // The decoder already returns null for an anchor inside a deleted block or
+  // tied to anything but text; this guards the textblock the server applies
+  // in. Checked for every kind.
   if (!$from.parent.isTextblock) return removed;
+  // Resolves, but the server would refuse it as lost (see SuggestionRange).
+  if (range.anchorLost) return removed;
 
   if (s.kind === "insert") return { state: "same", currentText: "", from };
 

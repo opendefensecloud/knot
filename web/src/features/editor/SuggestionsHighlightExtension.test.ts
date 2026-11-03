@@ -231,7 +231,9 @@ describe("suggestion highlights", () => {
     expect(editor.state.doc.childCount).toBe(2);
     const s = suggestion("s1", "replace", 7, 16);
     const decoded = decodeSuggestionRange(editor, ydoc, s.position_y, s.position_y_end);
-    expect(decoded).toEqual({ from: 7, to: 16 });
+    // Still resolves, so the card can place itself, but the two ends lie in
+    // different text nodes, which the server refuses as lost.
+    expect(decoded).toEqual({ from: 7, to: 16, anchorLost: true });
 
     show([s]);
     expect(dom().querySelector(".suggestion-highlight")).toBeNull();
@@ -239,6 +241,19 @@ describe("suggestion highlights", () => {
     // The same guard applies to a draft.
     showDraft("replace", 7, 16);
     expect(dom().querySelector(".suggestion-draft")).toBeNull();
+  });
+
+  it("skips an insertion whose anchored character moved on Enter", () => {
+    // Enter between "me" and " tomorrow" leaves the anchored "w" behind as a
+    // tombstone at the end of the first line; the card shows it as removed.
+    const { editor } = withText("Please call me tomorrow.");
+    const s = suggestion("s1", "insert", 24, 24);
+    show([s]);
+    expect(dom().querySelector(".suggestion-insert-marker")).not.toBeNull();
+
+    editor.view.dispatch(editor.state.tr.split(15));
+    show([s]);
+    expect(dom().querySelector(".suggestion-insert-marker")).toBeNull();
   });
 
   describe("a click on text under both a comment and a suggestion", () => {

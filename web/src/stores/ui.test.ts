@@ -104,6 +104,47 @@ describe("ui sidebar tabs", () => {
     expect(useUi.getState().pendingSuggestion).toBeNull();
   });
 
+  it("leaving_the_suggestions_tab_drops_the_focused_suggestion", () => {
+    // A stale active id or link would scroll the page back to an old
+    // highlight, or open Resolved again, the next time the tab shows.
+    const focused = () => {
+      useUi.getState().openSuggestionLink("s-1");
+      const s = useUi.getState();
+      expect(s.activeSuggestionId).toBe("s-1");
+      expect(s.suggestionLink).toEqual({ suggestionId: "s-1" });
+    };
+    const expectCleared = () => {
+      const s = useUi.getState();
+      expect(s.activeSuggestionId).toBeNull();
+      expect(s.suggestionLink).toBeNull();
+    };
+
+    focused();
+    useUi.getState().setSidebarTab("suggestions");
+    expect(useUi.getState().activeSuggestionId).toBe("s-1");
+    useUi.getState().setSidebarTab("comments");
+    expectCleared();
+
+    focused();
+    useUi.getState().closeCommentSidebar();
+    expectCleared();
+
+    focused();
+    useUi.getState().openCommentSidebar("suggestions");
+    expect(useUi.getState().activeSuggestionId).toBe("s-1");
+    useUi.getState().openCommentSidebar();
+    expectCleared();
+
+    focused();
+    useUi.getState().openThreadLink("t-1");
+    expectCleared();
+
+    // KnotEditor, leaving the page.
+    focused();
+    useUi.getState().clearSuggestionFocus();
+    expectCleared();
+  });
+
   it("suggestion_live_keeps_entries_that_read_the_same", () => {
     useUi.getState().setSuggestionLive({
       a: { state: "same", currentText: "x", from: 1 },
