@@ -13,6 +13,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   ArrowDown moved the cursor to the neighbouring cell and closed the list,
   and Tab jumped to the next cell instead of picking the highlighted
   person. Tab in a list item no longer indents it while the list is open.
+  (#76)
 
 ## [0.9.8] - 2026-11-03
 
