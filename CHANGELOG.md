@@ -8,6 +8,18 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Added
+- Personal API tokens: bearer authentication on `/api/*` for scripts and bot
+  accounts, so a bot can work in knot without a browser session. Every
+  workspace member can mint tokens scoped to `read`, `create`, `write` and
+  `delete`, in any combination, under `/api/tokens` or in Settings → API
+  tokens, and revoke them at any time. The secret is shown once; only its hash
+  is stored. A token acts as its user, so the workspace role, page grants and
+  restricted pages still apply on top of its scopes. Tokens bypass CSRF (no
+  cookies are involved), cannot manage tokens, and never authenticate the
+  real-time collab sockets or the `/auth/*` routes.
+- One migration, `20261102000000_api_tokens`; forward-only and additive.
+
 ### Fixed
 - The @-mention list works with the keyboard in a table cell. ArrowUp and
   ArrowDown moved the cursor to the neighbouring cell and closed the list,
