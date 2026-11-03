@@ -216,8 +216,8 @@ pub enum SuggestionStoreError {
     /// A text exceeds its character limit. Checked before SQL.
     #[error("text too long")]
     TooLong,
-    /// A reply body is empty. Checked before SQL; routes map it to 400
-    /// `suggestion.invalid`.
+    /// A reply body is empty. Checked before SQL; routes refuse an empty body
+    /// themselves (422 `suggestion.empty_body`) and map this to the same.
     #[error("reply body empty")]
     EmptyBody,
     /// Any other database error.
@@ -271,8 +271,9 @@ pub trait SuggestionStore: Send + Sync + 'static {
     async fn list_stuck_applying(&self, older_than: DateTime<Utc>) -> Result<Vec<Suggestion>>;
 
     /// Add a reply. The store enforces both bounds of the 1..[`MAX_REPLY_CHARS`]
-    /// body limit before SQL: `EmptyBody` when empty, `TooLong` over the limit.
-    /// `NotFound` when the suggestion does not exist.
+    /// body limit before SQL: `EmptyBody` when empty, `TooLong` over the limit,
+    /// so neither ever reaches Postgres' CHECK as a `Sqlx` error. `NotFound`
+    /// when the suggestion does not exist.
     async fn create_reply(
         &self,
         suggestion_id: Uuid,

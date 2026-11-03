@@ -9,6 +9,7 @@
 //!
 //! POST   /api/docs/{id}/suggestions/{suggestion_id}/replies            { body, mentions? } → 201
 //! PATCH  /api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id} { body, mentions? } → 200 (author)
+//!        (both: 422 `suggestion.empty_body` for an empty body, 422 `suggestion.too_long` over 4 096 chars)
 //! DELETE /api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id} → 204 (author or owner)
 //!
 //! Mounted inside `docs::router`'s doc-id routes, so `require_doc_role_mw`
@@ -43,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use yrs::StickyIndex;
 use yrs::updates::decoder::Decode;
+use yrs::updates::encoder::Encode;
 
 use crate::AppState;
 use crate::auth::{AuthContext, EffectiveDocRole, require_viewer};
@@ -174,6 +176,15 @@ fn too_long() -> Response {
     json_err(StatusCode::UNPROCESSABLE_ENTITY, "suggestion.too_long", "")
 }
 
+/// 422 for an empty reply body, refused before the store is called.
+fn empty_body() -> Response {
+    json_err(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "suggestion.empty_body",
+        "",
+    )
+}
+
 fn body_too_large() -> Response {
     json_err(
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -189,9 +200,7 @@ fn store_err(e: SuggestionStoreError, what: &str) -> Response {
         SuggestionStoreError::NotFound => not_found(),
         SuggestionStoreError::NotPending => not_pending(),
         SuggestionStoreError::TooLong => too_long(),
-        SuggestionStoreError::EmptyBody => {
-            json_err(StatusCode::BAD_REQUEST, "suggestion.invalid", "")
-        }
+        SuggestionStoreError::EmptyBody => empty_body(),
         SuggestionStoreError::Sqlx(e) => {
             tracing::error!(error=?e, "{what}");
             internal()
@@ -249,11 +258,13 @@ async fn ensure_reply_in_suggestion(
     }
 }
 
-/// Decode a base64 anchor and check yrs reads it as a RelativePosition.
+/// Decode a base64 anchor and check it is exactly one RelativePosition:
+/// `decode_v1` ignores bytes after a valid position, so the bytes must also
+/// re-encode to themselves (no trailing garbage stored with the row).
 fn decode_anchor(b64: &str) -> Option<Vec<u8>> {
     let bytes = STANDARD.decode(b64).ok()?;
-    StickyIndex::decode_v1(&bytes).ok()?;
-    Some(bytes)
+    let pos = StickyIndex::decode_v1(&bytes).ok()?;
+    (pos.encode_v1() == bytes).then_some(bytes)
 }
 
 /// Whether the texts fit the kind: a replace changes a non-empty range to a
@@ -653,6 +664,9 @@ async fn create_reply(
         Ok(b) => b,
         Err(r) => return r,
     };
+    if body.body.is_empty() {
+        return empty_body();
+    }
     if over(&body.body, MAX_REPLY_CHARS) {
         return too_long();
     }
@@ -707,6 +721,9 @@ async fn edit_reply(
         Ok(b) => b,
         Err(r) => return r,
     };
+    if body.body.is_empty() {
+        return empty_body();
+    }
     if over(&body.body, MAX_REPLY_CHARS) {
         return too_long();
     }
@@ -792,4 +809,31 @@ pub fn routes() -> Router<AppState> {
             "/api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id}",
             patch(edit_reply).delete(delete_reply),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn decode_anchor_takes_yjs_anchors_and_refuses_trailing_bytes() {
+        // Made by yjs 13.6 through the client's encoder (the same fixtures as
+        // `knot_crdt::suggestions`): item-anchored start and end, and a point
+        // anchored on the XmlText itself with either assoc.
+        for fixture in ["00070400", "00070541", "02070141", "02070100"] {
+            let b64 = STANDARD.encode(hex(fixture));
+            assert_eq!(decode_anchor(&b64), Some(hex(fixture)), "{fixture}");
+        }
+        let mut trailing = hex("00070400");
+        trailing.push(0x00);
+        assert_eq!(decode_anchor(&STANDARD.encode(trailing)), None);
+        assert_eq!(decode_anchor(&STANDARD.encode(b"position_bytes")), None);
+    }
 }

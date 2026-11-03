@@ -480,7 +480,16 @@ async fn bad_anchor_is_400() {
     let uri = format!("/api/docs/{doc_id}/suggestions");
 
     let not_a_position = STANDARD.encode(b"position_bytes");
+    // A valid position followed by extra bytes, which `decode_v1` alone
+    // would accept.
+    let mut trailing = STANDARD
+        .decode(replace_body()["position_y"].as_str().unwrap())
+        .unwrap();
+    trailing.extend_from_slice(b"garbage");
+    let trailing = STANDARD.encode(trailing);
     for (field, value) in [
+        ("position_y", trailing.clone()),
+        ("position_y_end", trailing),
         ("position_y", "not base64!!".to_string()),
         ("position_y_end", "not base64!!".to_string()),
         ("position_y", not_a_position.clone()),
@@ -807,10 +816,10 @@ async fn replies_are_listed_with_their_suggestion() {
     let (status, _) = reply(first.clone(), "three", sid_a.clone(), csrf_a.clone()).await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // An empty reply is invalid, an over-long one too long.
+    // An empty reply and an over-long one are both 422.
     let (status, json) = reply(first.clone(), "", sid_a.clone(), csrf_a.clone()).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
-    assert_eq!(code(&json), "suggestion.invalid");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_eq!(code(&json), "suggestion.empty_body");
     let (status, json) = post_json(
         &app,
         &format!("/api/docs/{doc_id}/suggestions/{first}/replies"),
@@ -883,8 +892,8 @@ async fn reply_edit_author_only() {
     assert_eq!(json["body"], "bob edited");
 
     let (status, json) = patch_json(&app, &uri, &sid_b, &csrf_b, json!({"body": ""})).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
-    assert_eq!(code(&json), "suggestion.invalid");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_eq!(code(&json), "suggestion.empty_body");
 }
 
 #[tokio::test(flavor = "multi_thread")]
