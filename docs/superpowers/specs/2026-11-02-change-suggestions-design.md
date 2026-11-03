@@ -119,6 +119,21 @@ notifications and content pipeline.
   first, so a "b" typed directly before "brave" is recorded after the
   original "b" and the range reads "bbrave". The card shows "changed", so the
   owner sees both versions before accepting. This is accepted for v1.
+- **An insertion whose anchored character is deleted is lost.** Pressing
+  Enter just before an insertion point moves the text after it into a new
+  block; y-tiptap leaves the anchored character behind as a tombstone, which
+  would resolve to the split point. Client and server both treat a deleted
+  anchor character as "removed", even after an undo brings the text back.
+  Likewise a range whose ends land in different text nodes, a caret next to
+  a line break with no text beside it, and a selection with a line break in
+  a code block are refused.
+- **The applied marker can't be forged.** The room records an apply in the
+  `knot_applied_suggestions` root map with a per-suggestion token minted on
+  the first claim and never sent to clients, so an editor writing that map
+  cannot make an accept look done. The room persists the apply before it
+  sends it to anyone, and the accept route runs in its own task with a 20 s
+  deadline (under the 30 s request timeout, well under the sweep's 120 s), so
+  a dropped request never strands a claim.
 - **Positions differ between client and server.** Room docs count offsets in
   bytes, while Yjs clocks and the browser count UTF-16 units. The server must
   resolve anchors in UTF-16 and convert, or umlauts and emoji before the range
