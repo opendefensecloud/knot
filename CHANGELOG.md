@@ -8,6 +8,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-11-03
+
 Editors can now suggest changes to a page instead of editing it directly.
 A suggestion waits in the sidebar, next to the text it's about, until an
 owner of the page accepts or rejects it. Until then the page stays as it is.
@@ -1037,7 +1039,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.7...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.8...HEAD
+[0.9.8]: https://github.com/opendefensecloud/knot/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/opendefensecloud/knot/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/opendefensecloud/knot/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/opendefensecloud/knot/compare/v0.9.4...v0.9.5
