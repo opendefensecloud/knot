@@ -161,9 +161,9 @@ test("a click in the text before ⌘E keeps the caret at the click", async ({ pa
   await expect(paragraph(page, n)).toContainText("Q");
 });
 
-test("a caret placed in a table stays clear of the toolbar's table row", async ({ page }) => {
-  // The toolbar adds table buttons once the caret is in a table and wraps to
-  // a second row; the caret's line must not end up under it.
+test("a caret placed in a table stays clear of the toolbar", async ({ page }) => {
+  // The toolbar swaps Insert table for the table menu once the caret is in a
+  // table; the caret's line must not end up under the toolbar.
   const blocks = LONG_MARKDOWN.split("\n\n");
   const table = ["| Item | Notes |", "| --- | --- |", ...Array.from({ length: 12 }, (_, i) => `| Row ${i + 1} | Cell text ${i + 1} |`)].join("\n");
   const markdown = [...blocks.slice(0, 80), table, ...blocks.slice(80)].join("\n\n");
@@ -177,7 +177,7 @@ test("a caret placed in a table stays clear of the toolbar's table row", async (
   });
   await expect(page.getByTestId("doc-dock")).toBeInViewport();
   await page.getByTestId("dock-toggle-edit-mode").click();
-  await expect(page.getByTestId("toolbar-table-add-row")).toBeVisible();
+  await expect(page.getByTestId("toolbar-table-menu")).toBeVisible();
   // Let the reveal frame run after the toolbar's re-render.
   await page.waitForTimeout(100);
 

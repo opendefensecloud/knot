@@ -355,7 +355,7 @@ function EditorBody({
           void uploadAndInsert(files);
           return true;
         },
-        handlePaste(_view, event) {
+        handlePaste(view, event) {
           const clipboard = (event as ClipboardEvent).clipboardData;
           const files = Array.from(clipboard?.files ?? []);
           if (files.length > 0) {
@@ -377,7 +377,18 @@ function EditorBody({
           const text = clipboard?.getData("text/plain") ?? "";
           if (!looksLikeMarkdown(text)) return false;
           event.preventDefault();
-          ed.chain().focus().insertContent(markdownToHtml(text)).run();
+          const html = markdownToHtml(text);
+          // A table pasted into a table goes through ProseMirror's own paste,
+          // where prosemirror-tables fills the cells from the caret's on
+          // instead of nesting a table in the cell, which GFM can't hold.
+          // That paste comes back here without clipboard data and falls
+          // through. The pasted header row lands on the caret's row, so it
+          // stays a header only when that row is one.
+          if (ed.isActive("table") && html.includes("<table")) {
+            view.pasteHTML(ed.isActive("table_header") ? html : html.replace(/<(\/?)th\b/g, "<$1td"));
+          } else {
+            ed.chain().focus().insertContent(html).run();
+          }
           notify("info", "Pasted as Markdown");
           return true;
         },
