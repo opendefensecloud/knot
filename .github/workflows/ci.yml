@@ -56,6 +56,16 @@ jobs:
   unit-rust:
     name: cargo nextest
     runs-on: ubuntu-latest
+    # The workspace builds ~50 integration-test binaries, each statically
+    # linking the entire knot-server graph. With debug info that is tens of
+    # gigabytes of target/, which outruns the runner's disk mid-link: lld then
+    # dies with `signal 7 [Bus error]` while writing its mmap'd output, and the
+    # job fails with no test ever having run. Neither setting is needed to
+    # diagnose a failure here — a panic still reports its `file:line` from the
+    # panic site — so both just make the artifacts small enough to fit.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
     # Integration tests use knot_test_support::fresh_db(), which creates a
     # t_<uuid> database on a Postgres at 127.0.0.1:5432. Without this service
     # the ~30 DB-backed tests fail deterministically.
@@ -74,6 +84,14 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
+      # The ubuntu image ships ~20 GB of toolchains this repo never uses; the
+      # link stage wants that headroom back.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
