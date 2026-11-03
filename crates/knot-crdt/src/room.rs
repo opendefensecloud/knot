@@ -143,12 +143,14 @@ pub enum Event {
     /// Apply an accepted change suggestion to the live doc
     /// ([`crate::suggestions::apply_suggestion`]): resolve its anchors, check
     /// the text the owner saw, replace the range and record the suggestion
-    /// id in [`crate::suggestions::APPLIED_MAP`], all in one transaction.
+    /// id in [`crate::suggestions::APPLIED_MAP`] under the claim's
+    /// `apply_token`, all in one transaction.
     /// The room first catches up on updates other replicas persisted, so a
     /// lagging room doesn't answer `AnchorLost` for text it hasn't seen yet.
-    /// The update is persisted and fanned out like `PatchTaskChecked`'s; a
-    /// refusal writes nothing. When persisting fails the room evicts itself,
-    /// so no live room keeps an applied marker that storage lacks.
+    /// The update is persisted first and fanned out only once storage has
+    /// it, so no client ever holds an apply that storage lacks; a refusal
+    /// writes nothing. When persisting fails the room evicts itself, so no
+    /// live room keeps an applied marker that storage lacks either.
     ApplySuggestion {
         request: crate::suggestions::ApplySuggestionRequest,
         /// Attribution for the persisted update: the suggester, who wrote
@@ -156,14 +158,17 @@ pub enum Event {
         by_user: Option<Uuid>,
         reply: oneshot::Sender<Result<i64, crate::suggestions::ApplySuggestionError>>,
     },
-    /// Whether the doc records `suggestion_id` as applied, after catching up
+    /// Whether the doc records `suggestion_id` as applied under the claim's
+    /// `apply_token` ([`crate::suggestions::is_applied`]), after catching up
     /// on persisted updates. The marker in the doc is the single source of
     /// truth for "was this applied", which recovering a suggestion stuck in
-    /// `applying` relies on. When the catch-up read fails the room drops
+    /// `applying` relies on; a marker with any other value (an Editor can
+    /// write the map over the socket) is not the room's and reads as "no". When the catch-up read fails the room drops
     /// `reply` unanswered rather than answer from a doc that may be stale:
     /// the caller treats a dropped channel as "unknown, ask again later".
     SuggestionApplied {
         suggestion_id: Uuid,
+        apply_token: Uuid,
         reply: oneshot::Sender<bool>,
     },
     Shutdown,
@@ -616,15 +621,10 @@ impl Room {
                             by_user_id: by_user,
                             persisted: Some(persisted_tx),
                         }).await;
-                        let framed = wrap_sync_update(&update_bytes);
-                        let mut to_close: Vec<ConnId> = Vec::new();
-                        for (cid, conn) in &self.conns {
-                            match conn.tx.try_send(framed.clone()) {
-                                Ok(_) => {}
-                                Err(_) => to_close.push(*cid),
-                            }
-                        }
-                        for cid in to_close { self.conns.remove(&cid); }
+                        // Persist BEFORE the fan-out: a client that got the
+                        // update would push it back on its resync after an
+                        // eviction, making durable an apply whose accept
+                        // already answered "persist failed".
                         let final_seq = match persisted_rx.await {
                             Ok(Ok(seq)) => seq,
                             Ok(Err(e)) => {
@@ -638,9 +638,18 @@ impl Room {
                                 continue;
                             }
                         };
+                        let framed = wrap_sync_update(&update_bytes);
+                        let mut to_close: Vec<ConnId> = Vec::new();
+                        for (cid, conn) in &self.conns {
+                            match conn.tx.try_send(framed.clone()) {
+                                Ok(_) => {}
+                                Err(_) => to_close.push(*cid),
+                            }
+                        }
+                        for cid in to_close { self.conns.remove(&cid); }
                         let _ = reply.send(Ok(final_seq));
                     }
-                    Some(Event::SuggestionApplied { suggestion_id, reply }) => {
+                    Some(Event::SuggestionApplied { suggestion_id, apply_token, reply }) => {
                         use crate::suggestions::{APPLIED_MAP, is_applied};
                         use yrs::Transact;
                         // Without the catch-up the doc may lag an apply
@@ -658,7 +667,7 @@ impl Room {
                         }
                         let applied = self.doc.inner().get_or_insert_map(APPLIED_MAP);
                         let txn = self.doc.inner().transact();
-                        let _ = reply.send(is_applied(&applied, &txn, suggestion_id));
+                        let _ = reply.send(is_applied(&applied, &txn, suggestion_id, apply_token));
                     }
                     Some(Event::Revoke) => {
                         // Tell every connection to close (the WS shim sends
@@ -967,9 +976,9 @@ impl Room {
     /// what storage has. As in [`Self::refuse_applied`], the room ends
     /// without its final snapshot and every connection is closed through
     /// the room's token, so clients reconnect to a room reloaded from
-    /// storage. A client that got the fan-out pushes the text and the marker
-    /// back together in its resync, so they are persisted as a pair or not
-    /// at all.
+    /// storage. The apply is fanned out only after it is persisted, so no
+    /// client holds it to push back in its resync: the change is gone with
+    /// the room.
     fn evict_unpersisted(&mut self, suggestion_id: Uuid) {
         tracing::warn!(
             doc_id = %self.doc_id,
@@ -2144,6 +2153,7 @@ pub(crate) mod tests {
     fn replace_world(seen: &str) -> crate::ApplySuggestionRequest {
         crate::ApplySuggestionRequest {
             suggestion_id: Uuid::new_v4(),
+            apply_token: Uuid::new_v4(),
             kind: crate::SuggestionKind::Replace,
             start: seed_anchor(8, yrs::Assoc::After),
             end: seed_anchor(12, yrs::Assoc::Before),
@@ -2216,10 +2226,11 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    async fn suggestion_applied(h: &RoomHandle, suggestion_id: Uuid) -> bool {
+    async fn suggestion_applied(h: &RoomHandle, suggestion_id: Uuid, apply_token: Uuid) -> bool {
         let (tx, rx) = oneshot::channel();
         h.tx.send(Event::SuggestionApplied {
             suggestion_id,
+            apply_token,
             reply: tx,
         })
         .await
@@ -2300,20 +2311,25 @@ pub(crate) mod tests {
         h.shutdown.cancel();
     }
 
-    /// `SuggestionApplied` reads the marker the apply records in the doc.
+    /// `SuggestionApplied` reads the marker the apply records in the doc,
+    /// and only under the claim's token.
     #[tokio::test(flavor = "multi_thread")]
     async fn suggestion_applied_reports_true_after_apply_false_before() {
         let h = spawn_suggestion_room(Uuid::new_v4(), Arc::new(NoopUpdates)).await;
         apply_update(&h, seed_paragraph(SEED_TEXT), None).await;
 
         let request = replace_world("world");
-        let id = request.suggestion_id;
-        assert!(!suggestion_applied(&h, id).await);
+        let (id, token) = (request.suggestion_id, request.apply_token);
+        assert!(!suggestion_applied(&h, id, token).await);
         apply_suggestion(&h, request.clone(), None)
             .await
             .expect("apply suggestion");
-        assert!(suggestion_applied(&h, id).await);
-        assert!(!suggestion_applied(&h, Uuid::new_v4()).await);
+        assert!(suggestion_applied(&h, id, token).await);
+        assert!(!suggestion_applied(&h, Uuid::new_v4(), token).await);
+        assert!(
+            !suggestion_applied(&h, id, Uuid::new_v4()).await,
+            "a marker under another token counts as applied"
+        );
         assert_eq!(
             apply_suggestion(&h, request, None).await.unwrap_err(),
             crate::ApplySuggestionError::AlreadyApplied
@@ -2453,7 +2469,8 @@ pub(crate) mod tests {
 
     /// An apply the store didn't take evicts the room: no live room may keep
     /// an applied marker that storage lacks, and the evicted room writes no
-    /// final snapshot, which would be the one thing that persisted it.
+    /// final snapshot, which would be the one thing that persisted it. No
+    /// connection got the apply either, so none can push it back on resync.
     #[tokio::test(flavor = "multi_thread")]
     async fn persist_failure_evicts_room() {
         let snapshots = Arc::new(CountingSnapshots::default());
@@ -2471,6 +2488,8 @@ pub(crate) mod tests {
         .unwrap();
         assert!(rx.await.unwrap().is_err());
         assert!(!h.shutdown.is_cancelled());
+        let (_conn, mut conn_rx) = join(&h).await;
+        while conn_rx.try_recv().is_ok() {}
 
         let err = apply_suggestion(&h, replace_world("world"), None)
             .await
@@ -2491,6 +2510,14 @@ pub(crate) mod tests {
             snapshots.inserts.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "the evicted room snapshotted its unpersisted marker"
+        );
+        let mut fanned_out = Vec::new();
+        while let Ok(frame) = conn_rx.try_recv() {
+            fanned_out.push(frame);
+        }
+        assert!(
+            fanned_out.is_empty(),
+            "a connection got the unpersisted apply: {fanned_out:?}"
         );
     }
 
@@ -2550,7 +2577,7 @@ pub(crate) mod tests {
         let h = spawn_suggestion_room(Uuid::new_v4(), updates.clone()).await;
         apply_update(&h, seed_paragraph(SEED_TEXT), None).await;
         let request = replace_world("world");
-        let id = request.suggestion_id;
+        let (id, token) = (request.suggestion_id, request.apply_token);
         apply_suggestion(&h, request, None).await.expect("apply");
 
         updates
@@ -2559,6 +2586,7 @@ pub(crate) mod tests {
         let (tx, rx) = oneshot::channel();
         h.tx.send(Event::SuggestionApplied {
             suggestion_id: id,
+            apply_token: token,
             reply: tx,
         })
         .await
@@ -2572,7 +2600,7 @@ pub(crate) mod tests {
         updates
             .fail_since
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        assert!(suggestion_applied(&h, id).await);
+        assert!(suggestion_applied(&h, id, token).await);
         h.shutdown.cancel();
     }
 }

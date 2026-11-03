@@ -10,6 +10,11 @@
 -- status moves only through conditional UPDATEs: pending → applying (the
 -- accept claim) → accepted, applying → pending (release), and
 -- pending → rejected | withdrawn.
+--
+-- apply_token is minted by the first accept claim and kept from then on.
+-- The room records it as the value of the doc's applied marker, a root
+-- Y.Map any Editor can write, so only a marker holding it counts as
+-- applied. Server-side only: never sent to clients.
 CREATE TABLE suggestions (
   id              uuid PRIMARY KEY,
   doc_id          uuid NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -25,6 +30,7 @@ CREATE TABLE suggestions (
                   CHECK (status IN ('pending', 'applying', 'accepted', 'rejected', 'withdrawn')),
   decided_by      uuid NULL REFERENCES users(id),
   decided_at      timestamptz NULL,
+  apply_token     uuid NULL,
   created_at      timestamptz NOT NULL DEFAULT now(),
   updated_at      timestamptz NOT NULL DEFAULT now()
 );
@@ -43,8 +49,10 @@ CREATE TABLE suggestion_replies (
   updated_at     timestamptz NOT NULL DEFAULT now(),
   deleted_at     timestamptz NULL
 );
+-- Not partial: the ON DELETE CASCADE from suggestions looks replies up by
+-- suggestion_id, deleted or not.
 CREATE INDEX suggestion_replies_suggestion_idx
-  ON suggestion_replies(suggestion_id, created_at) WHERE deleted_at IS NULL;
+  ON suggestion_replies(suggestion_id, created_at);
 
 -- Two new inbox kinds. The inline CHECK in 20261101120000_notifications.sql
 -- got Postgres's default name, notifications_kind_check.

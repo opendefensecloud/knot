@@ -186,6 +186,44 @@ async fn claim_is_exclusive() {
     ));
 }
 
+/// The claim mints the token the room records as the doc's applied marker.
+/// It is kept across a release, so a re-accept of a suggestion whose text
+/// landed after its row was released sees its own marker; it is read back
+/// by the sweep's listing and never serialized.
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_mints_a_hidden_apply_token_kept_across_release() {
+    let (store, _ws, doc, alice, bob) = setup().await;
+    let s = store.create(&replace_on(doc, bob, "x")).await.unwrap();
+    assert_eq!(s.apply_token, None);
+
+    let claimed = store.claim_for_accept(s.id, alice).await.unwrap();
+    let token = claimed.apply_token.expect("the claim sets a token");
+    let v = serde_json::to_value(&claimed).unwrap();
+    assert!(v.get("apply_token").is_none(), "token serialized: {v}");
+    assert!(
+        !v.to_string().contains(&token.to_string()),
+        "token leaked: {v}"
+    );
+
+    backdate(&store, s.id, 10).await;
+    let stuck = store
+        .list_stuck_applying(Utc::now() - Duration::seconds(120))
+        .await
+        .unwrap();
+    assert_eq!(stuck.len(), 1);
+    assert_eq!(stuck[0].apply_token, Some(token));
+
+    store.release(s.id).await.unwrap();
+    let again = store.claim_for_accept(s.id, alice).await.unwrap();
+    assert_eq!(again.apply_token, Some(token));
+
+    // Another row gets its own.
+    let other = store.create(&replace_on(doc, bob, "y")).await.unwrap();
+    let other = store.claim_for_accept(other.id, alice).await.unwrap();
+    assert_ne!(other.apply_token, Some(token));
+    assert!(other.apply_token.is_some());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn release_returns_to_pending() {
     let (store, _ws, doc, alice, bob) = setup().await;

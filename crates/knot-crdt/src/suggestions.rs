@@ -16,10 +16,20 @@
 //! would not match item positions, and the range is refused as
 //! [`ApplySuggestionError::AnchorLost`] rather than guessed.
 //!
+//! An insertion whose anchored character is deleted is lost
+//! ([`ApplySuggestionError::AnchorLost`]): a deleted item still resolves to
+//! an index, the place it was deleted from, which is not where its text went
+//! when a block split moved it (y-tiptap keeps the first XmlText and
+//! recreates the tail in a new one).
+//!
 //! [`apply_suggestion`] runs every check before its first mutation and records
 //! the suggestion id in the [`APPLIED_MAP`] root map in the same transaction,
 //! which makes the apply idempotent and tells a recovery sweep whether a
-//! suggestion stuck in `applying` was in fact applied.
+//! suggestion stuck in `applying` was in fact applied. Any Editor can write
+//! that root map over the socket, so the marker's value is the accept claim's
+//! `apply_token`, which only the server knows until it writes it: a marker
+//! holding anything else is not the room's and is ignored (and overwritten
+//! by the apply).
 
 use uuid::Uuid;
 use yrs::types::text::YChange;
@@ -46,6 +56,9 @@ pub enum SuggestionKind {
 pub struct ApplySuggestionRequest {
     /// The suggestion's id, recorded in [`APPLIED_MAP`] once applied.
     pub suggestion_id: Uuid,
+    /// The accept claim's token (`suggestions.apply_token`), recorded as the
+    /// marker's value; only a marker holding it counts as applied.
+    pub apply_token: Uuid,
     /// What to do with the range.
     pub kind: SuggestionKind,
     /// Raw `Y.RelativePosition` v1 bytes of the start anchor (not base64).
@@ -64,14 +77,15 @@ pub struct ApplySuggestionRequest {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApplySuggestionError {
     /// The anchors no longer resolve to a range inside one live text block,
-    /// the range collapsed for a replace or delete, or it is not a point for
-    /// an insertion.
+    /// the range collapsed for a replace or delete, it is not a point for an
+    /// insertion, or an insertion's anchored character is deleted.
     #[error("anchor lost")]
     AnchorLost,
     /// The text between the anchors is not what the owner saw.
     #[error("text changed")]
     Changed,
-    /// The suggestion id is already recorded in [`APPLIED_MAP`].
+    /// The suggestion id is already recorded in [`APPLIED_MAP`] under the
+    /// request's `apply_token`.
     #[error("already applied")]
     AlreadyApplied,
     /// An anchor's bytes don't decode as a RelativePosition.
@@ -82,7 +96,8 @@ pub enum ApplySuggestionError {
     Persist(String),
 }
 
-/// Root Y.Map recording applied suggestion ids (value: `Any::Bool(true)`).
+/// Root Y.Map recording applied suggestion ids. The value is the accept
+/// claim's `apply_token` as a string; see [`is_applied`].
 pub const APPLIED_MAP: &str = "knot_applied_suggestions";
 
 /// The root XmlFragment holding a page's content. Suggestions apply only
@@ -188,19 +203,44 @@ pub fn resolve_range<T: ReadTxn>(
 }
 
 /// Whether `suggestion_id` is recorded as applied in `applied`, the doc's
-/// [`APPLIED_MAP`].
-pub fn is_applied<T: ReadTxn>(applied: &MapRef, txn: &T, suggestion_id: Uuid) -> bool {
-    matches!(
-        applied.get(txn, &suggestion_id.to_string()),
-        Some(Out::Any(Any::Bool(true)))
-    )
+/// [`APPLIED_MAP`], under `apply_token`. Clients can write that map, so a
+/// marker with any other value (a forged `true`, another token) is not one
+/// the room wrote for this claim and reads as not applied.
+pub fn is_applied<T: ReadTxn>(
+    applied: &MapRef,
+    txn: &T,
+    suggestion_id: Uuid,
+    apply_token: Uuid,
+) -> bool {
+    match applied.get(txn, &suggestion_id.to_string()) {
+        Some(Out::Any(Any::String(value))) => *value == *apply_token.to_string(),
+        _ => false,
+    }
+}
+
+/// Whether `anchor` (raw RelativePosition v1 bytes) is tied to a character
+/// that is deleted in `txn`'s doc. An anchor scoped to a whole type (the
+/// start of a block) has no character and is never deleted here.
+fn anchored_char_deleted<T: ReadTxn>(txn: &T, anchor: &[u8]) -> Result<bool, ApplySuggestionError> {
+    let anchor =
+        StickyIndex::decode_v1(anchor).map_err(|e| ApplySuggestionError::Decode(e.to_string()))?;
+    Ok(anchor
+        .id()
+        .is_some_and(|id| txn.snapshot().delete_set.contains(id)))
 }
 
 /// Applies `req` in `txn` and records its id in `applied`, the doc's
-/// [`APPLIED_MAP`].
+/// [`APPLIED_MAP`], with `req.apply_token` as the value. A marker already
+/// there with that token makes it [`ApplySuggestionError::AlreadyApplied`];
+/// one with any other value is ignored and overwritten.
 ///
 /// A replace or delete needs a non-empty range and an insertion a point;
-/// otherwise the result is [`ApplySuggestionError::AnchorLost`]. A delete
+/// otherwise the result is [`ApplySuggestionError::AnchorLost`]. An insertion
+/// whose anchored character is deleted is lost too (`AnchorLost`): it would
+/// resolve to where the character was deleted from, which after a block split
+/// is the end of the head, not next to the text that moved. (A replace or
+/// delete whose text moved has both anchors on deleted characters and
+/// collapses, so it is refused as above.) A delete
 /// ignores `proposed_text`. A replace keeps the marks of the first replaced
 /// character. An insertion
 /// takes the marks of the character before the point (at the start of a
@@ -212,8 +252,11 @@ pub fn apply_suggestion(
     txn: &mut TransactionMut,
     req: &ApplySuggestionRequest,
 ) -> Result<(), ApplySuggestionError> {
-    if is_applied(applied, txn, req.suggestion_id) {
+    if is_applied(applied, txn, req.suggestion_id, req.apply_token) {
         return Err(ApplySuggestionError::AlreadyApplied);
+    }
+    if req.kind == SuggestionKind::Insert && anchored_char_deleted(txn, &req.start)? {
+        return Err(ApplySuggestionError::AnchorLost);
     }
     let range = resolve_range(txn, &req.start, &req.end)?;
     // A replace or delete needs a range, an insertion a point. Anything else
@@ -245,7 +288,11 @@ pub fn apply_suggestion(
             .text
             .insert_with_attributes(txn, range.start_byte, &req.proposed_text, attrs);
     }
-    applied.insert(txn, req.suggestion_id.to_string(), true);
+    applied.insert(
+        txn,
+        req.suggestion_id.to_string(),
+        req.apply_token.to_string(),
+    );
     Ok(())
 }
 
@@ -383,6 +430,7 @@ mod tests {
     ) -> ApplySuggestionRequest {
         ApplySuggestionRequest {
             suggestion_id: Uuid::new_v4(),
+            apply_token: Uuid::new_v4(),
             kind,
             start,
             end,
@@ -681,7 +729,12 @@ mod tests {
         assert_eq!(result, Err(ApplySuggestionError::Changed));
         assert_eq!(*updates.lock().unwrap(), 0);
         assert_eq!(plain(&doc, &text), "hello world");
-        assert!(!is_applied(&applied, &doc.transact(), req.suggestion_id));
+        assert!(!is_applied(
+            &applied,
+            &doc.transact(),
+            req.suggestion_id,
+            req.apply_token
+        ));
     }
 
     #[test]
@@ -790,9 +843,107 @@ mod tests {
         assert!(is_applied(
             &doc.get_or_insert_map(APPLIED_MAP),
             &doc.transact(),
-            req.suggestion_id
+            req.suggestion_id,
+            req.apply_token
         ));
         assert_eq!(apply(&doc, &req), Err(ApplySuggestionError::AlreadyApplied));
         assert_eq!(plain(&doc, &text), "hello there");
+    }
+
+    /// Any Editor can write the applied map over the socket. A marker that
+    /// doesn't carry the claim's token is not the room's, so the apply goes
+    /// ahead and overwrites it with the real one.
+    #[test]
+    fn forged_marker_does_not_short_circuit_apply() {
+        for forged in [Any::Bool(true), Any::from(Uuid::new_v4().to_string())] {
+            let (doc, text) = paragraph_doc("hello world");
+            let req = request(SuggestionKind::Replace, at(8), after(12), "world", "there");
+            let applied = doc.get_or_insert_map(APPLIED_MAP);
+            {
+                let mut txn = doc.transact_mut();
+                applied.insert(&mut txn, req.suggestion_id.to_string(), forged.clone());
+            }
+            assert!(
+                !is_applied(
+                    &applied,
+                    &doc.transact(),
+                    req.suggestion_id,
+                    req.apply_token
+                ),
+                "{forged:?} passed for the claim's token"
+            );
+
+            apply(&doc, &req).unwrap_or_else(|e| panic!("{forged:?}: {e:?}"));
+            assert_eq!(plain(&doc, &text), "hello there");
+            assert!(is_applied(
+                &applied,
+                &doc.transact(),
+                req.suggestion_id,
+                req.apply_token
+            ));
+            assert_eq!(apply(&doc, &req), Err(ApplySuggestionError::AlreadyApplied));
+        }
+    }
+
+    /// Splits `text`'s block at `index` the way y-tiptap does on Enter: the
+    /// first XmlText keeps the head, its tail is deleted and recreated in a
+    /// new XmlText of a new paragraph right after it.
+    fn split_block(doc: &Doc, text: &XmlTextRef, index: u32) -> XmlTextRef {
+        let frag = doc.get_or_insert_xml_fragment(FRAGMENT);
+        let mut txn = doc.transact_mut();
+        let full = plain_text(text, &txn).unwrap();
+        let tail = full[index as usize..].to_string();
+        text.remove_range(&mut txn, index, tail.len() as u32);
+        let p = frag.insert(&mut txn, 1, XmlElementPrelim::empty("paragraph"));
+        p.push_back(&mut txn, XmlTextPrelim::new(tail))
+    }
+
+    #[test]
+    fn insert_anchored_to_moved_text_is_anchor_lost() {
+        // "Please call me tomorrow.": "Please call me" at clocks 2..15,
+        // " tomorrow." at 16..25, the "w" of "tomorrow" at 24.
+        let (doc, text) = paragraph_doc("Please call me tomorrow.");
+        let req = request(SuggestionKind::Insert, after(24), after(24), "", " early");
+        // Enter between "me" and " tomorrow": the anchored "w" is now a
+        // tombstone in the still-live first XmlText, where it would resolve
+        // to the end of "Please call me".
+        let moved = split_block(&doc, &text, 14);
+        assert_eq!(plain(&doc, &text), "Please call me");
+        assert_eq!(plain(&doc, &moved), " tomorrow.");
+
+        assert_eq!(apply(&doc, &req), Err(ApplySuggestionError::AnchorLost));
+        assert_eq!(plain(&doc, &text), "Please call me");
+        assert_eq!(plain(&doc, &moved), " tomorrow.");
+    }
+
+    #[test]
+    fn insert_anchored_to_deleted_char_is_anchor_lost() {
+        // "hello world": the "o" of "hello" at clock 6.
+        let (doc, text) = paragraph_doc("hello world");
+        {
+            let mut txn = doc.transact_mut();
+            text.remove_range(&mut txn, 4, 1);
+        }
+        let req = request(SuggestionKind::Insert, after(6), after(6), "", "X");
+        assert_eq!(apply(&doc, &req), Err(ApplySuggestionError::AnchorLost));
+        assert_eq!(plain(&doc, &text), "hell world");
+    }
+
+    #[test]
+    fn replace_of_moved_text_is_anchor_lost() {
+        // "tomorrow" at clocks 17..24 of "Please call me tomorrow.".
+        let (doc, text) = paragraph_doc("Please call me tomorrow.");
+        let req = request(
+            SuggestionKind::Replace,
+            at(17),
+            after(24),
+            "tomorrow",
+            "today",
+        );
+        let moved = split_block(&doc, &text, 14);
+
+        assert_eq!(apply(&doc, &req), Err(ApplySuggestionError::AnchorLost));
+        assert_eq!(plain(&doc, &text), "Please call me");
+        assert_eq!(plain(&doc, &moved), " tomorrow.");
     }
 }

@@ -6,8 +6,10 @@
 //! the row `applying` with nobody to settle it. Every 60 s this sweep takes
 //! the rows that have been `applying` for longer than [`STUCK_AFTER`] and
 //! asks the doc's room whether the doc records the suggestion as applied
-//! (`knot_crdt::Event::SuggestionApplied`). The room writes that marker in
-//! the same transaction as the text, so it is the single source of truth:
+//! under the row's `apply_token` (`knot_crdt::Event::SuggestionApplied`).
+//! The room writes that marker in the same transaction as the text, so it is
+//! the single source of truth; a marker with another value is one a client
+//! wrote (any Editor can write the map) and reads as not applied:
 //!
 //! - applied → `finish_accept`, so the row says `accepted` like the text,
 //!   and the author gets the `suggestion_decided` row the accept never sent;
@@ -21,18 +23,23 @@
 //! same row both read the same marker, `finish_accept` refuses a row that is
 //! already `accepted`, and only one compare-and-set release can win.
 //!
-//! **Residual window.** Accept spends at most 60 s from its claim on queueing
-//! the event and waiting for the reply, well under [`STUCK_AFTER`] (120 s).
-//! If an `ApplySuggestion` event is still queued in a room on another
-//! replica after 120 s, the sweep may read "not applied" and release the
-//! row, and the queued event then applies the text with nobody left to
-//! finish the row. The row can then stay `pending` while the text is
+//! **Ordering.** Accept spends at most 20 s from its claim on queueing the
+//! event and waiting for the reply, under the 30 s request timeout and well
+//! under [`STUCK_AFTER`] (120 s). It does that in a task of its own, so a
+//! request the timeout cancels still settles its claim; only a crash leaves
+//! the row to this sweep.
+//!
+//! **Residual window.** If an `ApplySuggestion` event is still queued in a
+//! room on another replica after 120 s, the sweep may read "not applied" and
+//! release the row, and the queued event then applies the text with nobody
+//! left to finish the row. The row can then stay `pending` while the text is
 //! applied (a known v1 gap). It converges only if someone accepts it again:
-//! the marker makes that apply `AlreadyApplied`, so the accept (or a later
-//! sweep, if that claim gets stuck) finishes the row without touching the
-//! text a second time. Nothing prompts that accept, though: the applied
-//! text leaves the anchors on deleted items, so the card shows the
-//! suggestion as removed and offers no Accept.
+//! the claim keeps the row's `apply_token`, so the marker makes that apply
+//! `AlreadyApplied`, and the accept (or a later sweep, if that claim gets
+//! stuck) finishes the row without touching the text a second time. Nothing
+//! prompts that accept, though: the applied text leaves the anchors on
+//! deleted items, so the card shows the suggestion as removed and offers no
+//! Accept.
 
 use chrono::{DateTime, Utc};
 use knot_storage::{Suggestion, SuggestionStoreError};
@@ -44,7 +51,7 @@ use crate::AppState;
 const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a row must have been `applying` before the sweep settles it.
-/// Accept gives its room 60 s, so a row this old has no accept waiting.
+/// Accept gives its room 20 s, so a row this old has no accept waiting.
 pub const STUCK_AFTER: chrono::Duration = chrono::Duration::seconds(120);
 
 /// How long the sweep waits for a room to answer whether a suggestion was
@@ -106,10 +113,16 @@ pub async fn run_once(
     Ok(out)
 }
 
-/// Ask the doc's room whether it records `row` as applied. `None` when the
-/// room cannot be reached or does not answer in time.
+/// Ask the doc's room whether it records `row` as applied under the row's
+/// `apply_token`. `None` when the room cannot be reached or does not answer
+/// in time.
 async fn applied_in_doc(rooms: &knot_crdt::Rooms, row: &Suggestion) -> Option<bool> {
     let suggestion_id = row.id;
+    let Some(apply_token) = row.apply_token else {
+        // Every claim mints a token and the room records exactly that one,
+        // so a row without one was never applied.
+        return Some(false);
+    };
     let room = match rooms.acquire(row.doc_id).await {
         Ok(h) => h,
         Err(e) => {
@@ -121,6 +134,7 @@ async fn applied_in_doc(rooms: &knot_crdt::Rooms, row: &Suggestion) -> Option<bo
     room.tx
         .send(knot_crdt::Event::SuggestionApplied {
             suggestion_id,
+            apply_token,
             reply: tx,
         })
         .await

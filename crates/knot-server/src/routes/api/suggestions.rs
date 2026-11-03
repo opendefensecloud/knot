@@ -66,10 +66,14 @@ const MAX_REPLY_BYTES: usize = 64 * 1024;
 
 /// How long accept waits for the room to take and apply the change, counted
 /// from the claim (it covers queueing the event on a full room mailbox as
-/// well as the reply). Well under [`crate::suggestions_sweep::STUCK_AFTER`],
-/// so the sweep never looks at a row whose accept is still waiting on its
-/// room.
-const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+/// well as the reply). Under the 30 s request timeout (the `TimeoutLayer` in
+/// `crate::router_with_state`), so the owner normally gets the outcome
+/// rather than a 408, and well under
+/// [`crate::suggestions_sweep::STUCK_AFTER`] (120 s), so the sweep never
+/// looks at a row whose accept is still waiting on its room. The claim and
+/// its settling run in their own task ([`apply_claimed`]), so even a request
+/// the timeout cancels leaves no claim behind.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ---------------------------------------------------------------------------
 // Request / response shapes
@@ -422,6 +426,11 @@ async fn list(
 /// releases the row back to `pending`. When the outcome is unknown (the room
 /// timed out, went away or could not persist) the row stays `applying` and
 /// `suggestions_sweep` settles it from the doc's applied marker.
+///
+/// Everything from the claim on runs in a spawned task the handler awaits
+/// ([`apply_claimed`]): the request timeout cancels the handler, and a
+/// cancelled handler would strand its claim with nobody to release or
+/// finish it. The task runs on and settles the row (and notifies) anyway.
 async fn accept(
     State(state): State<AppState>,
     Path((doc_id, suggestion_id)): Path<(Uuid, Uuid)>,
@@ -460,19 +469,57 @@ async fn accept(
         }
     };
 
+    let task = tokio::spawn(apply_claimed(
+        state,
+        store,
+        ctx,
+        room,
+        doc_id,
+        suggestion_id,
+        body.seen_text,
+    ));
+    match task.await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::error!(error=?e, %suggestion_id, "accept_suggestion: apply task failed");
+            internal()
+        }
+    }
+}
+
+/// The part of accept from the claim on, run in its own task by [`accept`]
+/// so that it settles the row even when the request is cancelled: claim the
+/// row, have `room` apply it, then finish or release the row and notify.
+async fn apply_claimed(
+    state: AppState,
+    store: Arc<dyn SuggestionStore>,
+    ctx: AuthContext,
+    room: Arc<knot_crdt::RoomHandle>,
+    doc_id: Uuid,
+    suggestion_id: Uuid,
+    seen_text: String,
+) -> Response {
     let claimed = match store.claim_for_accept(suggestion_id, ctx.user_id).await {
         Ok(s) => s,
         Err(e) => return store_err(e, "claim_suggestion"),
     };
     // One deadline from the claim (which set `updated_at`) for both queueing
-    // the event and the reply, so accept settles well under `STUCK_AFTER`.
+    // the event and the reply, so accept settles within the request timeout
+    // and well under `STUCK_AFTER`.
     let deadline = tokio::time::Instant::now() + ACCEPT_TIMEOUT;
+    let Some(apply_token) = claimed.apply_token else {
+        // The claim always mints one.
+        tracing::error!(%suggestion_id, "accept_suggestion: claim without apply_token");
+        release_after_refusal(&store, suggestion_id).await;
+        return internal();
+    };
     let request = ApplySuggestionRequest {
         suggestion_id,
+        apply_token,
         kind: crdt_kind(claimed.kind),
         start: claimed.position_y,
         end: claimed.position_y_end,
-        seen_text: body.seen_text,
+        seen_text,
         proposed_text: claimed.proposed_text,
     };
     let (tx, rx) = tokio::sync::oneshot::channel();

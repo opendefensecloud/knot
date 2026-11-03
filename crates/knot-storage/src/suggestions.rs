@@ -3,7 +3,8 @@
 //! Schema:
 //!   suggestions(id, doc_id, author_id, kind, position_y BYTEA, position_y_end BYTEA,
 //!               original_text, context_before, proposed_text, reason NULL,
-//!               status, decided_by NULL, decided_at NULL, created_at, updated_at)
+//!               status, decided_by NULL, decided_at NULL, apply_token NULL,
+//!               created_at, updated_at)
 //!   suggestion_replies(id, suggestion_id, author_id, body,
 //!                      created_at, updated_at, deleted_at NULL)
 //!
@@ -158,6 +159,12 @@ pub struct Suggestion {
     pub decided_by: Option<Uuid>,
     /// When it was accepted, rejected or withdrawn.
     pub decided_at: Option<DateTime<Utc>>,
+    /// The token the first accept claim minted; the room records it as the
+    /// value of the doc's applied marker, so only a marker holding it counts
+    /// (clients can write that map). Server-side only: never serialized,
+    /// since a client that knew it before the apply could forge the marker.
+    #[serde(skip)]
+    pub apply_token: Option<Uuid>,
     /// When it was suggested.
     pub created_at: DateTime<Utc>,
     /// Bumped on every status change; the stuck-claim sweep compares it.
@@ -245,7 +252,10 @@ pub trait SuggestionStore: Send + Sync + 'static {
     /// include_resolved=false → pending + applying only. Ordered by created_at.
     async fn list(&self, doc_id: Uuid, include_resolved: bool) -> Result<Vec<Suggestion>>;
 
-    /// pending → applying, sets decided_by and updated_at = now(). NotPending if no row moved.
+    /// pending → applying, sets decided_by and updated_at = now(), and mints a random
+    /// `apply_token` unless the row has one from an earlier claim (kept, so a re-accept of
+    /// a suggestion applied after its row was released sees its own marker).
+    /// NotPending if no row moved.
     async fn claim_for_accept(&self, id: Uuid, decided_by: Uuid) -> Result<Suggestion>;
 
     /// (applying | pending) → accepted, sets decided_at and updated_at. The doc's applied marker
@@ -348,7 +358,7 @@ impl PgSuggestionStore {
 /// The `RETURNING` / `SELECT` column list every suggestion read shares.
 const COLS: &str = "id, doc_id, author_id, kind, position_y, position_y_end, \
      original_text, context_before, proposed_text, reason, status, \
-     decided_by, decided_at, created_at, updated_at";
+     decided_by, decided_at, apply_token, created_at, updated_at";
 
 const REPLY_COLS: &str = "id, suggestion_id, author_id, body, created_at, updated_at";
 
@@ -368,6 +378,7 @@ struct SuggestionRow {
     status: String,
     decided_by: Option<Uuid>,
     decided_at: Option<DateTime<Utc>>,
+    apply_token: Option<Uuid>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -398,6 +409,7 @@ impl TryFrom<SuggestionRow> for Suggestion {
             status,
             decided_by: r.decided_by,
             decided_at: r.decided_at,
+            apply_token: r.apply_token,
             created_at: r.created_at,
             updated_at: r.updated_at,
         })
@@ -491,11 +503,21 @@ impl SuggestionStore for PgSuggestionStore {
     async fn claim_for_accept(&self, id: Uuid, decided_by: Uuid) -> Result<Suggestion> {
         let sql = format!(
             "UPDATE suggestions \
-             SET status = 'applying', decided_by = $2, updated_at = now() \
+             SET status = 'applying', decided_by = $2, updated_at = now(), \
+                 apply_token = COALESCE(apply_token, $3) \
              WHERE id = $1 AND status = 'pending' \
              RETURNING {COLS}"
         );
-        self.transition(id, sql, Some(decided_by)).await
+        let row: Option<SuggestionRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .bind(decided_by)
+            .bind(Uuid::new_v4())
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => row.try_into(),
+            None => Err(self.no_transition(id).await),
+        }
     }
 
     async fn finish_accept(&self, id: Uuid, decided_by: Uuid) -> Result<Suggestion> {

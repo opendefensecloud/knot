@@ -392,6 +392,7 @@ mod tests {
             status: SuggestionStatus::Pending,
             decided_by: None,
             decided_at: None,
+            apply_token: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

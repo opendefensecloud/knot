@@ -1508,6 +1508,196 @@ async fn sweep_finishes_applied_and_releases_unapplied() {
     assert_eq!(out, knot_server::suggestions_sweep::SweepOutcome::default());
 }
 
+/// Writes `value` under `suggestion_id` into `client`'s applied map, as any
+/// Editor can over the collab socket, and returns that write's update. Each
+/// write on the same client supersedes its earlier ones.
+fn forged_marker(client: &yrs::Doc, suggestion_id: &str, value: yrs::Any) -> Vec<u8> {
+    use yrs::{Map, ReadTxn, Transact};
+    let applied = client.get_or_insert_map("knot_applied_suggestions");
+    let before = client.transact().state_vector();
+    {
+        let mut txn = client.transact_mut();
+        applied.insert(&mut txn, suggestion_id.to_string(), value);
+    }
+    client.transact().encode_state_as_update_v1(&before)
+}
+
+/// A forged applied marker doesn't make accept answer "accepted" while the
+/// text never changed: the room applies, under the claim's own token.
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_applied_marker_does_not_fake_an_accept() {
+    let f = accept_fixture().await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let (sid_a, csrf_a) = &f.alice_session;
+    let s = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+    let forged = forged_marker(&yrs::Doc::new(), &s, yrs::Any::Bool(true));
+    apply_to_room(&f.state, f.doc_id, forged, f.bob).await;
+
+    let (status, json) = accept(&f.app, f.doc_id, &s, sid_a, csrf_a, "Hello").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "accepted");
+    assert!(json.get("apply_token").is_none(), "token exposed: {json}");
+    assert_eq!(room_text(&f.state, f.doc_id).await, "Howdy world");
+}
+
+/// The sweep reads the marker under the row's token, so a forged one
+/// releases the row instead of finishing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn sweep_ignores_a_forged_marker() {
+    let f = accept_fixture().await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let pool = f.state.pool.clone().unwrap();
+    let s = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+    // Claimed (so it has a token) but never applied.
+    let store = knot_storage::PgSuggestionStore::new(pool.clone());
+    let claimed = knot_storage::SuggestionStore::claim_for_accept(
+        &store,
+        Uuid::parse_str(&s).unwrap(),
+        f.alice,
+    )
+    .await
+    .unwrap();
+    let token = claimed.apply_token.unwrap();
+    sqlx::query("UPDATE suggestions SET updated_at = now() - interval '5 minutes' WHERE id = $1")
+        .bind(claimed.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let editor = yrs::Doc::new();
+    for forged in [
+        yrs::Any::Bool(true),
+        yrs::Any::from(Uuid::new_v4().to_string()),
+    ] {
+        let update = forged_marker(&editor, &s, forged);
+        apply_to_room(&f.state, f.doc_id, update, f.bob).await;
+    }
+
+    let out = knot_server::suggestions_sweep::run_once(&f.state, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        knot_server::suggestions_sweep::SweepOutcome {
+            finished: 0,
+            released: 1
+        }
+    );
+    assert_eq!(status_of(&f.state, &s).await, "pending");
+    assert_eq!(room_text(&f.state, f.doc_id).await, SEED_TEXT);
+
+    // A marker under the row's token does count (it is what the room
+    // writes; a client only learns the token from that write).
+    let again = knot_storage::SuggestionStore::claim_for_accept(&store, claimed.id, f.alice)
+        .await
+        .unwrap();
+    assert_eq!(again.apply_token, Some(token));
+    let update = forged_marker(&editor, &s, yrs::Any::from(token.to_string()));
+    apply_to_room(&f.state, f.doc_id, update, f.bob).await;
+    sqlx::query("UPDATE suggestions SET updated_at = now() - interval '5 minutes' WHERE id = $1")
+        .bind(claimed.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let out = knot_server::suggestions_sweep::run_once(&f.state, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(out.finished, 1);
+    assert_eq!(status_of(&f.state, &s).await, "accepted");
+}
+
+/// An updates store over Postgres whose writes take `delay` while `slow`
+/// is set.
+struct SlowUpdates {
+    inner: knot_storage::PgUpdatesStore,
+    slow: std::sync::atomic::AtomicBool,
+    delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl knot_storage::UpdatesStore for SlowUpdates {
+    async fn insert_batch(
+        &self,
+        doc_id: Uuid,
+        updates: &[(Option<Uuid>, Vec<u8>)],
+    ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+        if self.slow.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.insert_batch(doc_id, updates).await
+    }
+    async fn since(
+        &self,
+        doc_id: Uuid,
+        after_seq: i64,
+    ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+        self.inner.since(doc_id, after_seq).await
+    }
+    async fn max_seq(&self, doc_id: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
+        self.inner.max_seq(doc_id).await
+    }
+    async fn delete_up_to(
+        &self,
+        doc_id: Uuid,
+        cutoff_seq: i64,
+    ) -> Result<u64, knot_storage::UpdatesStoreError> {
+        self.inner.delete_up_to(doc_id, cutoff_seq).await
+    }
+}
+
+/// An accept whose request is dropped while the room is still applying
+/// (the 30 s request timeout cancelling the handler) still settles its
+/// claim: the work after the claim runs in its own task.
+#[tokio::test(flavor = "multi_thread")]
+async fn accept_settles_after_the_request_is_dropped() {
+    use knot_storage::{PgSnapshotStore, SnapshotStore, UpdatesStore};
+    let (mut state, ws_id, doc_id, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    let _bob = add_bob(&state, ws_id, WorkspaceRole::Editor).await;
+    let pool = state.pool.clone().unwrap();
+    let updates = Arc::new(SlowUpdates {
+        inner: knot_storage::PgUpdatesStore::new(pool.clone()),
+        slow: std::sync::atomic::AtomicBool::new(false),
+        delay: std::time::Duration::from_secs(2),
+    });
+    let snapshots: Arc<dyn SnapshotStore> = Arc::new(PgSnapshotStore::new(pool));
+    state.rooms_v2 = Some(Arc::new(knot_crdt::Rooms::new(
+        Arc::new(knot_crdt::YrsEngine),
+        Arc::new(knot_crdt::MemBus::new()),
+        updates.clone() as Arc<dyn UpdatesStore>,
+        snapshots,
+        knot_crdt::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(600),
+        },
+        std::time::Duration::from_secs(300),
+    )));
+    seed_room(&state, doc_id, alice).await;
+    let app = router_with_state(state.clone());
+    let (sid_a, csrf_a) = login(&app, "alice@example.com").await;
+    let (sid_b, csrf_b) = login(&app, "bob@example.com").await;
+    let s = create_seeded(&app, doc_id, &sid_b, &csrf_b).await;
+
+    updates
+        .slow
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        accept(&app, doc_id, &s, &sid_a, &csrf_a, "Hello"),
+    )
+    .await;
+    assert!(dropped.is_err(), "the accept answered before the persist");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while status_of(&state, &s).await != "accepted" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the dropped accept left the row {}",
+            status_of(&state, &s).await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(room_text(&state, doc_id).await, "Howdy world");
+}
+
 // ---------------------------------------------------------------------------
 // Notifications (Task 6)
 // ---------------------------------------------------------------------------
