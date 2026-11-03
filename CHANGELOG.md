@@ -29,7 +29,7 @@ owner of the page accepts or rejects it. Until then the page stays as it is.
   cursor. Suggestions show in a new **Suggestions** tab beside Comments,
   and the text they're about is highlighted in the page. Editors and
   owners can suggest; everyone who can read the page sees them.
-  (#74)
+  (#75)
   - Owners of the page (the effective Owner role, as for sharing) accept or
     reject. Accepting makes the change in the page as an edit by the person
     who suggested it, so history and contributors credit them. Authors can
