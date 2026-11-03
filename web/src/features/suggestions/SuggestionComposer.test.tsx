@@ -162,13 +162,13 @@ describe("SuggestionComposer", () => {
     await waitFor(() => expect(api.create).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.getByTestId("suggestion-composer-submit")).toBeEnabled());
     expect(useUi.getState().pendingSuggestion).toEqual(REPLACE);
-    expect(useUi.getState().toasts.map((t) => t.text)).toEqual(["That suggestion is too long"]);
+    expect(useUi.getState().toasts.map((t) => t.text)).toEqual(["Suggestion is too long"]);
   });
 
   it("names_the_refusal_in_its_toast", () => {
-    expect(createErrorMessage("suggestion.too_long")).toBe("That suggestion is too long");
+    expect(createErrorMessage("suggestion.too_long")).toBe("Suggestion is too long");
     expect(createErrorMessage("suggestion.invalid_anchor")).toBe(
-      "Couldn't place the suggestion. Select the text again.",
+      "Couldn't suggest a change here.",
     );
     expect(createErrorMessage("doc.archived")).toBe("This page is archived and can't take suggestions");
     expect(createErrorMessage("http_error")).toBe("Couldn't send suggestion");

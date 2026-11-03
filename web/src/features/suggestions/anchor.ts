@@ -27,7 +27,7 @@
  * typed "b" before "brave" is recorded *after* the original "b", and the range
  * reads "bbrave". The card then shows "changed", so the owner sees it, but
  * accepting would delete the typed character. No anchor encoding can prevent
- * this; the spec's Constraints should list it next to the one above.
+ * this; the spec's Constraints list it next to the one above.
  *
  * The walk below is a copy of y-tiptap's position conversion
  * (`absolutePositionToRelativePosition` / `relativePositionToAbsolutePosition`

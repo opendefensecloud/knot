@@ -114,6 +114,11 @@ notifications and content pipeline.
   the right of its tombstone, so selecting the suggested words and retyping
   them leaves only the untouched remainder inside the range. The card shows
   that remainder as "Now". This is accepted for v1.
+- **Typing the range's first character just before it lands inside it.**
+  y-tiptap diffs old and new text with lib0 `simpleDiff`, common prefix
+  first, so a "b" typed directly before "brave" is recorded after the
+  original "b" and the range reads "bbrave". The card shows "changed", so the
+  owner sees both versions before accepting. This is accepted for v1.
 - **Positions differ between client and server.** Room docs count offsets in
   bytes, while Yjs clocks and the browser count UTF-16 units. The server must
   resolve anchors in UTF-16 and convert, or umlauts and emoji before the range

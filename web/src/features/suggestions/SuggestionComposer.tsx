@@ -15,9 +15,9 @@ export function createErrorMessage(code: string): string {
   switch (code) {
     case "suggestion.too_long":
     case "suggestion.body_too_large":
-      return "That suggestion is too long";
+      return "Suggestion is too long";
     case "suggestion.invalid_anchor":
-      return "Couldn't place the suggestion. Select the text again.";
+      return "Couldn't suggest a change here.";
     case "doc.archived":
       return "This page is archived and can't take suggestions";
     case "acl.editor_required":
