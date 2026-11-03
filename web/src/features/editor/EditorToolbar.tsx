@@ -144,7 +144,9 @@ export function EditorToolbar({
       data-sticky-band
       className="sticky top-0 z-10 py-2 mb-4 bg-bg/80 backdrop-blur border-b border-border"
     >
-      <div className="measure relative flex items-center gap-0.5 flex-wrap max-sm:pl-7">
+      {/* No gap between the buttons: at the default width the whole set,
+          with the room kept for the doc controls, fits one row only so. */}
+      <div className="measure relative flex items-center flex-wrap max-sm:pl-7">
         <Btn testId="toolbar-bold" label="Bold" active={editor.isActive("bold")}
           onClick={() => c().toggleBold().run()}>
           <Bold size={15} aria-hidden />
