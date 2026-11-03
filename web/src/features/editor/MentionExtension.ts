@@ -136,6 +136,12 @@ class MentionPopup {
 
 export const MentionExtension = Extension.create<MentionExtensionOptions>({
   name: "knotMention",
+  // The open popup owns the arrow keys, Enter and Tab, so its plugin has to
+  // see them first. At the default priority Tiptap runs the extensions
+  // registered after this one first, and in a table cell prosemirror-tables
+  // moved ArrowUp/ArrowDown to the neighbouring cell and Table sent Tab to
+  // the next one. Closed, the popup passes every key on.
+  priority: 1000,
 
   addOptions() {
     return { fetchMembers: () => Promise.resolve([]) };

@@ -8,6 +8,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Fixed
+- The @-mention list works with the keyboard in a table cell. ArrowUp and
+  ArrowDown moved the cursor to the neighbouring cell and closed the list,
+  and Tab jumped to the next cell instead of picking the highlighted
+  person. Tab in a list item no longer indents it while the list is open.
+
 ## [0.9.8] - 2026-11-03
 
 Editors can now suggest changes to a page instead of editing it directly.
