@@ -8,6 +8,47 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+Editors can now suggest changes to a page instead of editing it directly.
+A suggestion waits in the sidebar, next to the text it's about, until an
+owner of the page accepts or rejects it. Until then the page stays as it is.
+
+### Upgrading
+- One database migration runs on upgrade (the Helm chart's migrate hook
+  applies it). Rolling back to 0.9.7 needs a database restore: 0.9.7
+  doesn't start on a database with migrations it doesn't know.
+  - `20261102120000_suggestions` adds the suggestions and their replies,
+    and allows the two new notification kinds.
+- Every replica now checks once a minute for accepts that were cut off
+  halfway (a replica restarting mid-accept, say) and finishes or releases
+  them. There is nothing to configure.
+
+### Added
+- Change suggestions. Select text in a page and choose **Suggest change**
+  to propose a replacement or a deletion, with an optional reason. In edit
+  mode, **Suggest an insertion** in the toolbar proposes new text at the
+  cursor. Suggestions show in a new **Suggestions** tab beside Comments,
+  and the text they're about is highlighted in the page. Editors and
+  owners can suggest; everyone who can read the page sees them.
+  (#74)
+  - Owners of the page (the effective Owner role, as for sharing) accept or
+    reject. Accepting makes the change in the page as an edit by the person
+    who suggested it, so history and contributors credit them. Authors can
+    withdraw their own suggestions, and anyone who can comment can reply.
+  - If the text changed after it was suggested, the card shows both the
+    text when it was suggested and the text now, and accepting replaces
+    what is there now. If it changes while the owner is looking, the accept
+    is refused and the card refreshes, so nothing is replaced unseen. If the
+    text was deleted, the suggestion can't be accepted.
+  - A suggestion covers text within one paragraph, heading, list item or
+    table cell, and can't include mentions, dates, page links or line
+    breaks.
+  - Suggestions and replies update live for everyone on the page.
+  - New Inbox notifications: owners hear about a new suggestion
+    (`suggestion`), and authors when theirs is accepted or rejected
+    (`suggestion_decided`). Opening one takes you to the suggestion.
+  - `GET/POST /api/docs/{id}/suggestions`, `POST …/{sid}/accept`,
+    `…/reject`, `…/withdraw`, and replies under `…/{sid}/replies`.
+
 ## [0.9.7] - 2026-11-02
 
 A dependency-only release that picks up fixed versions of `zip`, KaTeX and
