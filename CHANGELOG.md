@@ -19,16 +19,16 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   pushed the page down under the pointer: dragging across cells selected
   the cells a row above, so bold or delete hit the wrong ones. The row and
   column actions now sit in a **Table** menu that takes the place of
-  **Insert table** while the cursor is in a table.
+  **Insert table** while the cursor is in a table. (#77)
 - Tab and Shift+Tab indent and outdent list items and code lines inside a
   table cell, instead of jumping to the next or previous cell and selecting
-  everything in it, which the next keystroke then replaced.
+  everything in it, which the next keystroke then replaced. (#77)
 - A table can no longer end up inside another table, which Markdown can't
   hold and the export wrote as escaped text. **Insert table** isn't offered
   inside a table, and a Markdown table pasted into a cell fills the cells
-  from there on.
+  from there on. (#77)
 - A table at the end of a page no longer traps the cursor: ArrowDown from
-  its last row, or a click below it, starts a new line after it.
+  its last row, or a click below it, starts a new line after it. (#77)
 
 ## [0.9.8] - 2026-11-03
 
