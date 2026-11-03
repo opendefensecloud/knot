@@ -43,6 +43,7 @@ pub mod room;
 pub mod routes;
 pub mod security_headers;
 pub mod static_files;
+pub(crate) mod suggestion_notifications;
 pub mod suggestions_sweep;
 mod ws_writer;
 

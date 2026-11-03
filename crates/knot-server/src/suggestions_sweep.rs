@@ -9,7 +9,8 @@
 //! (`knot_crdt::Event::SuggestionApplied`). The room writes that marker in
 //! the same transaction as the text, so it is the single source of truth:
 //!
-//! - applied → `finish_accept`, so the row says `accepted` like the text;
+//! - applied → `finish_accept`, so the row says `accepted` like the text,
+//!   and the author gets the `suggestion_decided` row the accept never sent;
 //! - not applied → `release_if_unchanged`, back to `pending`, compared and
 //!   set on the `updated_at` the sweep read, so a row an accept claimed
 //!   again meanwhile is left alone;
@@ -83,9 +84,15 @@ pub async fn run_once(
                 continue;
             };
             match store.finish_accept(row.id, decided_by).await {
-                Ok(_) => {
+                Ok(finished) => {
                     out.finished += 1;
                     crate::routes::api::suggestions::notify_suggestion_change(state, row.doc_id);
+                    // The accept that claimed this row never got to tell the
+                    // author; the dedupe key keeps it to one row if it did.
+                    crate::suggestion_notifications::emit_suggestion_decided_from_sweep(
+                        state, &finished,
+                    )
+                    .await;
                 }
                 // Settled by someone else meanwhile.
                 Err(SuggestionStoreError::NotPending | SuggestionStoreError::NotFound) => {}

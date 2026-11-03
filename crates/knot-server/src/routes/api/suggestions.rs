@@ -8,7 +8,7 @@
 //! POST   /api/docs/{id}/suggestions/{suggestion_id}/withdraw → 200 (author)
 //!
 //! POST   /api/docs/{id}/suggestions/{suggestion_id}/replies            { body, mentions? } → 201
-//! PATCH  /api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id} { body } → 200 (author)
+//! PATCH  /api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id} { body, mentions? } → 200 (author)
 //! DELETE /api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id} → 204 (author or owner)
 //!
 //! Mounted inside `docs::router`'s doc-id routes, so `require_doc_role_mw`
@@ -48,6 +48,9 @@ use crate::AppState;
 use crate::auth::{AuthContext, EffectiveDocRole, require_viewer};
 use crate::http_error::json_err;
 use crate::routes::api::comments::{internal, require_editor};
+use crate::suggestion_notifications::{
+    ReplyWrite, emit_suggestion_created, emit_suggestion_decided, emit_suggestion_reply,
+};
 
 /// Request cap for a new suggestion (the plan's 256 KiB). It covers every
 /// text limit at 4 UTF-8 bytes per character, which is what `JSON.stringify`
@@ -104,6 +107,9 @@ struct ReplyBody {
 #[derive(Deserialize)]
 struct EditReplyBody {
     body: String,
+    /// User ids the client's mention picker resolved in the edited body.
+    #[serde(default)]
+    mentions: Vec<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -352,7 +358,7 @@ async fn create(
     };
     match store.create(&new).await {
         Ok(s) => {
-            // Task 6: notify the page's owners (`suggestion` kind).
+            emit_suggestion_created(&state, ctx.workspace_id, &s).await;
             notify_suggestion_change(&state, doc_id);
             (StatusCode::CREATED, Json(s)).into_response()
         }
@@ -499,7 +505,7 @@ async fn accept(
 
     match outcome {
         Ok(_) | Err(ApplySuggestionError::AlreadyApplied) => {
-            finish(&state, &store, doc_id, suggestion_id, ctx.user_id).await
+            finish(&state, &store, &ctx, doc_id, suggestion_id).await
         }
         Err(ApplySuggestionError::AnchorLost) => {
             release_after_refusal(&store, suggestion_id).await;
@@ -529,11 +535,11 @@ async fn accept(
 async fn finish(
     state: &AppState,
     store: &Arc<dyn SuggestionStore>,
+    ctx: &AuthContext,
     doc_id: Uuid,
     suggestion_id: Uuid,
-    decided_by: Uuid,
 ) -> Response {
-    let finished = match store.finish_accept(suggestion_id, decided_by).await {
+    let finished = match store.finish_accept(suggestion_id, ctx.user_id).await {
         Ok(s) => s,
         Err(SuggestionStoreError::NotPending) => match store.get(suggestion_id).await {
             Ok(s) if s.status == SuggestionStatus::Accepted => s,
@@ -549,7 +555,7 @@ async fn finish(
         },
         Err(e) => return store_err(e, "finish_accept"),
     };
-    // Task 6: notify the author (`suggestion_decided` kind).
+    emit_suggestion_decided(state, ctx.workspace_id, &finished).await;
     notify_suggestion_change(state, doc_id);
     Json(finished).into_response()
 }
@@ -583,7 +589,7 @@ async fn reject(
     }
     match store.reject(suggestion_id, ctx.user_id).await {
         Ok(s) => {
-            // Task 6: notify the author (`suggestion_decided` kind).
+            emit_suggestion_decided(&state, ctx.workspace_id, &s).await;
             notify_suggestion_change(&state, doc_id);
             Json(s).into_response()
         }
@@ -639,9 +645,10 @@ async fn create_reply(
     let Some(store) = state.suggestions.clone() else {
         return internal();
     };
-    if let Err(r) = ensure_suggestion_in_doc(&store, suggestion_id, doc_id).await {
-        return r;
-    }
+    let suggestion = match ensure_suggestion_in_doc(&store, suggestion_id, doc_id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let body: ReplyBody = match read_json(req, MAX_REPLY_BYTES).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -649,13 +656,20 @@ async fn create_reply(
     if over(&body.body, MAX_REPLY_CHARS) {
         return too_long();
     }
-    // Task 6: `reply` / `mention` notifications use these picker ids.
-    let _mentions = body.mentions;
     match store
         .create_reply(suggestion_id, ctx.user_id, &body.body)
         .await
     {
         Ok(r) => {
+            emit_suggestion_reply(
+                &state,
+                ctx.workspace_id,
+                &suggestion,
+                &r,
+                ReplyWrite::Created,
+                &body.mentions,
+            )
+            .await;
             notify_suggestion_change(&state, doc_id);
             (StatusCode::CREATED, Json(r)).into_response()
         }
@@ -678,9 +692,10 @@ async fn edit_reply(
     let Some(store) = state.suggestions.clone() else {
         return internal();
     };
-    if let Err(r) = ensure_suggestion_in_doc(&store, suggestion_id, doc_id).await {
-        return r;
-    }
+    let suggestion = match ensure_suggestion_in_doc(&store, suggestion_id, doc_id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let existing = match ensure_reply_in_suggestion(&store, reply_id, suggestion_id).await {
         Ok(r) => r,
         Err(r) => return r,
@@ -697,7 +712,17 @@ async fn edit_reply(
     }
     match store.update_reply(reply_id, &body.body).await {
         Ok(r) => {
-            // Task 6: `mention` notifications for names new to the body.
+            // The dedupe key makes a name already mentioned a no-op, so
+            // only names new to the body notify.
+            emit_suggestion_reply(
+                &state,
+                ctx.workspace_id,
+                &suggestion,
+                &r,
+                ReplyWrite::Edited,
+                &body.mentions,
+            )
+            .await;
             notify_suggestion_change(&state, doc_id);
             Json(r).into_response()
         }

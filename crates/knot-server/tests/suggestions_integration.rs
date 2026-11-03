@@ -1448,6 +1448,11 @@ async fn sweep_finishes_applied_and_releases_unapplied() {
         .await
         .unwrap();
     }
+    // The accept that left the row `applying` never told Bob.
+    sqlx::query("DELETE FROM notifications WHERE kind = 'suggestion_decided'")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let out = knot_server::suggestions_sweep::run_once(&f.state, chrono::Utc::now())
         .await
@@ -1472,9 +1477,539 @@ async fn sweep_finishes_applied_and_releases_unapplied() {
             .unwrap();
     assert_eq!(decided_by, Some(f.alice));
 
+    // The sweep tells the author what the accept could not.
+    assert_eq!(
+        notified(&f.state, "suggestion_decided", &applied).await,
+        vec![f.bob]
+    );
+    let row = row_for(&f.state, "suggestion_decided", &applied, f.bob).await;
+    assert_eq!(row.actor_id, Some(f.alice));
+    assert_eq!(row.data["decision"], "accepted");
+    assert!(
+        notified(&f.state, "suggestion_decided", &unapplied)
+            .await
+            .is_empty(),
+        "a released row was not decided"
+    );
+
     // A second run finds nothing left to do.
     let out = knot_server::suggestions_sweep::run_once(&f.state, chrono::Utc::now())
         .await
         .unwrap();
     assert_eq!(out, knot_server::suggestions_sweep::SweepOutcome::default());
+}
+
+// ---------------------------------------------------------------------------
+// Notifications (Task 6)
+// ---------------------------------------------------------------------------
+
+/// Recipients of `kind` rows about `target_id`, sorted.
+async fn notified(state: &AppState, kind: &str, target_id: &str) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT user_id FROM notifications WHERE kind = $1 AND target_id = $2 ORDER BY user_id",
+    )
+    .bind(kind)
+    .bind(target_id)
+    .fetch_all(state.pool.as_ref().unwrap())
+    .await
+    .unwrap()
+}
+
+/// One inbox row as the tests inspect it.
+#[derive(Debug)]
+struct Row {
+    actor_id: Option<Uuid>,
+    target_kind: String,
+    dedupe_key: String,
+    data: Value,
+}
+
+/// The `kind` row about `target_id` addressed to `user_id`.
+async fn row_for(state: &AppState, kind: &str, target_id: &str, user_id: Uuid) -> Row {
+    let (actor_id, target_kind, dedupe_key, data): (Option<Uuid>, String, String, Value) =
+        sqlx::query_as(
+            "SELECT actor_id, target_kind, dedupe_key, data FROM notifications \
+             WHERE kind = $1 AND target_id = $2 AND user_id = $3",
+        )
+        .bind(kind)
+        .bind(target_id)
+        .bind(user_id)
+        .fetch_one(state.pool.as_ref().unwrap())
+        .await
+        .unwrap();
+    Row {
+        actor_id,
+        target_kind,
+        dedupe_key,
+        data,
+    }
+}
+
+fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
+    ids.sort();
+    ids
+}
+
+/// Post a reply; returns its id.
+async fn reply_to(
+    app: &axum::Router,
+    doc_id: Uuid,
+    suggestion_id: &str,
+    session: &(String, String),
+    body: Value,
+) -> String {
+    let (status, json) = post_json(
+        app,
+        &format!("/api/docs/{doc_id}/suggestions/{suggestion_id}/replies"),
+        &session.0,
+        &session.1,
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "reply: {json}");
+    json["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn created_notifies_explicit_owner_and_creator_not_workspace_owners() {
+    // Alice is a workspace Owner (W) who neither created nor was granted the doc.
+    let (state, ws_id, _alice_doc, _alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    let carl = add_member(
+        &state,
+        ws_id,
+        "carl@example.com",
+        "Carl",
+        WorkspaceRole::Owner,
+    )
+    .await;
+    let erin = add_member(
+        &state,
+        ws_id,
+        "erin@example.com",
+        "Erin",
+        WorkspaceRole::Editor,
+    )
+    .await;
+    add_member(
+        &state,
+        ws_id,
+        "sam@example.com",
+        "Sam",
+        WorkspaceRole::Editor,
+    )
+    .await;
+    let doc_id = state
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(ws_id, None, "Carl's page", "n", carl)
+        .await
+        .unwrap()
+        .id;
+    grant(&state, ws_id, doc_id, erin, WorkspaceRole::Owner, carl).await;
+    let app = router_with_state(state.clone());
+    let (sid_s, csrf_s) = login(&app, "sam@example.com").await;
+
+    let s = create(&app, doc_id, &sid_s, &csrf_s).await;
+
+    assert_eq!(
+        notified(&state, "suggestion", &s).await,
+        sorted(vec![carl, erin]),
+        "the creator and the explicit owner, not the workspace owner"
+    );
+    let sam: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = 'sam@example.com'")
+        .fetch_one(state.pool.as_ref().unwrap())
+        .await
+        .unwrap();
+    let row = row_for(&state, "suggestion", &s, erin).await;
+    assert_eq!(row.actor_id, Some(sam));
+    assert_eq!(row.target_kind, "suggestion");
+    assert_eq!(row.dedupe_key, format!("suggestion:{s}"));
+    assert_eq!(row.data["suggestion_id"], s);
+    assert_eq!(row.data["doc_title"], "Carl's page");
+    assert_eq!(row.data["excerpt"], "Howdy", "the proposed text");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn created_falls_back_to_workspace_owners() {
+    let (state, ws_id, doc_id, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    let bob = add_bob(&state, ws_id, WorkspaceRole::Editor).await;
+    let wanda = add_member(
+        &state,
+        ws_id,
+        "wanda@example.com",
+        "Wanda",
+        WorkspaceRole::Owner,
+    )
+    .await;
+    let will = add_member(
+        &state,
+        ws_id,
+        "will@example.com",
+        "Will",
+        WorkspaceRole::Owner,
+    )
+    .await;
+    // The creator is no longer an owner, and nobody holds an owner grant.
+    state
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .update_role(ws_id, alice, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+    let app = router_with_state(state.clone());
+    let (sid_b, csrf_b) = login(&app, "bob@example.com").await;
+
+    let (status, json) = post_json(
+        &app,
+        &format!("/api/docs/{doc_id}/suggestions"),
+        &sid_b,
+        &csrf_b,
+        json!({
+            "kind": "delete",
+            "position_y": anchor(0, Assoc::After),
+            "position_y_end": anchor(4, Assoc::Before),
+            "original_text": "Hello",
+            "proposed_text": "",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    let s = json["id"].as_str().unwrap();
+
+    assert_eq!(
+        notified(&state, "suggestion", s).await,
+        sorted(vec![wanda, will]),
+        "every workspace Owner, and not the demoted creator"
+    );
+    let row = row_for(&state, "suggestion", s, wanda).await;
+    assert_eq!(row.actor_id, Some(bob));
+    assert_eq!(
+        row.data["excerpt"], "Hello",
+        "a deletion quotes the removed text"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restricted_doc_recipients_must_still_read() {
+    // Alice (workspace Owner) created the parent and the child. Dave holds an
+    // inheriting owner grant on the parent, which a restriction stops.
+    let (state, ws_id, parent_id, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    let bob = add_bob(&state, ws_id, WorkspaceRole::Editor).await;
+    let carol = add_member(
+        &state,
+        ws_id,
+        "carol@example.com",
+        "Carol",
+        WorkspaceRole::Editor,
+    )
+    .await;
+    let dave = add_member(
+        &state,
+        ws_id,
+        "dave@example.com",
+        "Dave",
+        WorkspaceRole::Editor,
+    )
+    .await;
+    let child = state
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(ws_id, Some(parent_id), "Secret", "m", alice)
+        .await
+        .unwrap()
+        .id;
+    grant(&state, ws_id, parent_id, dave, WorkspaceRole::Owner, alice).await;
+    // Bob restricts the child, which makes him its owner by grant.
+    state
+        .docs
+        .as_ref()
+        .unwrap()
+        .set_restricted(ws_id, child, bob, true)
+        .await
+        .unwrap();
+    grant(&state, ws_id, child, carol, WorkspaceRole::Editor, bob).await;
+    let app = router_with_state(state.clone());
+    let (sid_c, csrf_c) = login(&app, "carol@example.com").await;
+
+    let s = create(&app, child, &sid_c, &csrf_c).await;
+
+    assert_eq!(
+        notified(&state, "suggestion", &s).await,
+        vec![bob],
+        "the creator and the ancestor's owner can no longer read the page"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn author_is_never_notified() {
+    let (state, ws_id, doc_id, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    let bob = add_bob(&state, ws_id, WorkspaceRole::Editor).await;
+    grant(&state, ws_id, doc_id, bob, WorkspaceRole::Owner, alice).await;
+    let app = router_with_state(state.clone());
+    let bob_session = login(&app, "bob@example.com").await;
+
+    let s = create(&app, doc_id, &bob_session.0, &bob_session.1).await;
+    assert_eq!(
+        notified(&state, "suggestion", &s).await,
+        vec![alice],
+        "Bob is an explicit owner, but he wrote it"
+    );
+
+    // Bob replies to and rejects his own suggestion: nothing for him.
+    reply_to(
+        &app,
+        doc_id,
+        &s,
+        &bob_session,
+        json!({"body": "note to self"}),
+    )
+    .await;
+    let (status, json) = post_json(
+        &app,
+        &format!("/api/docs/{doc_id}/suggestions/{s}/reject"),
+        &bob_session.0,
+        &bob_session.1,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(notified(&state, "suggestion_decided", &s).await.is_empty());
+    assert!(notified(&state, "reply", &s).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn creator_suggesting_on_own_page_notifies_nobody() {
+    let (state, ws_id, doc_id, _alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    add_member(
+        &state,
+        ws_id,
+        "wanda@example.com",
+        "Wanda",
+        WorkspaceRole::Owner,
+    )
+    .await;
+    let app = router_with_state(state.clone());
+    let (sid_a, csrf_a) = login(&app, "alice@example.com").await;
+
+    let s = create(&app, doc_id, &sid_a, &csrf_a).await;
+
+    assert!(
+        notified(&state, "suggestion", &s).await.is_empty(),
+        "no fallback to the workspace owners"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reply_edit_adding_mention_notifies() {
+    let (state, ws_id, doc_id, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    add_bob(&state, ws_id, WorkspaceRole::Editor).await;
+    let carol = add_member(
+        &state,
+        ws_id,
+        "carol@example.com",
+        "Carol",
+        WorkspaceRole::Editor,
+    )
+    .await;
+    let app = router_with_state(state.clone());
+    let (sid_a, csrf_a) = login(&app, "alice@example.com").await;
+    let bob_session = login(&app, "bob@example.com").await;
+    let s = create(&app, doc_id, &sid_a, &csrf_a).await;
+
+    let r = reply_to(&app, doc_id, &s, &bob_session, json!({"body": "first"})).await;
+    assert_eq!(notified(&state, "reply", &s).await, vec![alice]);
+    assert!(notified(&state, "mention", &s).await.is_empty());
+
+    let (status, json) = patch_json(
+        &app,
+        &format!("/api/docs/{doc_id}/suggestions/{s}/replies/{r}"),
+        &bob_session.0,
+        &bob_session.1,
+        json!({"body": "first, @carol take a look"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    assert_eq!(notified(&state, "mention", &s).await, vec![carol]);
+    let row = row_for(&state, "mention", &s, carol).await;
+    assert_eq!(row.dedupe_key, format!("suggestion_mention:{r}"));
+    assert_eq!(row.data["excerpt"], "first, @carol take a look");
+    assert_eq!(
+        notified(&state, "reply", &s).await,
+        vec![alice],
+        "an edit is not a new reply"
+    );
+
+    // A picker id on the edit mentions a member the body does not name.
+    let dave = add_member(
+        &state,
+        ws_id,
+        "dave@example.com",
+        "Dave",
+        WorkspaceRole::Editor,
+    )
+    .await;
+    let (status, json) = patch_json(
+        &app,
+        &format!("/api/docs/{doc_id}/suggestions/{s}/replies/{r}"),
+        &bob_session.0,
+        &bob_session.1,
+        json!({"body": "first, @carol and the picker's pick", "mentions": [dave]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let mut mentioned = notified(&state, "mention", &s).await;
+    mentioned.sort();
+    let mut expected = vec![carol, dave];
+    expected.sort();
+    assert_eq!(mentioned, expected, "carol once, dave by picker id");
+    let row = row_for(&state, "mention", &s, dave).await;
+    assert_eq!(row.dedupe_key, format!("suggestion_mention:{r}"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn decided_notifies_author_once() {
+    let f = accept_fixture().await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let (sid_a, csrf_a) = &f.alice_session;
+
+    let accepted = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+    let (status, json) = accept(&f.app, f.doc_id, &accepted, sid_a, csrf_a, "Hello").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        notified(&f.state, "suggestion_decided", &accepted).await,
+        vec![f.bob]
+    );
+    let row = row_for(&f.state, "suggestion_decided", &accepted, f.bob).await;
+    assert_eq!(row.actor_id, Some(f.alice));
+    assert_eq!(row.target_kind, "suggestion");
+    assert_eq!(row.dedupe_key, format!("suggestion_decided:{accepted}"));
+    assert_eq!(row.data["decision"], "accepted");
+    assert_eq!(row.data["suggestion_id"], accepted);
+    assert_eq!(row.data["doc_title"], "Test Doc");
+    assert_eq!(row.data["excerpt"], "Howdy");
+
+    // A repeated accept (the row was released after the text landed) does
+    // not tell Bob twice.
+    sqlx::query("UPDATE suggestions SET status = 'pending' WHERE id = $1")
+        .bind(Uuid::parse_str(&accepted).unwrap())
+        .execute(f.state.pool.as_ref().unwrap())
+        .await
+        .unwrap();
+    let (status, json) = accept(&f.app, f.doc_id, &accepted, sid_a, csrf_a, "Hello").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        notified(&f.state, "suggestion_decided", &accepted).await,
+        vec![f.bob]
+    );
+
+    let rejected = create(&f.app, f.doc_id, sid_b, csrf_b).await;
+    let (status, json) = post_json(
+        &f.app,
+        &format!("/api/docs/{}/suggestions/{rejected}/reject", f.doc_id),
+        sid_a,
+        csrf_a,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        notified(&f.state, "suggestion_decided", &rejected).await,
+        vec![f.bob]
+    );
+    let row = row_for(&f.state, "suggestion_decided", &rejected, f.bob).await;
+    assert_eq!(row.data["decision"], "rejected");
+
+    // Withdrawing is the author's own decision: nobody is told.
+    let withdrawn = create(&f.app, f.doc_id, sid_b, csrf_b).await;
+    let (status, json) = post_json(
+        &f.app,
+        &format!("/api/docs/{}/suggestions/{withdrawn}/withdraw", f.doc_id),
+        sid_b,
+        csrf_b,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(
+        notified(&f.state, "suggestion_decided", &withdrawn)
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reply_mentions_and_reply_kinds_carry_suggestion_id() {
+    let (state, ws_id, doc_id, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    let bob = add_bob(&state, ws_id, WorkspaceRole::Editor).await;
+    let carol = add_member(
+        &state,
+        ws_id,
+        "carol@example.com",
+        "Carol",
+        WorkspaceRole::Editor,
+    )
+    .await;
+    let dave = add_member(
+        &state,
+        ws_id,
+        "dave@example.com",
+        "Dave",
+        WorkspaceRole::Editor,
+    )
+    .await;
+    let app = router_with_state(state.clone());
+    let bob_session = login(&app, "bob@example.com").await;
+    let carol_session = login(&app, "carol@example.com").await;
+    let dave_session = login(&app, "dave@example.com").await;
+    let s = create(&app, doc_id, &bob_session.0, &bob_session.1).await;
+
+    // Carol's reply tells the suggester.
+    let first = reply_to(&app, doc_id, &s, &carol_session, json!({"body": "hi"})).await;
+    let row = row_for(&state, "reply", &s, bob).await;
+    assert_eq!(row.actor_id, Some(carol));
+    assert_eq!(row.target_kind, "suggestion");
+    assert_eq!(row.dedupe_key, format!("suggestion_reply:{first}"));
+    assert_eq!(row.data["suggestion_id"], s);
+    assert_eq!(row.data["doc_title"], "Test Doc");
+    assert_eq!(row.data["excerpt"], "hi");
+
+    // Dave names Alice through the picker and Carol by hand. Carol, an
+    // earlier replier, gets the mention only; Bob, the suggester, a reply.
+    let second = reply_to(
+        &app,
+        doc_id,
+        &s,
+        &dave_session,
+        json!({"body": "@carol agreed", "mentions": [alice]}),
+    )
+    .await;
+    assert_eq!(
+        notified(&state, "mention", &s).await,
+        sorted(vec![alice, carol])
+    );
+    let row = row_for(&state, "mention", &s, alice).await;
+    assert_eq!(row.actor_id, Some(dave));
+    assert_eq!(row.target_kind, "suggestion");
+    assert_eq!(row.dedupe_key, format!("suggestion_mention:{second}"));
+    assert_eq!(row.data["suggestion_id"], s);
+    assert_eq!(row.data["excerpt"], "@carol agreed");
+    let replied: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT user_id, dedupe_key FROM notifications \
+         WHERE kind = 'reply' AND target_id = $1 ORDER BY id",
+    )
+    .bind(&s)
+    .fetch_all(state.pool.as_ref().unwrap())
+    .await
+    .unwrap();
+    assert_eq!(
+        replied,
+        vec![
+            (bob, format!("suggestion_reply:{first}")),
+            (bob, format!("suggestion_reply:{second}")),
+        ]
+    );
 }
