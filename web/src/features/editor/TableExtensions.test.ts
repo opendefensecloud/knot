@@ -51,6 +51,19 @@ function caretAfter(b: BoundEditor, word: string) {
   placeSelection(b, at);
 }
 
+/**
+ * Whether one of the editor's mousedown handlers takes a mousedown 50px down
+ * on `target`, asked the way prosemirror-view asks them. Dispatching the
+ * event instead would also run prosemirror-view's own click handling when
+ * none does, and that needs `elementFromPoint`, which jsdom lacks.
+ */
+function mousedownTaken(b: BoundEditor, target: Element): boolean {
+  const { view } = b.editor;
+  const event = new MouseEvent("mousedown", { button: 0, clientY: 50, bubbles: true, cancelable: true });
+  Object.defineProperty(event, "target", { value: target });
+  return view.someProp("handleDOMEvents", (handlers) => handlers.mousedown?.(view, event)) ?? false;
+}
+
 function press(b: BoundEditor, key: string, shiftKey = false) {
   const event = new KeyboardEvent("keydown", { key, shiftKey, bubbles: true, cancelable: true });
   b.editor.view.dom.dispatchEvent(event);
@@ -171,15 +184,14 @@ describe("leaving a table that ends the page", () => {
 
   it("a click in a cell adds nothing", () => {
     const b = mount(p("before"), table(row(cell(p("a")))));
-    const td = b.editor.view.dom.querySelector("td")!;
-    td.dispatchEvent(new MouseEvent("mousedown", { button: 0, clientY: 50, bubbles: true, cancelable: true }));
+    expect(mousedownTaken(b, b.editor.view.dom.querySelector("td")!)).toBe(false);
     expect(doc(b)).toBe(shape(p("before"), table(row(cell(p("a"))))));
   });
 
   it("a click below adds nothing in view mode", () => {
     bound = mountBoundEditor({ editable: false });
     bound.editor.commands.setContent({ type: "doc", content: [table(row(cell(p("a"))))] });
-    bound.editor.view.dom.dispatchEvent(new MouseEvent("mousedown", { button: 0, clientY: 50, bubbles: true }));
+    expect(mousedownTaken(bound, bound.editor.view.dom)).toBe(false);
     expect(doc(bound)).toBe(shape(table(row(cell(p("a"))))));
   });
 });
