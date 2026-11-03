@@ -967,3 +967,514 @@ async fn mutation_sends_notify_with_topic() {
     assert_eq!(payload["doc_id"], doc_id.to_string(), "{payload}");
     assert_eq!(payload["topic"], "suggestions", "{payload}");
 }
+
+// ---------------------------------------------------------------------------
+// Accept (server-side apply) and the `applying` sweep
+// ---------------------------------------------------------------------------
+
+/// The text every accept test seeds its page with, as one paragraph of a
+/// fresh doc of client 7: the paragraph is clock 0, its XmlText clock 1 and
+/// its characters start at clock 2, so "Hello" is clocks 2..=6.
+const SEED_TEXT: &str = "Hello world";
+
+/// Give `state` doc rooms on a MemBus over its Postgres pool, as a replica
+/// serving the collab socket has.
+fn with_rooms(state: &mut AppState) {
+    use knot_storage::{PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore};
+    let pool = state.pool.clone().unwrap();
+    let updates: Arc<dyn UpdatesStore> = Arc::new(PgUpdatesStore::new(pool.clone()));
+    let snapshots: Arc<dyn SnapshotStore> = Arc::new(PgSnapshotStore::new(pool));
+    state.rooms_v2 = Some(Arc::new(knot_crdt::Rooms::new(
+        Arc::new(knot_crdt::YrsEngine),
+        Arc::new(knot_crdt::MemBus::new()),
+        updates,
+        snapshots,
+        knot_crdt::SnapshotPolicy {
+            every_n: 1000,
+            idle: std::time::Duration::from_secs(600),
+        },
+        std::time::Duration::from_secs(300),
+    )));
+}
+
+/// A fresh doc of client 7 holding `paragraph > text(SEED_TEXT)`, kept by
+/// the test so it can make later edits against the same items.
+fn seed_doc() -> yrs::Doc {
+    use yrs::{Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+    let doc = yrs::Doc::with_client_id(7);
+    let frag = doc.get_or_insert_xml_fragment("default");
+    {
+        let mut txn = doc.transact_mut();
+        let para = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+        para.push_back(&mut txn, XmlTextPrelim::new(SEED_TEXT));
+    }
+    doc
+}
+
+/// Apply `update_bytes` to the doc's room as `by_user`.
+async fn apply_to_room(state: &AppState, doc_id: Uuid, update_bytes: Vec<u8>, by_user: Uuid) {
+    let room = state
+        .rooms_v2
+        .as_ref()
+        .unwrap()
+        .acquire(doc_id)
+        .await
+        .unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    room.tx
+        .send(knot_crdt::Event::ApplyUpdate {
+            update_bytes,
+            by_user: Some(by_user),
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().expect("apply update");
+}
+
+/// Seed the doc's room with [`seed_doc`]'s content, credited to `by_user`;
+/// returns the seed doc for later edits.
+async fn seed_room(state: &AppState, doc_id: Uuid, by_user: Uuid) -> yrs::Doc {
+    use yrs::{ReadTxn, StateVector, Transact};
+    let doc = seed_doc();
+    let update = doc
+        .transact()
+        .encode_state_as_update_v1(&StateVector::default());
+    apply_to_room(state, doc_id, update, by_user).await;
+    doc
+}
+
+/// The plain text of every XmlText of the room's doc, concatenated.
+async fn room_text(state: &AppState, doc_id: Uuid) -> String {
+    use yrs::updates::decoder::Decode;
+    use yrs::{GetString, Transact, Update, XmlFragment, XmlOut};
+    let room = state
+        .rooms_v2
+        .as_ref()
+        .unwrap()
+        .acquire(doc_id)
+        .await
+        .unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    room.tx
+        .send(knot_crdt::Event::ExportState(tx))
+        .await
+        .unwrap();
+    let (bytes, _seq) = rx.await.unwrap().expect("export state");
+    let doc = yrs::Doc::new();
+    let frag = doc.get_or_insert_xml_fragment("default");
+    doc.transact_mut()
+        .apply_update(Update::decode_v1(&bytes).unwrap())
+        .unwrap();
+    let txn = doc.transact();
+    frag.successors(&txn)
+        .filter_map(|n| match n {
+            XmlOut::Text(t) => Some(t.get_string(&txn)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A replace suggestion of "Hello" (clocks 2..=6 of [`SEED_TEXT`]) with
+/// "Howdy".
+fn seeded_replace_body() -> Value {
+    json!({
+        "kind": "replace",
+        "position_y": anchor(2, Assoc::After),
+        "position_y_end": anchor(6, Assoc::Before),
+        "original_text": "Hello",
+        "context_before": "",
+        "proposed_text": "Howdy",
+    })
+}
+
+/// Create [`seeded_replace_body`] through the API; returns its id.
+async fn create_seeded(app: &axum::Router, doc_id: Uuid, sid: &str, csrf: &str) -> String {
+    let (status, json) = post_json(
+        app,
+        &format!("/api/docs/{doc_id}/suggestions"),
+        sid,
+        csrf,
+        seeded_replace_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {json}");
+    json["id"].as_str().unwrap().to_string()
+}
+
+async fn accept(
+    app: &axum::Router,
+    doc_id: Uuid,
+    suggestion_id: &str,
+    sid: &str,
+    csrf: &str,
+    seen_text: &str,
+) -> (StatusCode, Value) {
+    post_json(
+        app,
+        &format!("/api/docs/{doc_id}/suggestions/{suggestion_id}/accept"),
+        sid,
+        csrf,
+        json!({ "seen_text": seen_text }),
+    )
+    .await
+}
+
+/// The row's status, read straight from the database.
+async fn status_of(state: &AppState, suggestion_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM suggestions WHERE id = $1")
+        .bind(Uuid::parse_str(suggestion_id).unwrap())
+        .fetch_one(state.pool.as_ref().unwrap())
+        .await
+        .unwrap()
+}
+
+/// Alice (Owner) with a room seeded with [`SEED_TEXT`] (credited to her),
+/// and Bob (Editor) as the suggester, both logged in.
+struct AcceptFixture {
+    state: AppState,
+    app: axum::Router,
+    ws_id: Uuid,
+    doc_id: Uuid,
+    alice: Uuid,
+    bob: Uuid,
+    seed: yrs::Doc,
+    alice_session: (String, String),
+    bob_session: (String, String),
+}
+
+async fn accept_fixture() -> AcceptFixture {
+    let (mut state, ws_id, doc_id, alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    let bob = add_bob(&state, ws_id, WorkspaceRole::Editor).await;
+    with_rooms(&mut state);
+    let seed = seed_room(&state, doc_id, alice).await;
+    let app = router_with_state(state.clone());
+    let alice_session = login(&app, "alice@example.com").await;
+    let bob_session = login(&app, "bob@example.com").await;
+    AcceptFixture {
+        state,
+        app,
+        ws_id,
+        doc_id,
+        alice,
+        bob,
+        seed,
+        alice_session,
+        bob_session,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_accept_applies_text() {
+    let f = accept_fixture().await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let (sid_a, csrf_a) = &f.alice_session;
+    let s = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+
+    let (status, json) = accept(&f.app, f.doc_id, &s, sid_a, csrf_a, "Hello").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["id"], s);
+    assert_eq!(json["status"], "accepted");
+    assert_eq!(json["decided_by"], f.alice.to_string());
+    assert!(json["decided_at"].as_str().is_some(), "{json}");
+    assert_eq!(room_text(&f.state, f.doc_id).await, "Howdy world");
+    assert_eq!(status_of(&f.state, &s).await, "accepted");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accept_credits_suggester_in_contributors() {
+    let f = accept_fixture().await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let (sid_a, csrf_a) = &f.alice_session;
+    let s = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+    let pool = f.state.pool.clone().unwrap();
+    let contributors = || {
+        let pool = pool.clone();
+        let doc_id = f.doc_id;
+        async move {
+            let mut ids: Vec<Uuid> =
+                sqlx::query_scalar("SELECT user_id FROM doc_contributors WHERE doc_id = $1")
+                    .bind(doc_id)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            ids.sort();
+            ids
+        }
+    };
+
+    let before = contributors().await;
+    assert!(
+        before.contains(&f.alice),
+        "the seed credits alice: {before:?}"
+    );
+    assert!(!before.contains(&f.bob), "{before:?}");
+
+    let (status, json) = accept(&f.app, f.doc_id, &s, sid_a, csrf_a, "Hello").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let after = contributors().await;
+    assert!(
+        after.contains(&f.bob),
+        "the suggester wrote the words: {after:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_doc_accept_is_404_and_leaves_row_pending() {
+    let f = accept_fixture().await;
+    let (sid_a, csrf_a) = &f.alice_session;
+    let doc_b = f
+        .state
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(f.ws_id, None, "Other Doc", "n", f.alice)
+        .await
+        .unwrap()
+        .id;
+    let in_b = create(&f.app, doc_b, sid_a, csrf_a).await;
+
+    let (status, json) = accept(&f.app, f.doc_id, &in_b, sid_a, csrf_a, "Hello").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    assert_eq!(code(&json), "suggestion.not_found");
+    assert_eq!(status_of(&f.state, &in_b).await, "pending");
+
+    // An unknown id is 404 too.
+    let (status, json) = accept(
+        &f.app,
+        f.doc_id,
+        &Uuid::new_v4().to_string(),
+        sid_a,
+        csrf_a,
+        "Hello",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    assert_eq!(code(&json), "suggestion.not_found");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn room_unavailable_leaves_row_pending() {
+    // No rooms on this state.
+    let (state, _ws, doc_id, _alice) = state_with_seeded(WorkspaceRole::Owner).await;
+    let app = router_with_state(state.clone());
+    let (sid, csrf) = login(&app, "alice@example.com").await;
+    let s = create_seeded(&app, doc_id, &sid, &csrf).await;
+
+    let (status, json) = accept(&app, doc_id, &s, &sid, &csrf, "Hello").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+    assert_eq!(status_of(&state, &s).await, "pending");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn editor_cannot_accept() {
+    let f = accept_fixture().await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let s = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+
+    let (status, json) = accept(&f.app, f.doc_id, &s, sid_b, csrf_b, "Hello").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert_eq!(code(&json), "acl.owner_required");
+    assert_eq!(status_of(&f.state, &s).await, "pending");
+    assert_eq!(room_text(&f.state, f.doc_id).await, SEED_TEXT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn over_long_seen_text_is_422_and_row_untouched() {
+    let f = accept_fixture().await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let (sid_a, csrf_a) = &f.alice_session;
+    let s = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+
+    let seen = "a".repeat(10_001);
+    let (status, json) = accept(&f.app, f.doc_id, &s, sid_a, csrf_a, &seen).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_eq!(code(&json), "suggestion.too_long");
+    assert_eq!(status_of(&f.state, &s).await, "pending");
+    assert_eq!(room_text(&f.state, f.doc_id).await, SEED_TEXT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_seen_text_is_409_changed_and_row_back_to_pending() {
+    let f = accept_fixture().await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let (sid_a, csrf_a) = &f.alice_session;
+    let s = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+
+    let (status, json) = accept(&f.app, f.doc_id, &s, sid_a, csrf_a, "Hallo").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(code(&json), "suggestion.changed");
+    assert_eq!(status_of(&f.state, &s).await, "pending");
+    assert_eq!(room_text(&f.state, f.doc_id).await, SEED_TEXT);
+
+    // With the text the card now shows, a second accept succeeds.
+    let (status, json) = accept(&f.app, f.doc_id, &s, sid_a, csrf_a, "Hello").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(room_text(&f.state, f.doc_id).await, "Howdy world");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleted_target_is_409_anchor_lost() {
+    use yrs::{ReadTxn, Text, Transact, XmlFragment, XmlOut};
+    let f = accept_fixture().await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let (sid_a, csrf_a) = &f.alice_session;
+    let s = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+
+    // Someone deletes "Hello " in the page.
+    let update = {
+        let frag = f.seed.get_or_insert_xml_fragment("default");
+        let sv = f.seed.transact().state_vector();
+        {
+            let mut txn = f.seed.transact_mut();
+            let text = frag
+                .successors(&txn)
+                .find_map(|n| match n {
+                    XmlOut::Text(t) => Some(t),
+                    _ => None,
+                })
+                .unwrap();
+            text.remove_range(&mut txn, 0, 6);
+        }
+        f.seed.transact().encode_state_as_update_v1(&sv)
+    };
+    apply_to_room(&f.state, f.doc_id, update, f.alice).await;
+    assert_eq!(room_text(&f.state, f.doc_id).await, "world");
+
+    let (status, json) = accept(&f.app, f.doc_id, &s, sid_a, csrf_a, "").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(code(&json), "suggestion.anchor_lost");
+    assert_eq!(status_of(&f.state, &s).await, "pending");
+    assert_eq!(room_text(&f.state, f.doc_id).await, "world");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_accepts_one_wins() {
+    let f = accept_fixture().await;
+    add_member(
+        &f.state,
+        f.ws_id,
+        "carol@example.com",
+        "Carol",
+        WorkspaceRole::Owner,
+    )
+    .await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let (sid_a, csrf_a) = &f.alice_session;
+    let (sid_c, csrf_c) = login(&f.app, "carol@example.com").await;
+    let s = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+
+    let (a, c) = tokio::join!(
+        accept(&f.app, f.doc_id, &s, sid_a, csrf_a, "Hello"),
+        accept(&f.app, f.doc_id, &s, &sid_c, &csrf_c, "Hello"),
+    );
+    let mut statuses = [a.0, c.0];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::CONFLICT],
+        "{} / {}",
+        a.1,
+        c.1
+    );
+    let loser = if a.0 == StatusCode::CONFLICT {
+        &a.1
+    } else {
+        &c.1
+    };
+    assert_eq!(code(loser), "suggestion.not_pending");
+    assert_eq!(room_text(&f.state, f.doc_id).await, "Howdy world");
+    assert_eq!(status_of(&f.state, &s).await, "accepted");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accept_after_already_applied_finishes() {
+    let f = accept_fixture().await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let (sid_a, csrf_a) = &f.alice_session;
+    let s = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+    let (status, json) = accept(&f.app, f.doc_id, &s, sid_a, csrf_a, "Hello").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    // As if the row had been released after the text landed.
+    sqlx::query("UPDATE suggestions SET status = 'pending', decided_by = NULL, decided_at = NULL WHERE id = $1")
+        .bind(Uuid::parse_str(&s).unwrap())
+        .execute(f.state.pool.as_ref().unwrap())
+        .await
+        .unwrap();
+
+    let (status, json) = accept(&f.app, f.doc_id, &s, sid_a, csrf_a, "Hello").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "accepted");
+    assert_eq!(json["decided_by"], f.alice.to_string());
+    assert_eq!(
+        room_text(&f.state, f.doc_id).await,
+        "Howdy world",
+        "applied once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sweep_finishes_applied_and_releases_unapplied() {
+    let f = accept_fixture().await;
+    let (sid_b, csrf_b) = &f.bob_session;
+    let (sid_a, csrf_a) = &f.alice_session;
+    let pool = f.state.pool.clone().unwrap();
+
+    // Applied in the doc, but its row left `applying` (a crash before
+    // `finish_accept`).
+    let applied = create_seeded(&f.app, f.doc_id, sid_b, csrf_b).await;
+    let (status, json) = accept(&f.app, f.doc_id, &applied, sid_a, csrf_a, "Hello").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    // Claimed but never applied (a crash before the room event).
+    let unapplied = create(&f.app, f.doc_id, sid_b, csrf_b).await;
+    // Claimed just now: too young to sweep.
+    let young = create(&f.app, f.doc_id, sid_b, csrf_b).await;
+    for (id, age) in [
+        (&applied, "5 minutes"),
+        (&unapplied, "5 minutes"),
+        (&young, "0 seconds"),
+    ] {
+        sqlx::query(
+            "UPDATE suggestions \
+             SET status = 'applying', decided_by = $2, decided_at = NULL, \
+                 updated_at = now() - $3::interval \
+             WHERE id = $1",
+        )
+        .bind(Uuid::parse_str(id).unwrap())
+        .bind(f.alice)
+        .bind(age)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let out = knot_server::suggestions_sweep::run_once(&f.state, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        knot_server::suggestions_sweep::SweepOutcome {
+            finished: 1,
+            released: 1
+        }
+    );
+    assert_eq!(status_of(&f.state, &applied).await, "accepted");
+    assert_eq!(status_of(&f.state, &unapplied).await, "pending");
+    assert_eq!(status_of(&f.state, &young).await, "applying");
+    assert_eq!(room_text(&f.state, f.doc_id).await, "Howdy world");
+
+    let decided_by: Option<Uuid> =
+        sqlx::query_scalar("SELECT decided_by FROM suggestions WHERE id = $1")
+            .bind(Uuid::parse_str(&applied).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(decided_by, Some(f.alice));
+
+    // A second run finds nothing left to do.
+    let out = knot_server::suggestions_sweep::run_once(&f.state, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(out, knot_server::suggestions_sweep::SweepOutcome::default());
+}

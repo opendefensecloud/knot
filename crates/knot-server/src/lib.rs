@@ -43,6 +43,7 @@ pub mod room;
 pub mod routes;
 pub mod security_headers;
 pub mod static_files;
+pub mod suggestions_sweep;
 mod ws_writer;
 
 use auth::SessionDeps;

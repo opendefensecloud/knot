@@ -3,6 +3,7 @@
 //! POST   /api/docs/{id}/suggestions                       { kind, position_y, … } → 201 (Editor+)
 //! GET    /api/docs/{id}/suggestions?include_resolved      → 200 [SuggestionWithReplies]
 //!
+//! POST   /api/docs/{id}/suggestions/{suggestion_id}/accept   { seen_text } → 200 (Owner)
 //! POST   /api/docs/{id}/suggestions/{suggestion_id}/reject   → 200 (Owner)
 //! POST   /api/docs/{id}/suggestions/{suggestion_id}/withdraw → 200 (author)
 //!
@@ -12,10 +13,13 @@
 //!
 //! Mounted inside `docs::router`'s doc-id routes, so `require_doc_role_mw`
 //! has already resolved the caller's effective role (and refused writes to an
-//! archived doc). A suggestion never touches the Y.Doc here; only accept does.
+//! archived doc). A suggestion never touches the Y.Doc here; only accept
+//! does, and it does so through the doc's room
+//! (`knot_crdt::Event::ApplySuggestion`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -27,11 +31,12 @@ use axum::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use knot_crdt::{ApplySuggestionError, ApplySuggestionRequest};
 use knot_storage::suggestions::{
     MAX_CONTEXT_CHARS, MAX_REASON_CHARS, MAX_REPLY_CHARS, MAX_TEXT_CHARS,
 };
 use knot_storage::{
-    NewSuggestion, Suggestion, SuggestionKind, SuggestionReply, SuggestionStore,
+    NewSuggestion, Suggestion, SuggestionKind, SuggestionReply, SuggestionStatus, SuggestionStore,
     SuggestionStoreError, WorkspaceRole,
 };
 use serde::{Deserialize, Serialize};
@@ -54,6 +59,13 @@ const MAX_CREATE_BYTES: usize = 256 * 1024;
 /// a surrogate pair (`\uXXXX\uXXXX`, 12 bytes), plus room for `mentions`.
 const MAX_REPLY_BYTES: usize = 64 * 1024;
 
+/// How long accept waits for the room to take and apply the change, counted
+/// from the claim (it covers queueing the event on a full room mailbox as
+/// well as the reply). Well under [`crate::suggestions_sweep::STUCK_AFTER`],
+/// so the sweep never looks at a row whose accept is still waiting on its
+/// room.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+
 // ---------------------------------------------------------------------------
 // Request / response shapes
 // ---------------------------------------------------------------------------
@@ -72,6 +84,13 @@ struct CreateBody {
     proposed_text: String,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AcceptBody {
+    /// The "Now" text the owner's card showed (empty for an insertion). The
+    /// room applies only if the range still holds exactly this text.
+    seen_text: String,
 }
 
 #[derive(Deserialize)]
@@ -247,6 +266,15 @@ fn kind_matches(kind: SuggestionKind, original: &str, proposed: &str) -> bool {
     }
 }
 
+/// The room's name for a stored suggestion kind.
+fn crdt_kind(kind: SuggestionKind) -> knot_crdt::SuggestionKind {
+    match kind {
+        SuggestionKind::Replace => knot_crdt::SuggestionKind::Replace,
+        SuggestionKind::Insert => knot_crdt::SuggestionKind::Insert,
+        SuggestionKind::Delete => knot_crdt::SuggestionKind::Delete,
+    }
+}
+
 fn over(s: &str, max: usize) -> bool {
     s.chars().count() > max
 }
@@ -367,6 +395,172 @@ async fn list(
         })
         .collect();
     Json(out).into_response()
+}
+
+/// POST /api/docs/{id}/suggestions/{suggestion_id}/accept — Owner
+///
+/// Claims the row (`pending → applying`), has the doc's room apply the
+/// change in one transaction (which also records the suggestion as applied
+/// in the doc), then marks the row `accepted`. A refusal from the room
+/// releases the row back to `pending`. When the outcome is unknown (the room
+/// timed out, went away or could not persist) the row stays `applying` and
+/// `suggestions_sweep` settles it from the doc's applied marker.
+async fn accept(
+    State(state): State<AppState>,
+    Path((doc_id, suggestion_id)): Path<(Uuid, Uuid)>,
+    req: Request<Body>,
+) -> Response {
+    if let Some(r) = require_owner(&req) {
+        return r;
+    }
+    let Some(ctx) = auth(&req) else {
+        return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
+    };
+    let Some(store) = state.suggestions.clone() else {
+        return internal();
+    };
+    if let Err(r) = ensure_suggestion_in_doc(&store, suggestion_id, doc_id).await {
+        return r;
+    }
+    // `seen_text` is at most a range's text, so the create cap covers it.
+    let body: AcceptBody = match read_json(req, MAX_CREATE_BYTES).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    if over(&body.seen_text, MAX_TEXT_CHARS) {
+        return too_long();
+    }
+
+    // The room first: a failure here must leave the row untouched.
+    let Some(rooms) = state.rooms_v2.clone() else {
+        return internal();
+    };
+    let room = match rooms.acquire(doc_id).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error=?e, %doc_id, "accept_suggestion: room acquire failed");
+            return internal();
+        }
+    };
+
+    let claimed = match store.claim_for_accept(suggestion_id, ctx.user_id).await {
+        Ok(s) => s,
+        Err(e) => return store_err(e, "claim_suggestion"),
+    };
+    // One deadline from the claim (which set `updated_at`) for both queueing
+    // the event and the reply, so accept settles well under `STUCK_AFTER`.
+    let deadline = tokio::time::Instant::now() + ACCEPT_TIMEOUT;
+    let request = ApplySuggestionRequest {
+        suggestion_id,
+        kind: crdt_kind(claimed.kind),
+        start: claimed.position_y,
+        end: claimed.position_y_end,
+        seen_text: body.seen_text,
+        proposed_text: claimed.proposed_text,
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let sent = tokio::time::timeout_at(
+        deadline,
+        room.tx.send(knot_crdt::Event::ApplySuggestion {
+            request,
+            // The suggester wrote the words, so the edit is theirs.
+            by_user: Some(claimed.author_id),
+            reply: tx,
+        }),
+    )
+    .await;
+    match sent {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            // The room is gone and never got the event, so nothing was applied.
+            release_after_refusal(&store, suggestion_id).await;
+            return internal();
+        }
+        Err(_) => {
+            // `mpsc::Sender::send` is cancel safe: a send that timed out
+            // waiting for mailbox space was never queued, so nothing was
+            // applied.
+            tracing::error!(%suggestion_id, "accept_suggestion: room mailbox full until the deadline");
+            release_after_refusal(&store, suggestion_id).await;
+            return internal();
+        }
+    }
+    let outcome = match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(_)) => {
+            tracing::error!(%suggestion_id, "accept_suggestion: room dropped the reply; left for the sweep");
+            return internal();
+        }
+        Err(_) => {
+            tracing::error!(%suggestion_id, "accept_suggestion: room timed out; left for the sweep");
+            return internal();
+        }
+    };
+
+    match outcome {
+        Ok(_) | Err(ApplySuggestionError::AlreadyApplied) => {
+            finish(&state, &store, doc_id, suggestion_id, ctx.user_id).await
+        }
+        Err(ApplySuggestionError::AnchorLost) => {
+            release_after_refusal(&store, suggestion_id).await;
+            json_err(StatusCode::CONFLICT, "suggestion.anchor_lost", "")
+        }
+        Err(ApplySuggestionError::Changed) => {
+            release_after_refusal(&store, suggestion_id).await;
+            json_err(StatusCode::CONFLICT, "suggestion.changed", "")
+        }
+        Err(ApplySuggestionError::Decode(e)) => {
+            tracing::warn!(%suggestion_id, error=%e, "accept_suggestion: anchor does not decode");
+            release_after_refusal(&store, suggestion_id).await;
+            json_err(StatusCode::BAD_REQUEST, "suggestion.invalid_anchor", "")
+        }
+        Err(ApplySuggestionError::Persist(e)) => {
+            // The room evicted itself; whether the change is durable is
+            // for the sweep to read from storage.
+            tracing::error!(%suggestion_id, error=%e, "accept_suggestion: persist failed; left for the sweep");
+            internal()
+        }
+    }
+}
+
+/// Mark an applied suggestion `accepted` and answer 200 with it. A row that
+/// is no longer `applying`/`pending` was most likely finished already by the
+/// sweep; it is answered as 200 when it is `accepted` too.
+async fn finish(
+    state: &AppState,
+    store: &Arc<dyn SuggestionStore>,
+    doc_id: Uuid,
+    suggestion_id: Uuid,
+    decided_by: Uuid,
+) -> Response {
+    let finished = match store.finish_accept(suggestion_id, decided_by).await {
+        Ok(s) => s,
+        Err(SuggestionStoreError::NotPending) => match store.get(suggestion_id).await {
+            Ok(s) if s.status == SuggestionStatus::Accepted => s,
+            Ok(s) => {
+                tracing::error!(
+                    %suggestion_id,
+                    status = s.status.as_str(),
+                    "accept_suggestion: applied in the doc but the row moved elsewhere"
+                );
+                return internal();
+            }
+            Err(e) => return store_err(e, "accept_suggestion: re-read"),
+        },
+        Err(e) => return store_err(e, "finish_accept"),
+    };
+    // Task 6: notify the author (`suggestion_decided` kind).
+    notify_suggestion_change(state, doc_id);
+    Json(finished).into_response()
+}
+
+/// Return a claimed row to `pending` after the room refused (or never got)
+/// the change. A failure is only logged: the row stays `applying`, and the
+/// sweep releases it once it finds no applied marker in the doc.
+async fn release_after_refusal(store: &Arc<dyn SuggestionStore>, suggestion_id: Uuid) {
+    if let Err(e) = store.release(suggestion_id).await {
+        tracing::error!(error=?e, %suggestion_id, "accept_suggestion: release failed; left for the sweep");
+    }
 }
 
 /// POST /api/docs/{id}/suggestions/{suggestion_id}/reject — Owner
@@ -553,6 +747,10 @@ async fn delete_reply(
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/docs/{id}/suggestions", post(create).get(list))
+        .route(
+            "/api/docs/{id}/suggestions/{suggestion_id}/accept",
+            post(accept),
+        )
         .route(
             "/api/docs/{id}/suggestions/{suggestion_id}/reject",
             post(reject),
