@@ -49,6 +49,11 @@ owner of the page accepts or rejects it. Until then the page stays as it is.
   - `GET/POST /api/docs/{id}/suggestions`, `POST …/{sid}/accept`,
     `…/reject`, `…/withdraw`, and replies under `…/{sid}/replies`.
 
+### Security
+- pulldown-cmark 0.13.6 fixes RUSTSEC-2026-0433 (quadratic parsing of
+  nested image wikilinks). knot was not affected: it never enables
+  wikilinks when parsing Markdown.
+
 ## [0.9.7] - 2026-11-02
 
 A dependency-only release that picks up fixed versions of `zip`, KaTeX and
