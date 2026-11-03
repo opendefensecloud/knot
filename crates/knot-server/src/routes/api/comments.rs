@@ -98,7 +98,7 @@ fn require_auth(req: &Request<Body>) -> Option<&AuthContext> {
     req.extensions().get::<AuthContext>()
 }
 
-fn require_editor(req: &Request<Body>) -> Option<Response> {
+pub(crate) fn require_editor(req: &Request<Body>) -> Option<Response> {
     if req.extensions().get::<AuthContext>().is_none() {
         return Some(json_err(
             StatusCode::UNAUTHORIZED,
@@ -115,7 +115,7 @@ fn require_editor(req: &Request<Body>) -> Option<Response> {
     }
 }
 
-fn internal() -> Response {
+pub(crate) fn internal() -> Response {
     json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "")
 }
 
@@ -124,7 +124,7 @@ fn internal() -> Response {
 // ---------------------------------------------------------------------------
 
 /// Extract @mention handles from comment body.
-fn extract_mentions(body: &str) -> Vec<String> {
+pub(crate) fn extract_mentions(body: &str) -> Vec<String> {
     MENTION_RE
         .captures_iter(body)
         .filter_map(|cap| cap.get(1))

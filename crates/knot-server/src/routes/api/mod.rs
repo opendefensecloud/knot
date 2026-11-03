@@ -18,6 +18,7 @@ pub mod markdown;
 pub mod notifications;
 pub mod search;
 pub mod shares;
+pub mod suggestions;
 pub mod tasks;
 pub mod whats_new;
 pub mod workspace;

@@ -35,6 +35,8 @@ const LOCK_TIMEOUT = "4s";
 const TABLES = [
   "comment_reactions",
   "comments",
+  "suggestion_replies",
+  "suggestions",
   "acl_invalidations",
   "audit_events",
   "blob_bytes",

@@ -24,8 +24,9 @@ import {
   ySyncPluginKey,
 } from "@tiptap/y-tiptap";
 
+/** The ySync binding's map from Y types to the ProseMirror nodes they render. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type ProsemirrorMapping = Map<Y.AbstractType<any>, PmNode | PmNode[]>;
+export type ProsemirrorMapping = Map<Y.AbstractType<any>, PmNode | PmNode[]>;
 
 /** Shape of the ySyncPlugin's per-editor state. */
 interface YSyncState {
@@ -34,9 +35,20 @@ interface YSyncState {
   } | null;
 }
 
-function getMapping(editor: Editor): ProsemirrorMapping | null {
+/** The live ySync mapping, or null when the plugin has not built its binding. */
+export function getMapping(editor: Editor): ProsemirrorMapping | null {
   const ystate = ySyncPluginKey.getState(editor.state) as YSyncState | null | undefined;
   return ystate?.binding?.mapping ?? null;
+}
+
+/** Base64 of a Y.RelativePosition's v1 bytes: the stored anchor format. */
+export function relativePositionToBase64(rel: Y.RelativePosition): string {
+  return btoa(String.fromCharCode(...Y.encodeRelativePosition(rel)));
+}
+
+/** Inverse of `relativePositionToBase64`. Throws on malformed input. */
+export function relativePositionFromBase64(b64: string): Y.RelativePosition {
+  return Y.decodeRelativePosition(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
 }
 
 /** Returns null when the ySyncPlugin mapping isn't available. */
@@ -52,8 +64,7 @@ export function encodeAnchor(
   try {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     const rel: Y.RelativePosition = absolutePositionToRelativePosition(absPos, fragment, mapping);
-    const bytes = Y.encodeRelativePosition(rel);
-    return btoa(String.fromCharCode(...bytes));
+    return relativePositionToBase64(rel);
   } catch {
     return null;
   }
@@ -69,8 +80,7 @@ export function decodeAnchor(
   if (!mapping) return null;
 
   try {
-    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-    const rel = Y.decodeRelativePosition(bytes);
+    const rel = relativePositionFromBase64(b64);
     const fragment = ydoc.getXmlFragment("default");
     const abs = relativePositionToAbsolutePosition(ydoc, fragment, rel, mapping);
     if (abs === null) return null;

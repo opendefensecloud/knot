@@ -4,7 +4,10 @@ import { useState } from "react";
 
 import { IconButton } from "../../components/ui/IconButton";
 import { commentsApi, type Comment } from "../../lib/comments.api";
-import { useUi } from "../../stores/ui";
+import { suggestionsApi } from "../../lib/suggestions.api";
+import { useUi, type SidebarTab } from "../../stores/ui";
+import { isOpenStatus } from "../suggestions/SuggestionCard";
+import { SuggestionsPanel } from "../suggestions/SuggestionsPanel";
 import { CommentComposer } from "./CommentComposer";
 import { CommentThread } from "./CommentThread";
 
@@ -48,6 +51,36 @@ function groupByThread(comments: Comment[]): ThreadGroup[] {
   return groups;
 }
 
+/** One header tab: its label and count, pressed while it shows. */
+function SidebarTabButton({
+  tab,
+  label,
+  count,
+  active,
+  onSelect,
+}: {
+  tab: SidebarTab;
+  label: string;
+  count: number;
+  active: boolean;
+  onSelect: (t: SidebarTab) => void;
+}) {
+  return (
+    <button
+      type="button"
+      data-testid={`sidebar-tab-${tab}`}
+      aria-pressed={active}
+      onClick={() => onSelect(tab)}
+      className={`inline-flex items-center gap-1.5 h-8 px-2.5 rounded text-sm font-semibold transition-colors ${
+        active ? "bg-muted text-fg" : "text-fg-muted hover:text-fg hover:bg-muted/60"
+      }`}
+    >
+      {label}{" "}
+      <span className="text-[12px] font-medium tabular-nums text-fg-muted">{count}</span>
+    </button>
+  );
+}
+
 export function CommentSidebar({ docId }: { docId: string }) {
   const [showResolved, setShowResolved] = useState(false);
   const closeCommentSidebar = useUi((s) => s.closeCommentSidebar);
@@ -55,6 +88,8 @@ export function CommentSidebar({ docId }: { docId: string }) {
   const pendingAnchor = useUi((s) => s.pendingAnchor);
   const clearPendingAnchor = useUi((s) => s.clearPendingAnchor);
   const notify = useUi((s) => s.notify);
+  const sidebarTab = useUi((s) => s.sidebarTab);
+  const setSidebarTab = useUi((s) => s.setSidebarTab);
   const qc = useQueryClient();
 
   const list = useQuery({
@@ -79,8 +114,20 @@ export function CommentSidebar({ docId }: { docId: string }) {
     },
   });
 
+  // The pending suggestions, for the tab's count. The same key the panel and
+  // KnotEditor read, so this is one shared fetch.
+  const pendingSuggestions = useQuery({
+    queryKey: ["suggestions", docId, false],
+    queryFn: () => suggestionsApi.list(docId, false),
+  });
+
   const comments: Comment[] = list.data && "ok" in list.data ? list.data.ok : [];
   const groups = groupByThread(comments);
+  const openThreadCount = groups.filter((g) => g.resolvedAt === null).length;
+  const pendingSuggestionCount =
+    pendingSuggestions.data && "ok" in pendingSuggestions.data
+      ? pendingSuggestions.data.ok.filter((s) => isOpenStatus(s.status)).length
+      : 0;
 
   // A thread a link opened (a notification) may have been resolved since,
   // and is only listed with the resolved ones: show those, once per visit.
@@ -101,17 +148,34 @@ export function CommentSidebar({ docId }: { docId: string }) {
       className="fixed right-0 top-0 h-dvh w-[400px] max-w-full z-40 bg-surface border-l border-border shadow-xl flex flex-col"
     >
       <header className="flex items-center gap-2 px-4 py-3 border-b border-border">
-        <h2 className="m-0 flex-1 text-base font-semibold text-fg">Comments</h2>
-        <label className="text-[13px] text-fg-muted flex items-center gap-1.5 cursor-pointer select-none">
-          <input
-            type="checkbox"
-            data-testid="comment-show-resolved"
-            checked={showResolved}
-            onChange={(e) => setShowResolved(e.target.checked)}
-            className="accent-accent"
+        <div className="flex-1 flex items-center gap-1">
+          <SidebarTabButton
+            tab="comments"
+            label="Comments"
+            count={openThreadCount}
+            active={sidebarTab === "comments"}
+            onSelect={setSidebarTab}
           />
-          Show resolved
-        </label>
+          <SidebarTabButton
+            tab="suggestions"
+            label="Suggestions"
+            count={pendingSuggestionCount}
+            active={sidebarTab === "suggestions"}
+            onSelect={setSidebarTab}
+          />
+        </div>
+        {sidebarTab === "comments" && (
+          <label className="text-[13px] text-fg-muted flex items-center gap-1.5 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              data-testid="comment-show-resolved"
+              checked={showResolved}
+              onChange={(e) => setShowResolved(e.target.checked)}
+              className="accent-accent"
+            />
+            Show resolved
+          </label>
+        )}
         <IconButton
           data-testid="comment-sidebar-close"
           label="Close"
@@ -122,39 +186,45 @@ export function CommentSidebar({ docId }: { docId: string }) {
         </IconButton>
       </header>
 
-      {pendingAnchor && (
-        <div className="border-b border-border bg-accent/5">
-          <div className="px-4 pt-2 text-[12px] text-fg-muted">
-            New comment on: <em>&ldquo;{pendingAnchor.anchorText}&rdquo;</em>
-          </div>
-          <CommentComposer
-            placeholder="Start a new thread…"
-            submitLabel="Comment"
-            isPending={createThread.isPending}
-            onSubmit={(body, mentions) => createThread.mutate({ body, mentions })}
-            data-testid-input="comment-composer-input-new"
-            data-testid-submit="comment-composer-submit-new"
-          />
-        </div>
-      )}
+      {sidebarTab === "suggestions" ? (
+        <SuggestionsPanel docId={docId} />
+      ) : (
+        <>
+          {pendingAnchor && (
+            <div className="border-b border-border bg-accent/5">
+              <div className="px-4 pt-2 text-[12px] text-fg-muted">
+                New comment on: <em>&ldquo;{pendingAnchor.anchorText}&rdquo;</em>
+              </div>
+              <CommentComposer
+                placeholder="Start a new thread…"
+                submitLabel="Comment"
+                isPending={createThread.isPending}
+                onSubmit={(body, mentions) => createThread.mutate({ body, mentions })}
+                data-testid-input="comment-composer-input-new"
+                data-testid-submit="comment-composer-submit-new"
+              />
+            </div>
+          )}
 
-      <div className="flex-1 overflow-y-auto">
-        {list.isLoading && (
-          <p className="px-4 py-3 text-fg-muted text-sm">Loading…</p>
-        )}
-        {!list.isLoading && groups.length === 0 && !pendingAnchor && (
-          <p className="px-4 py-3 text-fg-muted text-sm">No comments yet.</p>
-        )}
-        {groups.map((g) => (
-          <CommentThread
-            key={g.threadId}
-            docId={docId}
-            threadId={g.threadId}
-            root={g.root}
-            replies={g.replies}
-          />
-        ))}
-      </div>
+          <div className="flex-1 overflow-y-auto">
+            {list.isLoading && (
+              <p className="px-4 py-3 text-fg-muted text-sm">Loading…</p>
+            )}
+            {!list.isLoading && groups.length === 0 && !pendingAnchor && (
+              <p className="px-4 py-3 text-fg-muted text-sm">No comments yet.</p>
+            )}
+            {groups.map((g) => (
+              <CommentThread
+                key={g.threadId}
+                docId={docId}
+                threadId={g.threadId}
+                root={g.root}
+                replies={g.replies}
+              />
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }

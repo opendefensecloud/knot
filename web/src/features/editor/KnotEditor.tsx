@@ -19,13 +19,17 @@ import { useSession } from "../../auth/SessionContext";
 import { colorFor } from "../../components/ui/Avatar";
 import { blobsApi } from "../../lib/blobs.api";
 import { commentsApi } from "../../lib/comments.api";
+import { suggestionsApi, type SuggestionWithReplies } from "../../lib/suggestions.api";
 import { useUi } from "../../stores/ui";
 
 import { encodeAnchorRange } from "../comments/anchor";
+import { encodeSuggestionAnchors } from "../suggestions/anchor";
+import { classifySuggestion, type SuggestionLive } from "../suggestions/liveState";
+import { SCOPE_TOOLTIP, suggestionScope, type SuggestionScope } from "../suggestions/scope";
 import { isEditModeShortcut } from "../docs/editMode";
 import { stickyCoverBottom } from "../docs/readingAnchor";
 import { workspaceApi } from "../workspace/workspace.api";
-import { computeAddCommentPos } from "./addCommentPos";
+import { SELECTION_FLOAT_WIDTH, computeAddCommentPos } from "./addCommentPos";
 import { createExtensions } from "./extensions";
 import {
   type HighlightedComment,
@@ -34,6 +38,12 @@ import {
 } from "./CommentsHighlightExtension";
 import { EditorToolbar } from "./EditorToolbar";
 import { setReadableDocIds } from "./InternalLinkExtension";
+import {
+  type DraftRange,
+  type HighlightedSuggestion,
+  refreshSuggestionHighlights,
+  setSuggestionsEditorRef,
+} from "./SuggestionsHighlightExtension";
 import { KnotProvider, type CommentChangeMsg, type ProviderStatus } from "./KnotProvider";
 import { looksLikeMarkdown, markdownToHtml } from "./markdownPaste";
 import { type KnotEditorHandle, placeCaretAtReadingLine, revealCaretBelowBand } from "./readingCaret";
@@ -66,6 +76,14 @@ export function KnotEditor({
   handleRef?: MutableRefObject<KnotEditorHandle | null>;
 }) {
   const [pair, setPair] = useState<Pair | null>(null);
+  const clearPendingSuggestion = useUi((s) => s.clearPendingSuggestion);
+
+  // An open suggestion composer belongs to this page: its anchors mean
+  // nothing in another one, where its draft range would be decoded against
+  // the wrong document. Leaving the page drops it. (The focused card and the
+  // last `?suggestion=` link are dropped by DocPage, next to where it sets
+  // them.)
+  useEffect(() => () => { clearPendingSuggestion(); }, [docId, clearPendingSuggestion]);
 
   // Own the Y.Doc + KnotProvider lifecycle inside an effect so React 18
   // StrictMode's double-mount in dev cannot leak a duplicate WebSocket.
@@ -151,6 +169,11 @@ function EditorBody({
   const setPendingAnchor = useUi((s) => s.setPendingAnchor);
   const setActiveCommentId = useUi((s) => s.setActiveCommentId);
   const activeCommentId = useUi((s) => s.activeCommentId);
+  const setPendingSuggestion = useUi((s) => s.setPendingSuggestion);
+  const pendingSuggestion = useUi((s) => s.pendingSuggestion);
+  const activeSuggestionId = useUi((s) => s.activeSuggestionId);
+  const setActiveSuggestionId = useUi((s) => s.setActiveSuggestionId);
+  const setSuggestionLive = useUi((s) => s.setSuggestionLive);
   const editorRef = useRef<Editor | null>(null);
   // ⌘⇧V / Ctrl+Shift+V is the conventional "paste without formatting". The
   // paste event carries no modifier state of its own, so latch it from the
@@ -177,6 +200,37 @@ function EditorBody({
       }));
   }, [commentsForHighlight.data]);
 
+  // Pending suggestions, for the blue highlights and each card's live state.
+  // The sidebar's panel reads the same key, so one fetch serves both.
+  const suggestionsQuery = useQuery({
+    queryKey: ["suggestions", docId, false],
+    queryFn: () => suggestionsApi.list(docId, false),
+    staleTime: 0,
+  });
+  const pendingSuggestions: SuggestionWithReplies[] = useMemo(() => {
+    if (!suggestionsQuery.data || "error" in suggestionsQuery.data) return [];
+    // `applying` is the server's brief claim during an accept; until it
+    // settles the suggestion is still pending as far as the page goes.
+    return suggestionsQuery.data.ok.filter((s) => s.status === "pending" || s.status === "applying");
+  }, [suggestionsQuery.data]);
+  const highlightSuggestions: HighlightedSuggestion[] = useMemo(
+    () => pendingSuggestions.map((s) => ({
+      id: s.id,
+      kind: s.kind,
+      position_y: s.position_y,
+      position_y_end: s.position_y_end,
+    })),
+    [pendingSuggestions],
+  );
+  const suggestionDraft: DraftRange | null = useMemo(
+    () => pendingSuggestion && {
+      kind: pendingSuggestion.kind,
+      position_y: pendingSuggestion.positionY,
+      position_y_end: pendingSuggestion.positionYEnd,
+    },
+    [pendingSuggestion],
+  );
+
   // The pages the user can open, for the locked style on doc links to any
   // other page: the sidebar's list, the templates and the archive.
   const readableDocIds = useReadableDocIds();
@@ -186,6 +240,9 @@ function EditorBody({
   // Floating "Add comment" button state
   const [addCommentPos, setAddCommentPos] = useState<{ top: number; left: number } | null>(null);
   const [selectionRange, setSelectionRange] = useState<{ from: number; to: number } | null>(null);
+  // What "Suggest change" would target for that selection; a refusal
+  // disables the button with its reason.
+  const [selectionScope, setSelectionScope] = useState<SuggestionScope | null>(null);
 
   useEffect(() => {
     const { provider } = pair;
@@ -205,11 +262,13 @@ function EditorBody({
   }, [pair]);
 
   // Invalidate the comments query when a peer pushes a MSG_COMMENTS frame,
-  // causing the comment sidebar to refetch automatically.
+  // causing the comment sidebar to refetch automatically. Suggestions share
+  // the frame and say so with `topic`.
   useEffect(() => {
     const { provider } = pair;
-    const onComments = (_msg: CommentChangeMsg) => {
-      void qc.invalidateQueries({ queryKey: ["comments", docId] });
+    const onComments = (msg: CommentChangeMsg) => {
+      const key = msg.topic === "suggestions" ? "suggestions" : "comments";
+      void qc.invalidateQueries({ queryKey: [key, docId] });
     };
     provider.on("comments", onComments);
     return () => { provider.off("comments", onComments); };
@@ -256,6 +315,12 @@ function EditorBody({
         onSelectComment: (commentId) => {
           setActiveCommentId(commentId);
           openCommentSidebar();
+        },
+        // Focuses the card, like a click on it; not a link, so it never
+        // opens Resolved, and nothing is left to replay later.
+        onSelectSuggestion: (id) => {
+          setActiveSuggestionId(id);
+          openCommentSidebar("suggestions");
         },
         navigate,
         fetchMembers: async () => {
@@ -323,6 +388,7 @@ function EditorBody({
         if (from === to) {
           setAddCommentPos(null);
           setSelectionRange(null);
+          setSelectionScope(null);
           return;
         }
         const coords = ed.view.coordsAtPos(from);
@@ -337,9 +403,11 @@ function EditorBody({
             caret: { top: coords.top, bottom: coords.bottom, left: coords.left },
             host: { top: hostRect.top, left: hostRect.left, width: hostRect.width },
             toolbarBottom: stickyCoverBottom(ed.view.dom.closest("[data-testid='doc-page']") ?? document),
+            buttonWidth: SELECTION_FLOAT_WIDTH,
           }),
         );
         setSelectionRange({ from, to });
+        setSelectionScope(suggestionScope(ed.state));
       },
     },
     [pair, sessionUser?.user_id, role, userColor, uploadAndInsert, canComment],
@@ -384,7 +452,11 @@ function EditorBody({
   // closes the loop without a circular import.
   useEffect(() => {
     setEditorRef(editor ?? null);
-    return () => { setEditorRef(null); };
+    setSuggestionsEditorRef(editor ?? null);
+    return () => {
+      setEditorRef(null);
+      setSuggestionsEditorRef(null);
+    };
   }, [editor]);
 
   // Push the latest comments + activeCommentId into the highlight extension's
@@ -408,6 +480,46 @@ function EditorBody({
     refreshHighlights(editor);
   }, [editor, highlightComments, activeCommentId, pair.doc]);
 
+  // The Y.Doc this page has seen content in. Until the WebSocket sync fills
+  // it, every anchor would read as removed; the cards show "unknown" instead.
+  const syncedDocRef = useRef<Y.Doc | null>(null);
+
+  // Each pending suggestion's state in the live document, for its card.
+  // Shared by the Y.Doc listener below and the query-data effect.
+  const reclassifySuggestions = useCallback(() => {
+    if (!editor || editor.isDestroyed) return;
+    if (syncedDocRef.current !== pair.doc) {
+      if (pair.doc.getXmlFragment("default").length === 0) {
+        if (Object.keys(useUi.getState().suggestionLive).length > 0) setSuggestionLive({});
+        return;
+      }
+      syncedDocRef.current = pair.doc;
+    }
+    const live: Record<string, SuggestionLive> = {};
+    for (const s of pendingSuggestions) {
+      live[s.id] = classifySuggestion(editor, pair.doc, s);
+    }
+    if (!sameLive(useUi.getState().suggestionLive, live)) setSuggestionLive(live);
+  }, [editor, pair.doc, pendingSuggestions, setSuggestionLive]);
+
+  // The same push for the suggestion highlights: the pending list, the
+  // focused card and the composer's draft range. Guarded like the comment
+  // effect above, for the same navigation race.
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    const storage = editor.extensionStorage.suggestionsHighlight;
+    storage.suggestions = highlightSuggestions;
+    storage.activeSuggestionId = activeSuggestionId;
+    storage.draft = suggestionDraft;
+    storage.doc = pair.doc;
+    refreshSuggestionHighlights(editor);
+    reclassifySuggestions();
+  }, [editor, highlightSuggestions, activeSuggestionId, suggestionDraft, pair.doc, reclassifySuggestions]);
+
+  // No editor, no live state: the cards fall back to "unknown" (e.g. in the
+  // Markdown view) rather than showing what this page last saw.
+  useEffect(() => () => { setSuggestionLive({}); }, [setSuggestionLive]);
+
   // Push the readable pages into the doc-link decorations. Guarded like the
   // highlight effect above: the outgoing editor may already be destroyed.
   useEffect(() => {
@@ -420,10 +532,16 @@ function EditorBody({
   // applyUpdate which may not always carry through. Belt-and-braces.
   useEffect(() => {
     if (!editor) return;
-    const onUpdate = () => { refreshHighlights(editor); };
+    const onUpdate = () => {
+      if (editor.isDestroyed) return;
+      syncedDocRef.current = pair.doc;
+      refreshHighlights(editor);
+      refreshSuggestionHighlights(editor);
+      reclassifySuggestions();
+    };
     pair.doc.on("update", onUpdate);
     return () => { pair.doc.off("update", onUpdate); };
-  }, [editor, pair.doc]);
+  }, [editor, pair.doc, reclassifySuggestions]);
 
   function handleAddComment() {
     if (!editor || !selectionRange) return;
@@ -453,6 +571,28 @@ function EditorBody({
     setAddCommentPos(null);
   }
 
+  /** Opens the suggestion composer for the current selection (a replace) or
+   *  caret (an insertion). Read fresh: the selection is what will be sent. */
+  function startSuggestion() {
+    if (!editor || editor.isDestroyed) return;
+    const scope = suggestionScope(editor.state);
+    if (!scope.ok) return;
+    const anchors = encodeSuggestionAnchors(editor, pair.doc, scope.from, scope.to);
+    if (!anchors) {
+      notify("error", "Couldn't suggest a change here.");
+      return;
+    }
+    setPendingSuggestion({
+      kind: scope.kind,
+      positionY: anchors.start,
+      positionYEnd: anchors.end,
+      originalText: scope.text,
+      contextBefore: scope.contextBefore,
+    });
+    openCommentSidebar("suggestions");
+    setAddCommentPos(null);
+  }
+
   return (
     <>
       <PresenceBar presence={presence} />
@@ -462,6 +602,7 @@ function EditorBody({
           editor={editor}
           docId={docId}
           onUploadFiles={(files) => { void uploadAndInsert(files); }}
+          onSuggest={canComment ? startSuggestion : undefined}
           trailing={toolbarTrailing}
           trailingVisible={toolbarTrailingVisible}
         />
@@ -470,22 +611,48 @@ function EditorBody({
         data-testid="editor-host"
         className="relative"
       >
-        {/* Floating "Add comment" button */}
+        {/* Floating "Add comment" and "Suggest change" buttons */}
         {canComment && addCommentPos && (
-          <button
-            type="button"
-            data-testid="add-comment-float"
-            onClick={handleAddComment}
-            className="absolute z-20 bg-accent text-accent-fg border-none rounded px-2 py-0.5 text-[12px] font-medium cursor-pointer shadow-md hover:opacity-90 transition-opacity"
+          <div
+            className="absolute z-20 flex items-center gap-1"
             style={{ top: addCommentPos.top, left: addCommentPos.left }}
           >
-            Add comment
-          </button>
+            <button
+              type="button"
+              data-testid="add-comment-float"
+              onClick={handleAddComment}
+              className="bg-accent text-accent-fg border-none rounded px-2 py-0.5 text-[12px] font-medium cursor-pointer shadow-md hover:opacity-90 transition-opacity"
+            >
+              Add comment
+            </button>
+            <button
+              type="button"
+              data-testid="suggest-change-float"
+              onClick={startSuggestion}
+              disabled={!selectionScope?.ok}
+              title={selectionScope && !selectionScope.ok ? SCOPE_TOOLTIP[selectionScope.reason] : undefined}
+              className="bg-surface text-fg border border-border rounded px-2 py-0.5 text-[12px] font-medium cursor-pointer shadow-md hover:bg-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Suggest change
+            </button>
+          </div>
         )}
         <EditorContent editor={editor} />
       </div>
     </>
   );
+}
+
+/** True when two live-state maps hold the same entries, so an update that
+ *  changed nothing a card shows does not re-render the sidebar. */
+function sameLive(a: Record<string, SuggestionLive>, b: Record<string, SuggestionLive>): boolean {
+  const keys = Object.keys(b);
+  if (Object.keys(a).length !== keys.length) return false;
+  return keys.every((k) => {
+    const x = a[k];
+    const y = b[k];
+    return x !== undefined && y !== undefined && x.state === y.state && x.currentText === y.currentText && x.from === y.from;
+  });
 }
 
 type Peer = { name: string; color: string };

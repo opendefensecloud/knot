@@ -2,7 +2,14 @@ import { apiFetch, type ApiResult } from "./api";
 
 export type Notification = {
   id: number;
-  kind: "mention" | "reply" | "task_assigned" | "task_due" | "doc_shared";
+  kind:
+    | "mention"
+    | "reply"
+    | "task_assigned"
+    | "task_due"
+    | "doc_shared"
+    | "suggestion"
+    | "suggestion_decided";
   doc_id: string | null;
   doc_title: string | null;
   target_kind: string;

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 
+import type { SuggestionLive } from "../features/suggestions/liveState";
 import type { LatLon } from "../lib/sun";
 import {
   SKIN_KEYS,
@@ -24,6 +25,19 @@ export type PendingAnchor = {
   positionY: string;
   positionYEnd: string;
   anchorText: string;
+};
+
+/** The comment sidebar's two tabs. */
+export type SidebarTab = "comments" | "suggestions";
+
+/** The selection a suggestion composer is open for: the anchors as encoded
+ *  when "Suggest change" was clicked, and the text they held then. */
+export type PendingSuggestion = {
+  kind: "replace" | "insert";
+  positionY: string;
+  positionYEnd: string;
+  originalText: string;
+  contextBefore: string;
 };
 
 /** The light/dark axis. Derived from the active skin; never set directly. */
@@ -69,7 +83,9 @@ type UiState = {
   togglePalette: () => void;
   // Comment sidebar
   commentSidebarOpen: boolean;
-  openCommentSidebar: () => void;
+  /** Opens the sidebar on `tab`, Comments unless told otherwise. A button
+   *  that should keep the last tab passes the current `sidebarTab`. */
+  openCommentSidebar: (tab?: SidebarTab) => void;
   closeCommentSidebar: () => void;
   pendingAnchor: PendingAnchor | null;
   setPendingAnchor: (a: PendingAnchor) => void;
@@ -83,6 +99,34 @@ type UiState = {
   // that is where the thread is.
   threadLink: { threadId: string } | null;
   openThreadLink: (threadId: string) => void;
+  // Which tab the sidebar shows. Global, so every comment entry point
+  // switches it back to "comments" (see openCommentSidebar).
+  sidebarTab: SidebarTab;
+  setSidebarTab: (t: SidebarTab) => void;
+  // The open suggestion composer's target; also drawn as the draft range.
+  // Only lives while the Suggestions tab shows: leaving the tab or closing
+  // the sidebar drops it, so no draft highlight stays without its composer.
+  // The focused card and the last link go the same way (LEFT_SUGGESTIONS).
+  pendingSuggestion: PendingSuggestion | null;
+  setPendingSuggestion: (p: PendingSuggestion) => void;
+  clearPendingSuggestion: () => void;
+  // The focused suggestion card — its highlight is emphasised in the page.
+  activeSuggestionId: string | null;
+  setActiveSuggestionId: (id: string | null) => void;
+  /** Drops the focused card and the last link (see LEFT_SUGGESTIONS). */
+  clearSuggestionFocus: () => void;
+  // The suggestion a link (a notification's `?suggestion=`) last opened, a
+  // new object per visit, like `threadLink`. A click on a highlight only
+  // focuses its card (setActiveSuggestionId).
+  suggestionLink: { suggestionId: string } | null;
+  /** Opens the sidebar on the Suggestions tab with `id` active. */
+  openSuggestionLink: (id: string) => void;
+  // Each pending suggestion's state in the live document, by id, as
+  // KnotEditor last classified it. Missing ids are unknown (e.g. the
+  // Markdown view, where no editor runs). Replaced whole, but an entry that
+  // reads the same keeps its object, so a card's selector stays stable.
+  suggestionLive: Record<string, SuggestionLive>;
+  setSuggestionLive: (m: Record<string, SuggestionLive>) => void;
   // Skin — the palette + typography set. `skin` is the one showing and
   // `theme` its light/dark scheme, kept in the store so consumers can
   // branch on it cheaply. `skinMode` says which skin shows: `manualSkin`,
@@ -234,6 +278,12 @@ function withSkinShowing(s: UiState, change: Partial<SkinPrefsState>): Partial<U
 const initialSkinPrefs = readSkinPrefs();
 const initialSkin = currentSkin(initialSkinPrefs);
 
+/** What leaving the Suggestions tab (or the sidebar) drops: the composer's
+ *  draft, the focused card and the last `?suggestion=` link. Kept, the active
+ *  id would scroll the page back to an old highlight and the link open
+ *  Resolved again the next time the tab shows. */
+const LEFT_SUGGESTIONS = { pendingSuggestion: null, activeSuggestionId: null, suggestionLink: null } as const;
+
 export const useUi = create<UiState>((set, get) => ({
   sidebarOpen: true,
   toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
@@ -246,8 +296,13 @@ export const useUi = create<UiState>((set, get) => ({
   closePalette: () => set({ paletteOpen: false }),
   togglePalette: () => set((s) => ({ paletteOpen: !s.paletteOpen })),
   commentSidebarOpen: false,
-  openCommentSidebar: () => set({ commentSidebarOpen: true }),
-  closeCommentSidebar: () => set({ commentSidebarOpen: false }),
+  openCommentSidebar: (tab = "comments") =>
+    set(
+      tab === "suggestions"
+        ? { commentSidebarOpen: true, sidebarTab: tab }
+        : { commentSidebarOpen: true, sidebarTab: tab, ...LEFT_SUGGESTIONS },
+    ),
+  closeCommentSidebar: () => set({ commentSidebarOpen: false, ...LEFT_SUGGESTIONS }),
   pendingAnchor: null,
   setPendingAnchor: (a) => set({ pendingAnchor: a }),
   clearPendingAnchor: () => set({ pendingAnchor: null }),
@@ -255,7 +310,41 @@ export const useUi = create<UiState>((set, get) => ({
   setActiveCommentId: (id) => set({ activeCommentId: id }),
   threadLink: null,
   openThreadLink: (threadId) =>
-    set({ commentSidebarOpen: true, activeCommentId: threadId, threadLink: { threadId } }),
+    set({
+      commentSidebarOpen: true,
+      sidebarTab: "comments",
+      activeCommentId: threadId,
+      threadLink: { threadId },
+      ...LEFT_SUGGESTIONS,
+    }),
+  sidebarTab: "comments",
+  setSidebarTab: (t) => set(t === "suggestions" ? { sidebarTab: t } : { sidebarTab: t, ...LEFT_SUGGESTIONS }),
+  pendingSuggestion: null,
+  setPendingSuggestion: (p) => set({ pendingSuggestion: p }),
+  clearPendingSuggestion: () => set({ pendingSuggestion: null }),
+  activeSuggestionId: null,
+  setActiveSuggestionId: (id) => set({ activeSuggestionId: id }),
+  clearSuggestionFocus: () => set({ activeSuggestionId: null, suggestionLink: null }),
+  suggestionLink: null,
+  openSuggestionLink: (id) =>
+    set({
+      commentSidebarOpen: true,
+      sidebarTab: "suggestions",
+      activeSuggestionId: id,
+      suggestionLink: { suggestionId: id },
+    }),
+  suggestionLive: {},
+  setSuggestionLive: (m) =>
+    set((s) => {
+      const prev = s.suggestionLive;
+      const next: Record<string, SuggestionLive> = {};
+      for (const [id, v] of Object.entries(m)) {
+        const old = prev[id];
+        next[id] =
+          old && old.state === v.state && old.currentText === v.currentText && old.from === v.from ? old : v;
+      }
+      return { suggestionLive: next };
+    }),
   skin: initialSkin,
   theme: schemeOf(initialSkin),
   ...stateOf(initialSkinPrefs),

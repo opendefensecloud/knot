@@ -305,6 +305,37 @@ async fn writes_to_archived_doc_are_rejected() {
             json!({"body": "hi", "anchor": null}),
         ),
         (
+            &editor,
+            "POST",
+            format!("/api/docs/{doc}/suggestions"),
+            json!({
+                "kind": "insert",
+                "position_y": "AA==",
+                "position_y_end": "AA==",
+                "original_text": "",
+                "context_before": "",
+                "proposed_text": "late",
+            }),
+        ),
+        (
+            owner,
+            "POST",
+            format!("/api/docs/{doc}/suggestions/{}/reject", Uuid::new_v4()),
+            json!({}),
+        ),
+        (
+            &editor,
+            "POST",
+            format!("/api/docs/{doc}/suggestions/{}/withdraw", Uuid::new_v4()),
+            json!({}),
+        ),
+        (
+            owner,
+            "POST",
+            format!("/api/docs/{doc}/suggestions/{}/accept", Uuid::new_v4()),
+            json!({"seen_text": ""}),
+        ),
+        (
             owner,
             "POST",
             format!("/api/docs/{doc}/template"),

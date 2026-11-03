@@ -18,6 +18,7 @@ import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import * as Y from "yjs";
 
 import { decodeAnchorRange } from "../comments/anchor";
+import { highlightAt } from "./highlightClick";
 
 export type HighlightedComment = {
   id: string;
@@ -99,14 +100,12 @@ export const CommentsHighlightExtension = Extension.create<CommentsHighlightOpti
         },
         props: {
           decorations: (state) => PLUGIN_KEY.getState(state) ?? DecorationSet.empty,
-          handleClickOn: (_view, _pos, _node, _nodePos, event) => {
-            const target = event.target as HTMLElement | null;
-            if (!target) return false;
-            const span = target.closest<HTMLElement>("[data-comment-id]");
-            if (!span) return false;
-            const id = span.dataset.commentId;
-            if (!id) return false;
-            storage.onSelect?.(id);
+          handleClickOn: (view, _pos, _node, _nodePos, event) => {
+            // Shared with the suggestion highlights, so a click on text under
+            // both goes to the more specific one; see highlightClick.
+            const hit = highlightAt(view.dom, event.target);
+            if (hit?.kind !== "comment") return false;
+            storage.onSelect?.(hit.id);
             return true;
           },
         },

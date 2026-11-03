@@ -19,6 +19,7 @@ import {
   ListChecks,
   ListOrdered,
   Lock,
+  MessageSquarePlus,
   Paperclip,
   Rows3,
   Table as TableIcon,
@@ -31,23 +32,26 @@ import {
 
 import { boardsApi } from "../../lib/boards.api";
 import { useUi } from "../../stores/ui";
+import { SCOPE_TOOLTIP, suggestionScope } from "../suggestions/scope";
 import { applyLinkUrl, toolbarLinkState } from "./toolbarLink";
 
 type ToolbarBtnProps = {
   testId: string;
   label: string;
+  /** The hover tooltip, `label` by default; e.g. why the button is disabled. */
+  title?: string;
   active?: boolean;
   disabled?: boolean;
   onClick: () => void;
   children: ReactNode;
 };
 
-function Btn({ testId, label, active, disabled, onClick, children }: ToolbarBtnProps) {
+function Btn({ testId, label, title, active, disabled, onClick, children }: ToolbarBtnProps) {
   return (
     <button
       type="button"
       data-testid={testId}
-      title={label}
+      title={title ?? label}
       aria-label={label}
       aria-pressed={active}
       disabled={disabled}
@@ -67,12 +71,16 @@ export function EditorToolbar({
   editor,
   docId,
   onUploadFiles,
+  onSuggest,
   trailing,
   trailingVisible = true,
 }: {
   editor: Editor | null;
   docId: string;
   onUploadFiles?: (files: File[]) => void;
+  /** Opens the suggestion composer for an insertion at the caret. Without
+   *  it the "Suggest an insertion" button is disabled. */
+  onSuggest?: () => void;
   /** Document controls (Edit, Comments) shown at the row's end once the
    *  header's action row has scrolled away. */
   trailing?: ReactNode;
@@ -116,6 +124,11 @@ export function EditorToolbar({
 
   if (!editor) return null;
   const c = () => editor.chain().focus();
+  // Insertions need a caret; a selection is a replace, offered by the
+  // selection float instead. Only a refusal has a reason worth a tooltip.
+  const scope = suggestionScope(editor.state);
+  const canSuggest = Boolean(onSuggest) && scope.ok && scope.kind === "insert";
+  const suggestTitle = onSuggest && !scope.ok ? SCOPE_TOOLTIP[scope.reason] : undefined;
 
   return (
     // The band spans the full shell so wide content scrolling under it is
@@ -131,7 +144,9 @@ export function EditorToolbar({
       data-sticky-band
       className="sticky top-0 z-10 py-2 mb-4 bg-bg/80 backdrop-blur border-b border-border"
     >
-      <div className="measure relative flex items-center gap-0.5 flex-wrap max-sm:pl-7">
+      {/* No gap between the buttons: at the default width the whole set,
+          with the room kept for the doc controls, fits one row only so. */}
+      <div className="measure relative flex items-center flex-wrap max-sm:pl-7">
         <Btn testId="toolbar-bold" label="Bold" active={editor.isActive("bold")}
           onClick={() => c().toggleBold().run()}>
           <Bold size={15} aria-hidden />
@@ -310,6 +325,15 @@ export function EditorToolbar({
           }}
         >
           <PenSquare size={15} aria-hidden />
+        </Btn>
+        <Btn
+          testId="toolbar-suggest"
+          label="Suggest an insertion"
+          title={suggestTitle}
+          disabled={!canSuggest}
+          onClick={() => onSuggest?.()}
+        >
+          <MessageSquarePlus size={15} aria-hidden />
         </Btn>
         <Sep />
         <Btn

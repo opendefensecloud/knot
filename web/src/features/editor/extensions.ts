@@ -15,6 +15,7 @@ import { Attachment } from "./nodes/AttachmentNode";
 import { ExcalidrawBoard } from "./nodes/ExcalidrawBoard";
 import { MermaidCodeBlock } from "./nodes/MermaidCodeBlock";
 import { CommentsHighlightExtension } from "./CommentsHighlightExtension";
+import { SuggestionsHighlightExtension } from "./SuggestionsHighlightExtension";
 import {
   KnotBulletList,
   KnotHardBreak,
@@ -268,6 +269,7 @@ export function createExtensions(opts: {
   awareness: Awareness;
   user: { name: string; color: string };
   onSelectComment?: (commentId: string) => void;
+  onSelectSuggestion?: (id: string) => void;
   navigate?: NavigateFunction;
   fetchMembers?: () => Promise<MentionMember[]>;
 }) {
@@ -338,6 +340,13 @@ export function createExtensions(opts: {
       comments: [],
       activeCommentId: null,
       onSelect: opts.onSelectComment ?? (() => {}),
+    }),
+    SuggestionsHighlightExtension.configure({
+      doc: opts.doc,
+      suggestions: [],
+      activeSuggestionId: null,
+      draft: null,
+      onSelect: opts.onSelectSuggestion ?? (() => {}),
     }),
   ];
 }

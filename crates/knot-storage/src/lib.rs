@@ -18,6 +18,7 @@ pub mod search;
 pub mod session_store;
 pub mod share_tokens;
 pub mod snapshot_store;
+pub mod suggestions;
 pub mod tasks;
 pub mod updates_store;
 pub mod user_store;
@@ -46,6 +47,10 @@ pub use session_store::{PgSessionStore, Session, SessionStore, SessionStoreError
 pub use share_tokens::{PgShareTokenStore, ShareStoreError, ShareToken, ShareTokenStore};
 pub use snapshot_store::{
     DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStore, SnapshotStoreError,
+};
+pub use suggestions::{
+    NewSuggestion, PgSuggestionStore, Suggestion, SuggestionKind, SuggestionReply,
+    SuggestionStatus, SuggestionStore, SuggestionStoreError,
 };
 pub use tasks::{
     AssignedTask, DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError, TaskWrite,

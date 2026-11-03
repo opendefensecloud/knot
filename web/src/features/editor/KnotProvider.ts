@@ -23,7 +23,10 @@ export type ProviderStatus =
   | "conflict"
   | "refused";
 
-export type CommentChangeMsg = { doc_id: string };
+/** Payload of a MSG_COMMENTS frame. Suggestion and suggestion-reply
+ *  mutations reuse the same frame with `topic: "suggestions"`; without a
+ *  topic the change is to comments. */
+export type CommentChangeMsg = { doc_id: string; topic?: "suggestions" };
 
 export type ProviderEvents = {
   status: (s: ProviderStatus) => void;

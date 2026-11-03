@@ -49,6 +49,8 @@ async fn migrations_apply_cleanly() {
         "notifications",
         "sessions",
         "share_tokens",
+        "suggestion_replies",
+        "suggestions",
         "users",
         "workspace_members",
         "workspaces",

@@ -47,6 +47,26 @@ describe("notificationText", () => {
     const n = base({ kind: "task_assigned", actor_display_name: "Alice" });
     expect(notificationText(n)).toEqual({ actor: "Alice", label: "assigned you a task" });
   });
+
+  it("labels a suggestion with and without an actor", () => {
+    expect(notificationText(base({ kind: "suggestion", actor_display_name: "Alice" }))).toEqual({
+      actor: "Alice",
+      label: "suggested a change",
+    });
+    expect(notificationText(base({ kind: "suggestion", actor_display_name: null }))).toEqual({
+      actor: null,
+      label: "New suggestion on your page",
+    });
+  });
+
+  it("labels a suggestion decision with and without an actor", () => {
+    expect(
+      notificationText(base({ kind: "suggestion_decided", actor_display_name: "Bob" })),
+    ).toEqual({ actor: "Bob", label: "reviewed your suggestion" });
+    expect(
+      notificationText(base({ kind: "suggestion_decided", actor_display_name: null })),
+    ).toEqual({ actor: null, label: "Your suggestion was reviewed" });
+  });
 });
 
 describe("targetPath", () => {
@@ -62,5 +82,28 @@ describe("targetPath", () => {
   it("links straight to the doc with no thread_id", () => {
     const n = base({ doc_id: "d1", data: {} });
     expect(targetPath(n)).toBe("/doc/d1");
+  });
+
+  // A suggestion reply carries both ids; the suggestion deep link wins so
+  // DocPage opens the Suggestions tab rather than looking for a comment thread.
+  it("targetPath_prefers_suggestion_id", () => {
+    const n = base({
+      kind: "reply",
+      doc_id: "d1",
+      target_kind: "suggestion",
+      target_id: "s1",
+      data: { suggestion_id: "s1", thread_id: "t1" },
+    });
+    expect(targetPath(n)).toBe("/doc/d1?suggestion=s1");
+  });
+
+  it("links a suggestion notification to its card", () => {
+    const n = base({ kind: "suggestion", doc_id: "d1", data: { suggestion_id: "s1" } });
+    expect(targetPath(n)).toBe("/doc/d1?suggestion=s1");
+  });
+
+  it("ignores a non-string suggestion_id and falls back to the thread", () => {
+    const n = base({ doc_id: "d1", data: { suggestion_id: 7, thread_id: "t1" } });
+    expect(targetPath(n)).toBe("/doc/d1?thread=t1");
   });
 });

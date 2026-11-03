@@ -286,6 +286,10 @@ async fn run_server(cfg: Config) {
         let _handle = knot_server::notifications_sweep::spawn(pool);
         tracing::info!("notification sweep spawned");
     }
+    if state.rooms_v2.is_some() {
+        let _handle = knot_server::suggestions_sweep::spawn(state.clone());
+        tracing::info!("suggestion sweep spawned");
+    }
 
     // Token shared with every collab socket; cancelled on SIGTERM so they
     // send a clean 1001 Close and drain instead of being severed mid-rollout.
