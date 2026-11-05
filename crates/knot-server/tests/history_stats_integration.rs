@@ -53,6 +53,7 @@ async fn history_stats_reports_rows_bytes_and_daily_rates() {
     seed_updates(pool, a, 2, 10, 1).await;
     seed_updates(pool, b, 1, 40, 0).await;
     // Outside the 30 day window: counts in the totals, not in the daily rates.
+    // So p50/p95/max stay 2.0/3.8/4: the in-window groups are still 4, 2 and 1.
     seed_updates(pool, b, 1, 20, 40).await;
     sqlx::query(
         "INSERT INTO doc_history_baselines (doc_id, snapshot_seq, state_bytes, state_vector, created_at)

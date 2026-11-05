@@ -115,15 +115,15 @@ pub async fn run(cfg: knot_config::Config, days: i32) -> anyhow::Result<()> {
         human(s.update_bytes_avg)
     );
     println!(
-        "rows_per_page_day_p50 (last {days}d): {:.1}",
+        "rows_per_page_day_p50: {:.1} (last {days}d)",
         s.rows_per_page_day_p50
     );
     println!(
-        "rows_per_page_day_p95 (last {days}d): {:.1}",
+        "rows_per_page_day_p95: {:.1} (last {days}d)",
         s.rows_per_page_day_p95
     );
     println!(
-        "rows_per_page_day_max (last {days}d): {}",
+        "rows_per_page_day_max: {} (last {days}d)",
         s.rows_per_page_day_max
     );
     println!("pages_with_updates: {}", s.pages_with_updates);
