@@ -4,7 +4,7 @@
 **Implements:** [2026-11-04-page-history-design.md](2026-11-04-page-history-design.md)
 **How it was made:** three independent proposals (simplest, CRDT-native, risk-first), each checked against the yrs 0.27.3 / @tiptap/y-tiptap 3.0.9 sources, scored by three judges (CRDT correctness, operations and security, implementability), then merged from the top-scoring proposal with every fatal flaw removed. File references are as of `7e1de9d`.
 
-**Deviations recorded in the M1.1 plan:** the `knot_replicas` heartbeat moves from M1.1 to M3 (erase), the only milestone that reads it; the `knot_history_table_bytes` gauge moves to M1.3 with the other history metrics; the append-only trigger and its function are both named `doc_updates_append_only`.
+**Deviations recorded in the M1.1 plan:** the `knot_replicas` heartbeat moves from M1.1 to M3 (erase), the only milestone that reads it; the `knot_history_table_bytes` gauge moves to M1.3 with the other history metrics; the append-only trigger and its function are both named `doc_updates_append_only`. M1.1's trigger is `BEFORE DELETE OR UPDATE OF update_bytes, doc_id` (no `rev`, which doesn't exist yet), and it allows a DELETE only at `pg_trigger_depth() > 1` (no NOT EXISTS arm; see storage_model). The M1.1 migration locks `documents` (SHARE ROW EXCLUSIVE) before it touches `doc_updates`, the app's lock order, so a duplicate or purge started during the copy waits instead of deadlocking (see baseline).
 
 
 ## Summary
@@ -18,9 +18,9 @@ The doc_updates log is the single source of truth. It is append-only and kept fo
 
 EXISTING TABLES
 doc_updates (migrations/20260602000001_v0_1_schema.sql:92-99), kept forever.
-- M1.1 trigger doc_updates_append_only: BEFORE DELETE OR UPDATE OF update_bytes, doc_id, rev, FOR EACH ROW. It allows:
-  (a) a DELETE when NOT EXISTS (SELECT 1 FROM documents WHERE id = OLD.doc_id) OR pg_trigger_depth() > 1, which is the purge FK cascade;
-  (b) an UPDATE that only sets rev where OLD.rev IS NULL (legacy numbering);
+- M1.1 trigger doc_updates_append_only (migrations/20261104120000_history_keep_updates.sql): BEFORE DELETE OR UPDATE OF update_bytes, doc_id, FOR EACH ROW. rev doesn't exist until M1.2. It allows:
+  (a) a DELETE at pg_trigger_depth() > 1, which is the purge FK cascade: every cascade runs inside RI_FKey_cascade_del, while a top-level DELETE has depth 1. There is no NOT EXISTS (parent) arm;
+  (b) from M1.2 only: an UPDATE that only sets rev where OLD.rev IS NULL (legacy numbering). M1.2 adds this rule to the function and re-creates the trigger with UPDATE OF update_bytes, doc_id, rev (see milestones);
   (c) anything when current_setting('knot.history_rewrite', true) = 'on'. Only the erase transaction and a future compaction set this, with SET LOCAL.
   Everything else raises SQLSTATE 'KH001'. It raises rather than silently skipping, so a missed delete path fails loudly. gc.rs:38-48 already logs and continues on error, so old replicas' hourly GC fails harmlessly from the moment the migration commits.
 - M1.2 columns:
@@ -47,7 +47,7 @@ users: M4 adds history_anonymized_at timestamptz NULL.
 NEW TABLES
 1. doc_history_baselines (M1.1): id bigserial PK, doc_id, snapshot_seq, state_bytes, state_vector, created_at, redacted_at NULL. The migration fills it with INSERT … SELECT FROM doc_snapshots. Only an erase changes it afterwards, rewriting it in place.
 
-2. knot_replicas (M1.1): replica_id uuid PK, version text, feature_level int, seen_at. Each replica upserts it every 60 s. Erase is refused unless every replica seen in the last 3 min reports feature_level >= ERASE_FENCE.
+2. knot_replicas (M3; planned for M1.1, see the deviation note at the top): replica_id uuid PK, version text, feature_level int, seen_at. Each replica upserts it every 60 s. Erase is refused unless every replica seen in the last 3 min reports feature_level >= ERASE_FENCE.
 
 3. doc_history_heads (M1.2): doc_id PK, head_rev bigint NOT NULL DEFAULT 0, legacy_rows bigint NOT NULL DEFAULT 0, content_epoch int NOT NULL DEFAULT 0, dirty bool NOT NULL DEFAULT true, last_write_at timestamptz. Partial index (last_write_at) WHERE dirty.
    The M1.2 migration must run its statements in this order inside one transaction:
@@ -484,10 +484,12 @@ Exact times, content, the comments and suggestions they wrote, suggestions.decid
 
 ## baseline
 
-M1.1, in one migration (the Helm pre-upgrade hook). The statement order matters:
-1. Create the doc_updates append-only trigger. From then on, old replicas' GC deletes raise KH001. The trigger comes first so its lock is taken early.
-2. Add documents.history_since with DEFAULT now(). Existing pages get this transaction's time and new pages get their creation time.
-3. Create doc_history_baselines and copy every doc_snapshots row into it with INSERT … SELECT. At most 5 plus 1/day for 30 days per page survive today's GC.
+M1.1, in one migration (the Helm pre-upgrade hook). The statement order matters (as shipped):
+1. SET LOCAL lock_timeout = '5s', so a blocked lock request fails and the Job retries instead of queueing the server behind it.
+2. LOCK TABLE documents IN SHARE ROW EXCLUSIVE MODE. The app takes documents before doc_updates (Duplicate inserts into documents, then doc_updates; a purge deletes from documents and cascades into doc_updates); locking doc_updates first deadlocked with either one started during the copy. Readers and FK checks pass; page creates, renames, moves, duplicates and purges wait until COMMIT.
+3. Create the doc_updates append-only trigger. From then on, old replicas' GC deletes raise KH001. It comes before the copy, so no delete lands between the copy and COMMIT; it blocks edit saves until COMMIT.
+4. Create doc_history_baselines and copy every doc_snapshots row into it with INSERT … SELECT, then add its FK. At most 5 plus 1/day for 30 days per page survive today's GC.
+5. Add documents.history_since with DEFAULT now() (ACCESS EXCLUSIVE, so last). Existing pages get this transaction's time and new pages get their creation time.
 
 Why this loses nothing that still exists:
 - GC never deleted rows after a page's latest snapshot. The latest baseline plus all later rows is therefore complete.
@@ -562,13 +564,14 @@ Timeline:
   - the raising append-only trigger on doc_updates (KH001; the FK cascade and knot.history_rewrite are allowed);
   - documents.history_since DEFAULT now();
   - doc_history_baselines, filled from doc_snapshots;
-  - knot_replicas, with the heartbeat task.
+  - knot_replicas, with the heartbeat task (moved to M3; see the deviation note at the top).
 - gc.rs stops deleting doc_updates (UpdatesStore::delete_up_to is removed) and runs under pg_try_advisory_lock. Snapshot thinning is unchanged, so today's drawer still works.
 - Ops: knot_history_table_bytes gauge, the `knot-server history-stats` CLI, the e2e reset list, and the migrations test (a direct DELETE raises; purge still cascades).
 - Old replicas' deletes fail from the moment the migration commits. No UI change.
 - **M1.2 Complete, ordered, labelled log** (backend only).
 - Schema:
   - doc_history_heads, created and seeded in trigger-first order;
+  - after ADD COLUMN rev, re-create the append-only trigger, not only its function: `CREATE OR REPLACE FUNCTION doc_updates_append_only()` with rule (b), and `CREATE OR REPLACE TRIGGER doc_updates_append_only BEFORE DELETE OR UPDATE OF update_bytes, doc_id, rev ON doc_updates FOR EACH ROW ...`. M1.1's trigger lists no rev column, so a function-only replacement never fires on UPDATE OF rev;
   - the doc_updates_assign_rev trigger for old-replica rows;
   - rev, source, meta and epoch columns on doc_updates;
   - the UNIQUE (doc_id, rev) index, built CONCURRENTLY in a no-transaction migration;
@@ -611,6 +614,8 @@ Timeline:
 - Remove the Markdown restore, preview and seq-list routes; update e2e/flows/history.spec.ts.
 - Property tests for the revert.
 - **M3 Erase from history.** Requires every replica to report ERASE_FENCE.
+- knot_replicas and its heartbeat task (moved here from M1.1). Replicas older than M3 never write a heartbeat, so the "every replica seen in the last 3 min" guard cannot see them, and the erase fence must not rely on it alone. For example, refuse erase until knot_replicas has shown only feature_level >= ERASE_FENCE for longer than a rolling upgrade plus the maximum pod termination grace can take, so every pre-M3 pod is gone.
+- Set knot.history_rewrite only with `SET LOCAL` or `set_config('knot.history_rewrite', 'on', true)`, never session-wide: pooled connections are reused, and a session-wide flag would let the next pool user rewrite history. Test that the flag does not reach the next user of the same pooled connection (M1.1 pins this for SET LOCAL in migrations_apply.rs).
 - The matcher, the preview endpoint and the dialog: counts, the short-text warning, the open-elsewhere warning, and the sentence on what is not reached.
 - The async erase job: heartbeat and sweeper; Phase A re-derivation with verification; Phase B as one fenced transaction under knot.history_rewrite.
 - Side-table redaction, including excerpt edges and JSON string leaves; markdown cache and search regeneration; the erase entry; audit.
