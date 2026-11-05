@@ -11,18 +11,21 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ### Upgrading
 - Two database migrations run on upgrade, each in its own transaction
   (the Helm chart's migrate hook applies them). Don't upgrade while
-  `pg_dump` or another long transaction runs on the database. Rolling
-  back to 0.9.8 needs a database restore: 0.9.8 doesn't start on a
-  database with migrations it doesn't know. Once the first migration has
-  committed, a 0.9.8 pod that restarts crash-loops until a new pod
-  replaces it. No new pod comes when the upgrade halts after the first
-  migration: when Helm's hook timeout fires while the migrate Job keeps
-  running and commits, or when the second migration gives up on every Job
-  attempt. Then
+  `pg_dump`, another long transaction or an anti-wraparound autovacuum
+  runs on the database; an ordinary autovacuum in the way is cancelled.
+  Pass `helm upgrade --timeout` of the expected copy time plus 5 minutes:
+  each migration may spend up to 45 s getting its locks, on each of up to
+  4 Job attempts. Rolling back to 0.9.8 needs a database restore once
+  either migration has committed: 0.9.8 doesn't start on a database with
+  migrations it doesn't know, so a 0.9.8 pod that restarts crash-loops
+  until a new pod replaces it. If the upgrade halts,
   `SELECT version FROM _sqlx_migrations WHERE version >= 20261104120000`
-  shows only 20261104120000. The running 0.9.8 pods keep serving, but
-  let a still-running migrate Job finish, end the long transaction and
-  re-run the upgrade promptly (see the Helm chart README).
+  says what to do. No rows: nothing was applied and 0.9.8 keeps working;
+  re-run at a quieter time. Only 20261104120000: running 0.9.8 pods keep
+  serving, but re-run promptly once the blocker is gone. Both (Helm's
+  hook timeout fired while the Job went on): re-run now. Let a running
+  migrate Job finish first. The Helm chart README has the details and a
+  query that shows what holds the locks.
   - `20261104120000_history_keep_updates` makes the stored edit log
     append-only and copies every stored snapshot into
     `doc_history_baselines`. Check
@@ -35,10 +38,9 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
     instance the waiting saves can fill each old pod's database pool, so
     pages may stop loading and pods may briefly go NotReady until the
     copy finishes. Upgrade in a quiet window when `doc_snapshots` is
-    larger than a few hundred MB, and pass `helm upgrade --timeout` above
-    the expected copy time. Don't re-run the upgrade while the migrate
-    Job is still running: that deletes the running Job and starts the
-    copy over. Before the copy it takes its locks in attempts 0.5 s
+    larger than a few hundred MB. Don't re-run the upgrade while the
+    migrate Job is still running: that deletes the running Job and starts
+    the copy over. Before the copy it takes its locks in attempts 0.5 s
     apart, for up to 45 s per Job attempt; each attempt pauses page
     writes for at most 100 ms.
   - `20261104120001_history_since` adds `documents.history_since`. It
