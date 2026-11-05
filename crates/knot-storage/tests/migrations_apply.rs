@@ -1142,6 +1142,54 @@ async fn flagged_history_rewrite_is_allowed() {
     assert!(kh001(e));
 }
 
+/// The erase path (a later milestone) deletes single rows under the flag.
+/// Pooled connections are reused, so a committed flag must not outlive its
+/// transaction on that connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn flagged_history_rewrite_allows_delete_and_does_not_leak() {
+    let (pool, _, doc) = history_fixture().await;
+    let seqs: Vec<i64> =
+        sqlx::query_scalar("SELECT seq FROM doc_updates WHERE doc_id = $1 ORDER BY seq")
+            .bind(doc)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(seqs.len(), 2);
+
+    let mut conn = pool.acquire().await.unwrap();
+    let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    let mut tx = sqlx::Connection::begin(&mut *conn).await.unwrap();
+    sqlx::query("SET LOCAL knot.history_rewrite = 'on'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let done = sqlx::query("DELETE FROM doc_updates WHERE seq = $1")
+        .bind(seqs[0])
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(done.rows_affected(), 1);
+    tx.commit().await.unwrap();
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 1);
+
+    // Same pooled connection, same backend, after COMMIT: the flag is gone.
+    let again: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(again, backend);
+    let e = sqlx::query("DELETE FROM doc_updates WHERE seq = $1")
+        .bind(seqs[1])
+        .execute(&mut *conn)
+        .await
+        .unwrap_err();
+    assert!(kh001(e));
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 1);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn purge_cascade_through_subpages_still_deletes_updates() {
     let pool = knot_test_support::fresh_db().await.pool;
