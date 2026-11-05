@@ -24,3 +24,6 @@ Cargo.lock.bak
 .env
 .env.local
 *.tsbuildinfo
+
+# superpowers scratch (brainstorm companion, SDD ledgers)
+.superpowers/
