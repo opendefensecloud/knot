@@ -9,26 +9,33 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ## [Unreleased]
 
 ### Upgrading
-- One database migration runs on upgrade (the Helm chart's migrate hook
-  applies it). Rolling back to 0.9.8 needs a database restore: 0.9.8
-  doesn't start on a database with migrations it doesn't know. That
-  includes a 0.9.8 pod that restarts during the rolling upgrade after the
-  migration has committed: it crash-loops until a new pod replaces it.
+- Two database migrations run on upgrade, each in its own transaction
+  (the Helm chart's migrate hook applies them). Rolling back to 0.9.8
+  needs a database restore: 0.9.8 doesn't start on a database with
+  migrations it doesn't know. That includes a 0.9.8 pod that restarts
+  during the rolling upgrade after the first migration has committed: it
+  crash-loops until a new pod replaces it.
   - `20261104120000_history_keep_updates` makes the stored edit log
-    append-only, adds `documents.history_since` and copies every stored
-    snapshot into `doc_history_baselines`. Check
+    append-only and copies every stored snapshot into
+    `doc_history_baselines`. Check
     `SELECT pg_size_pretty(pg_total_relation_size('doc_snapshots'))`
     beforehand: the copy takes about as long as reading and writing that
     much data (some 261 MB took 0.87 s on a local SSD; network disks are
-    slower). During the copy, saving edits and creating, renaming,
-    moving or purging pages wait. On a busy instance the waiting saves
-    can fill each old pod's database pool, so pages may stop loading and
-    pods may briefly go NotReady until the copy finishes. Upgrade in a
-    quiet window when `doc_snapshots` is larger than a few hundred MB, and
-    pass `helm upgrade --timeout` above the expected copy time. Don't
-    re-run the upgrade while the migrate Job is still running: that
-    deletes the running Job and starts the copy over. The migration gives
-    up after waiting 5 s for a lock, and the upgrade can simply be re-run.
+    slower). During the copy, saving edits waits, and so do creating,
+    renaming, moving, archiving, restoring, duplicating and purging
+    pages, making a page a template and restricting a page. On a busy
+    instance the waiting saves can fill each old pod's database pool, so
+    pages may stop loading and pods may briefly go NotReady until the
+    copy finishes. Upgrade in a quiet window when `doc_snapshots` is
+    larger than a few hundred MB, and pass `helm upgrade --timeout` above
+    the expected copy time. Don't re-run the upgrade while the migrate
+    Job is still running: that deletes the running Job and starts the
+    copy over.
+  - `20261104120001_history_since` adds `documents.history_since`. It
+    takes a brief exclusive lock on `documents`, so page reads and writes
+    pause for a moment, at most for the 5 s lock timeout.
+  - Each migration gives up after waiting 5 s for a lock, and the upgrade
+    can simply be re-run.
 - The database grows with every edit from now on; watch the size of
   `doc_updates`. Older pods still running during the rolling upgrade log a
   `doc_updates is append-only` warning from their hourly cleanup; that is

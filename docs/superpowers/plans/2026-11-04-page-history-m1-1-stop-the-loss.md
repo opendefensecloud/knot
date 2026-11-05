@@ -4,7 +4,7 @@
 
 **Goal:** From this release on, knot never deletes a stored edit (`doc_updates` row) again, except when a page is purged, and it keeps every snapshot that survives today's thinning as a permanent "earlier version".
 
-**Architecture:** One migration makes `doc_updates` append-only with a trigger that raises SQLSTATE `KH001` on any delete or rewrite that is not a purge cascade (or an explicitly flagged history rewrite, used from M3 on). The same migration stamps `documents.history_since` and copies every `doc_snapshots` row into a new `doc_history_baselines` table. The hourly GC stops deleting updates, keeps thinning snapshots (they are only a boot cache), and runs single-flight under an advisory lock. A `history-stats` CLI measures log growth so M1.3 can be tuned on real numbers. No UI change: today's History drawer keeps working unchanged.
+**Architecture:** One migration makes `doc_updates` append-only with a trigger that raises SQLSTATE `KH001` on any delete or rewrite that is not a purge cascade (or an explicitly flagged history rewrite, used from M3 on). The same migration copies every `doc_snapshots` row into a new `doc_history_baselines` table, and a second migration right after it stamps `documents.history_since`. The hourly GC stops deleting updates, keeps thinning snapshots (they are only a boot cache), and runs single-flight under an advisory lock. A `history-stats` CLI measures log growth so M1.3 can be tuned on real numbers. No UI change: today's History drawer keeps working unchanged.
 
 **Tech Stack:** Rust (sqlx 0.9, tokio, clap), Postgres (PL/pgSQL trigger), Playwright reset list (TypeScript).
 
@@ -12,13 +12,13 @@
 
 ## Global Constraints
 
-- Migration file: `migrations/20261104120000_history_keep_updates.sql`. sqlx runs it inside one transaction, as the Helm `pre-upgrade` Job, while old pods still serve, so every lock it takes is held until COMMIT.
-- Statement order inside the migration, chosen to keep the server usable while it runs:
+- Migration files: `migrations/20261104120000_history_keep_updates.sql`, then `migrations/20261104120001_history_since.sql`. sqlx runs each inside its own transaction (and records each in `_sqlx_migrations` on its own), as the Helm `pre-upgrade` Job, while old pods still serve, so every lock a migration takes is held until its COMMIT.
+- Statement order inside the first migration, chosen to keep the server usable while it runs:
   1. `SET LOCAL lock_timeout = '5s';` (a blocked lock request fails and the Job retries, instead of queueing the whole server behind it).
-  1b. `LOCK TABLE documents IN SHARE ROW EXCLUSIVE MODE;`. This is the app's lock order, `documents` before `doc_updates`: Duplicate inserts into `documents` and then `doc_updates` in one transaction, and a purge deletes from `documents` and cascades into `doc_updates`. Taking `doc_updates` first (step 2) and `documents` later (step 3's FK, step 4) deadlocks with either one started during the copy (reproduced: "deadlock detected", one side aborted). The mode lets readers of `documents` and FK checks against it (ROW SHARE) through; page creates, renames, moves, duplicates and purges wait until COMMIT, like edit saves.
-  2. Trigger function `doc_updates_append_only()` and trigger `doc_updates_append_only` on `doc_updates` (both names exactly this; M1.2 re-creates both the function and the trigger: `CREATE OR REPLACE FUNCTION doc_updates_append_only()` and, after `ADD COLUMN rev`, `CREATE OR REPLACE TRIGGER doc_updates_append_only BEFORE DELETE OR UPDATE OF update_bytes, doc_id, rev ...`; a function-only replacement never fires on `UPDATE OF rev`). It must come before the copy, so no delete can land between copy and commit. It blocks `doc_updates` inserts (edit saves) until COMMIT; that pause is the copy time and goes in the upgrade note.
-  3. `CREATE TABLE doc_history_baselines` **without** the FK, then the `INSERT ... SELECT FROM doc_snapshots` copy, then `ALTER TABLE doc_history_baselines ADD CONSTRAINT doc_history_baselines_doc_fk FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE`. Adding the FK after the copy validates it in one pass instead of row by row during the copy (`documents` is already locked by step 1b, so it gains no writability).
-  4. Last: `ALTER TABLE documents ADD COLUMN history_since timestamptz NOT NULL DEFAULT now()`. It takes ACCESS EXCLUSIVE on `documents`, so it goes last and holds that lock only until COMMIT. `now()` is the transaction start time wherever the statement sits.
+  2. `LOCK TABLE documents IN SHARE ROW EXCLUSIVE MODE;`. This is the app's lock order, `documents` before `doc_updates`: Duplicate inserts into `documents` and then `doc_updates` in one transaction, and a purge deletes from `documents` and cascades into `doc_updates`. Taking `doc_updates` first (step 3) and `documents` later (step 4's FK) deadlocks with either one started during the copy (reproduced: "deadlock detected", one side aborted). The mode lets readers of `documents` and row locks on it (FOR SHARE, FOR UPDATE, FK checks: ROW SHARE) through; every page write that needs ROW EXCLUSIVE on `documents` (creates, renames, moves, archives, restores, duplicates, purges, template and restriction changes) waits until COMMIT, like edit saves. Nothing later in this migration asks for more than this mode on `documents`.
+  3. Trigger function `doc_updates_append_only()` and trigger `doc_updates_append_only` on `doc_updates` (both names exactly this; M1.2 re-creates both the function and the trigger: `CREATE OR REPLACE FUNCTION doc_updates_append_only()` and, after `ADD COLUMN rev`, `CREATE OR REPLACE TRIGGER doc_updates_append_only BEFORE DELETE OR UPDATE OF update_bytes, doc_id, rev ...`; a function-only replacement never fires on `UPDATE OF rev`). It must come before the copy, so no delete can land between copy and commit. It blocks `doc_updates` inserts (edit saves) until COMMIT; that pause is the copy time and goes in the upgrade note.
+  4. `CREATE TABLE doc_history_baselines` **without** the FK, then the `INSERT ... SELECT FROM doc_snapshots` copy, then `ALTER TABLE doc_history_baselines ADD CONSTRAINT doc_history_baselines_doc_fk FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE`. Adding the FK after the copy validates it in one pass instead of row by row during the copy (`documents` is already locked by step 2, so it gains no writability). The FK takes SHARE ROW EXCLUSIVE on `documents`, already held, and its check reads without row locks.
+- The second migration: `SET LOCAL lock_timeout = '5s';` and `ALTER TABLE documents ADD COLUMN history_since timestamptz NOT NULL DEFAULT now()` alone. It takes ACCESS EXCLUSIVE on `documents`. As the last statement of the first migration, that lock upgrade deadlocked with any page write that had read or row-locked `documents` (a create's FOR SHARE on the parent, a purge's FOR UPDATE on the archive root) and then waited to write it (reproduced). In a transaction of its own it holds no other lock, so it can only wait, and fail after 5 s for the Job to retry. `now()` is that transaction's start time, after the trigger committed: pages created between the two commits get `history_since > created_at` and count as predating history, which is conservative and harmless (the trigger keeps their edits). It must not come before the first migration: old pods' GC still deletes edits until the trigger commits, so `history_since` would claim history that is gone.
 - Refusal error: `RAISE EXCEPTION 'doc_updates is append-only (page history)' USING ERRCODE = 'KH001'`.
 - Trigger body, exactly this logic (every FK cascade runs inside `RI_FKey_cascade_del`, so cascades arrive with `pg_trigger_depth() > 1`, and a top-level statement has depth 1):
 
@@ -49,6 +49,7 @@
 
 **Files:**
 - Create: `migrations/20261104120000_history_keep_updates.sql`
+- Create: `migrations/20261104120001_history_since.sql`
 - Modify: `crates/knot-storage/tests/migrations_apply.rs` (table list at :30-57, new tests at the end)
 - Modify: `crates/knot-storage/tests/updates.rs` (`setup()` at :5-25 also returns the `PgPool`, i.e. `(PgUpdatesStore, PgPool, Uuid, Uuid)`, with its callers updated; replace `delete_up_to_removes_inclusive` at :74-92)
 - Modify: `e2e/support/reset.ts:35-59` (add `"doc_history_baselines"` before `"doc_markdown_cache"`)
@@ -111,7 +112,7 @@ async fn workspace_delete_cascade_still_deletes_updates() {
 }
 ```
 
-And a migration-boundary test modelled on `doc_contributors_migration_backfills_from_doc_updates` (migrate to `VERSION - 1` with a filtered `Migrator`, seed, then run the full migrator), with `const VERSION: i64 = 20261104120000;`:
+And a migration-boundary test modelled on `doc_contributors_migration_backfills_from_doc_updates` (migrate to `VERSION - 1` with a filtered `Migrator`, seed, then run the full migrator, which applies both history migrations), with `const VERSION: i64 = 20261104120000;`:
 
 ```rust
 #[tokio::test(flavor = "multi_thread")]
@@ -134,9 +135,9 @@ In `crates/knot-storage/tests/updates.rs` replace `delete_up_to_removes_inclusiv
 Run: `cargo nextest run -p knot-storage --test migrations_apply --test updates`
 Expected: FAIL — table list mismatch, deletes succeed, `doc_history_baselines` does not exist.
 
-- [ ] **Step 3: Write `migrations/20261104120000_history_keep_updates.sql`**
+- [ ] **Step 3: Write `migrations/20261104120000_history_keep_updates.sql` and `migrations/20261104120001_history_since.sql`**
 
-Header comment: why (page history keeps every edit; see the design doc) and why the statement order is what it is (locks are held until COMMIT). Statements in exactly the order of Global Constraints; the copy is `INSERT INTO doc_history_baselines (doc_id, snapshot_seq, state_bytes, state_vector, created_at) SELECT doc_id, snapshot_seq, state_bytes, state_vector, created_at FROM doc_snapshots`.
+Header comments: why (page history keeps every edit; see the design doc), why the statement order is what it is (locks are held until COMMIT), and why `history_since` is a migration of its own. Statements in exactly the order of Global Constraints; the copy is `INSERT INTO doc_history_baselines (doc_id, snapshot_seq, state_bytes, state_vector, created_at) SELECT doc_id, snapshot_seq, state_bytes, state_vector, created_at FROM doc_snapshots`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -153,7 +154,7 @@ Expected: PASS; `SELECT to_regclass('doc_history_baselines')` in the e2e databas
 - [ ] **Step 7: Commit**
 
 ```bash
-git add migrations/20261104120000_history_keep_updates.sql crates/knot-storage/tests/migrations_apply.rs crates/knot-storage/tests/updates.rs e2e/support/reset.ts
+git add migrations/20261104120000_history_keep_updates.sql migrations/20261104120001_history_since.sql crates/knot-storage/tests/migrations_apply.rs crates/knot-storage/tests/updates.rs e2e/support/reset.ts
 git commit -m "feat(history): keep every doc update and every surviving snapshot"
 ```
 
@@ -318,9 +319,9 @@ git commit -m "feat(history): history-stats CLI to measure log growth"
 - [ ] **Step 1: CHANGELOG `[Unreleased]`**, in the file's existing style (see `## [0.9.8]` at :18-28 for the `### Upgrading` format):
   - **Changed:** "Knot no longer deletes old edits. Every change to a page is kept for the page's whole life (purging a page still removes it). This is the groundwork for the page history timeline; the History drawer itself is unchanged in this release."
   - **Added:** "`knot-server history-stats` reports how fast the stored edit log grows (rows and bytes per page per day). Run it a few weeks after upgrading and share the output with the maintainers."
-  - **`### Upgrading`:** "One database migration runs on upgrade. Rolling back to 0.9.8 needs a database restore." Then the migration bullet: "`20261104120000_history_keep_updates` makes the stored edit log append-only, adds `documents.history_since` and copies every stored snapshot into `doc_history_baselines`. While it runs, saving edits pauses for about as long as the copy takes; check `SELECT pg_size_pretty(pg_total_relation_size('doc_snapshots'))` beforehand." And: "The database grows with every edit from now on; watch the size of `doc_updates`. Older pods still running during the rolling upgrade log a `doc_updates is append-only` warning from their hourly cleanup; that is expected and harmless."
+  - **`### Upgrading`:** "Two database migrations run on upgrade. Rolling back to 0.9.8 needs a database restore." Then one bullet per migration: "`20261104120000_history_keep_updates` makes the stored edit log append-only and copies every stored snapshot into `doc_history_baselines`. While it runs, saving edits pauses for about as long as the copy takes; check `SELECT pg_size_pretty(pg_total_relation_size('doc_snapshots'))` beforehand." and "`20261104120001_history_since` adds `documents.history_since`; it takes a brief exclusive lock on `documents`." And: "The database grows with every edit from now on; watch the size of `doc_updates`. Older pods still running during the rolling upgrade log a `doc_updates is append-only` warning from their hourly cleanup; that is expected and harmless."
 
-- [ ] **Step 2: Helm README**: a new `### Upgrading to the release after 0.9.8` subsection under `## Upgrading` (:171) naming `20261104120000_history_keep_updates` and the edit-save pause during its copy; and an "Operational notes" bullet (:199) "Storage growth from page history": the edit log is kept forever, size it as rows/day × average row bytes × ~1.6 (tuple, index and TOAST overhead), backups and PITR grow at the same rate, and `knot-server history-stats` gives the inputs.
+- [ ] **Step 2: Helm README**: a new `### Upgrading to the release after 0.9.8` subsection under `## Upgrading` (:171) naming `20261104120000_history_keep_updates` and the edit-save pause during its copy, and `20261104120001_history_since` with its brief exclusive lock on `documents`; and an "Operational notes" bullet (:199) "Storage growth from page history": the edit log is kept forever, size it as rows/day × average row bytes × ~1.6 (tuple, index and TOAST overhead), backups and PITR grow at the same rate, and `knot-server history-stats` gives the inputs.
 
 - [ ] **Step 3: Verify**
 
