@@ -10,11 +10,19 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ### Upgrading
 - Two database migrations run on upgrade, each in its own transaction
-  (the Helm chart's migrate hook applies them). Rolling back to 0.9.8
-  needs a database restore: 0.9.8 doesn't start on a database with
-  migrations it doesn't know. That includes a 0.9.8 pod that restarts
-  during the rolling upgrade after the first migration has committed: it
-  crash-loops until a new pod replaces it.
+  (the Helm chart's migrate hook applies them). Don't upgrade while
+  `pg_dump` or another long transaction runs on the database. Rolling
+  back to 0.9.8 needs a database restore: 0.9.8 doesn't start on a
+  database with migrations it doesn't know. Once the first migration has
+  committed, a 0.9.8 pod that restarts crash-loops until a new pod
+  replaces it. No new pod comes when the upgrade halts after the first
+  migration: when Helm's hook timeout fires while the migrate Job keeps
+  running and commits, or when the second migration gives up on every Job
+  attempt. Then
+  `SELECT version FROM _sqlx_migrations WHERE version >= 20261104120000`
+  shows only 20261104120000. The running 0.9.8 pods keep serving, but
+  let a still-running migrate Job finish, end the long transaction and
+  re-run the upgrade promptly (see the Helm chart README).
   - `20261104120000_history_keep_updates` makes the stored edit log
     append-only and copies every stored snapshot into
     `doc_history_baselines`. Check
@@ -30,12 +38,13 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
     larger than a few hundred MB, and pass `helm upgrade --timeout` above
     the expected copy time. Don't re-run the upgrade while the migrate
     Job is still running: that deletes the running Job and starts the
-    copy over.
+    copy over. Before the copy it takes its locks in attempts 0.5 s
+    apart, for up to 45 s per Job attempt; each attempt pauses page
+    writes for at most 100 ms.
   - `20261104120001_history_since` adds `documents.history_since`. It
-    takes a brief exclusive lock on `documents`, so page reads and writes
-    pause for a moment, at most for the 5 s lock timeout.
-  - Each migration gives up after waiting 5 s for a lock, and the upgrade
-    can simply be re-run.
+    takes an exclusive lock on `documents` in attempts 0.5 s apart, for
+    up to 45 s per Job attempt; each attempt pauses all page access, page
+    reads and edit saves included, for at most 100 ms.
 - The database grows with every edit from now on; watch the size of
   `doc_updates`. Older pods still running during the rolling upgrade log a
   `doc_updates is append-only` warning from their hourly cleanup; that is
