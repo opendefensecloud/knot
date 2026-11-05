@@ -1117,12 +1117,29 @@ async fn flagged_history_rewrite_is_allowed() {
         .execute(&mut *tx)
         .await
         .unwrap();
-    sqlx::query("UPDATE doc_updates SET update_bytes = '\\x00' WHERE doc_id = $1")
+    let done = sqlx::query("UPDATE doc_updates SET update_bytes = '\\x00' WHERE doc_id = $1")
         .bind(doc)
         .execute(&mut *tx)
         .await
         .unwrap();
+    // A trigger returning NULL would skip every row without an error.
+    assert_eq!(done.rows_affected(), 2);
+    let bytes: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT update_bytes FROM doc_updates WHERE doc_id = $1")
+            .bind(doc)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(bytes, vec![vec![0u8], vec![0u8]]);
     tx.rollback().await.unwrap();
+
+    // The flag was transaction-local: the same statement is refused again.
+    let e = sqlx::query("UPDATE doc_updates SET update_bytes = '\\x00' WHERE doc_id = $1")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(kh001(e));
 }
 
 #[tokio::test(flavor = "multi_thread")]
