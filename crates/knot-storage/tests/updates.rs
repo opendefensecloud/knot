@@ -2,7 +2,7 @@ use knot_storage::{
     DocStore, PgDocStore, PgUpdatesStore, PgUserStore, PgWorkspaceStore, UpdatesStore, UserStore,
     WorkspaceRole, WorkspaceStore,
 };
-async fn setup() -> (PgUpdatesStore, uuid::Uuid, uuid::Uuid) {
+async fn setup() -> (PgUpdatesStore, sqlx::PgPool, uuid::Uuid, uuid::Uuid) {
     let pool = knot_test_support::fresh_db().await.pool;
 
     let ws = PgWorkspaceStore::new(pool.clone())
@@ -21,12 +21,12 @@ async fn setup() -> (PgUpdatesStore, uuid::Uuid, uuid::Uuid) {
         .create(ws.id, None, "D", "m", u.id)
         .await
         .unwrap();
-    (PgUpdatesStore::new(pool), d.id, u.id)
+    (PgUpdatesStore::new(pool.clone()), pool, d.id, u.id)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn insert_batch_returns_monotone_seqs_in_input_order() {
-    let (s, doc, user) = setup().await;
+    let (s, _pool, doc, user) = setup().await;
     let batch = vec![
         (Some(user), vec![1u8, 2, 3]),
         (Some(user), vec![4u8, 5]),
@@ -39,7 +39,7 @@ async fn insert_batch_returns_monotone_seqs_in_input_order() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn since_returns_after_watermark_in_order() {
-    let (s, doc, user) = setup().await;
+    let (s, _pool, doc, user) = setup().await;
     let seqs = s
         .insert_batch(
             doc,
@@ -61,7 +61,7 @@ async fn since_returns_after_watermark_in_order() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn max_seq_zero_when_empty_then_grows() {
-    let (s, doc, user) = setup().await;
+    let (s, _pool, doc, user) = setup().await;
     assert_eq!(s.max_seq(doc).await.unwrap(), 0);
     let seqs = s
         .insert_batch(doc, &[(Some(user), vec![1u8]), (Some(user), vec![2u8])])
@@ -71,8 +71,8 @@ async fn max_seq_zero_when_empty_then_grows() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn delete_up_to_removes_inclusive() {
-    let (s, doc, user) = setup().await;
+async fn rows_survive_and_direct_delete_is_refused() {
+    let (s, pool, doc, user) = setup().await;
     let seqs = s
         .insert_batch(
             doc,
@@ -84,16 +84,22 @@ async fn delete_up_to_removes_inclusive() {
         )
         .await
         .unwrap();
-    let n = s.delete_up_to(doc, seqs[1]).await.unwrap();
-    assert_eq!(n, 2);
-    let left = s.since(doc, 0).await.unwrap();
-    assert_eq!(left.len(), 1);
-    assert_eq!(left[0].seq, seqs[2]);
+    let e = sqlx::query("DELETE FROM doc_updates WHERE doc_id = $1 AND seq <= $2")
+        .bind(doc)
+        .bind(seqs[1])
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_database_error().and_then(|d| d.code()).as_deref(),
+        Some("KH001")
+    );
+    assert_eq!(s.since(doc, 0).await.unwrap().len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_batch_is_noop() {
-    let (s, doc, _) = setup().await;
+    let (s, _pool, doc, _) = setup().await;
     let seqs = s.insert_batch(doc, &[]).await.unwrap();
     assert!(seqs.is_empty());
     assert_eq!(s.max_seq(doc).await.unwrap(), 0);
