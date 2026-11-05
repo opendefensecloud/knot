@@ -169,14 +169,14 @@ async fn run_server(cfg: Config) {
                     knot_crdt::Rooms::new(
                         std::sync::Arc::new(knot_crdt::YrsEngine),
                         bus.clone(),
-                        updates.clone(),
+                        updates,
                         snapshots.clone(),
                         policy,
                         std::time::Duration::from_secs(cfg.room_idle_evict_sec as u64),
                     )
                     .with_dirty_tx(dirty_tx),
                 );
-                knot_crdt::spawn_gc(pool.clone(), snapshots, updates, cfg.snapshot_every_n);
+                knot_crdt::spawn_gc(pool.clone(), snapshots);
                 (Some(bus), Some(rooms), Some(dirty_rx))
             }
             Err(e) => {

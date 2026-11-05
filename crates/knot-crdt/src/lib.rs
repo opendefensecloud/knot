@@ -24,7 +24,7 @@ pub use bus_pg::PgBus;
 pub use engine::{
     ApplyMeasured, DocHandle, Engine, EngineError, TextMark, TextMarkAttr, YrsEngine,
 };
-pub use gc::spawn as spawn_gc;
+pub use gc::{GcRun, run_once as gc_run_once, spawn as spawn_gc};
 pub use presence::PRESENCE_MAX_BYTES;
 pub use registry::{AcquireError, Rooms};
 pub use room::{ConnHandle, ConnId, Event, InMsg, JoinState, Room, RoomHandle};

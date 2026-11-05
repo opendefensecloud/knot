@@ -1035,13 +1035,6 @@ pub(crate) mod tests {
         async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
             Ok(0)
         }
-        async fn delete_up_to(
-            &self,
-            _: Uuid,
-            _: i64,
-        ) -> Result<u64, knot_storage::UpdatesStoreError> {
-            Ok(0)
-        }
     }
 
     /// Records the author of every row the writer persists, in order, so
@@ -1071,13 +1064,6 @@ pub(crate) mod tests {
         async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
             Ok(0)
         }
-        async fn delete_up_to(
-            &self,
-            _: Uuid,
-            _: i64,
-        ) -> Result<u64, knot_storage::UpdatesStoreError> {
-            Ok(0)
-        }
     }
 
     /// Records every update the writer persists, in order.
@@ -1104,13 +1090,6 @@ pub(crate) mod tests {
             Ok(vec![])
         }
         async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
-            Ok(0)
-        }
-        async fn delete_up_to(
-            &self,
-            _: Uuid,
-            _: i64,
-        ) -> Result<u64, knot_storage::UpdatesStoreError> {
             Ok(0)
         }
     }
@@ -2409,13 +2388,6 @@ pub(crate) mod tests {
         async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
             Ok(0)
         }
-        async fn delete_up_to(
-            &self,
-            _: Uuid,
-            _: i64,
-        ) -> Result<u64, knot_storage::UpdatesStoreError> {
-            Ok(0)
-        }
     }
 
     /// A snapshot store that counts the snapshots written to it and stores
@@ -2558,13 +2530,6 @@ pub(crate) mod tests {
         }
         async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
             Ok(self.next_seq.load(std::sync::atomic::Ordering::SeqCst))
-        }
-        async fn delete_up_to(
-            &self,
-            _: Uuid,
-            _: i64,
-        ) -> Result<u64, knot_storage::UpdatesStoreError> {
-            Ok(0)
         }
     }
 

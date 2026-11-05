@@ -46,9 +46,6 @@ pub trait UpdatesStore: Send + Sync + 'static {
 
     /// Highest seq for a doc, or 0 if none.
     async fn max_seq(&self, doc_id: Uuid) -> Result<i64, UpdatesStoreError>;
-
-    /// Delete updates with seq <= cutoff (used by snapshot GC).
-    async fn delete_up_to(&self, doc_id: Uuid, cutoff_seq: i64) -> Result<u64, UpdatesStoreError>;
 }
 
 /// Appends one doc's updates, each with its author, and credits the
@@ -171,14 +168,5 @@ impl UpdatesStore for PgUpdatesStore {
                 .fetch_one(&self.pool)
                 .await?;
         Ok(v.unwrap_or(0))
-    }
-
-    async fn delete_up_to(&self, doc_id: Uuid, cutoff_seq: i64) -> Result<u64, UpdatesStoreError> {
-        let r = sqlx::query("DELETE FROM doc_updates WHERE doc_id = $1 AND seq <= $2")
-            .bind(doc_id)
-            .bind(cutoff_seq)
-            .execute(&self.pool)
-            .await?;
-        Ok(r.rows_affected())
     }
 }
