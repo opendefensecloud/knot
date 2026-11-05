@@ -1374,3 +1374,93 @@ async fn history_migration_copies_snapshots_and_stamps_history_since() {
             .unwrap();
     assert_eq!(left, 0, "baselines cascade with the page");
 }
+
+/// `history_since` of every page that exists when 20261104120001 runs is the
+/// moment 20261104120000 made deletes impossible, however long ago that
+/// committed; later pages default to their insert time.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_since_is_the_moment_deletes_stopped() {
+    use chrono::{DateTime, Utc};
+    use sqlx::migrate::Migrator;
+
+    const KEEP_UPDATES: i64 = 20261104120000;
+    const HISTORY_SINCE: i64 = 20261104120001;
+
+    let url = knot_test_support::fresh_db_url().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("connect");
+    let full = sqlx::migrate!("../../migrations");
+    let up_to = |last: i64| Migrator {
+        migrations: std::borrow::Cow::Owned(
+            full.migrations
+                .iter()
+                .filter(|m| m.version <= last)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    };
+    up_to(KEEP_UPDATES - 1)
+        .run(&pool)
+        .await
+        .expect("migrate to before the history migrations");
+    let (ws, user) = seed_ws_user(&pool).await;
+    let insert_page = |sort_key: &'static str| {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO documents (workspace_id, title, sort_key, created_by)
+             VALUES ($1, 'D', $2, $3) RETURNING id",
+        )
+        .bind(ws)
+        .bind(sort_key)
+        .bind(user)
+        .fetch_one(&pool)
+    };
+    let old = insert_page("a").await.unwrap();
+
+    up_to(KEEP_UPDATES)
+        .run(&pool)
+        .await
+        .expect("apply keep_updates");
+    let keeps_since: DateTime<Utc> = sqlx::query_scalar("SELECT keeps_since FROM doc_history_meta")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Created between the two migrations: its edits are all kept.
+    let between = insert_page("b").await.unwrap();
+
+    up_to(HISTORY_SINCE)
+        .run(&pool)
+        .await
+        .expect("apply history_since");
+    let after = insert_page("c").await.unwrap();
+
+    let read = |id: Uuid| {
+        sqlx::query_as::<_, (DateTime<Utc>, DateTime<Utc>)>(
+            "SELECT created_at, history_since FROM documents WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+    };
+    let (old_created, old_since) = read(old).await.unwrap();
+    assert_eq!(old_since, keeps_since, "existing page: the stored moment");
+    assert!(old_created < old_since, "existing page predates history");
+
+    let (between_created, between_since) = read(between).await.unwrap();
+    assert_eq!(between_since, keeps_since);
+    assert!(
+        between_created >= between_since,
+        "a page created between the migrations counts as a new page"
+    );
+
+    let (after_created, after_since) = read(after).await.unwrap();
+    assert_eq!(after_since, after_created, "default is the insert time");
+
+    let meta: Option<String> = sqlx::query_scalar("SELECT to_regclass('doc_history_meta')::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(meta, None, "doc_history_meta is dropped");
+}
