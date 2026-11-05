@@ -8,6 +8,31 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Upgrading
+- One database migration runs on upgrade. Rolling back to 0.9.8 needs a
+  database restore.
+  - `20261104120000_history_keep_updates` makes the stored edit log
+    append-only, adds `documents.history_since` and copies every stored
+    snapshot into `doc_history_baselines`. While it runs, saving edits
+    pauses for about as long as the copy takes; check
+    `SELECT pg_size_pretty(pg_total_relation_size('doc_snapshots'))`
+    beforehand.
+- The database grows with every edit from now on; watch the size of
+  `doc_updates`. Older pods still running during the rolling upgrade log a
+  `doc_updates is append-only` warning from their hourly cleanup; that is
+  expected and harmless.
+
+### Added
+- `knot-server history-stats` reports how fast the stored edit log grows
+  (rows and bytes per page per day). Run it a few weeks after upgrading
+  and share the output with the maintainers.
+
+### Changed
+- Knot no longer deletes old edits. Every change to a page is kept for the
+  page's whole life (purging a page still removes it). This is the
+  groundwork for the page history timeline; the History drawer itself is
+  unchanged in this release.
+
 ### Fixed
 - The @-mention list works with the keyboard in a table cell. ArrowUp and
   ArrowDown moved the cursor to the neighbouring cell and closed the list,
