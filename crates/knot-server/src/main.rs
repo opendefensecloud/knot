@@ -32,6 +32,12 @@ enum Cmd {
     /// Export every page offline to DOCX and ODT and report failures and
     /// fallbacks. Does not migrate; meant for a staging copy.
     ExportCheck,
+    /// Report how fast the page-history log grows. Read-only; does not migrate.
+    HistoryStats {
+        /// Window for the rows-per-page-per-day figures.
+        #[arg(long, default_value_t = 30)]
+        days: i32,
+    },
 }
 
 #[tokio::main]
@@ -61,6 +67,12 @@ async fn main() {
         Cmd::ExportCheck => {
             if let Err(e) = knot_server::export_check::run(cfg).await {
                 eprintln!("export-check: {e}");
+                process::exit(1);
+            }
+        }
+        Cmd::HistoryStats { days } => {
+            if let Err(e) = knot_server::history_stats::run(cfg, days).await {
+                eprintln!("history-stats: {e}");
                 process::exit(1);
             }
         }
