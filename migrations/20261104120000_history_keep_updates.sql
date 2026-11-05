@@ -11,17 +11,28 @@
 --
 -- sqlx runs this file in one transaction, as the Helm pre-upgrade Job, while
 -- old pods still serve, so every lock below is held until COMMIT. The order
--- keeps the server usable meanwhile:
+-- keeps the server usable meanwhile and follows the app's lock order:
 --   1. lock_timeout: a blocked lock request fails and the Job retries,
 --      instead of queueing the whole server behind it.
---   2. The trigger comes before the copy, so no delete can land between the
+--   2. documents is locked before doc_updates, the order the app takes them
+--      (a duplicate inserts into documents, then doc_updates; a purge deletes
+--      from documents and cascades into doc_updates). Locking doc_updates
+--      first deadlocks with either one when it starts during the copy.
+--      SHARE ROW EXCLUSIVE lets readers of documents and FK checks against
+--      it (ROW SHARE) through; page creates, renames, moves, duplicates and
+--      purges wait until COMMIT, like edit saves.
+--   3. The trigger comes before the copy, so no delete can land between the
 --      copy and COMMIT. It blocks doc_updates inserts (edit saves) until
 --      COMMIT; that pause is the copy time.
---   3. The baselines table is created without its foreign key, so documents
---      stays writable during the copy; the FK is added after.
---   4. documents.history_since takes ACCESS EXCLUSIVE on documents, so it
---      goes last. now() is the transaction start time wherever it sits.
+--   4. The baselines table gets its foreign key after the copy, so the FK
+--      check does not run row by row during it.
+--   5. documents.history_since takes ACCESS EXCLUSIVE on documents, so it
+--      goes last: readers of documents only wait from there to COMMIT.
+--      now() is the transaction start time wherever it sits.
 SET LOCAL lock_timeout = '5s';
+
+-- App lock order: documents before doc_updates (see 2 above).
+LOCK TABLE documents IN SHARE ROW EXCLUSIVE MODE;
 
 -- Every FK cascade runs inside RI_FKey_cascade_del, so a cascaded delete
 -- arrives with pg_trigger_depth() > 1; a top-level statement has depth 1.
