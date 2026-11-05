@@ -9,15 +9,26 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ## [Unreleased]
 
 ### Upgrading
-- One database migration runs on upgrade. Rolling back to 0.9.8 needs a
-  database restore.
+- One database migration runs on upgrade (the Helm chart's migrate hook
+  applies it). Rolling back to 0.9.8 needs a database restore: 0.9.8
+  doesn't start on a database with migrations it doesn't know. That
+  includes a 0.9.8 pod that restarts during the rolling upgrade after the
+  migration has committed: it crash-loops until a new pod replaces it.
   - `20261104120000_history_keep_updates` makes the stored edit log
     append-only, adds `documents.history_since` and copies every stored
-    snapshot into `doc_history_baselines`. While it runs, saving edits
-    pauses for about as long as the copy takes; check
+    snapshot into `doc_history_baselines`. Check
     `SELECT pg_size_pretty(pg_total_relation_size('doc_snapshots'))`
-    beforehand. It gives up after waiting 5 s for a lock, and the upgrade
-    can simply be re-run.
+    beforehand: the copy takes about as long as reading and writing that
+    much data (some 261 MB took 0.87 s on a local SSD; network disks are
+    slower). During the copy, saving edits and creating, renaming,
+    moving or purging pages wait. On a busy instance the waiting saves
+    can fill each old pod's database pool, so pages may stop loading and
+    pods may briefly go NotReady until the copy finishes. Upgrade in a
+    quiet window when `doc_snapshots` is larger than a few hundred MB, and
+    pass `helm upgrade --timeout` above the expected copy time. Don't
+    re-run the upgrade while the migrate Job is still running: that
+    deletes the running Job and starts the copy over. The migration gives
+    up after waiting 5 s for a lock, and the upgrade can simply be re-run.
 - The database grows with every edit from now on; watch the size of
   `doc_updates`. Older pods still running during the rolling upgrade log a
   `doc_updates is append-only` warning from their hourly cleanup; that is
@@ -25,8 +36,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ### Added
 - `knot-server history-stats` reports how fast the stored edit log grows
-  (rows and bytes per page per day). Run it a few weeks after upgrading
-  and share the output with the maintainers.
+  (rows and bytes per page per day). It needs the server's `KNOT_*`
+  environment, so run it inside a knot pod (see the Helm chart README).
+  Its per-day rates cover the last `--days` days (default 30), and before
+  the upgrade the old cleanup deleted edits, so run it at least 30 days
+  after upgrading, or pass a `--days` below the days since the upgrade.
+  Share the output with the maintainers.
 
 ### Changed
 - Knot no longer deletes old edits. Every change to a page is kept for the
