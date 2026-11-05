@@ -198,9 +198,9 @@ With the S3 blob backend, make sure knot's credentials allow `s3:DeleteObject` (
 
 ### Upgrading to the release after 0.9.8
 
-The `pre-upgrade` Job applies one migration, `20261104120000_history_keep_updates`. It makes the stored edit log (`doc_updates`) append-only, adds `documents.history_since`, and copies every stored snapshot into the new `doc_history_baselines` table. While it runs, saving edits pauses for about as long as the copy takes, so check `SELECT pg_size_pretty(pg_total_relation_size('doc_snapshots'))` beforehand: the bigger the table, the longer the pause. Rolling back to 0.9.8 needs a database restore.
+The `pre-upgrade` Job applies one migration, `20261104120000_history_keep_updates`. It makes the stored edit log (`doc_updates`) append-only, adds `documents.history_since`, and copies every stored snapshot into the new `doc_history_baselines` table. While it runs, saving edits pauses for about as long as the copy takes, so check `SELECT pg_size_pretty(pg_total_relation_size('doc_snapshots'))` beforehand: the bigger the table, the longer the pause. The migration sets a 5-second lock timeout: if it can't take a lock in time, it fails. The migrate Job retries up to `migrations.backoffLimit` times (default 3), and after that the upgrade halts; re-run the upgrade at a quieter time. Rolling back to 0.9.8 needs a database restore.
 
-Knot no longer deletes old edits, so the database grows with every edit (see [Storage growth from page history](#operational-notes)). During the rolling upgrade, pods still on the old version log a `doc_updates is append-only` warning from their hourly cleanup; that is expected and harmless.
+Knot no longer deletes old edits, so the database grows with every edit (see "Storage growth from page history" in [Operational notes](#operational-notes)). During the rolling upgrade, pods still on the old version log a `doc_updates is append-only` warning from their hourly cleanup; that is expected and harmless.
 
 ## Operational notes
 
@@ -210,7 +210,7 @@ Knot no longer deletes old edits, so the database grows with every edit (see [St
 - **Replicas** — knot's CRDT room actor is per-pod and discovers peers via Postgres `LISTEN/NOTIFY`, so `replicaCount > 1` works without sticky sessions. Each room is hosted by exactly one pod at a time; failover takes one TCP roundtrip.
 - **Notifications** — every replica checks for overdue tasks and deletes old notifications every 15 minutes, with nothing to configure and no coordination needed between replicas. Read notifications are deleted after 90 days, all after 180, and a page's go with it when it is deleted for good. They hold short excerpts (comment text, task text), so an excerpt of a deleted comment stays in its recipients' inboxes until then. `knot_notifications_emitted_total{kind}` counts them as they are written.
 - **Request body size** — image uploads and Word/OpenDocument exports (which upload the page's diagram pictures) send up to 10 MiB. A reverse proxy or ingress in front of knot must allow request bodies of at least 10 MiB. With ingress-nginx (default 1 MiB), set `nginx.ingress.kubernetes.io/proxy-body-size: 10m` in `ingress.annotations`.
-- **Storage growth from page history** — the edit log is kept forever, so size it as rows/day × average row bytes × ~1.6 (tuple, index and TOAST overhead). Backups and point-in-time recovery grow at the same rate. `knot-server history-stats [--days N]` (read-only, no migration) prints the inputs: rows per page per day, average row bytes, and the current size of `doc_updates`.
+- **Storage growth from page history** — the edit log is kept forever, so size it as rows/day × average row bytes × ~1.6 (tuple, index and TOAST overhead). Backups and point-in-time recovery grow at the same rate. `knot-server history-stats [--days N]` (read-only, no migration; `--days` defaults to 30, minimum 1) prints the inputs. To get rows/day, run it twice, some days apart: the difference in `update_rows` divided by the days between the runs is rows/day, and `update_bytes_avg` is the average row bytes. It also prints the current size of `doc_updates`.
 
 ## Uninstall
 

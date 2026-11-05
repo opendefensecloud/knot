@@ -16,7 +16,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
     snapshot into `doc_history_baselines`. While it runs, saving edits
     pauses for about as long as the copy takes; check
     `SELECT pg_size_pretty(pg_total_relation_size('doc_snapshots'))`
-    beforehand.
+    beforehand. It gives up after waiting 5 s for a lock, and the upgrade
+    can simply be re-run.
 - The database grows with every edit from now on; watch the size of
   `doc_updates`. Older pods still running during the rolling upgrade log a
   `doc_updates is append-only` warning from their hourly cleanup; that is
