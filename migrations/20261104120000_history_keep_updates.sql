@@ -18,17 +18,25 @@
 --      (a duplicate inserts into documents, then doc_updates; a purge deletes
 --      from documents and cascades into doc_updates). Locking doc_updates
 --      first deadlocks with either one when it starts during the copy.
---      SHARE ROW EXCLUSIVE lets readers of documents and FK checks against
---      it (ROW SHARE) through; page creates, renames, moves, duplicates and
---      purges wait until COMMIT, like edit saves.
+--      SHARE ROW EXCLUSIVE lets readers of documents and row locks on it
+--      (FOR SHARE, FOR UPDATE, FK checks: ROW SHARE) through. What waits
+--      until COMMIT is every page write that needs ROW EXCLUSIVE on
+--      documents (creates, renames, moves, archives, restores, duplicates,
+--      purges) and edit saves. A transaction that already holds a
+--      conflicting lock on documents (a page write in flight) only makes
+--      this one wait for it, up to the lock timeout. Nothing here asks for
+--      more than SHARE ROW EXCLUSIVE on documents afterwards, so a
+--      transaction that read or row-locked documents and then writes it
+--      waits for COMMIT instead of deadlocking. That is why
+--      documents.history_since, which needs ACCESS EXCLUSIVE, is a separate
+--      migration (20261104120001_history_since).
 --   3. The trigger comes before the copy, so no delete can land between the
 --      copy and COMMIT. It blocks doc_updates inserts (edit saves) until
 --      COMMIT; that pause is the copy time.
 --   4. The baselines table gets its foreign key after the copy, so the FK
---      check does not run row by row during it.
---   5. documents.history_since takes ACCESS EXCLUSIVE on documents, so it
---      goes last: readers of documents only wait from there to COMMIT.
---      now() is the transaction start time wherever it sits.
+--      check does not run row by row during it. Adding it takes SHARE ROW
+--      EXCLUSIVE on documents, already held, and the check reads documents
+--      without row locks.
 SET LOCAL lock_timeout = '5s';
 
 -- App lock order: documents before doc_updates (see 2 above).
@@ -68,7 +76,3 @@ FROM doc_snapshots;
 ALTER TABLE doc_history_baselines
   ADD CONSTRAINT doc_history_baselines_doc_fk
   FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE;
-
--- Pages with created_at < history_since predate history: their earliest
--- edits may already be gone. A page created later has created_at >= it.
-ALTER TABLE documents ADD COLUMN history_since timestamptz NOT NULL DEFAULT now();

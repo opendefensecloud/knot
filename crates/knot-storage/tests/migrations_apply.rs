@@ -1242,7 +1242,9 @@ async fn history_migration_copies_snapshots_and_stamps_history_since() {
     use chrono::{DateTime, Utc};
     use sqlx::migrate::Migrator;
 
+    // The trigger, baselines and copy; then history_since on its own.
     const VERSION: i64 = 20261104120000;
+    const HISTORY_SINCE: i64 = 20261104120001;
 
     let url = knot_test_support::fresh_db_url().await;
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -1251,10 +1253,12 @@ async fn history_migration_copies_snapshots_and_stamps_history_since() {
         .await
         .expect("connect");
     let full = sqlx::migrate!("../../migrations");
-    assert!(
-        full.migrations.iter().any(|m| m.version == VERSION),
-        "migration {VERSION} not embedded (cargo clean -p knot-storage?)"
-    );
+    for v in [VERSION, HISTORY_SINCE] {
+        assert!(
+            full.migrations.iter().any(|m| m.version == v),
+            "migration {v} not embedded (cargo clean -p knot-storage?)"
+        );
+    }
     let before = Migrator {
         migrations: std::borrow::Cow::Owned(
             full.migrations
@@ -1295,7 +1299,16 @@ async fn history_migration_copies_snapshots_and_stamps_history_since() {
         .unwrap();
     }
 
-    full.run(&pool).await.expect("apply history migration");
+    full.run(&pool).await.expect("apply history migrations");
+    // Two migrations, each recorded on its own.
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM _sqlx_migrations WHERE version >= $1 ORDER BY version",
+    )
+    .bind(VERSION)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(applied[..2], [VERSION, HISTORY_SINCE]);
     let t_mig: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
         .fetch_one(&pool)
         .await
