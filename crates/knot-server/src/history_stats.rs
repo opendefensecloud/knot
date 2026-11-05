@@ -76,20 +76,20 @@ pub async fn collect(pool: &PgPool, days: i32) -> Result<HistoryStats, sqlx::Err
     })
 }
 
-/// 1536 -> "1.5 KiB".
+/// 1536 -> "1.5 KiB". Units switch on the rounded value, so 1048575 bytes
+/// prints "1.0 MiB", never "1024.0 KiB".
 fn human(bytes: f64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1023.95 {
+        return format!("{bytes:.0} B");
+    }
     let mut v = bytes;
     let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
+    while i < UNITS.len() - 1 && v >= 1023.95 {
         v /= 1024.0;
         i += 1;
     }
-    if i == 0 {
-        format!("{v:.0} B")
-    } else {
-        format!("{v:.1} {}", UNITS[i])
-    }
+    format!("{v:.1} {}", UNITS[i])
 }
 
 pub async fn run(cfg: knot_config::Config, days: i32) -> anyhow::Result<()> {
@@ -139,4 +139,17 @@ pub async fn run(cfg: knot_config::Config, days: i32) -> anyhow::Result<()> {
         human(s.doc_updates_relation_bytes as f64)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human;
+
+    #[test]
+    fn human_switches_units_on_the_rounded_value() {
+        assert_eq!(human(1023.0), "1023 B");
+        assert_eq!(human(1024.0), "1.0 KiB");
+        assert_eq!(human(1_048_575.0), "1.0 MiB");
+        assert_eq!(human(1_048_576.0), "1.0 MiB");
+    }
 }

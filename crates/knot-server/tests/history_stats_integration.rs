@@ -20,7 +20,7 @@ async fn seed_updates(pool: &PgPool, doc: Uuid, rows: i32, bytes: i32, days_ago:
     for _ in 0..rows {
         sqlx::query(
             "INSERT INTO doc_updates (doc_id, update_bytes, created_at)
-             VALUES ($1, decode(repeat('ab', $2), 'hex'), now() - make_interval(days => $3))",
+             VALUES ($1, decode(repeat('ab', $2), 'hex'), date_trunc('day', now()) + interval '12 hours' - make_interval(days => $3))",
         )
         .bind(doc)
         .bind(bytes)
@@ -52,6 +52,8 @@ async fn history_stats_reports_rows_bytes_and_daily_rates() {
     seed_updates(pool, a, 4, 10, 0).await;
     seed_updates(pool, a, 2, 10, 1).await;
     seed_updates(pool, b, 1, 40, 0).await;
+    // Outside the 30 day window: counts in the totals, not in the daily rates.
+    seed_updates(pool, b, 1, 20, 40).await;
     sqlx::query(
         "INSERT INTO doc_history_baselines (doc_id, snapshot_seq, state_bytes, state_vector, created_at)
          VALUES ($1, 1, decode(repeat('ab', 100), 'hex'), decode(repeat('cd', 7), 'hex'), now())",
@@ -62,9 +64,10 @@ async fn history_stats_reports_rows_bytes_and_daily_rates() {
     .unwrap();
 
     let s = knot_server::history_stats::collect(pool, 30).await.unwrap();
-    assert_eq!(s.update_rows, 7);
-    assert_eq!(s.update_bytes_total, 100);
-    assert!((s.update_bytes_avg - 100.0 / 7.0).abs() < 1e-9);
+    // Rows: 4 + 2 + 1 + 1 old = 8. Bytes: 40 + 20 + 40 + 20 = 120.
+    assert_eq!(s.update_rows, 8);
+    assert_eq!(s.update_bytes_total, 120);
+    assert!((s.update_bytes_avg - 120.0 / 8.0).abs() < 1e-9);
     assert_eq!(s.pages_with_updates, 2);
     assert_eq!(s.rows_per_page_day_max, 4);
     assert!((s.rows_per_page_day_p50 - 2.0).abs() < 1e-9); // groups: 4, 2, 1

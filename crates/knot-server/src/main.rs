@@ -35,7 +35,7 @@ enum Cmd {
     /// Report how fast the page-history log grows. Read-only; does not migrate.
     HistoryStats {
         /// Window for the rows-per-page-per-day figures.
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(i32).range(1..))]
         days: i32,
     },
 }
@@ -72,7 +72,7 @@ async fn main() {
         }
         Cmd::HistoryStats { days } => {
             if let Err(e) = knot_server::history_stats::run(cfg, days).await {
-                eprintln!("history-stats: {e}");
+                eprintln!("history-stats: {e:#}");
                 process::exit(1);
             }
         }
