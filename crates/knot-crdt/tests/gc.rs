@@ -3,7 +3,7 @@
 
 use knot_crdt::GcRun;
 use knot_storage::PgSnapshotStore;
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 use uuid::Uuid;
 
 /// The literal the plan fixes; the test pins the const to it so the two
@@ -122,7 +122,9 @@ async fn gc_is_single_flight_across_replicas() {
     ));
 
     // And run_once released its own lock: another session can take it now.
-    let mut probe = pool.acquire().await.unwrap().detach();
+    // The probe is opened outside the pool, so it cannot be the same session
+    // (advisory locks are reentrant per session).
+    let mut probe = sqlx::PgConnection::connect(&db.url).await.unwrap();
     let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(GC_LOCK_KEY_FOR_TEST)
         .fetch_one(&mut probe)

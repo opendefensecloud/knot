@@ -43,7 +43,9 @@ pub async fn run_once(pool: &PgPool, snapshots: &dyn SnapshotStore) -> Result<Gc
     // A session-level lock on a connection taken out of the pool: dropping
     // it closes the session, which releases the lock even if this run
     // fails part-way. A pooled connection would go back to the pool still
-    // holding the lock and stop every later run, on every replica.
+    // holding the lock and stop every later run, on every replica. The
+    // success path still unlocks explicitly: the drop only closes the
+    // socket, so the server would release the lock asynchronously.
     let mut lock_conn = pool.acquire().await?.detach();
     let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(GC_LOCK_KEY)
@@ -61,6 +63,13 @@ pub async fn run_once(pool: &PgPool, snapshots: &dyn SnapshotStore) -> Result<Gc
             Ok(n) => snapshots_deleted += n,
             Err(e) => tracing::warn!(error=?e, %doc_id, "gc snapshots failed"),
         }
+    }
+    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(GC_LOCK_KEY)
+        .execute(&mut lock_conn)
+        .await
+    {
+        tracing::warn!(error=?e, "gc: releasing the lock failed");
     }
     drop(lock_conn);
     Ok(GcRun::Ran {
