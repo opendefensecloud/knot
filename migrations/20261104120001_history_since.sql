@@ -30,13 +30,15 @@
 -- the Job retries. While an attempt waits, all access to documents queues
 -- behind it, page reads and edit saves (their FK checks) included, for at
 -- most 100 ms. When an autovacuum worker holds documents, the loop waits
--- for the lock alone for deadlock_timeout + 500 ms once per worker, so the
--- deadlock check cancels it (see 20261104120000, item 1); the meta table's
--- ACCESS SHARE is the only other lock held, and no app touches that table.
--- A long reader (pg_dump, a slow export) or an anti-wraparound autovacuum
--- can outlast the loop; 20261104120000 has committed by then, so re-run the
--- upgrade once it is gone (see the Helm chart README). The error names the
--- sessions holding the lock.
+-- for the lock alone for deadlock_timeout + 500 ms, at most every 5 s per
+-- worker, so the deadlock check cancels it; all access to documents queues
+-- meanwhile. Detection, the anti-wraparound skip and the snapshot refresh
+-- are as in 20261104120000, item 1. The meta table's ACCESS SHARE is the
+-- only other lock held, and no app touches that table. A long reader
+-- (pg_dump, a slow export) or an anti-wraparound autovacuum can outlast the
+-- loop; 20261104120000 has committed by then, so re-run the upgrade once it
+-- is gone (see the Helm chart README). The error names up to three sessions
+-- holding a lock on documents, oldest transaction first.
 SET LOCAL lock_timeout = '5s';
 
 DO $$
@@ -47,7 +49,8 @@ DECLARE
   lone      int := 0;
   since     timestamptz;
   vacuum    int;
-  tried     int[] := '{}';
+  waited    int[] := '{}';          -- pid of each lone wait ...
+  waited_at timestamptz[] := '{}';  -- ... and when it started
   holders   text;
 BEGIN
   SELECT keeps_since INTO STRICT since FROM doc_history_meta;
@@ -67,16 +70,19 @@ BEGIN
       NULL;
     END;
     -- An autovacuum worker on documents, as in 20261104120000.
+    PERFORM pg_stat_clear_snapshot();
     SELECT l.pid INTO vacuum
       FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
      WHERE l.locktype = 'relation' AND l.relation = 'documents'::regclass AND l.granted
        AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
        AND (a.backend_type = 'autovacuum worker' OR (a.backend_type IS NULL AND a.usesysid IS NULL))
        AND coalesce(a.query, '') NOT LIKE '%to prevent wraparound%'
-       AND l.pid <> ALL (tried)
+       AND NOT EXISTS (SELECT 1 FROM unnest(waited, waited_at) AS w(p, at)
+                        WHERE w.p = l.pid AND w.at > clock_timestamp() - interval '5 seconds')
      LIMIT 1;
     IF vacuum IS NOT NULL AND clock_timestamp() < deadline THEN
-      tried := tried || vacuum;
+      waited := waited || vacuum;
+      waited_at := waited_at || clock_timestamp();
       lone := lone + 1;
       BEGIN
         PERFORM set_config('lock_timeout', lone_wait, true);
@@ -88,20 +94,29 @@ BEGIN
       CONTINUE;
     END IF;
     IF clock_timestamp() >= deadline THEN
-      SELECT string_agg(format('pid %s (%s%s)', h.pid,
-               CASE WHEN a.backend_type IS NOT NULL THEN a.backend_type
-                    WHEN a.usesysid IS NULL THEN 'autovacuum or another background process'
-                    ELSE 'a session of role ' || a.usename END,
-               CASE WHEN a.query IS NULL OR a.query = '<insufficient privilege>' THEN ''
-                    ELSE ', ' || coalesce(a.state, '?') || ': ' || left(regexp_replace(a.query, '\s+', ' ', 'g'), 60) END),
-             '; ')
+      -- Up to three holders of any lock on documents (all conflict with
+      -- ACCESS EXCLUSIVE), oldest transaction first.
+      PERFORM pg_stat_clear_snapshot();
+      SELECT string_agg(
+               CASE WHEN x.pid IS NULL THEN 'a prepared transaction'
+                    ELSE format('pid %s (%s%s)', x.pid,
+                      CASE WHEN x.apid IS NULL THEN 'a session that has ended'
+                           WHEN x.backend_type IS NOT NULL THEN x.backend_type
+                           WHEN x.usesysid IS NULL THEN 'autovacuum or another background process'
+                           ELSE 'a session of role ' || x.usename END,
+                      CASE WHEN x.query IS NULL OR x.query = '<insufficient privilege>' THEN ''
+                           ELSE ', ' || coalesce(x.state, '?') || ': ' || left(regexp_replace(x.query, '\s+', ' ', 'g'), 100) END)
+               END, '; ' ORDER BY x.since NULLS FIRST)
         INTO holders
-        FROM (SELECT DISTINCT pid FROM pg_locks
-               WHERE locktype = 'relation' AND relation = 'documents'::regclass AND granted
-                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-                 AND pid <> pg_backend_pid()
-               LIMIT 3) h
-        LEFT JOIN pg_stat_activity a ON a.pid = h.pid;
+        FROM (SELECT h.pid, a.pid AS apid, a.backend_type, a.usesysid, a.usename, a.state, a.query,
+                     coalesce(a.xact_start, a.backend_start) AS since
+                FROM (SELECT DISTINCT pid, virtualtransaction FROM pg_locks
+                       WHERE locktype = 'relation' AND relation = 'documents'::regclass AND granted
+                         AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                         AND pid IS DISTINCT FROM pg_backend_pid()) h
+                LEFT JOIN pg_stat_activity a ON a.pid = h.pid
+               ORDER BY since NULLS FIRST
+               LIMIT 3) x;
       RAISE EXCEPTION 'history_since: could not get ACCESS EXCLUSIVE on documents within 45 s (% attempts, % lone waits); held by %. The migrate Job will retry.',
         attempts, lone, coalesce(holders, 'no one any more');
     END IF;

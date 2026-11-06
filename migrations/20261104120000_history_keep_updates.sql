@@ -33,10 +33,19 @@
 --      never reach. So when an attempt fails on a table an autovacuum worker
 --      holds, the loop waits for that table's lock alone, holding nothing
 --      else, for deadlock_timeout + 500 ms: the check cancels the worker,
---      and the wait then rolls back at once (once per worker; it pauses
---      that table's writers for up to that long). An anti-wraparound
---      autovacuum is never cancelled; that wait just times out. On giving
---      up, the error names the sessions holding the lock.
+--      and the wait then rolls back at once. It pauses that table's writers
+--      for up to that long, at most every 5 s per worker and table, so a
+--      worker that moves on to the other table, or a check that reordered
+--      a wait queue instead of cancelling, gets another wait. A worker is
+--      backend_type 'autovacuum worker' or, without pg_read_all_stats
+--      (which hides other roles' backend_type), any lock holder with no
+--      role, i.e. a background process. A visibly anti-wraparound worker is
+--      skipped, since Postgres never cancels one; without pg_read_all_stats
+--      its query can't be seen, so its lone wait just times out. Every read
+--      of pg_stat_activity is preceded by pg_stat_clear_snapshot(): it is
+--      otherwise frozen for the transaction. On giving up, the error names
+--      up to three sessions holding a conflicting lock, oldest transaction
+--      first.
 --   2. From then on every statement needs only locks this transaction
 --      already holds, locks on tables it creates, or ACCESS SHARE on
 --      doc_snapshots (the copy), which no app transaction conflicts with.
@@ -70,7 +79,8 @@ DECLARE
   lone      int := 0;
   missing   regclass;
   vacuum    int;
-  tried     int[] := '{}';
+  waited    text[] := '{}';         -- 'pid:relation' of each lone wait ...
+  waited_at timestamptz[] := '{}';  -- ... and when it started
   holders   text;
 BEGIN
   LOOP
@@ -86,21 +96,24 @@ BEGIN
       -- The subtransaction rolled back: documents is released again.
       NULL;
     END;
-    -- An autovacuum worker on the table this attempt didn't get (without
-    -- pg_read_all_stats its backend_type reads NULL; a backend with no role
-    -- is a background process). Not anti-wraparound, not tried before.
+    -- An autovacuum worker on the table this attempt didn't get, not
+    -- visibly anti-wraparound, not waited on for this table in the last 5 s.
+    PERFORM pg_stat_clear_snapshot();
     SELECT l.pid INTO vacuum
       FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
      WHERE l.locktype = 'relation' AND l.relation = missing AND l.granted
        AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
        AND (a.backend_type = 'autovacuum worker' OR (a.backend_type IS NULL AND a.usesysid IS NULL))
        AND coalesce(a.query, '') NOT LIKE '%to prevent wraparound%'
-       AND l.pid <> ALL (tried)
+       AND NOT EXISTS (SELECT 1 FROM unnest(waited, waited_at) AS w(k, at)
+                        WHERE w.k = l.pid || ':' || l.relation
+                          AND w.at > clock_timestamp() - interval '5 seconds')
      LIMIT 1;
     IF vacuum IS NOT NULL AND clock_timestamp() < deadline THEN
       -- The lone wait: this table's lock alone, long enough for the
       -- deadlock check to cancel the worker, then released by rolling back.
-      tried := tried || vacuum;
+      waited := waited || (vacuum || ':' || missing::oid);
+      waited_at := waited_at || clock_timestamp();
       lone := lone + 1;
       BEGIN
         PERFORM set_config('lock_timeout', lone_wait, true);
@@ -116,21 +129,30 @@ BEGIN
       CONTINUE;
     END IF;
     IF clock_timestamp() >= deadline THEN
-      SELECT string_agg(format('pid %s (%s%s)', h.pid,
-               CASE WHEN a.backend_type IS NOT NULL THEN a.backend_type
-                    WHEN a.usesysid IS NULL THEN 'autovacuum or another background process'
-                    ELSE 'a session of role ' || a.usename END,
-               CASE WHEN a.query IS NULL OR a.query = '<insufficient privilege>' THEN ''
-                    ELSE ', ' || coalesce(a.state, '?') || ': ' || left(regexp_replace(a.query, '\s+', ' ', 'g'), 60) END),
-             '; ')
+      -- Up to three holders of a lock that conflicts with SHARE ROW
+      -- EXCLUSIVE, oldest transaction first.
+      PERFORM pg_stat_clear_snapshot();
+      SELECT string_agg(
+               CASE WHEN x.pid IS NULL THEN 'a prepared transaction'
+                    ELSE format('pid %s (%s%s)', x.pid,
+                      CASE WHEN x.apid IS NULL THEN 'a session that has ended'
+                           WHEN x.backend_type IS NOT NULL THEN x.backend_type
+                           WHEN x.usesysid IS NULL THEN 'autovacuum or another background process'
+                           ELSE 'a session of role ' || x.usename END,
+                      CASE WHEN x.query IS NULL OR x.query = '<insufficient privilege>' THEN ''
+                           ELSE ', ' || coalesce(x.state, '?') || ': ' || left(regexp_replace(x.query, '\s+', ' ', 'g'), 100) END)
+               END, '; ' ORDER BY x.since NULLS FIRST)
         INTO holders
-        FROM (SELECT DISTINCT pid FROM pg_locks
-               WHERE locktype = 'relation' AND relation = missing AND granted
-                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-                 AND pid <> pg_backend_pid()
-                 AND mode NOT IN ('AccessShareLock', 'RowShareLock')
-               LIMIT 3) h
-        LEFT JOIN pg_stat_activity a ON a.pid = h.pid;
+        FROM (SELECT h.pid, a.pid AS apid, a.backend_type, a.usesysid, a.usename, a.state, a.query,
+                     coalesce(a.xact_start, a.backend_start) AS since
+                FROM (SELECT DISTINCT pid, virtualtransaction FROM pg_locks
+                       WHERE locktype = 'relation' AND relation = missing AND granted
+                         AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                         AND pid IS DISTINCT FROM pg_backend_pid()
+                         AND mode NOT IN ('AccessShareLock', 'RowShareLock')) h
+                LEFT JOIN pg_stat_activity a ON a.pid = h.pid
+               ORDER BY since NULLS FIRST
+               LIMIT 3) x;
       RAISE EXCEPTION 'history_keep_updates: could not get SHARE ROW EXCLUSIVE on % within 45 s (% attempts, % lone waits); held by %. The migrate Job will retry.',
         missing, attempts, lone, coalesce(holders, 'no one any more');
     END IF;
