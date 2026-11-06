@@ -149,7 +149,7 @@ db.cleanup: ## drop all leftover t_* test databases from the dev Postgres
 	| while read db; do \
 		[ -z "$$db" ] && continue; \
 		echo "drop $$db"; \
-		docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d postgres -c "DROP DATABASE IF EXISTS \"$$db\"" >/dev/null; \
+		docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d postgres -c "DROP DATABASE IF EXISTS \"$$db\"" >/dev/null </dev/null; \
 	done; \
 	echo "done"
 
