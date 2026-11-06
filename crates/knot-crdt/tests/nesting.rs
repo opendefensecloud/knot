@@ -349,9 +349,6 @@ impl knot_storage::UpdatesStore for CapturingUpdates {
     async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
         Ok(0)
     }
-    async fn delete_up_to(&self, _: Uuid, _: i64) -> Result<u64, knot_storage::UpdatesStoreError> {
-        Ok(0)
-    }
 }
 
 /// Records the state of every snapshot a room writes, and serves none.
@@ -1108,9 +1105,6 @@ impl knot_storage::UpdatesStore for Stored {
     }
     async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
         Ok(self.rows().len() as i64)
-    }
-    async fn delete_up_to(&self, _: Uuid, _: i64) -> Result<u64, knot_storage::UpdatesStoreError> {
-        Ok(0)
     }
 }
 

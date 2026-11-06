@@ -32,6 +32,7 @@ pub mod comments_listener;
 pub mod duplicate;
 pub mod export;
 pub mod export_check;
+pub mod history_stats;
 pub mod http_error;
 pub mod metrics;
 pub mod notifications_sweep;

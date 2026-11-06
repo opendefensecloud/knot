@@ -1635,13 +1635,6 @@ impl knot_storage::UpdatesStore for SlowUpdates {
     async fn max_seq(&self, doc_id: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
         self.inner.max_seq(doc_id).await
     }
-    async fn delete_up_to(
-        &self,
-        doc_id: Uuid,
-        cutoff_seq: i64,
-    ) -> Result<u64, knot_storage::UpdatesStoreError> {
-        self.inner.delete_up_to(doc_id, cutoff_seq).await
-    }
 }
 
 /// An accept whose request is dropped while the room is still applying

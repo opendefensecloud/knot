@@ -8,6 +8,75 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-11-06
+
+### Upgrading
+- Two database migrations run on upgrade, each in its own transaction
+  (the Helm chart's migrate hook applies them). Don't upgrade while
+  `pg_dump`, another long transaction or an anti-wraparound autovacuum
+  runs on the database. An ordinary autovacuum in the way is cancelled:
+  the migration waits for that table's lock for about deadlock_timeout +
+  0.5 s (1.5 s by default), repeated at most every 5 s while a worker
+  stays, and that table's writers (for the second migration, all page
+  access) pause meanwhile. Pass `helm upgrade --timeout` of the expected
+  copy time plus 6 minutes: in the worst case that still succeeds, the
+  lock loops take 4 × 45 s (the Job runs three attempts; two give up,
+  the third uses both loops in full), plus Job restart backoff and the
+  image pull. Rolling back to 0.9.8 needs a database restore once
+  either migration has committed: 0.9.8 doesn't start on a database with
+  migrations it doesn't know, so a 0.9.8 pod that restarts crash-loops
+  until a new pod replaces it. If the upgrade halts,
+  `SELECT version FROM _sqlx_migrations WHERE version >= 20261104120000`
+  says what to do. No rows: nothing was applied and 0.9.8 keeps working;
+  re-run at a quieter time. Only 20261104120000: running 0.9.8 pods keep
+  serving, but re-run promptly once the blocker is gone. Both (Helm's
+  hook timeout fired while the Job went on): re-run now. Let a running
+  migrate Job finish first. The Job's error names up to three sessions
+  holding the locks; follow it with `kubectl logs -f` during the upgrade,
+  because Kubernetes deletes the Job's pod, and its log, once the Job
+  gives up. The Helm chart README has the details and a query that shows
+  what holds the locks. (#79)
+  - `20261104120000_history_keep_updates` makes the stored edit log
+    append-only and copies every stored snapshot into
+    `doc_history_baselines`. Check
+    `SELECT pg_size_pretty(pg_total_relation_size('doc_snapshots'))`
+    beforehand: the copy takes about as long as reading and writing that
+    much data (some 261 MB took 0.87 s on a local SSD; network disks are
+    slower). During the copy, saving edits waits, and so do creating,
+    renaming, moving, archiving, restoring, duplicating and purging
+    pages, making a page a template and restricting a page. On a busy
+    instance the waiting saves can fill each old pod's database pool, so
+    pages may stop loading and pods may briefly go NotReady until the
+    copy finishes. Upgrade in a quiet window when `doc_snapshots` is
+    larger than a few hundred MB. Don't re-run the upgrade while the
+    migrate Job is still running: that deletes the running Job and starts
+    the copy over. Before the copy it takes its locks in attempts 0.5 s
+    apart, for up to 45 s per Job attempt; each attempt pauses page
+    writes for at most 100 ms.
+  - `20261104120001_history_since` adds `documents.history_since`. It
+    takes an exclusive lock on `documents` in attempts 0.5 s apart, for
+    up to 45 s per Job attempt; each attempt pauses all page access, page
+    reads and edit saves included, for at most 100 ms.
+- The database grows with every edit from now on; watch the size of
+  `doc_updates`. Older pods still running during the rolling upgrade log a
+  `doc_updates is append-only` warning from their hourly cleanup; that is
+  expected and harmless. (#79)
+
+### Added
+- `knot-server history-stats` reports how fast the stored edit log grows
+  (rows per page per day, and the average and total row bytes). It needs
+  the server's `KNOT_*` environment, so run it inside a knot pod (see the
+  Helm chart README). Its per-day rates cover the last `--days` days
+  (default 30), and before the upgrade the old cleanup deleted edits, so
+  run it at least 30 days after upgrading, or pass a `--days` below the
+  days since the upgrade. Share the output with the maintainers. (#79)
+
+### Changed
+- Knot no longer deletes old edits. Every change to a page is kept for the
+  page's whole life (purging a page still removes it). This is the
+  groundwork for the page history timeline; the History drawer itself is
+  unchanged in this release. (#79)
+
 ### Fixed
 - The @-mention list works with the keyboard in a table cell. ArrowUp and
   ArrowDown moved the cursor to the neighbouring cell and closed the list,
@@ -1046,7 +1115,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.8...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.9...HEAD
+[0.9.9]: https://github.com/opendefensecloud/knot/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/opendefensecloud/knot/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/opendefensecloud/knot/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/opendefensecloud/knot/compare/v0.9.5...v0.9.6

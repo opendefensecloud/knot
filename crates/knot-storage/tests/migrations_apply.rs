@@ -39,6 +39,7 @@ async fn migrations_apply_cleanly() {
         "comment_reactions",
         "comments",
         "doc_contributors",
+        "doc_history_baselines",
         "doc_markdown_cache",
         "doc_markdown_sweep_attempts",
         "doc_snapshots",
@@ -1002,4 +1003,464 @@ async fn one_statement_may_swap_keys_after_migration() {
         .map(|id| after[id].sort_key.as_str())
         .collect();
     assert_eq!(keys, ["b", "a", "d", "c"]);
+}
+
+// ---------------------------------------------------------------------------
+// Page history: append-only doc_updates, permanent baselines
+// ---------------------------------------------------------------------------
+
+fn kh001(e: sqlx::Error) -> bool {
+    e.as_database_error().and_then(|d| d.code()).as_deref() == Some("KH001")
+}
+
+async fn seed_ws_user(pool: &PgPool) -> (Uuid, Uuid) {
+    let ws: Uuid = sqlx::query_scalar(
+        "INSERT INTO workspaces (slug, name) VALUES ('default', 'W') RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let user: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, display_name) VALUES ('a@x.test', 'Alice') RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (ws, user)
+}
+
+async fn seed_doc_with_updates(
+    pool: &PgPool,
+    ws: Uuid,
+    user: Uuid,
+    parent: Option<Uuid>,
+    n: usize,
+) -> Uuid {
+    let doc: Uuid = sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+         VALUES ($1, $2, 'D', 'm', $3) RETURNING id",
+    )
+    .bind(ws)
+    .bind(parent)
+    .bind(user)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    for _ in 0..n {
+        sqlx::query("INSERT INTO doc_updates (doc_id, update_bytes) VALUES ($1, '\\x01')")
+            .bind(doc)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    doc
+}
+
+async fn count_updates_any(pool: &PgPool, docs: &[Uuid]) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM doc_updates WHERE doc_id = ANY($1)")
+        .bind(docs)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A pool on a fresh, fully migrated database with one doc holding two updates.
+async fn history_fixture() -> (PgPool, Uuid, Uuid) {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let doc = seed_doc_with_updates(&pool, ws, user, None, 2).await;
+    (pool, ws, doc)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_delete_of_doc_updates_is_refused() {
+    let (pool, _, doc) = history_fixture().await;
+    let e = sqlx::query("DELETE FROM doc_updates WHERE doc_id = $1")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(kh001(e));
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn old_gc_delete_statement_is_refused() {
+    let (pool, _, doc) = history_fixture().await;
+    // The exact statement of knot <= 0.9.8's UpdatesStore::delete_up_to.
+    let e = sqlx::query("DELETE FROM doc_updates WHERE doc_id = $1 AND seq <= $2")
+        .bind(doc)
+        .bind(i64::MAX)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(kh001(e));
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rewriting_update_bytes_is_refused() {
+    let (pool, _, doc) = history_fixture().await;
+    let e = sqlx::query("UPDATE doc_updates SET update_bytes = '\\x00' WHERE doc_id = $1")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(kh001(e));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flagged_history_rewrite_is_allowed() {
+    let (pool, _, doc) = history_fixture().await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL knot.history_rewrite = 'on'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let done = sqlx::query("UPDATE doc_updates SET update_bytes = '\\x00' WHERE doc_id = $1")
+        .bind(doc)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // A trigger returning NULL would skip every row without an error.
+    assert_eq!(done.rows_affected(), 2);
+    let bytes: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT update_bytes FROM doc_updates WHERE doc_id = $1")
+            .bind(doc)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(bytes, vec![vec![0u8], vec![0u8]]);
+    tx.rollback().await.unwrap();
+
+    // The flag was transaction-local: the same statement is refused again.
+    let e = sqlx::query("UPDATE doc_updates SET update_bytes = '\\x00' WHERE doc_id = $1")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(kh001(e));
+}
+
+/// The erase path (a later milestone) deletes single rows under the flag.
+/// Pooled connections are reused, so a committed flag must not outlive its
+/// transaction on that connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn flagged_history_rewrite_allows_delete_and_does_not_leak() {
+    let (pool, _, doc) = history_fixture().await;
+    let seqs: Vec<i64> =
+        sqlx::query_scalar("SELECT seq FROM doc_updates WHERE doc_id = $1 ORDER BY seq")
+            .bind(doc)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(seqs.len(), 2);
+
+    let mut conn = pool.acquire().await.unwrap();
+    let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    let mut tx = sqlx::Connection::begin(&mut *conn).await.unwrap();
+    sqlx::query("SET LOCAL knot.history_rewrite = 'on'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let done = sqlx::query("DELETE FROM doc_updates WHERE seq = $1")
+        .bind(seqs[0])
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(done.rows_affected(), 1);
+    tx.commit().await.unwrap();
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 1);
+
+    // Same pooled connection, same backend, after COMMIT: the flag is gone.
+    let again: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(again, backend);
+    let e = sqlx::query("DELETE FROM doc_updates WHERE seq = $1")
+        .bind(seqs[1])
+        .execute(&mut *conn)
+        .await
+        .unwrap_err();
+    assert!(kh001(e));
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn purge_cascade_through_subpages_still_deletes_updates() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let p = seed_doc_with_updates(&pool, ws, user, None, 2).await;
+    let c = seed_doc_with_updates(&pool, ws, user, Some(p), 2).await;
+    let g = seed_doc_with_updates(&pool, ws, user, Some(c), 2).await;
+    assert_eq!(count_updates_any(&pool, &[p, c, g]).await, 6);
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(p)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count_updates_any(&pool, &[p, c, g]).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_delete_cascade_still_deletes_updates() {
+    let (pool, ws, doc) = history_fixture().await;
+    sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(ws)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 0);
+}
+
+/// `e2e/support/reset.ts` wipes tenant data with `TRUNCATE ... CASCADE`, which
+/// fires no row triggers; the append-only trigger must not get in its way.
+#[tokio::test(flavor = "multi_thread")]
+async fn truncate_cascade_is_not_blocked_by_append_only_trigger() {
+    let (pool, _, doc) = history_fixture().await;
+    sqlx::query(
+        "TRUNCATE TABLE doc_history_baselines, doc_snapshots, doc_updates, documents, \
+         users, workspaces CASCADE",
+    )
+    .execute(&pool)
+    .await
+    .expect("truncate");
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 0);
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM doc_updates")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_migration_copies_snapshots_and_stamps_history_since() {
+    use chrono::{DateTime, Utc};
+    use sqlx::migrate::Migrator;
+
+    // The trigger, baselines and copy; then history_since on its own.
+    const VERSION: i64 = 20261104120000;
+    const HISTORY_SINCE: i64 = 20261104120001;
+
+    let url = knot_test_support::fresh_db_url().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("connect");
+    let full = sqlx::migrate!("../../migrations");
+    for v in [VERSION, HISTORY_SINCE] {
+        assert!(
+            full.migrations.iter().any(|m| m.version == v),
+            "migration {v} not embedded (cargo clean -p knot-storage?)"
+        );
+    }
+    let before = Migrator {
+        migrations: std::borrow::Cow::Owned(
+            full.migrations
+                .iter()
+                .filter(|m| m.version < VERSION)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    };
+    before
+        .run(&pool)
+        .await
+        .expect("migrate to previous version");
+
+    let (ws, user) = seed_ws_user(&pool).await;
+    let doc: Uuid = sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, title, sort_key, created_by, created_at)
+         VALUES ($1, 'D', 'm', $2, '2026-01-01T00:00:00Z') RETURNING id",
+    )
+    .bind(ws)
+    .bind(user)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for (seq, day) in [(10_i64, 2), (20, 3), (30, 4)] {
+        sqlx::query(
+            "INSERT INTO doc_snapshots (doc_id, snapshot_seq, state_bytes, state_vector, created_at)
+             VALUES ($1, $2, $3, $4, make_timestamptz(2026, 1, $5, 0, 0, 0, 'UTC'))",
+        )
+        .bind(doc)
+        .bind(seq)
+        .bind(vec![seq as u8, 1, 2])
+        .bind(vec![seq as u8, 9])
+        .bind(day)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    full.run(&pool).await.expect("apply history migrations");
+    // Two migrations, each recorded on its own.
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM _sqlx_migrations WHERE version >= $1 ORDER BY version",
+    )
+    .bind(VERSION)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(applied[..2], [VERSION, HISTORY_SINCE]);
+    let t_mig: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    type Row = (i64, Vec<u8>, Vec<u8>, DateTime<Utc>);
+    let snaps: Vec<Row> = sqlx::query_as(
+        "SELECT snapshot_seq, state_bytes, state_vector, created_at
+         FROM doc_snapshots WHERE doc_id = $1 ORDER BY snapshot_seq",
+    )
+    .bind(doc)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let baselines: Vec<Row> = sqlx::query_as(
+        "SELECT snapshot_seq, state_bytes, state_vector, created_at
+         FROM doc_history_baselines WHERE doc_id = $1 ORDER BY snapshot_seq",
+    )
+    .bind(doc)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(baselines.len(), 3);
+    assert_eq!(baselines, snaps);
+
+    let (created_at, history_since): (DateTime<Utc>, DateTime<Utc>) =
+        sqlx::query_as("SELECT created_at, history_since FROM documents WHERE id = $1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(created_at < history_since, "old page predates history");
+    assert!((t_mig - history_since).num_seconds().abs() < 60);
+
+    // A page created after the migration is a "new page".
+    let fresh: Uuid = sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, title, sort_key, created_by)
+         VALUES ($1, 'N', 'n', $2) RETURNING id",
+    )
+    .bind(ws)
+    .bind(user)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let new_page: bool =
+        sqlx::query_scalar("SELECT created_at >= history_since FROM documents WHERE id = $1")
+            .bind(fresh)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(new_page);
+
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM doc_history_baselines WHERE doc_id = $1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "baselines cascade with the page");
+}
+
+/// `history_since` of every page that exists when 20261104120001 runs is the
+/// moment 20261104120000 made deletes impossible, however long ago that
+/// committed; later pages default to their insert time.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_since_is_the_moment_deletes_stopped() {
+    use chrono::{DateTime, Utc};
+    use sqlx::migrate::Migrator;
+
+    const KEEP_UPDATES: i64 = 20261104120000;
+    const HISTORY_SINCE: i64 = 20261104120001;
+
+    let url = knot_test_support::fresh_db_url().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("connect");
+    let full = sqlx::migrate!("../../migrations");
+    let up_to = |last: i64| Migrator {
+        migrations: std::borrow::Cow::Owned(
+            full.migrations
+                .iter()
+                .filter(|m| m.version <= last)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    };
+    up_to(KEEP_UPDATES - 1)
+        .run(&pool)
+        .await
+        .expect("migrate to before the history migrations");
+    let (ws, user) = seed_ws_user(&pool).await;
+    let insert_page = |sort_key: &'static str| {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO documents (workspace_id, title, sort_key, created_by)
+             VALUES ($1, 'D', $2, $3) RETURNING id",
+        )
+        .bind(ws)
+        .bind(sort_key)
+        .bind(user)
+        .fetch_one(&pool)
+    };
+    let old = insert_page("a").await.unwrap();
+
+    up_to(KEEP_UPDATES)
+        .run(&pool)
+        .await
+        .expect("apply keep_updates");
+    let keeps_since: DateTime<Utc> = sqlx::query_scalar("SELECT keeps_since FROM doc_history_meta")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Created between the two migrations: its edits are all kept.
+    let between = insert_page("b").await.unwrap();
+
+    up_to(HISTORY_SINCE)
+        .run(&pool)
+        .await
+        .expect("apply history_since");
+    let after = insert_page("c").await.unwrap();
+
+    let read = |id: Uuid| {
+        sqlx::query_as::<_, (DateTime<Utc>, DateTime<Utc>)>(
+            "SELECT created_at, history_since FROM documents WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+    };
+    let (old_created, old_since) = read(old).await.unwrap();
+    assert_eq!(old_since, keeps_since, "existing page: the stored moment");
+    assert!(old_created < old_since, "existing page predates history");
+
+    let (between_created, between_since) = read(between).await.unwrap();
+    assert_eq!(between_since, keeps_since);
+    assert!(
+        between_created >= between_since,
+        "a page created between the migrations counts as a new page"
+    );
+
+    let (after_created, after_since) = read(after).await.unwrap();
+    assert_eq!(after_since, after_created, "default is the insert time");
+
+    let meta: Option<String> = sqlx::query_scalar("SELECT to_regclass('doc_history_meta')::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(meta, None, "doc_history_meta is dropped");
 }
