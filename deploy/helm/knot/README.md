@@ -196,7 +196,7 @@ During the rollout, pods still on 0.8.1 can answer `409 doc.sort_key_conflict` w
 
 With the S3 blob backend, make sure knot's credentials allow `s3:DeleteObject` (see [S3 blob backend](#s3-blob-backend)). Earlier releases ignored a refused delete when they purged an archived page, deleting the page and leaving its files in the bucket; this release keeps the page and retries.
 
-### Upgrading to the release after 0.9.8
+### Upgrading from 0.9.8
 
 The `pre-upgrade` Job applies two migrations, each in its own transaction. The first, `20261104120000_history_keep_updates`, makes the stored edit log (`doc_updates`) append-only and copies every stored snapshot into the new `doc_history_baselines` table. Check `SELECT pg_size_pretty(pg_total_relation_size('doc_snapshots'))` beforehand: the copy takes about as long as reading and writing that much data (for orientation, some 261 MB took 0.87 s on a local SSD; network disks are slower). While the copy runs, saving edits waits until it finishes, and so do creating, renaming, moving, archiving, restoring, duplicating and purging pages, making a page a template and restricting a page. On a busy instance the waiting saves can fill each old pod's database pool, so pages may stop loading and pods may briefly go NotReady until the copy finishes. When `doc_snapshots` is larger than a few hundred MB, upgrade in a quiet window. The second, `20261104120001_history_since`, adds `documents.history_since`. It needs an exclusive lock on `documents`: each attempt to get it pauses all page access, page reads and edit saves included, for at most 100 ms.
 

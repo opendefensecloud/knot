@@ -8,6 +8,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-11-06
+
 ### Upgrading
 - Two database migrations run on upgrade, each in its own transaction
   (the Helm chart's migrate hook applies them). Don't upgrade while
@@ -1113,7 +1115,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.8...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.9...HEAD
+[0.9.9]: https://github.com/opendefensecloud/knot/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/opendefensecloud/knot/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/opendefensecloud/knot/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/opendefensecloud/knot/compare/v0.9.5...v0.9.6
