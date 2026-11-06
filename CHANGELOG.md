@@ -12,10 +12,15 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - Two database migrations run on upgrade, each in its own transaction
   (the Helm chart's migrate hook applies them). Don't upgrade while
   `pg_dump`, another long transaction or an anti-wraparound autovacuum
-  runs on the database; an ordinary autovacuum in the way is cancelled.
-  Pass `helm upgrade --timeout` of the expected copy time plus 5 minutes:
-  each migration may spend up to 45 s getting its locks, on each of up to
-  4 Job attempts. Rolling back to 0.9.8 needs a database restore once
+  runs on the database. An ordinary autovacuum in the way is cancelled:
+  the migration waits for that table's lock for about deadlock_timeout +
+  0.5 s (1.5 s by default), repeated at most every 5 s while a worker
+  stays, and that table's writers (for the second migration, all page
+  access) pause meanwhile. Pass `helm upgrade --timeout` of the expected
+  copy time plus 6 minutes: in the worst case that still succeeds, the
+  lock loops take 5 × 45 s (three Job attempts give up, the fourth uses
+  both loops in full), plus about 70 s of Job restart backoff and the
+  image pull. Rolling back to 0.9.8 needs a database restore once
   either migration has committed: 0.9.8 doesn't start on a database with
   migrations it doesn't know, so a 0.9.8 pod that restarts crash-loops
   until a new pod replaces it. If the upgrade halts,
@@ -24,8 +29,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   re-run at a quieter time. Only 20261104120000: running 0.9.8 pods keep
   serving, but re-run promptly once the blocker is gone. Both (Helm's
   hook timeout fired while the Job went on): re-run now. Let a running
-  migrate Job finish first. The Helm chart README has the details and a
-  query that shows what holds the locks.
+  migrate Job finish first. The Job's error names up to three sessions
+  holding the locks, oldest first; read it with `kubectl logs` within 10
+  minutes, before the Job is deleted. The Helm chart README has the
+  details and a query that shows what holds the locks.
   - `20261104120000_history_keep_updates` makes the stored edit log
     append-only and copies every stored snapshot into
     `doc_history_baselines`. Check
