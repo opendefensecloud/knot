@@ -1,10 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { Fragment, useState } from "react";
 
 import type { Member } from "../../lib/validators";
 
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { useUi } from "../../stores/ui";
+import { ApiKeysSection } from "../apiKeys/ApiKeysSection";
 
 import { memberMatches } from "./memberSearch";
 import { workspaceApi } from "./workspace.api";
@@ -32,11 +33,15 @@ export default function MembersPage() {
   const [inviteRole, setInviteRole] = useState<"owner" | "editor" | "viewer">("editor");
   const [invitePassword, setInvitePassword] = useState("");
   const [inviteName, setInviteName] = useState("");
+  const [inviteBot, setInviteBot] = useState(false);
   const [query, setQuery] = useState("");
+  const [keysFor, setKeysFor] = useState<string | null>(null);
 
   const invite = useMutation({
     mutationFn: async () =>
-      workspaceApi.invite(inviteEmail, inviteRole, invitePassword || undefined, inviteName || undefined),
+      inviteBot
+        ? workspaceApi.invite(inviteEmail, inviteRole === "owner" ? "editor" : inviteRole, undefined, inviteName || undefined, "bot")
+        : workspaceApi.invite(inviteEmail, inviteRole, invitePassword || undefined, inviteName || undefined),
     onSuccess: async (r) => {
       if ("error" in r) {
         const msg =
@@ -44,13 +49,18 @@ export default function MembersPage() {
             ? "User not found. Add a password to create the account."
             : r.error.code === "auth.weak_password"
               ? "Password must be at least 8 characters."
-              : "Invite failed.";
+              : r.error.code === "bot.owner_forbidden"
+                ? "A bot cannot be an owner."
+                : r.error.code === "workspace.email_taken"
+                  ? "That email already belongs to an account. Use a new email for a bot."
+                  : "Invite failed.";
         notify("error", msg);
         return;
       }
       setInviteEmail("");
       setInvitePassword("");
       setInviteName("");
+      setInviteBot(false);
       await qc.invalidateQueries({ queryKey: ["members"] });
     },
   });
@@ -119,17 +129,31 @@ export default function MembersPage() {
             >
               <option value="viewer">Viewer</option>
               <option value="editor">Editor</option>
-              <option value="owner">Owner</option>
+              {!inviteBot && <option value="owner">Owner</option>}
             </select>
-            <input
-              data-testid="invite-password"
-              type="password"
-              value={invitePassword}
-              onChange={(e) => setInvitePassword(e.target.value)}
-              placeholder="Initial password (optional)"
-              minLength={8}
-              className={`${inputCls} flex-1 min-w-[180px]`}
-            />
+            {!inviteBot && (
+              <input
+                data-testid="invite-password"
+                type="password"
+                value={invitePassword}
+                onChange={(e) => setInvitePassword(e.target.value)}
+                placeholder="Initial password (optional)"
+                minLength={8}
+                className={`${inputCls} flex-1 min-w-[180px]`}
+              />
+            )}
+            <label className="inline-flex items-center gap-1.5 text-sm text-fg">
+              <input
+                data-testid="invite-kind-bot"
+                type="checkbox"
+                checked={inviteBot}
+                onChange={(e) => {
+                  setInviteBot(e.target.checked);
+                  if (e.target.checked && inviteRole === "owner") setInviteRole("editor");
+                }}
+              />
+              Bot account
+            </label>
             <button
               data-testid="invite-submit"
               type="submit"
@@ -138,6 +162,11 @@ export default function MembersPage() {
               Invite
             </button>
           </form>
+          {inviteBot && (
+            <p data-testid="invite-bot-hint" className="mt-2 text-[13px] text-fg-muted">
+              A bot has no password and logs in only with an API key.
+            </p>
+          )}
         </section>
       )}
       <div className="mb-3 flex items-center gap-3">
@@ -174,40 +203,66 @@ export default function MembersPage() {
               </tr>
             )}
             {shown.map((m) => (
-              <tr key={m.user_id} data-testid={`member-${m.user_id}`} className="border-t border-border">
-                <td className="px-4 py-2 text-fg">{m.email}</td>
-                <td className="px-4 py-2 text-fg">{m.display_name}</td>
-                <td className="px-4 py-2">
-                  {isOwner ? (
-                    <select
-                      value={m.role}
-                      onChange={(e) =>
-                        setRole.mutate({ userId: m.user_id, role: e.target.value as typeof inviteRole })
-                      }
-                      className={selectCls}
-                    >
-                      <option value="viewer">Viewer</option>
-                      <option value="editor">Editor</option>
-                      <option value="owner">Owner</option>
-                    </select>
-                  ) : (
-                    <span className="inline-flex items-center px-2 h-5 rounded-full text-[11px] font-medium bg-muted text-fg-muted">{m.role}</span>
-                  )}
-                </td>
-                {isOwner && (
-                  <td className="px-4 py-2 whitespace-nowrap">
-                    <button
-                      onClick={() => {
-                        const question = `Remove ${m.email}? They also lose every page-level grant, including access to restricted pages.`;
-                        if (window.confirm(question)) remove.mutate(m.user_id);
-                      }}
-                      className="h-8 px-2.5 rounded text-destructive text-[13px] font-medium hover:bg-destructive/10 transition-colors"
-                    >
-                      Remove
-                    </button>
+              <Fragment key={m.user_id}>
+                <tr data-testid={`member-${m.user_id}`} className="border-t border-border">
+                  <td className="px-4 py-2 text-fg">{m.email}</td>
+                  <td className="px-4 py-2 text-fg">
+                    {m.display_name}
+                    {m.kind === "bot" && (
+                      <span data-testid="member-bot-badge" className="ml-2 inline-flex items-center px-2 h-5 rounded-full text-[11px] font-medium bg-accent/15 text-accent">
+                        Bot
+                      </span>
+                    )}
                   </td>
+                  <td className="px-4 py-2">
+                    {isOwner ? (
+                      <select
+                        value={m.role}
+                        onChange={(e) =>
+                          setRole.mutate({ userId: m.user_id, role: e.target.value as typeof inviteRole })
+                        }
+                        className={selectCls}
+                      >
+                        <option value="viewer">Viewer</option>
+                        <option value="editor">Editor</option>
+                        {m.kind !== "bot" && <option value="owner">Owner</option>}
+                      </select>
+                    ) : (
+                      <span className="inline-flex items-center px-2 h-5 rounded-full text-[11px] font-medium bg-muted text-fg-muted">{m.role}</span>
+                    )}
+                  </td>
+                  {isOwner && (
+                    <td className="px-4 py-2 whitespace-nowrap">
+                      {m.kind === "bot" && (
+                        <button
+                          data-testid="member-api-keys"
+                          aria-expanded={keysFor === m.user_id}
+                          onClick={() => setKeysFor(keysFor === m.user_id ? null : m.user_id)}
+                          className="h-8 px-2.5 rounded text-fg text-[13px] font-medium hover:bg-muted transition-colors"
+                        >
+                          API keys
+                        </button>
+                      )}
+                      <button
+                        onClick={() => {
+                          const question = `Remove ${m.email}? They also lose every page-level grant, including access to restricted pages.`;
+                          if (window.confirm(question)) remove.mutate(m.user_id);
+                        }}
+                        className="h-8 px-2.5 rounded text-destructive text-[13px] font-medium hover:bg-destructive/10 transition-colors"
+                      >
+                        Remove
+                      </button>
+                    </td>
+                  )}
+                </tr>
+                {isOwner && m.kind === "bot" && keysFor === m.user_id && (
+                  <tr data-testid={`member-api-keys-panel-${m.user_id}`} className="border-t border-border">
+                    <td colSpan={4} className="px-4 py-3">
+                      <ApiKeysSection targetUserId={m.user_id} />
+                    </td>
+                  </tr>
                 )}
-              </tr>
+              </Fragment>
             ))}
           </tbody>
         </table>

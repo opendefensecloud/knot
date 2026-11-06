@@ -70,7 +70,8 @@ pub enum DuplicateError {
     NotFound,
     /// The user can't put a page under the source's parent, where the copy
     /// goes: the answer of `restricted::require_editable_parent` (404, 403
-    /// or 409), passed on as it is.
+    /// or 409), or a bot's `403 bot.restricted_forbidden`, passed on as it
+    /// is.
     #[error("the source's parent refuses the copy")]
     Destination(Response),
     #[error("the page is a template")]
@@ -218,6 +219,16 @@ pub async fn check(
         None if ctx.role == WorkspaceRole::Viewer => return Err(DuplicateError::EditorRequired),
         None => {}
     }
+    // A copy inside a restricted subtree, or of a restricted page, gives the
+    // user an owner grant, which a bot can never hold.
+    if let Some(response) =
+        crate::bots::deny_bot_restricted_destination(state, ctx, source.parent_id).await
+    {
+        return Err(DuplicateError::Destination(response));
+    }
+    if source.restricted {
+        deny_bot_restricted_copy(state, ctx).await?;
+    }
     if source.is_template {
         return Err(DuplicateError::IsTemplate);
     }
@@ -268,6 +279,9 @@ pub async fn run(
         .await
         .map_err(internal)?;
     let subpages = readable_subpages(live_subpages, &visibility);
+    if subpages.iter().any(|row| row.restricted) {
+        deny_bot_restricted_copy(&state, &ctx).await?;
+    }
     // The restriction boundary the copy goes into, as its parent's.
     let destination_root = source
         .parent_id
@@ -435,6 +449,21 @@ pub async fn run(
         top: outcome.top,
         refresh,
     })
+}
+
+/// `403 bot.restricted_forbidden` when `ctx`'s user is a bot: the copy of a
+/// restricted page carries an owner grant for the user.
+async fn deny_bot_restricted_copy(
+    state: &AppState,
+    ctx: &AuthContext,
+) -> Result<(), DuplicateError> {
+    match crate::bots::is_bot(state, ctx.user_id).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(DuplicateError::Destination(
+            crate::bots::restricted_forbidden(ctx, "duplicate restricted page"),
+        )),
+        Err(response) => Err(DuplicateError::Destination(response)),
+    }
 }
 
 /// The live subpages, from `live_subtree`, that the user can read, in their

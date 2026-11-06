@@ -145,32 +145,9 @@ async fn callback(
         }
     };
 
-    // Resolve existing user by (issuer, subject), then by email, else
-    // auto-provision per policy.
-    let user = match users.find_by_oidc(oidc.issuer(), &id.subject).await {
-        Ok(Some(u)) => u,
-        Ok(None) => match users.find_by_email(&id.email).await {
-            Ok(Some(u)) => u,
-            Ok(None) => match auto_provision(&state, &id, users.as_ref()).await {
-                Ok(Some(u)) => u,
-                Ok(None) => {
-                    return json_err(
-                        StatusCode::FORBIDDEN,
-                        "auth.oidc.not_provisioned",
-                        "user not provisioned",
-                    );
-                }
-                Err(resp) => return resp,
-            },
-            Err(e) => {
-                tracing::error!(error=?e, "oidc lookup");
-                return internal();
-            }
-        },
-        Err(e) => {
-            tracing::error!(error=?e, "oidc lookup");
-            return internal();
-        }
+    let user = match resolve_user(&state, users.as_ref(), oidc.issuer(), &id).await {
+        Ok(u) => u,
+        Err(resp) => return resp,
     };
 
     if workspaces
@@ -218,6 +195,40 @@ async fn callback(
         HeaderValue::from_str(&flow_clear).expect("flow"),
     );
     resp
+}
+
+/// Resolve the user by (issuer, subject), then by email, else auto-provision
+/// per policy. A bot is refused in every branch, before membership or
+/// provisioning: a bot has no interactive credentials, so an IdP account
+/// sharing its email must not get a session as the bot.
+async fn resolve_user(
+    state: &AppState,
+    users: &dyn knot_storage::UserStore,
+    issuer: &str,
+    id: &knot_auth::oidc::VerifiedIdentity,
+) -> Result<knot_storage::User, Response> {
+    let found = match users.find_by_oidc(issuer, &id.subject).await {
+        Ok(Some(u)) => Some(u),
+        Ok(None) => users.find_by_email(&id.email).await.map_err(|e| {
+            tracing::error!(error=?e, "oidc lookup");
+            internal()
+        })?,
+        Err(e) => {
+            tracing::error!(error=?e, "oidc lookup");
+            return Err(internal());
+        }
+    };
+    let not_provisioned = |why| json_err(StatusCode::FORBIDDEN, "auth.oidc.not_provisioned", why);
+    match found {
+        Some(u) if u.kind == knot_storage::user_store::UserKind::Bot => {
+            tracing::warn!(user_id = %u.id, "oidc sign-in as a bot refused");
+            Err(not_provisioned("user not provisioned"))
+        }
+        Some(u) => Ok(u),
+        None => auto_provision(state, id, users)
+            .await?
+            .ok_or_else(|| not_provisioned("user not provisioned")),
+    }
 }
 
 /// Whether a `domain`-policy auto-provision is allowed for this identity.
@@ -329,7 +340,66 @@ fn always_policy_allows(email_verified: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{always_policy_allows, domain_policy_allows};
+    use super::{always_policy_allows, domain_policy_allows, resolve_user};
+    use crate::AppState;
+
+    fn identity(email: &str) -> knot_auth::oidc::VerifiedIdentity {
+        knot_auth::oidc::VerifiedIdentity {
+            subject: "idp-subject".into(),
+            email: email.into(),
+            email_verified: true,
+            display_name: "Someone".into(),
+            groups: vec![],
+        }
+    }
+
+    /// The callback signs in whoever `resolve_user` returns; a bot must never
+    /// be returned, so no session (and no `sid` cookie) is minted for it.
+    #[tokio::test]
+    async fn oidc_identity_with_a_bots_email_is_refused() {
+        let pool = knot_test_support::fresh_db().await.pool;
+        let mut state = AppState::with_pool(pool);
+        // Even the most permissive policy must not reach provisioning.
+        state.config = std::sync::Arc::new(knot_config::Config {
+            oidc_auto_provision: "always".into(),
+            ..Default::default()
+        });
+        let users = state.users.clone().unwrap();
+        let bot = users.create_bot("bot@example.com", "Bot").await.unwrap();
+        users
+            .create_local("human@example.com", "Human", "$h$")
+            .await
+            .unwrap();
+
+        let resp = resolve_user(
+            &state,
+            users.as_ref(),
+            "https://idp.test",
+            &identity(&bot.email),
+        )
+        .await
+        .expect_err("a bot is refused");
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "auth.oidc.not_provisioned");
+        let stored = users.find_by_id(bot.id).await.unwrap().unwrap();
+        assert!(
+            stored.oidc_subject.is_none(),
+            "no identity linked to the bot"
+        );
+
+        // A human with a matching email still signs in.
+        let human = resolve_user(
+            &state,
+            users.as_ref(),
+            "https://idp.test",
+            &identity("human@example.com"),
+        )
+        .await
+        .expect("human resolves");
+        assert_eq!(human.email, "human@example.com");
+    }
 
     // ---- always policy ----
 

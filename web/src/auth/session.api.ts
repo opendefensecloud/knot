@@ -1,11 +1,22 @@
+import * as v from "valibot";
+
 import { apiFetch } from "../lib/api";
 import {
   type AuthConfig,
   AuthConfig as AuthConfigSchema,
-  type Session,
   parse,
-  Session as SessionSchema,
+  Session as BaseSessionSchema,
 } from "../lib/validators";
+
+// The session also says how the user signed in and the longest API-key
+// lifetime the server allows them (null = unlimited). Fallbacks keep older
+// servers and fixtures parsing; the server enforces the cap regardless.
+const SessionSchema = v.object({
+  ...BaseSessionSchema.entries,
+  auth_kind: v.fallback(v.picklist(["local", "oidc", "bot"]), "local"),
+  max_api_key_ttl_days: v.fallback(v.nullable(v.number()), null),
+});
+export type Session = v.InferOutput<typeof SessionSchema>;
 
 export const authApi = {
   async session() {

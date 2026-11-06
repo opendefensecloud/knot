@@ -15,6 +15,32 @@ pub struct User {
     pub oidc_subject: Option<String>,
     pub oidc_issuer: Option<String>,
     pub created_at: DateTime<Utc>,
+    pub kind: UserKind,
+}
+
+/// `users.kind`. A bot has no password and no OIDC identity (DB CHECK
+/// `users_bot_has_no_credentials`), so it can only authenticate with an API
+/// key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserKind {
+    Human,
+    Bot,
+}
+
+impl UserKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Bot => "bot",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "human" => Some(Self::Human),
+            "bot" => Some(Self::Bot),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -25,6 +51,8 @@ pub enum UserStoreError {
     EmailExists,
     #[error("oidc subject already linked")]
     OidcExists,
+    #[error("invalid user kind: {0}")]
+    InvalidKind(String),
 }
 
 #[async_trait]
@@ -43,6 +71,9 @@ pub trait UserStore: Send + Sync + 'static {
         issuer: &str,
         subject: &str,
     ) -> Result<User, UserStoreError>;
+
+    /// Insert a `kind = 'bot'` user with no password and no OIDC identity.
+    async fn create_bot(&self, email: &str, display_name: &str) -> Result<User, UserStoreError>;
 
     async fn find_by_email(&self, email: &str) -> Result<Option<User>, UserStoreError>;
     async fn find_by_oidc(
@@ -89,10 +120,13 @@ type UserRow = (
     Option<String>,
     Option<String>,
     DateTime<Utc>,
+    String,
 );
 
-fn user_from_row(r: UserRow) -> User {
-    User {
+/// An unexpected `kind` is an error, never a silent `Human`.
+fn user_from_row(r: UserRow) -> Result<User, UserStoreError> {
+    let kind = UserKind::parse(&r.7).ok_or_else(|| UserStoreError::InvalidKind(r.7.clone()))?;
+    Ok(User {
         id: r.0,
         email: r.1,
         display_name: r.2,
@@ -100,7 +134,8 @@ fn user_from_row(r: UserRow) -> User {
         oidc_subject: r.4,
         oidc_issuer: r.5,
         created_at: r.6,
-    }
+        kind,
+    })
 }
 
 const EMAIL_UNIQUE_CONSTRAINT: &str = "users_email_key";
@@ -126,7 +161,7 @@ fn map_user_violation(e: sqlx::Error) -> UserStoreError {
 /// only value interpolated into the query strings that `AssertSqlSafe` wraps;
 /// all caller-supplied values stay `$N` binds.
 const SELECT_USER_COLS: &str =
-    "id, email::text, display_name, password_hash, oidc_subject, oidc_issuer, created_at";
+    "id, email::text, display_name, password_hash, oidc_subject, oidc_issuer, created_at, kind";
 
 #[async_trait]
 impl UserStore for PgUserStore {
@@ -147,7 +182,7 @@ impl UserStore for PgUserStore {
         .fetch_one(&self.pool)
         .await
         .map_err(map_user_violation)?;
-        Ok(user_from_row(row))
+        user_from_row(row)
     }
 
     async fn create_oidc(
@@ -169,7 +204,21 @@ impl UserStore for PgUserStore {
         .fetch_one(&self.pool)
         .await
         .map_err(map_user_violation)?;
-        Ok(user_from_row(row))
+        user_from_row(row)
+    }
+
+    async fn create_bot(&self, email: &str, display_name: &str) -> Result<User, UserStoreError> {
+        let row = sqlx::query_as::<_, UserRow>(AssertSqlSafe(format!(
+            "INSERT INTO users (email, display_name, kind)
+             VALUES ($1, $2, 'bot')
+             RETURNING {SELECT_USER_COLS}"
+        )))
+        .bind(email)
+        .bind(display_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_user_violation)?;
+        user_from_row(row)
     }
 
     async fn find_by_email(&self, email: &str) -> Result<Option<User>, UserStoreError> {
@@ -182,7 +231,7 @@ impl UserStore for PgUserStore {
         .bind(email)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(user_from_row))
+        row.map(user_from_row).transpose()
     }
 
     async fn find_by_oidc(
@@ -198,7 +247,7 @@ impl UserStore for PgUserStore {
         .bind(subject)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(user_from_row))
+        row.map(user_from_row).transpose()
     }
 
     async fn find_by_id(&self, id: Uuid) -> Result<Option<User>, UserStoreError> {
@@ -208,7 +257,7 @@ impl UserStore for PgUserStore {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(user_from_row))
+        row.map(user_from_row).transpose()
     }
 
     async fn count(&self) -> Result<i64, UserStoreError> {

@@ -11,14 +11,14 @@ Browser (SPA)
 knot-server (axum, Rust, single binary)
   ├─ /                       SPA fallback (ServeDir on web/dist + index.html)
   ├─ /auth/*                 knot-auth: Argon2id, OIDC, sid + csrf cookies
-  ├─ /api/*                  knot-storage: sqlx stores (Postgres)
+  ├─ /api/*                  knot-storage: sqlx stores (Postgres); sid cookie or Bearer API key
   ├─ /collab/:doc_id WS      knot-crdt: Room actor (yrs Y.Doc per doc)
   ├─ /api/healthz, /readyz   liveness + readiness
   └─ :9090/metrics           Prometheus exposition
             │
             ▼
        PostgreSQL 18
-       ├─ users, workspaces, sessions, workspace_members
+       ├─ users, workspaces, sessions, workspace_members, api_keys
        ├─ documents, document_grants
        ├─ doc_updates, doc_snapshots          (CRDT persistence)
        ├─ doc_markdown_cache                  (export)
@@ -32,7 +32,7 @@ There is **no Redis**. Cross-pod CRDT update fan-out and ACL revocation both rid
 | Crate | Role |
 |---|---|
 | `knot-server`     | axum router, middleware chain, route handlers, SPA fallback |
-| `knot-auth`       | password hashing, session creation, OIDC discovery + flow |
+| `knot-auth`       | password hashing, session creation, API-key generation + HMAC, OIDC discovery + flow |
 | `knot-config`     | figment-based `KNOT_*` env loader (default → file → env) |
 | `knot-storage`    | sqlx stores (users, workspaces, docs, grants, snapshots, updates) + migrations |
 | `knot-crdt`       | yrs `Engine`, `Rooms` registry, `Room` actor, `PgBus` over LISTEN/NOTIFY |
@@ -49,13 +49,18 @@ There is **no Redis**. Cross-pod CRDT update fan-out and ACL revocation both rid
 client                middleware (outside → inside)              handler
   │                  ┌─ metrics record (counter + histogram)
   │   HTTP   ─────►  ├─ tower-http TraceLayer  (#[instrument] inside)
-  │                  ├─ session loader (sid cookie → AuthContext)
-  │                  ├─ CSRF check (unsafe methods)
+  │                  ├─ session loader (Bearer API key on /api/* → AuthContext + ApiPrincipal,
+  │                  │                  else sid cookie → AuthContext)
+  │                  ├─ require session (/api/* only)
+  │                  ├─ scope check (/api/* with an API key: method → scope, override table)
+  │                  ├─ CSRF check (unsafe methods; skipped for API keys)
   │                  └─ route handler         ─────►  knot-auth / knot-storage / knot-crdt
   │   HTTP   ◄─────                            ◄─────
 ```
 
 Outermost layer is the metrics recorder so the histogram includes everything inside. TraceLayer wraps handlers + auth so spans cover the full lifetime minus the metrics recording itself.
+
+API keys (`Authorization: Bearer knot_…`) are resolved by the session loader, and only for paths under `/api/` (`auth/api_key_loader.rs`); `/auth/*`, `/collab/*` and `/p/*` stay cookie-only. A Bearer header that doesn't resolve to a live key of a current member is a 401 `api_key.invalid`, never a fall-back to the cookie. Keys are stored as HMAC-SHA256 under `KNOT_SESSION_KEY`, so rotating that key invalidates every session and every API key. Scopes are enforced by a separate middleware (`auth/scope.rs`) layered between require-session and CSRF on the `/api` router: the HTTP method picks the scope (GET/HEAD/OPTIONS read, POST create, PATCH/PUT update, DELETE delete), and its `OVERRIDES` table is the one place POST routes that aren't creates are remapped. A key lacking the scope gets 403 `api_key.scope_denied` with `details.scope`. Its `SESSION_ONLY` table lists the routes no key may call, whatever its scopes (403 `api_key.session_required`): key management (`/api/auth/api-keys`), member management (invite, role change, removal) and creating or listing public share links, since each would let a key mint a credential that is unscoped or outlives it. Bulk key revocation lives in DB triggers: on a password-hash change, on leaving the workspace (the member's keys and those it minted) and on losing the owner role (the keys it minted for others). A mint closes the race with them in its own transaction (`PgApiKeyStore::create`): it locks the user rows (a password change sets the hash and ends the sessions in one transaction), re-checks the session that asked, share-locks the membership rows and enforces the 50-live-keys cap before the insert, so a concurrent revoker either refuses the mint or revokes the committed key.
 
 ## CRDT data flow
 

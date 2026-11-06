@@ -486,6 +486,13 @@ async fn import(
             }
         }
     }
+    // Importing inside a restricted subtree mints owner grants; a bot never
+    // becomes an owner (S4), so refuse before anything is created.
+    if let Some(response) =
+        crate::bots::deny_bot_restricted_destination(&state, &ctx, q.parent_id).await
+    {
+        return response;
+    }
     let Some(blob_meta) = state.blob_meta.clone() else {
         return internal();
     };
@@ -512,6 +519,16 @@ async fn import(
         Ok(m) => m,
         Err(code) => return json_err(StatusCode::UNPROCESSABLE_ENTITY, code, ""),
     };
+    // A restricted page is created with an owner grant for the importer.
+    if manifest.docs.iter().any(|d| d.restricted) {
+        match crate::bots::is_bot(&state, ctx.user_id).await {
+            Ok(false) => {}
+            Ok(true) => {
+                return crate::bots::restricted_forbidden(&ctx, "import restricted page");
+            }
+            Err(response) => return response,
+        }
+    }
 
     // 2. ID remap tables — populated as we create new records below.
     let mut doc_remap: HashMap<String, Uuid> = HashMap::new();

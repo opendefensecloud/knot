@@ -28,6 +28,7 @@ pub mod admin;
 pub mod archive;
 pub mod auth;
 pub mod board_room_shim;
+pub mod bots;
 pub mod comments_listener;
 pub mod duplicate;
 pub mod export;
@@ -56,6 +57,8 @@ pub struct AppState {
     pub users: Option<Arc<dyn UserStore>>,
     pub workspaces: Option<Arc<dyn WorkspaceStore>>,
     pub sessions: Option<Arc<dyn SessionStore>>,
+    /// Scoped bearer credentials; `None` keeps the server cookie-only.
+    pub api_keys: Option<Arc<dyn knot_storage::ApiKeyStore>>,
     pub docs: Option<Arc<dyn DocStore>>,
     pub grants: Option<Arc<dyn GrantStore>>,
     pub acl: Option<Arc<AclCache>>,
@@ -109,6 +112,7 @@ impl AppState {
             users: None,
             workspaces: None,
             sessions: None,
+            api_keys: None,
             docs: None,
             grants: None,
             acl: None,
@@ -155,6 +159,8 @@ impl AppState {
         let users: Arc<dyn UserStore> = Arc::new(PgUserStore::new(pool.clone()));
         let workspaces: Arc<dyn WorkspaceStore> = Arc::new(PgWorkspaceStore::new(pool.clone()));
         let sessions: Arc<dyn SessionStore> = Arc::new(PgSessionStore::new(pool.clone()));
+        let api_keys: Arc<dyn knot_storage::ApiKeyStore> =
+            Arc::new(knot_storage::PgApiKeyStore::new(pool.clone()));
         let docs: Arc<dyn DocStore> = Arc::new(PgDocStore::new(pool.clone()));
         let grants: Arc<dyn GrantStore> = Arc::new(PgGrantStore::new(pool.clone()));
         let acl = Arc::new(AclCache::new(
@@ -185,6 +191,7 @@ impl AppState {
             users: Some(users),
             workspaces: Some(workspaces),
             sessions: Some(sessions),
+            api_keys: Some(api_keys),
             docs: Some(docs),
             grants: Some(grants),
             acl: Some(acl),
@@ -226,6 +233,7 @@ impl AppState {
         Some(SessionDeps {
             sessions: self.sessions.clone()?,
             workspaces: self.workspaces.clone()?,
+            api_keys: self.api_keys.clone(),
             session_key: self.session_key.clone(),
         })
     }

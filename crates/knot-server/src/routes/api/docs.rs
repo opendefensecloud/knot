@@ -329,6 +329,12 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
     {
         return response;
     }
+    // Inside a restricted subtree the create can mint an owner grant.
+    if let Some(response) =
+        crate::bots::deny_bot_restricted_destination(&state, &ctx, body.parent_id).await
+    {
+        return response;
+    }
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
@@ -1100,6 +1106,10 @@ async fn set_restricted_inline(
     if role.0 != WorkspaceRole::Owner {
         return json_err(StatusCode::FORBIDDEN, "acl.owner_required", "");
     }
+    // Restricting mints an owner grant, which a bot can never hold.
+    if let Some(response) = crate::bots::deny_bot_actor(&state, &ctx, "set_restricted").await {
+        return response;
+    }
     let Ok(body) = read_json::<SetRestrictedRequest>(req).await else {
         return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
     };
@@ -1179,6 +1189,12 @@ async fn create_from_template_inline(
     // gate for "can use as a template". Writing into the tree requires
     // editor+ where the copy goes.
     if let Err(response) = require_editable_destination(&state, &ctx, body.parent_id).await {
+        return response;
+    }
+    // Inside a restricted subtree the create can mint an owner grant.
+    if let Some(response) =
+        crate::bots::deny_bot_restricted_destination(&state, &ctx, body.parent_id).await
+    {
         return response;
     }
     let Some(docs) = state.docs.clone() else {
@@ -1299,4 +1315,41 @@ fn internal() -> Response {
 /// non-template page under the target parent, or it is the moved doc.
 fn bad_anchor() -> Response {
     json_err(StatusCode::UNPROCESSABLE_ENTITY, "doc.bad_anchor", "")
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+
+    use super::*;
+
+    /// Behind the ACL layer no bot ever reaches this handler as an owner
+    /// (S4), so the guard is pinned here, with the layer's verdict faked.
+    #[tokio::test]
+    async fn set_restricted_refuses_a_bot_even_with_owner_rights() {
+        let pool = knot_test_support::fresh_db().await.pool;
+        let bot: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (email, display_name, kind) VALUES ('b@x.test', 'B', 'bot') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let state = AppState::with_pool(pool);
+        let mut req = Request::builder()
+            .method("PUT")
+            .body(Body::from(r#"{"restricted":true}"#))
+            .unwrap();
+        req.extensions_mut().insert(AuthContext {
+            user_id: bot,
+            workspace_id: Uuid::new_v4(),
+            role: WorkspaceRole::Editor,
+        });
+        req.extensions_mut()
+            .insert(EffectiveDocRole(WorkspaceRole::Owner));
+        let r = set_restricted_inline(State(state), Path(Uuid::new_v4()), req).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], "bot.forbidden");
+    }
 }

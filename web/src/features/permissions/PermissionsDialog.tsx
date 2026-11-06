@@ -29,6 +29,7 @@ const RESTRICT_CONFIRM =
 function grantErrorText(code: string, fallback: string): string {
   if (code === "grant.last_owner") return "A restricted page needs at least one owner.";
   if (code === "grant.not_member") return "Only workspace members can be added.";
+  if (code === "bot.owner_forbidden") return "A bot can't be a page owner.";
   return fallback;
 }
 
@@ -502,7 +503,10 @@ export default function PermissionsDialog() {
             loading={members.isPending}
             failed={membersFailed}
             value={addUser}
-            onChange={setAddUser}
+            onChange={(userId) => {
+              setAddUser(userId);
+              if (addRole === "owner" && memberById.get(userId)?.kind === "bot") setAddRole("editor");
+            }}
             className="flex-1 min-w-[180px]"
           />
           <select
@@ -513,7 +517,8 @@ export default function PermissionsDialog() {
           >
             <option value="viewer">Viewer</option>
             <option value="editor">Editor</option>
-            <option value="owner">Owner</option>
+            {/* A bot can't own a page; the server refuses it. */}
+            {memberById.get(addUser)?.kind !== "bot" && <option value="owner">Owner</option>}
           </select>
           <label className="flex items-center gap-1.5 text-[13px] text-fg">
             <input

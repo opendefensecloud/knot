@@ -63,7 +63,7 @@ type Stub = {
   /** Answer to any PUT or DELETE; defaults to 204. */
   write?: { status: number; body?: unknown };
   /** `GET /api/workspace/members`; defaults to Ada alone. */
-  members?: { user_id: string; email: string; display_name: string; role: string }[] | "error";
+  members?: { user_id: string; email: string; display_name: string; role: string; kind?: string }[] | "error";
   /** Holds back the members answer until it resolves. */
   membersGate?: Promise<void>;
 };
@@ -292,6 +292,33 @@ describe("PermissionsDialog access", () => {
     fireEvent.click(screen.getByTestId("grant-add"));
 
     expect(await screen.findByText("Only workspace members can be added.")).toBeTruthy();
+  });
+
+  it("offers no owner role for a bot and maps the server's refusal", async () => {
+    const BOT = "55555555-5555-5555-5555-555555555555";
+    renderDialog({
+      members: [
+        { user_id: ADA, email: "ada@example.com", display_name: "Ada Lovelace", role: "editor" },
+        { user_id: BOT, email: "bot@example.com", display_name: "CI Bot", role: "editor", kind: "bot" },
+      ],
+      write: {
+        status: 422,
+        body: { error: { code: "bot.owner_forbidden", message: "", details: {} } },
+      },
+    });
+    const role = await screen.findByTestId("grant-role");
+    fireEvent.change(role, { target: { value: "owner" } });
+    expect(role).toHaveValue("owner");
+
+    const picker = await screen.findByTestId("grant-user");
+    fireEvent.focus(picker);
+    fireEvent.mouseDown(await screen.findByTestId(`grant-user-option-${BOT}`));
+    expect(within(role).queryByText("Owner")).toBeNull();
+    expect(within(role).getAllByRole("option")).toHaveLength(2);
+    expect(role).toHaveValue("editor");
+
+    fireEvent.click(screen.getByTestId("grant-add"));
+    expect(await screen.findByText("A bot can't be a page owner.")).toBeTruthy();
   });
 
   it("hints that inherit shares subpages on a restricted page", async () => {

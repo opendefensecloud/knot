@@ -53,7 +53,7 @@ Create a Secret with these keys:
 | Key | Required when | Value |
 |-----|---------------|-------|
 | `KNOT_DATABASE_URL` | always | Postgres connection URL |
-| `KNOT_SESSION_KEY` | always | 32-byte random key |
+| `KNOT_SESSION_KEY` | always | 32-byte random key. Rotating it logs everyone out and invalidates every API key |
 | `KNOT_OIDC_CLIENT_SECRET` | OIDC enabled | OIDC client secret |
 
 Then point the chart at it:

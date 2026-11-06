@@ -95,6 +95,9 @@ pub(super) async fn put_inline(
             "",
         );
     }
+    // One row per user whatever UUID spelling the caller sent: the ACL,
+    // member removal and the KB002 trigger all match the canonical text.
+    let principal = canonical_principal(&principal);
     // `group:` principals pass the format check but ACL resolution only honors
     // `user:` grants — a group grant would silently grant nothing. Reject at
     // creation rather than store a no-op. (delete still accepts them so any
@@ -105,6 +108,24 @@ pub(super) async fn put_inline(
             "grant.group_unsupported",
             "group grants are not supported; grant individual users",
         );
+    }
+    // A bot can never own a document (trigger KB002); answer cleanly first.
+    if new_role == WorkspaceRole::Owner
+        && let Some(rest) = principal.strip_prefix("user:")
+        && let Ok(target) = Uuid::parse_str(rest)
+    {
+        match crate::bots::is_bot(&state, target).await {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::info!(action = "grant owner", %doc_id, "bot owner grant denied");
+                return json_err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "bot.owner_forbidden",
+                    "a bot can't be a page owner",
+                );
+            }
+            Err(response) => return response,
+        }
     }
     let Some(grants) = state.grants.clone() else {
         return internal();
@@ -167,10 +188,18 @@ pub(super) async fn delete_inline(
     let Some(grants) = state.grants.clone() else {
         return internal();
     };
-    match grants
-        .delete(ctx.workspace_id, doc_id, &principal, ctx.user_id)
-        .await
-    {
+    // The canonical row, plus one stored under the spelling given, should a
+    // grant from before canonicalisation carry it.
+    let canonical = canonical_principal(&principal);
+    let mut result = grants
+        .delete(ctx.workspace_id, doc_id, &canonical, ctx.user_id)
+        .await;
+    if result.is_ok() && principal != canonical {
+        result = grants
+            .delete(ctx.workspace_id, doc_id, &principal, ctx.user_id)
+            .await;
+    }
+    match result {
         Ok(()) => {
             // As for put: this replica stops serving the revoked access now.
             crate::archive::evict_local_subtree(&state, doc_id).await;
@@ -340,6 +369,16 @@ fn last_owner() -> Response {
         "grant.last_owner",
         "a restricted page needs at least one owner",
     )
+}
+
+/// `user:<uuid>` in any spelling `Uuid::parse_str` takes (upper case,
+/// simple, braced, `urn:uuid:`) as `user:<hyphenated lower case>`; every
+/// other principal unchanged.
+fn canonical_principal(s: &str) -> String {
+    match s.strip_prefix("user:").map(Uuid::parse_str) {
+        Some(Ok(id)) => format!("user:{id}"),
+        _ => s.to_owned(),
+    }
 }
 
 fn is_valid_principal(s: &str) -> bool {

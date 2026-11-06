@@ -34,6 +34,8 @@ const memberSchema = v.object({
   email: v.string(),
   display_name: v.string(),
   role: v.picklist(["owner", "editor", "viewer"]),
+  // Older servers send no kind: everyone is human there.
+  kind: v.fallback(v.picklist(["human", "bot"]), "human"),
 });
 export type Member = v.InferOutput<typeof memberSchema>;
 export const Member = memberSchema;

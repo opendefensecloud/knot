@@ -28,6 +28,37 @@ pub async fn record(
     }
 }
 
+/// Same as `record`, with details about the event in `data` (a JSON
+/// object). Best-effort: failures are logged and swallowed.
+pub async fn record_with_data(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    actor: Option<Uuid>,
+    action: &str,
+    target_kind: &str,
+    target_id: Uuid,
+    data: &JsonValue,
+) {
+    let written = match pool.acquire().await {
+        Ok(mut conn) => {
+            record_in_tx_with_data(
+                &mut conn,
+                workspace_id,
+                actor,
+                action,
+                target_kind,
+                target_id,
+                data,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = written {
+        tracing::warn!(error=?e, action, "audit write failed (best-effort)");
+    }
+}
+
 /// Same as `record` but accepts an in-flight transaction so the audit row
 /// is committed alongside its mutation.
 pub async fn record_in_tx(

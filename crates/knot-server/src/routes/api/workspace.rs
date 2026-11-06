@@ -1,6 +1,6 @@
 //! GET    /api/workspace
 //! GET    /api/workspace/members
-//! POST   /api/workspace/members        body: {email, role}
+//! POST   /api/workspace/members        body: {email, role, password?, display_name?, kind?}
 //! PATCH  /api/workspace/members/{id}    body: {role}
 //! DELETE /api/workspace/members/{id}
 
@@ -13,6 +13,7 @@ use axum::{
 };
 use knot_storage::WorkspaceRole;
 use knot_storage::audit;
+use knot_storage::user_store::UserKind;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -70,6 +71,7 @@ struct MemberResponse {
     email: String,
     display_name: String,
     role: String,
+    kind: &'static str,
 }
 
 async fn list_members(State(state): State<AppState>, req: Request) -> Response {
@@ -92,6 +94,7 @@ async fn list_members(State(state): State<AppState>, req: Request) -> Response {
                     email: m.email,
                     display_name: m.display_name,
                     role: m.role.as_str().into(),
+                    kind: m.kind.as_str(),
                 })
                 .collect::<Vec<_>>(),
         )
@@ -109,6 +112,8 @@ struct InviteRequest {
     role: String,
     password: Option<String>,
     display_name: Option<String>,
+    /// `"human"` (default) or `"bot"`.
+    kind: Option<String>,
 }
 
 async fn invite_member(State(state): State<AppState>, req: Request) -> Response {
@@ -128,56 +133,102 @@ async fn invite_member(State(state): State<AppState>, req: Request) -> Response 
             "",
         );
     };
+    let kind = match body.kind.as_deref() {
+        None => UserKind::Human,
+        Some(k) => match UserKind::parse(k) {
+            Some(k) => k,
+            None => {
+                return json_err(StatusCode::UNPROCESSABLE_ENTITY, "member.kind_invalid", "");
+            }
+        },
+    };
+    // S4: answer cleanly before the KB001 trigger would.
+    if kind == UserKind::Bot && role == WorkspaceRole::Owner {
+        return json_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "bot.owner_forbidden",
+            "a bot can only be editor or viewer",
+        );
+    }
     let Some(users) = state.users.clone() else {
         return internal();
     };
     let Some(workspaces) = state.workspaces.clone() else {
         return internal();
     };
+    let display_name = body
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| body.email.split('@').next().unwrap_or(&body.email));
 
-    let user = match users.find_by_email(&body.email).await {
-        Ok(Some(u)) => u,
-        Ok(None) => match body.password.as_deref() {
-            Some(pw) if pw.chars().count() >= 8 => {
-                let hash = match state.hasher.hash(pw) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        tracing::error!(error=?e, "invite hash");
-                        return internal();
-                    }
-                };
-                let display = body
-                    .display_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| body.email.split('@').next().unwrap_or(&body.email));
-                match users.create_local(&body.email, display, &hash).await {
-                    Ok(u) => u,
-                    Err(e) => {
-                        tracing::error!(error=?e, "invite create_local");
-                        return internal();
+    let user = if kind == UserKind::Bot {
+        // A bot is always a fresh, credentialless user; any password is
+        // ignored. An existing email is refused rather than reused, so a
+        // human can never be turned into a bot. Removing a member revokes
+        // its keys in the DB, so nothing old comes back either way.
+        match users.create_bot(&body.email, display_name).await {
+            Ok(u) => u,
+            Err(knot_storage::UserStoreError::EmailExists) => {
+                return json_err(
+                    StatusCode::CONFLICT,
+                    "workspace.email_taken",
+                    "a bot needs an email no user has",
+                );
+            }
+            Err(e) => {
+                tracing::error!(error=?e, "invite create_bot");
+                return internal();
+            }
+        }
+    } else {
+        match users.find_by_email(&body.email).await {
+            // A removed bot is not re-added as a human; invite a new bot.
+            Ok(Some(u)) if u.kind == UserKind::Bot => {
+                return json_err(
+                    StatusCode::CONFLICT,
+                    "workspace.email_taken",
+                    "that email belongs to a bot",
+                );
+            }
+            Ok(Some(u)) => u,
+            Ok(None) => match body.password.as_deref() {
+                Some(pw) if pw.chars().count() >= 8 => {
+                    let hash = match state.hasher.hash(pw) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::error!(error=?e, "invite hash");
+                            return internal();
+                        }
+                    };
+                    match users.create_local(&body.email, display_name, &hash).await {
+                        Ok(u) => u,
+                        Err(e) => {
+                            tracing::error!(error=?e, "invite create_local");
+                            return internal();
+                        }
                     }
                 }
+                Some(_) => {
+                    return json_err(
+                        StatusCode::BAD_REQUEST,
+                        "auth.weak_password",
+                        "password too short",
+                    );
+                }
+                None => {
+                    return json_err(
+                        StatusCode::NOT_FOUND,
+                        "workspace.user_not_found",
+                        "user must exist or include a password",
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::error!(error=?e, "invite lookup");
+                return internal();
             }
-            Some(_) => {
-                return json_err(
-                    StatusCode::BAD_REQUEST,
-                    "auth.weak_password",
-                    "password too short",
-                );
-            }
-            None => {
-                return json_err(
-                    StatusCode::NOT_FOUND,
-                    "workspace.user_not_found",
-                    "user must exist or include a password",
-                );
-            }
-        },
-        Err(e) => {
-            tracing::error!(error=?e, "invite lookup");
-            return internal();
         }
     };
     let ws = match workspaces.get_singleton().await {
@@ -196,13 +247,15 @@ async fn invite_member(State(state): State<AppState>, req: Request) -> Response 
         }
     }
     if let Some(pool) = state.pool.as_ref() {
-        audit::record(
+        let data = serde_json::json!({ "kind": user.kind.as_str() });
+        audit::record_with_data(
             pool,
             ws.id,
             Some(ctx.user_id),
             "workspace.member.invite",
             "user",
             user.id,
+            &data,
         )
         .await;
     }
@@ -242,6 +295,27 @@ async fn change_role(
         Ok(Some(w)) => w,
         _ => return internal(),
     };
+
+    // S4: a bot can never be promoted to owner; answer before KB001 does.
+    if new_role == WorkspaceRole::Owner {
+        let Some(users) = state.users.clone() else {
+            return internal();
+        };
+        match users.find_by_id(user_id).await {
+            Ok(Some(u)) if u.kind == UserKind::Bot => {
+                return json_err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "bot.owner_forbidden",
+                    "a bot can only be editor or viewer",
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(error=?e, "change_role lookup");
+                return internal();
+            }
+        }
+    }
 
     if new_role != WorkspaceRole::Owner {
         let current = workspaces

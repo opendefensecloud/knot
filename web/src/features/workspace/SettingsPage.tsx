@@ -8,6 +8,7 @@ import { authApi } from "../../auth/session.api";
 import { useSession } from "../../auth/SessionContext";
 import { useUi } from "../../stores/ui";
 
+import { ApiKeysSection } from "../apiKeys/ApiKeysSection";
 import { readCookie } from "../../lib/csrf";
 import { SkinPicker } from "./SkinPicker";
 import { workspaceApi } from "./workspace.api";
@@ -68,6 +69,12 @@ export default function SettingsPage() {
             <h2 className="text-[13px] font-semibold uppercase tracking-wider text-fg-muted mb-2">Account</h2>
             <p className="text-sm text-fg m-0">{session.data.ok.display_name} <span className="text-fg-muted">({session.data.ok.email})</span></p>
             <p className="text-[13px] text-fg-muted mt-1">Role: <span className="text-fg">{session.data.ok.role}</span></p>
+          </section>
+        )}
+        {session.data && "ok" in session.data && (
+          <section data-testid="api-keys-section" className="bg-surface border border-border rounded-lg px-5 py-4">
+            <h2 className="text-[13px] font-semibold uppercase tracking-wider text-fg-muted mb-2">API keys</h2>
+            <ApiKeysSection />
           </section>
         )}
         <section data-testid="appearance" className="bg-surface border border-border rounded-lg px-5 py-4">
