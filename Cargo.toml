@@ -98,3 +98,7 @@ openidconnect = { version = "4", features = ["reqwest"] }
 regex = "1"
 clap = { version = "4", features = ["derive", "env"] }
 url = "2"
+
+# Line-numbered backtraces without the multi-GB debug-info cost of debug = 2.
+[profile.dev]
+debug = 1
