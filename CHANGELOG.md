@@ -18,8 +18,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   stays, and that table's writers (for the second migration, all page
   access) pause meanwhile. Pass `helm upgrade --timeout` of the expected
   copy time plus 6 minutes: in the worst case that still succeeds, the
-  lock loops take 5 × 45 s (three Job attempts give up, the fourth uses
-  both loops in full), plus about 70 s of Job restart backoff and the
+  lock loops take 4 × 45 s (the Job runs three attempts; two give up,
+  the third uses both loops in full), plus Job restart backoff and the
   image pull. Rolling back to 0.9.8 needs a database restore once
   either migration has committed: 0.9.8 doesn't start on a database with
   migrations it doesn't know, so a 0.9.8 pod that restarts crash-loops
@@ -30,9 +30,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   serving, but re-run promptly once the blocker is gone. Both (Helm's
   hook timeout fired while the Job went on): re-run now. Let a running
   migrate Job finish first. The Job's error names up to three sessions
-  holding the locks, oldest first; read it with `kubectl logs` within 10
-  minutes, before the Job is deleted. The Helm chart README has the
-  details and a query that shows what holds the locks.
+  holding the locks; follow it with `kubectl logs -f` during the upgrade,
+  because Kubernetes deletes the Job's pod, and its log, once the Job
+  gives up. The Helm chart README has the details and a query that shows
+  what holds the locks.
   - `20261104120000_history_keep_updates` makes the stored edit log
     append-only and copies every stored snapshot into
     `doc_history_baselines`. Check
@@ -61,12 +62,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ### Added
 - `knot-server history-stats` reports how fast the stored edit log grows
-  (rows and bytes per page per day). It needs the server's `KNOT_*`
-  environment, so run it inside a knot pod (see the Helm chart README).
-  Its per-day rates cover the last `--days` days (default 30), and before
-  the upgrade the old cleanup deleted edits, so run it at least 30 days
-  after upgrading, or pass a `--days` below the days since the upgrade.
-  Share the output with the maintainers.
+  (rows per page per day, and the average and total row bytes). It needs
+  the server's `KNOT_*` environment, so run it inside a knot pod (see the
+  Helm chart README). Its per-day rates cover the last `--days` days
+  (default 30), and before the upgrade the old cleanup deleted edits, so
+  run it at least 30 days after upgrading, or pass a `--days` below the
+  days since the upgrade. Share the output with the maintainers.
 
 ### Changed
 - Knot no longer deletes old edits. Every change to a page is kept for the
