@@ -35,7 +35,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   holding the locks; follow it with `kubectl logs -f` during the upgrade,
   because Kubernetes deletes the Job's pod, and its log, once the Job
   gives up. The Helm chart README has the details and a query that shows
-  what holds the locks.
+  what holds the locks. (#79)
   - `20261104120000_history_keep_updates` makes the stored edit log
     append-only and copies every stored snapshot into
     `doc_history_baselines`. Check
@@ -60,7 +60,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - The database grows with every edit from now on; watch the size of
   `doc_updates`. Older pods still running during the rolling upgrade log a
   `doc_updates is append-only` warning from their hourly cleanup; that is
-  expected and harmless.
+  expected and harmless. (#79)
 
 ### Added
 - `knot-server history-stats` reports how fast the stored edit log grows
@@ -69,13 +69,13 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   Helm chart README). Its per-day rates cover the last `--days` days
   (default 30), and before the upgrade the old cleanup deleted edits, so
   run it at least 30 days after upgrading, or pass a `--days` below the
-  days since the upgrade. Share the output with the maintainers.
+  days since the upgrade. Share the output with the maintainers. (#79)
 
 ### Changed
 - Knot no longer deletes old edits. Every change to a page is kept for the
   page's whole life (purging a page still removes it). This is the
   groundwork for the page history timeline; the History drawer itself is
-  unchanged in this release.
+  unchanged in this release. (#79)
 
 ### Fixed
 - The @-mention list works with the keyboard in a table cell. ArrowUp and
