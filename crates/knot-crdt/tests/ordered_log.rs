@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "common/fixtures.rs"]
+mod fixtures;
+
+use fixtures::{para, same_update, unwrap_frame};
 use knot_crdt::nesting::MAX_NESTING;
 use knot_crdt::{
     BootMode, Bus, ConnHandle, DocHandle, Engine, Event, InMsg, MemBus, Room, RoomHandle,
@@ -67,47 +71,6 @@ impl Rng {
             .map(|_| char::from(b'a' + self.below(26) as u8))
             .collect()
     }
-}
-
-/// Whether two updates carry the same insertions and deletions: a room
-/// persists and fans out what an apply changed, which yrs re-encodes. As
-/// `knot_crdt::room`'s test helper.
-fn same_update(a: &[u8], b: &[u8]) -> bool {
-    let (a, b) = (
-        Update::decode_v1(a).expect("a decodes"),
-        Update::decode_v1(b).expect("b decodes"),
-    );
-    a.insertions(true) == b.insertions(true) && a.delete_set() == b.delete_set()
-}
-
-/// The update inside a sync update frame.
-fn unwrap_frame(frame: &[u8]) -> Vec<u8> {
-    assert_eq!(frame[..2], [0, 2], "not a sync update frame");
-    let (mut len, mut shift, mut at) = (0usize, 0, 2);
-    loop {
-        let b = frame[at];
-        at += 1;
-        len |= ((b & 0x7f) as usize) << shift;
-        if b < 0x80 {
-            break;
-        }
-        shift += 7;
-    }
-    assert_eq!(frame.len() - at, len, "frame length");
-    frame[at..].to_vec()
-}
-
-/// A paragraph holding `text`, from a fresh doc of `client`.
-fn para(client: u64, text: &str) -> Vec<u8> {
-    let doc = Doc::with_client_id(client);
-    let frag = doc.get_or_insert_xml_fragment("default");
-    {
-        let mut txn = doc.transact_mut();
-        let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
-        p.push_back(&mut txn, XmlTextPrelim::new(text));
-    }
-    doc.transact()
-        .encode_state_as_update_v1(&StateVector::default())
 }
 
 fn doc_of(updates: &[&[u8]]) -> DocHandle {

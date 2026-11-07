@@ -1203,7 +1203,21 @@ impl Room {
             // Persisting it would write a `doc_updates` row on every page
             // open (and attribute an edit to someone who only looked);
             // fanning it out would make every peer re-apply a no-op.
-            Ok(applied) if !applied.changed || applied.persist.is_empty() => return,
+            Ok(applied) if !applied.changed => return,
+            // The doc changed but there is nothing to persist, which
+            // `ApplyMeasured::persist` rules out once the rejected case above
+            // is handled. Should it happen, the doc holds content no row
+            // carries: as for a rejected update, the room writes no more
+            // snapshots (`unlogged`), which would certify that content.
+            Ok(applied) if applied.persist.is_empty() => {
+                tracing::warn!(
+                    doc_id = %self.doc_id,
+                    conn = %m.from,
+                    "an update changed the doc but left nothing to persist; neither persisted nor fanned out"
+                );
+                self.unlogged = true;
+                return;
+            }
             Ok(applied) => applied,
             // It doesn't decode, so nothing of it was applied: refuse its
             // sender, which is broken or crafted, and no one else.
@@ -3099,111 +3113,9 @@ pub(crate) mod tests {
     use crate::test_metrics::CountingRecorder;
     use knot_storage::{DocUpdate, NewUpdate, Persisted, RowsAfter, SnapshotStamp};
 
-    /// Whether two updates carry the same insertions and deletions: the
-    /// room persists and fans out what an apply changed, which yrs
-    /// re-encodes, so its bytes may differ from what a client sent.
-    pub(crate) fn same_update(a: &[u8], b: &[u8]) -> bool {
-        use yrs::{Update, updates::decoder::Decode};
-        let (a, b) = (
-            Update::decode_v1(a).expect("a decodes"),
-            Update::decode_v1(b).expect("b decodes"),
-        );
-        a.insertions(true) == b.insertions(true) && a.delete_set() == b.delete_set()
-    }
-
-    /// The update inside a sync frame (`wrap_sync_update`).
-    fn unwrap_frame(frame: &[u8]) -> Vec<u8> {
-        assert_eq!(frame[..2], [0, 2], "not a sync update frame");
-        let mut len = 0usize;
-        let mut shift = 0;
-        let mut at = 2;
-        loop {
-            let b = frame[at];
-            at += 1;
-            len |= ((b & 0x7f) as usize) << shift;
-            if b < 0x80 {
-                break;
-            }
-            shift += 7;
-        }
-        assert_eq!(frame.len() - at, len, "frame length");
-        frame[at..].to_vec()
-    }
-
-    /// A paragraph holding `text`, from a fresh doc of `client`.
-    fn para(client: u64, text: &str) -> Vec<u8> {
-        use yrs::{Doc, ReadTxn, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
-        let doc = Doc::with_client_id(client);
-        let frag = doc.get_or_insert_xml_fragment("default");
-        {
-            let mut txn = doc.transact_mut();
-            let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
-            p.push_back(&mut txn, XmlTextPrelim::new(text));
-        }
-        doc.transact()
-            .encode_state_as_update_v1(&yrs::StateVector::default())
-    }
-
-    /// A page holding one paragraph "hello" from `client`, the doc, and the
-    /// id of the text's first character (an item that holds a string, not
-    /// a type). As `tests/nesting.rs`'s `text_page`.
-    fn text_page(client: u64) -> (Vec<u8>, yrs::Doc, yrs::ID) {
-        use yrs::{
-            Assoc, Doc, IndexedSequence, ReadTxn, Transact, XmlElementPrelim, XmlFragment,
-            XmlTextPrelim,
-        };
-        let doc = Doc::with_client_id(client);
-        let frag = doc.get_or_insert_xml_fragment("default");
-        let first = {
-            let mut txn = doc.transact_mut();
-            let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
-            let text = p.push_back(&mut txn, XmlTextPrelim::new("hello"));
-            let index = text
-                .sticky_index(&txn, 0, Assoc::After)
-                .expect("the text has a first character");
-            *index.id().expect("a character has an id")
-        };
-        let state = doc
-            .transact()
-            .encode_state_as_update_v1(&yrs::StateVector::default());
-        (state, doc, first)
-    }
-
-    /// From client 77: an element `partial` in the root fragment, then a
-    /// string whose parent is `not_a_type`, an item that holds text. While
-    /// the doc lacks `not_a_type`, yrs integrates `partial` and parks the
-    /// string; the apply that brings `not_a_type` then fails on it. As
-    /// `tests/nesting.rs`'s `rejected_part_way`.
-    fn rejected_part_way(not_a_type: &yrs::ID) -> Vec<u8> {
-        use yrs::block::{ClientID, ItemContent};
-        use yrs::branch::Branch;
-        use yrs::encoding::write::Write;
-        use yrs::types::TypeRef;
-        use yrs::updates::encoder::{Encoder, EncoderV1};
-        let mut enc = EncoderV1::new();
-        enc.write_var(1u32);
-        enc.write_var(2u32);
-        enc.write_client(ClientID::new(77));
-        enc.write_var(0u32);
-        enc.write_info(7);
-        enc.write_parent_info(true);
-        enc.write_string("default");
-        ItemContent::Type(Branch::new(TypeRef::XmlElement("partial".into()))).encode(&mut enc);
-        enc.write_info(4);
-        enc.write_parent_info(false);
-        enc.write_left_id(not_a_type);
-        ItemContent::String("y".into()).encode(&mut enc);
-        enc.write_var(0u32);
-        enc.to_vec()
-    }
-
-    /// A crafted update whose string yrs parks, waiting for client 5's
-    /// text, the innocent edit that brings that text (and fails on the
-    /// parked string), and the edit's client doc.
-    fn parked_block_and_the_edit_it_fails_on() -> (Vec<u8>, Vec<u8>, yrs::Doc) {
-        let (edit, doc, text) = text_page(5);
-        (rejected_part_way(&text), edit, doc)
-    }
+    use crate::test_fixtures::{
+        para, parked_block_and_the_edit_it_fails_on, same_update, unwrap_frame,
+    };
 
     /// A page log double: `append` stores rows at consecutive revs (or the
     /// revs queued in `own_revs`), and `rows_after` serves every stored row
@@ -3962,6 +3874,101 @@ pub(crate) mod tests {
         let page = exported_page(&h).await;
         assert!(!page.contains("XYZ"), "{page}");
         shut_down(&h).await;
+    }
+
+    /// An engine that applies as yrs does but reports nothing to persist
+    /// for one update (`silent`), although the apply changed the doc: an
+    /// `ApplyMeasured` that breaks its own contract.
+    struct NothingToPersist {
+        silent: Vec<u8>,
+    }
+
+    impl Engine for NothingToPersist {
+        fn new_doc(&self) -> DocHandle {
+            YrsEngine.new_doc()
+        }
+        fn apply_update(&self, d: &DocHandle, update: &[u8]) -> Result<(), EngineError> {
+            YrsEngine.apply_update(d, update)
+        }
+        fn apply_update_changed(&self, d: &DocHandle, update: &[u8]) -> Result<bool, EngineError> {
+            YrsEngine.apply_update_changed(d, update)
+        }
+        fn apply_update_measuring(
+            &self,
+            d: &DocHandle,
+            update: &[u8],
+            limit: usize,
+        ) -> Result<ApplyMeasured, EngineError> {
+            let mut applied = YrsEngine.apply_update_measuring(d, update, limit)?;
+            if update == self.silent {
+                applied.persist.clear();
+                applied.raw_fallback = false;
+            }
+            Ok(applied)
+        }
+        fn encode_state_as_update(
+            &self,
+            d: &DocHandle,
+            peer_sv: Option<&[u8]>,
+        ) -> Result<Vec<u8>, EngineError> {
+            YrsEngine.encode_state_as_update(d, peer_sv)
+        }
+        fn encode_state_vector(&self, d: &DocHandle) -> Result<Vec<u8>, EngineError> {
+            YrsEngine.encode_state_vector(d)
+        }
+    }
+
+    /// An apply that changed the doc but has nothing to persist leaves
+    /// content no row carries, as a rejected one does: the room writes no
+    /// snapshot from then on, which would certify that content, also once a
+    /// later edit is stored (review fix round 1).
+    #[tokio::test(start_paused = true)]
+    async fn a_change_with_nothing_to_persist_stops_snapshots() {
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let silent = para(11, "unlogged");
+        let doc_id = Uuid::new_v4();
+        let bus = MemBus::new();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(NothingToPersist {
+                silent: silent.clone(),
+            }),
+            Arc::new(MemBus::new()),
+            sub,
+            log.clone(),
+            snapshots.clone(),
+            EAGER,
+            None,
+        )
+        .await
+        .expect("the room boots");
+        let (writer, _writer_rx) = join(&h).await;
+        let (_peer, mut peer_rx) = join(&h).await;
+        drain(&mut peer_rx);
+
+        send_edit(&h, writer, silent).await;
+        until_probe(&h, "the room is unlogged", |p| p.unlogged).await;
+        assert!(log.appended().is_empty(), "nothing was to be stored");
+        assert!(
+            drain(&mut peer_rx).is_empty(),
+            "nothing was to be fanned out"
+        );
+
+        let later = para(12, "logged");
+        send_edit(&h, writer, later.clone()).await;
+        until("the later edit is stored", || {
+            log.appended().iter().any(|n| same_update(&n.bytes, &later))
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        shut_down(&h).await;
+        assert!(
+            snapshots.written().is_empty(),
+            "a snapshot certified content no row carries: {:?}",
+            snapshots.written()
+        );
     }
 
     /// The four rows `catch_up_passes_...` and `boot_passes_...` read: a

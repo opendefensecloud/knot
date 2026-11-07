@@ -18,10 +18,15 @@
 //! these tests.
 
 mod common;
+#[path = "common/fixtures.rs"]
+mod fixtures;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fixtures::{
+    is_frame_of, parked_block_and_the_edit_it_fails_on, rejected_part_way, same_update, text_page,
+};
 use knot_crdt::nesting::{
     MAX_NESTING, TooDeep, check_update, deepest_inserted_type_depth, inserted_type_ids,
     nests_deeper_than,
@@ -36,13 +41,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use yrs::block::{ClientID, ItemContent};
-use yrs::branch::Branch;
 use yrs::encoding::write::Write;
-use yrs::types::TypeRef;
 use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{
-    Assoc, Doc, ID, IndexedSequence, Options, ReadTxn, StateVector, Text, Transact,
-    XmlElementPrelim, XmlElementRef, XmlFragment, XmlOut, XmlTextPrelim,
+    Doc, Options, ReadTxn, StateVector, Text, Transact, XmlElementPrelim, XmlElementRef,
+    XmlFragment, XmlOut, XmlTextPrelim,
 };
 
 /// How deep the crafted updates nest: far past what a walk that recursed
@@ -499,42 +502,6 @@ fn sentinel() -> Vec<u8> {
         p.push_back(&mut txn, XmlTextPrelim::new("after"));
     }
     state(&doc)
-}
-
-/// Whether two updates carry the same insertions and deletions (false when
-/// either does not decode): a room persists and fans out what an apply
-/// changed, which yrs re-encodes, so its bytes may differ from what a client
-/// sent. As `knot_crdt::room`'s test helper.
-fn same_update(a: &[u8], b: &[u8]) -> bool {
-    use yrs::Update;
-    use yrs::updates::decoder::Decode;
-    match (Update::decode_v1(a), Update::decode_v1(b)) {
-        (Ok(a), Ok(b)) => {
-            a.insertions(true) == b.insertions(true) && a.delete_set() == b.delete_set()
-        }
-        _ => false,
-    }
-}
-
-/// Whether `frame` is a sync update frame carrying `update` (as
-/// [`same_update`]).
-fn is_frame_of(frame: &[u8], update: &[u8]) -> bool {
-    let [0, 2, rest @ ..] = frame else {
-        return false;
-    };
-    let mut len = 0usize;
-    let mut shift = 0;
-    let mut at = 0;
-    loop {
-        let Some(&b) = rest.get(at) else { return false };
-        at += 1;
-        len |= ((b & 0x7f) as usize) << shift;
-        if b < 0x80 {
-            break;
-        }
-        shift += 7;
-    }
-    rest.len() - at == len && same_update(&rest[at..], update)
 }
 
 /// Sends `deep` from one connection, then [`sentinel`] from another, and
@@ -1007,49 +974,6 @@ async fn board_refused_after_apply_and_evicted(base: Vec<u8>, bad: Vec<u8>) {
 //   Within the limit, it does what main does: it neither persists nor fans
 //   out the update, and keeps the sender and its other connections.
 
-/// A page holding one paragraph of text, from `client`, and the id of the
-/// text's first character: an item that holds a string, not a type.
-fn text_page(client: u64) -> (Vec<u8>, ID) {
-    let doc = Doc::with_client_id(client);
-    let frag = doc.get_or_insert_xml_fragment("default");
-    let first = {
-        let mut txn = doc.transact_mut();
-        let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
-        let text = p.push_back(&mut txn, XmlTextPrelim::new("hello"));
-        let index = text
-            .sticky_index(&txn, 0, Assoc::After)
-            .expect("the text has a first character");
-        *index.id().expect("a character has an id")
-    };
-    (state(&doc), first)
-}
-
-/// An ordinary inconsistent update, which yrs integrates part of and then
-/// rejects (`UpdateError::InvalidParent`): from client 77, an element
-/// `partial` in the page's root fragment, then a string whose parent is
-/// `not_a_type`, an item that holds text. yrs's own encoder never writes
-/// such an update; a buggy or crafted client can. Encoded by hand, as
-/// `knot_test_support::crafted` encodes the crafted attack. While the doc
-/// lacks `not_a_type`, yrs integrates `partial` and parks the string until
-/// that item arrives.
-fn rejected_part_way(not_a_type: &ID) -> Vec<u8> {
-    let mut enc = EncoderV1::new();
-    enc.write_var(1u32);
-    enc.write_var(2u32);
-    enc.write_client(ClientID::new(77));
-    enc.write_var(0u32);
-    enc.write_info(7);
-    enc.write_parent_info(true);
-    enc.write_string("default");
-    ItemContent::Type(Branch::new(TypeRef::XmlElement("partial".into()))).encode(&mut enc);
-    enc.write_info(4);
-    enc.write_parent_info(false);
-    enc.write_left_id(not_a_type);
-    ItemContent::String("y".into()).encode(&mut enc);
-    enc.write_var(0u32);
-    enc.to_vec()
-}
-
 /// Whether the root fragment of `doc` holds an element tagged `partial`.
 fn holds_partial(doc: &DocHandle) -> bool {
     let frag = doc.inner().get_or_insert_xml_fragment("default");
@@ -1063,7 +987,7 @@ fn holds_partial(doc: &DocHandle) -> bool {
 /// the doc although apply returned an error.
 #[test]
 fn yrs_rejects_the_update_part_way_and_keeps_what_it_integrated() {
-    let (base, not_a_type) = text_page(1);
+    let (base, _, not_a_type) = text_page(1);
     let bad = rejected_part_way(&not_a_type);
     let doc = page(&[&base]);
     assert_eq!(
@@ -1242,21 +1166,12 @@ async fn fanned_out(rx: &mut mpsc::Receiver<Vec<u8>>, update: &[u8]) -> Vec<Vec<
     }
 }
 
-/// A crafted update whose string yrs parks, as it waits for client 5's
-/// text, and the innocent edit that brings that text: the edit's apply
-/// integrates the edit, then retries the parked string, which fails, since
-/// text is no type.
-fn parked_block_and_the_edit_it_fails_on() -> (Vec<u8>, Vec<u8>) {
-    let (edit, text) = text_page(5);
-    (rejected_part_way(&text), edit)
-}
-
 /// The fixture: the crafted update applies, its string parked; the edit's
 /// apply integrates the edit, then fails on the parked string. GREEN-only:
 /// it names new API.
 #[test]
 fn a_parked_block_fails_the_apply_of_the_edit_it_waits_for() {
-    let (parked, edit) = parked_block_and_the_edit_it_fails_on();
+    let (parked, edit, _) = parked_block_and_the_edit_it_fails_on();
     let doc = YrsEngine.new_doc();
     let measured = YrsEngine
         .apply_update_measuring(&doc, &parked, MAX_NESTING)
@@ -1287,7 +1202,7 @@ fn a_parked_block_fails_the_apply_of_the_edit_it_waits_for() {
 async fn a_room_keeps_the_sender_whose_update_a_parked_block_fails_on() {
     let doc_id = Uuid::new_v4();
     let store = Stored::default();
-    let (parked, edit) = parked_block_and_the_edit_it_fails_on();
+    let (parked, edit, _) = parked_block_and_the_edit_it_fails_on();
 
     let room = room_on(doc_id, &store).await;
     let (crafted, _crafted_rx, _) = join(&room).await;
@@ -1342,7 +1257,7 @@ async fn a_room_keeps_the_sender_whose_update_a_parked_block_fails_on() {
 /// fails on that text (client 77's blocks integrate after client 99's).
 fn nests_too_deep_then_rejected() -> (Vec<u8>, Vec<u8>) {
     let (base, attack) = crafted_attack();
-    let (text, not_a_type) = text_page(2);
+    let (text, _, not_a_type) = text_page(2);
     let base = yrs::merge_updates_v1([base, text]).expect("merge the base");
     let bad =
         yrs::merge_updates_v1([attack, rejected_part_way(&not_a_type)]).expect("merge the update");
@@ -1450,7 +1365,7 @@ async fn a_board_room_refuses_only_the_sender_of_an_update_that_does_not_decode(
 async fn a_board_room_keeps_the_sender_whose_update_a_parked_block_fails_on() {
     let board_id = Uuid::new_v4();
     let store = StoredBoard::default();
-    let (parked, edit) = parked_block_and_the_edit_it_fails_on();
+    let (parked, edit, _) = parked_block_and_the_edit_it_fails_on();
 
     let h = board_on(board_id, &store).await;
     let (crafted, _crafted_rx, _) = join_board(&h).await;
@@ -1580,7 +1495,7 @@ async fn a_refused_connection_stays_refused() {
             })
             .await
             .unwrap();
-        let (edit, _) = text_page(3);
+        let (edit, ..) = text_page(3);
         let mut afters: Vec<Vec<u8>> = Vec::new();
         for _ in 0..2 {
             send(&room, conn, edit.clone()).await;
@@ -1669,7 +1584,7 @@ async fn a_refused_board_connection_stays_refused() {
         // Twice: fanning the peer's edit out must not drop the refused
         // connection, whose channel is closed, and with it the board room's
         // knowledge that it was refused.
-        let (edit, _) = text_page(3);
+        let (edit, ..) = text_page(3);
         let mut afters = Vec::new();
         for _ in 0..2 {
             send_board(&h, conn, edit.clone()).await;
@@ -1732,8 +1647,8 @@ async fn a_refused_board_connection_stays_refused() {
 /// panics in a debug build.
 #[test]
 fn the_reader_reads_the_updates_of_these_tests_as_yrs_does() {
-    let (text, first_char) = text_page(1);
-    let (parked, edit) = parked_block_and_the_edit_it_fails_on();
+    let (text, _, first_char) = text_page(1);
+    let (parked, edit, _) = parked_block_and_the_edit_it_fails_on();
     let (deep_base, too_deep) = nests_too_deep_then_rejected();
     let [no_update, _past_u32_max] = undecodable();
     let updates = [

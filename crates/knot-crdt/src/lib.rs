@@ -35,4 +35,7 @@ pub use suggestions::{ApplySuggestionError, ApplySuggestionRequest, SuggestionKi
 pub use writer::{Applied, PersistJob, WriterDone, WriterEvent, WriterLimits};
 
 #[cfg(test)]
+#[path = "../tests/common/fixtures.rs"]
+mod test_fixtures;
+#[cfg(test)]
 mod test_metrics;
