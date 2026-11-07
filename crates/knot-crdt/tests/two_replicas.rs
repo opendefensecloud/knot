@@ -5,33 +5,28 @@
 //! by rev, and the 0.9.9 pod's snapshot upserts never overwrite a stamped
 //! snapshot.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[path = "common/fixtures.rs"]
 mod fixtures;
+#[path = "common/log_fixtures.rs"]
+mod log_fixtures;
 
-use fixtures::{same_update, unwrap_frame};
-use knot_crdt::{
-    Bus, ConnHandle, DocHandle, Engine, Event, InMsg, MemBus, RoomHandle, Rooms, SnapshotPolicy,
-    YrsEngine,
-};
+use fixtures::{Rng, random_edit};
+use knot_crdt::{Bus, DocHandle, Event, MemBus, RoomHandle, Rooms, SnapshotPolicy, YrsEngine};
 use knot_storage::{
     DocSnapshot, DocUpdate, HistoryHead, NewUpdate, Persisted, PgSnapshotStore, PgUpdatesStore,
     RowsAfter, SnapshotMeta, SnapshotStamp, SnapshotStore, SnapshotStoreError, UpdatesStore,
     UpdatesStoreError,
 };
+use log_fixtures::{Client, assert_same_doc, doc_of, replay, row_count};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use uuid::Uuid;
-use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{
-    Doc, GetString, ReadTxn, StateVector, Subscription, Text, Transact, Update, XmlElementPrelim,
-    XmlFragment, XmlFragmentRef, XmlOut, XmlTextPrelim, XmlTextRef,
-};
+use yrs::{Doc, ReadTxn, StateVector, Transact, XmlFragmentRef};
 
 /// knot 0.9.9's `INSERT_UPDATES_SQL` (`updates_store.rs`), verbatim: 0.9.9
 /// pods keep running it against the M1.2 schema during the rolling upgrade.
@@ -85,138 +80,6 @@ const EDITS: usize = 200;
 const OLD_SAVES: usize = 60;
 
 // ---------------------------------------------------------------------------
-// Docs
-// ---------------------------------------------------------------------------
-
-/// A seeded xorshift64: the histories are reproducible from the seed alone.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn word(&mut self) -> String {
-        let len = 1 + self.below(6);
-        (0..len)
-            .map(|_| char::from(b'a' + self.below(26) as u8))
-            .collect()
-    }
-}
-
-fn doc_of(updates: &[&[u8]]) -> DocHandle {
-    let doc = YrsEngine.new_doc();
-    for u in updates {
-        YrsEngine.apply_update(&doc, u).expect("the update applies");
-    }
-    doc
-}
-
-fn text(d: &DocHandle) -> String {
-    let frag = d.inner().get_or_insert_xml_fragment("default");
-    frag.get_string(&d.inner().transact())
-}
-
-/// The pending structs and pending delete set, each encoded.
-fn pending(d: &DocHandle) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    let txn = d.inner().transact();
-    let store = txn.store();
-    (
-        store.pending_update().map(|p| p.update.encode_v1()),
-        store.pending_ds().map(|ds| ds.encode_v1()),
-    )
-}
-
-/// Where two docs differ (state vector, delete set, text, pending content),
-/// if they do.
-fn difference(a: &DocHandle, b: &DocHandle) -> Option<String> {
-    let state = |d: &DocHandle| {
-        let txn = d.inner().transact();
-        (txn.state_vector(), txn.snapshot().delete_set.encode_v1())
-    };
-    let ((sv_a, ds_a), (sv_b, ds_b)) = (state(a), state(b));
-    if sv_a != sv_b {
-        return Some(format!("state vectors differ: {sv_a:?} / {sv_b:?}"));
-    }
-    if ds_a != ds_b {
-        return Some("delete sets differ".into());
-    }
-    let (text_a, text_b) = (text(a), text(b));
-    if text_a != text_b {
-        return Some(format!("content differs:\n{text_a}\n{text_b}"));
-    }
-    let ((pu_a, pd_a), (pu_b, pd_b)) = (pending(a), pending(b));
-    let structs_agree = match (&pu_a, &pu_b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => same_update(a, b),
-        _ => false,
-    };
-    if !structs_agree || pd_a != pd_b {
-        return Some("pending content differs".into());
-    }
-    None
-}
-
-#[track_caller]
-fn assert_same_doc(a: &DocHandle, b: &DocHandle, what: &str) {
-    if let Some(how) = difference(a, b) {
-        panic!("{what}: {how}");
-    }
-}
-
-/// The text of the `i`th paragraph of `frag`.
-fn text_at(frag: &XmlFragmentRef, txn: &impl ReadTxn, i: u32) -> Option<XmlTextRef> {
-    match frag.get(txn, i)? {
-        XmlOut::Element(p) => match p.get(txn, 0)? {
-            XmlOut::Text(t) => Some(t),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// One random transaction on `doc`: a new paragraph, a word typed into
-/// one, or a few characters deleted.
-fn random_edit(doc: &Doc, frag: &XmlFragmentRef, rng: &mut Rng) {
-    let mut txn = doc.transact_mut();
-    let n = frag.len(&txn);
-    let pick = if n > 0 { rng.below(3) } else { 2 };
-    let target = if n > 0 {
-        text_at(frag, &txn, rng.below(n as usize) as u32)
-    } else {
-        None
-    };
-    match (pick, target) {
-        (0, Some(t)) => {
-            let at = rng.below(t.len(&txn) as usize + 1) as u32;
-            t.insert(&mut txn, at, &rng.word());
-        }
-        (1, Some(t)) if t.len(&txn) > 2 => {
-            let at = rng.below(t.len(&txn) as usize - 2) as u32;
-            t.remove_range(&mut txn, at, 1 + rng.below(2) as u32);
-        }
-        _ => {
-            let at = rng.below(n as usize + 1) as u32;
-            let p = frag.insert(&mut txn, at, XmlElementPrelim::empty("paragraph"));
-            p.push_back(&mut txn, XmlTextPrelim::new(rng.word()));
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The database
 // ---------------------------------------------------------------------------
 
@@ -258,33 +121,6 @@ async fn page_and_users(pool: &PgPool, n: usize) -> (Uuid, Vec<Uuid>) {
     .await
     .unwrap();
     (doc, users)
-}
-
-/// The page's rows, in rev order.
-async fn rows(pool: &PgPool, doc: Uuid) -> Vec<DocUpdate> {
-    PgUpdatesStore::new(pool.clone())
-        .rows_after(doc, RowsAfter::Rev(0))
-        .await
-        .unwrap()
-}
-
-/// The page's log replayed into a fresh doc up to and including `upto`.
-async fn replay(pool: &PgPool, doc: Uuid, upto: i64) -> DocHandle {
-    let rows = rows(pool, doc).await;
-    let upto: Vec<&[u8]> = rows
-        .iter()
-        .filter(|r| r.rev.unwrap() <= upto)
-        .map(|r| r.update_bytes.as_slice())
-        .collect();
-    doc_of(&upto)
-}
-
-async fn row_count(pool: &PgPool, doc: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM doc_updates WHERE doc_id = $1")
-        .bind(doc)
-        .fetch_one(pool)
-        .await
-        .unwrap()
 }
 
 /// Waits until the page's row count has not changed for a second.
@@ -512,94 +348,7 @@ async fn caught_up_doc(h: &RoomHandle, what: &str) -> DocHandle {
     }
 }
 
-/// An editor: a yrs doc joined to a room through a connection of its own.
-struct Client {
-    doc: Doc,
-    frag: XmlFragmentRef,
-    conn: Uuid,
-    user: Uuid,
-    rx: mpsc::Receiver<Vec<u8>>,
-    /// The update of each local transaction not yet taken by `edit`.
-    own: Arc<Mutex<Vec<Vec<u8>>>>,
-    /// Off while the client applies what it receives.
-    recording: Arc<AtomicBool>,
-    _sub: Subscription,
-}
-
 impl Client {
-    async fn join(h: &RoomHandle, client: u64, user: Uuid) -> Self {
-        let conn = Uuid::new_v4();
-        let (tx, rx) = mpsc::channel(8192);
-        let (reply, joined) = oneshot::channel();
-        h.tx.send(Event::Join {
-            conn_id: conn,
-            handle: ConnHandle::new(tx),
-            reply,
-        })
-        .await
-        .unwrap();
-        let state = joined.await.unwrap().unwrap();
-        let doc = Doc::with_client_id(client);
-        let frag = doc.get_or_insert_xml_fragment("default");
-        let own = Arc::new(Mutex::new(Vec::new()));
-        let recording = Arc::new(AtomicBool::new(true));
-        let sub = {
-            let (own, recording) = (own.clone(), recording.clone());
-            doc.observe_update_v1(move |_, e| {
-                if recording.load(Ordering::SeqCst) {
-                    own.lock().unwrap().push(e.update.clone());
-                }
-            })
-            .unwrap()
-        };
-        let client = Client {
-            doc,
-            frag,
-            conn,
-            user,
-            rx,
-            own,
-            recording,
-            _sub: sub,
-        };
-        client.apply(&state.update);
-        client
-    }
-
-    fn apply(&self, update: &[u8]) {
-        self.recording.store(false, Ordering::SeqCst);
-        let _ = self
-            .doc
-            .transact_mut()
-            .apply_update(Update::decode_v1(update).unwrap());
-        self.recording.store(true, Ordering::SeqCst);
-    }
-
-    /// Applies every frame received so far.
-    fn sync(&mut self) {
-        while let Ok(frame) = self.rx.try_recv() {
-            self.apply(&unwrap_frame(&frame));
-        }
-    }
-
-    /// One random transaction; returns its update.
-    fn edit(&mut self, rng: &mut Rng) -> Vec<u8> {
-        random_edit(&self.doc, &self.frag, rng);
-        let mut own = std::mem::take(&mut *self.own.lock().unwrap());
-        assert_eq!(own.len(), 1, "one transaction, one update");
-        own.pop().unwrap()
-    }
-
-    async fn send(&self, h: &RoomHandle, bytes: Vec<u8>) {
-        h.tx.send(Event::Inbound(InMsg {
-            from: self.conn,
-            by_user: Some(self.user),
-            bytes,
-        }))
-        .await
-        .unwrap();
-    }
-
     /// Types `edits` random transactions into `h`, catching up on what the
     /// room fans out before each one.
     async fn type_into(&mut self, h: &RoomHandle, edits: usize, seed: u64) {
@@ -714,9 +463,8 @@ impl OldPod {
     }
 }
 
-/// Every stamped snapshot of the page equals the log replayed to its rev;
-/// returns how many there are.
-async fn assert_stamped_snapshots_replay(pool: &PgPool, doc: Uuid) -> usize {
+/// Every stamped snapshot of the page equals the log replayed to its rev.
+async fn assert_stamped_snapshots_replay(pool: &PgPool, doc: Uuid) {
     let stamped: Vec<(i64, i64, Vec<u8>)> = sqlx::query_as(
         "SELECT snapshot_rev, snapshot_seq, state_bytes FROM doc_snapshots
           WHERE doc_id = $1 AND snapshot_rev IS NOT NULL ORDER BY snapshot_rev",
@@ -732,7 +480,6 @@ async fn assert_stamped_snapshots_replay(pool: &PgPool, doc: Uuid) -> usize {
             &format!("the stamped snapshot at rev {rev} (seq {seq})"),
         );
     }
-    stamped.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -764,9 +511,9 @@ async fn old_and_new_replicas_share_one_gapless_log() {
         .await
         .expect("replica B opens the page");
 
-    let mut a1 = Client::join(&a, 1, users[0]).await;
-    let mut a2 = Client::join(&a, 2, users[1]).await;
-    let mut b1 = Client::join(&b, 3, users[2]).await;
+    let mut a1 = Client::join_as(&a, 1, Some(users[0])).await;
+    let mut a2 = Client::join_as(&a, 2, Some(users[1])).await;
+    let mut b1 = Client::join_as(&b, 3, Some(users[2])).await;
 
     // Who types each of the edits, from one seed.
     let mut shares = [0usize; 3];
@@ -810,10 +557,10 @@ async fn old_and_new_replicas_share_one_gapless_log() {
     let all = replay(&db.pool, doc, i64::MAX).await;
     assert_same_doc(&caught_up_doc(&a, "replica A").await, &all, "replica A");
     assert_same_doc(&caught_up_doc(&b, "replica B").await, &all, "replica B");
-    assert!(
-        assert_stamped_snapshots_replay(&db.pool, doc).await > 0,
-        "no room wrote a stamped snapshot"
-    );
+    // How many stamped snapshots the rooms wrote while everyone typed
+    // depends on timing (a room snapshots only when nothing is in flight),
+    // so this checks whichever exist; the step below writes one for certain.
+    assert_stamped_snapshots_replay(&db.pool, doc).await;
 
     // Whether the 0.9.9 pod's upserts above met a stamped snapshot depends
     // on timing, so meet one for certain: one more edit on A, whose room
@@ -833,9 +580,10 @@ async fn old_and_new_replicas_share_one_gapless_log() {
             AND s.snapshot_seq = (SELECT max(seq) FROM doc_updates WHERE doc_id = $1)",
     )
     .bind(doc)
-    .fetch_one(&db.pool)
+    .fetch_optional(&db.pool)
     .await
-    .unwrap();
+    .unwrap()
+    .flatten();
     assert_eq!(
         at_newest,
         Some(count + 1),

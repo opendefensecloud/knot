@@ -13,8 +13,8 @@ use yrs::types::TypeRef;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{
-    Assoc, Doc, ID, IndexedSequence, ReadTxn, StateVector, Transact, Update, XmlElementPrelim,
-    XmlFragment, XmlTextPrelim,
+    Assoc, Doc, ID, IndexedSequence, ReadTxn, StateVector, Text, Transact, Update,
+    XmlElementPrelim, XmlFragment, XmlFragmentRef, XmlOut, XmlTextPrelim, XmlTextRef,
 };
 
 /// Whether two updates carry the same insertions and deletions: a room
@@ -131,4 +131,76 @@ pub fn rejected_part_way(not_a_type: &ID) -> Vec<u8> {
 pub fn parked_block_and_the_edit_it_fails_on() -> (Vec<u8>, Vec<u8>, Doc) {
     let (edit, doc, text) = text_page(5);
     (rejected_part_way(&text), edit, doc)
+}
+
+/// A seeded xorshift64: the histories are reproducible from the seed alone.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
+    pub fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    pub fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    pub fn chance(&mut self, pct: u64) -> bool {
+        self.next() % 100 < pct
+    }
+
+    pub fn word(&mut self) -> String {
+        let len = 1 + self.below(6);
+        (0..len)
+            .map(|_| char::from(b'a' + self.below(26) as u8))
+            .collect()
+    }
+}
+
+/// The text of the `i`th paragraph of `frag`.
+pub fn text_at(frag: &XmlFragmentRef, txn: &impl ReadTxn, i: u32) -> Option<XmlTextRef> {
+    match frag.get(txn, i)? {
+        XmlOut::Element(p) => match p.get(txn, 0)? {
+            XmlOut::Text(t) => Some(t),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// One random transaction on `doc`: a new paragraph, a word typed into
+/// one, or a few characters deleted.
+pub fn random_edit(doc: &Doc, frag: &XmlFragmentRef, rng: &mut Rng) {
+    let mut txn = doc.transact_mut();
+    let n = frag.len(&txn);
+    let pick = if n > 0 { rng.below(3) } else { 2 };
+    let target = if n > 0 {
+        text_at(frag, &txn, rng.below(n as usize) as u32)
+    } else {
+        None
+    };
+    match (pick, target) {
+        (0, Some(t)) => {
+            let at = rng.below(t.len(&txn) as usize + 1) as u32;
+            t.insert(&mut txn, at, &rng.word());
+        }
+        (1, Some(t)) if t.len(&txn) > 2 => {
+            let at = rng.below(t.len(&txn) as usize - 2) as u32;
+            t.remove_range(&mut txn, at, 1 + rng.below(2) as u32);
+        }
+        _ => {
+            let at = rng.below(n as usize + 1) as u32;
+            let p = frag.insert(&mut txn, at, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new(rng.word()));
+        }
+    }
 }

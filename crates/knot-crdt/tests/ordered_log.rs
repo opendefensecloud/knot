@@ -5,140 +5,39 @@
 //! (before the write, or after a COMMIT whose acknowledgement was lost) lose
 //! nothing, and pages last saved before the upgrade boot complete.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[path = "common/fixtures.rs"]
 mod fixtures;
+#[path = "common/log_fixtures.rs"]
+mod log_fixtures;
 
-use fixtures::{para, same_update, unwrap_frame};
+use fixtures::{Rng, para};
 use knot_crdt::nesting::MAX_NESTING;
 use knot_crdt::{
-    BootMode, Bus, ConnHandle, DocHandle, Engine, Event, InMsg, MemBus, Room, RoomHandle,
-    SnapshotPolicy, YrsEngine,
+    BootMode, Bus, DocHandle, Engine, Event, MemBus, Room, RoomHandle, SnapshotPolicy, YrsEngine,
 };
 use knot_storage::{
     DocUpdate, HistoryHead, NewUpdate, Persisted, PgSnapshotStore, PgUpdatesStore, RowsAfter,
     UpdatesStore, UpdatesStoreError,
 };
+use log_fixtures::{
+    Client, assert_same_doc, difference, doc_of, pending, replay, row_count, rows, text,
+};
 use sqlx::PgPool;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{
-    Doc, GetString, ReadTxn, StateVector, Subscription, Text, Transact, Update, XmlElementPrelim,
-    XmlFragment, XmlFragmentRef, XmlOut, XmlTextPrelim, XmlTextRef,
+    Doc, ReadTxn, StateVector, Text, Transact, Update, XmlElementPrelim, XmlFragment, XmlTextPrelim,
 };
 
 /// The migration that adds the log columns: a database migrated up to it
 /// holds rows and snapshots as 0.9.9 wrote them (no rev, no heads row).
 const HISTORY_LOG_COLUMNS: i64 = 20261107120000;
-
-// ---------------------------------------------------------------------------
-// Updates and docs
-// ---------------------------------------------------------------------------
-
-/// A seeded xorshift64: the histories are reproducible from the seed alone.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn chance(&mut self, pct: u64) -> bool {
-        self.next() % 100 < pct
-    }
-
-    fn word(&mut self) -> String {
-        let len = 1 + self.below(6);
-        (0..len)
-            .map(|_| char::from(b'a' + self.below(26) as u8))
-            .collect()
-    }
-}
-
-fn doc_of(updates: &[&[u8]]) -> DocHandle {
-    let doc = YrsEngine.new_doc();
-    for u in updates {
-        YrsEngine.apply_update(&doc, u).expect("the update applies");
-    }
-    doc
-}
-
-fn text(d: &DocHandle) -> String {
-    let frag = d.inner().get_or_insert_xml_fragment("default");
-    frag.get_string(&d.inner().transact())
-}
-
-/// The pending structs and pending delete set, each encoded.
-fn pending(d: &DocHandle) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    let txn = d.inner().transact();
-    let store = txn.store();
-    (
-        store.pending_update().map(|p| p.update.encode_v1()),
-        store.pending_ds().map(|ds| ds.encode_v1()),
-    )
-}
-
-/// Where two docs differ (state vector, delete set, text, pending content),
-/// if they do.
-fn difference(a: &DocHandle, b: &DocHandle) -> Option<String> {
-    let state = |d: &DocHandle| {
-        let txn = d.inner().transact();
-        (txn.state_vector(), txn.snapshot().delete_set.encode_v1())
-    };
-    let ((sv_a, ds_a), (sv_b, ds_b)) = (state(a), state(b));
-    if sv_a != sv_b {
-        return Some(format!("state vectors differ: {sv_a:?} / {sv_b:?}"));
-    }
-    if ds_a != ds_b {
-        return Some("delete sets differ".into());
-    }
-    let (text_a, text_b) = (text(a), text(b));
-    if text_a != text_b {
-        return Some(format!("content differs:\n{text_a}\n{text_b}"));
-    }
-    let ((pu_a, pd_a), (pu_b, pd_b)) = (pending(a), pending(b));
-    let structs_agree = match (&pu_a, &pu_b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => same_update(a, b),
-        _ => false,
-    };
-    if !structs_agree {
-        return Some(format!(
-            "pending structs differ: {:?} / {:?}",
-            pu_a.is_some(),
-            pu_b.is_some()
-        ));
-    }
-    if pd_a != pd_b {
-        return Some("pending deletes differ".into());
-    }
-    None
-}
-
-#[track_caller]
-fn assert_same_doc(a: &DocHandle, b: &DocHandle, what: &str) {
-    if let Some(how) = difference(a, b) {
-        panic!("{what}: {how}");
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The database
@@ -243,33 +142,6 @@ async fn legacy_snapshot(pool: &PgPool, doc: Uuid, seq: i64, state: &DocHandle) 
     .unwrap();
 }
 
-/// The page's rows, in rev order.
-async fn rows(pool: &PgPool, doc: Uuid) -> Vec<DocUpdate> {
-    PgUpdatesStore::new(pool.clone())
-        .rows_after(doc, RowsAfter::Rev(0))
-        .await
-        .unwrap()
-}
-
-/// The page's log replayed into a fresh doc up to and including `upto`.
-async fn replay(pool: &PgPool, doc: Uuid, upto: i64) -> DocHandle {
-    let rows = rows(pool, doc).await;
-    let upto: Vec<&[u8]> = rows
-        .iter()
-        .filter(|r| r.rev.unwrap() <= upto)
-        .map(|r| r.update_bytes.as_slice())
-        .collect();
-    doc_of(&upto)
-}
-
-async fn row_count(pool: &PgPool, doc: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM doc_updates WHERE doc_id = $1")
-        .bind(doc)
-        .fetch_one(pool)
-        .await
-        .unwrap()
-}
-
 /// The page's stamped snapshots: rev, epoch and state, by rev.
 async fn stamped_snapshots(pool: &PgPool, doc: Uuid) -> Vec<(i64, Option<i32>, Vec<u8>)> {
     sqlx::query_as(
@@ -372,138 +244,6 @@ async fn until_rows(pool: &PgPool, doc: Uuid, n: i64) {
             "the page never held {n} rows"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// An editor: a yrs doc joined to the room through a connection of its own.
-struct Client {
-    doc: Doc,
-    frag: XmlFragmentRef,
-    conn: Uuid,
-    rx: mpsc::Receiver<Vec<u8>>,
-    /// The update of each local transaction since the last `take`.
-    own: Arc<Mutex<Vec<Vec<u8>>>>,
-    /// Off while the client applies what it receives.
-    recording: Arc<AtomicBool>,
-    _sub: Subscription,
-}
-
-impl Client {
-    async fn join(h: &RoomHandle, client: u64) -> Self {
-        let conn = Uuid::new_v4();
-        let (tx, rx) = mpsc::channel(8192);
-        let (reply, joined) = oneshot::channel();
-        h.tx.send(Event::Join {
-            conn_id: conn,
-            handle: ConnHandle::new(tx),
-            reply,
-        })
-        .await
-        .unwrap();
-        let state = joined.await.unwrap().unwrap();
-        let doc = Doc::with_client_id(client);
-        let frag = doc.get_or_insert_xml_fragment("default");
-        let own = Arc::new(Mutex::new(Vec::new()));
-        let recording = Arc::new(AtomicBool::new(true));
-        let sub = {
-            let (own, recording) = (own.clone(), recording.clone());
-            doc.observe_update_v1(move |_, e| {
-                if recording.load(Ordering::SeqCst) {
-                    own.lock().unwrap().push(e.update.clone());
-                }
-            })
-            .unwrap()
-        };
-        let client = Client {
-            doc,
-            frag,
-            conn,
-            rx,
-            own,
-            recording,
-            _sub: sub,
-        };
-        client.apply(&state.update);
-        client
-    }
-
-    fn apply(&self, update: &[u8]) {
-        self.recording.store(false, Ordering::SeqCst);
-        let _ = self
-            .doc
-            .transact_mut()
-            .apply_update(Update::decode_v1(update).unwrap());
-        self.recording.store(true, Ordering::SeqCst);
-    }
-
-    /// Applies every frame received so far.
-    fn sync(&mut self) -> Vec<Vec<u8>> {
-        let mut got = Vec::new();
-        while let Ok(frame) = self.rx.try_recv() {
-            let update = unwrap_frame(&frame);
-            self.apply(&update);
-            got.push(update);
-        }
-        got
-    }
-
-    fn take(&self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut *self.own.lock().unwrap())
-    }
-
-    fn text_of(&self, txn: &impl ReadTxn, i: u32) -> Option<XmlTextRef> {
-        match self.frag.get(txn, i)? {
-            XmlOut::Element(p) => match p.get(txn, 0)? {
-                XmlOut::Text(t) => Some(t),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    /// One random transaction: a new paragraph, a word typed into one, or
-    /// a few characters deleted. Returns its update.
-    fn edit(&mut self, rng: &mut Rng) -> Vec<u8> {
-        {
-            let mut txn = self.doc.transact_mut();
-            let n = self.frag.len(&txn);
-            let pick = if n > 0 { rng.below(3) } else { 2 };
-            let target = if n > 0 {
-                self.text_of(&txn, rng.below(n as usize) as u32)
-            } else {
-                None
-            };
-            match (pick, target) {
-                (0, Some(t)) => {
-                    let at = rng.below(t.len(&txn) as usize + 1) as u32;
-                    t.insert(&mut txn, at, &rng.word());
-                }
-                (1, Some(t)) if t.len(&txn) > 2 => {
-                    let at = rng.below(t.len(&txn) as usize - 2) as u32;
-                    t.remove_range(&mut txn, at, 1 + rng.below(2) as u32);
-                }
-                _ => {
-                    let at = rng.below(n as usize + 1) as u32;
-                    let p = self
-                        .frag
-                        .insert(&mut txn, at, XmlElementPrelim::empty("paragraph"));
-                    p.push_back(&mut txn, XmlTextPrelim::new(rng.word()));
-                }
-            }
-        }
-        let mut own = self.take();
-        assert_eq!(own.len(), 1, "one transaction, one update");
-        own.pop().unwrap()
-    }
-
-    async fn send(&self, h: &RoomHandle, bytes: Vec<u8>) {
-        h.tx.send(Event::Inbound(InMsg {
-            from: self.conn,
-            by_user: None,
-            bytes,
-        }))
-        .await
-        .unwrap();
     }
 }
 
