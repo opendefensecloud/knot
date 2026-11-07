@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { useEffect } from "react";
+import { useLayoutEffect } from "react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -134,10 +134,12 @@ function lists(fetchMock: FetchMock): number {
     .length;
 }
 
-/** Reports each path the app arrives at. */
+/** Reports each path the app arrives at. A layout effect reports it in the
+ *  commit that renders it; a passive effect could still be pending when a
+ *  waitFor on the text below returns. */
 function Location({ onPath }: { onPath: (path: string) => void }) {
   const { pathname } = useLocation();
-  useEffect(() => onPath(pathname), [pathname, onPath]);
+  useLayoutEffect(() => onPath(pathname), [pathname, onPath]);
   return <output data-testid="location">{pathname}</output>;
 }
 
