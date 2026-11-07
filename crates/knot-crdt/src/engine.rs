@@ -3,7 +3,7 @@
 
 use thiserror::Error;
 use yrs::{
-    Doc, ReadTxn, StateVector, Transact, Update,
+    Doc, ReadTxn, StateVector, Transact, TransactionMut, Update,
     updates::{decoder::Decode, encoder::Encode},
 };
 
@@ -21,7 +21,8 @@ pub enum EngineError {
 
 /// What [`Engine::apply_update_measuring`] reports for an update that
 /// decoded: whether the doc changed, how deep the update nested the doc's
-/// shared types, and whether yrs rejected part of it.
+/// shared types, whether yrs rejected part of it, and what to persist and
+/// fan out for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyMeasured {
     /// Whether the doc changed, as [`Engine::apply_update_changed`] reports.
@@ -39,6 +40,21 @@ pub struct ApplyMeasured {
     /// update. `changed` and `max_depth` cover what the apply integrated
     /// either way.
     pub rejected: Option<String>,
+    /// What to persist and fan out for this apply: the effective update,
+    /// what the apply changed (the transaction's own `encode_update_v1`,
+    /// taken after commit: the blocks it integrated and the items it newly
+    /// deleted). A reconnect resend thus persists only what is new to the
+    /// doc, not the content and the whole delete set the doc already holds.
+    /// Empty when the doc did not change or yrs rejected part of the update.
+    /// It is the raw update instead (`raw_fallback`) when the apply parked or
+    /// drained pending structs or deletes (`encode_update_v1` omits pending
+    /// content, and replaying the log must park and drain it the same way),
+    /// and when `encode_update_v1` does not hold exactly the blocks the apply
+    /// integrated (a block integrated past a gap in its client's clock, or a
+    /// gap filled; see `effective_update`).
+    pub persist: Vec<u8>,
+    /// Whether `persist` is the raw update (see `persist`).
+    pub raw_fallback: bool,
 }
 
 pub struct DocHandle(pub(crate) Doc);
@@ -69,7 +85,8 @@ pub trait Engine: Send + Sync + 'static {
     /// [`crate::nesting`]). Returns whether the doc changed (as
     /// [`Engine::apply_update_changed`]), the depth of the deepest type the
     /// apply integrated, capped at `limit + 1` (a root type is at depth 0),
-    /// and whether yrs rejected part of the update ([`ApplyMeasured`]). A
+    /// whether yrs rejected part of the update, and the effective update to
+    /// persist and fan out ([`ApplyMeasured`]). A
     /// caller refuses the update, without persisting or fanning it out, when
     /// `max_depth > limit`: the doc then holds what it refused, also when
     /// yrs rejected the rest.
@@ -163,9 +180,9 @@ impl Engine for YrsEngine {
         // On an error, what yrs integrated before it stays in the doc, and
         // is measured below like the rest.
         let rejected = txn.apply_update(u).err().map(|e| e.to_string());
-        let changed = !txn.insert_set().is_empty()
-            || !txn.delete_set().is_empty()
-            || pending_fingerprint(&txn) != pending_before;
+        let pending_changed = pending_fingerprint(&txn) != pending_before;
+        let changed =
+            !txn.insert_set().is_empty() || !txn.delete_set().is_empty() || pending_changed;
         // Measure only the types THIS transaction actually integrated — the
         // ones in its insert set. A full-state SyncStep2 re-send re-encodes
         // every type the doc already has; those must not be re-measured, or
@@ -175,13 +192,26 @@ impl Engine for YrsEngine {
         // now IS in the insert set, so it is still measured.
         type_ids.retain(|id| txn.insert_set().contains(id));
         // Commit now (rather than on drop) so the walk below reads the
-        // integrated, garbage-collected document.
+        // integrated, garbage-collected document, and the effective update
+        // below is encoded from it.
         txn.commit();
         let max_depth = crate::nesting::deepest_inserted_type_depth(&txn, &type_ids, limit);
+        let (persist, raw_fallback) = if !changed || rejected.is_some() {
+            (Vec::new(), false)
+        } else if pending_changed {
+            (update.to_vec(), true)
+        } else {
+            match effective_update(&txn) {
+                Some(effective) => (effective, false),
+                None => (update.to_vec(), true),
+            }
+        };
         Ok(ApplyMeasured {
             changed,
             max_depth,
             rejected,
+            persist,
+            raw_fallback,
         })
     }
 
@@ -204,6 +234,30 @@ impl Engine for YrsEngine {
         let txn = d.0.transact();
         Ok(txn.state_vector().encode_v1())
     }
+}
+
+/// `txn.encode_update_v1()`, taken after commit, when it holds exactly the
+/// blocks the transaction integrated; `None` when it does not. It writes,
+/// for each client whose state-vector clock moved past the transaction's
+/// before-state, every block from there to the end of that client's list,
+/// and nothing for any other client. yrs 0.27 integrates a block whose own
+/// dependencies it has even when earlier blocks of the same client are
+/// missing, behind a Skip, and parks nothing, and the state vector stops at
+/// the gap. So an apply that integrates a block past a gap gets an update
+/// without it, and one that fills a gap gets one that also re-sends the
+/// blocks past the gap, which yrs 0.27 can panic on when it applies them to
+/// a doc that already holds them. The blocks and the delete set otherwise
+/// are this transaction's own, so a doc in the state the transaction began
+/// in integrates them as this one did.
+fn effective_update(txn: &TransactionMut) -> Option<Vec<u8>> {
+    let effective = txn.encode_update_v1();
+    if txn.insert_set().is_empty() {
+        // No block moved any state-vector clock: the update is the delete
+        // set alone.
+        return Some(effective);
+    }
+    let written = Update::decode_v1(&effective).ok()?.insertions(true);
+    (&written == txn.insert_set()).then_some(effective)
 }
 
 /// The doc's pending (not yet integrable) structs and deletes, encoded, so a
