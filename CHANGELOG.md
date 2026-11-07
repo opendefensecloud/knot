@@ -8,7 +8,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
-## [0.9.10] - 2026-11-07
+## [0.9.10] - 2026-11-08
 
 ### Upgrading
 - Upgrade from 0.9.9, and don't skip 0.9.10 on the way to a later
@@ -65,7 +65,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   - `20261107120004_history_rev_index_check` does nothing unless the
     index build was interrupted or aborted; then all access to page
     edits, open 0.9.9 pages included, pauses for one index build of
-    `doc_updates`.
+    `doc_updates`. (#82)
 - While 0.9.9 and 0.9.10 pods run side by side, editors on a 0.9.9 pod
   may not see edits saved by other pods while the upgrade runs
   (especially edits made during the third migration's pause) until
@@ -74,11 +74,11 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   0.9.9 to one replica or pick a quiet window. A page's Markdown
   export, My Tasks entries and search results may stay stale until the
   page is next edited, and an edit a 0.9.9 pod failed to save during
-  the rollout may be lost unless its author is still connected.
+  the rollout may be lost unless its author is still connected. (#82)
 - The first time each page edited before the upgrade opens, knot
   numbers its stored edits once and replays its whole stored history:
   that first load is slower, and `doc_updates` grows by up to the size
-  of the renumbered rows until autovacuum reclaims it.
+  of the renumbered rows until autovacuum reclaims it. (#82)
 
 ### Added
 - Metrics `knot_writer_flush_seconds`, `knot_writer_flush_retries_total`,
@@ -86,7 +86,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   `knot_room_updates_persisted_raw_total` and
   `knot_history_legacy_mismatch_total`. The Helm chart README says what
   `knot_room_row_apply_errors_total` and
-  `knot_history_legacy_mismatch_total` mean and when to report them.
+  `knot_history_legacy_mismatch_total` mean and when to report them. (#82)
 
 ### Changed
 - Edits that could not be saved during a database outage are retried in
@@ -94,25 +94,25 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   when a pod shuts down (for up to 10 s). The chart's default
   `terminationGracePeriodSeconds` is now 50 to leave room for it; a
   shorter value can lose unsaved edits when a pod stops during a
-  database outage.
+  database outage. (#82)
 - A save that waits on a lock gives up after 8 s in the database and is
-  retried, so a stalled save no longer holds a database connection.
+  retried, so a stalled save no longer holds a database connection. (#82)
 - After a long outage or a refused save, editors reconnect and resend
   their changes, and a page reopens on a pod only once that pod has
-  saved what it held.
+  saved what it held. (#82)
 - Changes made by knot itself (task checkboxes, imports, templates,
   restores, accepted suggestions) reach other editors only once they
   are saved; during an outage they fail after about 5 to 25 s and the
-  page's editors reconnect.
+  page's editors reconnect. (#82)
 - A page whose stored edits include one that cannot be applied opens
-  again (it used to fail to load).
+  again (it used to fail to load). (#82)
 
 ### Fixed
 - A page open on several pods could miss an edit another pod saved at
   the same moment, until the page's room restarted. Pages that already
-  missed one this way get it back the first time they open on 0.9.10.
+  missed one this way get it back the first time they open on 0.9.10. (#82)
 - Purging a page while someone edits it no longer risks a database
-  deadlock.
+  deadlock. (#82)
 
 ## [0.9.9] - 2026-11-06
 
