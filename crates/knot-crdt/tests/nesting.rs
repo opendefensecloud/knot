@@ -329,15 +329,37 @@ struct CapturingUpdates {
 
 #[async_trait::async_trait]
 impl knot_storage::UpdatesStore for CapturingUpdates {
-    async fn insert_batch(
+    async fn append(
         &self,
         _: Uuid,
-        updates: &[(Option<Uuid>, Vec<u8>)],
-    ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+        _: i32,
+        rows: &[knot_storage::NewUpdate],
+    ) -> Result<Vec<knot_storage::Persisted>, knot_storage::UpdatesStoreError> {
         let mut p = self.persisted.lock().unwrap();
         let first = p.len() as i64 + 1;
-        p.extend(updates.iter().map(|(_, b)| b.clone()));
-        Ok((first..first + updates.len() as i64).collect())
+        p.extend(rows.iter().map(|row| row.bytes.clone()));
+        Ok((first..first + rows.len() as i64)
+            .map(|seq| knot_storage::Persisted { seq, rev: seq })
+            .collect())
+    }
+    async fn rows_after(
+        &self,
+        _: Uuid,
+        _: knot_storage::RowsAfter,
+    ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+        Ok(vec![])
+    }
+    async fn head(
+        &self,
+        _: Uuid,
+    ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
+        Ok(knot_storage::HistoryHead::default())
+    }
+    async fn ensure_legacy_numbered(
+        &self,
+        _: Uuid,
+    ) -> Result<u64, knot_storage::UpdatesStoreError> {
+        Ok(0)
     }
     async fn since(
         &self,
@@ -359,10 +381,10 @@ struct RecordingSnapshots {
 
 #[async_trait::async_trait]
 impl knot_storage::SnapshotStore for RecordingSnapshots {
-    async fn insert(
+    async fn insert_stamped(
         &self,
         _: Uuid,
-        _: i64,
+        _: knot_storage::SnapshotStamp,
         state: &[u8],
         _: &[u8],
     ) -> Result<(), knot_storage::SnapshotStoreError> {
@@ -1074,15 +1096,44 @@ impl Stored {
 
 #[async_trait::async_trait]
 impl knot_storage::UpdatesStore for Stored {
-    async fn insert_batch(
+    async fn append(
         &self,
         _: Uuid,
-        updates: &[(Option<Uuid>, Vec<u8>)],
-    ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+        _: i32,
+        new_rows: &[knot_storage::NewUpdate],
+    ) -> Result<Vec<knot_storage::Persisted>, knot_storage::UpdatesStoreError> {
         let mut rows = self.0.lock().unwrap();
         let first = rows.len() as i64 + 1;
-        rows.extend(updates.iter().map(|(_, b)| b.clone()));
-        Ok((first..first + updates.len() as i64).collect())
+        rows.extend(new_rows.iter().map(|row| row.bytes.clone()));
+        Ok((first..first + new_rows.len() as i64)
+            .map(|seq| knot_storage::Persisted { seq, rev: seq })
+            .collect())
+    }
+    async fn rows_after(
+        &self,
+        doc_id: Uuid,
+        from: knot_storage::RowsAfter,
+    ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+        let after = match from {
+            knot_storage::RowsAfter::Rev(rev) => rev,
+            knot_storage::RowsAfter::All => 0,
+        };
+        self.since(doc_id, after).await
+    }
+    async fn head(
+        &self,
+        _: Uuid,
+    ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
+        Ok(knot_storage::HistoryHead {
+            head_rev: self.rows().len() as i64,
+            ..Default::default()
+        })
+    }
+    async fn ensure_legacy_numbered(
+        &self,
+        _: Uuid,
+    ) -> Result<u64, knot_storage::UpdatesStoreError> {
+        Ok(0)
     }
     async fn since(
         &self,
@@ -1100,6 +1151,10 @@ impl knot_storage::UpdatesStore for Stored {
                 update_bytes,
                 by_user_id: None,
                 created_at: sqlx::types::chrono::Utc::now(),
+                rev: Some(seq),
+                source: Some(knot_storage::UpdateSource::Edit),
+                meta: None,
+                epoch: Some(0),
             })
             .collect())
     }

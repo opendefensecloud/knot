@@ -158,6 +158,8 @@ impl World {
 fn page(parent: Option<Uuid>, title: &str, state: &[u8]) -> PageCopy {
     PageCopy {
         new_id: Uuid::new_v4(),
+        source_id: Uuid::new_v4(),
+        source_title: format!("source of {title}"),
         parent,
         title: title.into(),
         icon: Some("📄".into()),
@@ -929,4 +931,61 @@ async fn pending(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+/// Every page of a copy starts its log with one row: rev 1, source `copy`,
+/// the empty epoch, and where it was copied from.
+#[tokio::test(flavor = "multi_thread")]
+async fn copied_pages_get_a_copy_sourced_first_row() {
+    let w = world().await;
+    let s = w.seed(None, "S", "g").await;
+    let c = w.seed(Some(s), "C", "a").await;
+    let mut plan = plan_for(&w, s, None);
+    plan.top.source_id = s;
+    plan.top.source_title = "S".into();
+    let mut child = page(Some(plan.top.new_id), "C", b"c");
+    child.source_id = c;
+    child.source_title = "C".into();
+    plan.pages = vec![child];
+
+    let outcome = apply_duplicate(&w.pool, &plan).await.unwrap();
+    for (p, (id, seq)) in std::iter::once(&plan.top)
+        .chain(&plan.pages)
+        .zip(&outcome.pages)
+    {
+        type Row = (
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<i32>,
+            Option<serde_json::Value>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT seq, rev, source, epoch, meta FROM doc_updates WHERE doc_id = $1",
+        )
+        .bind(id)
+        .fetch_all(&w.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [(
+                *seq,
+                Some(1),
+                Some("copy".to_string()),
+                Some(0),
+                Some(serde_json::json!({
+                    "source_doc_id": p.source_id.to_string(),
+                    "source_title": p.source_title,
+                })),
+            )]
+        );
+        let head_rev: i64 =
+            sqlx::query_scalar("SELECT head_rev FROM doc_history_heads WHERE doc_id = $1")
+                .bind(id)
+                .fetch_one(&w.pool)
+                .await
+                .unwrap();
+        assert_eq!(head_rev, 1);
+    }
 }

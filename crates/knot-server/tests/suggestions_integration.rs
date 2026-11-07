@@ -1615,15 +1615,35 @@ struct SlowUpdates {
 
 #[async_trait::async_trait]
 impl knot_storage::UpdatesStore for SlowUpdates {
-    async fn insert_batch(
+    async fn append(
         &self,
         doc_id: Uuid,
-        updates: &[(Option<Uuid>, Vec<u8>)],
-    ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+        epoch: i32,
+        rows: &[knot_storage::NewUpdate],
+    ) -> Result<Vec<knot_storage::Persisted>, knot_storage::UpdatesStoreError> {
         if self.slow.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::time::sleep(self.delay).await;
         }
-        self.inner.insert_batch(doc_id, updates).await
+        self.inner.append(doc_id, epoch, rows).await
+    }
+    async fn rows_after(
+        &self,
+        doc_id: Uuid,
+        from: knot_storage::RowsAfter,
+    ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+        self.inner.rows_after(doc_id, from).await
+    }
+    async fn head(
+        &self,
+        doc_id: Uuid,
+    ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
+        self.inner.head(doc_id).await
+    }
+    async fn ensure_legacy_numbered(
+        &self,
+        doc_id: Uuid,
+    ) -> Result<u64, knot_storage::UpdatesStoreError> {
+        self.inner.ensure_legacy_numbered(doc_id).await
     }
     async fn since(
         &self,

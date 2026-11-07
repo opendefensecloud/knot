@@ -18,13 +18,18 @@ use uuid::Uuid;
 use crate::blobs::{BlobMetadata, BlobStore, BlobStoreError};
 use crate::doc_store::{COLS, DocRow, DocStoreError, Document, doc_from_row, map_unique};
 use crate::placement::{self, Placement};
-use crate::updates_store::INSERT_UPDATES_SQL;
+use crate::updates_store::{NewUpdate, UpdateSource, append_in_tx};
 use crate::{audit, invalidations, lexorank};
 
 /// One page of the copy.
 #[derive(Debug, Clone)]
 pub struct PageCopy {
     pub new_id: Uuid,
+    /// The page copied, and its own title (not the copy's "(copy)" one): the
+    /// copy's first history row names them, so they outlive a rename or a
+    /// purge of the source.
+    pub source_id: Uuid,
+    pub source_title: String,
     /// The top page: the source's parent. A subpage: the copy of its
     /// parent, earlier in the plan.
     pub parent: Option<Uuid>,
@@ -130,13 +135,18 @@ async fn apply_once(
     }
     let mut pages = Vec::with_capacity(plan.pages.len() + 1);
     for page in std::iter::once(&plan.top).chain(&plan.pages) {
-        let seq: i64 = sqlx::query_scalar(INSERT_UPDATES_SQL)
-            .bind(page.new_id)
-            .bind([Some(plan.actor)])
-            .bind([page.state.as_slice()])
-            .fetch_one(&mut *tx)
-            .await?;
-        pages.push((page.new_id, seq));
+        let row = NewUpdate {
+            by_user_id: Some(plan.actor),
+            bytes: page.state.clone(),
+            source: UpdateSource::Copy,
+            meta: Some(serde_json::json!({
+                "source_doc_id": page.source_id,
+                "source_title": page.source_title,
+            })),
+        };
+        // A new page: content epoch 0, rev 1.
+        let persisted = append_in_tx(&mut tx, page.new_id, 0, &[row]).await?;
+        pages.push((page.new_id, persisted[0].seq));
     }
     for board in &plan.boards {
         insert_board(&mut tx, plan.actor, board).await?;

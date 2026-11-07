@@ -1018,12 +1018,34 @@ pub(crate) mod tests {
     pub(crate) struct NoopUpdates;
     #[async_trait::async_trait]
     impl knot_storage::UpdatesStore for NoopUpdates {
-        async fn insert_batch(
+        async fn append(
             &self,
             _: Uuid,
-            updates: &[(Option<Uuid>, Vec<u8>)],
-        ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
-            Ok((1..=updates.len() as i64).collect())
+            _: i32,
+            rows: &[knot_storage::NewUpdate],
+        ) -> Result<Vec<knot_storage::Persisted>, knot_storage::UpdatesStoreError> {
+            Ok((1..=rows.len() as i64)
+                .map(|seq| knot_storage::Persisted { seq, rev: seq })
+                .collect())
+        }
+        async fn rows_after(
+            &self,
+            _: Uuid,
+            _: knot_storage::RowsAfter,
+        ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+            Ok(vec![])
+        }
+        async fn head(
+            &self,
+            _: Uuid,
+        ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
+            Ok(knot_storage::HistoryHead::default())
+        }
+        async fn ensure_legacy_numbered(
+            &self,
+            _: Uuid,
+        ) -> Result<u64, knot_storage::UpdatesStoreError> {
+            Ok(0)
         }
         async fn since(
             &self,
@@ -1044,15 +1066,37 @@ pub(crate) mod tests {
     }
     #[async_trait::async_trait]
     impl knot_storage::UpdatesStore for RecordingUpdates {
-        async fn insert_batch(
+        async fn append(
             &self,
             _: Uuid,
-            updates: &[(Option<Uuid>, Vec<u8>)],
-        ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+            _: i32,
+            rows: &[knot_storage::NewUpdate],
+        ) -> Result<Vec<knot_storage::Persisted>, knot_storage::UpdatesStoreError> {
             let mut seen = self.seen.lock().unwrap();
             let first = seen.len() as i64 + 1;
-            seen.extend(updates.iter().map(|(by, _)| *by));
-            Ok((first..first + updates.len() as i64).collect())
+            seen.extend(rows.iter().map(|row| row.by_user_id));
+            Ok((first..first + rows.len() as i64)
+                .map(|seq| knot_storage::Persisted { seq, rev: seq })
+                .collect())
+        }
+        async fn rows_after(
+            &self,
+            _: Uuid,
+            _: knot_storage::RowsAfter,
+        ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+            Ok(vec![])
+        }
+        async fn head(
+            &self,
+            _: Uuid,
+        ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
+            Ok(knot_storage::HistoryHead::default())
+        }
+        async fn ensure_legacy_numbered(
+            &self,
+            _: Uuid,
+        ) -> Result<u64, knot_storage::UpdatesStoreError> {
+            Ok(0)
         }
         async fn since(
             &self,
@@ -1072,15 +1116,37 @@ pub(crate) mod tests {
     }
     #[async_trait::async_trait]
     impl knot_storage::UpdatesStore for CapturingUpdates {
-        async fn insert_batch(
+        async fn append(
             &self,
             _: Uuid,
-            updates: &[(Option<Uuid>, Vec<u8>)],
-        ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+            _: i32,
+            rows: &[knot_storage::NewUpdate],
+        ) -> Result<Vec<knot_storage::Persisted>, knot_storage::UpdatesStoreError> {
             let mut p = self.persisted.lock().unwrap();
             let first = p.len() as i64 + 1;
-            p.extend(updates.iter().map(|(_, b)| b.clone()));
-            Ok((first..first + updates.len() as i64).collect())
+            p.extend(rows.iter().map(|row| row.bytes.clone()));
+            Ok((first..first + rows.len() as i64)
+                .map(|seq| knot_storage::Persisted { seq, rev: seq })
+                .collect())
+        }
+        async fn rows_after(
+            &self,
+            _: Uuid,
+            _: knot_storage::RowsAfter,
+        ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+            Ok(vec![])
+        }
+        async fn head(
+            &self,
+            _: Uuid,
+        ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
+            Ok(knot_storage::HistoryHead::default())
+        }
+        async fn ensure_legacy_numbered(
+            &self,
+            _: Uuid,
+        ) -> Result<u64, knot_storage::UpdatesStoreError> {
+            Ok(0)
         }
         async fn since(
             &self,
@@ -1097,10 +1163,10 @@ pub(crate) mod tests {
     pub(crate) struct NoopSnapshots;
     #[async_trait::async_trait]
     impl knot_storage::SnapshotStore for NoopSnapshots {
-        async fn insert(
+        async fn insert_stamped(
             &self,
             _: Uuid,
-            _: i64,
+            _: knot_storage::SnapshotStamp,
             _: &[u8],
             _: &[u8],
         ) -> Result<(), knot_storage::SnapshotStoreError> {
@@ -2365,18 +2431,40 @@ pub(crate) mod tests {
         h.shutdown.cancel();
     }
 
-    /// An updates store whose writes always fail.
+    /// An updates store whose writes always fail, permanently (so a writer
+    /// gives up at once instead of retrying).
     struct FailingUpdates;
     #[async_trait::async_trait]
     impl knot_storage::UpdatesStore for FailingUpdates {
-        async fn insert_batch(
+        async fn append(
             &self,
             _: Uuid,
-            _: &[(Option<Uuid>, Vec<u8>)],
-        ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
-            Err(knot_storage::UpdatesStoreError::Sqlx(
-                sqlx::Error::PoolClosed,
-            ))
+            epoch: i32,
+            _: &[knot_storage::NewUpdate],
+        ) -> Result<Vec<knot_storage::Persisted>, knot_storage::UpdatesStoreError> {
+            Err(knot_storage::UpdatesStoreError::EpochChanged {
+                room: epoch,
+                stored: epoch + 1,
+            })
+        }
+        async fn rows_after(
+            &self,
+            _: Uuid,
+            _: knot_storage::RowsAfter,
+        ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+            Ok(vec![])
+        }
+        async fn head(
+            &self,
+            _: Uuid,
+        ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
+            Ok(knot_storage::HistoryHead::default())
+        }
+        async fn ensure_legacy_numbered(
+            &self,
+            _: Uuid,
+        ) -> Result<u64, knot_storage::UpdatesStoreError> {
+            Ok(0)
         }
         async fn since(
             &self,
@@ -2398,10 +2486,10 @@ pub(crate) mod tests {
     }
     #[async_trait::async_trait]
     impl knot_storage::SnapshotStore for CountingSnapshots {
-        async fn insert(
+        async fn insert_stamped(
             &self,
             _: Uuid,
-            _: i64,
+            _: knot_storage::SnapshotStamp,
             _: &[u8],
             _: &[u8],
         ) -> Result<(), knot_storage::SnapshotStoreError> {
@@ -2493,39 +2581,72 @@ pub(crate) mod tests {
         );
     }
 
-    /// An updates store that takes every write and whose catch-up reads fail
-    /// while `fail_since` is set.
+    /// An updates store that takes every write and whose catch-up reads
+    /// (`since`, `rows_after`, `head`) fail while `fail_reads` is set.
     #[derive(Default)]
     struct FlakyReads {
         next_seq: std::sync::atomic::AtomicI64,
-        fail_since: std::sync::atomic::AtomicBool,
+        fail_reads: std::sync::atomic::AtomicBool,
+    }
+    impl FlakyReads {
+        fn read(&self) -> Result<(), knot_storage::UpdatesStoreError> {
+            if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(knot_storage::UpdatesStoreError::Sqlx(
+                    sqlx::Error::PoolClosed,
+                ));
+            }
+            Ok(())
+        }
     }
     #[async_trait::async_trait]
     impl knot_storage::UpdatesStore for FlakyReads {
-        async fn insert_batch(
+        async fn append(
             &self,
             _: Uuid,
-            batch: &[(Option<Uuid>, Vec<u8>)],
-        ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
-            Ok(batch
+            _: i32,
+            rows: &[knot_storage::NewUpdate],
+        ) -> Result<Vec<knot_storage::Persisted>, knot_storage::UpdatesStoreError> {
+            Ok(rows
                 .iter()
                 .map(|_| {
-                    self.next_seq
+                    let seq = self
+                        .next_seq
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                        + 1
+                        + 1;
+                    knot_storage::Persisted { seq, rev: seq }
                 })
                 .collect())
+        }
+        async fn rows_after(
+            &self,
+            _: Uuid,
+            _: knot_storage::RowsAfter,
+        ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+            self.read()?;
+            Ok(vec![])
+        }
+        async fn head(
+            &self,
+            _: Uuid,
+        ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
+            self.read()?;
+            Ok(knot_storage::HistoryHead {
+                head_rev: self.next_seq.load(std::sync::atomic::Ordering::SeqCst),
+                ..Default::default()
+            })
+        }
+        async fn ensure_legacy_numbered(
+            &self,
+            _: Uuid,
+        ) -> Result<u64, knot_storage::UpdatesStoreError> {
+            Ok(0)
         }
         async fn since(
             &self,
             _: Uuid,
             _: i64,
         ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
-            if self.fail_since.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(knot_storage::UpdatesStoreError::Sqlx(
-                    sqlx::Error::PoolClosed,
-                ));
-            }
+            self.read()?;
             Ok(vec![])
         }
         async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
@@ -2546,7 +2667,7 @@ pub(crate) mod tests {
         apply_suggestion(&h, request, None).await.expect("apply");
 
         updates
-            .fail_since
+            .fail_reads
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         h.tx.send(Event::SuggestionApplied {
@@ -2563,7 +2684,7 @@ pub(crate) mod tests {
         assert!(!h.shutdown.is_cancelled(), "a failed read evicted the room");
 
         updates
-            .fail_since
+            .fail_reads
             .store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(suggestion_applied(&h, id, token).await);
         h.shutdown.cancel();
