@@ -5,7 +5,7 @@
 //! (before the write, or after a COMMIT whose acknowledgement was lost) lose
 //! nothing, and pages last saved before the upgrade boot complete.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -264,6 +264,8 @@ struct Flaky {
     inner: PgUpdatesStore,
     mode: Mode,
     left: AtomicUsize,
+    /// Whether the latest append returned an error.
+    failing: AtomicBool,
 }
 
 impl Flaky {
@@ -272,7 +274,28 @@ impl Flaky {
             inner: PgUpdatesStore::new(pool.clone()),
             mode,
             left: AtomicUsize::new(k),
+            failing: AtomicBool::new(false),
         })
+    }
+
+    /// Every failure is used up and an append has succeeded since the last
+    /// one, so the writer is out of its retry backoff.
+    fn recovered(&self) -> bool {
+        self.left.load(Ordering::SeqCst) == 0 && !self.failing.load(Ordering::SeqCst)
+    }
+
+    /// Waits until [`Flaky::recovered`]. A lost acknowledgement leaves its
+    /// rows committed, so the log can equal the room's doc (and look
+    /// settled) while the writer still waits to retry them.
+    async fn until_recovered(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !self.recovered() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the writer never got past its failed appends"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     fn take_failure(&self) -> bool {
@@ -280,11 +303,8 @@ impl Flaky {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
     }
-}
 
-#[async_trait::async_trait]
-impl UpdatesStore for Flaky {
-    async fn append(
+    async fn append_or_fail(
         &self,
         doc_id: Uuid,
         epoch: i32,
@@ -307,6 +327,20 @@ impl UpdatesStore for Flaky {
                 Ok(persisted)
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl UpdatesStore for Flaky {
+    async fn append(
+        &self,
+        doc_id: Uuid,
+        epoch: i32,
+        rows: &[NewUpdate],
+    ) -> Result<Vec<Persisted>, UpdatesStoreError> {
+        let result = self.append_or_fail(doc_id, epoch, rows).await;
+        self.failing.store(result.is_err(), Ordering::SeqCst);
+        result
     }
     async fn rows_after(
         &self,
@@ -419,12 +453,15 @@ async fn every_snapshot_equals_the_log_replayed_to_its_rev() {
             c.send(&h, update).await;
         };
 
-        // Failed flushes first.
+        // Failed flushes first. The writer must be past them before the
+        // held-back update below: otherwise its retry takes the first
+        // spaced edits into its batch, and no snapshot falls between them.
         while edits < 20 {
             edit(&mut rng, &mut a, &mut b).await;
             edits += 1;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        flaky.until_recovered().await;
         settle(&pool, doc, &h).await;
         assert_eq!(flaky.left.load(Ordering::SeqCst), 0, "{mode:?}");
 
