@@ -11,6 +11,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
+use knot_auth::api_key::{self, PrincipalKind};
 use knot_auth::{Allow, SessionToken};
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,10 @@ struct SessionResponse {
     display_name: String,
     workspace_id: String,
     role: String,
+    /// "local" | "oidc" | "bot"; lets the UI hide "never expires" for SSO users.
+    auth_kind: &'static str,
+    /// Upper bound for API key TTL in days; `null` means unlimited allowed.
+    max_api_key_ttl_days: Option<i64>,
 }
 
 /// A fixed Argon2 hash so login runs the (expensive) verify even when the user
@@ -195,7 +200,14 @@ async fn session(State(state): State<AppState>, req: Request<Body>) -> Response 
             return internal();
         }
     };
+    let kind = crate::routes::api::api_keys::principal_kind(&user);
     Json(SessionResponse {
+        auth_kind: match kind {
+            PrincipalKind::Local => "local",
+            PrincipalKind::Oidc => "oidc",
+            PrincipalKind::Bot => "bot",
+        },
+        max_api_key_ttl_days: api_key::max_ttl_days(kind),
         user_id: user.id.to_string(),
         email: user.email,
         display_name: user.display_name,
@@ -300,23 +312,19 @@ async fn change_password(State(state): State<AppState>, req: Request<Body>) -> R
     let Some(pool) = state.pool.clone() else {
         return internal();
     };
-    if let Err(e) = sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
-        .bind(new_hash)
-        .bind(ctx.user_id)
-        .execute(&pool)
-        .await
-    {
+    // One transaction: the new hash (whose trigger revokes the user's API
+    // keys, S5) and the end of every existing session (other devices, any
+    // stolen cookie). A key mint locks the user row and re-checks its
+    // session, so it either commits first and is revoked here, or waits and
+    // finds its session gone. Two statements outside a transaction would
+    // let a mint slip in between.
+    if let Err(e) = replace_password_hash(&pool, ctx.user_id, &new_hash).await {
         tracing::error!(error=?e, "change_password update");
         return internal();
     }
 
-    // Kill every existing session for this user (logs out other devices and
-    // any stolen cookie), then mint a fresh session for the current request.
+    // Mint a fresh session for the current request.
     if let Some(sessions) = state.sessions.clone() {
-        if let Err(e) = sessions.delete_for_user(ctx.user_id).await {
-            tracing::error!(error=?e, "change_password: delete_for_user");
-            return internal();
-        }
         let token = SessionToken::generate();
         let exp = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
         let sid_hash = knot_auth::csrf::hash_session_id(&state.session_key, token.as_bytes());
@@ -337,6 +345,24 @@ async fn change_password(State(state): State<AppState>, req: Request<Body>) -> R
     state.throttle.reset(&ip_key);
     state.throttle.reset(&user_key);
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn replace_password_hash(
+    pool: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    new_hash: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = knot_storage::begin(pool).await?;
+    sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+        .bind(new_hash)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
 }
 
 fn invalid_credentials() -> Response {

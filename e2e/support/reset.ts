@@ -38,6 +38,7 @@ const TABLES = [
   "suggestion_replies",
   "suggestions",
   "acl_invalidations",
+  "api_keys",
   "audit_events",
   "blob_bytes",
   "blobs",
