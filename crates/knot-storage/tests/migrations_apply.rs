@@ -6,6 +6,43 @@ use std::collections::{BTreeMap, BTreeSet};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// knot 0.9.9's `INSERT_UPDATES_SQL` (`updates_store.rs`), verbatim: 0.9.9
+/// pods keep running it against the M1.2 schema during the rolling upgrade.
+const OLD_INSERT_UPDATES_SQL: &str = "WITH ins AS (
+             INSERT INTO doc_updates (doc_id, by_user_id, update_bytes)
+             SELECT $1, u.by_user_id, u.update_bytes
+             FROM UNNEST($2::uuid[], $3::bytea[])
+                  WITH ORDINALITY AS u(by_user_id, update_bytes, ord)
+             ORDER BY u.ord
+             RETURNING seq, by_user_id
+         ),
+         contrib AS (
+             INSERT INTO doc_contributors (doc_id, user_id)
+             SELECT DISTINCT $1::uuid, ins.by_user_id
+             FROM ins
+             WHERE ins.by_user_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM doc_contributors c
+                   WHERE c.doc_id = $1
+                     AND c.user_id = ins.by_user_id
+                     AND c.last_edited_at >= now() - interval '1 minute'
+               )
+             ORDER BY ins.by_user_id
+             ON CONFLICT (doc_id, user_id) DO UPDATE
+                 SET last_edited_at = now()
+                 WHERE doc_contributors.last_edited_at < now() - interval '1 minute'
+         )
+         SELECT seq FROM ins ORDER BY seq";
+
+/// knot 0.9.9's snapshot upsert (`PgSnapshotStore::insert`), verbatim.
+const OLD_SNAPSHOT_UPSERT_SQL: &str =
+    "INSERT INTO doc_snapshots (doc_id, snapshot_seq, state_bytes, state_vector)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (doc_id, snapshot_seq) DO UPDATE
+             SET state_bytes = EXCLUDED.state_bytes,
+                 state_vector = EXCLUDED.state_vector,
+                 created_at = now()";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn migrations_apply_cleanly() {
     // Empty DB on shared container; let `connect()` apply migrations
@@ -1463,4 +1500,310 @@ async fn history_since_is_the_moment_deletes_stopped() {
         .await
         .unwrap();
     assert_eq!(meta, None, "doc_history_meta is dropped");
+}
+
+// ---------------------------------------------------------------------------
+// Page history M1.2: the lock helper and the log columns
+// ---------------------------------------------------------------------------
+
+fn sqlstate(e: &sqlx::Error) -> Option<String> {
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.into_owned())
+}
+
+/// The deadlock M1.1's loop was written for, now through `knot_lock_tables`:
+/// a page write T1 holds a page row, an edit save T2 holds ROW EXCLUSIVE on
+/// `doc_updates` and waits for that row in its FK check, and T1 then writes
+/// `documents`. A migrator that waited for `doc_updates` while holding
+/// `documents` would close the cycle; the helper lets go and tries again.
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_helper_backs_off_instead_of_deadlocking() {
+    use std::time::{Duration, Instant};
+
+    let (pool, _, doc) = history_fixture().await;
+
+    let mut t1 = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM documents WHERE id = $1 FOR UPDATE")
+        .bind(doc)
+        .execute(&mut *t1)
+        .await
+        .unwrap();
+
+    let t2 = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await?;
+            sqlx::query("INSERT INTO doc_updates (doc_id, update_bytes) VALUES ($1, '\\x01')")
+                .bind(doc)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await
+        }
+    });
+    // T2 waits for T1's page row, holding ROW EXCLUSIVE on doc_updates.
+    knot_test_support::locks::wait_for_lock_waits(&pool, 1).await;
+
+    let m = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let started = Instant::now();
+            let mut tx = pool.begin().await?;
+            sqlx::query(
+                "SELECT knot_lock_tables('t', ARRAY['documents','doc_updates']::regclass[],
+                                         'SHARE ROW EXCLUSIVE', '20 seconds')",
+            )
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(started.elapsed())
+        }
+    });
+    // M has failed an attempt on doc_updates and let go of documents.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    sqlx::query("UPDATE documents SET title = 'x' WHERE id = $1")
+        .bind(doc)
+        .execute(&mut *t1)
+        .await
+        .unwrap();
+    t1.commit().await.unwrap();
+
+    let t2 = t2.await.unwrap();
+    let m = m.await.unwrap();
+    assert!(
+        t2.is_ok() && m.is_ok(),
+        "no 40P01 anywhere: t2 {t2:?}, m {m:?}"
+    );
+    let m_elapsed = m.unwrap();
+    assert!(m_elapsed < Duration::from_secs(20), "{m_elapsed:?}");
+    assert!(
+        m_elapsed >= Duration::from_millis(250),
+        "M got doc_updates only after T2 committed: {m_elapsed:?}"
+    );
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 3);
+}
+
+/// After `give_up_after` the helper raises, naming the session that holds a
+/// conflicting lock, and not one whose lock does not conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_helper_gives_up_naming_the_holder() {
+    let (pool, _, _) = history_fixture().await;
+
+    let mut h = pool.begin().await.unwrap();
+    let h_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *h)
+        .await
+        .unwrap();
+    sqlx::query("LOCK TABLE doc_updates IN ROW EXCLUSIVE MODE")
+        .execute(&mut *h)
+        .await
+        .unwrap();
+    // A reader: ACCESS SHARE does not conflict with SHARE.
+    let mut r = pool.begin().await.unwrap();
+    let r_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *r)
+        .await
+        .unwrap();
+    sqlx::query("SELECT count(*) FROM doc_updates")
+        .execute(&mut *r)
+        .await
+        .unwrap();
+
+    let mut m = pool.begin().await.unwrap();
+    let e = sqlx::query(
+        "SELECT knot_lock_tables('t', ARRAY['doc_updates']::regclass[], 'SHARE', '1 second')",
+    )
+    .execute(&mut *m)
+    .await
+    .unwrap_err();
+    let msg = e.to_string();
+    assert!(
+        msg.contains("t: could not get SHARE on doc_updates within 1 s"),
+        "{msg}"
+    );
+    assert!(msg.contains(&format!("pid {h_pid}")), "{msg}");
+    assert!(!msg.contains(&format!("pid {r_pid}")), "{msg}");
+    assert!(msg.contains("The migrate Job will retry."), "{msg}");
+    drop(m);
+    r.rollback().await.unwrap();
+    h.rollback().await.unwrap();
+}
+
+/// `lock_mode` is spliced into a LOCK statement, so only the three modes the
+/// migrations use are accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_helper_refuses_an_unknown_mode() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    for mode in [
+        "ROW SHARE; DROP TABLE doc_updates",
+        "ROW EXCLUSIVE",
+        "share",
+    ] {
+        let e = sqlx::query("SELECT knot_lock_tables('t', ARRAY['doc_updates']::regclass[], $1)")
+            .bind(mode)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(sqlstate(&e).as_deref(), Some("22023"), "{mode}: {e}");
+        assert!(e.to_string().contains("lock mode"), "{mode}: {e}");
+    }
+    let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('doc_updates')::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(exists.as_deref(), Some("doc_updates"));
+}
+
+/// The lone wait (for an autovacuum worker's deadlock-check cancel) asks for
+/// SHARE UPDATE EXCLUSIVE whatever the target mode: in ACCESS EXCLUSIVE it
+/// would stop every page load for about 1.5 s. An autovacuum can't be staged
+/// on demand, so this pins the function's source against a revert.
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_helper_lone_wait_never_requests_the_target_mode() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let def: String = sqlx::query_scalar("SELECT pg_get_functiondef('knot_lock_tables'::regproc)")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let lines: Vec<&str> = def.lines().collect();
+    let locks: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains("LOCK TABLE"))
+        .collect();
+    assert_eq!(
+        locks.len(),
+        2,
+        "one attempt LOCK and one lone-wait LOCK: {locks:#?}"
+    );
+    let khlw1 = lines
+        .iter()
+        .position(|l| l.contains("ERRCODE = 'KHLW1'"))
+        .expect("the lone wait ends by raising KHLW1");
+    let lone = lines[..khlw1]
+        .iter()
+        .rev()
+        .find(|l| l.contains("LOCK TABLE"))
+        .expect("the lone wait's LOCK");
+    assert!(lone.contains("SHARE UPDATE EXCLUSIVE"), "{lone}");
+    assert!(!lone.contains("lock_mode"), "{lone}");
+}
+
+/// Migration 1 only adds nullable columns and a NOT VALID check, so the
+/// statements 0.9.9 pods keep running during the upgrade still work.
+#[tokio::test(flavor = "multi_thread")]
+async fn log_columns_exist_and_old_statements_still_work() {
+    use chrono::{DateTime, Utc};
+
+    let pool = knot_test_support::fresh_db().await.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let doc = seed_doc_with_updates(&pool, ws, user, None, 0).await;
+
+    let cols: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT table_name::text, column_name::text, data_type::text, is_nullable::text
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND ((table_name = 'doc_updates' AND column_name IN ('rev', 'source', 'meta', 'epoch'))
+              OR (table_name = 'doc_snapshots' AND column_name IN ('snapshot_rev', 'epoch')))
+          ORDER BY table_name, column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let cols: Vec<[&str; 4]> = cols
+        .iter()
+        .map(|(t, c, d, n)| [t.as_str(), c.as_str(), d.as_str(), n.as_str()])
+        .collect();
+    assert_eq!(
+        cols,
+        [
+            ["doc_snapshots", "epoch", "integer", "YES"],
+            ["doc_snapshots", "snapshot_rev", "bigint", "YES"],
+            ["doc_updates", "epoch", "integer", "YES"],
+            ["doc_updates", "meta", "jsonb", "YES"],
+            ["doc_updates", "rev", "bigint", "YES"],
+            ["doc_updates", "source", "text", "YES"],
+        ]
+    );
+    let validated: bool = sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint WHERE conname = 'doc_updates_source_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !validated,
+        "added NOT VALID: no scan under ACCESS EXCLUSIVE"
+    );
+
+    // 0.9.9's edit save.
+    let seqs: Vec<i64> = sqlx::query_scalar(OLD_INSERT_UPDATES_SQL)
+        .bind(doc)
+        .bind(vec![Some(user), None])
+        .bind(vec![vec![1u8], vec![2u8]])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(seqs.len(), 2);
+    // 0.9.9's boot read.
+    type OldRow = (i64, Uuid, Vec<u8>, Option<Uuid>, DateTime<Utc>);
+    let rows: Vec<OldRow> = sqlx::query_as(
+        "SELECT seq, doc_id, update_bytes, by_user_id, created_at
+           FROM doc_updates WHERE doc_id = $1 AND seq > $2 ORDER BY seq",
+    )
+    .bind(doc)
+    .bind(0_i64)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|(s, d, b, u, _)| (*s, *d, b.clone(), *u))
+            .collect::<Vec<_>>(),
+        [
+            (seqs[0], doc, vec![1u8], Some(user)),
+            (seqs[1], doc, vec![2u8], None),
+        ]
+    );
+    let unlabelled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM doc_updates
+          WHERE doc_id = $1 AND source IS NULL AND meta IS NULL AND epoch IS NULL",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unlabelled, 2);
+
+    // 0.9.9's snapshot upsert, as an insert and on conflict.
+    for bytes in [b"one".as_slice(), b"two".as_slice()] {
+        sqlx::query(OLD_SNAPSHOT_UPSERT_SQL)
+            .bind(doc)
+            .bind(seqs[1])
+            .bind(bytes)
+            .bind(b"sv".as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let snap: (Vec<u8>, Option<i64>, Option<i32>) = sqlx::query_as(
+        "SELECT state_bytes, snapshot_rev, epoch FROM doc_snapshots WHERE doc_id = $1",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(snap, (b"two".to_vec(), None, None));
+
+    let label = |source: &'static str| {
+        sqlx::query(
+            "INSERT INTO doc_updates (doc_id, update_bytes, source) VALUES ($1, '\\x03', $2)",
+        )
+        .bind(doc)
+        .bind(source)
+        .execute(&pool)
+    };
+    let e = label("bogus").await.unwrap_err();
+    assert_eq!(sqlstate(&e).as_deref(), Some("23514"), "{e}");
+    label("edit").await.unwrap();
 }
