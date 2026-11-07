@@ -8,6 +8,8 @@ name: Helm upgrade test
 #   1. /api/version changes            -> the binary actually swapped
 #   2. the old cookie still authorises  -> session format + signing key survived
 #   3. the seeded doc reads back        -> schema + migrations survived
+#   4. its content reads back, takes an -> the new release opens a page from
+#      append and a task toggle            the edits the old one stored
 #
 # Deliberately a separate workflow from helm-ci.yaml: this builds an image and
 # runs a kind cluster (~10 min) where `ct lint` takes ~10 s, and the two want
@@ -20,6 +22,7 @@ on:
       - "migrations/**"
       - "Dockerfile"
       - ".github/workflows/helm-upgrade.yaml"
+      - ".github/scripts/knot-upgrade-lib.sh"
   push:
     branches: [main]
     paths:
@@ -280,7 +283,30 @@ jobs:
 
           # An unsafe method with a live session DOES need the CSRF header.
           api POST /api/docs '{"title":"upgrade-canary"}' | jq -r .id > /tmp/doc.id
-          echo "seeded doc $(cat /tmp/doc.id)"
+          DOC=$(cat /tmp/doc.id)
+          echo "seeded doc $DOC"
+
+          # Content and a task, written through the base release's room: they
+          # are stored as edits the base release wrote (rows without a rev,
+          # and possibly a snapshot without one), which the upgraded release
+          # must read, number and replay (assertion 4).
+          if ! api_md POST "/api/docs/$DOC/markdown?mode=replace" \
+               "$(printf '# Upgrade canary\n\nupgrade canary text\n\n- [ ] upgrade canary task\n')"; then
+            echo "::error::seeding the canary page's Markdown through $BASE_VER failed"
+            exit 1
+          fi
+          if ! api GET "/api/docs/$DOC/markdown" > /tmp/doc.before.md; then
+            echo "::error::reading the canary page's Markdown through $BASE_VER failed"
+            exit 1
+          fi
+          echo "--- canary Markdown on $BASE_VER:"
+          cat /tmp/doc.before.md
+          for line in 'upgrade canary text' '- [ ] upgrade canary task'; do
+            if ! grep -qxF -- "$line" /tmp/doc.before.md; then
+              echo "::error::$BASE_VER did not store '$line' on the canary page"
+              exit 1
+            fi
+          done
 
           stop_port_forward
 
@@ -328,7 +354,58 @@ jobs:
             exit 1
           fi
 
-          echo "upgrade $BASE_VER -> $NEW_VER verified: session and data intact"
+          # 4. the page content the base release stored reads back, takes new
+          # edits and a task toggle, and nothing is lost or doubled.
+          #
+          # 4a. No room for the page is live on the fresh pod, so this export is
+          # a read-only load over the base release's unnumbered stored edits
+          # (it numbers nothing).
+          if ! api GET "/api/docs/$DOC/markdown" > /tmp/doc.upgraded.md; then
+            echo "::error::GET /api/docs/$DOC/markdown failed after the upgrade (read-only load over $BASE_VER's edits)"
+            exit 1
+          fi
+          echo "--- canary Markdown on $NEW_VER, before any edit:"
+          cat /tmp/doc.upgraded.md
+          for line in 'upgrade canary text' '- [ ] upgrade canary task'; do
+            if ! grep -qxF -- "$line" /tmp/doc.upgraded.md; then
+              echo "::error::read-only load after the upgrade lacks '$line' (written through $BASE_VER)"
+              diff -u /tmp/doc.before.md /tmp/doc.upgraded.md || true
+              exit 1
+            fi
+          done
+
+          # 4b. Appending boots a room of the new release over the base
+          # release's edits: it numbers them and replays the whole stored log.
+          if ! api_md POST "/api/docs/$DOC/markdown?mode=append" 'appended after upgrade'; then
+            echo "::error::appending Markdown to the canary page failed after the upgrade (room boot over $BASE_VER's edits)"
+            exit 1
+          fi
+
+          # 4c. A task toggle, a server-side edit persisted through that room.
+          if ! api PATCH "/api/docs/$DOC/tasks/0" '{"checked": true}'; then
+            echo "::error::PATCH /api/docs/$DOC/tasks/0 failed after the upgrade"
+            exit 1
+          fi
+
+          if ! api GET "/api/docs/$DOC/markdown" > /tmp/doc.after.md; then
+            echo "::error::GET /api/docs/$DOC/markdown failed after the append and the task toggle"
+            exit 1
+          fi
+          echo "--- canary Markdown on $NEW_VER, after the append and the toggle:"
+          cat /tmp/doc.after.md
+          for line in 'upgrade canary text' 'appended after upgrade' '- [x] upgrade canary task'; do
+            COUNT=$(grep -cxF -- "$line" /tmp/doc.after.md || true)
+            if [ "$COUNT" != "1" ]; then
+              echo "::error::after the append and the task toggle, '$line' appears $COUNT times, expected once"
+              exit 1
+            fi
+          done
+          if grep -qxF -- '- [ ] upgrade canary task' /tmp/doc.after.md; then
+            echo "::error::the canary task is still unchecked after PATCH /api/docs/$DOC/tasks/0"
+            exit 1
+          fi
+
+          echo "upgrade $BASE_VER -> $NEW_VER verified: session, data and page content intact"
           stop_port_forward
 
       - name: Diagnostics

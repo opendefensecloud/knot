@@ -32,6 +32,16 @@ import { execSync } from "node:child_process";
 const ATTEMPTS = 8;
 const LOCK_TIMEOUT = "4s";
 
+// The database the server under test uses. CI leaves it unset and runs
+// against `knot`; a local run against a per-run database (a branch that adds
+// migrations must not migrate the shared `knot` database) sets KNOT_E2E_DB to
+// the database name in KNOT_DATABASE_URL, so reset() truncates that one. It
+// goes into a shell command, so only a plain identifier is accepted.
+const DATABASE = process.env.KNOT_E2E_DB ?? "knot";
+if (!/^[A-Za-z0-9_]+$/.test(DATABASE)) {
+  throw new Error(`KNOT_E2E_DB must be a plain database name, got ${JSON.stringify(DATABASE)}`);
+}
+
 const TABLES = [
   "comment_reactions",
   "comments",
@@ -71,7 +81,7 @@ export function reset(): void {
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
     try {
       execSync(
-        `docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d knot -v ON_ERROR_STOP=1 -c "${SQL}"`,
+        `docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d ${DATABASE} -v ON_ERROR_STOP=1 -c "${SQL}"`,
         { cwd: "..", stdio: "pipe" },
       );
       return;
