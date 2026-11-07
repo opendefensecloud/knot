@@ -75,7 +75,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - Knot no longer deletes old edits. Every change to a page is kept for the
   page's whole life (purging a page still removes it). This is the
   groundwork for the page history timeline; the History drawer itself is
-  unchanged in this release. (#79)
+  unchanged in this release. Text deleted from a page therefore stays in
+  the database, and in backups, until a later release adds erasing from
+  history; until then, purging the page is the only way to remove it.
+  (#79)
 
 ### Fixed
 - The @-mention list works with the keyboard in a table cell. ArrowUp and
