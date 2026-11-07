@@ -6,6 +6,8 @@ use sqlx::{AssertSqlSafe, PgPool};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::workspace_store::WorkspaceRole;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
     pub id: Uuid,
@@ -74,6 +76,16 @@ pub trait UserStore: Send + Sync + 'static {
 
     /// Insert a `kind = 'bot'` user with no password and no OIDC identity.
     async fn create_bot(&self, email: &str, display_name: &str) -> Result<User, UserStoreError>;
+
+    /// [`Self::create_bot`] and its workspace membership, in one transaction:
+    /// if the membership is refused no user is left behind holding the email.
+    async fn create_bot_member(
+        &self,
+        workspace_id: Uuid,
+        email: &str,
+        display_name: &str,
+        role: WorkspaceRole,
+    ) -> Result<User, UserStoreError>;
 
     async fn find_by_email(&self, email: &str) -> Result<Option<User>, UserStoreError>;
     async fn find_by_oidc(
@@ -219,6 +231,38 @@ impl UserStore for PgUserStore {
         .await
         .map_err(map_user_violation)?;
         user_from_row(row)
+    }
+
+    async fn create_bot_member(
+        &self,
+        workspace_id: Uuid,
+        email: &str,
+        display_name: &str,
+        role: WorkspaceRole,
+    ) -> Result<User, UserStoreError> {
+        let mut tx = crate::begin(&self.pool).await?;
+        let row = sqlx::query_as::<_, UserRow>(AssertSqlSafe(format!(
+            "INSERT INTO users (email, display_name, kind)
+             VALUES ($1, $2, 'bot')
+             RETURNING {SELECT_USER_COLS}"
+        )))
+        .bind(email)
+        .bind(display_name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_user_violation)?;
+        let user = user_from_row(row)?;
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, user_id, role)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(workspace_id)
+        .bind(user.id)
+        .bind(role.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(user)
     }
 
     async fn find_by_email(&self, email: &str) -> Result<Option<User>, UserStoreError> {

@@ -163,12 +163,30 @@ async fn invite_member(State(state): State<AppState>, req: Request) -> Response 
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| body.email.split('@').next().unwrap_or(&body.email));
 
+    // Before any user is created: a failure here must not burn the email.
+    let ws = match workspaces.get_singleton().await {
+        Ok(Some(w)) => w,
+        Ok(None) => {
+            tracing::error!("invite: no workspace");
+            return internal();
+        }
+        Err(e) => {
+            tracing::error!(error=?e, "invite workspace lookup");
+            return internal();
+        }
+    };
+
     let user = if kind == UserKind::Bot {
         // A bot is always a fresh, credentialless user; any password is
         // ignored. An existing email is refused rather than reused, so a
         // human can never be turned into a bot. Removing a member revokes
-        // its keys in the DB, so nothing old comes back either way.
-        match users.create_bot(&body.email, display_name).await {
+        // its keys in the DB, so nothing old comes back either way. The user
+        // and its membership commit together: an account no workspace lists
+        // would hold the email for good.
+        match users
+            .create_bot_member(ws.id, &body.email, display_name, role)
+            .await
+        {
             Ok(u) => u,
             Err(knot_storage::UserStoreError::EmailExists) => {
                 return json_err(
@@ -178,7 +196,7 @@ async fn invite_member(State(state): State<AppState>, req: Request) -> Response 
                 );
             }
             Err(e) => {
-                tracing::error!(error=?e, "invite create_bot");
+                tracing::error!(error=?e, "invite create_bot_member");
                 return internal();
             }
         }
@@ -231,11 +249,9 @@ async fn invite_member(State(state): State<AppState>, req: Request) -> Response 
             }
         }
     };
-    let ws = match workspaces.get_singleton().await {
-        Ok(Some(w)) => w,
-        _ => return internal(),
-    };
-    if let Err(e) = workspaces.add_member(ws.id, user.id, role).await {
+    if kind != UserKind::Bot
+        && let Err(e) = workspaces.add_member(ws.id, user.id, role).await
+    {
         match e {
             knot_storage::WorkspaceStoreError::Sqlx(ref s) if is_unique_violation(s) => {
                 return json_err(StatusCode::CONFLICT, "workspace.already_member", "");
@@ -440,4 +456,61 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 
 fn internal() -> Response {
     json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "")
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+
+    use super::*;
+    use crate::auth::log_capture;
+
+    fn invite(body: serde_json::Value) -> Request {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/workspace/members")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        req.extensions_mut().insert(AuthContext {
+            user_id: Uuid::nil(),
+            workspace_id: Uuid::nil(),
+            role: WorkspaceRole::Owner,
+        });
+        req
+    }
+
+    fn bodies() -> [serde_json::Value; 2] {
+        [
+            serde_json::json!({"email": "b@x.test", "role": "editor", "kind": "bot"}),
+            serde_json::json!({"email": "h@x.test", "role": "editor", "password": "longenough1"}),
+        ]
+    }
+
+    /// Catches the workspace being fetched after the user is created: the
+    /// failed invite would leave a user behind, its email burned on retry.
+    #[tokio::test]
+    async fn invite_without_a_workspace_creates_no_user_and_says_why() {
+        let state = AppState::with_pool(knot_test_support::fresh_db().await.pool);
+        let (logs, _guard) = log_capture::capture();
+        for body in bodies() {
+            let r = invite_member(State(state.clone()), invite(body)).await;
+            assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        assert_eq!(state.users.as_ref().unwrap().count().await.unwrap(), 0);
+        assert_eq!(logs.text().matches("invite: no workspace").count(), 2);
+    }
+
+    /// Catches a workspace lookup failure answering 500 with no log.
+    #[tokio::test]
+    async fn invite_logs_a_failed_workspace_lookup() {
+        let pool = knot_test_support::fresh_db().await.pool;
+        let state = AppState::with_pool(pool.clone());
+        pool.close().await;
+        let (logs, _guard) = log_capture::capture();
+        for body in bodies() {
+            let r = invite_member(State(state.clone()), invite(body)).await;
+            assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        assert_eq!(logs.text().matches("invite workspace lookup").count(), 2);
+    }
 }

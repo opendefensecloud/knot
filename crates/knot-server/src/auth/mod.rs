@@ -1,6 +1,8 @@
 pub mod api_key_loader;
 pub mod context;
 pub mod cookies;
+#[cfg(test)]
+pub(crate) mod log_capture;
 pub mod require_session;
 pub mod session_loader;
 

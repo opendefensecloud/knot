@@ -1,8 +1,13 @@
 //! Per-request scope check for API-key principals.
 //!
-//! Runs on every `/api/*` request (layered between `require_session` and
-//! `csrf` in `routes::api::router`). Cookie sessions carry no
-//! [`ApiPrincipal`] and are not scope-limited.
+//! Runs on every route of `routes::api::router` (layered there between
+//! `require_session` and `csrf`). Cookie sessions carry no [`ApiPrincipal`]
+//! and are not scope-limited.
+//!
+//! The health routes (`/api/healthz`, `/api/readyz`, `/api/version`) are merged
+//! separately in `lib.rs`, outside this layer, so they need no scope. They are
+//! still behind the session loader, so a broken or stale Bearer gets a 401
+//! `api_key.invalid` there too.
 //!
 //! The required scope comes from the HTTP method, except for the routes in
 //! [`OVERRIDES`]: that table is the single auditable place for exceptions.
@@ -128,15 +133,29 @@ pub fn session_only(method: &Method, matched: &str) -> bool {
         .any(|(m, p)| m == method && *p == matched)
 }
 
+/// Logged in place of the raw path, which is whatever the client sent.
+const UNMATCHED_ROUTE: &str = "<unmatched>";
+
+/// Logs denials and successful writes by key id, so an incident can be
+/// narrowed to the key. Audit rows still name only the key's user. Never the
+/// secret nor its hash, and no line for reads: too noisy.
 pub async fn scope_mw(req: Request<Body>, next: Next) -> Response {
     let Some(principal) = req.extensions().get::<ApiPrincipal>().copied() else {
         return next.run(req).await;
     };
-    let matched = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map(MatchedPath::as_str);
-    if matched.is_some_and(|m| session_only(req.method(), m)) {
+    let key_id = principal.key_id;
+    let method = req.method().clone();
+    let matched = req.extensions().get::<MatchedPath>().cloned();
+    let matched = matched.as_ref().map(MatchedPath::as_str);
+    let route = matched.unwrap_or(UNMATCHED_ROUTE);
+    if matched.is_some_and(|m| session_only(&method, m)) {
+        tracing::info!(
+            %key_id,
+            %method,
+            %route,
+            required = %"session",
+            "api key refused on a session-only route"
+        );
         return json_err(
             StatusCode::FORBIDDEN,
             "api_key.session_required",
@@ -146,12 +165,23 @@ pub async fn scope_mw(req: Request<Body>, next: Next) -> Response {
     // Without a MatchedPath (no route matched) the override table cannot
     // apply, so only the method default counts.
     let required = match matched {
-        Some(m) => required_scope(req.method(), m),
-        None => method_default(req.method()),
+        Some(m) => required_scope(&method, m),
+        None => method_default(&method),
     };
     if principal.scopes.contains(required) {
-        return next.run(req).await;
+        let response = next.run(req).await;
+        if !method.is_safe() && response.status().is_success() {
+            tracing::info!(%key_id, %method, %route, "api key write");
+        }
+        return response;
     }
+    tracing::info!(
+        %key_id,
+        %method,
+        %route,
+        required = %required.as_str(),
+        "api key scope denied"
+    );
     (
         StatusCode::FORBIDDEN,
         Json(json!({
@@ -167,13 +197,18 @@ pub async fn scope_mw(req: Request<Body>, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use axum::{Router, http::Request as HttpRequest, middleware, routing::post};
+    use axum::{
+        Router,
+        http::Request as HttpRequest,
+        middleware,
+        routing::{get, post},
+    };
     use knot_storage::{Scopes, WorkspaceRole};
     use tower::ServiceExt;
     use uuid::Uuid;
 
     use super::*;
-    use crate::auth::{AuthContext, csrf_mw};
+    use crate::auth::{AuthContext, csrf_mw, log_capture};
 
     fn up(p: &str) -> Scope {
         required_scope(&Method::POST, p)
@@ -335,11 +370,18 @@ mod tests {
     /// with a key principal injected by an outer layer, like
     /// `require_session` sees it after the API-key loader.
     fn app(scopes: &[&str]) -> Router {
+        keyed(
+            Router::new()
+                .route("/api/docs", post(|| async { "created" }))
+                .route("/api/docs/{id}/purge", post(|| async { "purged" })),
+            scopes,
+        )
+    }
+
+    fn keyed(routes: Router, scopes: &[&str]) -> Router {
         let scopes =
             Scopes::from_names(&scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
-        Router::new()
-            .route("/api/docs", post(|| async { "created" }))
-            .route("/api/docs/{id}/purge", post(|| async { "purged" }))
+        routes
             .layer(middleware::from_fn(csrf_mw))
             .layer(middleware::from_fn(scope_mw))
             .layer(middleware::from_fn(
@@ -381,6 +423,115 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(v["error"]["code"], "api_key.scope_denied");
         assert_eq!(v["error"]["details"]["scope"], "delete");
+    }
+
+    const NIL: &str = "00000000-0000-0000-0000-000000000000";
+
+    /// Routes the log tests need beyond `app`: a read, a write the handler
+    /// refuses and a session-only write.
+    fn logging_app(scopes: &[&str]) -> Router {
+        keyed(
+            Router::new()
+                .route("/api/docs/{id}", get(|| async { "doc" }))
+                .route(
+                    "/api/docs/{id}/template",
+                    post(|| async { StatusCode::UNPROCESSABLE_ENTITY }),
+                )
+                .route("/api/workspace/members", post(|| async { "invited" })),
+            scopes,
+        )
+    }
+
+    fn request(method: Method, path: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Catches a scope denial going unlogged, or losing a field. The whole
+    /// line is compared, so a new field (a secret, say) fails it too.
+    #[tokio::test]
+    async fn scope_denial_is_logged_with_key_method_route_and_scope() {
+        let (logs, _guard) = log_capture::capture();
+        let (status, _) = call(app(&["read"]), "/api/docs/x/purge").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            logs.text(),
+            format!(
+                " INFO api key scope denied key_id={NIL} method=POST \
+                 route=/api/docs/{{id}}/purge required=delete\n"
+            )
+        );
+    }
+
+    /// Catches a denial on an unrouted path going unlogged, or logging the
+    /// raw path, which is whatever the client sent.
+    #[tokio::test]
+    async fn scope_denial_without_a_route_does_not_log_the_raw_path() {
+        let (logs, _guard) = log_capture::capture();
+        let (status, _) = call(app(&["read"]), "/api/not-a-route").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            logs.text(),
+            format!(
+                " INFO api key scope denied key_id={NIL} method=POST \
+                 route=<unmatched> required=create\n"
+            )
+        );
+    }
+
+    /// Catches the session-only refusal going unlogged.
+    #[tokio::test]
+    async fn session_only_refusal_is_logged_with_key_method_route_and_scope() {
+        let (logs, _guard) = log_capture::capture();
+        let (status, v) = call(logging_app(&["create"]), "/api/workspace/members").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(v["error"]["code"], "api_key.session_required");
+        assert_eq!(
+            logs.text(),
+            format!(
+                " INFO api key refused on a session-only route key_id={NIL} method=POST \
+                 route=/api/workspace/members required=session\n"
+            )
+        );
+    }
+
+    /// Catches a successful write by a key going unlogged.
+    #[tokio::test]
+    async fn successful_write_is_logged_with_key_method_and_route() {
+        let (logs, _guard) = log_capture::capture();
+        let (status, _) = call(app(&["delete"]), "/api/docs/x/purge").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            logs.text(),
+            format!(" INFO api key write key_id={NIL} method=POST route=/api/docs/{{id}}/purge\n")
+        );
+    }
+
+    /// Catches logging every request by a key: reads are too noisy.
+    #[tokio::test]
+    async fn successful_read_is_not_logged() {
+        let (logs, _guard) = log_capture::capture();
+        let resp = logging_app(&["read"])
+            .oneshot(request(Method::GET, "/api/docs/x"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(logs.text(), "");
+    }
+
+    /// Catches logging a write the handler refused as if it had happened.
+    #[tokio::test]
+    async fn refused_write_is_not_logged_as_a_write() {
+        let (logs, _guard) = log_capture::capture();
+        let resp = logging_app(&["update"])
+            .oneshot(request(Method::POST, "/api/docs/x/template"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(logs.text(), "");
     }
 
     #[tokio::test]

@@ -10,9 +10,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ### Upgrading
 - One additive database migration (`20261106120000_api_keys_and_bots`)
-  adds `users.kind` and the `api_keys` table. It needs no downtime: it
-  only adds a column with a default, a new table and triggers. It waits
-  at most 5 seconds for a table lock (`lock_timeout`) rather than queue
+  adds `users.kind`, the `api_keys` table and triggers. It needs no
+  downtime: no table is rewritten, and its two checks on `users` each scan
+  that table once under the lock. It waits at most 5 seconds for a table
+  lock (`lock_timeout`) rather than queue
   sign-ins behind a long transaction; if it gives up, run the upgrade
   again once that transaction has ended.
 - Rotating `KNOT_SESSION_KEY` now invalidates every API key as well as
@@ -27,17 +28,18 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   `delete`. A request the key's scopes don't cover gets
   `403 api_key.scope_denied`.
 - Pick a key's lifetime: at least 30 days, or no expiry. Keys of
-  single-sign-on users expire within 90 days.
-- See your keys, who created each, when each was last used, and revoke
-  any of them. The list shows live keys and those revoked or expired in
-  the last 30 days.
+  single-sign-on users, and bot keys they mint, expire within 90 days.
+- See your keys and when each was last used, and revoke any live one. A
+  bot's keys also show who created each. The list shows live keys and those
+  revoked or expired in the last 30 days.
 - Each user or bot holds at most 50 live keys; creating another answers
   `409 api_key.limit_reached` until one is revoked or expires.
 - Workspace owners can add bot accounts (Members, or
   `POST /api/workspace/members` with `"kind":"bot"`) as editor or viewer
   for scripts and AI agents, and manage the bots' keys. A bot has no
   password and no SSO login; it signs in only with its API keys, which may
-  never expire. The member list shows each member's kind.
+  never expire when the owner minting them has a password. The member list
+  shows each member's kind.
 
 ### Security
 - API keys are stored only as an HMAC-SHA256 under `KNOT_SESSION_KEY`; the
@@ -49,14 +51,17 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   its scopes), so a leaked key can't take over the account or the workspace,
   raise its own scopes, or leave behind a public link or page access that
   outlives it. Reading a page's grants and access still works with `read`.
+- Requests refused by a key's scopes and writes made with a key are logged
+  with the key's id, the method and the route, never the key itself, so an
+  incident can be narrowed to one key.
 - Creating a key re-checks, in the same database transaction, that the
   session asking for it still exists and that its user is still a member
   (and still an owner, for a bot's key). A key requested just before a
   password change, a removal or a demotion is refused instead of
   outliving it. A password change now sets the new hash and ends every
   session in one transaction.
-- Keys of single-sign-on users are capped at 90 days, by the server and
-  by a database check.
+- Keys of single-sign-on users, and bot keys they mint, are capped at 90
+  days, by the server and by a database check.
 - Any change of a user's password hash (in the app, or a direct database
   update) revokes all of that user's keys, and the bot keys that user
   minted, so a stolen session can't leave a bot key behind before the
@@ -75,9 +80,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   other path. Bots also can't restrict pages (`403
   api_key.session_required`: no key may), create or import pages
   inside a restricted subtree, import restricted pages or duplicate a
-  restricted page (`403 bot.restricted_forbidden`), since each would make
-  them a page owner. Where a person would get an owner grant
-  on a page they create, a bot gets an editor grant.
+  restricted page (`403 bot.restricted_forbidden`). Where a person would
+  get an owner grant on a page they create, a bot gets an editor grant.
 - A page grant for `user:<id>` is stored under the canonical id whatever
   UUID spelling the request used (upper case, without hyphens, braced,
   `urn:uuid:`), and removed by any of them, so one person never holds

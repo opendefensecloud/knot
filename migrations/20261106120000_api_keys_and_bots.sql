@@ -9,7 +9,8 @@
 -- authenticated traffic. sqlx runs this file in one transaction.
 SET LOCAL lock_timeout = '5s';
 
--- Constant DEFAULT: metadata-only column add, no table rewrite.
+-- Constant DEFAULT: no table rewrite. This CHECK and the next each scan users
+-- once under the lock.
 ALTER TABLE users ADD COLUMN kind text NOT NULL DEFAULT 'human'
     CHECK (kind IN ('human','bot'));
 
@@ -110,21 +111,25 @@ BEGIN
 END;
 $$;
 
--- S6: pure-OIDC humans (no password, OIDC identity) get keys of at most 90
--- days. Enforced in the DB so no app path can mint an unbounded key for an
--- account whose real lifetime is controlled by the IdP. Exactly 90 days is
--- allowed (strict >). Bots (kind 'bot') are exempt and may have NULL expiry.
+-- S6: a key must expire within 90 days when its user or its minter is a
+-- pure-OIDC human (no password, OIDC identity): S5 revokes keys on a password
+-- change, and such a human has no password to change. Enforced in the DB so no
+-- app path can mint an unbounded key. Exactly 90 days is allowed (strict >). A
+-- bot key minted by a human with a password stays uncapped, since S5 can revoke
+-- it. principal_kind in routes/api/api_keys.rs holds the same pure-OIDC rule:
+-- change both together.
 CREATE OR REPLACE FUNCTION api_keys_sso_ttl_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
   IF EXISTS (SELECT 1 FROM users
-              WHERE id = NEW.user_id
+              WHERE id IN (NEW.user_id, NEW.created_by)
                 AND kind = 'human'
                 AND password_hash IS NULL
                 AND oidc_subject IS NOT NULL)
      AND (NEW.expires_at IS NULL
           OR NEW.expires_at > now() + interval '90 days') THEN
-    RAISE EXCEPTION 'api key for OIDC-only user % must expire within 90 days', NEW.user_id
+    RAISE EXCEPTION 'api key of user %, minted by %, must expire within 90 days: an OIDC-only user or minter has no password change to revoke it',
+      NEW.user_id, NEW.created_by
       USING ERRCODE = 'KB003';
   END IF;
   RETURN NEW;
@@ -204,7 +209,7 @@ CREATE TRIGGER document_grants_bot_not_owner
 
 DROP TRIGGER IF EXISTS api_keys_sso_ttl_guard ON api_keys;
 CREATE TRIGGER api_keys_sso_ttl_guard
-  BEFORE INSERT OR UPDATE OF expires_at, user_id ON api_keys
+  BEFORE INSERT OR UPDATE OF expires_at, user_id, created_by ON api_keys
   FOR EACH ROW EXECUTE FUNCTION api_keys_sso_ttl_guard();
 
 DROP TRIGGER IF EXISTS workspace_members_revoke_api_keys ON workspace_members;

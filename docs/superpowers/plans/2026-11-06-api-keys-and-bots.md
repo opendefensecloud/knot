@@ -69,7 +69,9 @@ Vitest, Playwright.
 - `hash(secret, session_key)` — reuses `csrf::hash_session_id`.
 - `PrincipalKind` (`Local` / `Oidc` / `Bot`), `max_ttl_days`,
   `validate_ttl_days`: minimum 30 days for everyone; 90 days *and* an expiry
-  for pure-OIDC humans; unbounded allowed for bots and local humans.
+  for pure-OIDC humans; unbounded allowed for bots and local humans. The
+  handler applies it to the minter too, so a pure-OIDC owner's bot keys are
+  capped.
 
 Tests: prefix/length, decode length, round-trip hash determinism, redacted
 `Debug`, TTL matrix (29 → too short, exactly 90 for OIDC → allowed, `None` for
@@ -81,8 +83,8 @@ OIDC → too long, `None` for bot → allowed).
 `user_store.rs` (`kind`), `workspace_store.rs`:
 
 - `ApiKeyStore` trait: `create`/`find_live_by_hash`/`list_for_user`/`revoke`/
-  `touch`, with `ApiKeyStoreError::{SessionEnded, LimitReached, TtlRejected,
-  Sqlx, UnknownScope}`.
+  `touch`, with `ApiKeyStoreError::{TtlRejected, LimitReached, SessionEnded,
+  NotPermitted, BadScopes, Sqlx}`.
 - `create` runs in one transaction: `FOR NO KEY UPDATE` on the user rows (in
   id order, so two mints never wait crosswise), re-check of the minting
   session, `FOR SHARE` on the membership rows with the role re-check, the
@@ -199,5 +201,5 @@ and `.claude/skills/knot-api/SKILL.md` (recipes a script or agent can copy).
    guarded, the DB triggers backstop them, and restricting a page as a bot is
    refused before the grant is written.
 5. **The plaintext leaking.** No store column, no `Debug`, no log line, no
-   audit row, no sqlx error carries it; the HMAC is dropped from memory before
-   the lookup.
+   audit row, no sqlx error carries it; the loader drops its owned copy of the
+   plaintext before the lookup, whose argument is the HMAC.

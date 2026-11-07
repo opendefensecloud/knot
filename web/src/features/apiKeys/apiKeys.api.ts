@@ -10,6 +10,7 @@ const apiKeySchema = v.object({
   id: v.string(),
   name: v.string(),
   scopes: v.array(v.string()),
+  created_by: v.string(),
   created_at: v.string(),
   expires_at: v.nullable(v.string()),
   last_used_at: v.nullable(v.string()),
@@ -30,7 +31,7 @@ export type CreatedApiKey = v.InferOutput<typeof createdApiKeySchema>;
 export type CreateApiKeyInput = {
   name: string;
   scopes: ApiKeyScope[];
-  /** null = never expires (bots / unrestricted users only). */
+  /** null = never expires (only when neither the key's user nor its minter is capped). */
   expiresInDays: number | null;
   userId?: string;
 };

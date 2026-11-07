@@ -95,8 +95,8 @@ pub(super) async fn put_inline(
             "",
         );
     }
-    // One row per user whatever UUID spelling the caller sent: the ACL,
-    // member removal and the KB002 trigger all match the canonical text.
+    // One row per user whatever UUID spelling the caller sent: the ACL and
+    // member removal match only the canonical text (KB002 takes any spelling).
     let principal = canonical_principal(&principal);
     // `group:` principals pass the format check but ACL resolution only honors
     // `user:` grants — a group grant would silently grant nothing. Reject at

@@ -152,8 +152,9 @@ async fn authorize_target(
     }
 }
 
-/// Which TTL policy applies to `u`'s keys. The pure-OIDC rule (human, no
-/// password, linked identity) lives only here.
+/// Which TTL policy applies to keys `u` holds or mints. The trigger
+/// `api_keys_sso_ttl_guard` (KB003) mirrors the pure-OIDC rule (human, no
+/// password, linked identity): change both together.
 pub(crate) fn principal_kind(u: &User) -> PrincipalKind {
     if u.kind == UserKind::Bot {
         PrincipalKind::Bot
@@ -231,14 +232,37 @@ async fn create_key(State(state): State<AppState>, req: Request) -> Response {
         );
     };
     let name = body.name.trim();
-    if !(1..=100).contains(&name.chars().count()) {
+    // A NUL would otherwise reach Postgres, which refuses it with a 500.
+    if !(1..=100).contains(&name.chars().count()) || name.chars().any(char::is_control) {
         return json_err(
             StatusCode::UNPROCESSABLE_ENTITY,
             "api_key.name_invalid",
-            "name must be 1 to 100 characters",
+            "name must be 1 to 100 characters, without control characters",
         );
     }
-    let days = match api_key::validate_ttl_days(principal_kind(&target), body.expires_in_days) {
+    // The cap follows the minter too (S6): S5 revokes a bot key when its minter
+    // changes password, which a pure-OIDC owner can't do.
+    let minter_kind = if target.id == ctx.user_id {
+        principal_kind(&target)
+    } else {
+        let Some(users) = state.users.as_ref() else {
+            return internal();
+        };
+        match users.find_by_id(ctx.user_id).await {
+            Ok(Some(minter)) => principal_kind(&minter),
+            Ok(None) => {
+                tracing::error!("api key minter not found");
+                return internal();
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "api key minter lookup");
+                return internal();
+            }
+        }
+    };
+    let days = match api_key::validate_ttl_days(principal_kind(&target), body.expires_in_days)
+        .and_then(|d| api_key::validate_ttl_days(minter_kind, d))
+    {
         Ok(d) => d,
         Err(TtlError::TooShort) => return ttl_too_short(),
         Err(TtlError::TooLong) => return ttl_too_long(),
@@ -423,7 +447,7 @@ fn ttl_too_long() -> Response {
     json_err(
         StatusCode::BAD_REQUEST,
         "api_key.ttl_too_long",
-        "single-sign-on users' keys expire within 90 days",
+        "keys of, or minted by, single-sign-on users expire within 90 days",
     )
 }
 

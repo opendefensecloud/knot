@@ -329,7 +329,9 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
     {
         return response;
     }
-    // Inside a restricted subtree the create can mint an owner grant.
+    // Policy: a bot adds no page inside a restricted subtree. There, the editor
+    // grant `ensure_creator_can_edit` gives a bot is only the backstop for a
+    // restriction landing after this check.
     if let Some(response) =
         crate::bots::deny_bot_restricted_destination(&state, &ctx, body.parent_id).await
     {
@@ -1191,7 +1193,9 @@ async fn create_from_template_inline(
     if let Err(response) = require_editable_destination(&state, &ctx, body.parent_id).await {
         return response;
     }
-    // Inside a restricted subtree the create can mint an owner grant.
+    // Policy: a bot adds no page inside a restricted subtree. There, the editor
+    // grant `ensure_creator_can_edit` gives a bot is only the backstop for a
+    // restriction landing after this check.
     if let Some(response) =
         crate::bots::deny_bot_restricted_destination(&state, &ctx, body.parent_id).await
     {

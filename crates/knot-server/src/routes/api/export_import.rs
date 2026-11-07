@@ -486,8 +486,8 @@ async fn import(
             }
         }
     }
-    // Importing inside a restricted subtree mints owner grants; a bot never
-    // becomes an owner (S4), so refuse before anything is created.
+    // Policy: a bot adds no page inside a restricted subtree, so refuse before
+    // anything is created.
     if let Some(response) =
         crate::bots::deny_bot_restricted_destination(&state, &ctx, q.parent_id).await
     {

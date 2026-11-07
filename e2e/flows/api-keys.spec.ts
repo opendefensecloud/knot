@@ -165,7 +165,7 @@ test("bot key works but cannot reach owner-only actions (S4)", async ({ request 
   await expect(panel).toBeVisible();
   // Every scope, so each refusal below is authorization, not the scope check.
   const botKey = await createKeyInUi(panel, "bot-key", ["read", "create", "update", "delete"], "never");
-  await expect(panel.getByTestId("api-key-row")).toContainText("Never");
+  await expect(panel.getByTestId("api-key-expires")).toHaveText("Never");
 
   const tasks = await request.get(`${SERVER}/api/workspace/tasks`, { headers: bearer(botKey) });
   expect(tasks.status()).toBe(200);

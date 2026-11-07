@@ -108,6 +108,7 @@ pub struct ApiKey {
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Last authenticated, so it includes requests later denied by scope.
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
 }
@@ -147,7 +148,7 @@ impl std::fmt::Debug for NewApiKey<'_> {
 #[derive(Debug, Error)]
 pub enum ApiKeyStoreError {
     /// The SSO TTL trigger (KB003) refused the expiry.
-    #[error("api key expiry rejected for OIDC-only user")]
+    #[error("api key expiry rejected: its user or minter is OIDC-only")]
     TtlRejected,
     /// The user already holds [`MAX_LIVE_KEYS_PER_USER`] live keys.
     #[error("api key limit reached")]
@@ -192,8 +193,8 @@ pub trait ApiKeyStore: Send + Sync + 'static {
         user_id: Uuid,
     ) -> Result<Vec<ApiKey>, ApiKeyStoreError>;
 
-    /// Revoke one live key of `user_id` in `workspace_id`. `false` when no
-    /// such key.
+    /// Revoke one not-yet-revoked key of `user_id` in `workspace_id`, expired
+    /// or not. `false` when no such key.
     async fn revoke(
         &self,
         workspace_id: Uuid,
@@ -390,11 +391,14 @@ impl ApiKeyStore for PgApiKeyStore {
 
     async fn touch(&self, key_id: Uuid) -> Result<(), ApiKeyStoreError> {
         // Debounced: busy agents would otherwise queue on this one row lock.
+        // A value ahead of the clock is repaired, not waited out.
         sqlx::query(
             "UPDATE api_keys SET last_used_at = now()
              WHERE id = $1
                AND revoked_at IS NULL
-               AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')",
+               AND (last_used_at IS NULL
+                    OR last_used_at < now() - interval '1 minute'
+                    OR last_used_at > now())",
         )
         .bind(key_id)
         .execute(&self.pool)

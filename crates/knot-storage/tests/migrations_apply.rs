@@ -1914,23 +1914,93 @@ async fn sso_user_key_capped_at_90_days() {
         .expect("S6 must only apply to users without a password");
 }
 
+/// S6: S5 can't revoke a bot key whose minter has no password to change, so
+/// the cap follows the minter too. Catches a trigger that checks only
+/// `user_id`, or that loses the `90 days` bound or the strict comparison.
 #[tokio::test(flavor = "multi_thread")]
-async fn bot_key_may_never_expire() {
+async fn bot_key_minted_by_a_pure_oidc_owner_is_capped_at_90_days() {
     let pool = knot_test_support::fresh_db().await.pool;
     let ws = seed_workspace(&pool).await;
     let owner = seed_user(&pool, "o@x.test", "human", None, Some("sub-1")).await;
     let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
 
-    let key = insert_key(&pool, ws, bot, owner, "NULL")
-        .await
-        .expect("a bot key may have NULL expires_at (S6 must not apply to bots)");
-    let exp: Option<chrono::DateTime<chrono::Utc>> =
-        sqlx::query_scalar("SELECT expires_at FROM api_keys WHERE id = $1")
-            .bind(key)
-            .fetch_one(&pool)
+    for (expires, why) in [
+        ("NULL", "a never-expiring bot key"),
+        ("now() + interval '91 days'", "a 91-day bot key"),
+    ] {
+        let err = insert_key(&pool, ws, bot, owner, expires)
             .await
-            .unwrap();
-    assert_eq!(exp, None);
+            .expect_err(&format!("S6 broken: OIDC-only owner minted {why}"));
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("KB003"),
+            "S6: {why} minted by an OIDC-only owner must raise KB003, got {err}"
+        );
+    }
+
+    let key = insert_key(&pool, ws, bot, owner, "now() + interval '90 days'")
+        .await
+        .expect("S6: exactly 90 days is allowed");
+
+    let err = sqlx::query("UPDATE api_keys SET expires_at = NULL WHERE id = $1")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .expect_err("S6 broken: OIDC-minted bot key extended to never expire");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("KB003"),
+        "S6: extending an OIDC-minted bot key must raise KB003, got {err}"
+    );
+}
+
+/// S6: re-pointing a key's minter is checked too. Catches `created_by` missing
+/// from the trigger's `UPDATE OF` list.
+#[tokio::test(flavor = "multi_thread")]
+async fn setting_created_by_to_a_pure_oidc_user_on_an_unbounded_key_is_refused() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let local = seed_user(&pool, "l@x.test", "human", Some("pw"), None).await;
+    let oidc = seed_user(&pool, "o@x.test", "human", None, Some("sub-1")).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    let key = insert_key(&pool, ws, bot, local, "NULL").await.unwrap();
+
+    let err = sqlx::query("UPDATE api_keys SET created_by = $1 WHERE id = $2")
+        .bind(oidc)
+        .bind(key)
+        .execute(&pool)
+        .await
+        .expect_err("S6 broken: an unbounded key was handed to an OIDC-only minter");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("KB003"),
+        "S6: moving an unbounded key to an OIDC-only minter must raise KB003, got {err}"
+    );
+}
+
+/// S5 can revoke a bot key whose minter has a password, so it stays uncapped,
+/// whether or not that owner also has an OIDC link. Catches a trigger that caps
+/// every bot key or tests only `oidc_subject`.
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_key_minted_by_a_password_owner_may_never_expire() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let local = seed_user(&pool, "l@x.test", "human", Some("pw"), None).await;
+    let linked = seed_user(&pool, "pw@x.test", "human", Some("pw"), Some("sub-2")).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+
+    for owner in [local, linked] {
+        let key = insert_key(&pool, ws, bot, owner, "NULL")
+            .await
+            .expect("a password owner's bot key may have NULL expires_at");
+        let exp: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT expires_at FROM api_keys WHERE id = $1")
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(exp, None);
+    }
 }
 
 async fn add_member(pool: &PgPool, ws: Uuid, user: Uuid, role: &str) {

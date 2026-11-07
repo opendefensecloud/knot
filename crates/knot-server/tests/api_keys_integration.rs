@@ -230,8 +230,8 @@ async fn bot_invite_creates_a_credentialless_member() {
 // ---------------------------------------------------------------------------
 
 /// A bot can work in the normal tree but never ends up an owner: no create
-/// inside a restricted subtree (that mints an owner grant), no restricting,
-/// no owner grant, no member management, no purge.
+/// inside a restricted subtree (policy), no restricting, no owner grant, no
+/// member management, no purge.
 #[tokio::test(flavor = "multi_thread")]
 async fn bot_ownership_guards() {
     let state = state_with_owner("owner@example.com", "ownerpass1").await;
@@ -608,6 +608,38 @@ async fn api_key_create_validates_name_and_scopes() {
     }
 }
 
+/// Catches dropping the control-character check: a NUL would reach Postgres
+/// and answer 500. Catches an over-broad check too (one that refuses spaces
+/// or non-ASCII letters).
+#[tokio::test(flavor = "multi_thread")]
+async fn api_key_name_refuses_control_characters_but_not_spaces_or_letters() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    for name in ["a\u{0000}b", "a\nb", "a\tb", "a\u{007f}b", "a\u{0085}b"] {
+        let (st, resp) = send(
+            &app,
+            &s,
+            "POST",
+            "/api/auth/api-keys",
+            Some(serde_json::json!({"name": name, "scopes": ["read"]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{name:?}: {resp}");
+        assert_eq!(resp["error"]["code"], "api_key.name_invalid", "{resp}");
+    }
+    let (st, resp) = send(
+        &app,
+        &s,
+        "POST",
+        "/api/auth/api-keys",
+        Some(serde_json::json!({"name": "  CI läuft 日本語 bot ", "scopes": ["read"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{resp}");
+    assert_eq!(resp["name"], "CI läuft 日本語 bot");
+}
+
 /// S2: a key can never mint, list or revoke keys, whatever its scopes.
 #[tokio::test(flavor = "multi_thread")]
 async fn api_key_management_requires_a_session() {
@@ -820,7 +852,7 @@ async fn ttl_rules() {
         assert!(!message.contains("sign-on"), "{message}");
     }
 
-    // A bot may have a key that never expires.
+    // A password owner's bot key may never expire: S5 can revoke it.
     let bot = invite_bot(&app, &s, &state, "ci-bot@example.com").await;
     let (st, body) = send(
         &app,
@@ -972,6 +1004,180 @@ async fn session_caps_api_key_ttl_for_pure_oidc_users() {
         body["max_api_key_ttl_days"],
         knot_auth::api_key::SSO_MAX_TTL_DAYS
     );
+}
+
+/// Mint a key for `bot` and return the answer.
+async fn mint_bot_key(
+    app: &axum::Router,
+    s: &Session,
+    bot: uuid::Uuid,
+    days: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    send(
+        app,
+        s,
+        "POST",
+        "/api/auth/api-keys",
+        Some(serde_json::json!({
+            "name": "ci", "scopes": ["read"], "expires_in_days": days, "user_id": bot,
+        })),
+    )
+    .await
+}
+
+/// S6: S5 can't revoke a bot key of a minter with no password to change, so a
+/// pure-OIDC owner's bot keys are capped; a local owner's are not. Catches the
+/// cap following only the key's user, or being applied to every bot key.
+#[tokio::test(flavor = "multi_thread")]
+async fn pure_oidc_owner_mints_bot_keys_of_at_most_90_days() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let pool = state.pool.clone().unwrap();
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let bot = invite_bot(&app, &s, &state, "ci-bot@example.com").await;
+
+    let (st, body) = mint_bot_key(&app, &s, bot, serde_json::Value::Null).await;
+    assert_eq!(st, StatusCode::CREATED, "local owner: {body}");
+    assert!(body["expires_at"].is_null(), "{body}");
+
+    // Turn the owner into a pure-OIDC human; the old session stays valid.
+    sqlx::query(
+        "UPDATE users SET password_hash = NULL, oidc_subject = 'sub-1', oidc_issuer = 'https://idp' \
+         WHERE email = 'owner@example.com'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let refused = async || {
+        for days in [serde_json::Value::Null, serde_json::json!(91)] {
+            let (st, body) = mint_bot_key(&app, &s, bot, days.clone()).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{days}: {body}");
+            assert_eq!(body["error"]["code"], "api_key.ttl_too_long", "{body}");
+        }
+    };
+    refused().await;
+
+    let (st, body) = mint_bot_key(&app, &s, bot, serde_json::json!(90)).await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    assert!(body["expires_at"].is_string(), "{body}");
+
+    // The answers above could have come from the KB003 backstop alone: the
+    // handler must refuse without it.
+    sqlx::query("DROP TRIGGER api_keys_sso_ttl_guard ON api_keys")
+        .execute(&pool)
+        .await
+        .unwrap();
+    refused().await;
+}
+
+/// Delegates to the real store, but fails `find_by_id` for one user.
+struct FailingFindById {
+    inner: Arc<dyn knot_storage::UserStore>,
+    fail_for: uuid::Uuid,
+}
+
+#[async_trait::async_trait]
+impl knot_storage::UserStore for FailingFindById {
+    async fn create_local(
+        &self,
+        email: &str,
+        display_name: &str,
+        password_hash: &str,
+    ) -> Result<knot_storage::User, knot_storage::UserStoreError> {
+        self.inner
+            .create_local(email, display_name, password_hash)
+            .await
+    }
+    async fn create_oidc(
+        &self,
+        email: &str,
+        display_name: &str,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<knot_storage::User, knot_storage::UserStoreError> {
+        self.inner
+            .create_oidc(email, display_name, issuer, subject)
+            .await
+    }
+    async fn create_bot(
+        &self,
+        email: &str,
+        display_name: &str,
+    ) -> Result<knot_storage::User, knot_storage::UserStoreError> {
+        self.inner.create_bot(email, display_name).await
+    }
+    async fn create_bot_member(
+        &self,
+        workspace_id: uuid::Uuid,
+        email: &str,
+        display_name: &str,
+        role: WorkspaceRole,
+    ) -> Result<knot_storage::User, knot_storage::UserStoreError> {
+        self.inner
+            .create_bot_member(workspace_id, email, display_name, role)
+            .await
+    }
+    async fn find_by_email(
+        &self,
+        email: &str,
+    ) -> Result<Option<knot_storage::User>, knot_storage::UserStoreError> {
+        self.inner.find_by_email(email).await
+    }
+    async fn find_by_oidc(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<knot_storage::User>, knot_storage::UserStoreError> {
+        self.inner.find_by_oidc(issuer, subject).await
+    }
+    async fn find_by_id(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<knot_storage::User>, knot_storage::UserStoreError> {
+        if id == self.fail_for {
+            return Err(knot_storage::UserStoreError::InvalidKind("test".into()));
+        }
+        self.inner.find_by_id(id).await
+    }
+    async fn count(&self) -> Result<i64, knot_storage::UserStoreError> {
+        self.inner.count().await
+    }
+    async fn last_seen_version(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<String>, knot_storage::UserStoreError> {
+        self.inner.last_seen_version(id).await
+    }
+    async fn set_last_seen_version(
+        &self,
+        id: uuid::Uuid,
+        current: Option<&str>,
+        version: &str,
+    ) -> Result<bool, knot_storage::UserStoreError> {
+        self.inner.set_last_seen_version(id, current, version).await
+    }
+}
+
+/// S6: not knowing the minter must not mean uncapped. Catches a lookup failure
+/// falling back to the bot's own (uncapped) policy: a 201 instead of the 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_key_mint_fails_when_the_minter_cannot_be_looked_up() {
+    let mut state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let bot = invite_bot(&app, &s, &state, "ci-bot@example.com").await;
+
+    let owner = user_id(&state, "owner@example.com").await;
+    state.users = Some(Arc::new(FailingFindById {
+        inner: state.users.clone().unwrap(),
+        fail_for: owner,
+    }));
+    let app = router_with_state(state.clone());
+
+    let (st, body) = mint_bot_key(&app, &s, bot, serde_json::Value::Null).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(live_keys_of(&state, bot).await, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,7 +1426,7 @@ async fn delete_key_scope_matrix() {
 // Invariants
 // ---------------------------------------------------------------------------
 
-/// S1, S9: a key authenticates nothing outside `/api/`.
+/// S1: a key authenticates nothing outside `/api/`.
 #[tokio::test(flavor = "multi_thread")]
 async fn bearer_is_rejected_outside_api() {
     let state = state_with_owner("owner@example.com", "ownerpass1").await;
@@ -1497,7 +1703,7 @@ async fn member_role(state: &AppState, user: uuid::Uuid) -> Option<String> {
         .unwrap()
 }
 
-/// S2, S9: member management changes who holds which role, so a key that
+/// S2: member management changes who holds which role, so a key that
 /// reached it could mint itself an owner with a known password. Refused for
 /// every key, whatever its scopes; listing members stays readable.
 #[tokio::test(flavor = "multi_thread")]
@@ -2065,18 +2271,22 @@ async fn every_scope_override_matches_a_real_route() {
 // ---------------------------------------------------------------------------
 
 /// Start `POST /api/auth/api-keys` and deliver its body only when the
-/// returned sender fires. The session is checked when the request arrives;
-/// the handler then waits for the body, so whatever runs meanwhile happens
-/// between the request's authentication and its insert.
-fn held_create_key(
+/// returned sender fires. Returns once `create_key` starts reading the body,
+/// which nothing does before authentication, so whatever runs next happens
+/// between the request's authentication and its insert. A request answered
+/// or stuck before that point fails here, so a race test cannot mistake a
+/// late auth rejection for the store's re-check.
+async fn held_create_key(
     app: &axum::Router,
     s: &Session,
 ) -> (
     tokio::sync::oneshot::Sender<serde_json::Value>,
     tokio::task::JoinHandle<(StatusCode, serde_json::Value)>,
 ) {
+    let (polled_tx, polled_rx) = tokio::sync::oneshot::channel::<()>();
     let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
     let stream = futures_util::stream::once(async move {
+        polled_tx.send(()).unwrap();
         let body = rx.await.unwrap().to_string();
         Ok::<_, std::io::Error>(axum::body::Bytes::from(body))
     });
@@ -2098,12 +2308,11 @@ fn held_create_key(
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         )
     });
-    (tx, task)
-}
-
-/// Let a held request get past authentication before racing it.
-async fn settle() {
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    match tokio::time::timeout(std::time::Duration::from_secs(30), polled_rx).await {
+        Ok(Ok(())) => (tx, task),
+        Ok(Err(_)) => panic!("answered without reading the body: {:?}", task.await),
+        Err(_) => panic!("the mint never started reading its body"),
+    }
 }
 
 async fn live_keys_of(state: &AppState, user: uuid::Uuid) -> i64 {
@@ -2149,8 +2358,7 @@ async fn mint_authenticated_before_a_password_change_is_refused() {
     let victim = login(&app, "owner@example.com", "ownerpass1").await;
     let owner = user_id(&state, "owner@example.com").await;
 
-    let (tx, held) = held_create_key(&app, &stolen);
-    settle().await;
+    let (tx, held) = held_create_key(&app, &stolen).await;
     assert_eq!(
         change_password(&app, &victim, "ownerpass1", "newpass999").await,
         StatusCode::NO_CONTENT
@@ -2200,7 +2408,11 @@ async fn password_change_commits_the_hash_and_the_session_purge_together() {
         };
         tokio::spawn(async move { change_password(&app, &s, "ownerpass1", "newpass999").await })
     };
-    settle().await;
+    // Time for the change to reach the lock. A body signal, as in
+    // held_create_key, would fire before the handler gets there: it reads the
+    // body first and hashes the password next. Too short a sleep can only let
+    // the checks below pass.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(!change.is_finished(), "the purge did not wait for the lock");
     assert_eq!(
         hash_now().await,
@@ -2233,8 +2445,7 @@ async fn bot_key_mint_by_an_owner_removed_meanwhile_is_refused() {
     let leaver_id = user_id(&state, "leaver@example.com").await;
     let leaver = login(&app, "leaver@example.com", "ownerpass2").await;
 
-    let (tx, held) = held_create_key(&app, &leaver);
-    settle().await;
+    let (tx, held) = held_create_key(&app, &leaver).await;
     let (st, body) = send(
         &app,
         &owner,
@@ -2273,8 +2484,7 @@ async fn bot_key_mint_by_an_owner_demoted_meanwhile_is_refused() {
     let second_id = user_id(&state, "second@example.com").await;
     let second = login(&app, "second@example.com", "ownerpass2").await;
 
-    let (tx, held) = held_create_key(&app, &second);
-    settle().await;
+    let (tx, held) = held_create_key(&app, &second).await;
     let (st, body) = send(
         &app,
         &owner,
@@ -2302,8 +2512,7 @@ async fn own_key_mint_by_a_member_removed_meanwhile_stays_dead_after_reinvite() 
     let ed = add_human(&app, &owner, "ed@example.com", "edpass123").await;
     let ed_id = user_id(&state, "ed@example.com").await;
 
-    let (tx, held) = held_create_key(&app, &ed);
-    settle().await;
+    let (tx, held) = held_create_key(&app, &ed).await;
     let (st, _) = send(
         &app,
         &owner,
@@ -2876,11 +3085,12 @@ async fn grant_principals_are_canonical_whatever_the_uuid_spelling() {
 // Bots and restricted subtrees: template, duplicate (S4)
 // ---------------------------------------------------------------------------
 
-/// A page from a template, a copy of a restricted page, and a copy of a
-/// tree holding one: each would give the bot an owner grant inside a
-/// restricted subtree, so each is a clean 403 before the KB002 trigger.
+/// A page from a template inside a restricted subtree (policy), a copy of a
+/// restricted page and a copy of a tree holding one (each copy would give the
+/// bot an owner grant): each is a clean 403, the copies before the KB002
+/// trigger.
 #[tokio::test(flavor = "multi_thread")]
-async fn bot_cannot_reach_owner_grants_via_template_duplicate_or_restrict() {
+async fn bot_is_refused_template_into_restricted_and_restricted_duplicates() {
     let mut state = state_with_owner("owner@example.com", "ownerpass1").await;
     matrix_wire_rooms(&mut state).await;
     let app = router_with_state(state.clone());
@@ -2982,4 +3192,167 @@ async fn bot_cannot_reach_owner_grants_via_template_duplicate_or_restrict() {
         .await
         .unwrap();
     assert_eq!(docs, 4, "secret, tpl, top, inner");
+}
+
+// ---------------------------------------------------------------------------
+// last_used_at through a real request
+// ---------------------------------------------------------------------------
+
+/// Catches the loader no longer touching the key that authenticated. The
+/// touch is fire-and-forget, so the listing is polled, with a bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bearer_request_shows_up_as_last_used_at_in_the_listing() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let key = matrix_key(&app, &s, &["read"]).await;
+
+    let (st, body) = send(&app, &s, "GET", "/api/auth/api-keys", None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["last_used_at"], serde_json::Value::Null, "{body}");
+
+    let (st, body) = guards_bearer(&app, &key, "GET", "/api/docs", None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (st, body) = send(&app, &s, "GET", "/api/auth/api-keys", None).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        if !body[0]["last_used_at"].is_null() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "last_used_at stayed null: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scopes only narrow what the key's user may do
+// ---------------------------------------------------------------------------
+
+/// The ids of a list of objects under `field`, sorted.
+fn sorted_ids(items: &serde_json::Value, field: &str) -> Vec<String> {
+    let mut ids: Vec<String> = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item[field].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Catches a key's scopes standing in for its user's rights: a viewer's
+/// every-scope key writing, or a key reading, listing or finding a restricted
+/// page its user has no grant on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_stays_limited_by_its_users_role_and_page_acl() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+
+    // A viewer bot's key reads, and its scopes do not make it an editor.
+    let (st, body) = send(
+        &app,
+        &s,
+        "POST",
+        "/api/workspace/members",
+        Some(serde_json::json!({
+            "email": "viewer-bot@example.com", "role": "viewer", "kind": "bot"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    let viewer = user_id(&state, "viewer-bot@example.com").await;
+    let viewer_key = guards_mint_all_scopes_key(&state, viewer).await;
+    let open = matrix_doc(&app, &s, "zanzibar open").await;
+    let open_uri = format!("/api/docs/{open}");
+
+    let (st, body) = guards_bearer(&app, &viewer_key, "GET", &open_uri, None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &viewer_key,
+        "POST",
+        "/api/docs",
+        Some(serde_json::json!({"title": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "acl.editor_required", "{body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &viewer_key,
+        "PATCH",
+        &open_uri,
+        Some(serde_json::json!({"title": "renamed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "acl.editor_required", "{body}");
+    let (st, meta) = send(&app, &s, "GET", &open_uri, None).await;
+    assert_eq!(st, StatusCode::OK, "{meta}");
+    assert_eq!(meta["title"], "zanzibar open", "the page was renamed");
+
+    // An editor bot's key reaches a page until it is restricted.
+    let bot = invite_bot(&app, &s, &state, "bot@example.com").await;
+    let key = guards_mint_all_scopes_key(&state, bot).await;
+    let member = add_human(&app, &s, "member@example.com", "memberpass1").await;
+    let secret = matrix_doc(&app, &s, "zanzibar secret").await;
+    let secret_uri = format!("/api/docs/{secret}");
+    let search_uri = "/api/search?q=zanzibar";
+    let mut both = vec![open.clone(), secret.clone()];
+    both.sort();
+
+    let (st, body) = guards_bearer(&app, &key, "GET", &secret_uri, None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let (_, listed) = guards_bearer(&app, &key, "GET", "/api/docs", None).await;
+    assert_eq!(sorted_ids(&listed, "id"), both, "{listed}");
+    let (_, found) = guards_bearer(&app, &key, "GET", search_uri, None).await;
+    assert_eq!(sorted_ids(&found["results"], "doc_id"), both, "{found}");
+
+    let (st, body) = send(
+        &app,
+        &s,
+        "PUT",
+        &format!("{secret_uri}/restricted"),
+        Some(serde_json::json!({"restricted": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    // The same answer a session user with no grant gets.
+    let (st, session_body) = send(&app, &member, "GET", &secret_uri, None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{session_body}");
+    assert_eq!(session_body["error"]["code"], "acl.no_grant");
+    let (st, key_body) = guards_bearer(&app, &key, "GET", &secret_uri, None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{key_body}");
+    assert_eq!(key_body, session_body);
+
+    let (st, listed) = guards_bearer(&app, &key, "GET", "/api/docs", None).await;
+    assert_eq!(st, StatusCode::OK, "{listed}");
+    assert_eq!(sorted_ids(&listed, "id"), [open.as_str()], "{listed}");
+    let (st, found) = guards_bearer(&app, &key, "GET", search_uri, None).await;
+    assert_eq!(st, StatusCode::OK, "{found}");
+    assert_eq!(
+        sorted_ids(&found["results"], "doc_id"),
+        [open.as_str()],
+        "{found}"
+    );
+
+    // The missing grant was the reason.
+    let (st, body) = send(
+        &app,
+        &s,
+        "PUT",
+        &format!("{secret_uri}/grants/user:{bot}"),
+        Some(serde_json::json!({"role": "viewer", "inherit": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{body}");
+    let (st, body) = guards_bearer(&app, &key, "GET", &secret_uri, None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
 }

@@ -35,7 +35,7 @@ const memberSchema = v.object({
   display_name: v.string(),
   role: v.picklist(["owner", "editor", "viewer"]),
   // Older servers send no kind: everyone is human there.
-  kind: v.fallback(v.picklist(["human", "bot"]), "human"),
+  kind: v.optional(v.picklist(["human", "bot"]), "human"),
 });
 export type Member = v.InferOutput<typeof memberSchema>;
 export const Member = memberSchema;
@@ -231,6 +231,6 @@ const diagramListSchema = v.object({
 export type DiagramList = v.InferOutput<typeof diagramListSchema>;
 export const DiagramList = diagramListSchema;
 
-export function parse<T>(schema: v.GenericSchema<T>, data: unknown): T {
+export function parse<T>(schema: v.GenericSchema<unknown, T>, data: unknown): T {
   return v.parse(schema, data);
 }

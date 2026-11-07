@@ -219,8 +219,9 @@ pub async fn check(
         None if ctx.role == WorkspaceRole::Viewer => return Err(DuplicateError::EditorRequired),
         None => {}
     }
-    // A copy inside a restricted subtree, or of a restricted page, gives the
-    // user an owner grant, which a bot can never hold.
+    // Policy: a bot adds no page inside a restricted subtree. And the copy of a
+    // restricted page gives the user an owner grant, which a bot can never
+    // hold.
     if let Some(response) =
         crate::bots::deny_bot_restricted_destination(state, ctx, source.parent_id).await
     {

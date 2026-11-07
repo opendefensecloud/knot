@@ -252,6 +252,39 @@ async fn touch_sets_last_used_at() {
 
     // Unknown id is a no-op, not an error.
     fx.store.touch(Uuid::new_v4()).await.unwrap();
+
+    // A revoked key stays as it was. Never used, so the debounce would not
+    // hold the touch back: catches `touch` losing `revoked_at IS NULL`.
+    let revoked = mint(&fx, fx.alice, "gone", &[2u8; 32], None).await.unwrap();
+    assert!(fx.store.revoke(fx.ws, fx.alice, revoked.id).await.unwrap());
+    fx.store.touch(revoked.id).await.unwrap();
+    let listed = fx.store.list_for_user(fx.ws, fx.alice).await.unwrap();
+    let listed = listed.iter().find(|l| l.id == revoked.id).unwrap();
+    assert_eq!(listed.last_used_at, None);
+}
+
+/// A `last_used_at` ahead of the clock (a clock stepped back, a restore)
+/// must not hold off updates until that time. Catches a debounce that only
+/// compares `last_used_at < now() - 1 minute`.
+#[tokio::test(flavor = "multi_thread")]
+async fn touch_repairs_a_last_used_at_in_the_future() {
+    let fx = setup().await;
+    let k = mint(&fx, fx.alice, "k", &[1u8; 32], None).await.unwrap();
+    sqlx::query("UPDATE api_keys SET last_used_at = now() + interval '1 year' WHERE id = $1")
+        .bind(k.id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+    fx.store.touch(k.id).await.unwrap();
+
+    let in_the_future: bool =
+        sqlx::query_scalar("SELECT last_used_at > now() FROM api_keys WHERE id = $1")
+            .bind(k.id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert!(!in_the_future);
 }
 
 #[tokio::test(flavor = "multi_thread")]

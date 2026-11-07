@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { Doc, DocAccessInfo, DocWithRole, parse } from "./validators";
+import { Doc, DocAccessInfo, DocWithRole, Member, parse } from "./validators";
 
 /** A sidebar row as servers before restricted documents sent it. */
 const LEGACY_DOC = {
@@ -39,6 +39,25 @@ describe("Doc", () => {
       parent_hidden: true,
       effective_role: "editor",
     });
+  });
+});
+
+describe("Member", () => {
+  const LEGACY_MEMBER = { user_id: "u1", email: "a@example.org", display_name: "A", role: "editor" };
+
+  // Catches the kind being made required: older servers send none.
+  it("treats a member without a kind as human", () => {
+    expect(parse(Member, LEGACY_MEMBER).kind).toBe("human");
+  });
+
+  it("keeps a bot's kind", () => {
+    expect(parse(Member, { ...LEGACY_MEMBER, kind: "bot" }).kind).toBe("bot");
+  });
+
+  // Catches v.fallback coming back: it turned an unknown kind into human, and
+  // the members page then offered Owner on that row.
+  it("rejects a kind it doesn't know instead of calling it human", () => {
+    expect(() => parse(Member, { ...LEGACY_MEMBER, kind: "robot" })).toThrow('received "robot"');
   });
 });
 

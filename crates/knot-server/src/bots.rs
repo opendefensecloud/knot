@@ -3,7 +3,9 @@
 //! The DB triggers (`KB001` on `workspace_members`, `KB002` on
 //! `document_grants`) are the last line: they refuse a bot owner whatever
 //! the code path. These guards answer the same refusal as a clean 4xx
-//! before the store call, instead of a trigger error turned 500.
+//! before the store call, instead of a trigger error turned 500. The
+//! exception is `deny_bot_restricted_destination`: that one is policy, not an
+//! ownership guard, and no trigger backs it.
 
 use axum::{http::StatusCode, response::Response};
 use knot_storage::user_store::UserKind;
@@ -41,8 +43,10 @@ pub async fn deny_bot_actor(state: &AppState, ctx: &AuthContext, action: &str) -
 }
 
 /// 403 `bot.restricted_forbidden` when the actor is a bot and `parent_id`
-/// resolves inside a restricted subtree (creating there mints an owner
-/// grant).
+/// resolves inside a restricted subtree. This is policy, not what keeps a bot
+/// from owning a page: `restricted::ensure_creator_can_edit` gives a bot
+/// `editor`, never `owner`, and inside a restricted subtree that grant is
+/// reached only when the restriction lands after this check.
 pub async fn deny_bot_restricted_destination(
     state: &AppState,
     ctx: &AuthContext,

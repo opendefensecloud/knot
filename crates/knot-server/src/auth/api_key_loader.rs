@@ -13,6 +13,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header::AUTHORIZATION},
     response::Response,
 };
+use chrono::{DateTime, Duration, Utc};
 use knot_storage::Scopes;
 use uuid::Uuid;
 
@@ -46,6 +47,15 @@ fn is_bearer(v: &HeaderValue) -> bool {
         return false;
     };
     scheme.eq_ignore_ascii_case(BEARER) && matches!(rest.first(), None | Some(b' ' | b'\t'))
+}
+
+/// Whether a request should spend a task and a pool connection on a touch.
+/// Saves the round trip the SQL debounce in `ApiKeyStore::touch` would answer
+/// with no update. `last_used_at` is the database clock and `now` this
+/// server's: a value ahead of `now` is due, so skew never stops touches, and
+/// the SQL debounce still decides.
+fn touch_is_due(last_used_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    last_used_at.is_none_or(|t| !(Duration::zero()..Duration::minutes(1)).contains(&(now - t)))
 }
 
 /// Bearer authentication for /api/* only. Ok(None) means "no usable
@@ -137,20 +147,29 @@ async fn lookup(
         .await
     {
         Ok(Some(role)) => role,
-        Ok(None) => return Err(invalid()),
+        Ok(None) => {
+            tracing::warn!(
+                key_id = %key.id,
+                user_id = %key.user_id,
+                "live api key of a non-member refused"
+            );
+            return Err(invalid());
+        }
         Err(e) => {
             tracing::error!(error = ?e, "api key member lookup failed");
             return Err(json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", ""));
         }
     };
 
-    let store = store.clone();
     let key_id = key.id;
-    tokio::spawn(async move {
-        if let Err(e) = store.touch(key_id).await {
-            tracing::warn!(error = ?e, "api key touch failed");
-        }
-    });
+    if touch_is_due(key.last_used_at, Utc::now()) {
+        let store = store.clone();
+        tokio::spawn(async move {
+            if let Err(e) = store.touch(key_id).await {
+                tracing::warn!(error = ?e, %key_id, "api key touch failed");
+            }
+        });
+    }
 
     Ok(Some((
         AuthContext {
@@ -167,20 +186,25 @@ async fn lookup(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use axum::http::Request;
     use knot_auth::api_key::{ApiKeySecret, hash};
     use knot_storage::{
-        ApiKeyStore, NewApiKey, PgApiKeyStore, PgSessionStore, PgUserStore, PgWorkspaceStore,
-        Scope, UserStore, WorkspaceRole, WorkspaceStore,
+        ApiKey, ApiKeyStore, ApiKeyStoreError, NewApiKey, PgApiKeyStore, PgSessionStore,
+        PgUserStore, PgWorkspaceStore, Scope, UserStore, WorkspaceRole, WorkspaceStore,
     };
 
     use super::*;
+    use crate::auth::log_capture;
 
     const KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
 
     struct Fx {
+        pool: sqlx::PgPool,
         deps: SessionDeps,
         keys: Arc<PgApiKeyStore>,
         wss: Arc<PgWorkspaceStore>,
@@ -199,6 +223,7 @@ mod tests {
             .unwrap();
         let keys = Arc::new(PgApiKeyStore::new(pool.clone()));
         Fx {
+            pool: pool.clone(),
             deps: SessionDeps {
                 sessions: Arc::new(PgSessionStore::new(pool.clone())),
                 workspaces: wss.clone(),
@@ -375,14 +400,148 @@ mod tests {
         .await
         .unwrap();
         let auth = format!("Bearer {}", secret.as_str());
-        assert!(
-            keys.find_live_by_hash(&hash(secret.as_str(), KEY))
-                .await
-                .unwrap()
-                .is_some(),
-            "the key itself is live"
-        );
+        let live = keys
+            .find_live_by_hash(&hash(secret.as_str(), KEY))
+            .await
+            .unwrap()
+            .expect("the key itself is live");
+        let (logs, _guard) = log_capture::capture();
         assert_invalid(&deps, req("/api/docs", Some(&auth))).await;
+        // Catches the refusal going silent: the 401 gives the holder no
+        // reason, so the log is where an operator finds one.
+        let logs = logs.text();
+        assert!(
+            logs.contains(&format!(
+                "WARN auth.api_key: live api key of a non-member refused key_id={} user_id={}",
+                live.id, outsider.id
+            )),
+            "{logs}"
+        );
+        assert!(!logs.contains(secret.as_str()), "{logs}");
+    }
+
+    /// Delegates to the real store, counting `touch` and optionally failing it.
+    struct TouchProbe {
+        inner: Arc<PgApiKeyStore>,
+        touches: AtomicUsize,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ApiKeyStore for TouchProbe {
+        async fn create(&self, k: NewApiKey<'_>) -> Result<ApiKey, ApiKeyStoreError> {
+            self.inner.create(k).await
+        }
+        async fn find_live_by_hash(&self, hash: &[u8]) -> Result<Option<ApiKey>, ApiKeyStoreError> {
+            self.inner.find_live_by_hash(hash).await
+        }
+        async fn list_for_user(
+            &self,
+            workspace_id: Uuid,
+            user_id: Uuid,
+        ) -> Result<Vec<ApiKey>, ApiKeyStoreError> {
+            self.inner.list_for_user(workspace_id, user_id).await
+        }
+        async fn revoke(
+            &self,
+            workspace_id: Uuid,
+            user_id: Uuid,
+            key_id: Uuid,
+        ) -> Result<bool, ApiKeyStoreError> {
+            self.inner.revoke(workspace_id, user_id, key_id).await
+        }
+        async fn touch(&self, key_id: Uuid) -> Result<(), ApiKeyStoreError> {
+            self.touches.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(ApiKeyStoreError::LimitReached);
+            }
+            self.inner.touch(key_id).await
+        }
+    }
+
+    fn probe(fx: &mut Fx, fail: bool) -> Arc<TouchProbe> {
+        let probe = Arc::new(TouchProbe {
+            inner: fx.keys.clone(),
+            touches: AtomicUsize::new(0),
+            fail,
+        });
+        fx.deps.api_keys = Some(probe.clone());
+        probe
+    }
+
+    /// Lets the spawned touch run: this is the current-thread runtime.
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    /// Catches `lookup` spawning a touch per request, whatever `last_used_at`
+    /// says, or never spawning one again for a value ahead of the clock.
+    #[tokio::test]
+    async fn only_a_key_due_for_a_touch_spawns_one() {
+        let mut fx = setup().await;
+        let probe = probe(&mut fx, false);
+        let (secret, id) = mint(&fx).await;
+        let r = || req("/api/docs", Some(&format!("Bearer {}", secret.as_str())));
+        for (last_used_at, touches) in [
+            ("NULL", 1),
+            ("now() - interval '10 seconds'", 0),
+            ("now() - interval '2 minutes'", 1),
+            ("now() + interval '1 hour'", 1),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE api_keys SET last_used_at = {last_used_at} WHERE id = $1"
+            )))
+            .bind(id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+            probe.touches.store(0, Ordering::SeqCst);
+            authenticate(&fx.deps, &r()).await.unwrap().unwrap();
+            settle().await;
+            assert_eq!(
+                probe.touches.load(Ordering::SeqCst),
+                touches,
+                "{last_used_at}"
+            );
+        }
+    }
+
+    /// Catches a failed touch that does not say which key it was for.
+    #[tokio::test]
+    async fn failed_touch_is_logged_with_the_key_id() {
+        let mut fx = setup().await;
+        let probe = probe(&mut fx, true);
+        let (secret, id) = mint(&fx).await;
+        let r = req("/api/docs", Some(&format!("Bearer {}", secret.as_str())));
+        let (logs, _guard) = log_capture::capture();
+        authenticate(&fx.deps, &r).await.unwrap().unwrap();
+        settle().await;
+        assert_eq!(probe.touches.load(Ordering::SeqCst), 1);
+        let logs = logs.text();
+        assert!(
+            logs.contains(&format!(
+                "WARN api key touch failed error=LimitReached key_id={id}"
+            )),
+            "{logs}"
+        );
+    }
+
+    /// Catches a future `last_used_at` counting as fresh, which would stop
+    /// touches for as long as the clock stays behind it, and an off-by-one
+    /// at the minute the SQL debounce uses.
+    #[test]
+    fn touch_is_due_unless_last_used_under_a_minute_ago() {
+        let now = DateTime::parse_from_rfc3339("2026-11-07T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let at = |s: &str| Some(DateTime::parse_from_rfc3339(s).unwrap().to_utc());
+        assert!(touch_is_due(None, now));
+        assert!(!touch_is_due(at("2026-11-07T12:00:00Z"), now));
+        assert!(!touch_is_due(at("2026-11-07T11:59:01Z"), now));
+        assert!(touch_is_due(at("2026-11-07T11:59:00Z"), now));
+        assert!(touch_is_due(at("2026-11-07T11:00:00Z"), now));
+        assert!(touch_is_due(at("2026-11-07T12:00:01Z"), now));
+        assert!(touch_is_due(at("2030-01-01T00:00:00Z"), now));
     }
 
     #[tokio::test]

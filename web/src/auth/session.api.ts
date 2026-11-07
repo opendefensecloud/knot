@@ -10,7 +10,10 @@ import {
 
 // The session also says how the user signed in and the longest API-key
 // lifetime the server allows them (null = unlimited). Fallbacks keep older
-// servers and fixtures parsing; the server enforces the cap regardless.
+// servers and fixtures parsing, and on purpose cover invalid values too: a
+// session that fails to parse sends a signed-in user to /login with no message,
+// while a wrong value here only changes which expiry options the form offers.
+// The server enforces the cap regardless.
 const SessionSchema = v.object({
   ...BaseSessionSchema.entries,
   auth_kind: v.fallback(v.picklist(["local", "oidc", "bot"]), "local"),

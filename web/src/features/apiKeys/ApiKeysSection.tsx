@@ -3,6 +3,7 @@ import { useId, useState } from "react";
 
 import { useSession } from "../../auth/SessionContext";
 import { useUi } from "../../stores/ui";
+import { workspaceApi } from "../workspace/workspace.api";
 
 import { API_KEY_SCOPES, type ApiKey, type ApiKeyScope, apiKeysApi, apiKeysQueryKey } from "./apiKeys.api";
 
@@ -21,7 +22,7 @@ export function apiKeyErrorMessage(code: string): string {
     case "api_key.ttl_too_short": return "Keys must be valid for at least 30 days.";
     case "api_key.ttl_too_long": return "That expiry is longer than your account allows.";
     case "api_key.scopes_invalid": return "Pick at least one scope.";
-    case "api_key.name_invalid": return "Name must be 1–100 characters.";
+    case "api_key.name_invalid": return "Name must be 1–100 characters, without control characters such as tabs.";
     case "api_key.session_required": return "API keys can only be managed from a signed-in browser session.";
     case "api_key.foreign_forbidden": return "You can't manage keys for this user.";
     case "api_key.not_found": return "That key no longer exists.";
@@ -36,6 +37,12 @@ function fmtDate(iso: string | null): string {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString();
 }
 
+function apiKeyState(k: ApiKey): "revoked" | "expired" | "live" {
+  if (k.revoked_at) return "revoked";
+  if (k.expires_at && new Date(k.expires_at).getTime() <= Date.now()) return "expired";
+  return "live";
+}
+
 type Props = {
   /** When set, the caller (a workspace owner) manages this bot's keys. */
   targetUserId?: string;
@@ -47,11 +54,19 @@ export function ApiKeysSection({ targetUserId }: Props) {
   const session = useSession();
   const queryKey = apiKeysQueryKey(targetUserId);
   const keys = useQuery({ queryKey, queryFn: () => apiKeysApi.list(targetUserId) });
+  // Only a bot's keys name their creator: one's own were all created by oneself.
+  const members = useQuery({
+    queryKey: ["members"],
+    queryFn: () => workspaceApi.listMembers(),
+    enabled: Boolean(targetUserId),
+  });
+  const memberNames = new Map(
+    members.data && "ok" in members.data ? members.data.ok.map((m) => [m.user_id, m.display_name]) : [],
+  );
 
-  // Bots may hold non-expiring keys; for oneself the session states the cap.
-  const maxTtl = targetUserId
-    ? null
-    : session.data && "ok" in session.data ? session.data.ok.max_api_key_ttl_days : null;
+  // The session states the signed-in person's cap, which also binds the keys
+  // they mint for a bot.
+  const maxTtl = session.data && "ok" in session.data ? session.data.ok.max_api_key_ttl_days : null;
   const expiryOptions = EXPIRY_DAYS.filter((d) => maxTtl === null || d <= maxTtl);
   const neverAllowed = maxTtl === null;
 
@@ -137,60 +152,69 @@ export function ApiKeysSection({ targetUserId }: Props) {
               <th className="font-medium py-1">Name</th>
               <th className="font-medium py-1">Scopes</th>
               <th className="font-medium py-1">Created</th>
+              {targetUserId && <th className="font-medium py-1">Created by</th>}
               <th className="font-medium py-1">Expires</th>
               <th className="font-medium py-1">Last used</th>
               <th className="py-1"><span className="sr-only">Actions</span></th>
             </tr>
           </thead>
           <tbody>
-            {list.map((k) => (
-              <tr key={k.id} data-testid="api-key-row" className="border-t border-border">
-                <td className="py-1.5 text-fg">{k.name}</td>
-                <td className="py-1.5">
-                  <span className="flex flex-wrap gap-1">
-                    {k.scopes.map((s) => (
-                      <span key={s} className="px-1.5 py-0.5 rounded bg-muted text-fg text-[11px]">{s}</span>
-                    ))}
-                  </span>
-                </td>
-                <td className="py-1.5 text-fg-muted">{fmtDate(k.created_at)}</td>
-                <td className="py-1.5 text-fg-muted">{k.expires_at ? fmtDate(k.expires_at) : "Never"}</td>
-                <td className="py-1.5 text-fg-muted">{k.last_used_at ? fmtDate(k.last_used_at) : "Never"}</td>
-                <td className="py-1.5 text-right">
-                  {k.revoked_at ? (
-                    <span className="text-[12px] text-fg-muted">Revoked</span>
-                  ) : confirmId === k.id ? (
-                    <span className="inline-flex gap-1">
-                      <button
-                        type="button"
-                        data-testid="api-key-revoke-confirm"
-                        disabled={revoke.isPending}
-                        onClick={() => revoke.mutate(k.id)}
-                        className="h-7 px-2 rounded bg-destructive text-white text-[12px] font-medium disabled:opacity-50"
-                      >
-                        Confirm revoke
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setConfirmId(null)}
-                        className="h-7 px-2 rounded border border-border text-fg text-[12px]"
-                      >
-                        Cancel
-                      </button>
+            {list.map((k) => {
+              const state = apiKeyState(k);
+              return (
+                <tr key={k.id} data-testid="api-key-row" className="border-t border-border">
+                  <td className="py-1.5 text-fg">{k.name}</td>
+                  <td className="py-1.5">
+                    <span className="flex flex-wrap gap-1">
+                      {k.scopes.map((s) => (
+                        <span key={s} className="px-1.5 py-0.5 rounded bg-muted text-fg text-[11px]">{s}</span>
+                      ))}
                     </span>
-                  ) : (
-                    <button
-                      type="button"
-                      data-testid="api-key-revoke"
-                      onClick={() => setConfirmId(k.id)}
-                      className="h-7 px-2 rounded border border-border text-fg text-[12px] hover:bg-muted"
-                    >
-                      Revoke
-                    </button>
+                  </td>
+                  <td className="py-1.5 text-fg-muted">{fmtDate(k.created_at)}</td>
+                  {targetUserId && (
+                    <td data-testid="api-key-created-by" className="py-1.5 text-fg-muted">
+                      {memberNames.get(k.created_by) ?? "Unknown"}
+                    </td>
                   )}
-                </td>
-              </tr>
-            ))}
+                  <td data-testid="api-key-expires" className="py-1.5 text-fg-muted">{k.expires_at ? fmtDate(k.expires_at) : "Never"}</td>
+                  <td data-testid="api-key-last-used" className="py-1.5 text-fg-muted">{k.last_used_at ? fmtDate(k.last_used_at) : "Never"}</td>
+                  <td className="py-1.5 text-right">
+                    {state !== "live" ? (
+                      <span className="text-[12px] text-fg-muted">{state === "revoked" ? "Revoked" : "Expired"}</span>
+                    ) : confirmId === k.id ? (
+                      <span className="inline-flex gap-1">
+                        <button
+                          type="button"
+                          data-testid="api-key-revoke-confirm"
+                          disabled={revoke.isPending}
+                          onClick={() => revoke.mutate(k.id)}
+                          className="h-7 px-2 rounded bg-destructive text-white text-[12px] font-medium disabled:opacity-50"
+                        >
+                          Confirm revoke
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmId(null)}
+                          className="h-7 px-2 rounded border border-border text-fg text-[12px]"
+                        >
+                          Cancel
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        data-testid="api-key-revoke"
+                        onClick={() => setConfirmId(k.id)}
+                        className="h-7 px-2 rounded border border-border text-fg text-[12px] hover:bg-muted"
+                      >
+                        Revoke
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}
@@ -255,6 +279,18 @@ export function ApiKeysSection({ targetUserId }: Props) {
 function RevealDialog({ name, secret, onClose }: { name: string; secret: string; onClose: () => void }) {
   const notify = useUi((s) => s.notify);
   const titleId = useId();
+
+  async function copy() {
+    try {
+      // navigator.clipboard is undefined on a plain-HTTP origin, so this can
+      // throw as well as reject.
+      await navigator.clipboard.writeText(secret);
+      notify("info", "Copied key");
+    } catch {
+      notify("error", "Couldn't copy, select the key and copy it manually");
+    }
+  }
+
   return (
     <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
       <div
@@ -280,12 +316,7 @@ function RevealDialog({ name, secret, onClose }: { name: string; secret: string;
           <button
             type="button"
             data-testid="api-key-copy"
-            onClick={() => {
-              void navigator.clipboard.writeText(secret).then(
-                () => notify("info", "Copied key"),
-                () => notify("error", "Couldn't copy, select the key and copy it manually"),
-              );
-            }}
+            onClick={() => void copy()}
             className="h-9 px-3 rounded border border-border bg-surface text-fg text-sm font-medium hover:bg-muted"
           >
             Copy
