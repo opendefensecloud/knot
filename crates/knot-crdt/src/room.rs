@@ -1336,7 +1336,7 @@ pub(crate) mod tests {
     /// forwards anything: the room only accepts updates from connections it
     /// holds. Keep the receiver alive — a closed one gets the conn dropped
     /// on the next fan-out.
-    async fn join(h: &RoomHandle) -> (ConnId, mpsc::Receiver<Vec<u8>>) {
+    pub(crate) async fn join(h: &RoomHandle) -> (ConnId, mpsc::Receiver<Vec<u8>>) {
         let conn_id = Uuid::new_v4();
         let (tx, rx) = mpsc::channel(64);
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2639,7 +2639,7 @@ pub(crate) mod tests {
     }
 
     /// The room's `default` fragment as XML.
-    async fn exported_page(h: &RoomHandle) -> String {
+    pub(crate) async fn exported_page(h: &RoomHandle) -> String {
         use yrs::{GetString, Transact, Update, updates::decoder::Decode};
         let (tx, rx) = oneshot::channel();
         h.tx.send(Event::ExportState(tx)).await.unwrap();
@@ -3375,7 +3375,7 @@ pub(crate) mod tests {
         rx.await.unwrap()
     }
 
-    async fn send_edit(h: &RoomHandle, from: ConnId, bytes: Vec<u8>) {
+    pub(crate) async fn send_edit(h: &RoomHandle, from: ConnId, bytes: Vec<u8>) {
         h.tx.send(Event::Inbound(InMsg {
             from,
             by_user: None,
@@ -3386,7 +3386,7 @@ pub(crate) mod tests {
     }
 
     /// Waits (in virtual time when it is paused) until `done` holds.
-    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    pub(crate) async fn until(what: &str, mut done: impl FnMut() -> bool) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
         while !done() {
             assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");

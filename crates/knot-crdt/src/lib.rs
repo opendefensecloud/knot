@@ -28,7 +28,7 @@ pub use engine::{
 pub use gc::{GcRun, run_once as gc_run_once, spawn as spawn_gc};
 pub use hydrate::{Boot, BootError, BootMode, boot};
 pub use presence::PRESENCE_MAX_BYTES;
-pub use registry::{AcquireError, Rooms};
+pub use registry::{AcquireError, DRAIN_JOIN_WAIT, Rooms, SHUTDOWN_DRAIN};
 pub use room::{ConnHandle, ConnId, Event, InMsg, JoinState, Room, RoomHandle};
 pub use snapshot::{SnapshotPolicy, SnapshotState, SnapshotWriteError, write_snapshot};
 pub use suggestions::{ApplySuggestionError, ApplySuggestionRequest, SuggestionKind};
