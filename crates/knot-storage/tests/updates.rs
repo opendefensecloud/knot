@@ -681,6 +681,31 @@ async fn legacy_numbering_count_mismatch_is_reported() {
     assert_eq!(numbered, 0, "no row numbered");
 }
 
+/// Legacy rows someone numbered by hand, not as `1..=legacy_rows`, leave no
+/// row unnumbered and no row at `rev = legacy_rows`. That is a mismatch too:
+/// booting would meet a rev gap at rev 1 and retry catch-up forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn hand_numbered_legacy_rows_are_reported_as_a_mismatch() {
+    let (s, pool, doc) = legacy_page(4).await;
+    sqlx::query("UPDATE doc_updates SET rev = seq + 100 WHERE doc_id = $1")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let e = s.ensure_legacy_numbered(doc).await.unwrap_err();
+    assert!(
+        matches!(
+            e,
+            UpdatesStoreError::LegacyCountMismatch {
+                legacy_rows: 4,
+                unnumbered: 0
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(e.is_permanent());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn error_classification() {
     let (s, pool, doc, user) = setup().await;

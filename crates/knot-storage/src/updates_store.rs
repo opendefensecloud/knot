@@ -722,9 +722,8 @@ async fn number_legacy_rows(
     .bind(doc_id)
     .fetch_one(&mut *conn)
     .await?;
-    if unnumbered == 0 {
-        return Ok(0);
-    }
+    // No row at `rev = legacy_rows` was found above, so `unnumbered == 0`
+    // (rows numbered by hand to other revs) is a mismatch too, not "done".
     if unnumbered != legacy_rows {
         tracing::error!(
             %doc_id,

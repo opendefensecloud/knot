@@ -13,36 +13,9 @@ use knot_storage::{
     SnapshotStoreError, UpdateSource, UpdatesStore, UpdatesStoreError,
 };
 use knot_test_support::locks::wait_for_lock_waits;
+use knot_test_support::old_sql::OLD_INSERT_UPDATES_SQL;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-/// knot 0.9.9's `INSERT_UPDATES_SQL`, verbatim: 0.9.9 pods keep running it
-/// during the rolling upgrade, and the trigger numbers its rows.
-const OLD_INSERT_UPDATES_SQL: &str = "WITH ins AS (
-             INSERT INTO doc_updates (doc_id, by_user_id, update_bytes)
-             SELECT $1, u.by_user_id, u.update_bytes
-             FROM UNNEST($2::uuid[], $3::bytea[])
-                  WITH ORDINALITY AS u(by_user_id, update_bytes, ord)
-             ORDER BY u.ord
-             RETURNING seq, by_user_id
-         ),
-         contrib AS (
-             INSERT INTO doc_contributors (doc_id, user_id)
-             SELECT DISTINCT $1::uuid, ins.by_user_id
-             FROM ins
-             WHERE ins.by_user_id IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM doc_contributors c
-                   WHERE c.doc_id = $1
-                     AND c.user_id = ins.by_user_id
-                     AND c.last_edited_at >= now() - interval '1 minute'
-               )
-             ORDER BY ins.by_user_id
-             ON CONFLICT (doc_id, user_id) DO UPDATE
-                 SET last_edited_at = now()
-                 WHERE doc_contributors.last_edited_at < now() - interval '1 minute'
-         )
-         SELECT seq FROM ins ORDER BY seq";
 
 /// A 0.9.10 snapshot write (Task 3's `migrations_apply.rs`).
 const STAMPED_SNAPSHOT_INSERT_SQL: &str = "INSERT INTO doc_snapshots

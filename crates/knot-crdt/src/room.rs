@@ -4389,7 +4389,11 @@ pub(crate) mod tests {
             .await
             .expect("the room was not evicted within 2 s");
         let frames = drain(&mut b_rx);
-        assert_eq!(frames.len(), 1, "B got the task's frame: {frames:?}");
+        assert_eq!(
+            frames.len(),
+            1,
+            "B gets exactly the typed edit's frame, not the failed task's: {frames:?}"
+        );
         assert!(same_update(&unwrap_frame(&frames[0]), &typed));
         assert!(log.appended().is_empty(), "the database was down");
 
