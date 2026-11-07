@@ -134,40 +134,28 @@ pub(crate) async fn current_snapshot(
 }
 
 /// The page's stored state, loaded the way a room loads it (latest
-/// snapshot, then the updates after it), with the latest seq applied. Read
-/// errors fail the snapshot instead of leaving content out, so a refresh
-/// never caches a page with part of it missing. Also the offline export
-/// check's load (`export_check::hydrate`).
+/// snapshot, then the log rows after it: [`knot_crdt::boot`], read-only, so
+/// it never writes), with the latest seq applied. Read errors fail the
+/// snapshot instead of leaving content out, and so does a row that fails to
+/// apply, so a refresh never caches a page with part of it missing. Also the
+/// offline export check's load (`export_check::hydrate`).
 pub(crate) async fn stored_snapshot(
     pool: &knot_storage::Pool,
     doc_id: Uuid,
 ) -> Result<(knot_crdt::DocHandle, i64), SnapshotError> {
-    use knot_storage::{SnapshotStore, UpdatesStore};
-
-    let engine = YrsEngine;
-    let doc = engine.new_doc();
-    let mut seq = 0;
-    let latest = knot_storage::PgSnapshotStore::new(pool.clone())
-        .latest(doc_id)
-        .await
-        .map_err(|e| SnapshotError::Storage(e.to_string()))?;
-    if let Some(snap) = latest {
-        engine
-            .apply_update(&doc, &snap.state_bytes)
-            .map_err(SnapshotError::Apply)?;
-        seq = snap.snapshot_seq;
-    }
-    let updates = knot_storage::PgUpdatesStore::new(pool.clone())
-        .since(doc_id, seq)
-        .await
-        .map_err(|e| SnapshotError::Storage(e.to_string()))?;
-    for update in updates {
-        engine
-            .apply_update(&doc, &update.update_bytes)
-            .map_err(SnapshotError::Apply)?;
-        seq = seq.max(update.seq);
-    }
-    Ok((doc, seq))
+    let booted = knot_crdt::boot(
+        &YrsEngine,
+        &knot_storage::PgUpdatesStore::new(pool.clone()),
+        &knot_storage::PgSnapshotStore::new(pool.clone()),
+        doc_id,
+        knot_crdt::BootMode::ReadOnly,
+    )
+    .await
+    .map_err(|e| match e {
+        knot_crdt::BootError::Store(e) => SnapshotError::Storage(e),
+        knot_crdt::BootError::Apply(e) => SnapshotError::Apply(e),
+    })?;
+    Ok((booted.doc, booted.last_seq))
 }
 
 /// Copy a running room's state into a transient doc, with its seq.

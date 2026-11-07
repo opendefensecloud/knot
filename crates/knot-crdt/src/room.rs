@@ -1,14 +1,28 @@
 //! Per-doc actor. One tokio task. Exclusive owner of `DocHandle` and the
 //! local connection map. All I/O flows through mpsc channels.
 //!
-//! This file is iteratively extended by Tasks 7-15:
-//!   T7   minimal select loop + InMsg → engine.apply_update + local fan-out
-//!   T8   writer task: batch persist
-//!   T9   hydration: load latest snapshot + replay updates
-//!   T10  snapshot scheduler
-//!   T12  backpressure: bounded channels, slow-consumer close
-//!   T13  awareness + bus presence + disconnect clearing
-//!   T14  catch-up tick
+//! - **Boot** ([`crate::hydrate`], room mode): the latest snapshot, then the
+//!   page's log rows contiguous in rev after it. The room's watermark,
+//!   `applied_through_rev`, is a rev: every row at or below it is applied.
+//! - **Inbound updates** are applied, and what the apply changed (the
+//!   effective update, or the raw bytes when content is pending:
+//!   [`crate::engine::ApplyMeasured`]) is handed to the writer
+//!   ([`crate::writer`]) and only then fanned out, those same bytes.
+//! - **The writer** reports where each row landed (`WriterEvent::Applied`,
+//!   with its rev). An own rev right after the watermark advances it; one
+//!   past it means rows of other replicas committed in between, and the room
+//!   catches up at once. A `WriterEvent::Fatal` evicts the room.
+//! - **Catch-up** (a bus message, a 5 s tick, a gap) reads the rows past the
+//!   watermark and applies those contiguous in rev. It stops at a rev gap
+//!   and retries on the next tick. A row that fails to apply is passed.
+//! - **Snapshots** (every N own rows, when idle, when the room ends) are
+//!   written only when the doc holds nothing beyond the page's pre-upgrade
+//!   base and the log up to the watermark: no row in flight, no own rev past
+//!   the watermark, not evicted, and not `unlogged`. A room is `unlogged`
+//!   for the rest of its life once its doc holds content no row carries: an
+//!   update yrs rejected part-way, or a row that failed to apply at boot or
+//!   in catch-up. Each snapshot is stamped with the watermark, the content
+//!   epoch and the seq of the row at the watermark.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,8 +32,10 @@ use uuid::Uuid;
 
 use crate::bus::{Bus, Subscription};
 use crate::engine::{ApplyMeasured, DocHandle, Engine, EngineError};
+use crate::hydrate::{BootError, BootMode};
 use crate::protocol::wrap_sync_update;
 use crate::tasks::patch_task_checked;
+use crate::writer::{Applied, PersistJob, WriterDone, WriterEvent, WriterLimits};
 
 pub type ConnId = Uuid;
 
@@ -163,15 +179,33 @@ pub enum Event {
     /// on persisted updates. The marker in the doc is the single source of
     /// truth for "was this applied", which recovering a suggestion stuck in
     /// `applying` relies on; a marker with any other value (an Editor can
-    /// write the map over the socket) is not the room's and reads as "no". When the catch-up read fails the room drops
-    /// `reply` unanswered rather than answer from a doc that may be stale:
-    /// the caller treats a dropped channel as "unknown, ask again later".
+    /// write the map over the socket) is not the room's and reads as "no".
+    /// When the catch-up does not catch up (its read fails, or it stops at a
+    /// rev gap) the room drops `reply` unanswered rather than answer from a
+    /// doc that may be stale: the caller treats a dropped channel as
+    /// "unknown, ask again later".
     SuggestionApplied {
         suggestion_id: Uuid,
         apply_token: Uuid,
         reply: oneshot::Sender<bool>,
     },
     Shutdown,
+    /// The room's log bookkeeping, for tests.
+    #[cfg(test)]
+    Probe(oneshot::Sender<Probe>),
+}
+
+/// What [`Event::Probe`] reports.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Probe {
+    pub applied_through_rev: i64,
+    pub through_seq: i64,
+    pub last_applied_seq: i64,
+    pub max_own_rev: i64,
+    pub in_flight: usize,
+    pub unlogged: bool,
+    pub content_epoch: i32,
 }
 
 pub struct Room {
@@ -179,14 +213,33 @@ pub struct Room {
     engine: Arc<dyn Engine>,
     doc: DocHandle,
     conns: HashMap<ConnId, ConnHandle>,
+    /// The highest seq applied (own rows, rows read back, the boot's). Kept
+    /// for `Event::ExportState` and the Markdown cache, which stay keyed by
+    /// seq; the log watermark is `applied_through_rev`.
     last_applied_seq: i64,
+    /// The page's content epoch at boot. The writer appends at it and
+    /// snapshots are stamped with it.
+    content_epoch: i32,
+    /// The highest rev such that every row at or below it is applied.
+    applied_through_rev: i64,
+    /// The seq of the row at `applied_through_rev` (or of the snapshot the
+    /// room booted from): the `snapshot_seq` of the next snapshot.
+    through_seq: i64,
+    /// Jobs handed to the writer and not yet confirmed (`Applied`).
+    in_flight: usize,
+    /// The highest rev the writer confirmed for this room's own rows.
+    max_own_rev: i64,
+    /// The doc holds content no log row carries (an update yrs rejected
+    /// part-way, or a row that failed to apply and was passed): no snapshot
+    /// is written for the rest of the room's life.
+    unlogged: bool,
     bus: Arc<dyn Bus>,
     shutdown: CancellationToken,
     rx: mpsc::Receiver<Event>,
     bus_updates_rx: mpsc::Receiver<i64>,
     bus_presence_rx: mpsc::Receiver<Vec<u8>>,
-    persist_tx: mpsc::Sender<crate::writer::PersistJob>,
-    writer_events: mpsc::UnboundedReceiver<crate::writer::WriterEvent>,
+    persist_tx: mpsc::Sender<PersistJob>,
+    writer_events: mpsc::UnboundedReceiver<WriterEvent>,
     snapshots: Arc<dyn knot_storage::SnapshotStore>,
     updates_store: Arc<dyn knot_storage::UpdatesStore>,
     policy: crate::snapshot::SnapshotPolicy,
@@ -203,8 +256,9 @@ pub struct Room {
     /// the next join reloads the page from storage, which never got the
     /// refused update. Also set when the room evicts itself over an applied
     /// suggestion it could not persist (`Room::evict_unpersisted`), so no
-    /// snapshot carries that unpersisted marker to storage, and when its
-    /// writer sends a Fatal (`Room::evict`).
+    /// snapshot carries that unpersisted marker to storage, when its
+    /// writer sends a Fatal or closes its channel (`Room::evict`), and when
+    /// a snapshot write finds the page's epoch changed or the page gone.
     evicted: bool,
 }
 
@@ -227,13 +281,26 @@ pub struct RoomHandle {
     pub revoked: CancellationToken,
     /// Resolves once the room's writer has written what it holds and ended,
     /// which can be after the room itself ended.
-    pub writer_done: crate::writer::WriterDone,
+    pub writer_done: WriterDone,
+}
+
+/// What a room is built from, besides its booted doc and its writer.
+struct RoomDeps {
+    doc_id: Uuid,
+    engine: Arc<dyn Engine>,
+    bus: Arc<dyn Bus>,
+    subscription: Subscription,
+    updates_store: Arc<dyn knot_storage::UpdatesStore>,
+    snapshots: Arc<dyn knot_storage::SnapshotStore>,
+    policy: crate::snapshot::SnapshotPolicy,
+    dirty_tx: Option<mpsc::Sender<Uuid>>,
 }
 
 impl Room {
-    /// Spawn a room, hydrating its `DocHandle` from the latest snapshot and
-    /// replaying any updates persisted after that snapshot. The actor starts
-    /// with `last_applied_seq` set to the highest seq applied during hydration.
+    /// Spawn a room, booting its `DocHandle` from storage
+    /// ([`crate::hydrate::boot`], room mode), and its writer with the default
+    /// [`WriterLimits`]. Fails when a store read fails or the snapshot does
+    /// not apply.
     #[allow(clippy::too_many_arguments)] // cohesive set of room dependencies
     pub async fn spawn(
         doc_id: Uuid,
@@ -244,75 +311,169 @@ impl Room {
         snapshots: Arc<dyn knot_storage::SnapshotStore>,
         policy: crate::snapshot::SnapshotPolicy,
         dirty_tx: Option<mpsc::Sender<Uuid>>,
-    ) -> Result<RoomHandle, EngineError> {
-        // Hydrate the doc.
-        let hydrate_started = std::time::Instant::now();
-        let doc = engine.new_doc();
-        let mut last_applied_seq: i64 = 0;
-        if let Ok(Some(snap)) = snapshots.latest(doc_id).await {
-            engine.apply_update(&doc, &snap.state_bytes)?;
-            last_applied_seq = snap.snapshot_seq;
-        }
-        if let Ok(after) = updates_store.since(doc_id, last_applied_seq).await {
-            for u in after {
-                engine.apply_update(&doc, &u.update_bytes)?;
-                if u.seq > last_applied_seq {
-                    last_applied_seq = u.seq;
-                }
-            }
-        }
-        metrics::histogram!("knot_room_hydrate_seconds")
-            .record(hydrate_started.elapsed().as_secs_f64());
+    ) -> Result<RoomHandle, BootError> {
+        Self::spawn_with_limits(
+            doc_id,
+            engine,
+            bus,
+            subscription,
+            updates_store,
+            snapshots,
+            policy,
+            dirty_tx,
+            WriterLimits::default(),
+        )
+        .await
+    }
 
-        // Spawn the actor with the hydrated doc + watermark.
-        let (tx, rx) = mpsc::channel::<Event>(256);
-        let shutdown = CancellationToken::new();
-
-        let (persist_tx, persist_rx) = mpsc::channel::<crate::writer::PersistJob>(1024);
+    /// [`Room::spawn`] with the writer's limits given.
+    #[allow(clippy::too_many_arguments)] // cohesive set of room dependencies
+    pub async fn spawn_with_limits(
+        doc_id: Uuid,
+        engine: Arc<dyn Engine>,
+        bus: Arc<dyn Bus>,
+        subscription: Subscription,
+        updates_store: Arc<dyn knot_storage::UpdatesStore>,
+        snapshots: Arc<dyn knot_storage::SnapshotStore>,
+        policy: crate::snapshot::SnapshotPolicy,
+        dirty_tx: Option<mpsc::Sender<Uuid>>,
+        limits: WriterLimits,
+    ) -> Result<RoomHandle, BootError> {
+        let deps = RoomDeps {
+            doc_id,
+            engine,
+            bus,
+            subscription,
+            updates_store,
+            snapshots,
+            policy,
+            dirty_tx,
+        };
+        let booted = Self::boot(&deps).await?;
+        let (persist_tx, persist_rx) = mpsc::channel::<PersistJob>(1024);
         let (events_tx, writer_events) = mpsc::unbounded_channel();
         let writer_done = crate::writer::spawn(
             doc_id,
-            0,
-            updates_store.clone(),
-            bus.clone(),
+            booted.content_epoch,
+            deps.updates_store.clone(),
+            deps.bus.clone(),
             persist_rx,
             events_tx,
-            crate::writer::WriterLimits::default(),
+            limits,
         );
+        Ok(Self::start(
+            deps,
+            booted,
+            persist_tx,
+            writer_events,
+            writer_done,
+        ))
+    }
 
+    /// [`Room::spawn`] without a writer: the test gets the room's persist
+    /// receiver, the sender of its writer events and the sender that
+    /// resolves its handle's `WriterDone` (by sending `true` or being
+    /// dropped).
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(crate) async fn spawn_detached(
+        doc_id: Uuid,
+        engine: Arc<dyn Engine>,
+        bus: Arc<dyn Bus>,
+        subscription: Subscription,
+        updates_store: Arc<dyn knot_storage::UpdatesStore>,
+        snapshots: Arc<dyn knot_storage::SnapshotStore>,
+        policy: crate::snapshot::SnapshotPolicy,
+        dirty_tx: Option<mpsc::Sender<Uuid>>,
+    ) -> Result<
+        (
+            RoomHandle,
+            mpsc::Receiver<PersistJob>,
+            mpsc::UnboundedSender<WriterEvent>,
+            tokio::sync::watch::Sender<bool>,
+        ),
+        BootError,
+    > {
+        let deps = RoomDeps {
+            doc_id,
+            engine,
+            bus,
+            subscription,
+            updates_store,
+            snapshots,
+            policy,
+            dirty_tx,
+        };
+        let booted = Self::boot(&deps).await?;
+        let (persist_tx, persist_rx) = mpsc::channel::<PersistJob>(1024);
+        let (events_tx, writer_events) = mpsc::unbounded_channel();
+        let (done_tx, writer_done) = WriterDone::pair();
+        let handle = Self::start(deps, booted, persist_tx, writer_events, writer_done);
+        Ok((handle, persist_rx, events_tx, done_tx))
+    }
+
+    async fn boot(deps: &RoomDeps) -> Result<crate::hydrate::Boot, BootError> {
+        let started = std::time::Instant::now();
+        let booted = crate::hydrate::boot(
+            deps.engine.as_ref(),
+            deps.updates_store.as_ref(),
+            deps.snapshots.as_ref(),
+            deps.doc_id,
+            BootMode::Room,
+        )
+        .await?;
+        metrics::histogram!("knot_room_hydrate_seconds").record(started.elapsed().as_secs_f64());
+        Ok(booted)
+    }
+
+    /// Spawn the actor over a booted doc and its writer's channels.
+    fn start(
+        deps: RoomDeps,
+        booted: crate::hydrate::Boot,
+        persist_tx: mpsc::Sender<PersistJob>,
+        writer_events: mpsc::UnboundedReceiver<WriterEvent>,
+        writer_done: WriterDone,
+    ) -> RoomHandle {
+        let (tx, rx) = mpsc::channel::<Event>(256);
+        let shutdown = CancellationToken::new();
         let snap_state = crate::snapshot::SnapshotState {
-            last_snapshot_seq: last_applied_seq,
+            last_snapshot_seq: booted.through_seq,
             updates_since_snapshot: 0,
             last_apply_at: std::time::Instant::now(),
         };
-
         let room = Self {
-            doc_id,
-            engine,
-            doc,
+            doc_id: deps.doc_id,
+            engine: deps.engine,
+            doc: booted.doc,
             conns: HashMap::new(),
-            last_applied_seq,
-            bus,
+            last_applied_seq: booted.last_seq,
+            content_epoch: booted.content_epoch,
+            applied_through_rev: booted.through_rev,
+            through_seq: booted.through_seq,
+            in_flight: 0,
+            max_own_rev: 0,
+            unlogged: booted.unlogged,
+            bus: deps.bus,
             shutdown: shutdown.clone(),
             rx,
-            bus_updates_rx: subscription.updates,
-            bus_presence_rx: subscription.presence,
+            bus_updates_rx: deps.subscription.updates,
+            bus_presence_rx: deps.subscription.presence,
             persist_tx,
             writer_events,
-            snapshots,
-            updates_store,
-            policy,
+            snapshots: deps.snapshots,
+            updates_store: deps.updates_store,
+            policy: deps.policy,
             snap_state,
-            dirty_tx,
+            dirty_tx: deps.dirty_tx,
             evicted: false,
         };
         tokio::spawn(room.run());
-        Ok(RoomHandle {
+        RoomHandle {
             tx,
             shutdown,
             revoked: CancellationToken::new(),
             writer_done,
-        })
+        }
     }
 
     #[tracing::instrument(skip_all, fields(doc_id = %self.doc_id))]
@@ -327,22 +488,21 @@ impl Room {
             tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => break,
+                // Before the inbound events: a Fatal must end the room before
+                // it applies and fans out more edits it can't persist.
+                Some(event) = self.writer_events.recv() => match event {
+                    WriterEvent::Applied(applied) => self.on_applied(applied).await,
+                    WriterEvent::Fatal(reason) => {
+                        self.evict(format_args!("writer: {reason}"));
+                    }
+                },
                 _ = catchup_tick.tick() => {
-                    let _ = self.replay_since_watermark().await;
+                    let _ = self.catch_up().await;
                 }
                 _ = idle_tick.tick() => {
                     let idle = self.snap_state.last_apply_at.elapsed();
-                    if self.snap_state.updates_since_snapshot > 0
-                        && idle >= self.policy.idle
-                        && crate::snapshot::write_snapshot(
-                            self.doc_id, self.last_applied_seq,
-                            self.engine.as_ref(), &self.doc,
-                            self.snapshots.as_ref(),
-                        ).await.is_ok()
-                    {
-                        metrics::counter!("knot_room_snapshots_total").increment(1);
-                        self.snap_state.last_snapshot_seq = self.last_applied_seq;
-                        self.snap_state.updates_since_snapshot = 0;
+                    if self.snap_state.updates_since_snapshot > 0 && idle >= self.policy.idle {
+                        self.snapshot().await;
                     }
                 }
                 msg = self.rx.recv() => match msg {
@@ -399,13 +559,16 @@ impl Room {
                         // a crash between reply and persist doesn't lose the
                         // update.
                         let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
-                        let _ = self.persist_tx.send(crate::writer::PersistJob {
+                        if !self.persist(PersistJob {
                             bytes: update_bytes.clone(),
                             by_user_id: by_user,
                             source: knot_storage::UpdateSource::Edit,
                             meta: None,
                             persisted: Some(persisted_tx),
-                        }).await;
+                        }).await {
+                            let _ = reply.send(Err(EngineError::Apply("persist channel closed".into())));
+                            continue;
+                        }
                         // Local fan-out (slow-consumer eviction).
                         let framed = wrap_sync_update(&update_bytes);
                         let mut to_close: Vec<ConnId> = Vec::new();
@@ -490,13 +653,16 @@ impl Room {
                         metrics::counter!("knot_room_updates_total", "source" => "restore").increment(1);
                         // Persist via the writer (mirrors ApplyUpdate path).
                         let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
-                        let _ = self.persist_tx.send(crate::writer::PersistJob {
+                        if !self.persist(PersistJob {
                             bytes: effective_bytes.clone(),
                             by_user_id: by_user,
                             source: knot_storage::UpdateSource::Edit,
                             meta: None,
                             persisted: Some(persisted_tx),
-                        }).await;
+                        }).await {
+                            let _ = reply.send(Err("persist channel closed".into()));
+                            continue;
+                        }
                         // Fan out the replace to local connections.
                         let framed = wrap_sync_update(&effective_bytes);
                         let mut to_close: Vec<ConnId> = Vec::new();
@@ -555,13 +721,16 @@ impl Room {
                         };
                         metrics::counter!("knot_room_updates_total", "source" => "patch").increment(1);
                         let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
-                        let _ = self.persist_tx.send(crate::writer::PersistJob {
+                        if !self.persist(PersistJob {
                             bytes: update_bytes.clone(),
                             by_user_id: by_user,
                             source: knot_storage::UpdateSource::Edit,
                             meta: None,
                             persisted: Some(persisted_tx),
-                        }).await;
+                        }).await {
+                            let _ = reply.send(Err("persist channel closed".into()));
+                            continue;
+                        }
                         let framed = wrap_sync_update(&update_bytes);
                         let mut to_close: Vec<ConnId> = Vec::new();
                         for (cid, conn) in &self.conns {
@@ -590,10 +759,10 @@ impl Room {
                         use yrs::Transact;
                         // Catch up first: the anchored text may come from an
                         // edit another replica persisted that this room's
-                        // bus hasn't delivered yet. A failed read is let
-                        // through: at worst it costs a spurious `AnchorLost`
+                        // bus hasn't delivered yet. A failed read, or one
+                        // that stopped at a rev gap, is let through: at worst it costs a spurious `AnchorLost`
                         // or `Changed`, which writes nothing.
-                        let _ = self.replay_since_watermark().await;
+                        let _ = self.catch_up().await;
                         // Both roots BEFORE the mutable transaction (see
                         // ReplaceWithMarkdown: they take their own write lock).
                         let _frag = self.doc.inner().get_or_insert_xml_fragment("default");
@@ -629,13 +798,17 @@ impl Room {
                         };
                         metrics::counter!("knot_room_updates_total", "source" => "suggestion").increment(1);
                         let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
-                        let _ = self.persist_tx.send(crate::writer::PersistJob {
+                        if !self.persist(PersistJob {
                             bytes: update_bytes.clone(),
                             by_user_id: by_user,
                             source: knot_storage::UpdateSource::Edit,
                             meta: None,
                             persisted: Some(persisted_tx),
-                        }).await;
+                        }).await {
+                            // `persist` evicted the room already.
+                            let _ = reply.send(Err(ApplySuggestionError::Persist("persist channel closed".into())));
+                            continue;
+                        }
                         // Persist BEFORE the fan-out: a client that got the
                         // update would push it back on its resync after an
                         // eviction, making durable an apply whose accept
@@ -672,11 +845,11 @@ impl Room {
                         // let the sweep release a row whose text is already
                         // applied. Drop `reply` instead: the sweep skips the
                         // row and asks again on its next run.
-                        if !self.replay_since_watermark().await {
+                        if !self.catch_up().await {
                             tracing::warn!(
                                 doc_id = %self.doc_id,
                                 %suggestion_id,
-                                "catch-up failed; leaving the applied check unanswered"
+                                "not caught up; leaving the applied check unanswered"
                             );
                             continue;
                         }
@@ -694,42 +867,21 @@ impl Room {
                         self.conns.clear();
                     }
                     Some(Event::Shutdown) | None => break,
+                    #[cfg(test)]
+                    Some(Event::Probe(reply)) => {
+                        let _ = reply.send(Probe {
+                            applied_through_rev: self.applied_through_rev,
+                            through_seq: self.through_seq,
+                            last_applied_seq: self.last_applied_seq,
+                            max_own_rev: self.max_own_rev,
+                            in_flight: self.in_flight,
+                            unlogged: self.unlogged,
+                            content_epoch: self.content_epoch,
+                        });
+                    }
                 },
-                Some(event) = self.writer_events.recv() => {
-                    let seq = match event {
-                        crate::writer::WriterEvent::Applied(crate::writer::Applied { seq, .. }) => seq,
-                        crate::writer::WriterEvent::Fatal(reason) => {
-                            self.evict(format_args!("writer: {reason}"));
-                            continue;
-                        }
-                    };
-                    if seq > self.last_applied_seq {
-                        self.last_applied_seq = seq;
-                    }
-                    self.snap_state.updates_since_snapshot += 1;
-                    self.snap_state.last_apply_at = std::time::Instant::now();
-                    // Notify the server-side reindex worker that this
-                    // doc has new content. `try_send` so a full channel
-                    // is dropped — the next applied update will refire.
-                    if let Some(tx) = &self.dirty_tx {
-                        let _ = tx.try_send(self.doc_id);
-                    }
-                    if self.snap_state.updates_since_snapshot >= self.policy.every_n {
-                        if let Err(e) = crate::snapshot::write_snapshot(
-                            self.doc_id, self.last_applied_seq,
-                            self.engine.as_ref(), &self.doc,
-                            self.snapshots.as_ref(),
-                        ).await {
-                            tracing::warn!(error=?e, "snapshot write failed");
-                        } else {
-                            metrics::counter!("knot_room_snapshots_total").increment(1);
-                            self.snap_state.last_snapshot_seq = self.last_applied_seq;
-                            self.snap_state.updates_since_snapshot = 0;
-                        }
-                    }
-                }
-                Some(_seq) = self.bus_updates_rx.recv() => {
-                    let _ = self.replay_since_watermark().await;
+                Some(_rev) = self.bus_updates_rx.recv() => {
+                    let _ = self.catch_up().await;
                 }
                 Some(payload) = self.bus_presence_rx.recv() => {
                     let mut to_close: Vec<ConnId> = Vec::new();
@@ -744,70 +896,213 @@ impl Room {
             }
         }
 
-        // Final flush: write a snapshot at the current seq so the next boot
-        // is cheap. Best-effort. Skipped when the room evicted itself over a
-        // refused update (`refuse_applied`), an unpersisted suggestion
-        // apply (`evict_unpersisted`) or a writer Fatal (`evict`): the live
-        // doc holds that content, and a snapshot of it would be the one
-        // thing that persisted it.
-        if !self.evicted {
-            let _ = crate::snapshot::write_snapshot(
-                self.doc_id,
-                self.last_applied_seq,
-                self.engine.as_ref(),
-                &self.doc,
-                self.snapshots.as_ref(),
-            )
-            .await;
+        // Final flush: a snapshot at the watermark so the next boot is
+        // cheap, only when the snapshot rule holds (`may_snapshot`); it does
+        // not wait for rows in flight, which the next boot replays. Skipped
+        // when the room evicted itself (`refuse_applied`,
+        // `evict_unpersisted`, `evict`, a snapshot write that found the
+        // epoch changed or the page gone): the live doc may hold content
+        // storage lacks, and a snapshot of it would be the one thing that
+        // persisted it.
+        self.snapshot().await;
+    }
+
+    /// The writer appended one of this room's rows at `rev`.
+    async fn on_applied(&mut self, Applied { seq, rev }: Applied) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.max_own_rev = self.max_own_rev.max(rev);
+        self.last_applied_seq = self.last_applied_seq.max(seq);
+        if rev == self.applied_through_rev + 1 {
+            self.applied_through_rev = rev;
+            self.through_seq = seq;
+        } else if rev > self.applied_through_rev + 1 {
+            // Other rows committed between the watermark and this one (other
+            // replicas', 0.9.9 pods', or this writer's own rows of an attempt
+            // whose acknowledgement was lost): revs are gapless, so read
+            // them now.
+            let _ = self.catch_up().await;
+        }
+        self.snap_state.updates_since_snapshot += 1;
+        self.snap_state.last_apply_at = std::time::Instant::now();
+        // Notify the server-side reindex worker that this doc has new
+        // content. `try_send` so a full channel is dropped — the next
+        // applied update will refire.
+        if let Some(tx) = &self.dirty_tx {
+            let _ = tx.try_send(self.doc_id);
+        }
+        if self.snap_state.updates_since_snapshot >= self.policy.every_n {
+            self.snapshot().await;
         }
     }
 
-    /// Apply the updates persisted past the room's watermark (other
-    /// replicas' edits the bus may not have delivered yet). Returns whether
-    /// the store read succeeded, i.e. whether the doc is now caught up with
-    /// storage as of the read; a failure is logged and leaves the doc as it
-    /// was.
-    async fn replay_since_watermark(&mut self) -> bool {
-        match self
-            .updates_store
-            .since(self.doc_id, self.last_applied_seq)
-            .await
-        {
-            Ok(rows) => {
-                for u in rows {
-                    if u.seq <= self.last_applied_seq {
-                        continue;
-                    }
-                    if self.engine.apply_update(&self.doc, &u.update_bytes).is_ok() {
-                        metrics::counter!("knot_room_updates_total", "source" => "peer")
-                            .increment(1);
-                        let framed = wrap_sync_update(&u.update_bytes);
-                        let mut to_close: Vec<ConnId> = Vec::new();
-                        for (cid, conn) in &self.conns {
-                            match conn.tx.try_send(framed.clone()) {
-                                Ok(_) => {}
-                                Err(_) => to_close.push(*cid),
-                            }
-                        }
-                        for cid in to_close {
-                            self.conns.remove(&cid);
-                        }
-                        self.last_applied_seq = u.seq;
-                        // Notify the server-side reindex worker so
-                        // non-writing replicas refresh their /tasks
-                        // index when an update arrives via the bus.
-                        // Without this, only the replica that owns
-                        // the WS connection ever ticks the indexer.
-                        if let Some(tx) = &self.dirty_tx {
-                            let _ = tx.try_send(self.doc_id);
-                        }
-                    }
-                }
+    /// Hands `job` to the writer, counting it in flight. A closed channel
+    /// means the writer gave up after a Fatal the room has not read yet: the
+    /// room is evicted, and the caller neither fans the update out nor
+    /// reports it persisted. Returns whether the job was handed over.
+    async fn persist(&mut self, job: PersistJob) -> bool {
+        match self.persist_tx.send(job).await {
+            Ok(()) => {
+                self.in_flight += 1;
                 true
             }
-            Err(e) => {
-                tracing::debug!(error=?e, "catch-up replay failed");
+            Err(_) => {
+                self.evict(format_args!("writer: its channel is closed"));
                 false
+            }
+        }
+    }
+
+    /// Apply the rows persisted past the watermark (other replicas' edits
+    /// the bus may not have delivered yet, rows written past a gap), in rev
+    /// order, as long as they are contiguous. A row that changes the doc is
+    /// fanned out; one that fails to apply is passed (logged, counted, the
+    /// room becomes `unlogged`, not fanned out). Returns whether the doc is
+    /// now caught up with storage as of the read: `false` when the read
+    /// failed, when it stopped at a rev gap, or when the log does not reach
+    /// a rev the writer confirmed for this room.
+    async fn catch_up(&mut self) -> bool {
+        let rows = match self
+            .updates_store
+            .rows_after(
+                self.doc_id,
+                knot_storage::RowsAfter::Rev(self.applied_through_rev),
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(error = ?e, "catch-up read failed");
+                return false;
+            }
+        };
+        for u in rows {
+            let Some(rev) = u.rev else { continue };
+            if rev <= self.applied_through_rev {
+                continue;
+            }
+            if rev != self.applied_through_rev + 1 {
+                metrics::counter!("knot_room_rev_gap_total").increment(1);
+                tracing::warn!(
+                    doc_id = %self.doc_id,
+                    applied_through_rev = self.applied_through_rev,
+                    next_rev = rev,
+                    "rev gap in the page's log; catching up again on the next tick"
+                );
+                return false;
+            }
+            match self.engine.apply_update_changed(&self.doc, &u.update_bytes) {
+                Ok(true) => {
+                    metrics::counter!("knot_room_updates_total", "source" => "peer").increment(1);
+                    self.fan_out(&wrap_sync_update(&u.update_bytes), None);
+                    // Notify the server-side reindex worker so non-writing
+                    // replicas refresh their /tasks index when an update
+                    // arrives via the bus. Without this, only the replica
+                    // that owns the WS connection ever ticks the indexer.
+                    if let Some(tx) = &self.dirty_tx {
+                        let _ = tx.try_send(self.doc_id);
+                    }
+                }
+                // Already in the doc: an own row read back, or a row
+                // written twice after a lost acknowledgement.
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        doc_id = %self.doc_id,
+                        rev,
+                        seq = u.seq,
+                        %error,
+                        "a log row failed to apply in catch-up; passed, and the room writes no more snapshots"
+                    );
+                    metrics::counter!("knot_room_row_apply_errors_total", "phase" => "catch_up")
+                        .increment(1);
+                    self.unlogged = true;
+                }
+            }
+            self.applied_through_rev = rev;
+            self.through_seq = u.seq;
+            self.last_applied_seq = self.last_applied_seq.max(u.seq);
+        }
+        if self.applied_through_rev < self.max_own_rev {
+            // The writer confirmed a row at `max_own_rev`, so every row below
+            // it was committed before it: the log lacks rows it must hold.
+            metrics::counter!("knot_room_rev_gap_total").increment(1);
+            tracing::warn!(
+                doc_id = %self.doc_id,
+                applied_through_rev = self.applied_through_rev,
+                max_own_rev = self.max_own_rev,
+                "the page's log does not reach the room's own rev; catching up again on the next tick"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Send `frame` to every connection but `except`, dropping a slow or
+    /// closed one.
+    fn fan_out(&mut self, frame: &[u8], except: Option<ConnId>) {
+        let mut to_close: Vec<ConnId> = Vec::new();
+        for (cid, conn) in &self.conns {
+            if Some(*cid) == except {
+                continue;
+            }
+            if conn.tx.try_send(frame.to_vec()).is_err() {
+                to_close.push(*cid);
+            }
+        }
+        for cid in to_close {
+            self.conns.remove(&cid);
+        }
+    }
+
+    /// Whether a snapshot of the doc now holds exactly the page's
+    /// pre-upgrade base and the log up to `applied_through_rev`: not
+    /// evicted, nothing unlogged in the doc, no row in flight (the doc holds
+    /// it, the log not yet) and no own row past the watermark (the doc holds
+    /// it, but not the rows below it).
+    fn may_snapshot(&self) -> bool {
+        !self.evicted
+            && !self.unlogged
+            && self.in_flight == 0
+            && self.max_own_rev <= self.applied_through_rev
+    }
+
+    /// Write a snapshot stamped with the watermark, if the snapshot rule
+    /// holds. A write that finds the page's epoch changed evicts the room;
+    /// one that finds the page gone ends it quietly (nothing broke). Either
+    /// way no further snapshot is written.
+    async fn snapshot(&mut self) {
+        if !self.may_snapshot() {
+            return;
+        }
+        let stamp = knot_storage::SnapshotStamp {
+            snapshot_seq: self.through_seq,
+            snapshot_rev: Some(self.applied_through_rev),
+            epoch: Some(self.content_epoch),
+        };
+        match crate::snapshot::write_snapshot(
+            self.doc_id,
+            stamp,
+            self.engine.as_ref(),
+            &self.doc,
+            self.snapshots.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => {
+                metrics::counter!("knot_room_snapshots_total").increment(1);
+                self.snap_state.last_snapshot_seq = self.through_seq;
+                self.snap_state.updates_since_snapshot = 0;
+            }
+            Err(crate::snapshot::SnapshotWriteError::EpochChanged) => {
+                self.evict(format_args!("snapshot: the page's history epoch changed"));
+            }
+            Err(crate::snapshot::SnapshotWriteError::DocGone) => {
+                tracing::debug!(doc_id = %self.doc_id, "snapshot: the page is gone; ending the room");
+                self.evicted = true;
+                self.shutdown.cancel();
+            }
+            Err(crate::snapshot::SnapshotWriteError::Other(error)) => {
+                tracing::warn!(doc_id = %self.doc_id, %error, "snapshot write failed");
             }
         }
     }
@@ -862,10 +1157,11 @@ impl Room {
         // the prefilter predicts yrs and can be bypassed (an update that
         // hangs a short chain of new types off existing legal content nests
         // past the limit without its own structure being deep).
-        match self
-            .engine
-            .apply_update_measuring(&self.doc, &m.bytes, crate::nesting::MAX_NESTING)
-        {
+        let measured = match self.engine.apply_update_measuring(
+            &self.doc,
+            &m.bytes,
+            crate::nesting::MAX_NESTING,
+        ) {
             // Measured over what the apply integrated, also when yrs
             // rejected the rest of the update.
             Ok(applied) if applied.max_depth > crate::nesting::MAX_NESTING => {
@@ -885,7 +1181,9 @@ impl Room {
             // sender's: yrs retries the blocks it parked earlier for a
             // missing dependency within the same apply and passes on their
             // error, so closing the sender could lock an innocent writer out
-            // for as long as the parked block is stored.
+            // for as long as the parked block is stored. The doc now holds
+            // what yrs integrated, which no row carries: the room writes no
+            // more snapshots (`unlogged`).
             Ok(ApplyMeasured {
                 rejected: Some(error),
                 ..
@@ -896,6 +1194,7 @@ impl Room {
                     %error,
                     "yrs rejected an update part-way; neither persisted nor fanned out"
                 );
+                self.unlogged = true;
                 return;
             }
             // Nothing new — typically the SyncStep2 a (re)connecting writer
@@ -904,8 +1203,8 @@ impl Room {
             // Persisting it would write a `doc_updates` row on every page
             // open (and attribute an edit to someone who only looked);
             // fanning it out would make every peer re-apply a no-op.
-            Ok(applied) if !applied.changed => return,
-            Ok(_) => {}
+            Ok(applied) if !applied.changed || applied.persist.is_empty() => return,
+            Ok(applied) => applied,
             // It doesn't decode, so nothing of it was applied: refuse its
             // sender, which is broken or crafted, and no one else.
             Err(e) => {
@@ -918,27 +1217,16 @@ impl Room {
                 self.refuse_sender(m.from);
                 return;
             }
-        }
+        };
         metrics::counter!("knot_room_updates_total", "source" => "local").increment(1);
-        let framed = wrap_sync_update(&m.bytes);
-        let mut to_close: Vec<ConnId> = Vec::new();
-        for (cid, conn) in &self.conns {
-            if *cid == m.from {
-                continue;
-            }
-            match conn.tx.try_send(framed.clone()) {
-                Ok(_) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => to_close.push(*cid),
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => to_close.push(*cid),
-            }
-        }
-        for cid in to_close {
-            self.conns.remove(&cid);
-        }
-        if let Err(e) = self
-            .persist_tx
-            .send(crate::writer::PersistJob {
-                bytes: m.bytes,
+        // What the apply changed (a resend persists only what is new), or
+        // the raw update when content is pending (`ApplyMeasured::persist`).
+        // Persisted first, and fanned out only once the writer has it: an
+        // edit the writer can no longer take reaches no one.
+        let framed = wrap_sync_update(&measured.persist);
+        let handed_over = self
+            .persist(PersistJob {
+                bytes: measured.persist,
                 by_user_id: m.by_user,
                 source: knot_storage::UpdateSource::Edit,
                 meta: None,
@@ -947,10 +1235,14 @@ impl Room {
                 // hold up acknowledgement on the durable insert.
                 persisted: None,
             })
-            .await
-        {
-            tracing::error!(error=?e, "persist channel closed; dropping update");
+            .await;
+        if !handed_over {
+            return;
         }
+        if measured.raw_fallback {
+            metrics::counter!("knot_room_updates_persisted_raw_total").increment(1);
+        }
+        self.fan_out(&framed, Some(m.from));
     }
 
     /// Refuse an update `from` sent: count it, drop the connection, which
@@ -1803,11 +2095,21 @@ pub(crate) mod tests {
         let real = client
             .transact()
             .encode_state_as_update_v1(&yrs::StateVector::default());
-        let sv_before_sentinel = client.transact().state_vector();
-        text.push(&mut client.transact_mut(), "!");
-        let sentinel = client
-            .transact()
-            .encode_state_as_update_v1(&sv_before_sentinel);
+        // The edit's own update, as a live client sends it (a state diff
+        // would re-send the whole delete set, which the room does not
+        // persist again).
+        let sentinel = {
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sub = {
+                let captured = captured.clone();
+                client
+                    .observe_update_v1(move |_, e| *captured.lock().unwrap() = e.update.clone())
+                    .unwrap()
+            };
+            text.push(&mut client.transact_mut(), "!");
+            drop(sub);
+            captured.lock().unwrap().clone()
+        };
 
         let sender = Uuid::new_v4();
         let (sender_tx, _sender_rx) = mpsc::channel(8);
@@ -1845,29 +2147,34 @@ pub(crate) mod tests {
                     .expect("peer channel closed"),
             );
         }
+        // The room fans out and persists what each apply changed, which yrs
+        // re-encodes (`real` carries a deletion): compared as updates.
         let (first, second) = (&fanned[0], &fanned[1]);
-        assert_eq!(*first, wrap_sync_update(&real));
-        assert_eq!(
-            *second,
-            wrap_sync_update(&sentinel),
+        assert!(same_update(&unwrap_frame(first), &real));
+        assert!(
+            same_update(&unwrap_frame(second), &sentinel),
             "the peer was sent the no-op instead of the next real edit"
         );
 
         // The writer persists in arrival order: once the sentinel is in, a
         // persisted no-op would be too.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !persisted.lock().unwrap().contains(&sentinel) {
+        while !persisted
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| same_update(p, &sentinel))
+        {
             assert!(
                 std::time::Instant::now() < deadline,
                 "writer never persisted the sentinel"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(
-            *persisted.lock().unwrap(),
-            vec![real, sentinel],
-            "the no-op update was persisted"
-        );
+        let persisted = persisted.lock().unwrap().clone();
+        assert_eq!(persisted.len(), 2, "the no-op update was persisted");
+        assert!(same_update(&persisted[0], &real));
+        assert!(same_update(&persisted[1], &sentinel));
 
         h.shutdown.cancel();
     }
@@ -1935,7 +2242,7 @@ pub(crate) mod tests {
             .await
             .expect("pending update was not fanned out")
             .unwrap();
-        assert_eq!(fanned, wrap_sync_update(&dependent));
+        assert!(same_update(&unwrap_frame(&fanned), &dependent));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while persisted.lock().unwrap().is_empty() {
             assert!(
@@ -1944,7 +2251,11 @@ pub(crate) mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(*persisted.lock().unwrap(), vec![dependent]);
+        // Persisted raw (the apply parked it: `raw_fallback`), but compared
+        // as an update like every persisted inbound update.
+        let persisted = persisted.lock().unwrap().clone();
+        assert_eq!(persisted.len(), 1);
+        assert!(same_update(&persisted[0], &dependent));
 
         h.shutdown.cancel();
     }
@@ -2778,5 +3089,1082 @@ pub(crate) mod tests {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(suggestion_applied(&h, id, token).await);
         h.shutdown.cancel();
+    }
+
+    // -----------------------------------------------------------------------
+    // The ordered log (page history M1.2): boot by rev, the watermark,
+    // catch-up, the snapshot rule, effective fan-out.
+    // -----------------------------------------------------------------------
+
+    use crate::test_metrics::CountingRecorder;
+    use knot_storage::{DocUpdate, NewUpdate, Persisted, RowsAfter, SnapshotStamp};
+
+    /// Whether two updates carry the same insertions and deletions: the
+    /// room persists and fans out what an apply changed, which yrs
+    /// re-encodes, so its bytes may differ from what a client sent.
+    pub(crate) fn same_update(a: &[u8], b: &[u8]) -> bool {
+        use yrs::{Update, updates::decoder::Decode};
+        let (a, b) = (
+            Update::decode_v1(a).expect("a decodes"),
+            Update::decode_v1(b).expect("b decodes"),
+        );
+        a.insertions(true) == b.insertions(true) && a.delete_set() == b.delete_set()
+    }
+
+    /// The update inside a sync frame (`wrap_sync_update`).
+    fn unwrap_frame(frame: &[u8]) -> Vec<u8> {
+        assert_eq!(frame[..2], [0, 2], "not a sync update frame");
+        let mut len = 0usize;
+        let mut shift = 0;
+        let mut at = 2;
+        loop {
+            let b = frame[at];
+            at += 1;
+            len |= ((b & 0x7f) as usize) << shift;
+            if b < 0x80 {
+                break;
+            }
+            shift += 7;
+        }
+        assert_eq!(frame.len() - at, len, "frame length");
+        frame[at..].to_vec()
+    }
+
+    /// A paragraph holding `text`, from a fresh doc of `client`.
+    fn para(client: u64, text: &str) -> Vec<u8> {
+        use yrs::{Doc, ReadTxn, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+        let doc = Doc::with_client_id(client);
+        let frag = doc.get_or_insert_xml_fragment("default");
+        {
+            let mut txn = doc.transact_mut();
+            let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new(text));
+        }
+        doc.transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default())
+    }
+
+    /// A page holding one paragraph "hello" from `client`, the doc, and the
+    /// id of the text's first character (an item that holds a string, not
+    /// a type). As `tests/nesting.rs`'s `text_page`.
+    fn text_page(client: u64) -> (Vec<u8>, yrs::Doc, yrs::ID) {
+        use yrs::{
+            Assoc, Doc, IndexedSequence, ReadTxn, Transact, XmlElementPrelim, XmlFragment,
+            XmlTextPrelim,
+        };
+        let doc = Doc::with_client_id(client);
+        let frag = doc.get_or_insert_xml_fragment("default");
+        let first = {
+            let mut txn = doc.transact_mut();
+            let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            let text = p.push_back(&mut txn, XmlTextPrelim::new("hello"));
+            let index = text
+                .sticky_index(&txn, 0, Assoc::After)
+                .expect("the text has a first character");
+            *index.id().expect("a character has an id")
+        };
+        let state = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        (state, doc, first)
+    }
+
+    /// From client 77: an element `partial` in the root fragment, then a
+    /// string whose parent is `not_a_type`, an item that holds text. While
+    /// the doc lacks `not_a_type`, yrs integrates `partial` and parks the
+    /// string; the apply that brings `not_a_type` then fails on it. As
+    /// `tests/nesting.rs`'s `rejected_part_way`.
+    fn rejected_part_way(not_a_type: &yrs::ID) -> Vec<u8> {
+        use yrs::block::{ClientID, ItemContent};
+        use yrs::branch::Branch;
+        use yrs::encoding::write::Write;
+        use yrs::types::TypeRef;
+        use yrs::updates::encoder::{Encoder, EncoderV1};
+        let mut enc = EncoderV1::new();
+        enc.write_var(1u32);
+        enc.write_var(2u32);
+        enc.write_client(ClientID::new(77));
+        enc.write_var(0u32);
+        enc.write_info(7);
+        enc.write_parent_info(true);
+        enc.write_string("default");
+        ItemContent::Type(Branch::new(TypeRef::XmlElement("partial".into()))).encode(&mut enc);
+        enc.write_info(4);
+        enc.write_parent_info(false);
+        enc.write_left_id(not_a_type);
+        ItemContent::String("y".into()).encode(&mut enc);
+        enc.write_var(0u32);
+        enc.to_vec()
+    }
+
+    /// A crafted update whose string yrs parks, waiting for client 5's
+    /// text, the innocent edit that brings that text (and fails on the
+    /// parked string), and the edit's client doc.
+    fn parked_block_and_the_edit_it_fails_on() -> (Vec<u8>, Vec<u8>, yrs::Doc) {
+        let (edit, doc, text) = text_page(5);
+        (rejected_part_way(&text), edit, doc)
+    }
+
+    /// A page log double: `append` stores rows at consecutive revs (or the
+    /// revs queued in `own_revs`), and `rows_after` serves every stored row
+    /// whose rev is not `hidden`, as Postgres does.
+    #[derive(Default)]
+    struct Log {
+        state: std::sync::Mutex<LogState>,
+    }
+
+    #[derive(Default)]
+    struct LogState {
+        rows: Vec<DocUpdate>,
+        hidden: std::collections::HashSet<i64>,
+        next_seq: i64,
+        own_revs: std::collections::VecDeque<i64>,
+        /// `rows_after(Rev(r))` also returns rows at or below `r`.
+        unfiltered: bool,
+        /// Every row `append` stored, in order.
+        appended: Vec<NewUpdate>,
+        /// One per `append` call, in order: the call waits for it first.
+        gates: std::collections::VecDeque<Arc<tokio::sync::Notify>>,
+        /// This many successful `append` calls store their rows and then
+        /// fail (a lost COMMIT acknowledgement).
+        lost_acks: usize,
+        /// `append` fails permanently, storing nothing.
+        refuse_appends: bool,
+    }
+
+    impl Log {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn row(rev: i64, seq: i64, update_bytes: Vec<u8>) -> DocUpdate {
+            DocUpdate {
+                seq,
+                doc_id: Uuid::nil(),
+                update_bytes,
+                by_user_id: None,
+                created_at: sqlx::types::chrono::Utc::now(),
+                rev: Some(rev),
+                source: Some(knot_storage::UpdateSource::Edit),
+                meta: None,
+                epoch: Some(0),
+            }
+        }
+
+        /// Stores a row of another writer at `rev` and `seq`.
+        fn push(&self, rev: i64, seq: i64, bytes: Vec<u8>) {
+            let mut s = self.state.lock().unwrap();
+            s.next_seq = s.next_seq.max(seq);
+            s.rows.push(Self::row(rev, seq, bytes));
+        }
+
+        fn with<R>(&self, f: impl FnOnce(&mut LogState) -> R) -> R {
+            f(&mut self.state.lock().unwrap())
+        }
+
+        fn appended(&self) -> Vec<NewUpdate> {
+            self.with(|s| s.appended.clone())
+        }
+
+        fn gate(&self) -> Arc<tokio::sync::Notify> {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            self.with(|s| s.gates.push_back(gate.clone()));
+            gate
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl knot_storage::UpdatesStore for Log {
+        async fn append(
+            &self,
+            _: Uuid,
+            epoch: i32,
+            rows: &[NewUpdate],
+        ) -> Result<Vec<Persisted>, knot_storage::UpdatesStoreError> {
+            if let Some(gate) = self.with(|s| s.gates.pop_front()) {
+                gate.notified().await;
+            }
+            let mut s = self.state.lock().unwrap();
+            if s.refuse_appends {
+                return Err(knot_storage::UpdatesStoreError::EpochChanged {
+                    room: epoch,
+                    stored: epoch + 1,
+                });
+            }
+            let mut out = Vec::new();
+            for new in rows {
+                let next = s.rows.iter().filter_map(|r| r.rev).max().unwrap_or(0) + 1;
+                let rev = s.own_revs.pop_front().unwrap_or(next);
+                s.next_seq += 1;
+                let seq = s.next_seq;
+                let mut row = Self::row(rev, seq, new.bytes.clone());
+                row.by_user_id = new.by_user_id;
+                row.epoch = Some(epoch);
+                s.rows.push(row);
+                s.appended.push(new.clone());
+                out.push(Persisted { seq, rev });
+            }
+            if s.lost_acks > 0 {
+                s.lost_acks -= 1;
+                return Err(knot_storage::UpdatesStoreError::Sqlx(sqlx::Error::Io(
+                    std::io::Error::new(std::io::ErrorKind::ConnectionReset, "lost ack"),
+                )));
+            }
+            Ok(out)
+        }
+        async fn rows_after(
+            &self,
+            _: Uuid,
+            from: RowsAfter,
+        ) -> Result<Vec<DocUpdate>, knot_storage::UpdatesStoreError> {
+            let s = self.state.lock().unwrap();
+            let mut rows: Vec<DocUpdate> = s
+                .rows
+                .iter()
+                .filter(|r| !s.hidden.contains(&r.rev.unwrap()))
+                .filter(|r| match from {
+                    RowsAfter::All => true,
+                    RowsAfter::Rev(after) => s.unfiltered || r.rev.unwrap() > after,
+                })
+                .cloned()
+                .collect();
+            rows.sort_by_key(|r| r.rev);
+            Ok(rows)
+        }
+        async fn head(
+            &self,
+            _: Uuid,
+        ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
+            let s = self.state.lock().unwrap();
+            Ok(knot_storage::HistoryHead {
+                head_rev: s.rows.iter().filter_map(|r| r.rev).max().unwrap_or(0),
+                ..Default::default()
+            })
+        }
+        async fn ensure_legacy_numbered(
+            &self,
+            _: Uuid,
+        ) -> Result<u64, knot_storage::UpdatesStoreError> {
+            Ok(0)
+        }
+        async fn since(
+            &self,
+            _: Uuid,
+            after: i64,
+        ) -> Result<Vec<DocUpdate>, knot_storage::UpdatesStoreError> {
+            let s = self.state.lock().unwrap();
+            Ok(s.rows.iter().filter(|r| r.seq > after).cloned().collect())
+        }
+        async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
+            Ok(self.with(|s| s.next_seq))
+        }
+    }
+
+    /// Records the stamp of every snapshot written, and fails each write
+    /// with `fail` when set.
+    #[derive(Default)]
+    struct Stamps {
+        written: std::sync::Mutex<Vec<SnapshotStamp>>,
+        fail: std::sync::Mutex<Option<fn() -> knot_storage::SnapshotStoreError>>,
+    }
+
+    impl Stamps {
+        fn written(&self) -> Vec<SnapshotStamp> {
+            self.written.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl knot_storage::SnapshotStore for Stamps {
+        async fn insert_stamped(
+            &self,
+            _: Uuid,
+            stamp: SnapshotStamp,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<(), knot_storage::SnapshotStoreError> {
+            self.written.lock().unwrap().push(stamp);
+            match *self.fail.lock().unwrap() {
+                Some(fail) => Err(fail()),
+                None => Ok(()),
+            }
+        }
+        async fn latest(
+            &self,
+            _: Uuid,
+        ) -> Result<Option<knot_storage::DocSnapshot>, knot_storage::SnapshotStoreError> {
+            Ok(None)
+        }
+        async fn gc(
+            &self,
+            _: Uuid,
+            _: i64,
+            _: i32,
+        ) -> Result<u64, knot_storage::SnapshotStoreError> {
+            Ok(0)
+        }
+        async fn list(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<Vec<knot_storage::SnapshotMeta>, knot_storage::SnapshotStoreError> {
+            Ok(vec![])
+        }
+        async fn by_seq(
+            &self,
+            _: Uuid,
+            _: i64,
+        ) -> Result<Option<knot_storage::DocSnapshot>, knot_storage::SnapshotStoreError> {
+            Ok(None)
+        }
+    }
+
+    /// Snapshots on every own row and on every idle tick.
+    const EAGER: crate::snapshot::SnapshotPolicy = crate::snapshot::SnapshotPolicy {
+        every_n: 1,
+        idle: std::time::Duration::ZERO,
+    };
+
+    /// Snapshots only when idle (on every idle tick).
+    const IDLE: crate::snapshot::SnapshotPolicy = crate::snapshot::SnapshotPolicy {
+        every_n: 1000,
+        idle: std::time::Duration::ZERO,
+    };
+
+    /// A room on `log` and `snapshots`. Its writer publishes on a bus of its
+    /// own, so the room catches up only on its tick, a gap, or a message the
+    /// test publishes on the returned bus.
+    async fn room_on_log(
+        log: &Arc<Log>,
+        snapshots: &Arc<Stamps>,
+        policy: crate::snapshot::SnapshotPolicy,
+    ) -> (RoomHandle, MemBus, Uuid) {
+        let doc_id = Uuid::new_v4();
+        let listened = MemBus::new();
+        let sub = listened.subscribe(doc_id).await.unwrap();
+        let h = Room::spawn(
+            doc_id,
+            Arc::new(YrsEngine),
+            Arc::new(MemBus::new()),
+            sub,
+            log.clone(),
+            snapshots.clone(),
+            policy,
+            None,
+        )
+        .await
+        .expect("the room boots");
+        (h, listened, doc_id)
+    }
+
+    async fn probe(h: &RoomHandle) -> Probe {
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::Probe(tx)).await.unwrap();
+        rx.await.unwrap()
+    }
+
+    async fn send_edit(h: &RoomHandle, from: ConnId, bytes: Vec<u8>) {
+        h.tx.send(Event::Inbound(InMsg {
+            from,
+            by_user: None,
+            bytes,
+        }))
+        .await
+        .unwrap();
+    }
+
+    /// Waits (in virtual time when it is paused) until `done` holds.
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Waits until the room's probe satisfies `done`.
+    async fn until_probe(h: &RoomHandle, what: &str, done: impl Fn(&Probe) -> bool) -> Probe {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let p = probe(h).await;
+            if done(&p) {
+                return p;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out: {what} ({p:?})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Every frame `rx` holds now.
+    fn drain(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    async fn shut_down(h: &RoomHandle) {
+        let _ = h.tx.send(Event::Shutdown).await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), h.tx.closed())
+            .await
+            .expect("the room did not end");
+    }
+
+    /// A row stays in flight until the writer confirms it: no snapshot
+    /// meanwhile, then one stamped with the confirmed rev.
+    #[tokio::test(start_paused = true)]
+    async fn no_snapshot_while_rows_are_in_flight() {
+        let log = Log::new();
+        let (first, second) = (log.gate(), log.gate());
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, IDLE).await;
+        let (sender, _rx) = join(&h).await;
+
+        send_edit(&h, sender, para(11, "one")).await;
+        // The writer's first attempt (holding only this edit) has started.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        send_edit(&h, sender, para(12, "two")).await;
+        first.notify_one();
+        // The first row is confirmed, the second is in flight.
+        until_probe(&h, "first row confirmed", |p| p.applied_through_rev == 1).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let p = probe(&h).await;
+        assert_eq!((p.in_flight, p.max_own_rev), (1, 1), "{p:?}");
+        assert!(
+            snapshots.written().is_empty(),
+            "a snapshot was written while a row was in flight: {:?}",
+            snapshots.written()
+        );
+
+        second.notify_one();
+        until("the snapshot after the last row", || {
+            !snapshots.written().is_empty()
+        })
+        .await;
+        assert_eq!(
+            snapshots.written()[0],
+            SnapshotStamp {
+                snapshot_seq: 2,
+                snapshot_rev: Some(2),
+                epoch: Some(0),
+            }
+        );
+        shut_down(&h).await;
+    }
+
+    /// An own rev past the watermark means other rows committed in between:
+    /// the room reads them at once (not on its 5 s tick).
+    #[tokio::test(start_paused = true)]
+    async fn an_own_rev_past_a_gap_triggers_catch_up() {
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, EAGER).await;
+        let (sender, _sender_rx) = join(&h).await;
+        let (_peer, mut peer_rx) = join(&h).await;
+        // Past the catch-up tick's first, immediate run.
+        probe(&h).await;
+
+        let peer_row = para(21, "peer");
+        log.push(1, 1, peer_row.clone());
+        log.with(|s| s.own_revs.push_back(2));
+        let sent = tokio::time::Instant::now();
+        send_edit(&h, sender, para(11, "own")).await;
+
+        let p = until_probe(&h, "own rev 2 confirmed", |p| p.max_own_rev == 2).await;
+        assert_eq!(p.applied_through_rev, 2, "{p:?}");
+        assert!(
+            sent.elapsed() < std::time::Duration::from_secs(4),
+            "caught up on the tick, not at once"
+        );
+        let frames = drain(&mut peer_rx);
+        assert!(
+            frames.iter().any(|f| unwrap_frame(f) == peer_row),
+            "the peer row was not fanned out"
+        );
+        until("a snapshot at rev 2", || {
+            snapshots
+                .written()
+                .iter()
+                .any(|s| s.snapshot_rev == Some(2))
+        })
+        .await;
+        assert!(
+            snapshots
+                .written()
+                .iter()
+                .all(|s| s.snapshot_rev == Some(2)),
+            "{:?}",
+            snapshots.written()
+        );
+        shut_down(&h).await;
+    }
+
+    /// Rows are applied by rev: one whose seq is below a seq already
+    /// applied is not skipped (0.9.x read `since(last_applied_seq)`).
+    #[tokio::test(start_paused = true)]
+    async fn catch_up_applies_a_row_whose_seq_is_below_the_watermark() {
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, bus, doc_id) = room_on_log(&log, &snapshots, IDLE).await;
+        probe(&h).await;
+
+        log.push(1, 20, para(21, "first"));
+        bus.publish(doc_id, 1).await.unwrap();
+        until_probe(&h, "rev 1 applied", |p| p.applied_through_rev == 1).await;
+        log.push(2, 15, para(22, "second"));
+        bus.publish(doc_id, 2).await.unwrap();
+        let p = until_probe(&h, "rev 2 applied", |p| p.applied_through_rev == 2).await;
+        assert_eq!((p.through_seq, p.last_applied_seq), (15, 20), "{p:?}");
+        let page = exported_page(&h).await;
+        assert!(page.contains("first") && page.contains("second"), "{page}");
+        shut_down(&h).await;
+    }
+
+    /// Catch-up stops at a rev gap and says so; a row at or below the
+    /// watermark that a store returns is skipped, not a gap.
+    #[tokio::test(start_paused = true)]
+    async fn catch_up_stops_at_a_rev_gap() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, bus, doc_id) = room_on_log(&log, &snapshots, IDLE).await;
+        let (_peer, mut peer_rx) = join(&h).await;
+        probe(&h).await;
+
+        let one = para(21, "one");
+        log.push(1, 1, one.clone());
+        log.push(3, 3, para(23, "three"));
+        bus.publish(doc_id, 3).await.unwrap();
+        let p = until_probe(&h, "rev 1 applied", |p| p.applied_through_rev == 1).await;
+        assert_eq!(p.through_seq, 1);
+        assert!(rec.counter("knot_room_rev_gap_total", &[]) >= 1);
+        assert!(!exported_page(&h).await.contains("three"));
+        let frames = drain(&mut peer_rx);
+        assert_eq!(frames.len(), 1, "only rev 1 was fanned out");
+        assert_eq!(unwrap_frame(&frames[0]), one);
+
+        // The store returns rev 1 again for Rev(1), and nothing past it.
+        log.with(|s| {
+            s.rows.retain(|r| r.rev != Some(3));
+            s.unfiltered = true;
+        });
+        let gaps = rec.counter("knot_room_rev_gap_total", &[]);
+        bus.publish(doc_id, 1).await.unwrap();
+        // A round trip after the bus message.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let p = probe(&h).await;
+        assert_eq!(p.applied_through_rev, 1, "{p:?}");
+        assert_eq!(rec.counter("knot_room_rev_gap_total", &[]), gaps);
+        assert!(drain(&mut peer_rx).is_empty(), "rev 1 was fanned out again");
+        shut_down(&h).await;
+    }
+
+    /// A snapshot write that finds the page gone ends the room quietly,
+    /// without an exit snapshot.
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_doc_gone_evicts_without_exit_snapshot() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        *snapshots.fail.lock().unwrap() = Some(|| knot_storage::SnapshotStoreError::DocGone);
+        let (h, _bus, _) = room_on_log(&log, &snapshots, IDLE).await;
+        let (sender, _rx) = join(&h).await;
+        send_edit(&h, sender, para(11, "one")).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), h.shutdown.cancelled())
+            .await
+            .expect("the room was not ended");
+        tokio::time::timeout(std::time::Duration::from_secs(60), h.tx.closed())
+            .await
+            .expect("the room's actor did not end");
+        assert_eq!(snapshots.written().len(), 1, "an exit snapshot was written");
+        assert_eq!(rec.counter("knot_room_evicted_total", &[]), 0);
+    }
+
+    /// A snapshot write that finds the page's epoch changed evicts the room,
+    /// without an exit snapshot.
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_epoch_changed_evicts_the_room() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        *snapshots.fail.lock().unwrap() = Some(|| knot_storage::SnapshotStoreError::EpochChanged);
+        let (h, _bus, _) = room_on_log(&log, &snapshots, IDLE).await;
+        let (sender, _rx) = join(&h).await;
+        send_edit(&h, sender, para(11, "one")).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), h.shutdown.cancelled())
+            .await
+            .expect("the room was not evicted");
+        tokio::time::timeout(std::time::Duration::from_secs(60), h.tx.closed())
+            .await
+            .expect("the room's actor did not end");
+        assert_eq!(snapshots.written().len(), 1, "an exit snapshot was written");
+        assert_eq!(rec.counter("knot_room_evicted_total", &[]), 1);
+    }
+
+    /// A writer Fatal evicts the room before any snapshot.
+    #[tokio::test(start_paused = true)]
+    async fn writer_fatal_evicts_without_snapshot() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let log = Log::new();
+        log.with(|s| s.refuse_appends = true);
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, EAGER).await;
+        let (sender, _rx) = join(&h).await;
+        send_edit(&h, sender, para(11, "one")).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), h.shutdown.cancelled())
+            .await
+            .expect("the room was not evicted");
+        tokio::time::timeout(std::time::Duration::from_secs(60), h.tx.closed())
+            .await
+            .expect("the room's actor did not end");
+        assert!(snapshots.written().is_empty(), "{:?}", snapshots.written());
+        assert_eq!(rec.counter("knot_room_evicted_total", &[]), 1);
+    }
+
+    /// The writer-event arm comes before the inbound events in the room's
+    /// select: a Fatal ends the room before it reads what is queued.
+    #[tokio::test]
+    async fn a_writer_fatal_is_seen_before_queued_inbound_events() {
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let (h, _persist_rx, events, _done) = Room::spawn_detached(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            Log::new(),
+            Arc::new(Stamps::default()),
+            IDLE,
+            None,
+        )
+        .await
+        .unwrap();
+        let (_conn, _rx) = join(&h).await;
+
+        let mut replies = Vec::new();
+        for _ in 0..20 {
+            let (tx, rx) = oneshot::channel();
+            h.tx.try_send(Event::ExportState(tx))
+                .unwrap_or_else(|_| panic!("the room's queue is full"));
+            replies.push(rx);
+        }
+        events.send(WriterEvent::Fatal("test".into())).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.tx.closed())
+            .await
+            .expect("the room did not end");
+        for rx in replies {
+            assert!(rx.await.is_err(), "a queued event was answered");
+        }
+    }
+
+    /// An update with a missing dependency is persisted raw, and counted.
+    #[tokio::test(start_paused = true)]
+    async fn a_raw_fallback_persist_is_counted() {
+        use yrs::{ReadTxn, Text, Transact};
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, IDLE).await;
+        let (sender, _rx) = join(&h).await;
+
+        let client = yrs::Doc::new();
+        let text = client.get_or_insert_text("t");
+        text.push(&mut client.transact_mut(), "a");
+        let sv = client.transact().state_vector();
+        text.push(&mut client.transact_mut(), "b");
+        let dependent = client.transact().encode_state_as_update_v1(&sv);
+
+        send_edit(&h, sender, dependent.clone()).await;
+        until("the dependent update is stored", || {
+            log.appended().len() == 1
+        })
+        .await;
+        assert_eq!(log.appended()[0].bytes, dependent, "persisted raw");
+        assert_eq!(rec.counter("knot_room_updates_persisted_raw_total", &[]), 1);
+
+        send_edit(&h, sender, para(12, "ordinary")).await;
+        until("the ordinary edit is stored", || log.appended().len() == 2).await;
+        assert_eq!(rec.counter("knot_room_updates_persisted_raw_total", &[]), 1);
+        shut_down(&h).await;
+    }
+
+    /// No snapshot while an own rev is past the watermark (the rows below it
+    /// are not readable yet), neither every-N, idle nor at exit; once they
+    /// are, the next catch-up reaches it and the next snapshot is stamped
+    /// with it.
+    #[tokio::test(start_paused = true)]
+    async fn no_snapshot_while_an_own_rev_is_past_a_gap() {
+        /// A log holding rev 1, rev 2 hidden, and own rows landing at rev 3.
+        fn gapped_log() -> Arc<Log> {
+            let log = Log::new();
+            log.push(1, 1, para(21, "one"));
+            log.push(2, 2, para(22, "two"));
+            log.with(|s| {
+                s.hidden.extend([2, 3]);
+                s.own_revs.push_back(3);
+            });
+            log
+        }
+
+        let log = gapped_log();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, EAGER).await;
+        let (sender, _rx) = join(&h).await;
+        send_edit(&h, sender, para(11, "own")).await;
+        let p = until_probe(&h, "own rev 3 confirmed", |p| p.max_own_rev == 3).await;
+        assert_eq!(p.applied_through_rev, 1, "{p:?}");
+        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+        assert!(snapshots.written().is_empty(), "{:?}", snapshots.written());
+        // Nor is the room caught up: the log lacks rows below its own rev.
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::SuggestionApplied {
+            suggestion_id: Uuid::new_v4(),
+            apply_token: Uuid::new_v4(),
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        assert!(rx.await.is_err(), "answered below its own rev");
+
+        // At exit, in a second room built the same way.
+        {
+            let log = gapped_log();
+            let snapshots = Arc::new(Stamps::default());
+            let (h, _bus, _) = room_on_log(&log, &snapshots, EAGER).await;
+            let (sender, _rx) = join(&h).await;
+            send_edit(&h, sender, para(11, "own")).await;
+            until_probe(&h, "own rev 3 confirmed", |p| p.max_own_rev == 3).await;
+            shut_down(&h).await;
+            assert!(snapshots.written().is_empty(), "{:?}", snapshots.written());
+        }
+
+        log.with(|s| s.hidden.clear());
+        let p = until_probe(&h, "caught up to rev 3", |p| p.applied_through_rev == 3).await;
+        assert_eq!(p.through_seq, 3, "{p:?}");
+        until("a snapshot", || !snapshots.written().is_empty()).await;
+        assert_eq!(snapshots.written()[0].snapshot_rev, Some(3));
+        assert_eq!(snapshots.written()[0].snapshot_seq, 3);
+        assert!(exported_page(&h).await.contains("two"));
+        shut_down(&h).await;
+    }
+
+    /// `SuggestionApplied` is answered only when the room caught up: a rev
+    /// gap leaves it unanswered, without evicting the room.
+    #[tokio::test(start_paused = true)]
+    async fn suggestion_applied_is_unanswered_at_a_rev_gap() {
+        let log = Log::new();
+        log.push(1, 1, para(21, "one"));
+        log.push(2, 2, para(22, "two"));
+        log.push(3, 3, para(23, "three"));
+        log.with(|s| {
+            s.hidden.insert(2);
+        });
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, IDLE).await;
+
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::SuggestionApplied {
+            suggestion_id: Uuid::new_v4(),
+            apply_token: Uuid::new_v4(),
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        assert!(rx.await.is_err(), "answered at a rev gap");
+        assert!(!h.shutdown.is_cancelled(), "a gap evicted the room");
+
+        log.with(|s| s.hidden.clear());
+        assert!(!suggestion_applied(&h, Uuid::new_v4(), Uuid::new_v4()).await);
+        assert_eq!(probe(&h).await.applied_through_rev, 3);
+        shut_down(&h).await;
+    }
+
+    /// An update yrs rejects part-way leaves content no row carries in the
+    /// doc: the room writes no snapshot from then on (Rulings). The cost,
+    /// pinned: an edit made inside that content is persisted and fanned
+    /// out, but a reboot from the log lacks it (it stays pending).
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_update_stops_snapshots() {
+        use yrs::{GetString, ReadTxn, Text, Transact, XmlFragment, XmlOut};
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, EAGER).await;
+        let (crafted, _crafted_rx) = join(&h).await;
+        let (innocent, _innocent_rx) = join(&h).await;
+        let (writer, _writer_rx) = join(&h).await;
+        let (_peer, mut peer_rx) = join(&h).await;
+        let (parked, edit, client) = parked_block_and_the_edit_it_fails_on();
+
+        send_edit(&h, crafted, parked).await;
+        until("a snapshot of the parked block", || {
+            !snapshots.written().is_empty()
+        })
+        .await;
+        let written = snapshots.written().len();
+        send_edit(&h, innocent, edit).await;
+        until_probe(&h, "the room is unlogged", |p| p.unlogged).await;
+
+        // An edit inside the paragraph the rejected update integrated.
+        let inside = {
+            let frag = client.get_or_insert_xml_fragment("default");
+            let sv = client.transact().state_vector();
+            {
+                let mut txn = client.transact_mut();
+                let Some(XmlOut::Element(p)) = frag.get(&txn, 0) else {
+                    panic!("no paragraph")
+                };
+                let Some(XmlOut::Text(text)) = p.get(&txn, 0) else {
+                    panic!("no text")
+                };
+                text.insert(&mut txn, 0, "XYZ");
+                assert_eq!(text.get_string(&txn), "XYZhello");
+            }
+            client.transact().encode_state_as_update_v1(&sv)
+        };
+        drain(&mut peer_rx);
+        send_edit(&h, writer, inside.clone()).await;
+        until("the inside edit is stored", || {
+            log.appended()
+                .iter()
+                .any(|n| same_update(&n.bytes, &inside))
+        })
+        .await;
+        let frames = drain(&mut peer_rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| same_update(&unwrap_frame(f), &inside)),
+            "the inside edit was not fanned out"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        shut_down(&h).await;
+        assert_eq!(
+            snapshots.written().len(),
+            written,
+            "a snapshot was written after the rejected update"
+        );
+
+        let (h, _bus, _) = room_on_log(&log, &Arc::new(Stamps::default()), IDLE).await;
+        let page = exported_page(&h).await;
+        assert!(!page.contains("XYZ"), "{page}");
+        shut_down(&h).await;
+    }
+
+    /// The four rows `catch_up_passes_...` and `boot_passes_...` read: a
+    /// paragraph, the crafted parked block, the innocent edit it fails on,
+    /// another paragraph.
+    fn rows_with_one_that_fails() -> [Vec<u8>; 4] {
+        let (parked, edit, _) = parked_block_and_the_edit_it_fails_on();
+        [para(11, "one"), parked, edit, para(12, "four")]
+    }
+
+    /// A row that fails to apply in catch-up is passed: later rows still
+    /// apply, the watermark moves past it, the room stays up, catches up,
+    /// and writes no snapshot from then on.
+    #[tokio::test(start_paused = true)]
+    async fn catch_up_passes_a_row_that_fails_to_apply_and_marks_the_room_unlogged() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, bus, doc_id) = room_on_log(&log, &snapshots, EAGER).await;
+        let (sender, _sender_rx) = join(&h).await;
+        let (_peer, mut peer_rx) = join(&h).await;
+        probe(&h).await;
+
+        let rows = rows_with_one_that_fails();
+        for (i, row) in rows.iter().enumerate() {
+            log.push(i as i64 + 1, i as i64 + 1, row.clone());
+        }
+        let published = tokio::time::Instant::now();
+        bus.publish(doc_id, 4).await.unwrap();
+        let p = until_probe(&h, "caught up to rev 4", |p| p.applied_through_rev == 4).await;
+        assert!(p.unlogged, "{p:?}");
+        // In the catch-up the bus message started, not a later one: the row
+        // that fails is passed, not retried.
+        assert!(
+            published.elapsed() < std::time::Duration::from_secs(4),
+            "caught up past the failing row only on a later tick"
+        );
+        let fanned: Vec<Vec<u8>> = drain(&mut peer_rx)
+            .iter()
+            .map(|f| unwrap_frame(f))
+            .collect();
+        assert_eq!(
+            fanned,
+            vec![rows[0].clone(), rows[1].clone(), rows[3].clone()],
+            "rows 1, 2 and 4 are fanned out, row 3 is not"
+        );
+        assert_eq!(
+            rec.counter("knot_room_row_apply_errors_total", &[("phase", "catch_up")]),
+            1
+        );
+        assert!(!suggestion_applied(&h, Uuid::new_v4(), Uuid::new_v4()).await);
+
+        send_edit(&h, sender, para(13, "own")).await;
+        until_probe(&h, "own row confirmed", |p| p.max_own_rev == 5).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(!h.shutdown.is_cancelled(), "the room was evicted");
+        shut_down(&h).await;
+        assert!(snapshots.written().is_empty(), "{:?}", snapshots.written());
+    }
+
+    /// A row that fails to apply at boot is passed: the page opens with the
+    /// rest, and the room writes no snapshot. A read-only load fails
+    /// instead.
+    #[tokio::test(start_paused = true)]
+    async fn boot_passes_a_row_that_fails_to_apply() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let log = Log::new();
+        for (i, row) in rows_with_one_that_fails().into_iter().enumerate() {
+            log.push(i as i64 + 1, i as i64 + 1, row);
+        }
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, doc_id) = room_on_log(&log, &snapshots, EAGER).await;
+        let p = probe(&h).await;
+        assert_eq!(p.applied_through_rev, 4, "{p:?}");
+        assert!(p.unlogged, "{p:?}");
+        assert_eq!(
+            rec.counter("knot_room_row_apply_errors_total", &[("phase", "boot")]),
+            1
+        );
+        let page = exported_page(&h).await;
+        for part in ["one", "<partial>", "four"] {
+            assert!(page.contains(part), "{part} is missing: {page}");
+        }
+
+        let (sender, _rx) = join(&h).await;
+        send_edit(&h, sender, para(13, "own")).await;
+        until_probe(&h, "own row confirmed", |p| p.max_own_rev == 5).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        shut_down(&h).await;
+        assert!(snapshots.written().is_empty(), "{:?}", snapshots.written());
+
+        let read_only = crate::hydrate::boot(
+            &YrsEngine,
+            log.as_ref(),
+            snapshots.as_ref(),
+            doc_id,
+            BootMode::ReadOnly,
+        )
+        .await;
+        assert!(
+            matches!(read_only, Err(BootError::Apply(_))),
+            "a read-only load passed a row that failed to apply"
+        );
+    }
+
+    /// A persist channel the writer closed (after a Fatal the room has not
+    /// read yet) evicts the room: the edit is not fanned out, and nothing
+    /// is reported persisted after it.
+    #[tokio::test]
+    async fn a_closed_persist_channel_evicts_without_fan_out() {
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let (h, persist_rx, _events, _done) = Room::spawn_detached(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            Log::new(),
+            Arc::new(Stamps::default()),
+            IDLE,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(persist_rx);
+        let (a, _a_rx) = join(&h).await;
+        let (_b, mut b_rx) = join(&h).await;
+
+        send_edit(&h, a, para(11, "lost")).await;
+        let (tx, rx) = oneshot::channel();
+        let queued =
+            h.tx.send(Event::ApplyUpdate {
+                update_bytes: para(12, "server"),
+                by_user: None,
+                reply: tx,
+            })
+            .await
+            .is_ok();
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.shutdown.cancelled())
+            .await
+            .expect("the room was not evicted");
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.tx.closed())
+            .await
+            .expect("the room did not end");
+        assert!(drain(&mut b_rx).is_empty(), "the edit was fanned out");
+        if queued {
+            assert!(
+                !matches!(rx.await, Ok(Ok(_))),
+                "a server-side edit after the closed channel was reported persisted"
+            );
+        }
+    }
+
+    /// An attempt whose COMMIT acknowledgement was lost is retried, so its
+    /// rows land twice; the room learns of the first copy only as a gap
+    /// ahead of its own rev, catches up over it, and only then snapshots.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_ack_attempt_is_caught_up_before_a_snapshot() {
+        let log = Log::new();
+        log.with(|s| s.lost_acks = 1);
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, EAGER).await;
+        let (sender, _sender_rx) = join(&h).await;
+        let (_peer, mut peer_rx) = join(&h).await;
+        probe(&h).await;
+
+        let edit = para(11, "twice");
+        send_edit(&h, sender, edit.clone()).await;
+        let p = until_probe(&h, "own rev 2 confirmed", |p| p.max_own_rev == 2).await;
+        assert_eq!(p.applied_through_rev, 2, "{p:?}");
+        assert_eq!(log.appended().len(), 2, "the row was not written twice");
+        until("a snapshot", || !snapshots.written().is_empty()).await;
+        assert!(
+            snapshots
+                .written()
+                .iter()
+                .all(|s| s.snapshot_rev == Some(2)),
+            "{:?}",
+            snapshots.written()
+        );
+        let frames = drain(&mut peer_rx);
+        assert_eq!(frames.len(), 1, "a copy read back was fanned out again");
+        assert!(same_update(&unwrap_frame(&frames[0]), &edit));
+        shut_down(&h).await;
+    }
+
+    /// The seq a room reports counts only the rows it applied: rows past a
+    /// rev gap are not.
+    #[tokio::test(start_paused = true)]
+    async fn boot_last_seq_ignores_rows_past_a_gap() {
+        let log = Log::new();
+        log.push(1, 10, para(21, "one"));
+        log.push(3, 30, para(23, "three"));
+        let (h, _bus, _) = room_on_log(&log, &Arc::new(Stamps::default()), IDLE).await;
+        let p = probe(&h).await;
+        assert_eq!(p.applied_through_rev, 1, "{p:?}");
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::ExportState(tx)).await.unwrap();
+        let (_, seq) = rx.await.unwrap().unwrap();
+        assert_eq!(seq, 10);
+        shut_down(&h).await;
     }
 }

@@ -13,7 +13,8 @@ use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use crate::bus::{Bus, BusError};
-use crate::engine::{Engine, EngineError};
+use crate::engine::Engine;
+use crate::hydrate::BootError;
 use crate::room::{Room, RoomHandle};
 use crate::snapshot::SnapshotPolicy;
 use knot_storage::{SnapshotStore, UpdatesStore};
@@ -24,7 +25,7 @@ pub enum AcquireError {
     #[error("bus subscribe: {0}")]
     Bus(#[from] BusError),
     #[error("hydrate: {0}")]
-    Hydrate(#[from] EngineError),
+    Hydrate(#[from] BootError),
 }
 
 /// How many counters [`AclEpochs`] spreads doc ids over.

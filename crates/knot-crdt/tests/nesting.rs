@@ -501,6 +501,42 @@ fn sentinel() -> Vec<u8> {
     state(&doc)
 }
 
+/// Whether two updates carry the same insertions and deletions (false when
+/// either does not decode): a room persists and fans out what an apply
+/// changed, which yrs re-encodes, so its bytes may differ from what a client
+/// sent. As `knot_crdt::room`'s test helper.
+fn same_update(a: &[u8], b: &[u8]) -> bool {
+    use yrs::Update;
+    use yrs::updates::decoder::Decode;
+    match (Update::decode_v1(a), Update::decode_v1(b)) {
+        (Ok(a), Ok(b)) => {
+            a.insertions(true) == b.insertions(true) && a.delete_set() == b.delete_set()
+        }
+        _ => false,
+    }
+}
+
+/// Whether `frame` is a sync update frame carrying `update` (as
+/// [`same_update`]).
+fn is_frame_of(frame: &[u8], update: &[u8]) -> bool {
+    let [0, 2, rest @ ..] = frame else {
+        return false;
+    };
+    let mut len = 0usize;
+    let mut shift = 0;
+    let mut at = 0;
+    loop {
+        let Some(&b) = rest.get(at) else { return false };
+        at += 1;
+        len |= ((b & 0x7f) as usize) << shift;
+        if b < 0x80 {
+            break;
+        }
+        shift += 7;
+    }
+    rest.len() - at == len && same_update(&rest[at..], update)
+}
+
 /// Sends `deep` from one connection, then [`sentinel`] from another, and
 /// checks that only the sentinel was persisted and fanned out, that the
 /// sender was closed, and that the room still serves.
@@ -522,22 +558,26 @@ async fn refused_and_still_serving(deep: Vec<u8>) {
         .await
         .expect("the room stopped fanning out")
         .expect("peer channel closed");
-    assert_eq!(
-        fanned,
-        wrap_sync_update(&after),
+    assert!(
+        is_frame_of(&fanned, &after),
         "the refused update was fanned out"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !persisted.lock().unwrap().contains(&after) {
+    while !persisted
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| same_update(p, &after))
+    {
         assert!(
             std::time::Instant::now() < deadline,
             "the room stopped persisting"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        *persisted.lock().unwrap(),
-        vec![after],
+    let stored = persisted.lock().unwrap().clone();
+    assert!(
+        stored.len() == 1 && same_update(&stored[0], &after),
         "the refused update was persisted"
     );
     assert!(refused.is_cancelled(), "the sender was not told to close");
@@ -647,7 +687,7 @@ async fn refused_after_apply_and_evicted(base: Vec<u8>, bad: Vec<u8>) {
         .await
         .expect("the room never fanned out the base")
         .expect("peer channel closed");
-    assert_eq!(base_fanout, wrap_sync_update(&base));
+    assert!(is_frame_of(&base_fanout, &base));
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while persisted.lock().unwrap().is_empty() {
         assert!(
@@ -673,9 +713,9 @@ async fn refused_after_apply_and_evicted(base: Vec<u8>, bad: Vec<u8>) {
         .await
         .expect("the evicted room did not stop");
     assert!(refused.is_cancelled(), "the sender was not told to close");
-    assert_eq!(
-        *persisted.lock().unwrap(),
-        vec![base],
+    let stored = persisted.lock().unwrap().clone();
+    assert!(
+        stored.len() == 1 && same_update(&stored[0], &base),
         "the refused update must not be persisted"
     );
     assert!(
@@ -751,7 +791,7 @@ async fn an_evicted_room_is_rebooted_on_the_next_acquire_and_keeps_serving() {
         .await
         .expect("the rebooted room stopped serving")
         .expect("peer channel closed");
-    assert_eq!(fanned, wrap_sync_update(&edit));
+    assert!(is_frame_of(&fanned, &edit));
 
     let (reply, st) = oneshot::channel();
     second.tx.send(Event::ExportState(reply)).await.unwrap();
@@ -1084,7 +1124,7 @@ impl Stored {
     /// Waits until `update` is stored.
     async fn holds(&self, update: &[u8]) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !self.rows().iter().any(|row| row == update) {
+        while !self.rows().iter().any(|row| same_update(row, update)) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the update was never stored"
@@ -1189,14 +1229,13 @@ async fn room_on(doc_id: Uuid, store: &Stored) -> RoomHandle {
 /// Waits until `rx` gets `update` fanned out, and returns the frames it got
 /// before (the room's catch-up may fan an earlier update out again).
 async fn fanned_out(rx: &mut mpsc::Receiver<Vec<u8>>, update: &[u8]) -> Vec<Vec<u8>> {
-    let want = wrap_sync_update(update);
     let mut before = Vec::new();
     loop {
         let frame = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("the update was never fanned out")
             .expect("the channel closed");
-        if frame == want {
+        if is_frame_of(&frame, update) {
             return before;
         }
         before.push(frame);
@@ -1264,13 +1303,13 @@ async fn a_room_keeps_the_sender_whose_update_a_parked_block_fails_on() {
 
     let before = fanned_out(&mut peer_rx, &after).await;
     assert!(
-        !before.contains(&wrap_sync_update(&edit)),
+        !before.iter().any(|f| is_frame_of(f, &edit)),
         "the update yrs rejected was fanned out"
     );
     store.holds(&after).await;
-    assert_eq!(
-        store.rows(),
-        vec![parked, after],
+    let rows = store.rows();
+    assert!(
+        rows.len() == 2 && rows[0] == parked && same_update(&rows[1], &after),
         "the update yrs rejected was persisted"
     );
     assert!(!refused.is_cancelled(), "the innocent sender was refused");
@@ -1560,15 +1599,15 @@ async fn a_refused_connection_stays_refused() {
             assert!(
                 before
                     .iter()
-                    .all(|f| afters.iter().any(|a| *f == wrap_sync_update(a))),
+                    .all(|f| afters.iter().any(|a| is_frame_of(f, a))),
                 "the refused connection's edit or presence was fanned out"
             );
             afters.push(after);
         }
         store.holds(&afters[1]).await;
-        assert_eq!(
-            store.rows(),
-            afters,
+        let rows = store.rows();
+        assert!(
+            rows.len() == afters.len() && rows.iter().zip(&afters).all(|(r, a)| same_update(r, a)),
             "the refused connection's edit was persisted"
         );
         assert!(
