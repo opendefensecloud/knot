@@ -2476,6 +2476,10 @@ async fn migrations_one_to_five_run_under_live_0_9_9_traffic() {
     for &p in &pages {
         assert_gapless(&pool, p).await;
     }
+    assert!(
+        matches!(rev_index(&pool).await, Some((_, true, _))),
+        "the concurrent build under load left a valid index"
+    );
 
     // Every backend but this probe has exited, so each flushed its
     // statistics; a 40P01 anywhere (even one a retry hid) shows here.
@@ -2941,4 +2945,272 @@ async fn heads_fk_migration_drops_orphans_and_cascades() {
         .await
         .unwrap();
     assert_eq!(heads_row(&pool, n).await, None);
+}
+
+// --- Task 4: the (doc_id, rev) unique index (migrations 4 and 5) ---
+
+const REV_INDEX_SQL: &str =
+    include_str!("../../../migrations/20261107120003_history_rev_index.sql");
+const REV_INDEX_CHECK_SQL: &str =
+    include_str!("../../../migrations/20261107120004_history_rev_index_check.sql");
+
+/// `doc_updates_doc_rev_uq`'s oid, `indisvalid` and definition, or `None`
+/// when there is no such index on `doc_updates`.
+async fn rev_index(pool: &PgPool) -> Option<(i64, bool, String)> {
+    sqlx::query_as(
+        "SELECT i.indexrelid::oid::int8, i.indisvalid, pg_get_indexdef(i.indexrelid)
+           FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+          WHERE i.indrelid = 'doc_updates'::regclass AND c.relname = 'doc_updates_doc_rev_uq'",
+    )
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+/// What a CIC that the deadlock detector aborted, or that was cancelled,
+/// leaves behind: the index exists and is not valid.
+async fn mark_rev_index_invalid(pool: &PgPool) {
+    sqlx::query(
+        "UPDATE pg_index SET indisvalid = false
+          WHERE indexrelid = 'doc_updates_doc_rev_uq'::regclass",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    assert!(matches!(rev_index(pool).await, Some((_, false, _))));
+}
+
+/// Migration 5 as sqlx runs it: the whole file in one transaction.
+async fn run_rev_index_check(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(REV_INDEX_CHECK_SQL).execute(&mut *tx).await?;
+    tx.commit().await
+}
+
+const REV_INDEX_DEF: &str = "CREATE UNIQUE INDEX doc_updates_doc_rev_uq ON public.doc_updates \
+                             USING btree (doc_id, rev) WHERE (rev IS NOT NULL)";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rev_index_is_built_valid_and_unique() {
+    let (pool, ws, doc) = history_fixture().await;
+    let (_, valid, def) = rev_index(&pool).await.expect("index exists");
+    assert!(valid, "indisvalid");
+    assert_eq!(def, REV_INDEX_DEF);
+
+    // history_fixture's two rows went through the trigger: revs 1 and 2.
+    let explicit = "INSERT INTO doc_updates (doc_id, update_bytes, rev, epoch)
+                    VALUES ($1, '\\x01', $2, 0)";
+    let e = sqlx::query(explicit)
+        .bind(doc)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate(&e).as_deref(), Some("23505"), "{e}");
+    // The epoch was right: the next rev goes in.
+    sqlx::query(explicit)
+        .bind(doc)
+        .bind(3_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Unique per page: another page has its own rev 1.
+    let user: Uuid = sqlx::query_scalar("SELECT id FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let child = seed_doc_with_updates(&pool, ws, user, Some(doc), 1).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<i64>>("SELECT rev FROM doc_updates WHERE doc_id = $1")
+            .bind(child)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+}
+
+#[test]
+fn no_transaction_migration_is_one_statement() {
+    let sql = REV_INDEX_SQL;
+    assert!(sql.starts_with("-- no-transaction"));
+    assert_eq!(
+        sql.matches(';').count(),
+        1,
+        "sqlx sends the file as one query"
+    );
+    assert!(
+        sql.contains(
+            "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS doc_updates_doc_rev_uq \
+             ON doc_updates (doc_id, rev) WHERE rev IS NOT NULL;"
+        ),
+        "{sql}"
+    );
+    for line in sql.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            line.starts_with("--") || line.starts_with("CREATE UNIQUE INDEX CONCURRENTLY"),
+            "only comment lines besides the statement: {line}"
+        );
+    }
+}
+
+/// An aborted CIC leaves an invalid index that the next run's `IF NOT EXISTS`
+/// skips; a missing one (dropped by hand) is no better. Migration 5 rebuilds
+/// both, and leaves a valid index alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_check_rebuilds_an_invalid_index() {
+    let (pool, _, _) = history_fixture().await;
+    let (oid0, _, _) = rev_index(&pool).await.unwrap();
+
+    run_rev_index_check(&pool).await.unwrap();
+    assert_eq!(
+        rev_index(&pool).await.map(|(oid, ..)| oid),
+        Some(oid0),
+        "a valid index is not rebuilt"
+    );
+
+    mark_rev_index_invalid(&pool).await;
+    run_rev_index_check(&pool).await.unwrap();
+    let (oid1, valid, def) = rev_index(&pool).await.expect("index exists");
+    assert!(valid, "rebuilt valid");
+    assert_ne!(oid1, oid0, "dropped and created again");
+    assert_eq!(def, REV_INDEX_DEF);
+
+    sqlx::query("DROP INDEX doc_updates_doc_rev_uq")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rev_index(&pool).await, None);
+    run_rev_index_check(&pool).await.unwrap();
+    let (_, valid, def) = rev_index(&pool).await.expect("index exists again");
+    assert!(valid);
+    assert_eq!(def, REV_INDEX_DEF);
+}
+
+/// The repair takes ACCESS EXCLUSIVE through `knot_lock_tables`. A plain
+/// LOCK would queue, and a page write T1 that holds a page row and then reads
+/// `doc_updates` would queue behind it, while an old-style save T2 holds ROW
+/// EXCLUSIVE on `doc_updates` and waits for T1's page row in the trigger:
+/// a three-way cycle. (Two sessions cannot show it: a reader that already
+/// holds ACCESS SHARE jumps the queued request.) Its T1 -> M edge is only
+/// queue order, so Postgres breaks it by moving T1 ahead of M, but only when
+/// a waiter's deadlock check runs, `deadlock_timeout` after it began to
+/// wait: every page load behind a plain LOCK stalls that long. So the read
+/// starts after T2's and M's own checks have run, and must not wait for its
+/// own; with the helper it waits at most one 100 ms attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_check_backs_off_instead_of_deadlocking() {
+    use std::time::{Duration, Instant};
+
+    let (pool, _, doc) = history_fixture().await;
+    mark_rev_index_invalid(&pool).await;
+    let ten_s = Duration::from_secs(10);
+
+    let mut t1 = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM documents WHERE id = $1 FOR UPDATE")
+        .bind(doc)
+        .execute(&mut *t1)
+        .await
+        .unwrap();
+
+    let t2 = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let started = Instant::now();
+            let mut tx = pool.begin().await?;
+            sqlx::query("INSERT INTO doc_updates (doc_id, update_bytes) VALUES ($1, '\\x01')")
+                .bind(doc)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(started.elapsed())
+        }
+    });
+    // T2 holds ROW EXCLUSIVE on doc_updates and waits for T1's page row in
+    // doc_updates_assign_rev's FOR KEY SHARE.
+    knot_test_support::locks::wait_for_lock_waits(&pool, 1).await;
+
+    let m = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let started = Instant::now();
+            run_rev_index_check(&pool).await?;
+            Ok::<_, sqlx::Error>(started.elapsed())
+        }
+    });
+    // M's 100 ms attempts keep failing on T2's lock. Past deadlock_timeout,
+    // T2 and M have each run their one deadlock check.
+    let deadlock_timeout: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM current_setting('deadlock_timeout')::interval)::float8",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let deadlock_timeout = Duration::from_secs_f64(deadlock_timeout);
+    tokio::time::sleep(deadlock_timeout + Duration::from_millis(200)).await;
+
+    let read_started = Instant::now();
+    let n: i64 = tokio::time::timeout(
+        ten_s,
+        sqlx::query_scalar("SELECT count(*) FROM doc_updates WHERE doc_id = $1")
+            .bind(doc)
+            .fetch_one(&mut *t1),
+    )
+    .await
+    .expect("T1's read never queues behind M for long")
+    .expect("T1's read");
+    let read_took = read_started.elapsed();
+    assert_eq!(n, 2);
+    t1.commit().await.unwrap();
+
+    let t2 = tokio::time::timeout(ten_s, t2)
+        .await
+        .expect("T2 finishes")
+        .unwrap();
+    let m = tokio::time::timeout(ten_s, m)
+        .await
+        .expect("M finishes")
+        .unwrap();
+    assert!(
+        t2.is_ok() && m.is_ok(),
+        "no 40P01 anywhere: t2 {t2:?}, m {m:?}"
+    );
+    let (t2_took, m_took) = (t2.unwrap(), m.unwrap());
+    assert!(
+        read_took < deadlock_timeout / 2,
+        "T1's read queued behind M: {read_took:?}"
+    );
+    assert!(
+        t2_took < ten_s && m_took < ten_s,
+        "t2 {t2_took:?}, m {m_took:?}"
+    );
+    assert!(
+        m_took >= deadlock_timeout,
+        "M got doc_updates only after T2 committed: {m_took:?}"
+    );
+    assert!(matches!(rev_index(&pool).await, Some((_, true, _))));
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 3);
+}
+
+/// With a valid index the check reads the catalog and nothing else, so a
+/// session writing `doc_updates` does not hold it up.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_check_takes_no_lock_when_the_index_is_valid() {
+    use std::time::Duration;
+
+    let (pool, _, _) = history_fixture().await;
+    let before = rev_index(&pool).await;
+
+    let mut h = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE doc_updates IN ROW EXCLUSIVE MODE")
+        .execute(&mut *h)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), run_rev_index_check(&pool))
+        .await
+        .expect("the check commits within 1 s")
+        .unwrap();
+    h.rollback().await.unwrap();
+    assert_eq!(rev_index(&pool).await, before, "untouched");
 }
