@@ -9,7 +9,6 @@ import {
   Calendar as CalendarIcon,
   Code,
   Code2,
-  Columns3,
   Heading1,
   Heading2,
   Heading3,
@@ -21,18 +20,16 @@ import {
   Lock,
   MessageSquarePlus,
   Paperclip,
-  Rows3,
-  Table as TableIcon,
   Network,
   PenSquare,
   Quote,
   Strikethrough,
-  Trash2,
 } from "lucide-react";
 
 import { boardsApi } from "../../lib/boards.api";
 import { useUi } from "../../stores/ui";
 import { SCOPE_TOOLTIP, suggestionScope } from "../suggestions/scope";
+import { TableMenu } from "./TableMenu";
 import { applyLinkUrl, toolbarLinkState } from "./toolbarLink";
 
 type ToolbarBtnProps = {
@@ -46,6 +43,9 @@ type ToolbarBtnProps = {
   children: ReactNode;
 };
 
+const BTN_CLS =
+  "inline-flex items-center justify-center h-8 min-w-8 px-2 rounded text-fg-muted hover:text-fg hover:bg-muted transition-colors ease-swift duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40 disabled:cursor-not-allowed";
+
 function Btn({ testId, label, title, active, disabled, onClick, children }: ToolbarBtnProps) {
   return (
     <button
@@ -56,7 +56,7 @@ function Btn({ testId, label, title, active, disabled, onClick, children }: Tool
       aria-pressed={active}
       disabled={disabled}
       onClick={onClick}
-      className={`inline-flex items-center justify-center h-8 min-w-8 px-2 rounded text-fg-muted hover:text-fg hover:bg-muted transition-colors ease-swift duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40 disabled:cursor-not-allowed ${active ? "bg-muted text-fg" : ""}`}
+      className={`${BTN_CLS} ${active ? "bg-muted text-fg" : ""}`}
     >
       {children}
     </button>
@@ -213,60 +213,7 @@ export function EditorToolbar({
         >
           <CalendarIcon size={15} aria-hidden />
         </Btn>
-        <Btn
-          testId="toolbar-table"
-          label="Insert table"
-          onClick={() =>
-            c()
-              .insertTable({ rows: 3, cols: 3, withHeaderRow: true })
-              .run()
-          }
-        >
-          <TableIcon size={15} aria-hidden />
-        </Btn>
-        {editor.isActive("table") && (
-          <>
-            <Btn
-              testId="toolbar-table-add-row"
-              label="Add row below"
-              onClick={() => c().addRowAfter().run()}
-            >
-              <Rows3 size={15} aria-hidden />
-              <span className="text-[10px] ml-0.5">+</span>
-            </Btn>
-            <Btn
-              testId="toolbar-table-delete-row"
-              label="Delete row"
-              onClick={() => c().deleteRow().run()}
-            >
-              <Rows3 size={15} aria-hidden />
-              <span className="text-[10px] ml-0.5">−</span>
-            </Btn>
-            <Btn
-              testId="toolbar-table-add-col"
-              label="Add column right"
-              onClick={() => c().addColumnAfter().run()}
-            >
-              <Columns3 size={15} aria-hidden />
-              <span className="text-[10px] ml-0.5">+</span>
-            </Btn>
-            <Btn
-              testId="toolbar-table-delete-col"
-              label="Delete column"
-              onClick={() => c().deleteColumn().run()}
-            >
-              <Columns3 size={15} aria-hidden />
-              <span className="text-[10px] ml-0.5">−</span>
-            </Btn>
-            <Btn
-              testId="toolbar-table-delete"
-              label="Delete table"
-              onClick={() => c().deleteTable().run()}
-            >
-              <Trash2 size={15} aria-hidden />
-            </Btn>
-          </>
-        )}
+        <TableMenu editor={editor} btnClass={BTN_CLS} />
         <Btn
           testId="toolbar-task-list"
           label="Task list"
