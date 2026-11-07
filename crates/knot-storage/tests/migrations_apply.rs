@@ -2052,6 +2052,193 @@ async fn demoting_an_owner_revokes_the_keys_it_minted_for_others() {
     );
 }
 
+/// One `api-key.revoke-cascade` audit row: its workspace, actor, target, the
+/// recorded cause and the sorted key ids.
+#[derive(Debug, PartialEq)]
+struct CascadeRow {
+    workspace: Uuid,
+    actor: Option<Uuid>,
+    target: Uuid,
+    cause: String,
+    keys: Vec<Uuid>,
+}
+
+async fn cascade_rows(pool: &PgPool) -> Vec<CascadeRow> {
+    let rows: Vec<(Uuid, Option<Uuid>, Uuid, serde_json::Value)> = sqlx::query_as(
+        "SELECT workspace_id, actor_id, target_id, data FROM audit_events
+          WHERE action = 'api-key.revoke-cascade' AND target_kind = 'user'
+          ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(workspace, actor, target, data)| {
+            let mut keys: Vec<Uuid> =
+                serde_json::from_value(data["key_ids"].clone()).expect("key_ids");
+            keys.sort();
+            CascadeRow {
+                workspace,
+                actor,
+                target,
+                cause: data["cause"].as_str().expect("cause").to_string(),
+                keys,
+            }
+        })
+        .collect()
+}
+
+fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
+    ids.sort();
+    ids
+}
+
+/// A trigger-driven revocation answers later requests exactly like a typo
+/// (`api_key.invalid`), so the audit log is where an operator finds the cause.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_change_audits_the_keys_it_revoked() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let user = seed_user(&pool, "h@x.test", "human", Some("old"), None).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    let own = insert_key(&pool, ws, user, user, "NULL").await.unwrap();
+    let minted = insert_key(&pool, ws, bot, user, "NULL").await.unwrap();
+    let already_gone = insert_key(&pool, ws, user, user, "NULL").await.unwrap();
+    sqlx::query("UPDATE api_keys SET revoked_at = '2020-01-01T00:00:00Z' WHERE id = $1")
+        .bind(already_gone)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE users SET password_hash = 'x' WHERE id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cascade_rows(&pool).await,
+        vec![CascadeRow {
+            workspace: ws,
+            actor: None,
+            target: user,
+            cause: "password_change".into(),
+            keys: sorted(vec![own, minted]),
+        }]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_change_that_revokes_nothing_writes_no_audit_row() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    seed_workspace(&pool).await;
+    let user = seed_user(&pool, "h@x.test", "human", Some("old"), None).await;
+
+    sqlx::query("UPDATE users SET password_hash = 'x' WHERE id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(cascade_rows(&pool).await, vec![]);
+}
+
+/// A user with keys in two workspaces gets one row in each, so neither
+/// workspace's owners see the other's key ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_change_audits_each_workspace_separately() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws_a = seed_workspace(&pool).await;
+    let ws_b: Uuid =
+        sqlx::query_scalar("INSERT INTO workspaces (slug, name) VALUES ('b', 'B') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let user = seed_user(&pool, "h@x.test", "human", Some("old"), None).await;
+    let in_a = insert_key(&pool, ws_a, user, user, "NULL").await.unwrap();
+    let in_b = insert_key(&pool, ws_b, user, user, "NULL").await.unwrap();
+
+    sqlx::query("UPDATE users SET password_hash = 'x' WHERE id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let rows = cascade_rows(&pool).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for (ws, key) in [(ws_a, in_a), (ws_b, in_b)] {
+        let row = rows.iter().find(|r| r.workspace == ws).expect("row");
+        assert_eq!(row.keys, vec![key]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_member_audits_the_keys_it_revoked() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let owner = seed_user(&pool, "o@x.test", "human", Some("pw"), None).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    add_member(&pool, ws, owner, "owner").await;
+    add_member(&pool, ws, bot, "editor").await;
+    let own = insert_key(&pool, ws, owner, owner, "NULL").await.unwrap();
+    let minted = insert_key(&pool, ws, bot, owner, "NULL").await.unwrap();
+
+    sqlx::query("DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2")
+        .bind(ws)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cascade_rows(&pool).await,
+        vec![CascadeRow {
+            workspace: ws,
+            actor: None,
+            target: owner,
+            cause: "member_removed".into(),
+            keys: sorted(vec![own, minted]),
+        }]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn demoting_an_owner_audits_the_keys_it_revoked() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let owner = seed_user(&pool, "o@x.test", "human", Some("pw"), None).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    add_member(&pool, ws, owner, "owner").await;
+    add_member(&pool, ws, bot, "editor").await;
+    insert_key(&pool, ws, owner, owner, "NULL").await.unwrap();
+    let minted = insert_key(&pool, ws, bot, owner, "NULL").await.unwrap();
+
+    // Not a demotion from owner, so nothing is revoked or audited.
+    sqlx::query("UPDATE workspace_members SET role = 'viewer' WHERE user_id = $1")
+        .bind(bot)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(cascade_rows(&pool).await, vec![]);
+
+    sqlx::query("UPDATE workspace_members SET role = 'editor' WHERE user_id = $1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cascade_rows(&pool).await,
+        vec![CascadeRow {
+            workspace: ws,
+            actor: None,
+            target: owner,
+            cause: "owner_demoted".into(),
+            keys: vec![minted],
+        }]
+    );
+}
+
 /// S4: users.kind is immutable, so an owner can never become a bot owner.
 #[tokio::test(flavor = "multi_thread")]
 async fn user_kind_cannot_change() {

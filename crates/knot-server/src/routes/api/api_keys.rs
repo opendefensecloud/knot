@@ -365,13 +365,14 @@ async fn revoke_key(
         }
     }
     if let Some(pool) = state.pool.as_ref() {
-        audit::record(
+        audit::record_with_data(
             pool,
             ctx.workspace_id,
             Some(ctx.user_id),
             "api-key.revoke",
             "user",
             owner,
+            &serde_json::json!({ "key_id": key_id }),
         )
         .await;
     }

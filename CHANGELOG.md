@@ -44,10 +44,11 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   plaintext never reaches the database, logs, traces or the audit log.
 - A key works only on `/api/*`. It can't open the live editor websocket,
   change the password, log out, create, list or revoke keys, invite,
-  re-role or remove members, or create or list public share links
-  (`403 api_key.session_required`, whatever its scopes), so a leaked key
-  can't take over the account or the workspace, raise its own scopes, or
-  leave behind a public link that outlives it.
+  re-role or remove members, create or list public share links, or change
+  a page's grants or restriction (`403 api_key.session_required`, whatever
+  its scopes), so a leaked key can't take over the account or the workspace,
+  raise its own scopes, or leave behind a public link or page access that
+  outlives it. Reading a page's grants and access still works with `read`.
 - Creating a key re-checks, in the same database transaction, that the
   session asking for it still exists and that its user is still a member
   (and still an owner, for a bot's key). A key requested just before a
@@ -62,14 +63,17 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   owner resets the password (a database trigger). Removing a member
   revokes their keys, so re-inviting them brings none back, and
   revokes the bot keys they minted; an owner who loses the owner role
-  loses the bot keys they minted too (database triggers).
+  loses the bot keys they minted too (database triggers). Each of these
+  writes an `api-key.revoke-cascade` audit event naming the cause and the
+  keys, and the app warns before a password change, a removal or an owner's
+  demotion.
 - A bot can't sign in through single sign-on, even when an identity
   provider account has its email, and a user's kind (human or bot) never
   changes (a database trigger).
 - A bot can never own the workspace or a page: the server refuses with
   `422 bot.owner_forbidden`, and database triggers refuse it on every
-  other path. Bots also can't restrict pages (`403 acl.owner_required`: a
-  bot never holds the page-owner role that needs), create or import pages
+  other path. Bots also can't restrict pages (`403
+  api_key.session_required`: no key may), create or import pages
   inside a restricted subtree, import restricted pages or duplicate a
   restricted page (`403 bot.restricted_forbidden`), since each would make
   them a page owner. Where a person would get an owner grant

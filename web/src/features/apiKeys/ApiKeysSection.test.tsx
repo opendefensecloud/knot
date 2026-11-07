@@ -2,6 +2,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { useUi } from "../../stores/ui";
+
 import { type ApiKey, apiKeysApi } from "./apiKeys.api";
 import { ApiKeysSection } from "./ApiKeysSection";
 
@@ -49,6 +51,7 @@ function renderSection(props: { targetUserId?: string } = {}) {
 
 beforeEach(() => {
   maxTtl = null;
+  useUi.setState({ toasts: [] });
   list = vi.spyOn(apiKeysApi, "list").mockResolvedValue({ ok: KEYS });
 });
 
@@ -137,6 +140,23 @@ describe("ApiKeysSection", () => {
     fireEvent.click(screen.getByTestId("api-key-revoke-confirm"));
     await waitFor(() => expect(revoke).toHaveBeenCalledWith("k1", undefined));
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["api-keys", "self"] }));
+  });
+
+  it("says so when the key list can't be loaded, rather than looking empty", async () => {
+    list.mockRejectedValue(new TypeError("Failed to fetch"));
+    renderSection();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't load");
+  });
+
+  it("reports a revoke that fails on the network, and that the key still works", async () => {
+    vi.spyOn(apiKeysApi, "revoke").mockRejectedValue(new TypeError("Failed to fetch"));
+    renderSection();
+    fireEvent.click(await screen.findByTestId("api-key-revoke"));
+    fireEvent.click(screen.getByTestId("api-key-revoke-confirm"));
+    await waitFor(() => {
+      const errors = useUi.getState().toasts.filter((t) => t.kind === "error");
+      expect(errors.map((t) => t.text)).toEqual([expect.stringContaining("still active")]);
+    });
   });
 
   it("maps a server error code to a message", async () => {

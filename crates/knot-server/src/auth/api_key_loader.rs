@@ -29,7 +29,7 @@ pub struct ApiPrincipal {
 }
 
 const API_PREFIX: &str = "/api/";
-const BEARER: &[u8] = b"bearer ";
+const BEARER: &[u8] = b"bearer";
 
 /// One answer for every way a presented key can be unusable: malformed,
 /// unknown, expired, revoked, or its user no longer a member. No oracle.
@@ -38,10 +38,14 @@ fn invalid() -> Response {
 }
 
 /// `true` when the header uses the Bearer scheme (case-insensitive per
-/// RFC 7235). Checked on raw bytes so a non-ASCII value cannot hide one.
+/// RFC 7235), with or without credentials: the HTTP parser trims trailing
+/// whitespace, so a script with an unset key sends a bare `Bearer`. Checked
+/// on raw bytes so a non-ASCII value cannot hide one.
 fn is_bearer(v: &HeaderValue) -> bool {
-    let b = v.as_bytes();
-    b.len() >= BEARER.len() && b[..BEARER.len()].eq_ignore_ascii_case(BEARER)
+    let Some((scheme, rest)) = v.as_bytes().split_at_checked(BEARER.len()) else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case(BEARER) && matches!(rest.first(), None | Some(b' ' | b'\t'))
 }
 
 /// Bearer authentication for /api/* only. Ok(None) means "no usable
@@ -307,6 +311,23 @@ mod tests {
         let auth = format!("Bearer {}", secret.as_str());
         fx.wss.remove_member(fx.ws, fx.user).await.unwrap();
         assert_invalid(&fx.deps, req("/api/docs", Some(&auth))).await;
+    }
+
+    /// S9: HTTP parsers trim trailing whitespace, so an unset key reaches us
+    /// as a bare `Bearer`, and that is still an attempt to use a key.
+    #[tokio::test]
+    async fn a_bare_or_tab_separated_bearer_scheme_is_judged_not_passed_to_the_cookie() {
+        let fx = setup().await;
+        for value in ["Bearer", "bearer", "BEARER", "Bearer\tnope"] {
+            assert_invalid(&fx.deps, req("/api/docs", Some(value))).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scheme_that_only_starts_with_bearer_falls_through_to_cookie() {
+        let fx = setup().await;
+        let other = req("/api/docs", Some("Bearerish token"));
+        assert!(authenticate(&fx.deps, &other).await.unwrap().is_none());
     }
 
     #[tokio::test]

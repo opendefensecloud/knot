@@ -91,8 +91,10 @@ OIDC → too long, `None` for bot → allowed).
   debounced to once a minute and skips revoked rows.
 - `list_for_user` returns live keys plus those revoked or expired in the last
   30 days; the column list never includes `key_hash`.
-- `audit.rs`: `api_key.create` / `api_key.revoke` rows carry the key id, the
-  scopes and the expiry — never the secret or a hash.
+- `audit.rs`: `api-key.create` rows carry the key id, the scopes and the
+  expiry; `api-key.revoke` rows carry the key id; the revoking triggers write
+  `api-key.revoke-cascade` rows with the cause and key ids. Never the secret
+  or a hash.
 - Migration: `users.kind`, the credentials CHECK, the `api_keys` table and its
   indexes, and the six triggers with their functions (`KB001` bot not
   workspace owner, `KB002` bot never a doc owner under any UUID spelling,

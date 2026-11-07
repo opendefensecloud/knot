@@ -161,6 +161,9 @@ export default function SettingsPage() {
         )}
         <section data-testid="change-password" className="bg-surface border border-border rounded-lg px-5 py-4">
           <h2 className="text-[13px] font-semibold uppercase tracking-wider text-fg-muted mb-3">Change password</h2>
+          <p className="text-[13px] text-fg-muted m-0 mb-3">
+            Changing your password signs out your other devices and revokes your API keys, along with any bot keys you created.
+          </p>
           <form
             onSubmit={(e) => { e.preventDefault(); changePw.mutate(); }}
             className="grid gap-3 max-w-sm"

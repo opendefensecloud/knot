@@ -25,11 +25,16 @@ use crate::http_error::json_err;
 /// Routes no API key may call, keyed by the exact axum `MatchedPath`: they
 /// mint credentials or change who is a member and with which role, so a
 /// scoped key reaching them could turn itself into an unscoped owner
-/// (S2, S9). The handlers of `/api/auth/api-keys*` refuse keys as well.
+/// (S2). The handlers of `/api/auth/api-keys*` refuse keys as well.
 ///
 /// A public share link is a credential too, an anonymous one that outlives
 /// the key, its user's password and membership: no key may mint one or
 /// read the existing tokens. Revoking a link (DELETE) stays open to keys.
+///
+/// Page grants and restriction decide who can reach a page, and those
+/// decisions outlive the key that made them: a leaked key of a page's owner
+/// could otherwise hand the page to another account, or lift its
+/// restriction, for good. Reading grants and access stays open to keys.
 pub const SESSION_ONLY: &[(Method, &str)] = &[
     (Method::GET, "/api/auth/api-keys"),
     (Method::POST, "/api/auth/api-keys"),
@@ -39,6 +44,9 @@ pub const SESSION_ONLY: &[(Method, &str)] = &[
     (Method::DELETE, "/api/workspace/members/{id}"),
     (Method::POST, "/api/docs/{doc_id}/shares"),
     (Method::GET, "/api/docs/{doc_id}/shares"),
+    (Method::PUT, "/api/docs/{id}/grants/{principal}"),
+    (Method::DELETE, "/api/docs/{id}/grants/{principal}"),
+    (Method::PUT, "/api/docs/{id}/restricted"),
 ];
 
 /// POST routes that are not creates, keyed by the exact axum `MatchedPath`.
@@ -107,8 +115,14 @@ pub fn required_scope(method: &Method, matched: &str) -> Scope {
         .unwrap_or_else(|| method_default(method))
 }
 
-/// Whether `method` on the route template `matched` refuses API keys.
+/// Whether `method` on the route template `matched` refuses API keys. axum
+/// answers HEAD with the GET handler, so a GET row covers HEAD as well.
 pub fn session_only(method: &Method, matched: &str) -> bool {
+    let method = if method == Method::HEAD {
+        &Method::GET
+    } else {
+        method
+    };
     SESSION_ONLY
         .iter()
         .any(|(m, p)| m == method && *p == matched)
@@ -251,7 +265,29 @@ mod tests {
         }
         // Listing members stays readable to keys (agents look up assignees).
         assert!(!session_only(&Method::GET, "/api/workspace/members"));
-        assert_eq!(SESSION_ONLY.len(), 8);
+        assert_eq!(SESSION_ONLY.len(), 11);
+    }
+
+    #[test]
+    fn changing_who_can_reach_a_page_is_session_only() {
+        for (m, p) in [
+            (Method::PUT, "/api/docs/{id}/grants/{principal}"),
+            (Method::DELETE, "/api/docs/{id}/grants/{principal}"),
+            (Method::PUT, "/api/docs/{id}/restricted"),
+        ] {
+            assert!(session_only(&m, p), "{m} {p}");
+        }
+        // Seeing who has access stays readable to keys.
+        assert!(!session_only(&Method::GET, "/api/docs/{id}/grants"));
+        assert!(!session_only(&Method::GET, "/api/docs/{id}/access"));
+    }
+
+    /// axum answers HEAD with the GET handler, so a GET row covers HEAD too.
+    #[test]
+    fn head_on_a_session_only_get_route_is_session_only() {
+        assert!(session_only(&Method::HEAD, "/api/docs/{doc_id}/shares"));
+        assert!(session_only(&Method::HEAD, "/api/auth/api-keys"));
+        assert!(!session_only(&Method::HEAD, "/api/workspace/members"));
     }
 
     #[test]

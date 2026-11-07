@@ -336,8 +336,8 @@ async fn bot_ownership_guards() {
     assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"]["code"], "bot.restricted_forbidden", "{body}");
 
-    // Restricting a page: a bot never holds the page-owner role it needs
-    // (the bot guard behind it is pinned in the handler's own tests).
+    // Restricting a page: no key may, and a bot has nothing but keys (the
+    // bot guard behind it is pinned in the handler's own tests).
     let (st, body) = guards_bearer(
         &app,
         &key,
@@ -347,7 +347,7 @@ async fn bot_ownership_guards() {
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["error"]["code"], "acl.owner_required", "{body}");
+    assert_eq!(body["error"]["code"], "api_key.session_required", "{body}");
 
     // An owner grant for the bot, even from the page's owner.
     let (st, body) = send(
@@ -2398,7 +2398,15 @@ async fn every_session_only_row_matches_a_real_route() {
     let key = matrix_key(&app, &s, &ALL_SCOPES).await;
     let id = uuid::Uuid::new_v4().to_string();
     for (method, template) in knot_server::auth::scope::SESSION_ONLY {
-        let uri = template.replace("{doc_id}", &doc).replace("{id}", &id);
+        let path_id = if template.starts_with("/api/docs/") {
+            &doc
+        } else {
+            &id
+        };
+        let uri = template
+            .replace("{doc_id}", &doc)
+            .replace("{id}", path_id)
+            .replace("{principal}", &format!("user:{id}"));
         assert!(!uri.contains('{'), "unsubstituted parameter in {template}");
         let body = (*method == axum::http::Method::POST).then(|| serde_json::json!({}));
         let (st, body) = guards_bearer(&app, &key, method.as_str(), &uri, body).await;
@@ -2407,7 +2415,244 @@ async fn every_session_only_row_matches_a_real_route() {
             body["error"]["code"], "api_key.session_required",
             "{method} {template}: {body}"
         );
+        // axum serves HEAD from the GET handler. A HEAD answer has no body,
+        // so only the status can be checked; the shares row is the one that
+        // would answer 200 here if HEAD slipped past the table.
+        if *method == axum::http::Method::GET {
+            let (st, _) = guards_bearer(&app, &key, "HEAD", &uri, None).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "HEAD {template}");
+        }
     }
+}
+
+/// S2: a grant or a lifted restriction would survive revoking the key that
+/// made it, so no key may change who can reach a page, whatever its scopes
+/// and even when its user owns the page. Reading who has access stays open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_cannot_change_who_can_reach_a_page() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    add_human(&app, &s, "member@example.com", "memberpass1").await;
+    let member = user_id(&state, "member@example.com").await;
+    let doc = matrix_doc(&app, &s, "page").await;
+    let (st, body) = send(
+        &app,
+        &s,
+        "PUT",
+        &format!("/api/docs/{doc}/grants/user:{member}"),
+        Some(serde_json::json!({"role": "viewer", "inherit": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{body}");
+    let key = matrix_key(&app, &s, &ALL_SCOPES).await;
+    let grants_uri = format!("/api/docs/{doc}/grants");
+    let (_, grants_before) = send(&app, &s, "GET", &grants_uri, None).await;
+
+    for (method, uri, body) in [
+        (
+            "PUT",
+            format!("{grants_uri}/user:{member}"),
+            Some(serde_json::json!({"role": "owner", "inherit": true})),
+        ),
+        ("DELETE", format!("{grants_uri}/user:{member}"), None),
+        (
+            "PUT",
+            format!("/api/docs/{doc}/restricted"),
+            Some(serde_json::json!({"restricted": true})),
+        ),
+    ] {
+        let (st, resp) = guards_bearer(&app, &key, method, &uri, body).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{method} {uri}: {resp}");
+        assert_eq!(
+            resp["error"]["code"], "api_key.session_required",
+            "{method} {uri}"
+        );
+    }
+
+    let (_, grants_after) = send(&app, &s, "GET", &grants_uri, None).await;
+    assert_eq!(grants_after, grants_before, "a grant changed");
+    let (st, meta) = send(&app, &s, "GET", &format!("/api/docs/{doc}"), None).await;
+    assert_eq!(st, StatusCode::OK, "{meta}");
+    assert_eq!(meta["restricted"], false, "the page was restricted");
+
+    let (st, body) = guards_bearer(&app, &key, "GET", &grants_uri, None).await;
+    assert_eq!(st, StatusCode::OK, "listing grants with a key: {body}");
+    let (st, body) =
+        guards_bearer(&app, &key, "GET", &format!("/api/docs/{doc}/access"), None).await;
+    assert_eq!(st, StatusCode::OK, "reading access with a key: {body}");
+}
+
+/// A request carrying a session cookie (and its CSRF token) and an
+/// `Authorization` header, as a script with a stale cookie jar sends.
+async fn cookie_and_authorization(
+    app: &axum::Router,
+    s: &Session,
+    authorization: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("cookie", &s.cookie)
+        .header("x-csrf-token", &s.csrf)
+        .header("authorization", authorization);
+    let body = match body {
+        Some(v) => {
+            b = b.header("content-type", "application/json");
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    let r = app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
+    let status = r.status();
+    let bytes = r.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+/// S9: next to a valid session, the Bearer header still decides the request.
+/// A broken key is refused rather than served from the cookie, and a working
+/// key keeps its scope limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bearer_header_wins_over_a_valid_cookie() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let (st, minted) = send(
+        &app,
+        &s,
+        "POST",
+        "/api/auth/api-keys",
+        Some(serde_json::json!({"name": "ro", "scopes": ["read"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{minted}");
+    let key = minted["key"].as_str().unwrap();
+    let id = minted["id"].as_str().unwrap();
+    let new_doc = serde_json::json!({"title": "by whom"});
+
+    let (st, body) = cookie_and_authorization(
+        &app,
+        &s,
+        &format!("Bearer {key}"),
+        "POST",
+        "/api/docs",
+        Some(new_doc.clone()),
+    )
+    .await;
+    assert_scope_denied(st, &body, "create");
+
+    let (st, body) =
+        cookie_and_authorization(&app, &s, "Bearer nope", "GET", "/api/docs", None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["code"], "api_key.invalid", "{body}");
+
+    let (st, _) = send(
+        &app,
+        &s,
+        "DELETE",
+        &format!("/api/auth/api-keys/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, body) =
+        cookie_and_authorization(&app, &s, &format!("Bearer {key}"), "GET", "/api/docs", None)
+            .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["code"], "api_key.invalid", "{body}");
+
+    // The cookie alone is still a working session: the refusals above came
+    // from the header.
+    let (st, body) = send(&app, &s, "POST", "/api/docs", Some(new_doc)).await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+}
+
+/// S9, over a real socket: the HTTP parser trims trailing whitespace, so
+/// `curl -H "Authorization: Bearer $UNSET"` reaches the server as `Bearer`,
+/// which an in-process request never shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_bearer_over_a_real_socket_is_refused_not_served_from_the_cookie() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let get = |extra_header: String| {
+        let cookie = s.cookie.clone();
+        async move {
+            let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request = format!(
+                "GET /api/docs HTTP/1.1\r\nHost: knot.test\r\nCookie: {cookie}\r\n\
+                 {extra_header}Connection: close\r\n\r\n"
+            );
+            conn.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).await.unwrap();
+            response
+        }
+    };
+
+    let control = get(String::new()).await;
+    assert!(control.starts_with("HTTP/1.1 200"), "{control}");
+
+    for value in ["Bearer ", "Bearer", "bearer  "] {
+        let response = get(format!("Authorization: {value}\r\n")).await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "{value:?} was served from the cookie: {response}"
+        );
+        assert!(
+            response.contains("api_key.invalid"),
+            "{value:?}: {response}"
+        );
+    }
+}
+
+/// The audit trail must say which key went: a bot can hold up to 50.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_revoke_audit_row_names_the_key() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let mut ids = Vec::new();
+    for name in ["kept", "revoked"] {
+        let (st, minted) = send(
+            &app,
+            &s,
+            "POST",
+            "/api/auth/api-keys",
+            Some(serde_json::json!({"name": name, "scopes": ["read"]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{minted}");
+        ids.push(minted["id"].as_str().unwrap().to_string());
+    }
+    let revoked = &ids[1];
+    let (st, _) = send(
+        &app,
+        &s,
+        "DELETE",
+        &format!("/api/auth/api-keys/{revoked}"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    let data: serde_json::Value =
+        sqlx::query_scalar("SELECT data FROM audit_events WHERE action = 'api-key.revoke'")
+            .fetch_one(state.pool.as_ref().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(data["key_id"], revoked.as_str());
 }
 
 // ---------------------------------------------------------------------------

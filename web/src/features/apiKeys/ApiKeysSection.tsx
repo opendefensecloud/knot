@@ -102,6 +102,7 @@ export function ApiKeysSection({ targetUserId }: Props) {
       if ("error" in r) notify("error", apiKeyErrorMessage(r.error.code));
       await qc.invalidateQueries({ queryKey });
     },
+    onError: () => notify("error", "Couldn't revoke the key, so it's still active. Try again."),
   });
 
   function toggleScope(s: ApiKeyScope, on: boolean) {
@@ -113,7 +114,10 @@ export function ApiKeysSection({ targetUserId }: Props) {
   }
 
   const list: ApiKey[] = keys.data && "ok" in keys.data ? keys.data.ok : [];
-  const listError = keys.data && "error" in keys.data ? apiKeyErrorMessage(keys.data.error.code) : null;
+  // An empty list must mean "no keys": active keys may exist if it failed.
+  const listError = keys.isError
+    ? "Couldn't load the API keys, so active keys may be missing from this list."
+    : keys.data && "error" in keys.data ? apiKeyErrorMessage(keys.data.error.code) : null;
   const canSubmit = name.trim().length > 0 && scopes.size > 0 && !create.isPending;
 
   return (

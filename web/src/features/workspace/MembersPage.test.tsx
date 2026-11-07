@@ -88,7 +88,7 @@ describe("MembersPage remove", () => {
     vi.spyOn(workspaceApi, "listMembers").mockResolvedValue({ ok: MEMBERS });
   });
 
-  it("warns that a removed member loses their page grants too", async () => {
+  it("warns that a removed member loses their page grants and API keys too", async () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     const remove = vi.spyOn(workspaceApi, "remove");
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -101,9 +101,55 @@ describe("MembersPage remove", () => {
     const row = await screen.findByTestId("member-u2");
     fireEvent.click(within(row).getByRole("button", { name: "Remove" }));
     expect(confirm).toHaveBeenCalledWith(
-      "Remove bob@example.org? They also lose every page-level grant, including access to restricted pages.",
+      "Remove bob@example.org? They also lose every page-level grant, including access to restricted pages. Their API keys and any bot keys they created stop working.",
     );
     expect(remove).not.toHaveBeenCalled();
+  });
+});
+
+describe("MembersPage role change", () => {
+  beforeEach(() => {
+    vi.spyOn(workspaceApi, "listMembers").mockResolvedValue({ ok: MEMBERS });
+  });
+
+  function renderPage() {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={qc}>
+        <MembersPage />
+      </QueryClientProvider>,
+    );
+  }
+
+  async function chooseRole(userId: string, role: string) {
+    const row = await screen.findByTestId(`member-${userId}`);
+    fireEvent.change(within(row).getByRole("combobox"), { target: { value: role } });
+  }
+
+  it("asks before demoting an owner, and changes nothing if declined", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const setRole = vi.spyOn(workspaceApi, "setRole");
+    renderPage();
+    await chooseRole("u1", "editor");
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("bot keys"));
+    expect(setRole).not.toHaveBeenCalled();
+  });
+
+  it("demotes an owner once confirmed", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const setRole = vi.spyOn(workspaceApi, "setRole").mockResolvedValue({ ok: undefined });
+    renderPage();
+    await chooseRole("u1", "editor");
+    await waitFor(() => expect(setRole).toHaveBeenCalledWith("u1", "editor"));
+  });
+
+  it("doesn't ask when the member isn't an owner, since no key is at stake", async () => {
+    const confirm = vi.spyOn(window, "confirm");
+    const setRole = vi.spyOn(workspaceApi, "setRole").mockResolvedValue({ ok: undefined });
+    renderPage();
+    await chooseRole("u2", "viewer");
+    await waitFor(() => expect(setRole).toHaveBeenCalledWith("u2", "viewer"));
+    expect(confirm).not.toHaveBeenCalled();
   });
 });
 

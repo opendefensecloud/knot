@@ -46,11 +46,25 @@ CREATE INDEX api_keys_user_live_idx ON api_keys (user_id) WHERE revoked_at IS NU
 -- reset the password must not outlive the reset. Lives in the DB so every
 -- change of the password hash (the app, or a direct database update) is
 -- covered.
+--
+-- Every revoking trigger here also writes an api-key.revoke-cascade audit row
+-- per workspace, naming the cause and the keys: a revoked key answers exactly
+-- like a typo, so the audit log is where an operator finds out why. No row
+-- when nothing was revoked. actor_id stays NULL: the trigger can't know who
+-- acted, and the member paths write their own row saying so.
 CREATE OR REPLACE FUNCTION users_revoke_api_keys_on_password_change() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-  UPDATE api_keys SET revoked_at = now()
-   WHERE (user_id = NEW.id OR created_by = NEW.id) AND revoked_at IS NULL;
+  WITH revoked AS (
+    UPDATE api_keys SET revoked_at = now()
+     WHERE (user_id = NEW.id OR created_by = NEW.id) AND revoked_at IS NULL
+    RETURNING id, workspace_id
+  )
+  INSERT INTO audit_events (workspace_id, action, target_kind, target_id, data)
+  SELECT workspace_id, 'api-key.revoke-cascade', 'user', NEW.id,
+         jsonb_build_object('cause', 'password_change', 'key_ids', jsonb_agg(id))
+    FROM revoked
+   GROUP BY workspace_id;
   RETURN NULL;
 END;
 $$;
@@ -125,16 +139,32 @@ CREATE OR REPLACE FUNCTION workspace_members_revoke_api_keys() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
   IF TG_OP = 'DELETE' THEN
-    UPDATE api_keys SET revoked_at = now()
-     WHERE workspace_id = OLD.workspace_id
-       AND (user_id = OLD.user_id OR created_by = OLD.user_id)
-       AND revoked_at IS NULL;
+    WITH revoked AS (
+      UPDATE api_keys SET revoked_at = now()
+       WHERE workspace_id = OLD.workspace_id
+         AND (user_id = OLD.user_id OR created_by = OLD.user_id)
+         AND revoked_at IS NULL
+      RETURNING id
+    )
+    INSERT INTO audit_events (workspace_id, action, target_kind, target_id, data)
+    SELECT OLD.workspace_id, 'api-key.revoke-cascade', 'user', OLD.user_id,
+           jsonb_build_object('cause', 'member_removed', 'key_ids', jsonb_agg(id))
+      FROM revoked
+    HAVING count(*) > 0;
   ELSIF OLD.role = 'owner' AND NEW.role <> 'owner' THEN
-    UPDATE api_keys SET revoked_at = now()
-     WHERE workspace_id = OLD.workspace_id
-       AND created_by = OLD.user_id
-       AND user_id <> OLD.user_id
-       AND revoked_at IS NULL;
+    WITH revoked AS (
+      UPDATE api_keys SET revoked_at = now()
+       WHERE workspace_id = OLD.workspace_id
+         AND created_by = OLD.user_id
+         AND user_id <> OLD.user_id
+         AND revoked_at IS NULL
+      RETURNING id
+    )
+    INSERT INTO audit_events (workspace_id, action, target_kind, target_id, data)
+    SELECT OLD.workspace_id, 'api-key.revoke-cascade', 'user', OLD.user_id,
+           jsonb_build_object('cause', 'owner_demoted', 'key_ids', jsonb_agg(id))
+      FROM revoked
+    HAVING count(*) > 0;
   END IF;
   RETURN NULL;
 END;

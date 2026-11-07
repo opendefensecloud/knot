@@ -218,9 +218,14 @@ export default function MembersPage() {
                     {isOwner ? (
                       <select
                         value={m.role}
-                        onChange={(e) =>
-                          setRole.mutate({ userId: m.user_id, role: e.target.value as typeof inviteRole })
-                        }
+                        onChange={(e) => {
+                          const role = e.target.value as typeof inviteRole;
+                          if (m.role === "owner" && role !== "owner") {
+                            const question = `Change ${m.email} from owner to ${role}? Any bot keys they created stop working.`;
+                            if (!window.confirm(question)) return;
+                          }
+                          setRole.mutate({ userId: m.user_id, role });
+                        }}
                         className={selectCls}
                       >
                         <option value="viewer">Viewer</option>
@@ -245,7 +250,7 @@ export default function MembersPage() {
                       )}
                       <button
                         onClick={() => {
-                          const question = `Remove ${m.email}? They also lose every page-level grant, including access to restricted pages.`;
+                          const question = `Remove ${m.email}? They also lose every page-level grant, including access to restricted pages. Their API keys and any bot keys they created stop working.`;
                           if (window.confirm(question)) remove.mutate(m.user_id);
                         }}
                         className="h-8 px-2.5 rounded text-destructive text-[13px] font-medium hover:bg-destructive/10 transition-colors"
