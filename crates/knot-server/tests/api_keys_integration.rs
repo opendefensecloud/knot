@@ -1404,6 +1404,37 @@ async fn removed_member_key_is_inert() {
     assert_eq!(body["error"]["code"], "api_key.invalid", "{body}");
 }
 
+/// S5: a bot key the session minted before the password change must die with
+/// it, or a stolen owner session outlives the reset it provoked.
+#[tokio::test(flavor = "multi_thread")]
+async fn password_change_revokes_bot_keys_the_user_minted() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let bot = invite_bot(&app, &s, &state, "ci-bot@example.com").await;
+    let (st, created) = send(
+        &app,
+        &s,
+        "POST",
+        "/api/auth/api-keys",
+        Some(serde_json::json!({"name": "bot", "scopes": ["read"], "user_id": bot})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{created}");
+    let bot_key = created["key"].as_str().unwrap();
+    let (st, _) = guards_bearer(&app, bot_key, "GET", "/api/docs", None).await;
+    assert_eq!(st, StatusCode::OK);
+
+    assert_eq!(
+        change_password(&app, &s, "ownerpass1", "newpass999").await,
+        StatusCode::NO_CONTENT
+    );
+
+    let (st, body) = guards_bearer(&app, bot_key, "GET", "/api/docs", None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["code"], "api_key.invalid", "{body}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn csrf_does_not_apply_to_api_keys() {
     let state = state_with_owner("owner@example.com", "ownerpass1").await;

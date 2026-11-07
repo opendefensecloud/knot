@@ -41,14 +41,16 @@ CREATE INDEX api_keys_user_live_idx ON api_keys (user_id) WHERE revoked_at IS NU
 -- Trigger functions
 -- ---------------------------------------------------------------------
 
--- S5: a password change revokes all of the user's live keys. Lives in the DB
--- so every change of the password hash (the app, or a direct database
--- update) is covered.
+-- S5: a password change revokes all of the user's live keys, and the bot keys
+-- that user minted: a stolen session that minted a bot key before the owner
+-- reset the password must not outlive the reset. Lives in the DB so every
+-- change of the password hash (the app, or a direct database update) is
+-- covered.
 CREATE OR REPLACE FUNCTION users_revoke_api_keys_on_password_change() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
   UPDATE api_keys SET revoked_at = now()
-   WHERE user_id = NEW.id AND revoked_at IS NULL;
+   WHERE (user_id = NEW.id OR created_by = NEW.id) AND revoked_at IS NULL;
   RETURN NULL;
 END;
 $$;

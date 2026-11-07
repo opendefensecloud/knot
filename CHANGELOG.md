@@ -57,8 +57,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - Keys of single-sign-on users are capped at 90 days, by the server and
   by a database check.
 - Any change of a user's password hash (in the app, or a direct database
-  update) revokes all of that user's keys (a database trigger). Removing
-  a member revokes their keys, so re-inviting them brings none back, and
+  update) revokes all of that user's keys, and the bot keys that user
+  minted, so a stolen session can't leave a bot key behind before the
+  owner resets the password (a database trigger). Removing a member
+  revokes their keys, so re-inviting them brings none back, and
   revokes the bot keys they minted; an owner who loses the owner role
   loses the bot keys they minted too (database triggers).
 - A bot can't sign in through single sign-on, even when an identity

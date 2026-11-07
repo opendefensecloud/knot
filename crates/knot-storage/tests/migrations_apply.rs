@@ -1692,6 +1692,9 @@ async fn password_change_revokes_api_keys() {
     let live = insert_key(&pool, ws, user, user, "NULL").await.unwrap();
     let old_revoked = insert_key(&pool, ws, user, user, "NULL").await.unwrap();
     let others = insert_key(&pool, ws, other, other, "NULL").await.unwrap();
+    // A bot key `user` minted: a stolen session must not leave it behind.
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    let minted = insert_key(&pool, ws, bot, user, "NULL").await.unwrap();
     let past: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("UPDATE api_keys SET revoked_at = '2020-01-01T00:00:00Z' WHERE id = $1 RETURNING revoked_at")
             .bind(old_revoked)
@@ -1708,6 +1711,10 @@ async fn password_change_revokes_api_keys() {
     assert!(
         revoked_at(&pool, live).await.is_some(),
         "S5 broken: password change left the user's key live"
+    );
+    assert!(
+        revoked_at(&pool, minted).await.is_some(),
+        "S5 broken: password change left a bot key the user minted live"
     );
     assert_eq!(
         revoked_at(&pool, old_revoked).await,

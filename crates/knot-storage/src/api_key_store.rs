@@ -393,6 +393,7 @@ impl ApiKeyStore for PgApiKeyStore {
         sqlx::query(
             "UPDATE api_keys SET last_used_at = now()
              WHERE id = $1
+               AND revoked_at IS NULL
                AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')",
         )
         .bind(key_id)
