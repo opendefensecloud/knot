@@ -30,4 +30,7 @@ pub use registry::{AcquireError, Rooms};
 pub use room::{ConnHandle, ConnId, Event, InMsg, JoinState, Room, RoomHandle};
 pub use snapshot::{SnapshotPolicy, SnapshotState};
 pub use suggestions::{ApplySuggestionError, ApplySuggestionRequest, SuggestionKind};
-pub use writer::{Applied, PersistJob};
+pub use writer::{Applied, PersistJob, WriterDone, WriterEvent, WriterLimits};
+
+#[cfg(test)]
+mod test_metrics;

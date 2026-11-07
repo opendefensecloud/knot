@@ -186,7 +186,7 @@ pub struct Room {
     bus_updates_rx: mpsc::Receiver<i64>,
     bus_presence_rx: mpsc::Receiver<Vec<u8>>,
     persist_tx: mpsc::Sender<crate::writer::PersistJob>,
-    applied_rx: mpsc::Receiver<crate::writer::Applied>,
+    writer_events: mpsc::UnboundedReceiver<crate::writer::WriterEvent>,
     snapshots: Arc<dyn knot_storage::SnapshotStore>,
     updates_store: Arc<dyn knot_storage::UpdatesStore>,
     policy: crate::snapshot::SnapshotPolicy,
@@ -203,16 +203,17 @@ pub struct Room {
     /// the next join reloads the page from storage, which never got the
     /// refused update. Also set when the room evicts itself over an applied
     /// suggestion it could not persist (`Room::evict_unpersisted`), so no
-    /// snapshot carries that unpersisted marker to storage.
+    /// snapshot carries that unpersisted marker to storage, and when its
+    /// writer sends a Fatal (`Room::evict`).
     evicted: bool,
 }
 
 pub struct RoomHandle {
     pub tx: mpsc::Sender<Event>,
     /// The room's lifetime. Cancel it to stop the room. The room cancels it
-    /// itself when it evicts itself (`Room::refuse_applied`, or
+    /// itself when it evicts itself (`Room::refuse_applied`,
     /// `Room::evict_unpersisted` for an applied suggestion it could not
-    /// persist), and its actor
+    /// persist, or `Room::evict` on a writer Fatal), and its actor
     /// cancels it whenever it ends, panics included. Once it is cancelled the
     /// registry treats the room as gone and boots a fresh one on the next
     /// join, and every WS shim of the room, which watches it, closes its
@@ -224,6 +225,9 @@ pub struct RoomHandle {
     /// so every socket closes with 4403 and its client leaves the page,
     /// rather than with 1012 and a reconnect to a page that is gone.
     pub revoked: CancellationToken,
+    /// Resolves once the room's writer has written what it holds and ended,
+    /// which can be after the room itself ended.
+    pub writer_done: crate::writer::WriterDone,
 }
 
 impl Room {
@@ -265,13 +269,15 @@ impl Room {
         let shutdown = CancellationToken::new();
 
         let (persist_tx, persist_rx) = mpsc::channel::<crate::writer::PersistJob>(1024);
-        let (applied_tx, applied_rx) = mpsc::channel::<crate::writer::Applied>(256);
-        crate::writer::spawn(
+        let (events_tx, writer_events) = mpsc::unbounded_channel();
+        let writer_done = crate::writer::spawn(
             doc_id,
+            0,
             updates_store.clone(),
             bus.clone(),
             persist_rx,
-            applied_tx,
+            events_tx,
+            crate::writer::WriterLimits::default(),
         );
 
         let snap_state = crate::snapshot::SnapshotState {
@@ -292,7 +298,7 @@ impl Room {
             bus_updates_rx: subscription.updates,
             bus_presence_rx: subscription.presence,
             persist_tx,
-            applied_rx,
+            writer_events,
             snapshots,
             updates_store,
             policy,
@@ -305,6 +311,7 @@ impl Room {
             tx,
             shutdown,
             revoked: CancellationToken::new(),
+            writer_done,
         })
     }
 
@@ -395,6 +402,8 @@ impl Room {
                         let _ = self.persist_tx.send(crate::writer::PersistJob {
                             bytes: update_bytes.clone(),
                             by_user_id: by_user,
+                            source: knot_storage::UpdateSource::Edit,
+                            meta: None,
                             persisted: Some(persisted_tx),
                         }).await;
                         // Local fan-out (slow-consumer eviction).
@@ -484,6 +493,8 @@ impl Room {
                         let _ = self.persist_tx.send(crate::writer::PersistJob {
                             bytes: effective_bytes.clone(),
                             by_user_id: by_user,
+                            source: knot_storage::UpdateSource::Edit,
+                            meta: None,
                             persisted: Some(persisted_tx),
                         }).await;
                         // Fan out the replace to local connections.
@@ -547,6 +558,8 @@ impl Room {
                         let _ = self.persist_tx.send(crate::writer::PersistJob {
                             bytes: update_bytes.clone(),
                             by_user_id: by_user,
+                            source: knot_storage::UpdateSource::Edit,
+                            meta: None,
                             persisted: Some(persisted_tx),
                         }).await;
                         let framed = wrap_sync_update(&update_bytes);
@@ -619,6 +632,8 @@ impl Room {
                         let _ = self.persist_tx.send(crate::writer::PersistJob {
                             bytes: update_bytes.clone(),
                             by_user_id: by_user,
+                            source: knot_storage::UpdateSource::Edit,
+                            meta: None,
                             persisted: Some(persisted_tx),
                         }).await;
                         // Persist BEFORE the fan-out: a client that got the
@@ -680,9 +695,16 @@ impl Room {
                     }
                     Some(Event::Shutdown) | None => break,
                 },
-                Some(applied) = self.applied_rx.recv() => {
-                    if applied.seq > self.last_applied_seq {
-                        self.last_applied_seq = applied.seq;
+                Some(event) = self.writer_events.recv() => {
+                    let seq = match event {
+                        crate::writer::WriterEvent::Applied(crate::writer::Applied { seq, .. }) => seq,
+                        crate::writer::WriterEvent::Fatal(reason) => {
+                            self.evict(format_args!("writer: {reason}"));
+                            continue;
+                        }
+                    };
+                    if seq > self.last_applied_seq {
+                        self.last_applied_seq = seq;
                     }
                     self.snap_state.updates_since_snapshot += 1;
                     self.snap_state.last_apply_at = std::time::Instant::now();
@@ -724,9 +746,10 @@ impl Room {
 
         // Final flush: write a snapshot at the current seq so the next boot
         // is cheap. Best-effort. Skipped when the room evicted itself over a
-        // refused update (`refuse_applied`) or an unpersisted suggestion
-        // apply (`evict_unpersisted`): the live doc holds that content, and a
-        // snapshot of it would be the one thing that persisted it.
+        // refused update (`refuse_applied`), an unpersisted suggestion
+        // apply (`evict_unpersisted`) or a writer Fatal (`evict`): the live
+        // doc holds that content, and a snapshot of it would be the one
+        // thing that persisted it.
         if !self.evicted {
             let _ = crate::snapshot::write_snapshot(
                 self.doc_id,
@@ -917,6 +940,8 @@ impl Room {
             .send(crate::writer::PersistJob {
                 bytes: m.bytes,
                 by_user_id: m.by_user,
+                source: knot_storage::UpdateSource::Edit,
+                meta: None,
                 // Inbound WS updates are fire-and-forget — the client
                 // already has the update locally, so we don't need to
                 // hold up acknowledgement on the durable insert.
@@ -980,11 +1005,16 @@ impl Room {
     /// client holds it to push back in its resync: the change is gone with
     /// the room.
     fn evict_unpersisted(&mut self, suggestion_id: Uuid) {
-        tracing::warn!(
-            doc_id = %self.doc_id,
-            %suggestion_id,
-            "could not persist an applied suggestion; evicting the room"
-        );
+        self.evict(format_args!(
+            "could not persist applied suggestion {suggestion_id}"
+        ));
+    }
+
+    /// Evict the room: it ends without its final snapshot (`evicted`), and
+    /// every connection is closed through the room's token, so clients
+    /// reconnect to a room reloaded from storage and resend their edits.
+    fn evict(&mut self, why: std::fmt::Arguments) {
+        tracing::warn!(doc_id = %self.doc_id, "{why}; evicting the room");
         metrics::counter!("knot_room_evicted_total").increment(1);
         self.evicted = true;
         self.shutdown.cancel();
@@ -2432,8 +2462,24 @@ pub(crate) mod tests {
     }
 
     /// An updates store whose writes always fail, permanently (so a writer
-    /// gives up at once instead of retrying).
+    /// gives up at once instead of retrying), and whose log holds the seed
+    /// paragraph ([`SEED_TEXT`]) as its one row, seq 1 and rev 1.
     struct FailingUpdates;
+    impl FailingUpdates {
+        fn seed_row() -> knot_storage::DocUpdate {
+            knot_storage::DocUpdate {
+                seq: 1,
+                doc_id: Uuid::nil(),
+                update_bytes: seed_paragraph(SEED_TEXT),
+                by_user_id: None,
+                created_at: sqlx::types::chrono::Utc::now(),
+                rev: Some(1),
+                source: Some(knot_storage::UpdateSource::Edit),
+                meta: None,
+                epoch: Some(0),
+            }
+        }
+    }
     #[async_trait::async_trait]
     impl knot_storage::UpdatesStore for FailingUpdates {
         async fn append(
@@ -2450,15 +2496,24 @@ pub(crate) mod tests {
         async fn rows_after(
             &self,
             _: Uuid,
-            _: knot_storage::RowsAfter,
+            from: knot_storage::RowsAfter,
         ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
-            Ok(vec![])
+            let after = match from {
+                knot_storage::RowsAfter::All => 0,
+                knot_storage::RowsAfter::Rev(r) => r,
+            };
+            Ok(std::iter::once(Self::seed_row())
+                .filter(|u| u.rev.is_some_and(|rev| rev > after))
+                .collect())
         }
         async fn head(
             &self,
             _: Uuid,
         ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
-            Ok(knot_storage::HistoryHead::default())
+            Ok(knot_storage::HistoryHead {
+                head_rev: 1,
+                ..Default::default()
+            })
         }
         async fn ensure_legacy_numbered(
             &self,
@@ -2469,12 +2524,14 @@ pub(crate) mod tests {
         async fn since(
             &self,
             _: Uuid,
-            _: i64,
+            after_seq: i64,
         ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
-            Ok(vec![])
+            Ok(std::iter::once(Self::seed_row())
+                .filter(|u| u.seq > after_seq)
+                .collect())
         }
         async fn max_seq(&self, _: Uuid) -> Result<i64, knot_storage::UpdatesStoreError> {
-            Ok(0)
+            Ok(1)
         }
     }
 
@@ -2534,20 +2591,10 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn persist_failure_evicts_room() {
         let snapshots = Arc::new(CountingSnapshots::default());
+        // The room boots the seed paragraph from the store's log.
         let h =
             spawn_suggestion_room_with(Uuid::new_v4(), Arc::new(FailingUpdates), snapshots.clone())
                 .await;
-        // The seed's own persist fails too; the live doc holds it anyway.
-        let (tx, rx) = oneshot::channel();
-        h.tx.send(Event::ApplyUpdate {
-            update_bytes: seed_paragraph(SEED_TEXT),
-            by_user: None,
-            reply: tx,
-        })
-        .await
-        .unwrap();
-        assert!(rx.await.unwrap().is_err());
-        assert!(!h.shutdown.is_cancelled());
         let (_conn, mut conn_rx) = join(&h).await;
         while conn_rx.try_recv().is_ok() {}
 
@@ -2579,6 +2626,49 @@ pub(crate) mod tests {
             fanned_out.is_empty(),
             "a connection got the unpersisted apply: {fanned_out:?}"
         );
+    }
+
+    /// A WS edit the store refuses for good evicts the room through its
+    /// writer's Fatal, and the evicted room writes no final snapshot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_writer_fatal_evicts_the_room() {
+        let snapshots = Arc::new(CountingSnapshots::default());
+        let h =
+            spawn_suggestion_room_with(Uuid::new_v4(), Arc::new(FailingUpdates), snapshots.clone())
+                .await;
+        let (conn, _conn_rx) = join(&h).await;
+        let edit = {
+            use yrs::{ReadTxn, Text, Transact};
+            let other = yrs::Doc::new();
+            other
+                .get_or_insert_text("t")
+                .push(&mut other.transact_mut(), "hello");
+            other
+                .transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        h.tx.send(Event::Inbound(InMsg {
+            from: conn,
+            by_user: None,
+            bytes: edit,
+        }))
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.shutdown.cancelled())
+            .await
+            .expect("the writer's Fatal did not evict the room");
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.tx.closed())
+            .await
+            .expect("the evicted room's actor did not end");
+        assert_eq!(
+            snapshots.inserts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the evicted room wrote a final snapshot"
+        );
+        let mut done = h.writer_done.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(10), done.wait())
+            .await
+            .expect("the writer did not end after its permanent error");
     }
 
     /// An updates store that takes every write and whose catch-up reads

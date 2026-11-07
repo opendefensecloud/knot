@@ -2027,6 +2027,7 @@ dependencies = [
  "knot-test-support",
  "metrics",
  "rustls",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.20",
  "tokio",
