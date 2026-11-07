@@ -770,6 +770,87 @@ async fn an_evicted_room_is_rebooted_on_the_next_acquire_and_keeps_serving() {
     second.shutdown.cancel();
 }
 
+/// A server-side `ApplyUpdate` that nests the page past the limit is
+/// refused after it was applied, as an inbound one is (`refuse_applied`):
+/// nothing of it is persisted or fanned out, the caller gets `Err`, and the
+/// room evicts itself without a snapshot, so the next acquire boots a room
+/// from storage, which never got the chain (review round 4).
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_update_too_deep_is_refused_and_evicts() {
+    let persisted = Arc::new(Mutex::new(Vec::new()));
+    let snapshots = RecordingSnapshots::default();
+    let written = snapshots.written.clone();
+    let rooms = Rooms::new(
+        Arc::new(YrsEngine),
+        Arc::new(MemBus::new()),
+        Arc::new(CapturingUpdates {
+            persisted: persisted.clone(),
+        }),
+        Arc::new(snapshots),
+        SnapshotPolicy {
+            every_n: 1000,
+            idle: Duration::from_secs(3600),
+        },
+        Duration::from_secs(300),
+    );
+    let doc_id = Uuid::new_v4();
+    let first = rooms.acquire(doc_id).await.unwrap();
+    let (_conn, mut conn_rx, _) = join(&first).await;
+
+    let (reply, answered) = oneshot::channel();
+    first
+        .tx
+        .send(Event::ApplyUpdate {
+            update_bytes: chain_update(MAX_NESTING + 1),
+            by_user: None,
+            source: knot_storage::UpdateSource::Import,
+            meta: None,
+            reply,
+        })
+        .await
+        .unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(10), answered)
+        .await
+        .expect("the room never answered")
+        .expect("the room dropped the reply");
+    assert!(
+        answer.is_err(),
+        "a too-deep update was accepted: {answer:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(10), first.shutdown.cancelled())
+        .await
+        .expect("the room did not evict itself");
+    tokio::time::timeout(Duration::from_secs(10), first.tx.closed())
+        .await
+        .expect("the evicted room did not stop");
+    assert!(
+        persisted.lock().unwrap().is_empty(),
+        "the refused update was persisted"
+    );
+    assert!(
+        matches!(
+            conn_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty) | Err(mpsc::error::TryRecvError::Disconnected)
+        ),
+        "the refused update was fanned out"
+    );
+    assert!(
+        written.lock().unwrap().is_empty(),
+        "the evicted room snapshotted a doc holding the refused update"
+    );
+
+    let second = rooms.acquire(doc_id).await.unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    let (reply, st) = oneshot::channel();
+    second.tx.send(Event::ExportState(reply)).await.unwrap();
+    let (bytes, _) = st.await.unwrap().unwrap();
+    assert!(
+        !on_worker_stack(move || nests_deeper_than(&page(&[&bytes]), MAX_NESTING)),
+        "the rebooted room holds the refused chain"
+    );
+    second.shutdown.cancel();
+}
+
 /// Dropping a doc 100,000 types deep does not recurse: yrs holds items flat
 /// in the block store, and neither `Branch` nor `Item` has a custom `Drop`.
 /// The room relies on this when it evicts itself (drops the deep doc) over a

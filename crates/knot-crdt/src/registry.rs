@@ -801,6 +801,8 @@ mod tests {
             .send(crate::room::Event::ApplyUpdate {
                 update_bytes: para(12, "toggled"),
                 by_user: None,
+                source: knot_storage::UpdateSource::Edit,
+                meta: None,
                 reply: reply_tx,
             })
             .await

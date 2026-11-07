@@ -296,6 +296,8 @@ impl World {
             .send(knot_crdt::Event::ReplaceWithMarkdown {
                 update_bytes,
                 by_user: Some(self.owner.user_id),
+                source: knot_storage::UpdateSource::Import,
+                meta: None,
                 reply,
             })
             .await

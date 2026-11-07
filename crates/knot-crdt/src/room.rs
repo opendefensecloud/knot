@@ -8,6 +8,12 @@
 //!   effective update, or the raw bytes when content is pending:
 //!   [`crate::engine::ApplyMeasured`]) is handed to the writer
 //!   ([`crate::writer`]) and only then fanned out, those same bytes.
+//! - **Server-side edits** (`ApplyUpdate`, `ReplaceWithMarkdown`,
+//!   `PatchTaskChecked`, `ApplySuggestion`) are tagged with what made them
+//!   (`source`, `meta`), and the room waits until the writer has stored one
+//!   before it fans it out and replies. One that is not stored, or that
+//!   fails after it began to change the doc, reaches no client and evicts
+//!   the room.
 //! - **The writer** reports where each row landed (`WriterEvent::Applied`,
 //!   with its rev). An own rev right after the watermark advances it; one
 //!   past it means rows of other replicas committed in between, and the room
@@ -125,16 +131,34 @@ pub enum Event {
     /// Opaque bytes — the room does not interpret them.
     ServerFrame(Vec<u8>),
     ExportState(oneshot::Sender<Result<(Vec<u8>, i64), EngineError>>),
+    /// Apply a server-side update (a Markdown import in append mode, a page
+    /// created from a template, a test's seed) to the live doc. What the
+    /// apply changed (`ApplyMeasured::persist`) is persisted as one row
+    /// tagged `source` and `meta`, and fanned out only once the writer has
+    /// stored it; `reply` then carries its seq. An update that changes
+    /// nothing persists nothing and replies `Ok` with the room's seq. An
+    /// update that does not decode replies `Err` and changes nothing. One
+    /// that yrs rejects part-way, or that nests the page too deep, or whose
+    /// persist fails, replies `Err` and evicts the room, which then holds
+    /// content no row carries.
     ApplyUpdate {
         update_bytes: Vec<u8>,
         by_user: Option<Uuid>,
+        /// What made the edit (`doc_updates.source`).
+        source: knot_storage::UpdateSource,
+        /// Ids, timestamps and page titles only; never page text or names.
+        meta: Option<serde_json::Value>,
         reply: oneshot::Sender<Result<i64, EngineError>>,
     },
     /// Replace the entire document content with the given pre-parsed update bytes.
-    /// Clears the live doc's "default" XmlFragment then applies the update,
-    /// all in a single Yrs transaction. Persists + fans out via the writer,
-    /// same as `ApplyUpdate`. The caller is responsible for converting markdown
-    /// to update bytes (e.g. via `knot_markdown::from_markdown::parse`).
+    /// The bytes are decoded first; then the live doc's "default"
+    /// XmlFragment is cleared and the update applied, in a single Yrs
+    /// transaction, whose own update is persisted as one row tagged `source`
+    /// and `meta` and fanned out only once the writer has stored it. Bytes
+    /// that do not decode reply `Err` and leave the doc untouched; an apply
+    /// error after the clear, a transaction that produced no update, or a
+    /// failed persist replies `Err` and evicts the room. The caller is responsible for converting markdown to update
+    /// bytes (e.g. via `knot_markdown::from_markdown::parse`).
     ReplaceWithMarkdown {
         /// Full-state update bytes encoding the replacement content.
         update_bytes: Vec<u8>,
@@ -142,6 +166,10 @@ pub enum Event {
         /// the importer / restorer, credited as a contributor. `None` only
         /// where there is no meaningful actor (tests).
         by_user: Option<Uuid>,
+        /// What made the edit (`doc_updates.source`): `Import` or `Restore`.
+        source: knot_storage::UpdateSource,
+        /// Ids, timestamps and page titles only; never page text or names.
+        meta: Option<serde_json::Value>,
         reply: oneshot::Sender<Result<i64, String>>,
     },
     /// Flip the `checked` attribute on the Nth task `list_item` in the doc.
@@ -149,7 +177,8 @@ pub enum Event {
     /// document order ([`crate::tasks::task_items`]) — the index
     /// `knot_markdown::tasks::extract_tasks_from_doc` lists. The mutation
     /// happens directly on the live doc; the resulting update is persisted
-    /// and fanned out via the same pipeline as `ApplyUpdate`.
+    /// as a `task` row and fanned out only once the writer has stored it. A
+    /// failed persist replies `Err` and evicts the room.
     PatchTaskChecked {
         item_index: i32,
         checked: bool,
@@ -172,6 +201,9 @@ pub enum Event {
         /// Attribution for the persisted update: the suggester, who wrote
         /// the words, not the accepting owner.
         by_user: Option<Uuid>,
+        /// The owner who accepted it, recorded in the row's `meta` as
+        /// `accepted_by`, beside the `suggestion_id`.
+        accepted_by: Uuid,
         reply: oneshot::Sender<Result<i64, crate::suggestions::ApplySuggestionError>>,
     },
     /// Whether the doc records `suggestion_id` as applied under the claim's
@@ -254,20 +286,21 @@ pub struct Room {
     /// whether yrs applied all of it or rejected the rest. The live doc then
     /// holds the refused content, so the final flush must NOT snapshot it:
     /// the next join reloads the page from storage, which never got the
-    /// refused update. Also set when the room evicts itself over an applied
-    /// suggestion it could not persist (`Room::evict_unpersisted`), so no
-    /// snapshot carries that unpersisted marker to storage, when its
-    /// writer sends a Fatal or closes its channel (`Room::evict`), and when
-    /// a snapshot write finds the page's epoch changed or the page gone.
+    /// refused update. Also set (`Room::evict`) when a server-side edit the
+    /// doc holds was not persisted, or failed after it began to change the
+    /// doc (`Room::persist_server_edit`; for an applied suggestion, so no
+    /// snapshot carries that unpersisted marker to storage), when its writer
+    /// sends a Fatal or closes its channel, and when a snapshot write finds
+    /// the page's epoch changed or the page gone.
     evicted: bool,
 }
 
 pub struct RoomHandle {
     pub tx: mpsc::Sender<Event>,
     /// The room's lifetime. Cancel it to stop the room. The room cancels it
-    /// itself when it evicts itself (`Room::refuse_applied`,
-    /// `Room::evict_unpersisted` for an applied suggestion it could not
-    /// persist, or `Room::evict` on a writer Fatal), and its actor
+    /// itself when it evicts itself (`Room::refuse_applied`, or
+    /// `Room::evict` for a server-side edit it could not persist or on a
+    /// writer Fatal), and its actor
     /// cancels it whenever it ends, panics included. Once it is cancelled the
     /// registry treats the room as gone and boots a fresh one on the next
     /// join, and every WS shim of the room, which watches it, closes its
@@ -547,50 +580,9 @@ impl Room {
                         for cid in to_close { self.conns.remove(&cid); }
                     }
                     Some(Event::BusUpdate(_)) | Some(Event::BusPresence(_)) => {}
-                    Some(Event::ApplyUpdate { update_bytes, by_user, reply }) => {
-                        // Apply to the live doc.
-                        if let Err(e) = self.engine.apply_update(&self.doc, &update_bytes) {
-                            let _ = reply.send(Err(e));
-                            continue;
-                        }
-                        metrics::counter!("knot_room_updates_total", "source" => "local").increment(1);
-                        // Persist via the writer (backpressured). Wait for
-                        // the durable-insert confirmation before replying so
-                        // a crash between reply and persist doesn't lose the
-                        // update.
-                        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
-                        if !self.persist(PersistJob {
-                            bytes: update_bytes.clone(),
-                            by_user_id: by_user,
-                            source: knot_storage::UpdateSource::Edit,
-                            meta: None,
-                            persisted: Some(persisted_tx),
-                        }).await {
-                            let _ = reply.send(Err(EngineError::Apply("persist channel closed".into())));
-                            continue;
-                        }
-                        // Local fan-out (slow-consumer eviction).
-                        let framed = wrap_sync_update(&update_bytes);
-                        let mut to_close: Vec<ConnId> = Vec::new();
-                        for (cid, conn) in &self.conns {
-                            match conn.tx.try_send(framed.clone()) {
-                                Ok(_) => {}
-                                Err(_) => to_close.push(*cid),
-                            }
-                        }
-                        for cid in to_close { self.conns.remove(&cid); }
-                        let final_seq = match persisted_rx.await {
-                            Ok(Ok(seq)) => seq,
-                            Ok(Err(e)) => {
-                                let _ = reply.send(Err(EngineError::Apply(format!("persist: {e}"))));
-                                continue;
-                            }
-                            Err(_) => {
-                                let _ = reply.send(Err(EngineError::Apply("persist channel closed".into())));
-                                continue;
-                            }
-                        };
-                        let _ = reply.send(Ok(final_seq));
+                    Some(Event::ApplyUpdate { update_bytes, by_user, source, meta, reply }) => {
+                        let result = self.on_apply_update(update_bytes, by_user, source, meta).await;
+                        let _ = reply.send(result);
                     }
                     Some(Event::ExportState(reply)) => {
                         let r = self.engine
@@ -598,244 +590,17 @@ impl Room {
                             .map(|bytes| (bytes, self.last_applied_seq));
                         let _ = reply.send(r);
                     }
-                    Some(Event::ReplaceWithMarkdown { update_bytes, by_user, reply }) => {
-                        // In a single transaction on the live doc:
-                        //   1. Clear the existing "default" XmlFragment content.
-                        //   2. Apply the pre-parsed update bytes.
-                        use std::sync::{Arc, Mutex};
-                        use yrs::{Transact, Update, XmlFragment, updates::decoder::Decode};
-
-                        // Get (or create) the fragment reference BEFORE opening the
-                        // mutable transaction, because get_or_insert_xml_fragment
-                        // internally acquires its own write lock. Calling it while
-                        // a TransactionMut is active would deadlock (write_blocking).
-                        let frag = self.doc.inner().get_or_insert_xml_fragment("default");
-
-                        // Capture what the transaction ACTUALLY produces rather than
-                        // reusing `update_bytes`. The clear and the apply happen
-                        // together, but `update_bytes` encodes only the insertion —
-                        // persisting and fanning that out ships the insert without the
-                        // delete, so every peer MERGES the restored content into what
-                        // it already had instead of replacing it, yielding
-                        // "<old text><restored text>". Same capture pattern as
-                        // PatchTaskChecked below.
-                        let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-                        let captured_clone = captured.clone();
-                        let sub = self.doc.inner().observe_update_v1(move |_txn, e| {
-                            *captured_clone.lock().unwrap() = Some(e.update.clone());
-                        });
-                        let replace_result = {
-                            let mut txn = self.doc.inner().transact_mut();
-                            let len = frag.len(&txn);
-                            if len > 0 {
-                                frag.remove_range(&mut txn, 0, len);
-                            }
-                            Update::decode_v1(&update_bytes)
-                                .map_err(|e| format!("decode: {e}"))
-                                .and_then(|upd| {
-                                    txn.apply_update(upd).map_err(|e| format!("apply: {e}"))
-                                })
-                        };
-                        // Dropping the subscription must happen AFTER the txn closes
-                        // (Drop on TransactionMut flushes the update notification).
-                        drop(sub);
-
-                        if let Err(e) = replace_result {
-                            let _ = reply.send(Err(e));
-                            continue;
-                        }
-                        // A restore always clears and re-inserts, so the transaction
-                        // cannot be a no-op the way a task-checkbox patch can be.
-                        let Some(effective_bytes) = captured.lock().unwrap().take() else {
-                            let _ = reply.send(Err("replace produced no update".into()));
-                            continue;
-                        };
-                        metrics::counter!("knot_room_updates_total", "source" => "restore").increment(1);
-                        // Persist via the writer (mirrors ApplyUpdate path).
-                        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
-                        if !self.persist(PersistJob {
-                            bytes: effective_bytes.clone(),
-                            by_user_id: by_user,
-                            source: knot_storage::UpdateSource::Edit,
-                            meta: None,
-                            persisted: Some(persisted_tx),
-                        }).await {
-                            let _ = reply.send(Err("persist channel closed".into()));
-                            continue;
-                        }
-                        // Fan out the replace to local connections.
-                        let framed = wrap_sync_update(&effective_bytes);
-                        let mut to_close: Vec<ConnId> = Vec::new();
-                        for (cid, conn) in &self.conns {
-                            match conn.tx.try_send(framed.clone()) {
-                                Ok(_) => {}
-                                Err(_) => to_close.push(*cid),
-                            }
-                        }
-                        for cid in to_close { self.conns.remove(&cid); }
-                        let final_seq = match persisted_rx.await {
-                            Ok(Ok(seq)) => seq,
-                            Ok(Err(e)) => {
-                                let _ = reply.send(Err(format!("persist: {e}")));
-                                continue;
-                            }
-                            Err(_) => {
-                                let _ = reply.send(Err("persist channel closed".into()));
-                                continue;
-                            }
-                        };
-                        let _ = reply.send(Ok(final_seq));
+                    Some(Event::ReplaceWithMarkdown { update_bytes, by_user, source, meta, reply }) => {
+                        let result = self.on_replace(update_bytes, by_user, source, meta).await;
+                        let _ = reply.send(result);
                     }
                     Some(Event::PatchTaskChecked { item_index, checked, by_user, reply }) => {
-                        use std::sync::{Arc, Mutex};
-                        use yrs::Transact;
-                        let frag = self.doc.inner().get_or_insert_xml_fragment("default");
-
-                        // Subscribe to the v1 update stream so we can capture
-                        // the bytes the mutation produces. We immediately
-                        // drop the subscription after the txn closes.
-                        let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-                        let captured_clone = captured.clone();
-                        let sub = self.doc.inner().observe_update_v1(move |_txn, e| {
-                            *captured_clone.lock().unwrap() = Some(e.update.clone());
-                        });
-                        let patch_result = {
-                            let mut txn = self.doc.inner().transact_mut();
-                            patch_task_checked(&frag, &mut txn, item_index, checked)
-                        };
-                        // Dropping the subscription must happen AFTER the
-                        // txn closes (Drop on TransactionMut flushes the
-                        // update notification).
-                        drop(sub);
-
-                        if let Err(e) = patch_result {
-                            let _ = reply.send(Err(e));
-                            continue;
-                        }
-                        let Some(update_bytes) = captured.lock().unwrap().take() else {
-                            // No update emitted means the attribute was
-                            // already set to the requested value — nothing
-                            // to do, treat as success.
-                            let _ = reply.send(Ok(self.last_applied_seq));
-                            continue;
-                        };
-                        metrics::counter!("knot_room_updates_total", "source" => "patch").increment(1);
-                        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
-                        if !self.persist(PersistJob {
-                            bytes: update_bytes.clone(),
-                            by_user_id: by_user,
-                            source: knot_storage::UpdateSource::Edit,
-                            meta: None,
-                            persisted: Some(persisted_tx),
-                        }).await {
-                            let _ = reply.send(Err("persist channel closed".into()));
-                            continue;
-                        }
-                        let framed = wrap_sync_update(&update_bytes);
-                        let mut to_close: Vec<ConnId> = Vec::new();
-                        for (cid, conn) in &self.conns {
-                            match conn.tx.try_send(framed.clone()) {
-                                Ok(_) => {}
-                                Err(_) => to_close.push(*cid),
-                            }
-                        }
-                        for cid in to_close { self.conns.remove(&cid); }
-                        let final_seq = match persisted_rx.await {
-                            Ok(Ok(seq)) => seq,
-                            Ok(Err(e)) => {
-                                let _ = reply.send(Err(format!("persist: {e}")));
-                                continue;
-                            }
-                            Err(_) => {
-                                let _ = reply.send(Err("persist channel closed".into()));
-                                continue;
-                            }
-                        };
-                        let _ = reply.send(Ok(final_seq));
+                        let result = self.on_patch_task(item_index, checked, by_user).await;
+                        let _ = reply.send(result);
                     }
-                    Some(Event::ApplySuggestion { request, by_user, reply }) => {
-                        use crate::suggestions::{APPLIED_MAP, ApplySuggestionError, apply_suggestion};
-                        use std::sync::{Arc, Mutex};
-                        use yrs::Transact;
-                        // Catch up first: the anchored text may come from an
-                        // edit another replica persisted that this room's
-                        // bus hasn't delivered yet. A failed read, or one
-                        // that stopped at a rev gap, is let through: at worst it costs a spurious `AnchorLost`
-                        // or `Changed`, which writes nothing.
-                        let _ = self.catch_up().await;
-                        // Both roots BEFORE the mutable transaction (see
-                        // ReplaceWithMarkdown: they take their own write lock).
-                        let _frag = self.doc.inner().get_or_insert_xml_fragment("default");
-                        let applied = self.doc.inner().get_or_insert_map(APPLIED_MAP);
-
-                        let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-                        let captured_clone = captured.clone();
-                        let sub = self.doc.inner().observe_update_v1(move |_txn, e| {
-                            *captured_clone.lock().unwrap() = Some(e.update.clone());
-                        });
-                        let apply_result = {
-                            let mut txn = self.doc.inner().transact_mut();
-                            apply_suggestion(&applied, &mut txn, &request)
-                        };
-                        // Dropping the subscription must happen AFTER the
-                        // txn closes (Drop on TransactionMut flushes the
-                        // update notification).
-                        drop(sub);
-
-                        if let Err(e) = apply_result {
-                            // Every check runs before the first mutation, so
-                            // a refusal left the doc as it was.
-                            let _ = reply.send(Err(e));
-                            continue;
-                        }
-                        // An apply always records its marker, so it can't be
-                        // a no-op; if nothing was captured, the doc holds a
-                        // change we can't persist.
-                        let Some(update_bytes) = captured.lock().unwrap().take() else {
-                            let _ = reply.send(Err(ApplySuggestionError::Persist("no update".into())));
-                            self.evict_unpersisted(request.suggestion_id);
-                            continue;
-                        };
-                        metrics::counter!("knot_room_updates_total", "source" => "suggestion").increment(1);
-                        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
-                        if !self.persist(PersistJob {
-                            bytes: update_bytes.clone(),
-                            by_user_id: by_user,
-                            source: knot_storage::UpdateSource::Edit,
-                            meta: None,
-                            persisted: Some(persisted_tx),
-                        }).await {
-                            // `persist` evicted the room already.
-                            let _ = reply.send(Err(ApplySuggestionError::Persist("persist channel closed".into())));
-                            continue;
-                        }
-                        // Persist BEFORE the fan-out: a client that got the
-                        // update would push it back on its resync after an
-                        // eviction, making durable an apply whose accept
-                        // already answered "persist failed".
-                        let final_seq = match persisted_rx.await {
-                            Ok(Ok(seq)) => seq,
-                            Ok(Err(e)) => {
-                                let _ = reply.send(Err(ApplySuggestionError::Persist(e)));
-                                self.evict_unpersisted(request.suggestion_id);
-                                continue;
-                            }
-                            Err(_) => {
-                                let _ = reply.send(Err(ApplySuggestionError::Persist("persist channel closed".into())));
-                                self.evict_unpersisted(request.suggestion_id);
-                                continue;
-                            }
-                        };
-                        let framed = wrap_sync_update(&update_bytes);
-                        let mut to_close: Vec<ConnId> = Vec::new();
-                        for (cid, conn) in &self.conns {
-                            match conn.tx.try_send(framed.clone()) {
-                                Ok(_) => {}
-                                Err(_) => to_close.push(*cid),
-                            }
-                        }
-                        for cid in to_close { self.conns.remove(&cid); }
-                        let _ = reply.send(Ok(final_seq));
+                    Some(Event::ApplySuggestion { request, by_user, accepted_by, reply }) => {
+                        let result = self.on_apply_suggestion(request, by_user, accepted_by).await;
+                        let _ = reply.send(result);
                     }
                     Some(Event::SuggestionApplied { suggestion_id, apply_token, reply }) => {
                         use crate::suggestions::{APPLIED_MAP, is_applied};
@@ -899,12 +664,280 @@ impl Room {
         // Final flush: a snapshot at the watermark so the next boot is
         // cheap, only when the snapshot rule holds (`may_snapshot`); it does
         // not wait for rows in flight, which the next boot replays. Skipped
-        // when the room evicted itself (`refuse_applied`,
-        // `evict_unpersisted`, `evict`, a snapshot write that found the
+        // when the room evicted itself (`refuse_applied`, `evict`, a
+        // server-side edit it could not persist, a snapshot write that found the
         // epoch changed or the page gone): the live doc may hold content
         // storage lacks, and a snapshot of it would be the one thing that
         // persisted it.
         self.snapshot().await;
+    }
+
+    /// `Event::ApplyUpdate`: apply, measure, persist what the apply changed
+    /// (`ApplyMeasured::persist`), and fan it out once it is stored. An
+    /// update that does not decode changes nothing and is only refused; one
+    /// that changes nothing is answered `Ok` with the room's seq.
+    async fn on_apply_update(
+        &mut self,
+        update_bytes: Vec<u8>,
+        by_user: Option<Uuid>,
+        source: knot_storage::UpdateSource,
+        meta: Option<serde_json::Value>,
+    ) -> Result<i64, EngineError> {
+        let limit = crate::nesting::MAX_NESTING;
+        // `Err` here: it doesn't decode, so nothing of it was applied.
+        let measured = self
+            .engine
+            .apply_update_measuring(&self.doc, &update_bytes, limit)?;
+        // Checked first, as for an inbound update (`refuse_applied`): the
+        // doc holds what the apply integrated, all of it or the part before
+        // a rejection, and none of it may be persisted or fanned out. No
+        // production caller gets here: they degrade deep Markdown before
+        // they build the update.
+        if measured.max_depth > limit {
+            let why = format!(
+                "it nested a type {} deep, past the limit of {limit}",
+                measured.max_depth
+            );
+            self.evict(format_args!(
+                "refused a server-side update after applying it ({why})"
+            ));
+            return Err(EngineError::Apply(why));
+        }
+        // yrs rejected the update part-way: the doc holds what it integrated,
+        // which no row carries (`unlogged`), and the caller is told the edit
+        // failed, so the room goes too.
+        if let Some(error) = measured.rejected {
+            self.unlogged = true;
+            self.evict(format_args!(
+                "yrs rejected a server-side update part-way ({error})"
+            ));
+            return Err(EngineError::Apply(error));
+        }
+        if !measured.changed {
+            return Ok(self.last_applied_seq);
+        }
+        // The doc changed but there is nothing to persist, which
+        // `ApplyMeasured::persist` rules out: the doc holds content no row
+        // carries, and the caller must not hear that the edit was saved.
+        if measured.persist.is_empty() {
+            self.unlogged = true;
+            self.evict(format_args!(
+                "a server-side update changed the doc but left nothing to persist"
+            ));
+            return Err(EngineError::Apply("nothing to persist".into()));
+        }
+        metrics::counter!("knot_room_updates_total", "source" => "local").increment(1);
+        let framed = wrap_sync_update(&measured.persist);
+        let seq = self
+            .persist_server_edit(measured.persist, by_user, source, meta)
+            .await
+            .map_err(EngineError::Apply)?;
+        if measured.raw_fallback {
+            metrics::counter!("knot_room_updates_persisted_raw_total").increment(1);
+        }
+        self.fan_out(&framed, None);
+        Ok(seq)
+    }
+
+    /// `Event::ReplaceWithMarkdown`: decode the replacement, then clear the
+    /// page and apply it in one transaction, whose own update is persisted
+    /// and, once stored, fanned out.
+    async fn on_replace(
+        &mut self,
+        update_bytes: Vec<u8>,
+        by_user: Option<Uuid>,
+        source: knot_storage::UpdateSource,
+        meta: Option<serde_json::Value>,
+    ) -> Result<i64, String> {
+        use yrs::{Update, XmlFragment, updates::decoder::Decode};
+        // Before anything is cleared: bytes that don't decode leave the page
+        // as it was.
+        let update = Update::decode_v1(&update_bytes).map_err(|e| format!("decode: {e}"))?;
+        // Get (or create) the fragment reference BEFORE opening the mutable
+        // transaction, because get_or_insert_xml_fragment internally
+        // acquires its own write lock. Calling it while a TransactionMut is
+        // active would deadlock (write_blocking).
+        let frag = self.doc.inner().get_or_insert_xml_fragment("default");
+        // Capture what the transaction ACTUALLY produces rather than reusing
+        // `update_bytes`. The clear and the apply happen together, but
+        // `update_bytes` encodes only the insertion — persisting and fanning
+        // that out ships the insert without the delete, so every peer MERGES
+        // the restored content into what it already had instead of replacing
+        // it, yielding "<old text><restored text>".
+        let (applied, effective) = self.capturing_update(|txn| {
+            let len = frag.len(txn);
+            if len > 0 {
+                frag.remove_range(txn, 0, len);
+            }
+            txn.apply_update(update).map_err(|e| format!("apply: {e}"))
+        });
+        if let Err(e) = applied {
+            // The page is cleared, and part of the update may be in it.
+            self.evict(format_args!(
+                "a replace failed after clearing the page ({e})"
+            ));
+            return Err(e);
+        }
+        // A replace that changed nothing (an empty page replaced by nothing)
+        // emits no update; the doc may still hold structs the apply parked,
+        // which no row would carry.
+        let Some(effective) = effective else {
+            self.evict(format_args!("a replace produced no update"));
+            return Err("replace produced no update".into());
+        };
+        metrics::counter!("knot_room_updates_total", "source" => "restore").increment(1);
+        let framed = wrap_sync_update(&effective);
+        let seq = self
+            .persist_server_edit(effective, by_user, source, meta)
+            .await?;
+        self.fan_out(&framed, None);
+        Ok(seq)
+    }
+
+    /// `Event::PatchTaskChecked`: flip the task item's attribute, persist
+    /// the change as a `task` row and, once stored, fan it out. An index
+    /// with no task changes nothing.
+    async fn on_patch_task(
+        &mut self,
+        item_index: i32,
+        checked: bool,
+        by_user: Option<Uuid>,
+    ) -> Result<i64, String> {
+        let frag = self.doc.inner().get_or_insert_xml_fragment("default");
+        // `patch_task_checked` finds the item before it changes anything.
+        let (patched, update) =
+            self.capturing_update(|txn| patch_task_checked(&frag, txn, item_index, checked));
+        patched?;
+        // No update: the attribute already had the requested value.
+        let Some(update) = update else {
+            return Ok(self.last_applied_seq);
+        };
+        metrics::counter!("knot_room_updates_total", "source" => "patch").increment(1);
+        let framed = wrap_sync_update(&update);
+        let seq = self
+            .persist_server_edit(update, by_user, knot_storage::UpdateSource::Task, None)
+            .await?;
+        self.fan_out(&framed, None);
+        Ok(seq)
+    }
+
+    /// `Event::ApplySuggestion`: catch up, apply the suggestion and its
+    /// applied marker in one transaction, persist that as a `suggestion`
+    /// row by the suggester, naming the suggestion and the owner who
+    /// accepted it, and fan it out once it is stored: a client that got the
+    /// update would push it back on its resync after an eviction, making
+    /// durable an apply whose accept already answered "persist failed".
+    async fn on_apply_suggestion(
+        &mut self,
+        request: crate::suggestions::ApplySuggestionRequest,
+        by_user: Option<Uuid>,
+        accepted_by: Uuid,
+    ) -> Result<i64, crate::suggestions::ApplySuggestionError> {
+        use crate::suggestions::{APPLIED_MAP, ApplySuggestionError, apply_suggestion};
+        // Catch up first: the anchored text may come from an edit another
+        // replica persisted that this room's bus hasn't delivered yet. A
+        // failed read, or one that stopped at a rev gap, is let through: at
+        // worst it costs a spurious `AnchorLost` or `Changed`, which writes
+        // nothing.
+        let _ = self.catch_up().await;
+        // Both roots BEFORE the mutable transaction (see `on_replace`: they
+        // take their own write lock).
+        let _frag = self.doc.inner().get_or_insert_xml_fragment("default");
+        let applied = self.doc.inner().get_or_insert_map(APPLIED_MAP);
+        let (result, update) =
+            self.capturing_update(|txn| apply_suggestion(&applied, txn, &request));
+        // Every check runs before the first mutation, so a refusal left the
+        // doc as it was.
+        result?;
+        // An apply always records its marker, so it can't be a no-op; if
+        // nothing was captured, the doc holds a change we can't persist.
+        let Some(update) = update else {
+            self.evict(format_args!(
+                "could not persist applied suggestion {}: no update",
+                request.suggestion_id
+            ));
+            return Err(ApplySuggestionError::Persist("no update".into()));
+        };
+        metrics::counter!("knot_room_updates_total", "source" => "suggestion").increment(1);
+        let framed = wrap_sync_update(&update);
+        let meta = serde_json::json!({
+            "suggestion_id": request.suggestion_id,
+            "accepted_by": accepted_by,
+        });
+        let seq = self
+            .persist_server_edit(
+                update,
+                by_user,
+                knot_storage::UpdateSource::Suggestion,
+                Some(meta),
+            )
+            .await
+            .map_err(ApplySuggestionError::Persist)?;
+        self.fan_out(&framed, None);
+        Ok(seq)
+    }
+
+    /// Runs `mutate` in one transaction on the live doc and returns its
+    /// result with the update the transaction produced (`None` when it
+    /// changed nothing).
+    fn capturing_update<R>(
+        &self,
+        mutate: impl FnOnce(&mut yrs::TransactionMut) -> R,
+    ) -> (R, Option<Vec<u8>>) {
+        use std::sync::Mutex;
+        use yrs::Transact;
+        let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let sink = captured.clone();
+        let sub = self.doc.inner().observe_update_v1(move |_txn, e| {
+            *sink.lock().unwrap() = Some(e.update.clone());
+        });
+        let result = {
+            let mut txn = self.doc.inner().transact_mut();
+            mutate(&mut txn)
+        };
+        // Dropping the subscription must happen AFTER the txn closes (Drop
+        // on TransactionMut flushes the update notification).
+        drop(sub);
+        let update = captured.lock().unwrap().take();
+        (result, update)
+    }
+
+    /// Hands a server-side edit the doc already holds to the writer, as one
+    /// row of `source`, and waits until the writer stored it: only then may
+    /// the caller fan it out, so an edit that is not stored reaches no
+    /// client, and no reconnect can push it back credited to someone else.
+    /// The writer bounds the wait ([`WriterLimits`]). Returns the row's seq.
+    /// When the edit is not stored the room is evicted: its doc holds an
+    /// edit no row carries.
+    async fn persist_server_edit(
+        &mut self,
+        bytes: Vec<u8>,
+        by_user: Option<Uuid>,
+        source: knot_storage::UpdateSource,
+        meta: Option<serde_json::Value>,
+    ) -> Result<i64, String> {
+        let (persisted, stored) = oneshot::channel();
+        let job = PersistJob {
+            bytes,
+            by_user_id: by_user,
+            source,
+            meta,
+            persisted: Some(persisted),
+        };
+        // `persist` evicts the room when the writer's channel is closed.
+        if !self.persist(job).await {
+            return Err("persist channel closed".into());
+        }
+        let error = match stored.await {
+            Ok(Ok(seq)) => return Ok(seq),
+            Ok(Err(e)) => format!("persist: {e}"),
+            Err(_) => "persist channel closed".to_string(),
+        };
+        self.evict(format_args!(
+            "could not persist a server-side {} edit ({error})",
+            source.as_str()
+        ));
+        Err(error)
     }
 
     /// The writer appended one of this room's rows at `rev`.
@@ -1300,22 +1333,6 @@ impl Room {
         self.shutdown.cancel();
     }
 
-    /// Evict the room after it applied suggestion `suggestion_id` but could
-    /// not persist the change. The live doc then holds the new text and the
-    /// applied marker while storage holds neither, and no live room may keep
-    /// such a marker: a recovery sweep asking `SuggestionApplied` must see
-    /// what storage has. As in [`Self::refuse_applied`], the room ends
-    /// without its final snapshot and every connection is closed through
-    /// the room's token, so clients reconnect to a room reloaded from
-    /// storage. The apply is fanned out only after it is persisted, so no
-    /// client holds it to push back in its resync: the change is gone with
-    /// the room.
-    fn evict_unpersisted(&mut self, suggestion_id: Uuid) {
-        self.evict(format_args!(
-            "could not persist applied suggestion {suggestion_id}"
-        ));
-    }
-
     /// Evict the room: it ends without its final snapshot (`evicted`), and
     /// every connection is closed through the room's token, so clients
     /// reconnect to a room reloaded from storage and resend their edits.
@@ -1648,6 +1665,8 @@ pub(crate) mod tests {
         h.tx.send(Event::ReplaceWithMarkdown {
             update_bytes: initial_bytes,
             by_user: None,
+            source: knot_storage::UpdateSource::Import,
+            meta: None,
             reply: tx,
         })
         .await
@@ -1660,6 +1679,8 @@ pub(crate) mod tests {
         h.tx.send(Event::ReplaceWithMarkdown {
             update_bytes: replacement_bytes,
             by_user: None,
+            source: knot_storage::UpdateSource::Import,
+            meta: None,
             reply: tx2,
         })
         .await
@@ -1733,6 +1754,8 @@ pub(crate) mod tests {
         h.tx.send(Event::ReplaceWithMarkdown {
             update_bytes: make_replace_bytes_raw("Hello World"),
             by_user: None,
+            source: knot_storage::UpdateSource::Import,
+            meta: None,
             reply: tx,
         })
         .await
@@ -1767,6 +1790,8 @@ pub(crate) mod tests {
         h.tx.send(Event::ReplaceWithMarkdown {
             update_bytes: make_replace_bytes_raw("Replaced Content"),
             by_user: None,
+            source: knot_storage::UpdateSource::Import,
+            meta: None,
             reply: tx2,
         })
         .await
@@ -2052,6 +2077,8 @@ pub(crate) mod tests {
         h.tx.send(Event::ReplaceWithMarkdown {
             update_bytes: make_replace_bytes_raw("Imported"),
             by_user: Some(alice),
+            source: knot_storage::UpdateSource::Import,
+            meta: None,
             reply: tx,
         })
         .await
@@ -2419,14 +2446,18 @@ pub(crate) mod tests {
         h.tx.send(Event::ApplyUpdate {
             update_bytes: sentinel.clone(),
             by_user: None,
+            source: knot_storage::UpdateSource::Edit,
+            meta: None,
             reply: reply_tx,
         })
         .await
         .unwrap();
         reply_rx.await.unwrap().unwrap();
-        assert_eq!(
-            *persisted.lock().unwrap(),
-            vec![sentinel],
+        // The sentinel is persisted as what its apply changed, which yrs
+        // re-encodes: compared as an update.
+        let persisted = persisted.lock().unwrap().clone();
+        assert!(
+            persisted.len() == 1 && same_update(&persisted[0], &sentinel),
             "an update from a revoked connection was persisted"
         );
 
@@ -2600,6 +2631,8 @@ pub(crate) mod tests {
         h.tx.send(Event::ApplyUpdate {
             update_bytes,
             by_user,
+            source: knot_storage::UpdateSource::Edit,
+            meta: None,
             reply: tx,
         })
         .await
@@ -2616,6 +2649,7 @@ pub(crate) mod tests {
         h.tx.send(Event::ApplySuggestion {
             request,
             by_user,
+            accepted_by: Uuid::new_v4(),
             reply: tx,
         })
         .await
@@ -3142,6 +3176,9 @@ pub(crate) mod tests {
         lost_acks: usize,
         /// `append` fails permanently, storing nothing.
         refuse_appends: bool,
+        /// `append` fails transiently (the pool timed out: the database is
+        /// down), storing nothing.
+        down: bool,
     }
 
     impl Log {
@@ -3197,6 +3234,11 @@ pub(crate) mod tests {
                 gate.notified().await;
             }
             let mut s = self.state.lock().unwrap();
+            if s.down {
+                return Err(knot_storage::UpdatesStoreError::Sqlx(
+                    sqlx::Error::PoolTimedOut,
+                ));
+            }
             if s.refuse_appends {
                 return Err(knot_storage::UpdatesStoreError::EpochChanged {
                     room: epoch,
@@ -4106,6 +4148,8 @@ pub(crate) mod tests {
             h.tx.send(Event::ApplyUpdate {
                 update_bytes: para(12, "server"),
                 by_user: None,
+                source: knot_storage::UpdateSource::Edit,
+                meta: None,
                 reply: tx,
             })
             .await
@@ -4172,6 +4216,375 @@ pub(crate) mod tests {
         h.tx.send(Event::ExportState(tx)).await.unwrap();
         let (_, seq) = rx.await.unwrap().unwrap();
         assert_eq!(seq, 10);
+        shut_down(&h).await;
+    }
+    // -----------------------------------------------------------------------
+    // Server-side edits: persisted before they are fanned out, tagged with
+    // what made them, and evicting the room when they cannot be persisted.
+    // -----------------------------------------------------------------------
+
+    /// A page holding one unchecked task item ("todo"), from a fresh doc of
+    /// `client`.
+    fn task_page(client: u64) -> Vec<u8> {
+        use yrs::{
+            Doc, ReadTxn, StateVector, Transact, Xml, XmlElementPrelim, XmlFragment, XmlTextPrelim,
+        };
+        let doc = Doc::with_client_id(client);
+        let frag = doc.get_or_insert_xml_fragment("default");
+        {
+            let mut txn = doc.transact_mut();
+            let list = frag.push_back(&mut txn, XmlElementPrelim::empty("bullet_list"));
+            let item = list.push_back(&mut txn, XmlElementPrelim::empty("list_item"));
+            item.insert_attribute(&mut txn, "checked", "false");
+            let p = item.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new("todo"));
+        }
+        doc.transact()
+            .encode_state_as_update_v1(&StateVector::default())
+    }
+
+    /// The server-side edits whose room awaits their persist.
+    #[derive(Debug, Clone, Copy)]
+    enum ServerEdit {
+        /// Checks the [`task_page`]'s task (`PatchTaskChecked`).
+        Task,
+        /// Replaces the page with a paragraph (`ReplaceWithMarkdown`).
+        Replace,
+        /// Appends a paragraph (`ApplyUpdate`).
+        Update,
+    }
+
+    /// Sends `edit` to `h` and returns its reply.
+    async fn server_edit(h: &RoomHandle, edit: ServerEdit) -> Result<i64, String> {
+        match edit {
+            ServerEdit::Task => {
+                let (reply, rx) = oneshot::channel();
+                h.tx.send(Event::PatchTaskChecked {
+                    item_index: 0,
+                    checked: true,
+                    by_user: None,
+                    reply,
+                })
+                .await
+                .unwrap();
+                rx.await.expect("the room answered")
+            }
+            ServerEdit::Replace => {
+                let (reply, rx) = oneshot::channel();
+                h.tx.send(Event::ReplaceWithMarkdown {
+                    update_bytes: para(31, "replaced"),
+                    by_user: None,
+                    source: knot_storage::UpdateSource::Import,
+                    meta: None,
+                    reply,
+                })
+                .await
+                .unwrap();
+                rx.await.expect("the room answered")
+            }
+            ServerEdit::Update => try_apply_update(h, para(32, "appended"))
+                .await
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Sends `update_bytes` as an `ApplyUpdate` and returns its reply.
+    async fn try_apply_update(h: &RoomHandle, update_bytes: Vec<u8>) -> Result<i64, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        h.tx.send(Event::ApplyUpdate {
+            update_bytes,
+            by_user: None,
+            source: knot_storage::UpdateSource::Import,
+            meta: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        rx.await.expect("the room answered")
+    }
+
+    /// A server-side edit whose persist fails reaches no client (Review
+    /// Focus 5): nobody can push it back on a reconnect, credited to
+    /// themselves. The room is evicted and writes no snapshot.
+    #[tokio::test(start_paused = true)]
+    async fn server_edit_persist_failure_reaches_no_client() {
+        for edit in [ServerEdit::Task, ServerEdit::Replace, ServerEdit::Update] {
+            let log = Log::new();
+            log.push(1, 1, task_page(41));
+            log.with(|s| s.refuse_appends = true);
+            let snapshots = Arc::new(Stamps::default());
+            let (h, _bus, _) = room_on_log(&log, &snapshots, EAGER).await;
+            let (_conn, mut conn_rx) = join(&h).await;
+
+            let reply = server_edit(&h, edit).await;
+            assert!(reply.is_err(), "{edit:?}: replied {reply:?}");
+            tokio::time::timeout(std::time::Duration::from_secs(10), h.shutdown.cancelled())
+                .await
+                .unwrap_or_else(|_| panic!("{edit:?}: the room was not evicted"));
+            tokio::time::timeout(std::time::Duration::from_secs(10), h.tx.closed())
+                .await
+                .unwrap_or_else(|_| panic!("{edit:?}: the room did not end"));
+            assert!(
+                drain(&mut conn_rx).is_empty(),
+                "{edit:?}: a client got the unpersisted edit"
+            );
+            assert!(
+                snapshots.written().is_empty(),
+                "{edit:?}: {:?}",
+                snapshots.written()
+            );
+            assert!(log.appended().is_empty(), "{edit:?}");
+        }
+    }
+
+    /// Review Focus 3: during an outage a task toggle fails within its
+    /// deadline and frees the room (evicted), instead of freezing it for the
+    /// outage; the WS edit buffered ahead of it, whose author already left,
+    /// is still written once the database is back, and the toggle never is.
+    #[tokio::test(start_paused = true)]
+    async fn server_edit_during_an_outage_frees_the_room_and_keeps_the_ws_edit() {
+        let log = Log::new();
+        log.push(1, 1, task_page(41));
+        log.with(|s| s.down = true);
+        let doc_id = Uuid::new_v4();
+        let listened = MemBus::new();
+        let sub = listened.subscribe(doc_id).await.unwrap();
+        let h = Room::spawn_with_limits(
+            doc_id,
+            Arc::new(YrsEngine),
+            Arc::new(MemBus::new()),
+            sub,
+            log.clone(),
+            Arc::new(Stamps::default()),
+            IDLE,
+            None,
+            WriterLimits {
+                server_job_deadline: std::time::Duration::from_millis(300),
+                attempt_timeout: std::time::Duration::from_millis(300),
+            },
+        )
+        .await
+        .expect("the room boots");
+        let (a, _a_rx) = join(&h).await;
+        let (_b, mut b_rx) = join(&h).await;
+        let a_user = Uuid::new_v4();
+        let typed = para(42, "typed");
+        h.tx.send(Event::Inbound(InMsg {
+            from: a,
+            by_user: Some(a_user),
+            bytes: typed.clone(),
+        }))
+        .await
+        .unwrap();
+        // A closed the tab.
+        h.tx.send(Event::Leave(a)).await.unwrap();
+
+        let asked = tokio::time::Instant::now();
+        let within = asked + std::time::Duration::from_secs(2);
+        let reply = tokio::time::timeout_at(within, server_edit(&h, ServerEdit::Task))
+            .await
+            .expect("the toggle was not answered within 2 s");
+        assert!(reply.is_err(), "{reply:?}");
+        tokio::time::timeout_at(within, h.shutdown.cancelled())
+            .await
+            .expect("the room was not evicted within 2 s");
+        let frames = drain(&mut b_rx);
+        assert_eq!(frames.len(), 1, "B got the task's frame: {frames:?}");
+        assert!(same_update(&unwrap_frame(&frames[0]), &typed));
+        assert!(log.appended().is_empty(), "the database was down");
+
+        log.with(|s| s.down = false);
+        let mut done = h.writer_done.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(60), done.wait())
+            .await
+            .expect("the writer did not end once the database was back");
+        let appended = log.appended();
+        assert_eq!(appended.len(), 1, "{appended:?}");
+        assert!(same_update(&appended[0].bytes, &typed));
+        assert_eq!(appended[0].by_user_id, Some(a_user));
+        assert_eq!(appended[0].source, knot_storage::UpdateSource::Edit);
+    }
+
+    /// A server-side edit the writer answers with `Err` evicts the room by
+    /// itself, whether or not a writer Fatal comes with it, and reaches no
+    /// client.
+    #[tokio::test]
+    async fn a_server_edit_the_writer_did_not_store_evicts_the_room() {
+        let log = Log::new();
+        log.push(1, 1, task_page(41));
+        let doc_id = Uuid::new_v4();
+        let bus = Arc::new(MemBus::new());
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        let (h, mut persist_rx, _events, _done) = Room::spawn_detached(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            log,
+            Arc::new(Stamps::default()),
+            IDLE,
+            None,
+        )
+        .await
+        .unwrap();
+        let (_conn, mut conn_rx) = join(&h).await;
+        // The writer: no Fatal, only the job's `Err`.
+        let writer = tokio::spawn(async move {
+            let job = persist_rx.recv().await.expect("the room sent the job");
+            let source = job.source;
+            let _ = job
+                .persisted
+                .expect("a server-side job")
+                .send(Err("not stored".into()));
+            (source, persist_rx)
+        });
+
+        let reply = server_edit(&h, ServerEdit::Task).await;
+        assert!(reply.is_err(), "{reply:?}");
+        let (source, _persist_rx) = writer.await.unwrap();
+        assert_eq!(source, knot_storage::UpdateSource::Task);
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.shutdown.cancelled())
+            .await
+            .expect("the room was not evicted");
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.tx.closed())
+            .await
+            .expect("the room did not end");
+        assert!(drain(&mut conn_rx).is_empty(), "a client got the edit");
+    }
+
+    /// An `ApplyUpdate` whose blocks park, waiting for a dependency the room
+    /// lacks, persists its raw bytes, so no row misses the parked content;
+    /// once the dependency arrives, the rows replayed in order rebuild the
+    /// room's doc (review round 3).
+    #[tokio::test(start_paused = true)]
+    async fn apply_update_with_a_missing_dependency_is_still_persisted() {
+        use yrs::{
+            GetString, ReadTxn, StateVector, Text, Transact, Update, updates::decoder::Decode,
+        };
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let log = Log::new();
+        let (h, _bus, _) = room_on_log(&log, &Arc::new(Stamps::default()), IDLE).await;
+        let (_peer, mut peer_rx) = join(&h).await;
+
+        let client = yrs::Doc::new();
+        let text = client.get_or_insert_text("t");
+        text.push(&mut client.transact_mut(), "a");
+        let sv = client.transact().state_vector();
+        let dependency = client
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        text.push(&mut client.transact_mut(), "b");
+        let dependent = client.transact().encode_state_as_update_v1(&sv);
+
+        try_apply_update(&h, dependent.clone())
+            .await
+            .expect("a parked update is persisted");
+        let appended = log.appended();
+        assert_eq!(appended.len(), 1, "{appended:?}");
+        assert!(same_update(&appended[0].bytes, &dependent));
+        assert_eq!(rec.counter("knot_room_updates_persisted_raw_total", &[]), 1);
+        let frames = drain(&mut peer_rx);
+        assert_eq!(frames.len(), 1);
+        assert!(same_update(&unwrap_frame(&frames[0]), &dependent));
+
+        try_apply_update(&h, dependency)
+            .await
+            .expect("the dependency is persisted");
+        let replayed = yrs::Doc::new();
+        for row in log.appended() {
+            replayed
+                .transact_mut()
+                .apply_update(Update::decode_v1(&row.bytes).unwrap())
+                .unwrap();
+        }
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::ExportState(tx)).await.unwrap();
+        let (state, _) = rx.await.unwrap().unwrap();
+        let live = yrs::Doc::new();
+        live.transact_mut()
+            .apply_update(Update::decode_v1(&state).unwrap())
+            .unwrap();
+        let text_of = |d: &yrs::Doc| d.get_or_insert_text("t").get_string(&d.transact());
+        assert_eq!(text_of(&live), "ab");
+        assert_eq!(text_of(&replayed), "ab");
+        assert_eq!(
+            replayed.transact().state_vector(),
+            live.transact().state_vector()
+        );
+        shut_down(&h).await;
+    }
+
+    /// An `ApplyUpdate` the doc already holds persists and fans out nothing,
+    /// and replies `Ok`.
+    #[tokio::test(start_paused = true)]
+    async fn apply_update_that_changes_nothing_persists_nothing() {
+        let held = para(11, "held");
+        let log = Log::new();
+        log.push(1, 1, held.clone());
+        let (h, _bus, _) = room_on_log(&log, &Arc::new(Stamps::default()), IDLE).await;
+        let (_conn, mut conn_rx) = join(&h).await;
+
+        try_apply_update(&h, held)
+            .await
+            .expect("a no-op update is answered Ok");
+        tokio::time::sleep(crate::writer::BATCH_INTERVAL * 4).await;
+        assert!(log.appended().is_empty(), "{:?}", log.appended());
+        assert!(drain(&mut conn_rx).is_empty(), "a no-op was fanned out");
+        assert!(!h.shutdown.is_cancelled());
+        shut_down(&h).await;
+    }
+
+    /// An `ApplyUpdate` yrs rejects part-way leaves part of it in the doc,
+    /// which no row carries: the caller gets `Err`, nothing is persisted or
+    /// fanned out, and the room is evicted (`unlogged` as well, so no
+    /// snapshot certifies it).
+    #[tokio::test(start_paused = true)]
+    async fn apply_update_rejected_part_way_evicts() {
+        let (parked, edit, _) = parked_block_and_the_edit_it_fails_on();
+        let log = Log::new();
+        log.push(1, 1, parked);
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, EAGER).await;
+        let (_conn, mut conn_rx) = join(&h).await;
+
+        let reply = try_apply_update(&h, edit).await;
+        assert!(reply.is_err(), "{reply:?}");
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.shutdown.cancelled())
+            .await
+            .expect("the room was not evicted");
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.tx.closed())
+            .await
+            .expect("the room did not end");
+        assert!(log.appended().is_empty(), "{:?}", log.appended());
+        assert!(drain(&mut conn_rx).is_empty(), "the edit was fanned out");
+        assert!(snapshots.written().is_empty(), "{:?}", snapshots.written());
+    }
+
+    /// Replacement bytes that do not decode are refused before the page is
+    /// cleared: the doc keeps its content, and the room keeps running.
+    #[tokio::test(start_paused = true)]
+    async fn replace_with_undecodable_bytes_leaves_the_doc_untouched() {
+        let log = Log::new();
+        log.push(1, 1, para(11, "kept"));
+        let (h, _bus, _) = room_on_log(&log, &Arc::new(Stamps::default()), IDLE).await;
+        let before = exported_page(&h).await;
+        assert!(before.contains("kept"), "{before}");
+
+        let (reply, rx) = oneshot::channel();
+        h.tx.send(Event::ReplaceWithMarkdown {
+            update_bytes: b"\xff".to_vec(),
+            by_user: None,
+            source: knot_storage::UpdateSource::Import,
+            meta: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        assert!(rx.await.unwrap().is_err());
+        assert_eq!(exported_page(&h).await, before);
+        assert!(!h.shutdown.is_cancelled(), "the room was evicted");
+        assert!(log.appended().is_empty());
         shut_down(&h).await;
     }
 }

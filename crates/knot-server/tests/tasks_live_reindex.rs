@@ -92,6 +92,8 @@ async fn doc_edit_with_mention_lands_in_task_index_without_http() {
         .send(Event::ApplyUpdate {
             update_bytes,
             by_user: Some(user.id),
+            source: knot_storage::UpdateSource::Edit,
+            meta: None,
             reply: tx,
         })
         .await

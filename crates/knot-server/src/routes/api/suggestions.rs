@@ -527,8 +527,10 @@ async fn apply_claimed(
         deadline,
         room.tx.send(knot_crdt::Event::ApplySuggestion {
             request,
-            // The suggester wrote the words, so the edit is theirs.
+            // The suggester wrote the words, so the edit is theirs; the
+            // owner who accepted them is recorded beside it.
             by_user: Some(claimed.author_id),
+            accepted_by: ctx.user_id,
             reply: tx,
         }),
     )

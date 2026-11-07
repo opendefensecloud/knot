@@ -532,6 +532,8 @@ pub(super) async fn import_inline(
             .send(knot_crdt::Event::ReplaceWithMarkdown {
                 update_bytes,
                 by_user: Some(ctx.user_id),
+                source: knot_storage::UpdateSource::Import,
+                meta: None,
                 reply: tx,
             })
             .await
@@ -550,6 +552,8 @@ pub(super) async fn import_inline(
             .send(knot_crdt::Event::ApplyUpdate {
                 update_bytes,
                 by_user: Some(ctx.user_id),
+                source: knot_storage::UpdateSource::Import,
+                meta: None,
                 reply: tx,
             })
             .await

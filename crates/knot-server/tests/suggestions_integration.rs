@@ -1034,6 +1034,8 @@ async fn apply_to_room(state: &AppState, doc_id: Uuid, update_bytes: Vec<u8>, by
         .send(knot_crdt::Event::ApplyUpdate {
             update_bytes,
             by_user: Some(by_user),
+            source: knot_storage::UpdateSource::Edit,
+            meta: None,
             reply: tx,
         })
         .await

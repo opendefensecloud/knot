@@ -179,6 +179,13 @@ pub async fn restore(
             // The restorer rewrote the page, so they are its latest
             // contributor — not the authors of the snapshot's content.
             by_user: Some(ctx.user_id),
+            // The version restored to, by its snapshot seq and the time it
+            // was taken (a page's history shows "Restored by X, to <date>").
+            source: knot_storage::UpdateSource::Restore,
+            meta: Some(serde_json::json!({
+                "target_snapshot_seq": seq,
+                "target_ended_at": snap.created_at.to_rfc3339(),
+            })),
             reply: tx,
         })
         .await
