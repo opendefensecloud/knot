@@ -871,7 +871,7 @@ async fn a_first_build_racing_another_builder_is_busy_not_failed() {
         let a = a.clone();
         tokio::spawn(async move { a.build_page(doc).await })
     };
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    claimed_by(&db, doc, a.id()).await;
     let t = Instant::now();
     let r = b.build_page(doc).await;
     assert!(t.elapsed() < Duration::from_millis(1500));
