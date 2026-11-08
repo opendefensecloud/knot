@@ -883,6 +883,11 @@ pub struct WindowInput {
     /// when replaying for that gap entry, or for a session credited by it.
     pub merge_gap_at_end: bool,
     pub progress: Progress,
+    /// Test hooks; production code leaves them at their default. A window
+    /// runs `panic_at_rev`, `sleep_at_rev`, `corrupt_at_rev` and
+    /// `retry_every_row`, as the pass does for its rows.
+    #[doc(hidden)]
+    pub hooks: ReplayHooks,
 }
 
 /// Why a window replay stopped.
@@ -917,6 +922,7 @@ pub fn replay_window(input: WindowInput) -> Result<Replayer, WindowError> {
         end_rev,
         merge_gap_at_end,
         progress,
+        hooks,
     } = input;
     let mut replayer = Replayer::from_state(mode, &checkpoint_state)
         .map_err(|e| WindowError::State(e.to_string()))?;
@@ -924,7 +930,7 @@ pub fn replay_window(input: WindowInput) -> Result<Replayer, WindowError> {
     // once the replay gains what they wait for (`replay::Parked`), as the
     // pass does. The window knows no claims: every row that parks stays,
     // and one that drained waits for nothing.
-    let mut parked = Parked::new(false);
+    let mut parked = Parked::new(hooks.retry_every_row);
     for row in &reapply {
         let rev = rev_of(row);
         if skip_revs.contains(&rev) {
@@ -934,8 +940,9 @@ pub fn replay_window(input: WindowInput) -> Result<Replayer, WindowError> {
             return Err(WindowError::Cancelled);
         }
         progress.set(Stage::Prefix(rev));
+        hooks.at_row(rev);
         let e = replayer.apply(&row.update_bytes);
-        if e.outcome == RowOutcome::Corrupt {
+        if e.outcome == RowOutcome::Corrupt || hooks.corrupt_at_rev == Some(rev) {
             return Err(WindowError::Corrupt { rev });
         }
         parked.mark(&e.inserted);
@@ -959,8 +966,9 @@ pub fn replay_window(input: WindowInput) -> Result<Replayer, WindowError> {
             continue;
         }
         progress.set(Stage::Row(rev));
+        hooks.at_row(rev);
         let mut e = replayer.apply(&row.update_bytes);
-        if e.outcome == RowOutcome::Corrupt {
+        if e.outcome == RowOutcome::Corrupt || hooks.corrupt_at_rev == Some(rev) {
             return Err(WindowError::Corrupt { rev });
         }
         parked.mark(&e.inserted);

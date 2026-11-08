@@ -668,6 +668,7 @@ fn a_window_over_a_union_gap_checkpoint_merges_it() {
             end_rev: 3,
             merge_gap_at_end: false,
             progress: Progress::default(),
+            hooks: ReplayHooks::default(),
         })
     };
     let replayed = window(vec![(1, gap.clone())]).expect("the window replays");
@@ -731,6 +732,7 @@ fn replay_window_merges_a_gap_at_its_end_only_when_asked() {
             end_rev,
             merge_gap_at_end,
             progress: Progress::default(),
+            hooks: ReplayHooks::default(),
         })
         .expect("the window replays");
         xml_of(r.doc())
@@ -1212,6 +1214,7 @@ fn a_gap_merge_credits_the_rows_it_drains() {
             end_rev: 3,
             merge_gap_at_end,
             progress: Progress::default(),
+            hooks: ReplayHooks::default(),
         })
         .unwrap();
         xml_of(r.doc())
@@ -1537,6 +1540,7 @@ fn window(
         end_rev: end,
         merge_gap_at_end: true,
         progress: Progress::default(),
+        hooks: ReplayHooks::default(),
     })
     .expect("the window replays")
 }
@@ -1971,6 +1975,77 @@ fn a_failing_reapply_row_blames_the_checkpoint() {
     assert!(matches!(run_pass(inp), Err(ReplayError::Cancelled)));
 }
 
+/// A window from `cp` (its pending rows re-applied) through `end_rev`.
+fn window_from(cp: &CheckpointWrite, rows: &[DocUpdate], end_rev: i64) -> WindowInput {
+    WindowInput {
+        mode: ReplayMode::KeepDeleted,
+        checkpoint_state: cp.state_bytes.clone(),
+        reapply: reapply_of(cp, rows),
+        rows: rows_in(rows, cp.rev, end_rev),
+        gap_states: Vec::new(),
+        skip_revs: BTreeSet::new(),
+        end_rev,
+        merge_gap_at_end: false,
+        progress: Progress::default(),
+        hooks: ReplayHooks::default(),
+    }
+}
+
+#[test]
+fn a_window_blames_a_failing_reapply_or_row_by_its_rev() {
+    let h = parked_for_good_then_typing(8);
+    let first = pass(input(empty_state(), &h.rows()[..6]));
+    let cp = first
+        .checkpoints
+        .iter()
+        .rfind(|c| c.kind == CheckpointKind::Periodic)
+        .expect("a periodic checkpoint")
+        .clone();
+    assert_eq!(cp.pending_revs, vec![1]);
+    let end_rev = 9;
+    let next = cp.rev + 1;
+    assert!(next <= end_rev);
+    assert!(replay_window(window_from(&cp, h.rows(), end_rev)).is_ok());
+
+    // A re-applied row that corrupts the decoded checkpoint.
+    let mut inp = window_from(&cp, h.rows(), end_rev);
+    inp.hooks.corrupt_at_rev = Some(1);
+    let r = replay_window(inp).err();
+    assert!(matches!(r, Some(WindowError::Corrupt { rev: 1 })), "{r:?}");
+
+    // A panic while re-applying it happens at its prefix stage.
+    let mut inp = window_from(&cp, h.rows(), end_rev);
+    inp.hooks.panic_at_rev = Some(1);
+    let progress = inp.progress.clone();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay_window(inp)));
+    assert!(r.is_err());
+    assert_eq!(progress.get(), Stage::Prefix(1));
+
+    // Cancelled before the re-applied rows (no later row or gap state
+    // would see the cancellation).
+    let mut inp = window_from(&cp, h.rows(), end_rev);
+    inp.rows.clear();
+    inp.progress.cancel();
+    let r = replay_window(inp).err();
+    assert!(matches!(r, Some(WindowError::Cancelled)), "{r:?}");
+
+    // A row after the checkpoint that corrupts the replay, and a panic
+    // at its row stage.
+    let mut inp = window_from(&cp, h.rows(), end_rev);
+    inp.hooks.corrupt_at_rev = Some(next);
+    let r = replay_window(inp).err();
+    assert!(
+        matches!(r, Some(WindowError::Corrupt { rev }) if rev == next),
+        "{r:?}"
+    );
+    let mut inp = window_from(&cp, h.rows(), end_rev);
+    inp.hooks.panic_at_rev = Some(next);
+    let progress = inp.progress.clone();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay_window(inp)));
+    assert!(r.is_err());
+    assert_eq!(progress.get(), Stage::Row(next));
+}
+
 #[test]
 fn a_row_parked_for_good_is_not_retried_on_every_row() {
     let h = parked_for_good_then_typing(30);
@@ -2042,6 +2117,7 @@ fn a_window_checks_cancellation_before_each_gap_merge() {
         end_rev: 3,
         merge_gap_at_end: true,
         progress,
+        hooks: ReplayHooks::default(),
     });
     let r = r.err();
     assert!(matches!(r, Some(WindowError::Cancelled)), "{r:?}");
