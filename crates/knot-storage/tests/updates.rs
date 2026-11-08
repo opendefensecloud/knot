@@ -324,7 +324,10 @@ async fn flush_for_a_freshly_credited_author_does_not_lock_their_row() {
 // ---------------------------------------------------------------------------
 
 use knot_storage::testing::db_error;
-use knot_storage::{HistoryHead, NewUpdate, RowsAfter, UpdateSource, UpdatesStoreError};
+use knot_storage::{
+    HistoryHead, NewUpdate, RowsAfter, UpdateSource, UpdatesStoreError, rows_in_range,
+};
+use knot_test_support::migrate::migrator_up_to;
 
 fn new_row(
     by: Option<uuid::Uuid>,
@@ -492,25 +495,6 @@ async fn append_with_a_stale_epoch_writes_nothing() {
 }
 
 const HISTORY_LOG_COLUMNS: i64 = 20261107120000;
-
-/// The embedded migrations up to and including `last`.
-fn migrator_up_to(last: i64) -> sqlx::migrate::Migrator {
-    let full = sqlx::migrate!("../../migrations");
-    assert!(
-        full.migrations.iter().any(|m| m.version == last),
-        "migration {last} not embedded (cargo clean -p knot-storage?)"
-    );
-    sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(
-            full.migrations
-                .iter()
-                .filter(|m| m.version <= last)
-                .cloned()
-                .collect(),
-        ),
-        ..sqlx::migrate::Migrator::DEFAULT
-    }
-}
 
 /// A page whose `n` rows predate the heads migration (rev NULL), on a
 /// database then migrated all the way. Legacy rows hold their ordinal as
@@ -877,5 +861,89 @@ async fn since_and_latest_read_a_database_from_before_the_upgrade() {
             .map(|r| r.update_bytes.clone())
             .collect::<Vec<_>>(),
         vec![vec![1u8], vec![2u8]]
+    );
+}
+
+/// The revs `rows_in_range` returns for these bounds.
+async fn revs_in_range(
+    conn: &mut sqlx::PgConnection,
+    doc: uuid::Uuid,
+    after_rev: i64,
+    through_rev: Option<i64>,
+    max_rows: i64,
+    max_bytes: i64,
+) -> Vec<i64> {
+    rows_in_range(conn, doc, after_rev, through_rev, max_rows, max_bytes)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.rev.expect("a numbered row"))
+        .collect()
+}
+
+/// `rows_in_range` returns the numbered rows `after_rev < rev <= through_rev`
+/// in rev order, at most `max_rows` of them, and stops before the row whose
+/// bytes would take the total over `max_bytes`; the first row comes back
+/// even when it alone is over the limit, so every caller gets a row.
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_in_range_caps_rows_and_bytes() {
+    const ANY: i64 = i64::MAX;
+    let (s, pool, doc, user) = setup().await;
+    let rows: Vec<NewUpdate> = (1..=5u8).map(|i| edit(Some(user), &[i; 10])).collect();
+    s.append(doc, 0, &rows).await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let c = &mut *conn;
+
+    assert_eq!(
+        revs_in_range(c, doc, 0, None, ANY, ANY).await,
+        [1, 2, 3, 4, 5]
+    );
+    assert_eq!(revs_in_range(c, doc, 0, None, 3, ANY).await, [1, 2, 3]);
+    assert_eq!(
+        revs_in_range(c, doc, 0, None, ANY, 25).await,
+        [1, 2],
+        "the third would cross 25"
+    );
+    assert_eq!(
+        revs_in_range(c, doc, 0, None, ANY, 30).await,
+        [1, 2, 3],
+        "exactly 30"
+    );
+    assert_eq!(
+        revs_in_range(c, doc, 0, None, ANY, 1).await,
+        [1],
+        "a first row over the limit"
+    );
+    assert_eq!(revs_in_range(c, doc, 0, Some(2), ANY, ANY).await, [1, 2]);
+    assert_eq!(revs_in_range(c, doc, 2, None, ANY, ANY).await, [3, 4, 5]);
+    assert_eq!(revs_in_range(c, doc, 2, Some(4), ANY, 15).await, [3]);
+    assert_eq!(revs_in_range(c, doc, 2, Some(4), 1, ANY).await, [3]);
+    assert!(revs_in_range(c, doc, 5, None, ANY, ANY).await.is_empty());
+    assert!(revs_in_range(c, doc, 2, Some(2), ANY, ANY).await.is_empty());
+
+    // Each row comes back whole, as `rows_after` maps it.
+    let got = rows_in_range(c, doc, 2, Some(3), ANY, ANY).await.unwrap();
+    let want = s.rows_after(doc, RowsAfter::Rev(2)).await.unwrap();
+    assert_eq!(got, want[..1]);
+    assert_eq!(got[0].update_bytes, vec![3u8; 10]);
+}
+
+/// Legacy rows are not returned until `ensure_legacy_numbered` gives them
+/// their revs.
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_in_range_leaves_out_unnumbered_legacy_rows() {
+    let (s, pool, doc) = legacy_page(3).await;
+    s.append(doc, 0, &[edit(None, b"4"), edit(None, b"5")])
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    assert_eq!(
+        revs_in_range(&mut conn, doc, 0, None, i64::MAX, i64::MAX).await,
+        [4, 5]
+    );
+    s.ensure_legacy_numbered(doc).await.unwrap();
+    assert_eq!(
+        revs_in_range(&mut conn, doc, 0, None, i64::MAX, i64::MAX).await,
+        [1, 2, 3, 4, 5]
     );
 }

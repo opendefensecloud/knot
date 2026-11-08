@@ -60,6 +60,7 @@ pub use tasks::{
 pub use updates_store::{
     APPEND_STATEMENT_TIMEOUT, DocUpdate, HistoryHead, NewUpdate, Persisted, PgUpdatesStore,
     RowsAfter, UnknownUpdateSource, UpdateSource, UpdatesStore, UpdatesStoreError, append_in_tx,
+    rows_in_range,
 };
 pub use user_store::{PgUserStore, User, UserStore, UserStoreError};
 pub use workspace_store::{
