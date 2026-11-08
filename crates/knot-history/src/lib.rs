@@ -9,16 +9,25 @@
 //!   later apply integrates it.
 //! - [`sessions`]: groups credited effects into per-author sessions and the
 //!   other timeline entries.
+//! - [`diff`]: one entry's diff on a union doc, the core of M1.4's "Show
+//!   changes".
+//! - [`words`]: the words an entry added and removed, counted in that diff.
 
 pub mod claims;
+pub mod diff;
 pub mod isolate;
 pub mod replay;
 pub mod sessions;
+pub mod words;
 
 pub use claims::{Claims, ClaimsError, Credit, ParkedClaim};
+pub use diff::{
+    ChunkKind, DiffError, EntryDiff, TextChunk, entry_diff, strip_zero_clocks, text_chunks,
+};
 pub use isolate::{IsolateError, run_isolated};
 pub use replay::{ReplayError, ReplayMode, Replayer, RowEffect, RowOutcome};
 pub use sessions::{
     Contribution, ContributionKind, EntryDraft, EntryKind, Grouper, SEAL_MARGIN, SESSION_GAP,
     UnknownEntryKind,
 };
+pub use words::{WordCounts, count_words, entry_word_counts};
