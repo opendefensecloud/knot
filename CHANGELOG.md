@@ -8,6 +8,68 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.11] - 2026-11-08
+
+### Upgrading
+- Upgrade from 0.9.10, and don't skip 0.9.10 on the way from 0.9.9:
+  this release builds on the numbered edit log that 0.9.10 starts. One
+  database migration runs on upgrade, `20261108120000_history_builder`,
+  which creates three empty tables. Its lock attempts pause page writes
+  (creating, moving, archiving or purging pages, among others) and user
+  updates for at most 100 ms each; once it has its locks it commits at
+  once. Edit saves and page loads go on. 0.9.10 pods that restart after
+  the migration commits crash-loop until new pods replace them; rolling
+  back needs a database restore. (#TBD)
+- After the upgrade, every page's history is built once in the
+  background, pages edited longest ago first. Expect extra CPU and
+  database reads for a while (about one read of `doc_updates`), and
+  watch `knot_history_builder_lag_revs` fall to 0. Pages given up are
+  left out of it and counted by `knot_history_given_up_pages`. (#TBD)
+- The builder runs one replay at a time per replica by default
+  (`history.workers: 1`), paced to half a CPU core on average
+  (`history.cpuShare: 0.5`). Unpaced, one worker can take a whole core,
+  the chart's default CPU limit for the whole pod. A worker can hold up
+  to about 192 MiB of memory at the default `history.replayMaxBytes`
+  (8 MiB), so raise `resources.limits.memory` before raising
+  `history.workers`; the chart README has the formula.
+  `history.workers: 0` turns the builder off on a replica. (#TBD)
+- The database grows by checkpoints, about as much again as
+  `doc_updates`, and by history entries (small). Backups grow the
+  same. (#TBD)
+- A page whose history cannot be built is given up after ten failed
+  attempts, two replay timeouts or three crashes in a row, or when its
+  replay would read more than `history.replayMaxBytes`. The chart
+  README says how to find such pages and re-enable them. (#TBD)
+- The old snapshot thinning is unchanged. (#TBD)
+
+### Added
+- knot now builds every page's history in the background: who edited,
+  when, and how much, per editing session, back to the page's creation
+  (or to the 0.9.9 upgrade for older pages). The History drawer is
+  unchanged in this release; the new timeline arrives in the next. (#TBD)
+- `GET /api/docs/{id}/history/entries` lists a page's history entries
+  for its editors. The web app doesn't use it yet, and its format may
+  change in the next release. (#TBD)
+- Chart values `history.workers`, `history.replayMaxBytes` and
+  `history.cpuShare` (`KNOT_HISTORY_WORKERS`,
+  `KNOT_HISTORY_REPLAY_MAX_BYTES`, `KNOT_HISTORY_CPU_SHARE`). (#TBD)
+- Metrics `knot_history_table_bytes`, `knot_history_builder_lag_revs`,
+  `knot_history_given_up_pages`, `knot_history_replay_threads_stalled`,
+  `knot_history_rows_built_total`, `knot_history_rows_unapplied_total`,
+  `knot_history_rows_parked_total`, `knot_history_gap_total`,
+  `knot_history_snapshots_unchecked_total`,
+  `knot_history_build_failures_total`,
+  `knot_history_replay_timeouts_total`,
+  `knot_history_pages_given_up_total`,
+  `knot_history_words_skipped_total` and `knot_history_replay_seconds`.
+  The Helm chart README says which are worth an alert. (#TBD)
+- `knot-server history-stats` also reports checkpoint and entry
+  sizes. (#TBD)
+
+### Changed
+- `GET /api/docs/{id}/contributors` adds `former` to each person
+  (always `false` for now). (#TBD)
+
 ## [0.9.10] - 2026-11-08
 
 ### Upgrading
@@ -1224,7 +1286,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.10...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.11...HEAD
+[0.9.11]: https://github.com/opendefensecloud/knot/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/opendefensecloud/knot/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/opendefensecloud/knot/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/opendefensecloud/knot/compare/v0.9.7...v0.9.8
