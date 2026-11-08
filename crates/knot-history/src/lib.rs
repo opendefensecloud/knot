@@ -18,7 +18,11 @@
 //!   checkpoints), and the window replay every other reader uses.
 //! - [`genesis`]: a page's history before `history_since`, as one
 //!   checkpoint and its pre-rollout entries.
+//! - [`builder`]: the background builder that claims dirty pages, runs
+//!   genesis and passes on them and writes what they built (its SQL lives
+//!   in the crate-private `store`).
 
+pub mod builder;
 pub mod canonical;
 pub mod claims;
 pub mod diff;
@@ -27,8 +31,13 @@ pub mod isolate;
 pub mod pass;
 pub mod replay;
 pub mod sessions;
+mod store;
 pub mod words;
 
+pub use builder::{
+    BUILDER_VERSION, BuildLimits, Builder, PassResult, TestHooks, failure_backoff, history_permits,
+    pacing_delay,
+};
 pub use claims::{Claims, ClaimsError, Credit, ParkedClaim};
 pub use diff::{
     ChunkKind, DiffError, EntryDiff, TextChunk, entry_diff, strip_zero_clocks, text_chunks,

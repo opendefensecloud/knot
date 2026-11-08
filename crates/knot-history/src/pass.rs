@@ -225,7 +225,8 @@ pub struct ReplayHooks {
     pub corrupt_merge_at: Option<i64>,
     /// Sleeps at that row's stage, like `panic_at_rev`.
     pub sleep_at_rev: Option<(i64, Duration)>,
-    /// Sleeps inside the first emit, at `Stage::Emit`.
+    /// Sleeps inside the first emit, at `Stage::Emit` (in genesis, the
+    /// genesis checkpoint's).
     pub sleep_at_emit: Option<Duration>,
     /// Sleeps in genesis at `Stage::Checkpoint` while merging the baseline
     /// with that id.

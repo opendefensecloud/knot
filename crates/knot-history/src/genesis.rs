@@ -172,6 +172,9 @@ pub fn build_genesis(input: GenesisInput) -> Result<GenesisOutput, GenesisError>
     stats.retried = parked.retried;
 
     progress.set(Stage::Emit(genesis_rev));
+    if let Some(d) = hooks.sleep_at_emit {
+        std::thread::sleep(d);
+    }
     let state = replayer.encode_state();
     let mut checkpoint = verified_state(&replayer, state).ok_or(GenesisError::Encode)?;
     progress.set(Stage::Idle);

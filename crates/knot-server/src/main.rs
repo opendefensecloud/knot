@@ -160,12 +160,15 @@ async fn run_server(cfg: Config) {
     };
 
     // 3b. CRDT bus + Rooms registry (only when a real pool exists).
-    let (bus, rooms_v2, reindex_rx) = if let Some(pool) = pool.clone() {
+    let (bus, rooms_v2, reindex_rx, history_updates) = if let Some(pool) = pool.clone() {
         match knot_crdt::PgBus::connect(&cfg.database_url).await {
             Ok(b) => {
                 let bus: std::sync::Arc<dyn knot_crdt::Bus> = std::sync::Arc::new(b);
                 let updates: std::sync::Arc<dyn knot_storage::UpdatesStore> =
                     std::sync::Arc::new(knot_storage::PgUpdatesStore::new(pool.clone()));
+                // The history builder reads the same log (spawned below,
+                // once the shutdown token exists).
+                let history_updates = updates.clone();
                 let snapshots: std::sync::Arc<dyn knot_storage::SnapshotStore> =
                     std::sync::Arc::new(knot_storage::PgSnapshotStore::new(pool.clone()));
                 let policy = knot_crdt::SnapshotPolicy {
@@ -189,7 +192,12 @@ async fn run_server(cfg: Config) {
                     .with_dirty_tx(dirty_tx),
                 );
                 knot_crdt::spawn_gc(pool.clone(), snapshots);
-                (Some(bus), Some(rooms), Some(dirty_rx))
+                (
+                    Some(bus),
+                    Some(rooms),
+                    Some(dirty_rx),
+                    Some(history_updates),
+                )
             }
             Err(e) => {
                 tracing::error!(error=?e, "PgBus connect failed");
@@ -202,7 +210,8 @@ async fn run_server(cfg: Config) {
             Option<std::sync::Arc<dyn knot_crdt::Bus>>,
             Option<std::sync::Arc<knot_crdt::Rooms>>,
             Option<tokio::sync::mpsc::Receiver<uuid::Uuid>>,
-        ) = (None, None, None);
+            Option<std::sync::Arc<dyn knot_storage::UpdatesStore>>,
+        ) = (None, None, None, None);
         none
     };
 
@@ -276,6 +285,26 @@ async fn run_server(cfg: Config) {
         knot_server::reindex::spawn_with_sweep(state.clone(), rx);
         tracing::info!("reindex worker spawned");
     }
+    // The page history builder, after `state`: it stops with the shutdown
+    // token that lives in AppState.
+    let mut history_builder = None;
+    if let (Some(pool), Some(history_updates)) = (state.pool.clone(), history_updates) {
+        if cfg.history_workers == 0 {
+            tracing::warn!("history builder disabled");
+        } else {
+            // M1.4: share with AppState for the view endpoint
+            let history_permits = knot_history::history_permits(cfg.history_workers as usize);
+            let handle = std::sync::Arc::new(knot_history::Builder::new(
+                pool,
+                history_updates,
+                knot_history::BuildLimits::from_config(&cfg),
+                history_permits.clone(),
+            ))
+            .spawn(state.shutdown.clone());
+            history_builder = Some(handle);
+            tracing::info!("history builder spawned");
+        }
+    }
     if state.pool.is_some() {
         knot_server::archive::spawn_purge_job(state.clone());
         tracing::info!(
@@ -336,6 +365,11 @@ async fn run_server(cfg: Config) {
     if let Some(rooms) = rooms {
         let pending = rooms.drain_all(knot_crdt::SHUTDOWN_DRAIN).await;
         tracing::info!(pending, "page writers drained");
+    }
+    // The builder released its leases when the token was cancelled; wait
+    // briefly so that statement is not cut off by the exit.
+    if let Some(handle) = history_builder {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 
     // Normal (drained) exit: flush traces.
