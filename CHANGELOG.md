@@ -9,7 +9,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ## [Unreleased]
 
 ### Upgrading
-- One additive database migration (`20261106120000_api_keys_and_bots`)
+- One additive database migration (`20261108120000_api_keys_and_bots`)
   adds `users.kind`, the `api_keys` table and triggers. It needs no
   downtime: no table is rewritten, and its two checks on `users` each scan
   that table once under the lock. It waits at most 5 seconds for a table
@@ -86,6 +86,112 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   UUID spelling the request used (upper case, without hyphens, braced,
   `urn:uuid:`), and removed by any of them, so one person never holds
   several rows that member removal would miss.
+
+## [0.9.10] - 2026-11-08
+
+### Upgrading
+- Upgrade from 0.9.9, and don't skip 0.9.10 on the way to a later
+  release. Five database migrations run on upgrade (the Helm chart's
+  migrate hook applies them), each in its own transaction except the
+  index build. Don't upgrade while `pg_dump`, another long transaction
+  or an anti-wraparound autovacuum runs on the database: every one of
+  the five waits for or gives up on them, and when a later one gives up
+  the earlier ones have committed, so 0.9.9 pods that restart
+  crash-loop. Don't re-run the upgrade while the migrate Job is still
+  running: that deletes the running Job and orphans its index build in
+  the database. With `migrations.enabled=false`, run
+  `knot-server migrate` to completion before rolling out pods:
+  otherwise every new pod migrates at startup, before it answers its
+  liveness probe, which can kill it mid-build. In the four migrations
+  other than the index build, lock attempts and the give-up message
+  work as in 0.9.9; their autovacuum handling no longer pauses readers.
+  Pass `helm upgrade --timeout` of the count time plus twice the index
+  build time plus 8 minutes. 0.9.9 pods that restart after the first
+  migration commits crash-loop until new pods replace them; rolling
+  back needs a database restore. The Helm chart README has the details,
+  what to do when the upgrade halts, and a query that shows what holds
+  the locks.
+  - `20261107120000_history_log_columns` takes its locks in attempts of
+    at most 100 ms, each of which pauses all access to `doc_updates`
+    and `doc_snapshots`, page loads included; then it makes
+    catalog-only changes.
+  - `20261107120001_history_heads` counts the stored edits per page.
+    Meanwhile edit saves and duplicates wait, and on 0.9.9 pods a task
+    toggle, accepted suggestion, import or restore holds up its open
+    page. Each waiting save holds a database connection, so on a busy
+    instance the waiting saves can fill each 0.9.9 pod's pool, after
+    which pages stop loading and API calls fail until the count
+    commits. Size the pause by the table, not its index, since nothing
+    guarantees an index-only count: check
+    `SELECT pg_size_pretty(pg_relation_size('doc_updates'))`
+    beforehand and, when `doc_updates` is large, upgrade in a quiet
+    window.
+  - `20261107120002_history_heads_fk`: page writes, edit saves and
+    snapshot writes pause for one pass over the per-page rows; on 0.9.9
+    pods an open page waiting on a task toggle, accepted suggestion,
+    import or snapshot is held up too.
+  - `20261107120003_history_rev_index` is built while knot keeps
+    serving. It has no lock loop and no lock timeout, so it waits as
+    long as needed behind an anti-wraparound autovacuum or a long
+    transaction on `doc_updates`: check `pg_stat_activity` before
+    upgrading. It also waits for transactions older than itself, so not
+    during `pg_dump`, and don't restart knot pods meanwhile: a starting
+    pod waits on the migration lock, and the build may then be aborted.
+    If the migrate Job dies during the build, the build may keep
+    running in the database: check `pg_stat_progress_create_index`
+    before re-running, and wait for it or end it with
+    `pg_terminate_backend`.
+  - `20261107120004_history_rev_index_check` does nothing unless the
+    index build was interrupted or aborted; then all access to page
+    edits, open 0.9.9 pages included, pauses for one index build of
+    `doc_updates`. (#82)
+- While 0.9.9 and 0.9.10 pods run side by side, editors on a 0.9.9 pod
+  may not see edits saved by other pods while the upgrade runs
+  (especially edits made during the third migration's pause) until
+  they reconnect. Nothing is lost, and the page is complete once it
+  opens on 0.9.10. On an instance with many concurrent editors, scale
+  0.9.9 to one replica or pick a quiet window. A page's Markdown
+  export, My Tasks entries and search results may stay stale until the
+  page is next edited, and an edit a 0.9.9 pod failed to save during
+  the rollout may be lost unless its author is still connected. (#82)
+- The first time each page edited before the upgrade opens, knot
+  numbers its stored edits once and replays its whole stored history:
+  that first load is slower, and `doc_updates` grows by up to the size
+  of the renumbered rows until autovacuum reclaims it. (#82)
+
+### Added
+- Metrics `knot_writer_flush_seconds`, `knot_writer_flush_retries_total`,
+  `knot_room_rev_gap_total`, `knot_room_row_apply_errors_total`,
+  `knot_room_updates_persisted_raw_total` and
+  `knot_history_legacy_mismatch_total`. The Helm chart README says what
+  `knot_room_row_apply_errors_total` and
+  `knot_history_legacy_mismatch_total` mean and when to report them. (#82)
+
+### Changed
+- Edits that could not be saved during a database outage are retried in
+  order instead of being dropped, also after their editor left and
+  when a pod shuts down (for up to 10 s). The chart's default
+  `terminationGracePeriodSeconds` is now 50 to leave room for it; a
+  shorter value can lose unsaved edits when a pod stops during a
+  database outage. (#82)
+- A save that waits on a lock gives up after 8 s in the database and is
+  retried, so a stalled save no longer holds a database connection. (#82)
+- After a long outage or a refused save, editors reconnect and resend
+  their changes, and a page reopens on a pod only once that pod has
+  saved what it held. (#82)
+- Changes made by knot itself (task checkboxes, imports, templates,
+  restores, accepted suggestions) reach other editors only once they
+  are saved; during an outage they fail after about 5 to 25 s and the
+  page's editors reconnect. (#82)
+- A page whose stored edits include one that cannot be applied opens
+  again (it used to fail to load). (#82)
+
+### Fixed
+- A page open on several pods could miss an edit another pod saved at
+  the same moment, until the page's room restarted. Pages that already
+  missed one this way get it back the first time they open on 0.9.10. (#82)
+- Purging a page while someone edits it no longer risks a database
+  deadlock. (#82)
 
 ## [0.9.9] - 2026-11-06
 
@@ -1197,7 +1303,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.9...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.10...HEAD
+[0.9.10]: https://github.com/opendefensecloud/knot/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/opendefensecloud/knot/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/opendefensecloud/knot/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/opendefensecloud/knot/compare/v0.9.6...v0.9.7

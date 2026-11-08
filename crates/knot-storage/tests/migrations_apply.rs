@@ -3,8 +3,35 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use knot_test_support::old_sql::{OLD_INSERT_UPDATES_SQL, OLD_SNAPSHOT_UPSERT_SQL};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+/// A 0.9.10 snapshot write, stamped with the rev it holds the log up to and
+/// the content epoch it was taken at.
+const STAMPED_SNAPSHOT_INSERT_SQL: &str = "INSERT INTO doc_snapshots
+             (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch)
+             VALUES ($1, $2, $3, $4, $5, $6)";
+
+/// The shape of 0.9.10's stamped snapshot upsert (`PgSnapshotStore::insert_stamped`).
+const STAMPED_SNAPSHOT_UPSERT_SQL: &str = "INSERT INTO doc_snapshots
+             (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (doc_id, snapshot_seq) DO UPDATE
+             SET state_bytes = EXCLUDED.state_bytes,
+                 state_vector = EXCLUDED.state_vector,
+                 created_at = now(),
+                 snapshot_rev = EXCLUDED.snapshot_rev,
+                 epoch = EXCLUDED.epoch";
+
+/// The second statement of every 0.9.10 flush (plan, Global Constraints):
+/// `$1` the page, `$2` the number of rows it writes.
+const HEADS_UPSERT_SQL: &str =
+    "INSERT INTO doc_history_heads AS h (doc_id, head_rev, dirty, last_write_at)
+     VALUES ($1, $2, true, clock_timestamp())
+     ON CONFLICT (doc_id) DO UPDATE
+     SET head_rev = h.head_rev + $2, dirty = true, last_write_at = clock_timestamp()
+     RETURNING h.head_rev - $2 AS base, h.content_epoch";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn migrations_apply_cleanly() {
@@ -41,6 +68,7 @@ async fn migrations_apply_cleanly() {
         "comments",
         "doc_contributors",
         "doc_history_baselines",
+        "doc_history_heads",
         "doc_markdown_cache",
         "doc_markdown_sweep_attempts",
         "doc_snapshots",
@@ -1467,15 +1495,1694 @@ async fn history_since_is_the_moment_deletes_stopped() {
 }
 
 // ---------------------------------------------------------------------------
-// API keys and bots (20261106120000_api_keys_and_bots)
+// Page history M1.2: the lock helper and the log columns
 // ---------------------------------------------------------------------------
 
-/// The SQLSTATE of a database error, or `None` for any other error.
 fn sqlstate(e: &sqlx::Error) -> Option<String> {
     e.as_database_error()
         .and_then(|d| d.code())
         .map(|c| c.into_owned())
 }
+
+/// The deadlock M1.1's loop was written for, now through `knot_lock_tables`:
+/// a page write T1 holds a page row, an edit save T2 holds ROW EXCLUSIVE on
+/// `doc_updates` and waits for that row in its FK check, and T1 then writes
+/// `documents`. A migrator that waited for `doc_updates` while holding
+/// `documents` would close the cycle; the helper lets go and tries again.
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_helper_backs_off_instead_of_deadlocking() {
+    use std::time::{Duration, Instant};
+
+    let (pool, _, doc) = history_fixture().await;
+
+    let mut t1 = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM documents WHERE id = $1 FOR UPDATE")
+        .bind(doc)
+        .execute(&mut *t1)
+        .await
+        .unwrap();
+
+    let t2 = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await?;
+            sqlx::query("INSERT INTO doc_updates (doc_id, update_bytes) VALUES ($1, '\\x01')")
+                .bind(doc)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await
+        }
+    });
+    // T2 waits for T1's page row, holding ROW EXCLUSIVE on doc_updates.
+    knot_test_support::locks::wait_for_lock_waits(&pool, 1).await;
+
+    let m = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let started = Instant::now();
+            let mut tx = pool.begin().await?;
+            sqlx::query(
+                "SELECT knot_lock_tables('t', ARRAY['documents','doc_updates']::regclass[],
+                                         'SHARE ROW EXCLUSIVE', '20 seconds')",
+            )
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(started.elapsed())
+        }
+    });
+    // M has failed an attempt on doc_updates and let go of documents.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    sqlx::query("UPDATE documents SET title = 'x' WHERE id = $1")
+        .bind(doc)
+        .execute(&mut *t1)
+        .await
+        .unwrap();
+    t1.commit().await.unwrap();
+
+    let t2 = t2.await.unwrap();
+    let m = m.await.unwrap();
+    assert!(
+        t2.is_ok() && m.is_ok(),
+        "no 40P01 anywhere: t2 {t2:?}, m {m:?}"
+    );
+    let m_elapsed = m.unwrap();
+    assert!(m_elapsed < Duration::from_secs(20), "{m_elapsed:?}");
+    assert!(
+        m_elapsed >= Duration::from_millis(250),
+        "M got doc_updates only after T2 committed: {m_elapsed:?}"
+    );
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 3);
+}
+
+/// After `give_up_after` the helper raises, naming the session that holds a
+/// conflicting lock, and not one whose lock does not conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_helper_gives_up_naming_the_holder() {
+    let (pool, _, _) = history_fixture().await;
+
+    let mut h = pool.begin().await.unwrap();
+    let h_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *h)
+        .await
+        .unwrap();
+    sqlx::query("LOCK TABLE doc_updates IN ROW EXCLUSIVE MODE")
+        .execute(&mut *h)
+        .await
+        .unwrap();
+    // A reader: ACCESS SHARE does not conflict with SHARE.
+    let mut r = pool.begin().await.unwrap();
+    let r_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *r)
+        .await
+        .unwrap();
+    sqlx::query("SELECT count(*) FROM doc_updates")
+        .execute(&mut *r)
+        .await
+        .unwrap();
+
+    let mut m = pool.begin().await.unwrap();
+    let e = sqlx::query(
+        "SELECT knot_lock_tables('t', ARRAY['doc_updates']::regclass[], 'SHARE', '1 second')",
+    )
+    .execute(&mut *m)
+    .await
+    .unwrap_err();
+    let msg = e.to_string();
+    assert!(
+        msg.contains("t: could not get SHARE on doc_updates within 1 s"),
+        "{msg}"
+    );
+    assert!(msg.contains(&format!("pid {h_pid}")), "{msg}");
+    assert!(!msg.contains(&format!("pid {r_pid}")), "{msg}");
+    assert!(msg.contains("The migrate Job will retry."), "{msg}");
+    drop(m);
+    r.rollback().await.unwrap();
+    h.rollback().await.unwrap();
+}
+
+/// `lock_mode` is spliced into a LOCK statement, so only the three modes the
+/// migrations use are accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_helper_refuses_an_unknown_mode() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    for mode in [
+        "ROW SHARE; DROP TABLE doc_updates",
+        "ROW EXCLUSIVE",
+        "share",
+    ] {
+        let e = sqlx::query("SELECT knot_lock_tables('t', ARRAY['doc_updates']::regclass[], $1)")
+            .bind(mode)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(sqlstate(&e).as_deref(), Some("22023"), "{mode}: {e}");
+        assert!(e.to_string().contains("lock mode"), "{mode}: {e}");
+    }
+    let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('doc_updates')::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(exists.as_deref(), Some("doc_updates"));
+}
+
+/// The lone wait (for an autovacuum worker's deadlock-check cancel) asks for
+/// SHARE UPDATE EXCLUSIVE whatever the target mode: in ACCESS EXCLUSIVE it
+/// would stop every page load for about 1.5 s. An autovacuum can't be staged
+/// on demand, so this pins the function's source against a revert.
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_helper_lone_wait_never_requests_the_target_mode() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let def: String = sqlx::query_scalar("SELECT pg_get_functiondef('knot_lock_tables'::regproc)")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let lines: Vec<&str> = def.lines().collect();
+    let locks: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains("LOCK TABLE"))
+        .collect();
+    assert_eq!(
+        locks.len(),
+        2,
+        "one attempt LOCK and one lone-wait LOCK: {locks:#?}"
+    );
+    let khlw1 = lines
+        .iter()
+        .position(|l| l.contains("ERRCODE = 'KHLW1'"))
+        .expect("the lone wait ends by raising KHLW1");
+    let lone = lines[..khlw1]
+        .iter()
+        .rev()
+        .find(|l| l.contains("LOCK TABLE"))
+        .expect("the lone wait's LOCK");
+    assert!(lone.contains("SHARE UPDATE EXCLUSIVE"), "{lone}");
+    assert!(!lone.contains("lock_mode"), "{lone}");
+}
+
+/// Migration 1 only adds nullable columns and a NOT VALID check, so the
+/// statements 0.9.9 pods keep running during the upgrade still work.
+#[tokio::test(flavor = "multi_thread")]
+async fn log_columns_exist_and_old_statements_still_work() {
+    use chrono::{DateTime, Utc};
+
+    let pool = knot_test_support::fresh_db().await.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let doc = seed_doc_with_updates(&pool, ws, user, None, 0).await;
+
+    let cols: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT table_name::text, column_name::text, data_type::text, is_nullable::text
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND ((table_name = 'doc_updates' AND column_name IN ('rev', 'source', 'meta', 'epoch'))
+              OR (table_name = 'doc_snapshots' AND column_name IN ('snapshot_rev', 'epoch')))
+          ORDER BY table_name, column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let cols: Vec<[&str; 4]> = cols
+        .iter()
+        .map(|(t, c, d, n)| [t.as_str(), c.as_str(), d.as_str(), n.as_str()])
+        .collect();
+    assert_eq!(
+        cols,
+        [
+            ["doc_snapshots", "epoch", "integer", "YES"],
+            ["doc_snapshots", "snapshot_rev", "bigint", "YES"],
+            ["doc_updates", "epoch", "integer", "YES"],
+            ["doc_updates", "meta", "jsonb", "YES"],
+            ["doc_updates", "rev", "bigint", "YES"],
+            ["doc_updates", "source", "text", "YES"],
+        ]
+    );
+    let validated: bool = sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint WHERE conname = 'doc_updates_source_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !validated,
+        "added NOT VALID: no scan under ACCESS EXCLUSIVE"
+    );
+
+    // 0.9.9's edit save.
+    let seqs: Vec<i64> = sqlx::query_scalar(OLD_INSERT_UPDATES_SQL)
+        .bind(doc)
+        .bind(vec![Some(user), None])
+        .bind(vec![vec![1u8], vec![2u8]])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(seqs.len(), 2);
+    // 0.9.9's boot read.
+    type OldRow = (i64, Uuid, Vec<u8>, Option<Uuid>, DateTime<Utc>);
+    let rows: Vec<OldRow> = sqlx::query_as(
+        "SELECT seq, doc_id, update_bytes, by_user_id, created_at
+           FROM doc_updates WHERE doc_id = $1 AND seq > $2 ORDER BY seq",
+    )
+    .bind(doc)
+    .bind(0_i64)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|(s, d, b, u, _)| (*s, *d, b.clone(), *u))
+            .collect::<Vec<_>>(),
+        [
+            (seqs[0], doc, vec![1u8], Some(user)),
+            (seqs[1], doc, vec![2u8], None),
+        ]
+    );
+    let unlabelled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM doc_updates
+          WHERE doc_id = $1 AND source IS NULL AND meta IS NULL AND epoch IS NULL",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unlabelled, 2);
+
+    // 0.9.9's snapshot upsert, as an insert and on conflict.
+    for bytes in [b"one".as_slice(), b"two".as_slice()] {
+        sqlx::query(OLD_SNAPSHOT_UPSERT_SQL)
+            .bind(doc)
+            .bind(seqs[1])
+            .bind(bytes)
+            .bind(b"sv".as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let snap: (Vec<u8>, Option<i64>, Option<i32>) = sqlx::query_as(
+        "SELECT state_bytes, snapshot_rev, epoch FROM doc_snapshots WHERE doc_id = $1",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(snap, (b"two".to_vec(), None, None));
+
+    let label = |source: &'static str| {
+        sqlx::query(
+            "INSERT INTO doc_updates (doc_id, update_bytes, source) VALUES ($1, '\\x03', $2)",
+        )
+        .bind(doc)
+        .bind(source)
+        .execute(&pool)
+    };
+    let e = label("bogus").await.unwrap_err();
+    assert_eq!(sqlstate(&e).as_deref(), Some("23514"), "{e}");
+    label("edit").await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Page history M1.2: the heads table, the rev trigger and the epoch triggers
+// ---------------------------------------------------------------------------
+
+/// 0.9.9's schema: M1.1's last migration.
+const V0_9_9_SCHEMA: i64 = 20261104120001;
+const HISTORY_LOG_COLUMNS: i64 = 20261107120000;
+const HISTORY_HEADS: i64 = 20261107120001;
+
+fn kh002(e: &sqlx::Error) -> bool {
+    sqlstate(e).as_deref() == Some("KH002")
+}
+
+/// The embedded migrations up to and including `last`.
+fn migrator_up_to(last: i64) -> sqlx::migrate::Migrator {
+    let full = sqlx::migrate!("../../migrations");
+    assert!(
+        full.migrations.iter().any(|m| m.version == last),
+        "migration {last} not embedded (cargo clean -p knot-storage?)"
+    );
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            full.migrations
+                .iter()
+                .filter(|m| m.version <= last)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    }
+}
+
+async fn migrate_up_to(pool: &PgPool, last: i64) {
+    migrator_up_to(last)
+        .run(pool)
+        .await
+        .unwrap_or_else(|e| panic!("migrate up to {last}: {e}"));
+}
+
+async fn migrate_all(pool: &PgPool) {
+    sqlx::migrate!("../../migrations")
+        .run(pool)
+        .await
+        .expect("migrate");
+}
+
+/// A fresh database with no migrations applied, and a pool on it.
+async fn bare_db(max_connections: u32) -> (String, PgPool) {
+    let url = knot_test_support::fresh_db_url().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect(&url)
+        .await
+        .expect("connect");
+    (url, pool)
+}
+
+async fn try_new_page<'e>(
+    ex: impl sqlx::PgExecutor<'e>,
+    ws: Uuid,
+    user: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, title, sort_key, created_by)
+         VALUES ($1, 'D', gen_random_uuid()::text, $2) RETURNING id",
+    )
+    .bind(ws)
+    .bind(user)
+    .fetch_one(ex)
+    .await
+}
+
+/// A top-level page with a key of its own, so any number fit one workspace.
+async fn new_page(pool: &PgPool, ws: Uuid, user: Uuid) -> Uuid {
+    try_new_page(pool, ws, user).await.unwrap()
+}
+
+/// `n` rows inserted one by one with a raw INSERT (no rev, no epoch).
+async fn raw_rows(pool: &PgPool, doc: Uuid, n: usize) {
+    for _ in 0..n {
+        sqlx::query("INSERT INTO doc_updates (doc_id, update_bytes) VALUES ($1, '\\x01')")
+            .bind(doc)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
+/// 0.9.9's edit save of `n` rows by `user`; returns their seqs.
+async fn old_insert<'e>(
+    ex: impl sqlx::PgExecutor<'e>,
+    doc: Uuid,
+    user: Option<Uuid>,
+    n: usize,
+) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar(OLD_INSERT_UPDATES_SQL)
+        .bind(doc)
+        .bind(vec![user; n])
+        .bind(vec![vec![1u8]; n])
+        .fetch_all(ex)
+        .await
+}
+
+/// 0.9.9's snapshot write.
+async fn old_snapshot<'e>(
+    ex: impl sqlx::PgExecutor<'e>,
+    doc: Uuid,
+    seq: i64,
+    bytes: &[u8],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(OLD_SNAPSHOT_UPSERT_SQL)
+        .bind(doc)
+        .bind(seq)
+        .bind(bytes)
+        .bind(b"sv".as_slice())
+        .execute(ex)
+        .await
+        .map(drop)
+}
+
+/// A stamped snapshot write: (doc, seq, bytes, rev, epoch).
+async fn stamped_snapshot<'e>(
+    ex: impl sqlx::PgExecutor<'e>,
+    sql: &'static str,
+    doc: Uuid,
+    seq: i64,
+    bytes: &[u8],
+    rev: i64,
+    epoch: i32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql)
+        .bind(doc)
+        .bind(seq)
+        .bind(bytes)
+        .bind(b"sv".as_slice())
+        .bind(rev)
+        .bind(epoch)
+        .execute(ex)
+        .await
+        .map(drop)
+}
+
+/// (state_bytes, snapshot_rev, epoch) of one snapshot.
+async fn snapshot_at(pool: &PgPool, doc: Uuid, seq: i64) -> (Vec<u8>, Option<i64>, Option<i32>) {
+    sqlx::query_as(
+        "SELECT state_bytes, snapshot_rev, epoch FROM doc_snapshots
+          WHERE doc_id = $1 AND snapshot_seq = $2",
+    )
+    .bind(doc)
+    .bind(seq)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// (head_rev, legacy_rows, content_epoch, dirty, last_write_at).
+type HeadsRow = (i64, i64, i32, bool, Option<chrono::DateTime<chrono::Utc>>);
+
+async fn heads_row(pool: &PgPool, doc: Uuid) -> Option<HeadsRow> {
+    sqlx::query_as(
+        "SELECT head_rev, legacy_rows, content_epoch, dirty, last_write_at
+           FROM doc_history_heads WHERE doc_id = $1",
+    )
+    .bind(doc)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+async fn rev_of(pool: &PgPool, seq: i64) -> Option<i64> {
+    sqlx::query_scalar("SELECT rev FROM doc_updates WHERE seq = $1")
+        .bind(seq)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The page's legacy rows keep rev NULL, and its numbered rows are exactly
+/// `legacy_rows + 1 ..= head_rev`, each once. Returns (legacy_rows, head_rev).
+async fn assert_gapless(pool: &PgPool, doc: Uuid) -> (i64, i64) {
+    let (head_rev, legacy_rows, ..) = heads_row(pool, doc).await.expect("a heads row");
+    let unnumbered: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM doc_updates WHERE doc_id = $1 AND rev IS NULL")
+            .bind(doc)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(unnumbered, legacy_rows, "{doc}: legacy rows keep rev NULL");
+    let revs: Vec<i64> = sqlx::query_scalar(
+        "SELECT rev FROM doc_updates WHERE doc_id = $1 AND rev IS NOT NULL ORDER BY rev",
+    )
+    .bind(doc)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        revs,
+        (legacy_rows + 1..=head_rev).collect::<Vec<_>>(),
+        "{doc}: revs after the legacy rows, gapless"
+    );
+    (legacy_rows, head_rev)
+}
+
+fn err_text(e: sqlx::Error) -> String {
+    format!("{e} (SQLSTATE {:?})", sqlstate(&e))
+}
+
+/// What one background loop of the concurrency tests saw.
+#[derive(Debug, Default)]
+struct LoopReport {
+    runs: u64,
+    errors: Vec<String>,
+}
+
+struct Loop {
+    handle: tokio::task::JoinHandle<LoopReport>,
+    /// The longest single run so far, in microseconds.
+    longest_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Loop {
+    fn longest(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.longest_us.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// Runs `body(pool, n)` for n = 0, 1, ... until `stop`, pausing `pause`
+/// after each run, recording every error and the longest run; closes `pool`
+/// at the end (a backend flushes its statistics when it exits).
+fn spawn_loop<F, Fut>(
+    pool: PgPool,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pause: std::time::Duration,
+    body: F,
+) -> Loop
+where
+    F: Fn(PgPool, u64) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    use std::sync::atomic::Ordering::SeqCst;
+    let longest_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let handle = tokio::spawn({
+        let longest_us = longest_us.clone();
+        async move {
+            let mut report = LoopReport::default();
+            while !stop.load(SeqCst) {
+                let started = std::time::Instant::now();
+                if let Err(e) = body(pool.clone(), report.runs).await {
+                    report.errors.push(e);
+                }
+                longest_us.fetch_max(started.elapsed().as_micros() as u64, SeqCst);
+                report.runs += 1;
+                if !pause.is_zero() {
+                    tokio::time::sleep(pause).await;
+                }
+            }
+            pool.close().await;
+            report
+        }
+    });
+    Loop { handle, longest_us }
+}
+
+async fn loop_pool(url: &str) -> PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(url)
+        .await
+        .expect("loop pool")
+}
+
+/// Rows a 0.9.9 pod inserts after the upgrade are numbered after the page's
+/// legacy rows, by the trigger, in commit order.
+#[tokio::test(flavor = "multi_thread")]
+async fn old_style_inserts_are_numbered_after_the_legacy_rows() {
+    use chrono::{DateTime, Utc};
+
+    let (_url, pool) = bare_db(4).await;
+    migrate_up_to(&pool, HISTORY_LOG_COLUMNS).await;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let d = new_page(&pool, ws, user).await;
+    raw_rows(&pool, d, 3).await;
+    migrate_all(&pool).await;
+
+    let (head_rev, legacy_rows, epoch, dirty, last_write_at) = heads_row(&pool, d).await.unwrap();
+    assert_eq!((head_rev, legacy_rows, epoch, dirty), (3, 3, 0, true));
+    assert!(last_write_at.is_some(), "seeded rows are never NULL");
+
+    // A builder cleared the row: the ON CONFLICT arm must set both again.
+    sqlx::query(
+        "UPDATE doc_history_heads SET dirty = false, last_write_at = '2000-01-01'
+          WHERE doc_id = $1",
+    )
+    .bind(d)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let s4 = old_insert(&pool, d, Some(user), 1).await.unwrap()[0];
+    let s5 = old_insert(&pool, d, Some(user), 1).await.unwrap()[0];
+    assert_eq!(rev_of(&pool, s4).await, Some(4));
+    assert_eq!(rev_of(&pool, s5).await, Some(5));
+    assert_gapless(&pool, d).await;
+    let at = |seq: i64| {
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT created_at FROM doc_updates WHERE seq = $1")
+            .bind(seq)
+            .fetch_one(&pool)
+    };
+    assert!(at(s5).await.unwrap() >= at(s4).await.unwrap());
+    let (head_rev, _, _, dirty, last_write_at) = heads_row(&pool, d).await.unwrap();
+    assert_eq!((head_rev, dirty), (5, true));
+    let cleared: DateTime<Utc> = "2000-01-01T00:00:00Z".parse().unwrap();
+    assert!(last_write_at.unwrap() > cleared);
+
+    // Tests and tools stamp rows explicitly: that timestamp stays.
+    let explicit: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+    let s6: i64 = sqlx::query_scalar(
+        "INSERT INTO doc_updates (doc_id, update_bytes, created_at)
+         VALUES ($1, '\\x01', $2) RETURNING seq",
+    )
+    .bind(d)
+    .bind(explicit)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(at(s6).await.unwrap(), explicit);
+    assert_eq!(rev_of(&pool, s6).await, Some(6));
+
+    // A page with no heads row yet: the trigger's INSERT arm starts at rev 1.
+    let n = new_page(&pool, ws, user).await;
+    assert_eq!(heads_row(&pool, n).await, None);
+    let s = old_insert(&pool, n, None, 1).await.unwrap()[0];
+    assert_eq!(rev_of(&pool, s).await, Some(1));
+    let (head_rev, legacy_rows, epoch, dirty, last_write_at) = heads_row(&pool, n).await.unwrap();
+    assert_eq!((head_rev, legacy_rows, epoch, dirty), (1, 0, 0, true));
+    assert!(last_write_at.is_some());
+}
+
+/// Spike "migration ordering": 0.9.9 saves keep coming while the heads
+/// migration runs, and every one of them is either counted as legacy or
+/// numbered by the trigger, never both, never neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn old_inserts_racing_the_heads_migration_are_counted_exactly() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::time::Duration;
+
+    let (url, pool) = bare_db(4).await;
+    migrate_up_to(&pool, HISTORY_LOG_COLUMNS).await;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let a = new_page(&pool, ws, user).await;
+    let b = new_page(&pool, ws, user).await;
+    raw_rows(&pool, a, 5).await;
+    raw_rows(&pool, b, 5).await;
+    // A quiet page as the pre-M1.1 GC left it: a snapshot and no rows.
+    let c = new_page(&pool, ws, user).await;
+    old_snapshot(&pool, c, 7, b"c").await.unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let inserts = spawn_loop(
+        loop_pool(&url).await,
+        stop.clone(),
+        Duration::ZERO,
+        move |pool, n| async move {
+            let doc = if n % 2 == 0 { a } else { b };
+            old_insert(&pool, doc, Some(user), 1 + (n % 3) as usize)
+                .await
+                .map(drop)
+                .map_err(err_text)
+        },
+    );
+    let snapshots = spawn_loop(
+        loop_pool(&url).await,
+        stop.clone(),
+        Duration::ZERO,
+        move |pool, _| async move { old_snapshot(&pool, a, 1, b"a").await.map_err(err_text) },
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    migrate_up_to(&pool, HISTORY_HEADS).await;
+    let longest = snapshots.longest();
+    assert!(
+        longest < Duration::from_secs(1),
+        "the heads migration does not lock doc_snapshots: {longest:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    migrate_all(&pool).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.store(true, SeqCst);
+    let inserts = inserts.handle.await.unwrap();
+    let snapshots = snapshots.handle.await.unwrap();
+    assert!(inserts.errors.is_empty(), "{:?}", inserts.errors);
+    assert!(snapshots.errors.is_empty(), "{:?}", snapshots.errors);
+
+    let mut legacy = 0;
+    let mut numbered = 0;
+    for doc in [a, b, c] {
+        let (legacy_rows, head_rev) = assert_gapless(&pool, doc).await;
+        legacy += legacy_rows;
+        numbered += head_rev - legacy_rows;
+    }
+    // The loop saved on both sides of the migration.
+    assert!(legacy > 10, "{legacy} legacy rows");
+    assert!(numbered > 0, "{numbered} numbered rows");
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM doc_updates")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(total, legacy + numbered, "no row counted twice or missed");
+
+    let (head_rev, legacy_rows, epoch, dirty, last_write_at) = heads_row(&pool, c).await.unwrap();
+    assert_eq!(
+        (head_rev, legacy_rows, epoch, dirty),
+        (0, 0, 0, true),
+        "every page has a heads row"
+    );
+    assert!(last_write_at.is_some());
+    let unstamped: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM doc_history_heads WHERE last_write_at IS NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(unstamped, 0);
+    eprintln!(
+        "{} old saves, {} old snapshot writes",
+        inserts.runs, snapshots.runs
+    );
+}
+
+/// Review round 5: the M1.1 deadlock class (page writes, purges, Duplicate,
+/// readers) against the real migration files, under 0.9.9-shaped traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn migrations_one_to_five_run_under_live_0_9_9_traffic() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::time::{Duration, Instant};
+
+    use knot_storage::{DocStore, PgDocStore};
+    use sqlx::Connection;
+
+    let (url, pool) = bare_db(4).await;
+    migrate_up_to(&pool, V0_9_9_SCHEMA).await;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let p = new_page(&pool, ws, user).await;
+        raw_rows(&pool, p, 5).await;
+        pages.push(p);
+    }
+    let (a, b) = (pages[0], pages[1]);
+    let c = new_page(&pool, ws, user).await;
+    old_snapshot(&pool, c, 7, b"c").await.unwrap();
+    let deadlocks0: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut loops = Vec::new();
+    // (i) One back-to-back inserter per page.
+    for &p in &pages {
+        loops.push((
+            "insert",
+            spawn_loop(
+                loop_pool(&url).await,
+                stop.clone(),
+                Duration::ZERO,
+                move |pool, n| async move {
+                    old_insert(&pool, p, Some(user), 1 + (n % 3) as usize)
+                        .await
+                        .map(drop)
+                        .map_err(err_text)
+                },
+            ),
+        ));
+    }
+    // (ii) A page write on A.
+    loops.push((
+        "page write",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(20),
+            move |pool, n| async move {
+                let mut tx = pool.begin().await.map_err(err_text)?;
+                sqlx::query("SELECT id FROM documents WHERE id = $1 FOR UPDATE")
+                    .bind(a)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(err_text)?;
+                sqlx::query("UPDATE documents SET title = 'w' || $2::text WHERE id = $1")
+                    .bind(a)
+                    .bind(n as i64)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(err_text)?;
+                tx.commit().await.map_err(err_text)
+            },
+        ),
+    ));
+    // (iii) Archive and purge a throwaway page.
+    loops.push((
+        "purge",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(50),
+            move |pool, _| async move {
+                let t = try_new_page(&pool, ws, user).await.map_err(err_text)?;
+                old_insert(&pool, t, Some(user), 1)
+                    .await
+                    .map_err(err_text)?;
+                let store = PgDocStore::new(pool);
+                store
+                    .archive(ws, t, user)
+                    .await
+                    .map_err(|e| format!("archive: {e:?}"))?;
+                store
+                    .purge(ws, t, None)
+                    .await
+                    .map_err(|e| format!("purge: {e:?}"))?;
+                Ok(())
+            },
+        ),
+    ));
+    // (iv) 0.9.9's Duplicate: a new page and its row, then placement locks
+    // the source's page row.
+    loops.push((
+        "duplicate",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(50),
+            move |pool, n| async move {
+                let mut tx = pool.begin().await.map_err(err_text)?;
+                let id: Uuid = sqlx::query_scalar(
+                    "INSERT INTO documents (workspace_id, parent_id, title, sort_key, created_by)
+                     VALUES ($1, NULL, 'D', '~dup' || $3::text, $2) RETURNING id",
+                )
+                .bind(ws)
+                .bind(user)
+                .bind(n as i64)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(err_text)?;
+                old_insert(&mut *tx, id, Some(user), 1)
+                    .await
+                    .map_err(err_text)?;
+                sqlx::query("SELECT id FROM documents WHERE id = $1 FOR UPDATE")
+                    .bind(a)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(err_text)?;
+                sqlx::query("UPDATE documents SET sort_key = 'n' || $2::text WHERE id = $1")
+                    .bind(id)
+                    .bind(n as i64)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(err_text)?;
+                tx.commit().await.map_err(err_text)
+            },
+        ),
+    ));
+    // (v) 0.9.9's snapshot write on A.
+    loops.push((
+        "snapshot",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(50),
+            move |pool, _| async move { old_snapshot(&pool, a, 1, b"a").await.map_err(err_text) },
+        ),
+    ));
+    // (vi) A reader, one call per run: 0.9.9's statements. Not `SELECT *`,
+    // which no 0.9.9 path runs on these tables: a statement prepared before
+    // migration 1 adds columns fails with 0A000 ("cached plan must not
+    // change result type") on its next execution.
+    let reader = spawn_loop(
+        loop_pool(&url).await,
+        stop.clone(),
+        Duration::ZERO,
+        move |pool, n| async move {
+            if n % 2 == 0 {
+                sqlx::query("SELECT count(*) FROM doc_updates WHERE doc_id = $1")
+                    .bind(b)
+                    .execute(&pool)
+                    .await
+                    .map(drop)
+                    .map_err(err_text)
+            } else {
+                // PgSnapshotStore::latest in 0.9.9.
+                sqlx::query(
+                    "SELECT doc_id, snapshot_seq, state_bytes, state_vector, created_at
+                       FROM doc_snapshots WHERE doc_id = $1 ORDER BY snapshot_seq DESC LIMIT 1",
+                )
+                .bind(c)
+                .execute(&pool)
+                .await
+                .map(drop)
+                .map_err(err_text)
+            }
+        },
+    );
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let started = Instant::now();
+    let migrated = tokio::time::timeout(
+        Duration::from_secs(30),
+        sqlx::migrate!("../../migrations").run(&pool),
+    )
+    .await;
+    let took = started.elapsed();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    stop.store(true, SeqCst);
+    let mut reports = Vec::new();
+    for (name, l) in loops {
+        reports.push((name, l.handle.await.unwrap()));
+    }
+    let reader_longest = reader.longest();
+    reports.push(("reader", reader.handle.await.unwrap()));
+
+    match migrated {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("migrator failed after {took:?}: {e}"),
+        Err(_) => panic!("migrator still running after 30 s"),
+    }
+    eprintln!("migrations 1-5 under load took {took:?}");
+    for (name, report) in &reports {
+        eprintln!("{name}: {} runs", report.runs);
+        assert!(report.runs > 0, "{name} never ran");
+        assert!(report.errors.is_empty(), "{name}: {:?}", report.errors);
+    }
+    assert!(
+        reader_longest < Duration::from_secs(1),
+        "reads are blocked only by migration 1's short attempts: {reader_longest:?}"
+    );
+    for &p in &pages {
+        assert_gapless(&pool, p).await;
+    }
+    assert!(
+        matches!(rev_index(&pool).await, Some((_, true, _))),
+        "the concurrent build under load left a valid index"
+    );
+
+    // Every backend but this probe has exited, so each flushed its
+    // statistics; a 40P01 anywhere (even one a retry hid) shows here.
+    pool.close().await;
+    let mut probe = sqlx::PgConnection::connect(&url).await.unwrap();
+    let mut others: i64 = -1;
+    for _ in 0..50 {
+        sqlx::query("SELECT pg_stat_clear_snapshot()")
+            .execute(&mut probe)
+            .await
+            .unwrap();
+        others = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database() AND backend_type = 'client backend'
+                AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(&mut probe)
+        .await
+        .unwrap();
+        if others == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(others, 0, "every loop backend exited within 5 s");
+    sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(&mut probe)
+        .await
+        .unwrap();
+    let deadlocks: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&mut probe)
+    .await
+    .unwrap();
+    assert_eq!(deadlocks, deadlocks0, "no deadlock anywhere");
+}
+
+/// Once an erase bumps `content_epoch`, a writer that saw the old epoch
+/// (0.9.9 carries none) is refused with KH002, rows and snapshots alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_are_refused_once_the_epoch_moves() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let d = new_page(&pool, ws, user).await;
+    raw_rows(&pool, d, 1).await;
+    let other = new_page(&pool, ws, user).await;
+    let bumped = sqlx::query("UPDATE doc_history_heads SET content_epoch = 1 WHERE doc_id = $1")
+        .bind(d)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(bumped.rows_affected(), 1);
+
+    let e = old_insert(&pool, d, Some(user), 1).await.unwrap_err();
+    assert!(kh002(&e), "{e}");
+    let with_epoch = |epoch: i32| {
+        sqlx::query(
+            "INSERT INTO doc_updates (doc_id, update_bytes, rev, epoch) VALUES ($1, '\\x01', 2, $2)",
+        )
+        .bind(d)
+        .bind(epoch)
+        .execute(&pool)
+    };
+    let e = with_epoch(0).await.unwrap_err();
+    assert!(kh002(&e), "{e}");
+    with_epoch(1).await.unwrap();
+
+    let e = old_snapshot(&pool, d, 1, b"x").await.unwrap_err();
+    assert!(kh002(&e), "a snapshot without an epoch: {e}");
+    let e = stamped_snapshot(&pool, STAMPED_SNAPSHOT_INSERT_SQL, d, 2, b"x", 2, 0)
+        .await
+        .unwrap_err();
+    assert!(kh002(&e), "{e}");
+    stamped_snapshot(&pool, STAMPED_SNAPSHOT_INSERT_SQL, d, 2, b"x", 2, 1)
+        .await
+        .unwrap();
+
+    // A page still at epoch 0 (no heads row yet counts as 0).
+    old_snapshot(&pool, other, 1, b"o").await.unwrap();
+}
+
+/// A 0.9.9 upsert at a stamped snapshot's seq would keep its snapshot_rev
+/// over other bytes; the trigger skips it instead (Rulings: stamped
+/// snapshots are immutable).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_snapshot_upsert_leaves_a_stamped_snapshot_alone() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let d = new_page(&pool, ws, user).await;
+    raw_rows(&pool, d, 3).await;
+
+    stamped_snapshot(&pool, STAMPED_SNAPSHOT_INSERT_SQL, d, 10, b"X", 3, 0)
+        .await
+        .unwrap();
+    old_snapshot(&pool, d, 10, b"Y")
+        .await
+        .expect("0.9.9 sees no error");
+    assert_eq!(
+        snapshot_at(&pool, d, 10).await,
+        (b"X".to_vec(), Some(3), Some(0))
+    );
+    stamped_snapshot(&pool, STAMPED_SNAPSHOT_UPSERT_SQL, d, 10, b"Z", 3, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot_at(&pool, d, 10).await,
+        (b"X".to_vec(), Some(3), Some(0))
+    );
+
+    // A legacy snapshot still takes 0.9.9's upsert, and a stamped one
+    // promotes it.
+    old_snapshot(&pool, d, 20, b"L1").await.unwrap();
+    old_snapshot(&pool, d, 20, b"L2").await.unwrap();
+    assert_eq!(
+        snapshot_at(&pool, d, 20).await,
+        (b"L2".to_vec(), None, None)
+    );
+    stamped_snapshot(&pool, STAMPED_SNAPSHOT_UPSERT_SQL, d, 20, b"S", 3, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot_at(&pool, d, 20).await,
+        (b"S".to_vec(), Some(3), Some(0))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_and_trigger_path_writes_to_a_purged_page_fail_with_23503() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let d = new_page(&pool, ws, user).await;
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(d)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let e = old_insert(&pool, d, Some(user), 1).await.unwrap_err();
+    assert_eq!(sqlstate(&e).as_deref(), Some("23503"), "{e}");
+    let e = old_snapshot(&pool, d, 1, b"x").await.unwrap_err();
+    assert_eq!(sqlstate(&e).as_deref(), Some("23503"), "{e}");
+    assert_eq!(
+        heads_row(&pool, d).await,
+        None,
+        "no heads row for a gone page"
+    );
+}
+
+/// The trigger path takes the page row before the heads row, so a purge and
+/// a 0.9.9 save wait for each other instead of deadlocking, in either order.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purge_racing_a_trigger_path_insert_never_deadlocks() {
+    use std::time::Duration;
+
+    use knot_test_support::locks::wait_for_lock_waits;
+
+    let pool = knot_test_support::fresh_db().await.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let delete_page = |pool: PgPool, doc: Uuid| async move {
+        let mut tx = pool.begin().await?;
+        sqlx::query("DELETE FROM documents WHERE id = $1")
+            .bind(doc)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    };
+
+    // The save first: it holds the page row's KEY SHARE and the heads row.
+    let d = new_page(&pool, ws, user).await;
+    raw_rows(&pool, d, 1).await;
+    let mut t = pool.begin().await.unwrap();
+    old_insert(&mut *t, d, Some(user), 2).await.unwrap();
+    let p = tokio::spawn(tokio::time::timeout(
+        Duration::from_secs(5),
+        delete_page(pool.clone(), d),
+    ));
+    wait_for_lock_waits(&pool, 1).await;
+    t.commit().await.unwrap();
+    let p = p.await.unwrap().expect("purge within 5 s");
+    assert!(p.is_ok(), "the purge waited, then ran: {p:?}");
+    assert_eq!(heads_row(&pool, d).await, None, "the heads row cascades");
+    assert_eq!(count_updates_any(&pool, &[d]).await, 0);
+
+    // The purge first: the save waits on the page row, then finds it gone.
+    let d = new_page(&pool, ws, user).await;
+    raw_rows(&pool, d, 1).await;
+    let mut p = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(d)
+        .execute(&mut *p)
+        .await
+        .unwrap();
+    let t = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), old_insert(&pool, d, Some(user), 1)).await
+        }
+    });
+    wait_for_lock_waits(&pool, 1).await;
+    p.commit().await.unwrap();
+    let e = t.await.unwrap().expect("save within 5 s").unwrap_err();
+    assert_eq!(sqlstate(&e).as_deref(), Some("23503"), "{e}");
+}
+
+/// Spike "row-lock recheck": a snapshot write and a flush that queue behind
+/// an erase's lock on the heads row see the epoch it committed.
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_insert_waits_for_an_epoch_bump_then_fails() {
+    use std::time::Duration;
+
+    use knot_test_support::locks::wait_for_lock_waits;
+
+    let pool = knot_test_support::fresh_db().await.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let d = new_page(&pool, ws, user).await;
+    raw_rows(&pool, d, 1).await;
+
+    let mut e = pool.begin().await.unwrap();
+    sqlx::query("SELECT content_epoch FROM doc_history_heads WHERE doc_id = $1 FOR UPDATE")
+        .bind(d)
+        .execute(&mut *e)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE doc_history_heads SET content_epoch = 1 WHERE doc_id = $1")
+        .bind(d)
+        .execute(&mut *e)
+        .await
+        .unwrap();
+
+    let s = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                stamped_snapshot(&pool, STAMPED_SNAPSHOT_INSERT_SQL, d, 1, b"x", 1, 0),
+            )
+            .await
+        }
+    });
+    wait_for_lock_waits(&pool, 1).await;
+    let w = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                sqlx::query_as::<_, (i64, i32)>(HEADS_UPSERT_SQL)
+                    .bind(d)
+                    .bind(1_i64)
+                    .fetch_one(&pool),
+            )
+            .await
+        }
+    });
+    wait_for_lock_waits(&pool, 2).await;
+    e.commit().await.unwrap();
+
+    let s = s
+        .await
+        .unwrap()
+        .expect("snapshot write within 5 s")
+        .unwrap_err();
+    assert!(kh002(&s), "{s}");
+    let (base, epoch) = w.await.unwrap().expect("flush within 5 s").unwrap();
+    assert_eq!((base, epoch), (1, 1));
+}
+
+/// Numbering a legacy row (rev NULL to a value, nothing else changed) is
+/// the one update the append-only trigger lets through.
+#[tokio::test(flavor = "multi_thread")]
+async fn append_only_allows_only_the_legacy_rev_numbering() {
+    let (_url, pool) = bare_db(4).await;
+    migrate_up_to(&pool, HISTORY_LOG_COLUMNS).await;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let d = new_page(&pool, ws, user).await;
+    raw_rows(&pool, d, 2).await;
+    migrate_all(&pool).await;
+    let other: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, display_name) VALUES ('b@x.test', 'Bob') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let seqs: Vec<i64> =
+        sqlx::query_scalar("SELECT seq FROM doc_updates WHERE doc_id = $1 ORDER BY seq")
+            .bind(d)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(seqs.len(), 2);
+
+    // `$1` the row's seq, `$2` another user (unused by some statements).
+    let update = |set: &'static str, seq: i64| {
+        let sql = format!("UPDATE doc_updates SET {set} WHERE seq = $1");
+        let pool = pool.clone();
+        async move {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(seq)
+                .bind(other)
+                .execute(&pool)
+                .await
+        }
+    };
+    let numbered = update("rev = 1", seqs[0]).await.unwrap();
+    // A trigger returning NULL would skip the row without an error.
+    assert_eq!(numbered.rows_affected(), 1, "numbering a legacy row");
+    assert_eq!(rev_of(&pool, seqs[0]).await, Some(1));
+    let e = update("rev = 2", seqs[0]).await.unwrap_err();
+    assert!(kh001(e), "a numbered row is never renumbered");
+    assert_eq!(rev_of(&pool, seqs[0]).await, Some(1));
+
+    for set in [
+        "rev = 9, by_user_id = $2",
+        "by_user_id = $2",
+        "created_at = created_at - interval '1 day'",
+        "source = 'edit'",
+    ] {
+        let e = update(set, seqs[1]).await.unwrap_err();
+        assert_eq!(sqlstate(&e).as_deref(), Some("KH001"), "{set}: {e}");
+    }
+    assert_eq!(rev_of(&pool, seqs[1]).await, None);
+}
+
+/// Review round 3: the rewrite flag (an erase) skips the epoch check and the
+/// immutability guard, never the page-row lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flagged_rewrite_may_write_a_snapshot_at_any_epoch() {
+    use sqlx::Connection;
+
+    let db = knot_test_support::fresh_db().await;
+    let pool = db.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let d = new_page(&pool, ws, user).await;
+    raw_rows(&pool, d, 1).await;
+    stamped_snapshot(&pool, STAMPED_SNAPSHOT_INSERT_SQL, d, 10, b"X", 1, 0)
+        .await
+        .unwrap();
+
+    // A session that never set the flag reads it as NULL (review round 4).
+    let mut conn = sqlx::PgConnection::connect(&db.url).await.unwrap();
+    let flag: Option<String> =
+        sqlx::query_scalar("SELECT current_setting('knot.history_rewrite', true)")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(flag, None);
+    let e = stamped_snapshot(&mut conn, STAMPED_SNAPSHOT_INSERT_SQL, d, 11, b"N", 1, 1)
+        .await
+        .unwrap_err();
+    assert!(kh002(&e), "{e}");
+    old_snapshot(&mut conn, d, 10, b"Y").await.unwrap();
+    assert_eq!(
+        snapshot_at(&pool, d, 10).await,
+        (b"X".to_vec(), Some(1), Some(0))
+    );
+
+    let mut tx = conn.begin().await.unwrap();
+    sqlx::query("SET LOCAL knot.history_rewrite = 'on'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    stamped_snapshot(&mut *tx, STAMPED_SNAPSHOT_INSERT_SQL, d, 11, b"N", 1, 1)
+        .await
+        .unwrap();
+    stamped_snapshot(&mut *tx, STAMPED_SNAPSHOT_UPSERT_SQL, d, 10, b"Z", 1, 1)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        snapshot_at(&pool, d, 11).await,
+        (b"N".to_vec(), Some(1), Some(1))
+    );
+    assert_eq!(
+        snapshot_at(&pool, d, 10).await,
+        (b"Z".to_vec(), Some(1), Some(1))
+    );
+
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(d)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut tx = conn.begin().await.unwrap();
+    sqlx::query("SET LOCAL knot.history_rewrite = 'on'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let e = stamped_snapshot(&mut *tx, STAMPED_SNAPSHOT_INSERT_SQL, d, 12, b"P", 1, 1)
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate(&e).as_deref(), Some("23503"), "{e}");
+    assert!(
+        e.to_string().contains("does not exist"),
+        "the trigger's page check, before the FK: {e}"
+    );
+    tx.rollback().await.unwrap();
+}
+
+/// Rule (b) of `doc_updates_append_only` compares every column but `rev`
+/// by name; a new column must be added there.
+#[tokio::test(flavor = "multi_thread")]
+async fn doc_updates_columns_are_the_ones_rule_b_compares() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let cols: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'doc_updates'
+          ORDER BY column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        cols,
+        [
+            "by_user_id",
+            "created_at",
+            "doc_id",
+            "epoch",
+            "meta",
+            "rev",
+            "seq",
+            "source",
+            "update_bytes"
+        ],
+        "a new doc_updates column must be added to rule (b) in doc_updates_append_only"
+    );
+}
+
+/// Between the heads migration and its FK a purge leaves an orphan heads
+/// row; the FK migration deletes it, and from then on heads rows cascade.
+#[tokio::test(flavor = "multi_thread")]
+async fn heads_fk_migration_drops_orphans_and_cascades() {
+    let (_url, pool) = bare_db(4).await;
+    migrate_up_to(&pool, HISTORY_HEADS).await;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let d = new_page(&pool, ws, user).await;
+    raw_rows(&pool, d, 2).await;
+    assert!(heads_row(&pool, d).await.is_some());
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(d)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count_updates_any(&pool, &[d]).await, 0);
+    assert!(heads_row(&pool, d).await.is_some(), "no FK yet: an orphan");
+
+    migrate_all(&pool).await;
+    assert_eq!(heads_row(&pool, d).await, None, "the orphan is gone");
+    let delete_rule: String = sqlx::query_scalar(
+        "SELECT confdeltype::text FROM pg_constraint WHERE conname = 'doc_history_heads_doc_fk'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(delete_rule, "c", "ON DELETE CASCADE");
+
+    let n = new_page(&pool, ws, user).await;
+    raw_rows(&pool, n, 1).await;
+    assert!(heads_row(&pool, n).await.is_some());
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(n)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(heads_row(&pool, n).await, None);
+}
+
+// --- Task 4: the (doc_id, rev) unique index (migrations 4 and 5) ---
+
+const REV_INDEX_SQL: &str =
+    include_str!("../../../migrations/20261107120003_history_rev_index.sql");
+const REV_INDEX_CHECK_SQL: &str =
+    include_str!("../../../migrations/20261107120004_history_rev_index_check.sql");
+
+/// `doc_updates_doc_rev_uq`'s oid, `indisvalid` and definition, or `None`
+/// when there is no such index on `doc_updates`.
+async fn rev_index(pool: &PgPool) -> Option<(i64, bool, String)> {
+    sqlx::query_as(
+        "SELECT i.indexrelid::oid::int8, i.indisvalid, pg_get_indexdef(i.indexrelid)
+           FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+          WHERE i.indrelid = 'doc_updates'::regclass AND c.relname = 'doc_updates_doc_rev_uq'",
+    )
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+/// What a CIC that the deadlock detector aborted, or that was cancelled,
+/// leaves behind: the index exists and is not valid.
+async fn mark_rev_index_invalid(pool: &PgPool) {
+    sqlx::query(
+        "UPDATE pg_index SET indisvalid = false
+          WHERE indexrelid = 'doc_updates_doc_rev_uq'::regclass",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    assert!(matches!(rev_index(pool).await, Some((_, false, _))));
+}
+
+/// Migration 5 as sqlx runs it: the whole file in one transaction.
+async fn run_rev_index_check(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(REV_INDEX_CHECK_SQL).execute(&mut *tx).await?;
+    tx.commit().await
+}
+
+const REV_INDEX_DEF: &str = "CREATE UNIQUE INDEX doc_updates_doc_rev_uq ON public.doc_updates \
+                             USING btree (doc_id, rev) WHERE (rev IS NOT NULL)";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rev_index_is_built_valid_and_unique() {
+    let (pool, ws, doc) = history_fixture().await;
+    let (_, valid, def) = rev_index(&pool).await.expect("index exists");
+    assert!(valid, "indisvalid");
+    assert_eq!(def, REV_INDEX_DEF);
+
+    // history_fixture's two rows went through the trigger: revs 1 and 2.
+    let explicit = "INSERT INTO doc_updates (doc_id, update_bytes, rev, epoch)
+                    VALUES ($1, '\\x01', $2, 0)";
+    let e = sqlx::query(explicit)
+        .bind(doc)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate(&e).as_deref(), Some("23505"), "{e}");
+    // The epoch was right: the next rev goes in.
+    sqlx::query(explicit)
+        .bind(doc)
+        .bind(3_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Unique per page: another page has its own rev 1.
+    let user: Uuid = sqlx::query_scalar("SELECT id FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let child = seed_doc_with_updates(&pool, ws, user, Some(doc), 1).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<i64>>("SELECT rev FROM doc_updates WHERE doc_id = $1")
+            .bind(child)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+}
+
+#[test]
+fn no_transaction_migration_is_one_statement() {
+    let sql = REV_INDEX_SQL;
+    assert!(sql.starts_with("-- no-transaction"));
+    assert_eq!(
+        sql.matches(';').count(),
+        1,
+        "sqlx sends the file as one query"
+    );
+    assert!(
+        sql.contains(
+            "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS doc_updates_doc_rev_uq \
+             ON doc_updates (doc_id, rev) WHERE rev IS NOT NULL;"
+        ),
+        "{sql}"
+    );
+    for line in sql.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            line.starts_with("--") || line.starts_with("CREATE UNIQUE INDEX CONCURRENTLY"),
+            "only comment lines besides the statement: {line}"
+        );
+    }
+}
+
+/// An aborted CIC leaves an invalid index that the next run's `IF NOT EXISTS`
+/// skips; a missing one (dropped by hand) is no better. Migration 5 rebuilds
+/// both, and leaves a valid index alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_check_rebuilds_an_invalid_index() {
+    let (pool, _, _) = history_fixture().await;
+    let (oid0, _, _) = rev_index(&pool).await.unwrap();
+
+    run_rev_index_check(&pool).await.unwrap();
+    assert_eq!(
+        rev_index(&pool).await.map(|(oid, ..)| oid),
+        Some(oid0),
+        "a valid index is not rebuilt"
+    );
+
+    mark_rev_index_invalid(&pool).await;
+    run_rev_index_check(&pool).await.unwrap();
+    let (oid1, valid, def) = rev_index(&pool).await.expect("index exists");
+    assert!(valid, "rebuilt valid");
+    assert_ne!(oid1, oid0, "dropped and created again");
+    assert_eq!(def, REV_INDEX_DEF);
+
+    sqlx::query("DROP INDEX doc_updates_doc_rev_uq")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rev_index(&pool).await, None);
+    run_rev_index_check(&pool).await.unwrap();
+    let (_, valid, def) = rev_index(&pool).await.expect("index exists again");
+    assert!(valid);
+    assert_eq!(def, REV_INDEX_DEF);
+}
+
+/// The repair takes ACCESS EXCLUSIVE through `knot_lock_tables`. A plain
+/// LOCK would queue, and a page write T1 that holds a page row and then reads
+/// `doc_updates` would queue behind it, while an old-style save T2 holds ROW
+/// EXCLUSIVE on `doc_updates` and waits for T1's page row in the trigger:
+/// a three-way cycle. (Two sessions cannot show it: a reader that already
+/// holds ACCESS SHARE jumps the queued request.) Its T1 -> M edge is only
+/// queue order, so Postgres breaks it by moving T1 ahead of M, but only when
+/// a waiter's deadlock check runs, `deadlock_timeout` after it began to
+/// wait: every page load behind a plain LOCK stalls that long. So the read
+/// starts after T2's and M's own checks have run, and must not wait for its
+/// own; with the helper it waits at most one 100 ms attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_check_backs_off_instead_of_deadlocking() {
+    use std::time::{Duration, Instant};
+
+    let (pool, _, doc) = history_fixture().await;
+    mark_rev_index_invalid(&pool).await;
+    let ten_s = Duration::from_secs(10);
+
+    let mut t1 = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM documents WHERE id = $1 FOR UPDATE")
+        .bind(doc)
+        .execute(&mut *t1)
+        .await
+        .unwrap();
+
+    let t2 = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let started = Instant::now();
+            let mut tx = pool.begin().await?;
+            sqlx::query("INSERT INTO doc_updates (doc_id, update_bytes) VALUES ($1, '\\x01')")
+                .bind(doc)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(started.elapsed())
+        }
+    });
+    // T2 holds ROW EXCLUSIVE on doc_updates and waits for T1's page row in
+    // doc_updates_assign_rev's FOR KEY SHARE.
+    knot_test_support::locks::wait_for_lock_waits(&pool, 1).await;
+
+    let m = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let started = Instant::now();
+            run_rev_index_check(&pool).await?;
+            Ok::<_, sqlx::Error>(started.elapsed())
+        }
+    });
+    // M's 100 ms attempts keep failing on T2's lock. Past deadlock_timeout,
+    // T2 and M have each run their one deadlock check.
+    let deadlock_timeout: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM current_setting('deadlock_timeout')::interval)::float8",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let deadlock_timeout = Duration::from_secs_f64(deadlock_timeout);
+    tokio::time::sleep(deadlock_timeout + Duration::from_millis(200)).await;
+
+    let read_started = Instant::now();
+    let n: i64 = tokio::time::timeout(
+        ten_s,
+        sqlx::query_scalar("SELECT count(*) FROM doc_updates WHERE doc_id = $1")
+            .bind(doc)
+            .fetch_one(&mut *t1),
+    )
+    .await
+    .expect("T1's read never queues behind M for long")
+    .expect("T1's read");
+    let read_took = read_started.elapsed();
+    assert_eq!(n, 2);
+    t1.commit().await.unwrap();
+
+    let t2 = tokio::time::timeout(ten_s, t2)
+        .await
+        .expect("T2 finishes")
+        .unwrap();
+    let m = tokio::time::timeout(ten_s, m)
+        .await
+        .expect("M finishes")
+        .unwrap();
+    assert!(
+        t2.is_ok() && m.is_ok(),
+        "no 40P01 anywhere: t2 {t2:?}, m {m:?}"
+    );
+    let (t2_took, m_took) = (t2.unwrap(), m.unwrap());
+    assert!(
+        read_took < deadlock_timeout / 2,
+        "T1's read queued behind M: {read_took:?}"
+    );
+    assert!(
+        t2_took < ten_s && m_took < ten_s,
+        "t2 {t2_took:?}, m {m_took:?}"
+    );
+    assert!(
+        m_took >= deadlock_timeout,
+        "M got doc_updates only after T2 committed: {m_took:?}"
+    );
+    assert!(matches!(rev_index(&pool).await, Some((_, true, _))));
+    assert_eq!(count_updates_any(&pool, &[doc]).await, 3);
+}
+
+/// With a valid index the check reads the catalog and nothing else, so a
+/// session writing `doc_updates` does not hold it up.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_check_takes_no_lock_when_the_index_is_valid() {
+    use std::time::Duration;
+
+    let (pool, _, _) = history_fixture().await;
+    let before = rev_index(&pool).await;
+
+    let mut h = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE doc_updates IN ROW EXCLUSIVE MODE")
+        .execute(&mut *h)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), run_rev_index_check(&pool))
+        .await
+        .expect("the check commits within 1 s")
+        .unwrap();
+    h.rollback().await.unwrap();
+    assert_eq!(rev_index(&pool).await, before, "untouched");
+}
+
+// ---------------------------------------------------------------------------
+// API keys and bots (20261108120000_api_keys_and_bots)
+// ---------------------------------------------------------------------------
 
 /// A workspace plus one user of the given shape. `kind` is 'human' or 'bot'.
 async fn seed_user(
@@ -2449,7 +4156,7 @@ async fn bot_owner_guard_matches_every_uuid_spelling() {
 /// holds inside a transaction, so the file must not opt out of sqlx's.
 #[test]
 fn api_keys_migration_bounds_its_lock_wait() {
-    let sql = include_str!("../../../migrations/20261106120000_api_keys_and_bots.sql");
+    let sql = include_str!("../../../migrations/20261108120000_api_keys_and_bots.sql");
     assert!(
         sql.contains("SET LOCAL lock_timeout = '5s';"),
         "lock_timeout went missing"

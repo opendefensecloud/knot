@@ -101,6 +101,10 @@ fn internal(e: impl std::fmt::Display) -> DuplicateError {
 /// One page of the copy while it is prepared.
 struct Page {
     new_id: Uuid,
+    /// The page copied, and its own title (the top page's, not the copy's
+    /// "(copy)" one), for the copy's first history row.
+    source_id: Uuid,
+    source_title: String,
     parent: Option<Uuid>,
     title: String,
     icon: Option<String>,
@@ -300,6 +304,7 @@ pub async fn run(
     // copy of its parent, which comes before it.
     let outline = std::iter::once((
         source_id,
+        source.title.clone(),
         source.parent_id,
         format!("{} (copy)", source.title),
         source.icon.clone(),
@@ -308,6 +313,7 @@ pub async fn run(
     .chain(subpages.into_iter().map(|row| {
         (
             row.id,
+            row.title.clone(),
             Some(page_ids[&row.parent_id]),
             row.title,
             row.icon,
@@ -315,11 +321,13 @@ pub async fn run(
         )
     }));
     let mut pages = Vec::with_capacity(page_ids.len());
-    for (id, parent, title, icon, restricted) in outline {
+    for (id, source_title, parent, title, icon, restricted) in outline {
         let (content, _seq) = current_snapshot(&state, id).await.map_err(internal)?;
         let refs = references(content.inner());
         pages.push(Page {
             new_id: page_ids[&id],
+            source_id: id,
+            source_title,
             parent,
             title,
             icon,
@@ -375,6 +383,8 @@ pub async fn run(
         remap_refs(page.content.inner(), &remap);
         copies.push(PageCopy {
             new_id: page.new_id,
+            source_id: page.source_id,
+            source_title: page.source_title.clone(),
             parent: page.parent,
             title: page.title.clone(),
             icon: page.icon.clone(),

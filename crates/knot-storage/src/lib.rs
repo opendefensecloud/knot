@@ -21,6 +21,8 @@ pub mod share_tokens;
 pub mod snapshot_store;
 pub mod suggestions;
 pub mod tasks;
+#[doc(hidden)]
+pub mod testing;
 pub mod updates_store;
 pub mod user_store;
 pub mod workspace_store;
@@ -50,7 +52,7 @@ pub use search::{PgSearchStore, SearchHit, SearchStore, SearchStoreError};
 pub use session_store::{PgSessionStore, Session, SessionStore, SessionStoreError};
 pub use share_tokens::{PgShareTokenStore, ShareStoreError, ShareToken, ShareTokenStore};
 pub use snapshot_store::{
-    DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStore, SnapshotStoreError,
+    DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStamp, SnapshotStore, SnapshotStoreError,
 };
 pub use suggestions::{
     NewSuggestion, PgSuggestionStore, Suggestion, SuggestionKind, SuggestionReply,
@@ -59,7 +61,10 @@ pub use suggestions::{
 pub use tasks::{
     AssignedTask, DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError, TaskWrite,
 };
-pub use updates_store::{DocUpdate, PgUpdatesStore, UpdatesStore, UpdatesStoreError};
+pub use updates_store::{
+    APPEND_STATEMENT_TIMEOUT, DocUpdate, HistoryHead, NewUpdate, Persisted, PgUpdatesStore,
+    RowsAfter, UnknownUpdateSource, UpdateSource, UpdatesStore, UpdatesStoreError, append_in_tx,
+};
 pub use user_store::{PgUserStore, User, UserStore, UserStoreError};
 pub use workspace_store::{
     Member, PgWorkspaceStore, Workspace, WorkspaceRole, WorkspaceStore, WorkspaceStoreError,

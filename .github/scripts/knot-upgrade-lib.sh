@@ -79,3 +79,27 @@ api() {
 
   curl "${args[@]}"
 }
+
+# api_md <METHOD> <PATH> <markdown-body> — like `api`, but sends a Markdown
+# body (POST /api/docs/{id}/markdown) with the session and CSRF headers.
+#
+# --data-raw sends the body as given: no `@file` lookup for a body that starts
+# with `@`, and newlines kept, which the Markdown's block structure needs.
+api_md() {
+  local method="$1" path="$2" body="$3"
+  local -a args=(-sSf -X "$method" "$BASE_URL$path")
+
+  if [ -f /tmp/sid ]; then
+    local jar
+    jar="sid=$(cat /tmp/sid)"
+    [ -f /tmp/csrf ] && jar="$jar; csrf=$(cat /tmp/csrf)"
+    args+=(-H "cookie: $jar")
+    if [ -f /tmp/csrf ]; then
+      args+=(-H "x-csrf-token: $(cat /tmp/csrf)")
+    fi
+  fi
+
+  args+=(-H 'content-type: text/markdown; charset=utf-8' --data-raw "$body")
+
+  curl "${args[@]}"
+}

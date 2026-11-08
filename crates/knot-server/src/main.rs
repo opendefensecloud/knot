@@ -306,6 +306,8 @@ async fn run_server(cfg: Config) {
     // Token shared with every collab socket; cancelled on SIGTERM so they
     // send a clean 1001 Close and drain instead of being severed mid-rollout.
     let shutdown = state.shutdown.clone();
+    // Kept for the page-writer drain once HTTP has drained.
+    let rooms = state.rooms_v2.clone();
     let app = knot_server::router_with_state(state);
 
     // 5. Bind + serve.
@@ -326,6 +328,14 @@ async fn run_server(cfg: Config) {
     if let Err(e) = serve_result {
         tracing::error!(error=?e, "serve failed");
         process::exit(5);
+    }
+
+    // After the HTTP drain, so no request still awaits a room: end every
+    // room and give each page writer up to SHUTDOWN_DRAIN to write the
+    // edits it holds (during a database outage it may still be retrying).
+    if let Some(rooms) = rooms {
+        let pending = rooms.drain_all(knot_crdt::SHUTDOWN_DRAIN).await;
+        tracing::info!(pending, "page writers drained");
     }
 
     // Normal (drained) exit: flush traces.

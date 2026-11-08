@@ -82,6 +82,8 @@ async fn seeded() -> (AppState, Uuid, Uuid, Uuid, String) {
         .send(Event::ApplyUpdate {
             update_bytes,
             by_user: Some(owner.id),
+            source: knot_storage::UpdateSource::Edit,
+            meta: None,
             reply: tx,
         })
         .await
@@ -204,6 +206,8 @@ async fn from_template_clones_markdown_into_new_doc() {
         .send(Event::ReplaceWithMarkdown {
             update_bytes: mutate_bytes,
             by_user: None,
+            source: knot_storage::UpdateSource::Import,
+            meta: None,
             reply: tx,
         })
         .await
@@ -362,6 +366,8 @@ async fn instantiating_a_template_notifies_nobody() {
         .send(Event::ReplaceWithMarkdown {
             update_bytes,
             by_user: None,
+            source: knot_storage::UpdateSource::Import,
+            meta: None,
             reply: tx,
         })
         .await
