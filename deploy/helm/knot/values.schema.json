@@ -140,6 +140,14 @@
       "properties": {
         "retentionDays": { "type": "integer", "minimum": 1 }
       }
+    },
+    "history": {
+      "type": "object",
+      "properties": {
+        "workers": { "type": "integer", "minimum": 0 },
+        "replayMaxBytes": { "type": "integer", "minimum": 1048576 },
+        "cpuShare": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+      }
     }
   }
 }

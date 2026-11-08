@@ -84,10 +84,21 @@ impl CountingRecorder {
 
     /// The last value gauge `name` (no labels) was set to, if any.
     pub fn gauge(&self, name: &str) -> Option<f64> {
+        self.labeled_gauge(name, &[])
+    }
+
+    /// The last value gauge `name` with exactly these labels was set to, if
+    /// any.
+    pub fn labeled_gauge(&self, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        let mut labels: Vec<(String, String)> = labels
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        labels.sort();
         self.gauges
             .lock()
             .unwrap()
-            .get(&(name.to_owned(), Vec::new()))
+            .get(&(name.to_owned(), labels))
             .map(|g| f64::from_bits(g.0.load(Ordering::Relaxed)))
     }
 

@@ -25,6 +25,8 @@
 //!   that hides a former member (also used by the contributors API).
 //! - [`list`]: one page of a page's entries, newest first, and its response
 //!   body with every entry's `meta` rebuilt from an allowlist.
+//! - [`sizes`]: the size of each history table, sampled by one replica at a
+//!   time into `knot_history_table_bytes`.
 
 pub mod builder;
 pub mod canonical;
@@ -37,6 +39,7 @@ pub mod pass;
 pub mod people;
 pub mod replay;
 pub mod sessions;
+pub mod sizes;
 mod store;
 pub mod words;
 
@@ -66,5 +69,8 @@ pub use replay::{ReplayError, ReplayMode, Replayer, RowEffect, RowOutcome};
 pub use sessions::{
     Contribution, ContributionKind, EntryDraft, EntryKind, Grouper, SEAL_MARGIN, SESSION_GAP,
     UnknownEntryKind,
+};
+pub use sizes::{
+    HISTORY_TABLES, SIZE_LOCK_KEY, SIZE_SAMPLE_EVERY, sample_table_sizes, spawn_size_sampler,
 };
 pub use words::{WordCounts, count_words, entry_word_counts};

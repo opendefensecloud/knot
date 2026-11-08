@@ -286,7 +286,8 @@ async fn run_server(cfg: Config) {
         tracing::info!("reindex worker spawned");
     }
     // The page history builder, after `state`: it stops with the shutdown
-    // token that lives in AppState.
+    // token that lives in AppState. `history_workers == 0` turns off the
+    // builder and the table-size sampler on this replica.
     let mut history_builder = None;
     if let (Some(pool), Some(history_updates)) = (state.pool.clone(), history_updates) {
         if cfg.history_workers == 0 {
@@ -294,6 +295,7 @@ async fn run_server(cfg: Config) {
         } else {
             // M1.4: share with AppState for the view endpoint
             let history_permits = knot_history::history_permits(cfg.history_workers as usize);
+            knot_history::spawn_size_sampler(pool.clone());
             let handle = std::sync::Arc::new(knot_history::Builder::new(
                 pool,
                 history_updates,
