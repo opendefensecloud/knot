@@ -20,8 +20,7 @@ use yrs::{
     XmlTextRef,
 };
 
-#[path = "../../knot-crdt/tests/common/fixtures.rs"]
-mod fixtures;
+use common::fixtures;
 
 use fixtures::{Rng, para, parked_block_and_the_edit_it_fails_on};
 
@@ -63,6 +62,12 @@ fn pending_bytes(r: &Replayer) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
         store.pending_update().map(|p| p.update.encode_v1()),
         store.pending_ds().map(|ds| ds.encode_v1()),
     )
+}
+
+/// The replay's state vector (compared as a value: its v1 encoding follows
+/// a hash map's order).
+fn state_vector_of(r: &Replayer) -> StateVector {
+    r.doc().transact().state_vector()
 }
 
 fn delete_set_of(r: &Replayer) -> Vec<u8> {
@@ -198,8 +203,11 @@ fn a_delete_of_unknown_items_parks_deletes_only() {
     assert!(r.has_pending());
 }
 
+/// A checkpoint leaves pending content out (the pending fallback, Task 4):
+/// a replay resumed from it re-applies the rows that parked, which parks
+/// the same content again.
 #[test]
-fn checkpoint_round_trip_keeps_pending_content() {
+fn a_checkpoint_leaves_pending_content_to_the_rows_that_parked_it() {
     let (base, _u_a, u_b) = base_and_two_dependent_edits();
     let (_u1, u2) = insert_then_delete();
     let mut r = Replayer::new(ReplayMode::Gc);
@@ -212,10 +220,90 @@ fn checkpoint_round_trip_keeps_pending_content() {
         "fixture: r holds pending structs and a pending delete set"
     );
 
-    let again = Replayer::from_state(ReplayMode::Gc, &r.encode_state()).unwrap();
+    let mut again = Replayer::from_state(ReplayMode::Gc, &r.encode_state()).unwrap();
+    assert!(
+        !again.has_pending(),
+        "the checkpoint carries no pending content"
+    );
+    assert_eq!(xml_string(&again), xml_string(&r));
+    applied(&mut again, &u_b);
+    applied(&mut again, &u2);
     assert_eq!(pending_bytes(&again), pending_bytes(&r));
-    assert_eq!(again.state_vector(), r.state_vector());
-    assert!(again.has_pending());
+    assert_eq!(state_vector_of(&again), state_vector_of(&r));
+}
+
+/// Client 1's transactions on one paragraph: "base" (t0), "WWW" after it
+/// (t1, withheld), "pp" after the "WWW" (t2, parks on t1), "zz" before
+/// "base" (t2b, withheld), then a new paragraph and "qq" inside the "WWW"
+/// (t3: the paragraph integrates past the gap t2b leaves, "qq" parks on
+/// t1).
+fn overlapping_skips_case() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let c = Doc::with_client_id(1);
+    let frag = c.get_or_insert_xml_fragment("default");
+    let t0 = txn_update(&c, |txn| {
+        let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
+        p.push_back(txn, XmlTextPrelim::new("base"));
+    });
+    let _t1 = txn_update(&c, |txn| text_of(&frag, txn, 0).insert(txn, 4, "WWW"));
+    let t2 = txn_update(&c, |txn| text_of(&frag, txn, 0).insert(txn, 7, "pp"));
+    let _t2b = txn_update(&c, |txn| text_of(&frag, txn, 0).insert(txn, 0, "zz"));
+    let t3 = txn_update(&c, |txn| {
+        let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
+        p.push_back(txn, XmlTextPrelim::new("new"));
+        text_of(&frag, txn, 0).insert(txn, 7, "qq");
+    });
+    (t0, t2, t3)
+}
+
+/// Why checkpoints leave pending content out: yrs 0.27.3 merges t3's
+/// parked remainder into the pending update without splitting its Skips,
+/// so the pending update holds overlapping Skips, and its v1 encoding (which
+/// `encode_state_as_update_v1` merges into a full state) writes "qq" at a
+/// shifted clock: the full state names blocks the doc never had.
+#[test]
+fn a_pending_update_with_overlapping_skips_stays_out_of_the_checkpoint() {
+    let (t0, t2, t3) = overlapping_skips_case();
+    let mut r = Replayer::new(ReplayMode::Gc);
+    for u in [&t0, &t2, &t3] {
+        applied(&mut r, u);
+    }
+    let (held, pending) = {
+        let txn = r.doc().transact();
+        let pending = txn
+            .store()
+            .pending_update()
+            .expect("t2 and t3's \"qq\" are pending")
+            .update
+            .insertions(true);
+        (insertions_of(&r.encode_state()), pending)
+    };
+    // yrs's own full state names ids that are neither held nor pending.
+    let full = insertions_of(
+        &r.doc()
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default()),
+    );
+    assert!(
+        !full.diff(&held.merge(&pending)).is_empty(),
+        "yrs 0.27.3 shifts the clocks of later pending blocks"
+    );
+    // The checkpoint holds the blocks only; re-applying the rows that
+    // parked restores exactly the pending content, under its real ids.
+    let mut again = Replayer::from_state(ReplayMode::Gc, &r.encode_state()).unwrap();
+    assert!(!again.has_pending());
+    for u in [&t2, &t3] {
+        again.apply(u);
+    }
+    let again_pending = again
+        .doc()
+        .transact()
+        .store()
+        .pending_update()
+        .map(|p| p.update.insertions(true))
+        .unwrap_or_default();
+    assert_eq!(again_pending, pending);
+    assert_eq!(state_vector_of(&again), state_vector_of(&r));
+    assert_eq!(xml_string(&again), xml_string(&r));
 }
 
 #[test]
@@ -267,7 +355,13 @@ fn a_checkpoint_with_pending_nested_content_resumes_like_one_that_never_round_tr
         !e3.parked_inserts.is_empty() && !e4.parked_inserts.is_empty(),
         "fixture: u3 and u4 park while u2 is withheld"
     );
+    // The checkpoint carries no pending content: the resumed replay
+    // re-applies the rows that parked it (the pending fallback, Task 4).
     let mut again = Replayer::from_state(ReplayMode::Gc, &r.encode_state()).unwrap();
+    assert!(!again.has_pending());
+    for u in [&u3, &u4] {
+        again.apply(u);
+    }
     assert!(again.has_pending());
 
     let drained = r.apply(&u2);

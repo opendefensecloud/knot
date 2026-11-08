@@ -7,17 +7,30 @@
 //! Applying an update to such a doc is safe in general, since yrs trims
 //! what the doc holds before integrating (`transaction.rs:825-827`), but
 //! one shape panics in debug builds and corrupts the block list in release
-//! builds (`block_store.rs:318`): see [`Replayer::would_underflow`]. The
+//! builds (`block_store.rs:318`): see `Replayer::would_underflow`. The
 //! replay refuses that shape before applying it ([`RowOutcome::Refused`]),
 //! and after any apply that met blocks held past a gap it checks that it
 //! holds nothing that neither the update brought nor was pending before
 //! ([`RowOutcome::Corrupt`]).
+//!
+//! Checkpoints leave pending content out (the pending fallback, Rulings):
+//! yrs 0.27.3 merges a newly parked remainder into a doc's pending update
+//! without splitting the Skips, so the pending update can hold overlapping
+//! Skips (`skip(11..=18), skip(13..=18)`), and its v1 encoding writes every
+//! later pending block at a shifted clock (`'qq'` at 1#18 encoded at 1#23).
+//! `encode_state_as_update_v1` merges exactly that encoding into a full
+//! state (`merge_pending_v1`, `transaction.rs:375-391`), so a state that
+//! carries pending content can name blocks the doc never had and turn
+//! integrated blocks into pending ones. [`Replayer::encode_state`] writes
+//! the doc's blocks and delete set only; a replay from a checkpoint first
+//! re-applies the original rows of the claims open at it (its
+//! `pending_revs`), which re-parks their content under its real ids.
 
 use std::collections::BTreeMap;
 
 use yrs::block::ClientID;
 use yrs::updates::decoder::Decode;
-use yrs::updates::encoder::Encode;
+use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{Doc, ID, IdSet, Options, ReadTxn, StateVector, Transact, Update};
 
 /// How the replay's doc keeps deleted content.
@@ -151,8 +164,9 @@ impl Replayer {
         }
     }
 
-    /// A replay that starts from `state` (a checkpoint: a full state, its
-    /// pending content included).
+    /// A replay that starts from `state` (a checkpoint: the blocks and the
+    /// delete set, no pending content; the caller re-applies the rows of
+    /// the checkpoint's `pending_revs`).
     pub fn from_state(mode: ReplayMode, state: &[u8]) -> Result<Replayer, ReplayError> {
         let update = Update::decode_v1(state).map_err(|e| ReplayError::State(e.to_string()))?;
         let doc = mode.new_doc();
@@ -186,7 +200,8 @@ impl Replayer {
     }
 
     /// What applying `state` would do, on a copy made from
-    /// [`Replayer::encode_state`]; the replay itself is left untouched.
+    /// [`Replayer::encode_state`] (so without the replay's pending content);
+    /// the replay itself is left untouched.
     pub fn probe(&self, state: &[u8]) -> RowEffect {
         let update = match Update::decode_v1(state) {
             Ok(u) => u,
@@ -209,7 +224,9 @@ impl Replayer {
     /// an `ApplyError`) the fresh doc replaces the replay, and the effect is
     /// what it holds that the replay did not: held insertions, delete set
     /// and pending content, each after − before. Any other outcome leaves
-    /// the replay untouched.
+    /// the replay untouched. The replay's own pending content does not
+    /// survive (its state carries none): the caller re-applies the rows of
+    /// the claims still open to park it again.
     pub fn union(&mut self, state: &[u8]) -> RowEffect {
         let mut fresh = match Replayer::from_state(self.mode, state) {
             Ok(fresh) => fresh,
@@ -256,11 +273,41 @@ impl Replayer {
         effect
     }
 
-    /// The replay's full state, its pending content included.
+    /// Applies `rows` again (the original bytes of rows whose content was
+    /// parked, in rev order) and adds what they integrate now to `effect`.
+    ///
+    /// yrs 0.27.3 retries its pending structs only when a missing clock it
+    /// recorded falls below that client's clock (`transaction.rs:836-843`),
+    /// and the structs it keeps pending can no longer integrate in some
+    /// cases where the row's own bytes do; so whether parked content
+    /// integrates once everything it needs is there would depend on how the
+    /// replay got there (a replay resumed from a checkpoint re-parks the
+    /// rows afresh). Every replay calls this after each apply that
+    /// integrated something, with the rows parked so far: parked content
+    /// then integrates at the first apply after which it can, whatever the
+    /// replay's past. Already-held blocks are trimmed, so a row that drained
+    /// long ago changes nothing. `false` when one of them corrupts the
+    /// replay, which must not be used again.
+    pub fn retry<'a>(
+        &mut self,
+        rows: impl IntoIterator<Item = &'a [u8]>,
+        effect: &mut RowEffect,
+    ) -> bool {
+        for bytes in rows {
+            let e = self.apply(bytes);
+            if e.outcome == RowOutcome::Corrupt {
+                return false;
+            }
+            effect.inserted.merge_with(e.inserted);
+            effect.deleted.merge_with(e.deleted);
+        }
+        true
+    }
+
+    /// The replay's state: its blocks and delete set, without pending
+    /// content (module docs: the pending fallback).
     pub fn encode_state(&self) -> Vec<u8> {
-        self.doc
-            .transact()
-            .encode_state_as_update_v1(&StateVector::default())
+        own_state(&self.doc.transact())
     }
 
     /// The replay's state vector, v1-encoded.
@@ -420,17 +467,20 @@ fn highest_clock(set: &IdSet, client: &ClientID) -> u32 {
         .unwrap_or(0)
 }
 
-/// The blocks a doc holds: its full state's insertions, deleted ones
-/// included, less its pending structs (which the full state re-encodes but
-/// the block store does not hold). `None` when the doc's own state does not
-/// decode again.
+/// A doc's blocks and delete set as a v1 update, without its pending
+/// content (`encode_state_as_update` with an encoder skips
+/// `merge_pending_v1`; module docs).
+fn own_state<T: ReadTxn>(txn: &T) -> Vec<u8> {
+    let mut encoder = EncoderV1::new();
+    txn.encode_state_as_update(&StateVector::default(), &mut encoder);
+    encoder.to_vec()
+}
+
+/// The blocks a doc holds, deleted ones included (its pending structs are
+/// not in the block store). `None` when the doc's own state does not decode
+/// again.
 fn held<T: ReadTxn>(txn: &T) -> Option<IdSet> {
-    let full = txn.encode_state_as_update_v1(&StateVector::default());
-    let mut held = Update::decode_v1(&full).ok()?.insertions(true);
-    if let Some(pending) = txn.store().pending_update() {
-        held.diff_with(&pending.update.insertions(true));
-    }
-    Some(held)
+    Some(Update::decode_v1(&own_state(txn)).ok()?.insertions(true))
 }
 
 /// The parts of `set` at or above each client's clock in `sv`.

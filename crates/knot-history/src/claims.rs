@@ -167,6 +167,11 @@ impl Claims {
         credits
     }
 
+    /// The open claims, oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = &ParkedClaim> {
+        self.claims.iter()
+    }
+
     /// The number of open claims.
     pub fn len(&self) -> usize {
         self.claims.len()
