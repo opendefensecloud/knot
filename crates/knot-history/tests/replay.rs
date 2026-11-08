@@ -332,6 +332,58 @@ fn a_resend_over_blocks_held_past_a_gap_is_trimmed_and_applied() {
     assert!(!r.has_pending());
 }
 
+/// A checked apply (the replay holds t3 past client 1's gap, and the
+/// update has client 1's blocks) that drains parked content the update does
+/// not itself carry is a legitimate apply, not `Corrupt`: content parked
+/// before the apply may become held by it.
+#[test]
+fn a_checked_apply_that_drains_parked_content_is_applied() {
+    let (_doc, t1, t2, t3, _) = three_paragraphs();
+    // Client 3 holds t1 and adds paragraph "q" (e3); client 2 holds t1 and
+    // e3 and types "W" into q (e2), which depends on e3.
+    let c3 = doc_with(3, &t1);
+    let frag3 = c3.get_or_insert_xml_fragment("default");
+    let e3 = txn_update(&c3, |txn| {
+        let p = frag3.push_back(txn, XmlElementPrelim::empty("paragraph"));
+        p.push_back(txn, XmlTextPrelim::new("q"));
+    });
+    let c2 = doc_with(2, &yrs::merge_updates_v1([&t1, &e3]).expect("merge"));
+    let frag2 = c2.get_or_insert_xml_fragment("default");
+    let e2 = txn_update(&c2, |txn| text_of(&frag2, txn, 1).insert(txn, 1, "W"));
+
+    let mut r = gapped_replay(&t1, &t3);
+    let parked = r.apply(&e2);
+    assert_eq!(parked.outcome, RowOutcome::Applied);
+    assert_eq!(
+        parked.parked_inserts,
+        insertions_of(&e2),
+        "fixture: e2 parks on client 3"
+    );
+    let row = yrs::merge_updates_v1([&t2, &e3]).expect("merge t2 and e3");
+    let e = r.apply(&row);
+    assert_eq!(e.outcome, RowOutcome::Applied);
+    assert!(
+        e.inserted.contains(&first_id_of(&e2)),
+        "e2's parked block drains in this transaction"
+    );
+    assert!(!r.has_pending());
+
+    // A plain yrs doc applies the same rows to the same content.
+    let plain = Doc::new();
+    for u in [&t1, &t3, &e2, &row] {
+        plain
+            .transact_mut()
+            .apply_update(Update::decode_v1(u).expect("an update"))
+            .expect("applies");
+    }
+    assert_eq!(xml_string(&r), xml_string_of_doc(&plain));
+    assert_eq!(
+        xml_string(&r),
+        "<paragraph>three</paragraph><paragraph>one</paragraph>\
+         <paragraph>two</paragraph><paragraph>qW</paragraph>"
+    );
+}
+
 #[test]
 fn a_full_state_probe_over_a_gapped_replay_reports_the_missing_range() {
     let (doc, t1, t2, t3, _) = three_paragraphs();

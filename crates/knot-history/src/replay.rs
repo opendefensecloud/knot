@@ -10,7 +10,8 @@
 //! builds (`block_store.rs:318`): see [`Replayer::would_underflow`]. The
 //! replay refuses that shape before applying it ([`RowOutcome::Refused`]),
 //! and after any apply that met blocks held past a gap it checks that it
-//! holds nothing the update did not bring ([`RowOutcome::Corrupt`]).
+//! holds nothing that neither the update brought nor was pending before
+//! ([`RowOutcome::Corrupt`]).
 
 use std::collections::BTreeMap;
 
@@ -53,8 +54,8 @@ pub enum RowOutcome {
     /// The update has the shape that reaches yrs 0.27.3's skip underflow;
     /// it was not applied and nothing changed.
     Refused,
-    /// After the apply the replay holds blocks the update did not bring: its
-    /// block list is corrupt, and a `Replayer` that returned this from
+    /// After the apply the replay holds blocks that neither the update
+    /// brought nor were pending before it: its block list is corrupt, and a `Replayer` that returned this from
     /// [`Replayer::apply`] or [`Replayer::merge_state`] must not be used
     /// again.
     Corrupt,
@@ -317,7 +318,8 @@ impl Replayer {
         if let Some(held_before) = held_before {
             let txn = self.doc.transact();
             let ok = held(&txn).is_some_and(|held_after| {
-                holds_only_what_it_was_given(&held_before, &held_after, &brought, &inserted)
+                let given = brought.merge(&pending_before.inserts);
+                holds_only_what_it_was_given(&held_before, &held_after, &given, &inserted)
             });
             if !ok {
                 outcome = RowOutcome::Corrupt;
@@ -384,27 +386,29 @@ fn gc_block_straddles_a_skip_end(gc: &IdSet, past_gap: &IdSet) -> bool {
 /// The post-apply check: after an apply to a replay that held blocks past a
 /// gap, the transaction integrated nothing the replay already held (yrs
 /// trims what a doc holds before integrating, so a correct apply never
-/// does), the replay holds only what it held before and what the update
-/// brought, and no client's highest held clock is past both. A release
+/// does), the replay holds only what it held before and what it was
+/// `given`, and no client's highest held clock is past both. `given` is
+/// what the update brought and what was pending before the apply: an apply
+/// may drain parked content the update does not itself carry. A release
 /// build wraps the underflow instead of panicking: on the reproducer it
 /// integrates the whole GC block over the held 2#2 and inserts a wrapped
 /// Skip after it, which only the first condition sees.
 fn holds_only_what_it_was_given(
     held_before: &IdSet,
     held_after: &IdSet,
-    brought: &IdSet,
+    given: &IdSet,
     inserted: &IdSet,
 ) -> bool {
     if !inserted.intersect(held_before).is_empty() {
         return false;
     }
-    let allowed = held_before.merge(brought);
+    let allowed = held_before.merge(given);
     if !held_after.diff(&allowed).is_empty() {
         return false;
     }
     held_after.iter().all(|(client, ranges)| {
         let highest = ranges.iter().map(|r| r.end).max().unwrap_or(0);
-        highest <= highest_clock(held_before, client).max(highest_clock(brought, client))
+        highest <= highest_clock(held_before, client).max(highest_clock(given, client))
     })
 }
 
@@ -494,6 +498,26 @@ mod tests {
         // The transaction integrated a block the replay held (the wrapped
         // underflow): corrupt, although what it holds looks right.
         assert!(!check(&filled, &set(&[(2, 2, 5)])));
+
+        // Content pending before the apply drained into it: the caller
+        // passes it in `given` with what the update brought, so a client
+        // the update does not name may grow, up to what was pending.
+        let pending = set(&[(3, 0, 2)]);
+        let given = brought.merge(&pending);
+        let drained = set(&[(1, 0, 5), (2, 0, 6), (3, 0, 2)]);
+        let inserted = set(&[(2, 2, 4), (3, 0, 2)]);
+        assert!(holds_only_what_it_was_given(
+            &before, &drained, &given, &inserted
+        ));
+        // Without the pending content it reads as corrupt.
+        assert!(!check(&drained, &inserted));
+        // Past what was pending: still corrupt.
+        assert!(!holds_only_what_it_was_given(
+            &before,
+            &set(&[(1, 0, 5), (2, 0, 6), (3, 0, 3)]),
+            &given,
+            &inserted
+        ));
     }
 
     #[test]
