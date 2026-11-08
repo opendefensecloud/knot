@@ -60,10 +60,12 @@ pub const MAX_TIMEOUTS: i32 = 2;
 /// Passes that died with the process after which a page is given up.
 pub const MAX_CRASHES: i32 = 3;
 /// Rebuilds asked for by a rejected genesis or gap starting checkpoint
-/// after which a page is given up. Only a give-up and a newer builder
-/// version reset the count (not a written genesis or pass, nor the claim's
-/// lift of the rebuild request), so a rejection that recurs after every
-/// rebuild cannot loop forever.
+/// after which a page is given up. The count is the page's whole life
+/// under one builder version, rebuilds that worked included: only a
+/// give-up and a newer builder version reset it (not a written genesis or
+/// pass, nor the claim's lift of the rebuild request), so a rejection that
+/// recurs after every rebuild cannot loop forever, at the cost of giving
+/// up a page whose three rejections were unrelated (Rulings).
 pub const MAX_REBUILDS: i32 = 3;
 /// New rows one pass replays at most.
 pub const PASS_MAX_ROWS: i64 = 5_000;
@@ -971,6 +973,17 @@ impl Run<'_> {
             now,
             bytes: _,
         } = load;
+        // Nothing to replay, yet rows or a left-out snapshot remain: such a
+        // pass would release the page still dirty, and it would be claimed
+        // again on every tick without a backoff. A failure backs it off and
+        // in the end gives it up.
+        if rows.is_empty() && snapshots.is_empty() && !rows_exhausted {
+            return self
+                .fail(Failure::plain(format!(
+                    "pass loaded nothing after rev {built_rev}"
+                )))
+                .await;
+        }
         // When each gap checkpoint's snapshot was written: probes run at
         // their own rev, late ones at `built_rev`.
         let mut gap_times: Vec<(i64, chrono::DateTime<chrono::Utc>)> = Vec::new();

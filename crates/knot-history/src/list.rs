@@ -73,9 +73,10 @@ impl Cursor {
             }),
             ["B", "start"] => Ok(Cursor::BaselineStart),
             ["B", micros, id] => Ok(Cursor::Baseline {
-                // Only times a list can have produced: Postgres's
-                // timestamptz holds less than chrono does, and a time it
-                // cannot hold fails the query instead of being a 400.
+                // Only times a list can have produced (years 1 to 9999):
+                // Postgres's timestamptz holds nothing before 4713 BC, and
+                // a time it cannot hold fails the query (SQLSTATE 22008)
+                // instead of being a 400.
                 ended_at: DateTime::from_timestamp_micros(int(micros)?)
                     .filter(|t| (1..=9999).contains(&t.year()))
                     .ok_or(CursorError)?,
@@ -408,7 +409,9 @@ pub fn render_page(
                 "author": author_json(e.author_id, people),
                 "started_at": e.started_at,
                 "ended_at": e.ended_at,
-                "open": !e.sealed,
+                // A given-up page's open session never seals (the sweep
+                // skips the page), so it is not shown in progress.
+                "open": !e.sealed && !page.unavailable,
                 "words_added": e.words_added,
                 "words_removed": e.words_removed,
                 "meta": render_meta(e, people, readable),
@@ -459,9 +462,11 @@ mod tests {
             "B.start.1",
             "B.9223372036854775807.1",
             "B.-9223372036854775808.1",
-            // Times chrono holds and Postgres does not (years -251540 and
-            // 10000).
+            // A time chrono holds and Postgres does not (year -251540).
             "B.-8000000000000000000.1",
+            // Times no list produces (years 0 and 10000), though Postgres
+            // holds them.
+            "B.-62167219200000000.1",
             "B.253402300800000000.1",
             "L.1.2.3",
         ] {
@@ -504,6 +509,33 @@ mod tests {
                 anonymized,
             },
         )
+    }
+
+    #[test]
+    fn an_open_session_is_in_progress_unless_the_page_is_unavailable() {
+        let mut open = row(1, EntryKind::Session, None, json!({}));
+        open.sealed = false;
+        open.words_added = None;
+        open.words_removed = None;
+        let mut page = HistoryPage {
+            history_since: t(0),
+            history_complete: true,
+            catching_up: false,
+            unavailable: false,
+            entries: vec![open, row(2, EntryKind::Session, None, json!({}))],
+            next_cursor: None,
+        };
+        let opens = |page: &HistoryPage| -> Vec<Value> {
+            render_page(page, &HashMap::new(), &HashSet::new())["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["open"].clone())
+                .collect()
+        };
+        assert_eq!(opens(&page), vec![json!(true), json!(false)]);
+        page.unavailable = true;
+        assert_eq!(opens(&page), vec![json!(false), json!(false)]);
     }
 
     #[test]

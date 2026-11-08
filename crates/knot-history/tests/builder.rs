@@ -624,6 +624,100 @@ async fn an_oversized_snapshot_is_left_unchecked_not_given_up() {
     assert!(of_kind(&db.entries(doc).await, "gap").is_empty());
 }
 
+/// `SELECT <sql>` with `$1` bound to `doc`, as a bigint.
+async fn bytes_of(db: &Db, doc: Uuid, sql: &str) -> i64 {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_string()))
+        .bind(doc)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_gap_and_its_snapshot_that_do_not_fit_together_still_build() {
+    // A rebuild keeps the gap checkpoint K at 2 and probes the snapshot S
+    // at 2 again. Under a cap where each fits with rows 1-2 but not both,
+    // a pass that leaves S out must still load row 2 and K: loading rows
+    // through 1 only made every later pass load nothing, forever.
+    let db = db().await;
+    let doc = db.page().await;
+    page_with_gaps(&db, doc, &[(2, "gap x")], false).await;
+    db.exec(
+        "UPDATE doc_history_state SET builder_version = 0 WHERE doc_id = $1",
+        doc,
+    )
+    .await;
+    assert_eq!(db.builder(limits()).build_page(doc).await, genesis(0));
+    let base = base_of(&db, doc).await;
+    let rows_to = bytes_of(
+        &db,
+        doc,
+        "SELECT sum(octet_length(update_bytes))::bigint FROM doc_updates
+          WHERE doc_id = $1 AND rev BETWEEN 1 AND 2",
+    )
+    .await;
+    let kept = bytes_of(
+        &db,
+        doc,
+        "SELECT octet_length(state_bytes)::bigint FROM doc_history_checkpoints
+          WHERE doc_id = $1 AND rev = 2 AND kind = 'gap'",
+    )
+    .await;
+    let snap = bytes_of(
+        &db,
+        doc,
+        "SELECT octet_length(state_bytes)::bigint FROM doc_snapshots
+          WHERE doc_id = $1 AND snapshot_rev = 2",
+    )
+    .await;
+    let cap = base + rows_to + kept.max(snap);
+    assert!(base + rows_to + kept + snap > cap);
+    let capped = db.builder(limits_with(|l| l.max_input_bytes = cap));
+    // At most 50 passes: the stuck pass returned `Built { rows: 0 }` on
+    // every call.
+    build_clean(&capped, doc).await;
+    let s = db.state(doc).await;
+    assert_eq!(s.built_rev, 4);
+    assert!(!s.given_up && s.retry_null, "{s:?}");
+    let entries = db.entries(doc).await;
+    let gaps = of_kind(&entries, "gap");
+    assert_eq!(gaps.len(), 1, "{entries:#?}");
+    assert_eq!(gaps[0].end_rev, Some(2));
+    let at2 = db.checkpoints(doc).await;
+    let at2 = at2.iter().find(|c| c.rev == 2).expect("a checkpoint at 2");
+    assert!(holds(&at2.state_bytes, "gap x"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_that_loads_nothing_below_the_head_fails_with_backoff() {
+    let db = db().await;
+    let doc = db.page().await;
+    genesis_then_rows(&db, doc).await;
+    assert!(is_built(
+        &db.builder(limits_with(|l| l.max_rows = 1))
+            .build_page(doc)
+            .await
+    ));
+    assert_eq!(db.state(doc).await.built_rev, 1);
+    // A snapshot at 3 that does not fit with the rows to it is left out, so
+    // the pass loads rows through 2, and row 2 is gone (an operator's
+    // rewrite): nothing loads, and rows remain.
+    db.snapshot(doc, 3, &vec![0_u8; 8192]).await;
+    db.rewrite("DELETE FROM doc_updates WHERE doc_id = $1 AND rev = 2", doc)
+        .await;
+    let base = base_of(&db, doc).await;
+    let b = db.builder(limits_with(|l| l.max_input_bytes = base + 4096));
+    assert_eq!(b.build_page(doc).await, PassResult::Failed);
+    let s = db.state(doc).await;
+    assert_eq!((s.built_rev, s.failures, s.claimed_by), (1, 1, None));
+    assert!(
+        s.last_error.as_deref().unwrap().contains("loaded nothing"),
+        "{s:?}"
+    );
+    assert!(s.deferred);
+    assert!(!b.dirty_candidates().await.contains(&doc));
+}
+
 // ---------------------------------------------------------------------------
 // Passes, concurrency, leases
 // ---------------------------------------------------------------------------
@@ -1198,7 +1292,8 @@ async fn a_pass_that_dies_mid_compute_defers_the_page() {
         let a = a.clone();
         tokio::spawn(async move { a.build_page(doc).await })
     };
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Aborted only once the claim (lease and crash marker) committed.
+    claimed_by(&db, doc, a.id()).await;
     dying.abort();
     let _ = dying.await;
     assert_eq!(b.build_page(doc).await, PassResult::Deferred);
@@ -1482,8 +1577,9 @@ async fn a_page_that_crashes_the_process_three_times_is_given_up() {
     let doc = db.page().await;
     for i in 0..3 {
         let x = db.builder_with(holding(Duration::from_secs(5)), history_permits(1));
+        let id = x.id();
         let dying = tokio::spawn(async move { x.build_page(doc).await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        claimed_by(&db, doc, id).await;
         dying.abort();
         let _ = dying.await;
         let s = db.state(doc).await;
@@ -2277,6 +2373,29 @@ async fn a_rev_gap_fails_the_page_with_backoff() {
     assert_eq!(s.last_error.as_deref(), Some("rev gap after 1"));
     assert!(s.deferred);
     assert!(!b.dirty_candidates().await.contains(&doc));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_backoff_counts_from_the_failure_not_the_claim() {
+    let db = db().await;
+    let doc = db.page().await;
+    genesis_then_rows(&db, doc).await;
+    let b = db.builder(limits_with(|l| {
+        l.hooks.hold_compute = Duration::from_millis(1500);
+        l.hooks.replay.corrupt_at_rev = Some(2);
+    }));
+    assert_eq!(b.build_page(doc).await, PassResult::Failed);
+    let s = db.state(doc).await;
+    assert_eq!(s.failures, 1);
+    let secs = knot_history::builder::failure_backoff(0).num_seconds();
+    assert!(
+        db.state_is(
+            doc,
+            &format!("retry_after - updated_at = make_interval(secs => {secs})")
+        )
+        .await,
+        "the full backoff after the failure, not the claim's less the compute: {s:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

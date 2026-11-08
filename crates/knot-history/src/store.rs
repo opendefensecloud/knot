@@ -279,7 +279,7 @@ pub(crate) async fn claim(pool: &PgPool, doc_id: Uuid, me: Uuid, lease: Duration
         Some((
             "failures",
             format!(
-                "given up after {rebuilds} rebuilds that did not help (last: {})",
+                "given up after {rebuilds} rebuilds asked for by rejected starting checkpoints (last: {})",
                 last_error.as_deref().unwrap_or("none")
             ),
         ))
@@ -460,8 +460,8 @@ pub(crate) enum Recorded {
 }
 
 /// Records a failed pass (Rulings, "a failed pass"): the claim's crash
-/// marker stays, the lease is released, `last_error` names the failure and
-/// `action` applies. `timed_out` with `FailureAction::None` counts a
+/// marker stays, the lease is released, the backoff restarts from now,
+/// `last_error` names the failure and `action` applies. `timed_out` with `FailureAction::None` counts a
 /// timeout, and the second gives the page up in the same transaction.
 pub(crate) async fn record_failure(
     pool: &PgPool,
@@ -474,15 +474,15 @@ pub(crate) async fn record_failure(
     let Some(mut tx) = begin_page_write(pool, doc_id, "10s").await? else {
         return Ok(Recorded::NoMatch);
     };
-    let row: Option<(i64, i32)> = sqlx::query_as(
-        "SELECT built_rev, timeouts FROM doc_history_state
+    let row: Option<(i64, i32, i32)> = sqlx::query_as(
+        "SELECT built_rev, timeouts, failures FROM doc_history_state
           WHERE doc_id = $1 AND claimed_by = $2 FOR UPDATE",
     )
     .bind(doc_id)
     .bind(me)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((built_rev, timeouts)) = row else {
+    let Some((built_rev, timeouts, failures)) = row else {
         return Ok(Recorded::NoMatch);
     };
     let count_timeout = timed_out && action == FailureAction::None;
@@ -506,9 +506,14 @@ pub(crate) async fn record_failure(
         FailureAction::Rebuild { .. } => (None, None, None, true),
         _ => (None, None, None, false),
     };
+    // The backoff again, from now: the claim's counted from the claim, so
+    // a pass that failed after a long compute would be claimed again at
+    // once (`failures` already counts this one).
+    let backoff = crate::builder::failure_backoff(failures - 1);
     sqlx::query(
         "UPDATE doc_history_state
             SET last_error = $2, claimed_by = NULL, claimed_until = NULL, updated_at = now(),
+                retry_after = now() + make_interval(secs => $8),
                 timeouts = timeouts + $3,
                 skip_revs = CASE WHEN $4::bigint IS NULL OR $4 = ANY(skip_revs) THEN skip_revs
                                  ELSE array_append(skip_revs, $4) END,
@@ -529,6 +534,7 @@ pub(crate) async fn record_failure(
     .bind(skip_snapshot)
     .bind(skip_baseline)
     .bind(rebuild)
+    .bind(backoff.num_seconds() as f64)
     .execute(&mut *tx)
     .await?;
     let dropped = match action {
@@ -904,7 +910,14 @@ pub(crate) fn walk(
                 w.snapshots.push(s);
                 any_taken = true;
             } else {
-                w.through = Some(sn.rev - 1);
+                // The rows through the snapshot's rev when a kept gap at
+                // that rev was taken (it went first, and was taken with
+                // those rows counted): through `rev - 1` the loader would
+                // skip the kept gap, and with both at `built_rev + 1` no
+                // pass would ever load a row. The snapshot is then probed
+                // late, at that rev, by the next pass.
+                let kept_here = w.kept.last().is_some_and(|&i| kept[i].rev == sn.rev);
+                w.through = Some(if kept_here { sn.rev } else { sn.rev - 1 });
                 w.left_out = true;
                 break;
             }
@@ -1822,6 +1835,48 @@ mod tests {
         // Far ahead it is left out instead, so the rows before it load.
         let w = walk(&[sized(20, 60, 30)], &[], 50, 5, 10, 100, None);
         assert_eq!(w.through, Some(19));
+    }
+
+    #[test]
+    fn a_kept_gap_taken_at_a_left_out_snapshots_rev_loads_its_row() {
+        // K and S both at built_rev + 1: each fits alone, not both.
+        let w = walk(
+            &[sized(11, 30, 5)],
+            &[sized(11, 30, 5)],
+            50,
+            5,
+            10,
+            100,
+            None,
+        );
+        assert_eq!(w.kept, vec![0]);
+        assert!(w.snapshots.is_empty() && w.oversized.is_empty());
+        assert!(w.left_out);
+        assert_eq!(w.through, Some(11), "row 11 loads, and with it K");
+        // Further ahead, after a late snapshot: the same.
+        let w = walk(
+            &[sized(9, 10, 0), sized(14, 30, 10)],
+            &[sized(14, 30, 10)],
+            50,
+            5,
+            10,
+            100,
+            None,
+        );
+        assert_eq!((w.snapshots, w.kept), (vec![0], vec![0]));
+        assert_eq!(w.through, Some(14));
+        // A kept gap below the left-out snapshot's rev changes nothing.
+        let w = walk(
+            &[sized(14, 30, 10)],
+            &[sized(12, 30, 8)],
+            50,
+            5,
+            10,
+            100,
+            None,
+        );
+        assert_eq!(w.kept, vec![0]);
+        assert_eq!(w.through, Some(13));
     }
 
     #[test]
