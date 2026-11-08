@@ -700,7 +700,14 @@ async fn a_bad_cursor_is_a_400() {
     let fx = fixture().await;
     let doc = page(&fx, "Cursors").await;
     let mut cursors = vec!["!!".to_string()];
-    for plain in ["Q.1.2", "L.1", "B.start.1", "B.9223372036854775807.1"] {
+    for plain in [
+        "Q.1.2",
+        "L.1",
+        "B.start.1",
+        "B.9223372036854775807.1",
+        // A time chrono holds and Postgres's timestamptz does not.
+        "B.-8000000000000000000.1",
+    ] {
         cursors.push(URL_SAFE_NO_PAD.encode(plain));
     }
     for c in cursors {

@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use thiserror::Error;
@@ -73,7 +73,12 @@ impl Cursor {
             }),
             ["B", "start"] => Ok(Cursor::BaselineStart),
             ["B", micros, id] => Ok(Cursor::Baseline {
-                ended_at: DateTime::from_timestamp_micros(int(micros)?).ok_or(CursorError)?,
+                // Only times a list can have produced: Postgres's
+                // timestamptz holds less than chrono does, and a time it
+                // cannot hold fails the query instead of being a 400.
+                ended_at: DateTime::from_timestamp_micros(int(micros)?)
+                    .filter(|t| (1..=9999).contains(&t.year()))
+                    .ok_or(CursorError)?,
                 id: int(id)?,
             }),
             _ => Err(CursorError),
@@ -454,6 +459,10 @@ mod tests {
             "B.start.1",
             "B.9223372036854775807.1",
             "B.-9223372036854775808.1",
+            // Times chrono holds and Postgres does not (years -251540 and
+            // 10000).
+            "B.-8000000000000000000.1",
+            "B.253402300800000000.1",
             "L.1.2.3",
         ] {
             bad.push(b64(plain));
