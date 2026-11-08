@@ -141,13 +141,14 @@ archive:
 # only with CPU headroom; workers: 0 turns the builder off on that replica
 # (an incident switch; history then waits). replayMaxBytes caps the input of
 # every replay, builds and word counts alike (the page's state plus the edits
-# and snapshots it reads); a replay holds about 24 times its input in memory
-# (measured), so peak builder memory is about workers × 24 × replayMaxBytes,
+# and snapshots it reads); a replay holds up to about 40 times its input in
+# memory (measured), so peak builder memory is about workers × 40 ×
+# replayMaxBytes (160 MiB at the defaults),
 # which must fit resources.limits.memory next to the web server. A page whose
 # input exceeds the cap gets no further history until the cap is raised.
 history:
   workers: 1
-  replayMaxBytes: 8388608
+  replayMaxBytes: 4194304
   cpuShare: 0.5
 
 resources:

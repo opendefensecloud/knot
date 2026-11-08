@@ -29,8 +29,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   (`history.workers: 1`), paced to half a CPU core on average
   (`history.cpuShare: 0.5`). Unpaced, one worker can take a whole core,
   the chart's default CPU limit for the whole pod. A worker can hold up
-  to about 192 MiB of memory at the default `history.replayMaxBytes`
-  (8 MiB), so raise `resources.limits.memory` before raising
+  to about 160 MiB of memory at the default `history.replayMaxBytes`
+  (4 MiB), so raise `resources.limits.memory` before raising
   `history.workers`; the chart README has the formula.
   `history.workers: 0` turns the builder off on a replica. (#TBD)
 - The database grows by checkpoints, about as much again as

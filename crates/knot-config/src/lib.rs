@@ -52,17 +52,18 @@ where
     })
 }
 
-/// The default `history_replay_max_bytes`: 8 MiB, set by page history
+/// The default `history_replay_max_bytes`: 4 MiB, set by page history
 /// M1.3's replay spike (`cargo run --release -p knot-history --example
 /// replay_throughput`). The cap is the largest power of two at most
 /// min(the slower replay workload's throughput × 2 s, (512 MiB − 256 MiB
-/// for the web server) ÷ (2 workers × F)), clamped to [8 MiB, 32 MiB]. The
-/// spike measured 6.4 MiB/s for pastes (12.8 MiB in 2 s) and a doc-memory
-/// factor F = 24 (a pass on a page of interleaved one-character typing,
-/// whose items never squash), so memory bounds it at 5.3 MiB and the floor
-/// applies: at F = 24 only one worker fits the chart's 512 Mi limit
-/// (24 × 8 MiB = 192 MiB).
-pub const DEFAULT_HISTORY_REPLAY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// for the web server) ÷ (1 worker × F)), at most 32 MiB. The spike
+/// measured 7 MiB/s for pastes (14 MiB in 2 s) and a doc-memory factor
+/// F = 40: a pass whose input is mostly a checkpoint of interleaved
+/// one-character typing, whose items never squash (one decoded checkpoint
+/// byte takes 38 bytes of heap; rows and snapshots cost less, so mixed
+/// inputs measured 23). Memory bounds the cap at 6.4 MiB, so one worker
+/// takes up to 40 × 4 MiB = 160 MiB.
+pub const DEFAULT_HISTORY_REPLAY_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -157,7 +158,7 @@ pub struct Config {
     pub history_workers: u32,
     /// The most input bytes one history replay reads (a checkpoint or
     /// baseline, rows, gap states, snapshots), builds and word counts
-    /// alike. Peak memory is about `history_workers` × 24 × this. Minimum
+    /// alike. Peak memory is up to about `history_workers` × 40 × this. Minimum
     /// 1 MiB.
     pub history_replay_max_bytes: u64,
     /// The share of one core each history worker may use on average: after

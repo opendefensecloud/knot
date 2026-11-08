@@ -32,7 +32,19 @@
 //! 5. a page holding a 1 MiB row parked for good (its paragraph's creator
 //!    never delivered it) under 22,000 typing rows, built in passes of
 //!    5,000 rows, against the same typing without it: `PassStats::retried`
-//!    and rows/s (Task 4's review).
+//!    and rows/s (Task 4's review);
+//! 6. memory again on the same two 4 MiB states, for inputs that are mostly
+//!    the starting checkpoint (final review round 1: workload 4's input was
+//!    mostly rows and snapshots, which cost less per byte than a decoded
+//!    checkpoint): (a) a pass over the checkpoint and 20 rows, (b) the same
+//!    with a late snapshot whose probe finds a gap, (c) a word count over
+//!    (b)'s output. F is the largest factor of workloads 4 and 6.
+//!
+//! The cap rule: the largest power of two at most min(the slower of
+//! workloads 1-2 × 2 s, (512 MiB − 256 MiB) ÷ (1 worker × F)), at most
+//! 32 MiB. One worker is the default; the [8, 32] MiB clamp of the M1.3
+//! plan is gone, since at F > 32 its 8 MiB floor does not fit even one
+//! worker in the chart's 512 Mi limit.
 
 #[path = "../tests/common/underflow.rs"]
 mod underflow;
@@ -159,7 +171,7 @@ const PASS_MAX_ROWS: usize = 5_000;
 /// the default cap must fit (Rulings).
 const MEMORY_LIMIT: usize = 512 * MIB;
 const WEB_ALLOWANCE: usize = 256 * MIB;
-const CAP_WORKERS: usize = 2;
+const CAP_WORKERS: usize = 1;
 /// Seconds of the slower replay workload the cap may hold.
 const CAP_SECONDS: f64 = 2.0;
 /// The bound on workload 3's worst replay.
@@ -1032,6 +1044,158 @@ fn memory(growth: Growth) -> [f64; 2] {
 }
 
 // ---------------------------------------------------------------------------
+// Workload 6: inputs that are mostly a checkpoint
+// ---------------------------------------------------------------------------
+
+/// Peak heap factors of passes and a word count whose input is mostly the
+/// starting checkpoint, the usual shape of an incremental pass on a large
+/// page (final review round 1): (a) the checkpoint and 20 new rows; (b) the
+/// same with a late snapshot whose probe finds a gap (a probe copy, the
+/// merge and the gap checkpoint's decode check); (c) a word count over (b)'s
+/// output (the checkpoint, the rows and the gap state).
+fn checkpoint_heavy(growth: Growth) -> [f64; 3] {
+    let mut ed = Editors::new(6);
+    let mut log = Log::default();
+    let mut i = 0;
+    let check_every = match growth {
+        Growth::Typing => 20_000,
+        Growth::Pastes => 1,
+    };
+    loop {
+        let (c, bytes) = growth.row(&mut ed, i);
+        log.push(c, bytes);
+        i += 1;
+        if i % check_every == 0 && ed.state().len() >= 4 * MIB {
+            break;
+        }
+    }
+    let checkpoint_rev = log.rows.len() as i64;
+    let checkpoint_state = Replayer::from_state(ReplayMode::Gc, &ed.state())
+        .expect("the page's state")
+        .encode_state();
+    let late = {
+        let x = Doc::with_client_id(0x78);
+        apply(&x, &ed.state());
+        let frag = x.get_or_insert_xml_fragment("default");
+        let mut txn = x.transact_mut();
+        let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+        p.push_back(&mut txn, XmlTextPrelim::new(ed.rng.text(4 * KIB)));
+        drop(txn);
+        own_state(&x)
+    };
+    for _ in 0..20 {
+        let (c, bytes) = match growth {
+            Growth::Typing => (i % 3, ed.type_shared(i % 3)),
+            Growth::Pastes => (i % 3, ed.paste(i % 3, KIB)),
+        };
+        log.push(c, bytes);
+        i += 1;
+    }
+    let rows = log.rows;
+    let new = rows_in(&rows, checkpoint_rev, i64::MAX);
+    let pass = |snapshots: Vec<SnapshotProbe>| PassInput {
+        checkpoint_rev,
+        checkpoint_state: checkpoint_state.clone(),
+        reapply: Vec::new(),
+        replay: Vec::new(),
+        genesis_rev: 0,
+        built_rev: checkpoint_rev,
+        rows: new.clone(),
+        rows_exhausted: true,
+        open: Vec::new(),
+        claims: Claims::default(),
+        kept_gaps: Vec::new(),
+        snapshots,
+        snapshot_checked_rev: checkpoint_rev,
+        skip_revs: BTreeSet::new(),
+        progress: Progress::default(),
+        now: at(i64::try_from(rows.len()).unwrap() + 7200),
+        rows_budget: None,
+        checkpoint_floor: CHECKPOINT_FLOOR_BYTES,
+        hooks: ReplayHooks::default(),
+    };
+
+    let a_input = checkpoint_state.len() + bytes_of(&new);
+    let input = pass(Vec::new());
+    let a = measure(|| run_pass(input).expect("the pass"));
+    drop(a.value);
+    let factor_a = (a_input + a.peak) as f64 / a_input as f64;
+
+    let b_input = a_input + late.len();
+    let input = pass(vec![SnapshotProbe {
+        rev: checkpoint_rev,
+        created_at: at(checkpoint_rev) + Duration::seconds(30),
+        state_bytes: Some(late.clone()),
+    }]);
+    let b = measure(|| run_pass(input).expect("the pass"));
+    let out = b.value;
+    assert_eq!(out.stats.gaps, 1, "the late snapshot's gap");
+    let factor_b = (b_input + b.peak) as f64 / b_input as f64;
+
+    let gap_states: Vec<(i64, Vec<u8>)> = out
+        .checkpoints
+        .iter()
+        .filter(|c| c.kind == CheckpointKind::Gap)
+        .map(|c| (c.rev, c.state_bytes.clone()))
+        .collect();
+    let session = out
+        .entries
+        .iter()
+        .find(|e| e.kind == EntryKind::Session)
+        .expect("a session")
+        .clone();
+    let end_rev = session.end_rev.expect("an end rev");
+    let window_rows = rows_in(&rows, checkpoint_rev, end_rev);
+    let c_input = checkpoint_state.len()
+        + bytes_of(&window_rows)
+        + gap_states.iter().map(|(_, s)| s.len()).sum::<usize>();
+    let w = WindowInput {
+        mode: ReplayMode::KeepDeleted,
+        checkpoint_state: checkpoint_state.clone(),
+        reapply: Vec::new(),
+        rows: window_rows,
+        gap_states,
+        skip_revs: BTreeSet::new(),
+        end_rev,
+        merge_gap_at_end: false,
+        progress: Progress::default(),
+        hooks: ReplayHooks::default(),
+    };
+    let c = measure(|| {
+        let r = replay_window(w).expect("the window");
+        let d = entry_diff(r.doc(), &session.inserted, &session.deleted).expect("the diff");
+        count_words(&text_chunks(&d))
+    });
+    let factor_c = (c_input + c.peak) as f64 / c_input as f64;
+
+    println!("== 6. a checkpoint-heavy input: {}", growth.name());
+    println!(
+        "  checkpoint {:.2} MiB at rev {checkpoint_rev}, new rows {:.3} MiB ({} rows), snapshot {:.2} MiB",
+        mib(checkpoint_state.len()),
+        mib(bytes_of(&new)),
+        new.len(),
+        mib(late.len()),
+    );
+    for (name, input, m, f) in [
+        ("(a) pass, checkpoint + rows", a_input, a.peak, factor_a),
+        (
+            "(b) pass, + a late snapshot's gap",
+            b_input,
+            b.peak,
+            factor_b,
+        ),
+        ("(c) word count over (b)", c_input, c.peak, factor_c),
+    ] {
+        println!(
+            "  {name}: input {:.2} MiB, peak heap above start {:.2} MiB, F = (input + peak) / input {f:.2}",
+            mib(input),
+            mib(m),
+        );
+    }
+    [factor_a, factor_b, factor_c]
+}
+
+// ---------------------------------------------------------------------------
 // Workload 5: a row parked for good under typing
 // ---------------------------------------------------------------------------
 
@@ -1116,6 +1280,10 @@ fn main() {
                     memory(Growth::Pastes);
                 }
                 "5" => parked_for_good(),
+                "6" => {
+                    checkpoint_heavy(Growth::Typing);
+                    checkpoint_heavy(Growth::Pastes);
+                }
                 other => panic!("no workload {other}"),
             }
         }
@@ -1128,6 +1296,9 @@ fn main() {
     for growth in [Growth::Typing, Growth::Pastes] {
         factors.extend(memory(growth));
     }
+    for growth in [Growth::Typing, Growth::Pastes] {
+        factors.extend(checkpoint_heavy(growth));
+    }
     parked_for_good();
 
     let slower = t1.mib_per_sec.min(t2.mib_per_sec);
@@ -1135,7 +1306,7 @@ fn main() {
     let by_time = slower * CAP_SECONDS * MIB as f64;
     let by_memory = (MEMORY_LIMIT - WEB_ALLOWANCE) as f64 / (CAP_WORKERS as f64 * f);
     let bound = by_time.min(by_memory);
-    let mut cap = 8 * MIB;
+    let mut cap = MIB;
     while ((cap * 2) as f64) <= bound && cap * 2 <= 32 * MIB {
         cap *= 2;
     }
@@ -1153,14 +1324,10 @@ fn main() {
         by_memory / MIB as f64
     );
     println!(
-        "  replay cap: largest power of two <= {:.1} MiB, clamped to [8, 32] MiB = {} MiB{}",
+        "  replay cap: largest power of two <= {:.1} MiB, at most 32 MiB = {} MiB ({CAP_WORKERS} worker x F x cap = {:.0} MiB)",
         bound / MIB as f64,
         cap / MIB,
-        if f > 16.0 {
-            " (F > 16: two workers do not fit the 512 Mi limit at the 8 MiB floor)"
-        } else {
-            ""
-        }
+        (CAP_WORKERS * cap) as f64 * f / MIB as f64,
     );
     println!(
         "  policy: worst replay {:.3} s against {POLICY_BOUND_SECS} s: {}",
