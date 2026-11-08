@@ -8,8 +8,6 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
-## [0.9.11] - 2026-11-08
-
 ### Upgrading
 - Upgrade from 0.9.10, and don't skip 0.9.10 on the way from 0.9.9:
   this release builds on the numbered edit log that 0.9.10 starts. One
@@ -1289,8 +1287,7 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.11...HEAD
-[0.9.11]: https://github.com/opendefensecloud/knot/compare/v0.9.10...v0.9.11
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.10...HEAD
 [0.9.10]: https://github.com/opendefensecloud/knot/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/opendefensecloud/knot/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/opendefensecloud/knot/compare/v0.9.7...v0.9.8
