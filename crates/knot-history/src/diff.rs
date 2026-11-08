@@ -125,13 +125,24 @@ pub fn entry_diff(h: &Doc, inserted: &IdSet, deleted: &IdSet) -> Result<EntryDif
 /// fragment, depth-first, each diffed between `s` (hi) and `s_lo` (lo).
 /// Only string inserts become chunks; an embedded node ends the current
 /// segment.
+///
+/// Each text is diffed in a transaction of its own: yrs 0.27.3's
+/// `diff_range` splits the whole doc by both snapshots on every call and
+/// records every block of their delete sets in the transaction's
+/// `merge_blocks` (`transaction.rs:1336-1362`), which only a commit drains,
+/// so one transaction over all texts held (texts × those blocks) ids at
+/// once: about 500 MiB on a 4 MiB page of interleaved typing (Task 5's
+/// spike, `tests/diff_memory.rs`).
 pub fn text_chunks(d: &EntryDiff) -> Vec<TextChunk> {
-    let mut txn = d.union.transact_mut();
-    let Some(root) = txn.get_xml_fragment("default") else {
-        return Vec::new();
+    let texts = {
+        let txn = d.union.transact();
+        let Some(root) = txn.get_xml_fragment("default") else {
+            return Vec::new();
+        };
+        let mut texts = Vec::new();
+        collect_texts(&txn, root.children(&txn), &mut texts);
+        texts
     };
-    let mut texts = Vec::new();
-    collect_texts(&txn, root.children(&txn), &mut texts);
 
     let mut chunks = Vec::new();
     let mut segment = 0;
@@ -141,6 +152,7 @@ pub fn text_chunks(d: &EntryDiff) -> Vec<TextChunk> {
             segment += 1;
             segment_used = false;
         }
+        let mut txn = d.union.transact_mut();
         for diff in text.diff_range(&mut txn, Some(&d.s), Some(&d.s_lo), |c: YChange| c) {
             match diff.insert {
                 Out::Any(Any::String(s)) => {
