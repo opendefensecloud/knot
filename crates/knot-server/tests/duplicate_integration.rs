@@ -296,6 +296,8 @@ impl World {
             .send(knot_crdt::Event::ReplaceWithMarkdown {
                 update_bytes,
                 by_user: Some(self.owner.user_id),
+                source: knot_storage::UpdateSource::Import,
+                meta: None,
                 reply,
             })
             .await
@@ -1143,6 +1145,28 @@ async fn copy_title_and_icon() {
     let child_copy = w.doc(children[0]).await;
     assert_eq!(child_copy["title"], "Notes", "subpages keep their titles");
     assert_eq!(child_copy["icon"], "📝");
+
+    // Each copy's first history row names its source by the source's own
+    // title, not the copy's "(copy)" one.
+    for (copy_id, source_id, source_title) in [
+        (id_of(&copy), source, "Plan"),
+        (children[0], child, "Notes"),
+    ] {
+        let rows: Vec<(Option<i64>, Option<String>, Option<Value>)> =
+            sqlx::query_as("SELECT rev, source, meta FROM doc_updates WHERE doc_id = $1")
+                .bind(copy_id)
+                .fetch_all(w.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            [(
+                Some(1),
+                Some("copy".to_string()),
+                Some(json!({"source_doc_id": source_id, "source_title": source_title})),
+            )]
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

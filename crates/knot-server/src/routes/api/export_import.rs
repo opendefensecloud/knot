@@ -741,6 +741,8 @@ async fn import(
                 update_bytes,
                 // The importer put this content into the new page.
                 by_user: Some(ctx.user_id),
+                source: knot_storage::UpdateSource::Import,
+                meta: None,
                 reply: tx,
             })
             .await;

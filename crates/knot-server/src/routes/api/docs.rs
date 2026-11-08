@@ -1195,12 +1195,18 @@ async fn create_from_template_inline(
         }
     };
 
-    // Default title falls back to the template's title + " copy".
+    // The template's title: the new page's row records it (`meta`), and the
+    // default title falls back to it + " copy". Read even when the body
+    // names a title.
+    let template_title = match docs.get(template_id).await {
+        Ok(Some(d)) => Some(d.title),
+        _ => None,
+    };
     let title = match body.title {
         Some(t) if !t.trim().is_empty() => t,
-        _ => match docs.get(template_id).await {
-            Ok(Some(d)) => format!("{} copy", d.title),
-            _ => "Untitled".to_string(),
+        _ => match &template_title {
+            Some(t) => format!("{t} copy"),
+            None => "Untitled".to_string(),
         },
     };
 
@@ -1267,6 +1273,11 @@ async fn create_from_template_inline(
         .send(knot_crdt::Event::ApplyUpdate {
             update_bytes,
             by_user: Some(ctx.user_id),
+            source: knot_storage::UpdateSource::Template,
+            meta: Some(serde_json::json!({
+                "template_doc_id": template_id,
+                "template_title": template_title,
+            })),
             reply: tx,
         })
         .await

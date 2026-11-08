@@ -5,6 +5,7 @@ pub mod bus_mem;
 pub mod bus_pg;
 pub mod engine;
 pub mod gc;
+pub mod hydrate;
 pub mod nesting;
 pub mod presence;
 pub mod protocol;
@@ -25,9 +26,16 @@ pub use engine::{
     ApplyMeasured, DocHandle, Engine, EngineError, TextMark, TextMarkAttr, YrsEngine,
 };
 pub use gc::{GcRun, run_once as gc_run_once, spawn as spawn_gc};
+pub use hydrate::{Boot, BootError, BootMode, boot};
 pub use presence::PRESENCE_MAX_BYTES;
-pub use registry::{AcquireError, Rooms};
+pub use registry::{AcquireError, DRAIN_JOIN_WAIT, Rooms, SHUTDOWN_DRAIN};
 pub use room::{ConnHandle, ConnId, Event, InMsg, JoinState, Room, RoomHandle};
-pub use snapshot::{SnapshotPolicy, SnapshotState};
+pub use snapshot::{SnapshotPolicy, SnapshotState, SnapshotWriteError, write_snapshot};
 pub use suggestions::{ApplySuggestionError, ApplySuggestionRequest, SuggestionKind};
-pub use writer::{Applied, PersistJob};
+pub use writer::{Applied, PersistJob, WriterDone, WriterEvent, WriterLimits};
+
+#[cfg(test)]
+#[path = "../tests/common/fixtures.rs"]
+mod test_fixtures;
+#[cfg(test)]
+mod test_metrics;

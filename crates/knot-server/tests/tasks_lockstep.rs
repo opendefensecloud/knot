@@ -130,6 +130,8 @@ impl Harness {
             .send(Event::ApplyUpdate {
                 update_bytes,
                 by_user: None,
+                source: knot_storage::UpdateSource::Edit,
+                meta: None,
                 reply: tx,
             })
             .await

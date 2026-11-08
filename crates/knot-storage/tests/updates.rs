@@ -318,3 +318,564 @@ async fn flush_for_a_freshly_credited_author_does_not_lock_their_row() {
     );
     flushed.unwrap().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Page history M1.2: revs, labels and epochs
+// ---------------------------------------------------------------------------
+
+use knot_storage::testing::db_error;
+use knot_storage::{HistoryHead, NewUpdate, RowsAfter, UpdateSource, UpdatesStoreError};
+
+fn new_row(
+    by: Option<uuid::Uuid>,
+    bytes: &[u8],
+    source: UpdateSource,
+    meta: Option<serde_json::Value>,
+) -> NewUpdate {
+    NewUpdate {
+        by_user_id: by,
+        bytes: bytes.to_vec(),
+        source,
+        meta,
+    }
+}
+
+fn edit(by: Option<uuid::Uuid>, bytes: &[u8]) -> NewUpdate {
+    new_row(by, bytes, UpdateSource::Edit, None)
+}
+
+/// (dirty, last_write_at) of the page's heads row.
+async fn heads_flags(
+    pool: &sqlx::PgPool,
+    doc: uuid::Uuid,
+) -> (bool, Option<chrono::DateTime<chrono::Utc>>) {
+    sqlx::query_as("SELECT dirty, last_write_at FROM doc_history_heads WHERE doc_id = $1")
+        .bind(doc)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn row_count(pool: &sqlx::PgPool, doc: uuid::Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM doc_updates WHERE doc_id = $1")
+        .bind(doc)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+fn sqlstate(e: &UpdatesStoreError) -> Option<String> {
+    match e {
+        UpdatesStoreError::Sqlx(e) => e
+            .as_database_error()
+            .and_then(|d| d.code())
+            .map(|c| c.into_owned()),
+        _ => None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn append_assigns_consecutive_revs_and_stores_labels() {
+    let a = two_authors().await;
+    let suggestion = uuid::Uuid::new_v4();
+    let meta = serde_json::json!({"suggestion_id": suggestion, "accepted_by": a.alice});
+    let rows = vec![
+        new_row(Some(a.alice), b"e", UpdateSource::Edit, None),
+        new_row(Some(a.alice), b"t", UpdateSource::Task, None),
+        new_row(
+            Some(a.bob),
+            b"s",
+            UpdateSource::Suggestion,
+            Some(meta.clone()),
+        ),
+    ];
+    let persisted = a.s.append(a.doc, 0, &rows).await.unwrap();
+    assert_eq!(
+        persisted.iter().map(|p| p.rev).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert!(
+        persisted.windows(2).all(|w| w[0].seq < w[1].seq),
+        "seqs ascend with revs: {persisted:?}"
+    );
+
+    let got = a.s.rows_after(a.doc, RowsAfter::Rev(0)).await.unwrap();
+    let got: Vec<_> = got
+        .into_iter()
+        .map(|r| {
+            (
+                r.seq,
+                r.rev,
+                r.by_user_id,
+                r.update_bytes,
+                r.source,
+                r.meta,
+                r.epoch,
+            )
+        })
+        .collect();
+    let want: Vec<_> = persisted
+        .iter()
+        .zip(&rows)
+        .map(|(p, r)| {
+            (
+                p.seq,
+                Some(p.rev),
+                r.by_user_id,
+                r.bytes.clone(),
+                Some(r.source),
+                r.meta.clone(),
+                Some(0),
+            )
+        })
+        .collect();
+    assert_eq!(got, want);
+    assert_eq!(
+        a.s.head(a.doc).await.unwrap(),
+        HistoryHead {
+            head_rev: 3,
+            legacy_rows: 0,
+            content_epoch: 0
+        }
+    );
+    let (dirty, last_write_at) = heads_flags(&a.pool, a.doc).await;
+    assert!(dirty, "the first flush creates the heads row dirty");
+    assert!(last_write_at.is_some(), "and stamps last_write_at");
+
+    // As M1.3's builder will: the next flush goes through the ON CONFLICT arm.
+    sqlx::query(
+        "UPDATE doc_history_heads SET dirty = false, last_write_at = '2000-01-01'
+          WHERE doc_id = $1",
+    )
+    .bind(a.doc)
+    .execute(&a.pool)
+    .await
+    .unwrap();
+    let persisted =
+        a.s.append(a.doc, 0, &[edit(Some(a.bob), b"4"), edit(None, b"5")])
+            .await
+            .unwrap();
+    assert_eq!(
+        persisted.iter().map(|p| p.rev).collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+    let (dirty, last_write_at) = heads_flags(&a.pool, a.doc).await;
+    assert!(dirty, "a flush marks the page dirty again");
+    let old: chrono::DateTime<chrono::Utc> = "2000-01-01T00:00:00Z".parse().unwrap();
+    assert!(last_write_at.unwrap() > old, "{last_write_at:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn append_with_a_stale_epoch_writes_nothing() {
+    let (s, pool, doc, user) = setup().await;
+    // First a row, so the heads row exists: on a fresh page the UPDATE below
+    // would match nothing and the append would succeed for the wrong reason.
+    s.append(doc, 0, &[edit(Some(user), b"1")]).await.unwrap();
+    let bumped = sqlx::query("UPDATE doc_history_heads SET content_epoch = 1 WHERE doc_id = $1")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(bumped.rows_affected(), 1);
+
+    let e = s
+        .append(doc, 0, &[edit(Some(user), b"2")])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, UpdatesStoreError::EpochChanged { room: 0, stored: 1 }),
+        "{e:?}"
+    );
+    assert!(e.is_permanent());
+    assert_eq!(row_count(&pool, doc).await, 1, "nothing more was written");
+    assert_eq!(s.head(doc).await.unwrap().head_rev, 1);
+}
+
+const HISTORY_LOG_COLUMNS: i64 = 20261107120000;
+
+/// The embedded migrations up to and including `last`.
+fn migrator_up_to(last: i64) -> sqlx::migrate::Migrator {
+    let full = sqlx::migrate!("../../migrations");
+    assert!(
+        full.migrations.iter().any(|m| m.version == last),
+        "migration {last} not embedded (cargo clean -p knot-storage?)"
+    );
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            full.migrations
+                .iter()
+                .filter(|m| m.version <= last)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    }
+}
+
+/// A page whose `n` rows predate the heads migration (rev NULL), on a
+/// database then migrated all the way. Legacy rows hold their ordinal as
+/// bytes (`int4send`).
+async fn legacy_page(n: i32) -> (PgUpdatesStore, sqlx::PgPool, uuid::Uuid) {
+    let url = knot_test_support::fresh_db_url().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&url)
+        .await
+        .unwrap();
+    migrator_up_to(HISTORY_LOG_COLUMNS)
+        .run(&pool)
+        .await
+        .unwrap();
+    let ws: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO workspaces (slug, name) VALUES ('w', 'W') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let user: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, display_name) VALUES ('a@x.test', 'A') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let doc: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, title, sort_key, created_by)
+         VALUES ($1, 'D', 'm', $2) RETURNING id",
+    )
+    .bind(ws)
+    .bind(user)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO doc_updates (doc_id, update_bytes)
+         SELECT $1, int4send(g) FROM generate_series(1, $2) g",
+    )
+    .bind(doc)
+    .bind(n)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    (PgUpdatesStore::new(pool.clone()), pool, doc)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_after_all_returns_legacy_rows_by_seq_then_revs() {
+    let (s, pool, doc) = legacy_page(4).await;
+    assert_eq!(
+        s.head(doc).await.unwrap(),
+        HistoryHead {
+            head_rev: 4,
+            legacy_rows: 4,
+            content_epoch: 0
+        }
+    );
+    let appended = s
+        .append(doc, 0, &[edit(None, b"new 5"), edit(None, b"new 6")])
+        .await
+        .unwrap();
+    assert_eq!(
+        appended.iter().map(|p| p.rev).collect::<Vec<_>>(),
+        vec![5, 6]
+    );
+
+    let legacy_bytes: Vec<Vec<u8>> = (1..=4i32).map(|i| i.to_be_bytes().to_vec()).collect();
+    let all = s.rows_after(doc, RowsAfter::All).await.unwrap();
+    assert_eq!(
+        all.iter().map(|r| r.rev).collect::<Vec<_>>(),
+        vec![None, None, None, None, Some(5), Some(6)]
+    );
+    assert!(
+        all[..4].windows(2).all(|w| w[0].seq < w[1].seq),
+        "legacy rows by seq"
+    );
+    assert_eq!(
+        all[..4]
+            .iter()
+            .map(|r| r.update_bytes.clone())
+            .collect::<Vec<_>>(),
+        legacy_bytes
+    );
+    assert!(
+        all[..4]
+            .iter()
+            .all(|r| r.source.is_none() && r.epoch.is_none())
+    );
+
+    assert_eq!(s.ensure_legacy_numbered(doc).await.unwrap(), 4);
+    let all = s.rows_after(doc, RowsAfter::All).await.unwrap();
+    assert_eq!(
+        all.iter().map(|r| r.rev).collect::<Vec<_>>(),
+        (1..=6).map(Some).collect::<Vec<_>>()
+    );
+    assert!(all.windows(2).all(|w| w[0].seq < w[1].seq), "seq order");
+    assert_eq!(
+        all[..4]
+            .iter()
+            .map(|r| r.update_bytes.clone())
+            .collect::<Vec<_>>(),
+        legacy_bytes,
+        "legacy rows numbered in seq order"
+    );
+    assert_eq!(s.ensure_legacy_numbered(doc).await.unwrap(), 0);
+    assert_eq!(
+        s.rows_after(doc, RowsAfter::Rev(4))
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.rev)
+            .collect::<Vec<_>>(),
+        vec![Some(5), Some(6)]
+    );
+
+    // A page created after the upgrade has nothing to number.
+    let fresh: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, title, sort_key, created_by)
+         SELECT workspace_id, 'N', 'n', created_by FROM documents WHERE id = $1
+         RETURNING id",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        s.ensure_legacy_numbered(fresh).await.unwrap(),
+        0,
+        "no heads row"
+    );
+    s.append(fresh, 0, &[edit(None, b"x")]).await.unwrap();
+    assert_eq!(s.ensure_legacy_numbered(fresh).await.unwrap(), 0);
+    assert_eq!(
+        s.head(uuid::Uuid::new_v4()).await.unwrap(),
+        HistoryHead::default()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_numbering_count_mismatch_is_reported() {
+    let (s, pool, doc) = legacy_page(4).await;
+    sqlx::query("UPDATE doc_history_heads SET legacy_rows = 3 WHERE doc_id = $1")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let e = s.ensure_legacy_numbered(doc).await.unwrap_err();
+    assert!(
+        matches!(
+            e,
+            UpdatesStoreError::LegacyCountMismatch {
+                legacy_rows: 3,
+                unnumbered: 4
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(e.is_permanent());
+    let numbered: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM doc_updates WHERE doc_id = $1 AND rev IS NOT NULL",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(numbered, 0, "no row numbered");
+}
+
+/// Legacy rows someone numbered by hand, not as `1..=legacy_rows`, leave no
+/// row unnumbered and no row at `rev = legacy_rows`. That is a mismatch too:
+/// booting would meet a rev gap at rev 1 and retry catch-up forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn hand_numbered_legacy_rows_are_reported_as_a_mismatch() {
+    let (s, pool, doc) = legacy_page(4).await;
+    sqlx::query("UPDATE doc_updates SET rev = seq + 100 WHERE doc_id = $1")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let e = s.ensure_legacy_numbered(doc).await.unwrap_err();
+    assert!(
+        matches!(
+            e,
+            UpdatesStoreError::LegacyCountMismatch {
+                legacy_rows: 4,
+                unnumbered: 0
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(e.is_permanent());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn error_classification() {
+    let (s, pool, doc, user) = setup().await;
+    s.append(doc, 0, &[edit(Some(user), b"1")]).await.unwrap();
+    let store_err = |e: sqlx::Error| UpdatesStoreError::Sqlx(e);
+
+    // KH002: an explicit rev at the wrong epoch.
+    let e = store_err(
+        sqlx::query(
+            "INSERT INTO doc_updates (doc_id, update_bytes, rev, epoch) VALUES ($1, '\\x01', 2, 5)",
+        )
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(sqlstate(&e).as_deref(), Some("KH002"), "{e}");
+    assert!(e.is_permanent());
+
+    // KH001: rewriting a row.
+    let e = store_err(
+        sqlx::query("UPDATE doc_updates SET by_user_id = NULL WHERE doc_id = $1")
+            .bind(doc)
+            .execute(&pool)
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(sqlstate(&e).as_deref(), Some("KH001"), "{e}");
+    assert!(e.is_permanent());
+
+    // 23505: a rev the page already has, at the right epoch.
+    let e = store_err(
+        sqlx::query(
+            "INSERT INTO doc_updates (doc_id, update_bytes, rev, epoch) VALUES ($1, '\\x01', 1, 0)",
+        )
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(sqlstate(&e).as_deref(), Some("23505"), "{e}");
+    assert!(e.is_permanent());
+
+    // A page that does not exist.
+    let e = s
+        .append(uuid::Uuid::new_v4(), 0, &[edit(None, b"x")])
+        .await
+        .unwrap_err();
+    assert!(matches!(e, UpdatesStoreError::DocGone), "{e:?}");
+    assert!(e.is_permanent());
+
+    let permanent = |e: sqlx::Error| store_err(e).is_permanent();
+    assert!(!permanent(sqlx::Error::PoolTimedOut));
+    assert!(permanent(sqlx::Error::PoolClosed));
+    assert!(permanent(sqlx::Error::RowNotFound));
+    assert!(permanent(sqlx::Error::Decode("bad".into())));
+    assert!(permanent(sqlx::Error::ColumnDecode {
+        index: "0".into(),
+        source: "bad".into()
+    }));
+    for code in [
+        "KH001", "KH002", "23503", "23505", "22P02", "42703", "XX000",
+    ] {
+        assert!(permanent(db_error(code)), "{code} is permanent");
+    }
+    for code in ["40P01", "55P03", "57014", "53300", "08006"] {
+        assert!(!permanent(db_error(code)), "{code} is transient");
+    }
+    assert!(UpdatesStoreError::DocGone.is_permanent());
+    assert!(
+        UpdatesStoreError::LegacyCountMismatch {
+            legacy_rows: 1,
+            unnumbered: 2
+        }
+        .is_permanent()
+    );
+
+    let shrinks = |e: sqlx::Error| store_err(e).shrinks_batch();
+    assert!(shrinks(db_error("57014")));
+    assert!(shrinks(db_error("54000")));
+    assert!(shrinks(db_error("54001")));
+    assert!(!shrinks(db_error("55P03")));
+    assert!(!shrinks(db_error("40P01")));
+    assert!(!shrinks(db_error("22P02")));
+    assert!(!shrinks(sqlx::Error::PoolTimedOut));
+    assert!(!UpdatesStoreError::DocGone.shrinks_batch());
+}
+
+#[test]
+fn update_sources_round_trip_their_sql_spellings() {
+    use std::str::FromStr;
+    let all = [
+        (UpdateSource::Edit, "edit"),
+        (UpdateSource::Task, "task"),
+        (UpdateSource::Suggestion, "suggestion"),
+        (UpdateSource::Restore, "restore"),
+        (UpdateSource::RestoreFallback, "restore_fallback"),
+        (UpdateSource::Import, "import"),
+        (UpdateSource::Template, "template"),
+        (UpdateSource::Copy, "copy"),
+    ];
+    for (source, sql) in all {
+        assert_eq!(source.as_str(), sql);
+        assert_eq!(UpdateSource::from_str(sql).unwrap(), source);
+    }
+    assert!(UpdateSource::from_str("Edit").is_err());
+    assert!(UpdateSource::from_str("").is_err());
+}
+
+/// `knot-server export-check` reads a staging copy that may never have been
+/// migrated past 0.9.9: `since` and `latest` still work there.
+#[tokio::test(flavor = "multi_thread")]
+async fn since_and_latest_read_a_database_from_before_the_upgrade() {
+    use knot_storage::{PgSnapshotStore, SnapshotStore};
+    const V0_9_9_SCHEMA: i64 = 20261104120001;
+    let url = knot_test_support::fresh_db_url().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    migrator_up_to(V0_9_9_SCHEMA).run(&pool).await.unwrap();
+    let doc: uuid::Uuid = sqlx::query_scalar(
+        "WITH w AS (INSERT INTO workspaces (slug, name) VALUES ('w', 'W') RETURNING id),
+              u AS (INSERT INTO users (email, display_name) VALUES ('a@x.test', 'A')
+                    RETURNING id)
+         INSERT INTO documents (workspace_id, title, sort_key, created_by)
+         SELECT w.id, 'D', 'm', u.id FROM w, u RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for (seq, bytes) in [(10i64, b"old".as_slice()), (20, b"new")] {
+        sqlx::query(
+            "INSERT INTO doc_snapshots (doc_id, snapshot_seq, state_bytes, state_vector)
+             VALUES ($1, $2, $3, 'sv')",
+        )
+        .bind(doc)
+        .bind(seq)
+        .bind(bytes)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO doc_updates (doc_id, update_bytes) VALUES ($1, '\\x01'), ($1, '\\x02')",
+    )
+    .bind(doc)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let latest = PgSnapshotStore::new(pool.clone())
+        .latest(doc)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            latest.snapshot_seq,
+            latest.state_bytes.as_slice(),
+            latest.snapshot_rev
+        ),
+        (20, b"new".as_slice(), None)
+    );
+    let rows = PgUpdatesStore::new(pool).since(doc, 0).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.update_bytes.clone())
+            .collect::<Vec<_>>(),
+        vec![vec![1u8], vec![2u8]]
+    );
+}

@@ -171,8 +171,13 @@ probes:
 # a 1001 Close to live collab WebSockets, and drains in-flight HTTP. preStop
 # sleeps first so the pod leaves Service endpoints before draining begins
 # (kube-proxy stops routing new traffic). Uses the native `sleep` lifecycle
-# handler — no shell, so it works on the scratch image.
-terminationGracePeriodSeconds: 30
+# handler — no shell, so it works on the scratch image. After the HTTP drain
+# each page's writer gets up to 10 s to save the edits it still holds (during
+# a database outage it keeps retrying them).
+# Budget: preStop (preStopSleepSeconds) + up to 30 s of HTTP drain + up to
+# 10 s of page-writer drain + 5 s of slack = 50 s. A shorter grace period can
+# lose buffered edits on a shutdown during a database outage.
+terminationGracePeriodSeconds: 50
 preStopSleepSeconds: 5
 
 nodeSelector: {}

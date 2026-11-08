@@ -12,6 +12,7 @@ use crate::audit;
 use crate::grant_store::ChainNode;
 use crate::invalidations;
 use crate::placement::{self, Placement};
+use crate::updates_store::UpdatesStoreError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
@@ -104,6 +105,25 @@ pub enum DocStoreError {
     /// Restoring the archived ancestor first avoids that.
     #[error("restore would leave the restricted subtree")]
     RestoreRestrictedParentArchived,
+    /// Something that is neither the caller's mistake nor a database error,
+    /// e.g. the page history refused a row a transaction wrote.
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+impl From<UpdatesStoreError> for DocStoreError {
+    /// A database error stays one, as it is, so `retry_on_deadlock` still
+    /// sees a 40P01 from inside an append.
+    fn from(e: UpdatesStoreError) -> Self {
+        match e {
+            UpdatesStoreError::Sqlx(e) => DocStoreError::Sqlx(e),
+            e @ (UpdatesStoreError::EpochChanged { .. }
+            | UpdatesStoreError::DocGone
+            | UpdatesStoreError::LegacyCountMismatch { .. }) => {
+                DocStoreError::Internal(e.to_string())
+            }
+        }
+    }
 }
 
 /// One page of a live subtree (see `DocStore::live_subtree`).
@@ -313,6 +333,34 @@ pub struct PgDocStore {
 impl PgDocStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// One attempt of `purge`.
+    async fn purge_once(
+        &self,
+        workspace_id: Uuid,
+        doc_id: Uuid,
+        actor: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, DocStoreError> {
+        let mut tx = crate::begin(&self.pool).await?;
+        lock_archive_root(&mut tx, workspace_id, doc_id).await?;
+        let deleted: Vec<Uuid> = sqlx::query_scalar(SUBTREE_IDS_SQL)
+            .bind(doc_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        // The parent_id cascade takes the subtrees.
+        sqlx::query("DELETE FROM documents WHERE id = $1 OR archive_root_id = $1")
+            .bind(doc_id)
+            .execute(&mut *tx)
+            .await?;
+        audit::record_in_tx(&mut tx, workspace_id, actor, "doc.purge", "doc", doc_id).await?;
+        // One per deleted doc: once the rows are gone the ACL listener can no
+        // longer find descendants to evict from the root's id alone.
+        for id in &deleted {
+            invalidations::record_in_tx(&mut tx, workspace_id, *id, "purge").await?;
+        }
+        tx.commit().await?;
+        Ok(deleted)
     }
 
     /// One attempt of `create_placed`, or of `create_placed_restricted`
@@ -1010,25 +1058,9 @@ impl DocStore for PgDocStore {
         doc_id: Uuid,
         actor: Option<Uuid>,
     ) -> Result<Vec<Uuid>, DocStoreError> {
-        let mut tx = crate::begin(&self.pool).await?;
-        lock_archive_root(&mut tx, workspace_id, doc_id).await?;
-        let deleted: Vec<Uuid> = sqlx::query_scalar(SUBTREE_IDS_SQL)
-            .bind(doc_id)
-            .fetch_all(&mut *tx)
-            .await?;
-        // The parent_id cascade takes the subtrees.
-        sqlx::query("DELETE FROM documents WHERE id = $1 OR archive_root_id = $1")
-            .bind(doc_id)
-            .execute(&mut *tx)
-            .await?;
-        audit::record_in_tx(&mut tx, workspace_id, actor, "doc.purge", "doc", doc_id).await?;
-        // One per deleted doc: once the rows are gone the ACL listener can no
-        // longer find descendants to evict from the root's id alone.
-        for id in &deleted {
-            invalidations::record_in_tx(&mut tx, workspace_id, *id, "purge").await?;
-        }
-        tx.commit().await?;
-        Ok(deleted)
+        // Page history writers take the page row first, so no cycle with the
+        // cascade is known; the retry is a backstop for one nobody foresaw.
+        placement::retry_on_deadlock(|| self.purge_once(workspace_id, doc_id, actor)).await
     }
 
     async fn list_archive_roots(

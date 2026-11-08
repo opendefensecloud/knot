@@ -28,9 +28,9 @@ impl MemBus {
 
 #[async_trait]
 impl Bus for MemBus {
-    async fn publish(&self, doc_id: Uuid, seq: i64) -> Result<(), BusError> {
+    async fn publish(&self, doc_id: Uuid, hint: i64) -> Result<(), BusError> {
         if let Some(mut entry) = self.map.get_mut(&doc_id) {
-            entry.update_tx.retain(|tx| tx.try_send(seq).is_ok());
+            entry.update_tx.retain(|tx| tx.try_send(hint).is_ok());
         }
         Ok(())
     }

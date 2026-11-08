@@ -5,7 +5,8 @@
 //! by channel name into per-doc mpsc senders.
 //!
 //! Channel naming:
-//!   doc:<uuid>       — payload = "<seq>" as decimal text
+//!   doc:<uuid>       — payload = an opaque wake-up hint as decimal text
+//!                      (a rev from 0.9.10, a seq from 0.9.9; see `bus`)
 //!   presence:<uuid>  — payload = url-safe base64 of bytes
 
 use async_trait::async_trait;
@@ -250,11 +251,11 @@ impl PgBus {
             let Ok(doc_id) = Uuid::parse_str(rest) else {
                 return;
             };
-            let Ok(seq) = payload.parse::<i64>() else {
+            let Ok(hint) = payload.parse::<i64>() else {
                 return;
             };
             if let Some(mut e) = subscriptions.get_mut(&doc_id) {
-                e.update_tx.retain(|tx| tx.try_send(seq).is_ok());
+                e.update_tx.retain(|tx| tx.try_send(hint).is_ok());
             }
         } else if let Some(rest) = channel.strip_prefix("presence:") {
             let Ok(doc_id) = Uuid::parse_str(rest) else {
@@ -273,13 +274,13 @@ impl PgBus {
 
 #[async_trait]
 impl Bus for PgBus {
-    async fn publish(&self, doc_id: Uuid, seq: i64) -> Result<(), BusError> {
+    async fn publish(&self, doc_id: Uuid, hint: i64) -> Result<(), BusError> {
         // pg_notify() binds the channel + payload as parameters, so no SQL
         // string is built from values (defence-in-depth; both are internal).
         self.current_client()
             .execute(
                 "SELECT pg_notify($1, $2)",
-                &[&format!("doc:{doc_id}"), &seq.to_string()],
+                &[&format!("doc:{doc_id}"), &hint.to_string()],
             )
             .await
             .map_err(|e| BusError::Io(e.to_string()))?;

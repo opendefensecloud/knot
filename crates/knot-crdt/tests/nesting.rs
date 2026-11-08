@@ -18,10 +18,15 @@
 //! these tests.
 
 mod common;
+#[path = "common/fixtures.rs"]
+mod fixtures;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fixtures::{
+    is_frame_of, parked_block_and_the_edit_it_fails_on, rejected_part_way, same_update, text_page,
+};
 use knot_crdt::nesting::{
     MAX_NESTING, TooDeep, check_update, deepest_inserted_type_depth, inserted_type_ids,
     nests_deeper_than,
@@ -36,13 +41,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use yrs::block::{ClientID, ItemContent};
-use yrs::branch::Branch;
 use yrs::encoding::write::Write;
-use yrs::types::TypeRef;
 use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{
-    Assoc, Doc, ID, IndexedSequence, Options, ReadTxn, StateVector, Text, Transact,
-    XmlElementPrelim, XmlElementRef, XmlFragment, XmlOut, XmlTextPrelim,
+    Doc, Options, ReadTxn, StateVector, Text, Transact, XmlElementPrelim, XmlElementRef,
+    XmlFragment, XmlOut, XmlTextPrelim,
 };
 
 /// How deep the crafted updates nest: far past what a walk that recursed
@@ -329,15 +332,37 @@ struct CapturingUpdates {
 
 #[async_trait::async_trait]
 impl knot_storage::UpdatesStore for CapturingUpdates {
-    async fn insert_batch(
+    async fn append(
         &self,
         _: Uuid,
-        updates: &[(Option<Uuid>, Vec<u8>)],
-    ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+        _: i32,
+        rows: &[knot_storage::NewUpdate],
+    ) -> Result<Vec<knot_storage::Persisted>, knot_storage::UpdatesStoreError> {
         let mut p = self.persisted.lock().unwrap();
         let first = p.len() as i64 + 1;
-        p.extend(updates.iter().map(|(_, b)| b.clone()));
-        Ok((first..first + updates.len() as i64).collect())
+        p.extend(rows.iter().map(|row| row.bytes.clone()));
+        Ok((first..first + rows.len() as i64)
+            .map(|seq| knot_storage::Persisted { seq, rev: seq })
+            .collect())
+    }
+    async fn rows_after(
+        &self,
+        _: Uuid,
+        _: knot_storage::RowsAfter,
+    ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+        Ok(vec![])
+    }
+    async fn head(
+        &self,
+        _: Uuid,
+    ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
+        Ok(knot_storage::HistoryHead::default())
+    }
+    async fn ensure_legacy_numbered(
+        &self,
+        _: Uuid,
+    ) -> Result<u64, knot_storage::UpdatesStoreError> {
+        Ok(0)
     }
     async fn since(
         &self,
@@ -359,10 +384,10 @@ struct RecordingSnapshots {
 
 #[async_trait::async_trait]
 impl knot_storage::SnapshotStore for RecordingSnapshots {
-    async fn insert(
+    async fn insert_stamped(
         &self,
         _: Uuid,
-        _: i64,
+        _: knot_storage::SnapshotStamp,
         state: &[u8],
         _: &[u8],
     ) -> Result<(), knot_storage::SnapshotStoreError> {
@@ -500,22 +525,26 @@ async fn refused_and_still_serving(deep: Vec<u8>) {
         .await
         .expect("the room stopped fanning out")
         .expect("peer channel closed");
-    assert_eq!(
-        fanned,
-        wrap_sync_update(&after),
+    assert!(
+        is_frame_of(&fanned, &after),
         "the refused update was fanned out"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !persisted.lock().unwrap().contains(&after) {
+    while !persisted
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| same_update(p, &after))
+    {
         assert!(
             std::time::Instant::now() < deadline,
             "the room stopped persisting"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        *persisted.lock().unwrap(),
-        vec![after],
+    let stored = persisted.lock().unwrap().clone();
+    assert!(
+        stored.len() == 1 && same_update(&stored[0], &after),
         "the refused update was persisted"
     );
     assert!(refused.is_cancelled(), "the sender was not told to close");
@@ -625,7 +654,7 @@ async fn refused_after_apply_and_evicted(base: Vec<u8>, bad: Vec<u8>) {
         .await
         .expect("the room never fanned out the base")
         .expect("peer channel closed");
-    assert_eq!(base_fanout, wrap_sync_update(&base));
+    assert!(is_frame_of(&base_fanout, &base));
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while persisted.lock().unwrap().is_empty() {
         assert!(
@@ -651,9 +680,9 @@ async fn refused_after_apply_and_evicted(base: Vec<u8>, bad: Vec<u8>) {
         .await
         .expect("the evicted room did not stop");
     assert!(refused.is_cancelled(), "the sender was not told to close");
-    assert_eq!(
-        *persisted.lock().unwrap(),
-        vec![base],
+    let stored = persisted.lock().unwrap().clone();
+    assert!(
+        stored.len() == 1 && same_update(&stored[0], &base),
         "the refused update must not be persisted"
     );
     assert!(
@@ -729,7 +758,7 @@ async fn an_evicted_room_is_rebooted_on_the_next_acquire_and_keeps_serving() {
         .await
         .expect("the rebooted room stopped serving")
         .expect("peer channel closed");
-    assert_eq!(fanned, wrap_sync_update(&edit));
+    assert!(is_frame_of(&fanned, &edit));
 
     let (reply, st) = oneshot::channel();
     second.tx.send(Event::ExportState(reply)).await.unwrap();
@@ -737,6 +766,87 @@ async fn an_evicted_room_is_rebooted_on_the_next_acquire_and_keeps_serving() {
     assert!(
         !on_worker_stack(move || nests_deeper_than(&page(&[&bytes]), MAX_NESTING)),
         "the rebooted room must hold nothing past the limit"
+    );
+    second.shutdown.cancel();
+}
+
+/// A server-side `ApplyUpdate` that nests the page past the limit is
+/// refused after it was applied, as an inbound one is (`refuse_applied`):
+/// nothing of it is persisted or fanned out, the caller gets `Err`, and the
+/// room evicts itself without a snapshot, so the next acquire boots a room
+/// from storage, which never got the chain (review round 4).
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_update_too_deep_is_refused_and_evicts() {
+    let persisted = Arc::new(Mutex::new(Vec::new()));
+    let snapshots = RecordingSnapshots::default();
+    let written = snapshots.written.clone();
+    let rooms = Rooms::new(
+        Arc::new(YrsEngine),
+        Arc::new(MemBus::new()),
+        Arc::new(CapturingUpdates {
+            persisted: persisted.clone(),
+        }),
+        Arc::new(snapshots),
+        SnapshotPolicy {
+            every_n: 1000,
+            idle: Duration::from_secs(3600),
+        },
+        Duration::from_secs(300),
+    );
+    let doc_id = Uuid::new_v4();
+    let first = rooms.acquire(doc_id).await.unwrap();
+    let (_conn, mut conn_rx, _) = join(&first).await;
+
+    let (reply, answered) = oneshot::channel();
+    first
+        .tx
+        .send(Event::ApplyUpdate {
+            update_bytes: chain_update(MAX_NESTING + 1),
+            by_user: None,
+            source: knot_storage::UpdateSource::Import,
+            meta: None,
+            reply,
+        })
+        .await
+        .unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(10), answered)
+        .await
+        .expect("the room never answered")
+        .expect("the room dropped the reply");
+    assert!(
+        answer.is_err(),
+        "a too-deep update was accepted: {answer:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(10), first.shutdown.cancelled())
+        .await
+        .expect("the room did not evict itself");
+    tokio::time::timeout(Duration::from_secs(10), first.tx.closed())
+        .await
+        .expect("the evicted room did not stop");
+    assert!(
+        persisted.lock().unwrap().is_empty(),
+        "the refused update was persisted"
+    );
+    assert!(
+        matches!(
+            conn_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty) | Err(mpsc::error::TryRecvError::Disconnected)
+        ),
+        "the refused update was fanned out"
+    );
+    assert!(
+        written.lock().unwrap().is_empty(),
+        "the evicted room snapshotted a doc holding the refused update"
+    );
+
+    let second = rooms.acquire(doc_id).await.unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    let (reply, st) = oneshot::channel();
+    second.tx.send(Event::ExportState(reply)).await.unwrap();
+    let (bytes, _) = st.await.unwrap().unwrap();
+    assert!(
+        !on_worker_stack(move || nests_deeper_than(&page(&[&bytes]), MAX_NESTING)),
+        "the rebooted room holds the refused chain"
     );
     second.shutdown.cancel();
 }
@@ -945,49 +1055,6 @@ async fn board_refused_after_apply_and_evicted(base: Vec<u8>, bad: Vec<u8>) {
 //   Within the limit, it does what main does: it neither persists nor fans
 //   out the update, and keeps the sender and its other connections.
 
-/// A page holding one paragraph of text, from `client`, and the id of the
-/// text's first character: an item that holds a string, not a type.
-fn text_page(client: u64) -> (Vec<u8>, ID) {
-    let doc = Doc::with_client_id(client);
-    let frag = doc.get_or_insert_xml_fragment("default");
-    let first = {
-        let mut txn = doc.transact_mut();
-        let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
-        let text = p.push_back(&mut txn, XmlTextPrelim::new("hello"));
-        let index = text
-            .sticky_index(&txn, 0, Assoc::After)
-            .expect("the text has a first character");
-        *index.id().expect("a character has an id")
-    };
-    (state(&doc), first)
-}
-
-/// An ordinary inconsistent update, which yrs integrates part of and then
-/// rejects (`UpdateError::InvalidParent`): from client 77, an element
-/// `partial` in the page's root fragment, then a string whose parent is
-/// `not_a_type`, an item that holds text. yrs's own encoder never writes
-/// such an update; a buggy or crafted client can. Encoded by hand, as
-/// `knot_test_support::crafted` encodes the crafted attack. While the doc
-/// lacks `not_a_type`, yrs integrates `partial` and parks the string until
-/// that item arrives.
-fn rejected_part_way(not_a_type: &ID) -> Vec<u8> {
-    let mut enc = EncoderV1::new();
-    enc.write_var(1u32);
-    enc.write_var(2u32);
-    enc.write_client(ClientID::new(77));
-    enc.write_var(0u32);
-    enc.write_info(7);
-    enc.write_parent_info(true);
-    enc.write_string("default");
-    ItemContent::Type(Branch::new(TypeRef::XmlElement("partial".into()))).encode(&mut enc);
-    enc.write_info(4);
-    enc.write_parent_info(false);
-    enc.write_left_id(not_a_type);
-    ItemContent::String("y".into()).encode(&mut enc);
-    enc.write_var(0u32);
-    enc.to_vec()
-}
-
 /// Whether the root fragment of `doc` holds an element tagged `partial`.
 fn holds_partial(doc: &DocHandle) -> bool {
     let frag = doc.inner().get_or_insert_xml_fragment("default");
@@ -1001,7 +1068,7 @@ fn holds_partial(doc: &DocHandle) -> bool {
 /// the doc although apply returned an error.
 #[test]
 fn yrs_rejects_the_update_part_way_and_keeps_what_it_integrated() {
-    let (base, not_a_type) = text_page(1);
+    let (base, _, not_a_type) = text_page(1);
     let bad = rejected_part_way(&not_a_type);
     let doc = page(&[&base]);
     assert_eq!(
@@ -1062,7 +1129,7 @@ impl Stored {
     /// Waits until `update` is stored.
     async fn holds(&self, update: &[u8]) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !self.rows().iter().any(|row| row == update) {
+        while !self.rows().iter().any(|row| same_update(row, update)) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the update was never stored"
@@ -1074,15 +1141,44 @@ impl Stored {
 
 #[async_trait::async_trait]
 impl knot_storage::UpdatesStore for Stored {
-    async fn insert_batch(
+    async fn append(
         &self,
         _: Uuid,
-        updates: &[(Option<Uuid>, Vec<u8>)],
-    ) -> Result<Vec<i64>, knot_storage::UpdatesStoreError> {
+        _: i32,
+        new_rows: &[knot_storage::NewUpdate],
+    ) -> Result<Vec<knot_storage::Persisted>, knot_storage::UpdatesStoreError> {
         let mut rows = self.0.lock().unwrap();
         let first = rows.len() as i64 + 1;
-        rows.extend(updates.iter().map(|(_, b)| b.clone()));
-        Ok((first..first + updates.len() as i64).collect())
+        rows.extend(new_rows.iter().map(|row| row.bytes.clone()));
+        Ok((first..first + new_rows.len() as i64)
+            .map(|seq| knot_storage::Persisted { seq, rev: seq })
+            .collect())
+    }
+    async fn rows_after(
+        &self,
+        doc_id: Uuid,
+        from: knot_storage::RowsAfter,
+    ) -> Result<Vec<knot_storage::DocUpdate>, knot_storage::UpdatesStoreError> {
+        let after = match from {
+            knot_storage::RowsAfter::Rev(rev) => rev,
+            knot_storage::RowsAfter::All => 0,
+        };
+        self.since(doc_id, after).await
+    }
+    async fn head(
+        &self,
+        _: Uuid,
+    ) -> Result<knot_storage::HistoryHead, knot_storage::UpdatesStoreError> {
+        Ok(knot_storage::HistoryHead {
+            head_rev: self.rows().len() as i64,
+            ..Default::default()
+        })
+    }
+    async fn ensure_legacy_numbered(
+        &self,
+        _: Uuid,
+    ) -> Result<u64, knot_storage::UpdatesStoreError> {
+        Ok(0)
     }
     async fn since(
         &self,
@@ -1100,6 +1196,10 @@ impl knot_storage::UpdatesStore for Stored {
                 update_bytes,
                 by_user_id: None,
                 created_at: sqlx::types::chrono::Utc::now(),
+                rev: Some(seq),
+                source: Some(knot_storage::UpdateSource::Edit),
+                meta: None,
+                epoch: Some(0),
             })
             .collect())
     }
@@ -1134,27 +1234,17 @@ async fn room_on(doc_id: Uuid, store: &Stored) -> RoomHandle {
 /// Waits until `rx` gets `update` fanned out, and returns the frames it got
 /// before (the room's catch-up may fan an earlier update out again).
 async fn fanned_out(rx: &mut mpsc::Receiver<Vec<u8>>, update: &[u8]) -> Vec<Vec<u8>> {
-    let want = wrap_sync_update(update);
     let mut before = Vec::new();
     loop {
         let frame = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("the update was never fanned out")
             .expect("the channel closed");
-        if frame == want {
+        if is_frame_of(&frame, update) {
             return before;
         }
         before.push(frame);
     }
-}
-
-/// A crafted update whose string yrs parks, as it waits for client 5's
-/// text, and the innocent edit that brings that text: the edit's apply
-/// integrates the edit, then retries the parked string, which fails, since
-/// text is no type.
-fn parked_block_and_the_edit_it_fails_on() -> (Vec<u8>, Vec<u8>) {
-    let (edit, text) = text_page(5);
-    (rejected_part_way(&text), edit)
 }
 
 /// The fixture: the crafted update applies, its string parked; the edit's
@@ -1162,7 +1252,7 @@ fn parked_block_and_the_edit_it_fails_on() -> (Vec<u8>, Vec<u8>) {
 /// it names new API.
 #[test]
 fn a_parked_block_fails_the_apply_of_the_edit_it_waits_for() {
-    let (parked, edit) = parked_block_and_the_edit_it_fails_on();
+    let (parked, edit, _) = parked_block_and_the_edit_it_fails_on();
     let doc = YrsEngine.new_doc();
     let measured = YrsEngine
         .apply_update_measuring(&doc, &parked, MAX_NESTING)
@@ -1193,7 +1283,7 @@ fn a_parked_block_fails_the_apply_of_the_edit_it_waits_for() {
 async fn a_room_keeps_the_sender_whose_update_a_parked_block_fails_on() {
     let doc_id = Uuid::new_v4();
     let store = Stored::default();
-    let (parked, edit) = parked_block_and_the_edit_it_fails_on();
+    let (parked, edit, _) = parked_block_and_the_edit_it_fails_on();
 
     let room = room_on(doc_id, &store).await;
     let (crafted, _crafted_rx, _) = join(&room).await;
@@ -1209,13 +1299,13 @@ async fn a_room_keeps_the_sender_whose_update_a_parked_block_fails_on() {
 
     let before = fanned_out(&mut peer_rx, &after).await;
     assert!(
-        !before.contains(&wrap_sync_update(&edit)),
+        !before.iter().any(|f| is_frame_of(f, &edit)),
         "the update yrs rejected was fanned out"
     );
     store.holds(&after).await;
-    assert_eq!(
-        store.rows(),
-        vec![parked, after],
+    let rows = store.rows();
+    assert!(
+        rows.len() == 2 && rows[0] == parked && same_update(&rows[1], &after),
         "the update yrs rejected was persisted"
     );
     assert!(!refused.is_cancelled(), "the innocent sender was refused");
@@ -1248,7 +1338,7 @@ async fn a_room_keeps_the_sender_whose_update_a_parked_block_fails_on() {
 /// fails on that text (client 77's blocks integrate after client 99's).
 fn nests_too_deep_then_rejected() -> (Vec<u8>, Vec<u8>) {
     let (base, attack) = crafted_attack();
-    let (text, not_a_type) = text_page(2);
+    let (text, _, not_a_type) = text_page(2);
     let base = yrs::merge_updates_v1([base, text]).expect("merge the base");
     let bad =
         yrs::merge_updates_v1([attack, rejected_part_way(&not_a_type)]).expect("merge the update");
@@ -1356,7 +1446,7 @@ async fn a_board_room_refuses_only_the_sender_of_an_update_that_does_not_decode(
 async fn a_board_room_keeps_the_sender_whose_update_a_parked_block_fails_on() {
     let board_id = Uuid::new_v4();
     let store = StoredBoard::default();
-    let (parked, edit) = parked_block_and_the_edit_it_fails_on();
+    let (parked, edit, _) = parked_block_and_the_edit_it_fails_on();
 
     let h = board_on(board_id, &store).await;
     let (crafted, _crafted_rx, _) = join_board(&h).await;
@@ -1486,7 +1576,7 @@ async fn a_refused_connection_stays_refused() {
             })
             .await
             .unwrap();
-        let (edit, _) = text_page(3);
+        let (edit, ..) = text_page(3);
         let mut afters: Vec<Vec<u8>> = Vec::new();
         for _ in 0..2 {
             send(&room, conn, edit.clone()).await;
@@ -1505,15 +1595,15 @@ async fn a_refused_connection_stays_refused() {
             assert!(
                 before
                     .iter()
-                    .all(|f| afters.iter().any(|a| *f == wrap_sync_update(a))),
+                    .all(|f| afters.iter().any(|a| is_frame_of(f, a))),
                 "the refused connection's edit or presence was fanned out"
             );
             afters.push(after);
         }
         store.holds(&afters[1]).await;
-        assert_eq!(
-            store.rows(),
-            afters,
+        let rows = store.rows();
+        assert!(
+            rows.len() == afters.len() && rows.iter().zip(&afters).all(|(r, a)| same_update(r, a)),
             "the refused connection's edit was persisted"
         );
         assert!(
@@ -1575,7 +1665,7 @@ async fn a_refused_board_connection_stays_refused() {
         // Twice: fanning the peer's edit out must not drop the refused
         // connection, whose channel is closed, and with it the board room's
         // knowledge that it was refused.
-        let (edit, _) = text_page(3);
+        let (edit, ..) = text_page(3);
         let mut afters = Vec::new();
         for _ in 0..2 {
             send_board(&h, conn, edit.clone()).await;
@@ -1638,8 +1728,8 @@ async fn a_refused_board_connection_stays_refused() {
 /// panics in a debug build.
 #[test]
 fn the_reader_reads_the_updates_of_these_tests_as_yrs_does() {
-    let (text, first_char) = text_page(1);
-    let (parked, edit) = parked_block_and_the_edit_it_fails_on();
+    let (text, _, first_char) = text_page(1);
+    let (parked, edit, _) = parked_block_and_the_edit_it_fails_on();
     let (deep_base, too_deep) = nests_too_deep_then_rejected();
     let [no_update, _past_u32_max] = undecodable();
     let updates = [
