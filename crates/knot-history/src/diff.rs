@@ -112,6 +112,7 @@ pub fn entry_diff(h: &Doc, inserted: &IdSet, deleted: &IdSet) -> Result<EntryDif
         .transact_mut()
         .apply_update(update)
         .map_err(|e| DiffError::Encode(e.to_string()))?;
+    pad_short_clients(&union, &s.state_map)?;
     Ok(EntryDiff {
         s,
         s_lo,
@@ -193,6 +194,62 @@ fn collect_texts<T: ReadTxn>(
             XmlOut::Fragment(f) => collect_texts(txn, f.children(txn), out),
         }
     }
+}
+
+/// The root that holds [`pad_short_clients`]'s blocks; never rendered.
+const PAD_ROOT: &str = "knot-diff-pad";
+
+/// Gives every client of `sv` whose clock is 1 or 2 one more block in the
+/// union doc, at that clock, under [`PAD_ROOT`].
+///
+/// yrs 0.27.3's `diff_range` splits the doc at each snapshot clock
+/// (`TransactionMut::split_by_snapshot`, `transaction.rs:1339-1347`), which
+/// looks up the block at the client's full clock, past its last block.
+/// `ClientBlockList::find_index` (`block_store.rs:49-74`) guesses the index
+/// as `(clock / end) * right`, `end` being the last block's inclusive end:
+/// at clock 1 that divides by zero (a client that typed one character), and
+/// at clock 2 over two blocks (a client that only made an empty paragraph)
+/// it indexes past the list. A block starting exactly at the clock takes
+/// the lookup's first branch instead. The pad lives under its own root, so
+/// no text of `default` shows it.
+fn pad_short_clients(union: &Doc, sv: &StateVector) -> Result<(), DiffError> {
+    use yrs::block::BLOCK_ITEM_ANY_REF_NUMBER;
+    use yrs::encoding::write::Write;
+
+    let short: Vec<(ClientID, u32)> = {
+        let txn = union.transact();
+        let held = txn.state_vector();
+        sv.iter()
+            .filter(|&(client, &clock)| (1..=2).contains(&clock) && held.get(client) == clock)
+            .map(|(client, clock)| (*client, *clock))
+            .collect()
+    };
+    if short.is_empty() {
+        return Ok(());
+    }
+    // One update, one block per client: an `Any::Null` under the pad root
+    // at the client's clock (no origins, so the parent is named), and an
+    // empty delete set, so nothing the union doc holds changes.
+    let mut encoder = EncoderV1::new();
+    encoder.write_var(short.len() as u32);
+    for &(client, clock) in &short {
+        encoder.write_var(1u32);
+        encoder.write_client(client);
+        encoder.write_var(clock);
+        encoder.write_info(BLOCK_ITEM_ANY_REF_NUMBER);
+        encoder.write_parent_info(true);
+        encoder.write_string(PAD_ROOT);
+        encoder.write_len(1);
+        encoder.write_any(&Any::Null);
+    }
+    encoder.write_var(0u32);
+    let pad =
+        Update::decode_v1(&encoder.to_vec()).map_err(|e| DiffError::Encode(format!("pad: {e}")))?;
+    union
+        .transact_mut()
+        .apply_update(pad)
+        .map_err(|e| DiffError::Encode(format!("pad: {e}")))?;
+    Ok(())
 }
 
 /// `sv` without its zero clocks: yrs 0.27.3's `Store::write_blocks_to`

@@ -518,3 +518,73 @@ fn an_inline_node_between_texts_starts_a_new_segment() {
         }
     );
 }
+
+/// A doc where client 1 typed "hello world" and then `f` ran on client 2's
+/// view of it; returns the replay (skip-GC), client 1's insertions and
+/// client 2's effect.
+fn after_second_client(
+    f: impl FnOnce(&mut TransactionMut, &XmlFragmentRef),
+) -> (Replayer, IdSet, IdSet, IdSet) {
+    let a = Doc::with_client_id(1);
+    let fa = a.get_or_insert_xml_fragment("default");
+    let ua = txn_update(&a, |txn| push_paragraph(&fa, txn, "hello world"));
+    let b = Doc::with_client_id(2);
+    let fb = b.get_or_insert_xml_fragment("default");
+    b.transact_mut()
+        .apply_update(Update::decode_v1(&ua).unwrap())
+        .unwrap();
+    let ub = txn_update(&b, |txn| f(txn, &fb));
+    let mut r = Replayer::new(ReplayMode::KeepDeleted);
+    let first = r.apply(&ua);
+    assert_eq!(first.outcome, RowOutcome::Applied);
+    let e = r.apply(&ub);
+    assert_eq!(e.outcome, RowOutcome::Applied);
+    (r, first.inserted, e.inserted, e.deleted)
+}
+
+/// yrs 0.27.3's `find_index` divides by zero looking up clock 1 of a client
+/// with one block of length 1 (`diff_range` → `split_by_snapshot`); the
+/// union doc pads such clients.
+#[test]
+fn a_client_that_typed_one_character_is_counted() {
+    let (r, _, ins, del) = after_second_client(|txn, frag| {
+        text_of(frag, txn, 0).insert(txn, 5, "!");
+    });
+    let counts = catch_unwind(AssertUnwindSafe(|| entry_word_counts(r.doc(), &ins, &del)))
+        .expect("no panic")
+        .expect("counts");
+    assert_eq!(
+        counts,
+        WordCounts {
+            added: 1,
+            removed: 0
+        }
+    );
+}
+
+/// ... and indexes past the list at clock 2 over two blocks of length 1 (a
+/// client that only made an empty paragraph); the other author's words
+/// still count.
+#[test]
+fn an_empty_paragraph_by_another_client_does_not_break_the_diff() {
+    let (r, ins, _, _) = after_second_client(|txn, frag| {
+        let n = frag.len(txn);
+        let p = frag.insert(txn, n, XmlElementPrelim::empty("paragraph"));
+        p.push_back(txn, XmlTextPrelim::new(""));
+    });
+    let counts = catch_unwind(AssertUnwindSafe(|| {
+        entry_word_counts(r.doc(), &ins, &IdSet::new())
+    }))
+    .expect("no panic")
+    .expect("counts");
+    assert_eq!(
+        counts,
+        WordCounts {
+            added: 2,
+            removed: 0
+        }
+    );
+    // The pad never shows in the diff.
+    let d = entry_diff(r.doc(), &ins, &IdSet::new()).unwrap();
+    assert_eq!(texts_of(&text_chunks(&d), ChunkKind::Added), "hello world");
+}
