@@ -52,6 +52,18 @@ where
     })
 }
 
+/// The default `history_replay_max_bytes`: 8 MiB, set by page history
+/// M1.3's replay spike (`cargo run --release -p knot-history --example
+/// replay_throughput`). The cap is the largest power of two at most
+/// min(the slower replay workload's throughput × 2 s, (512 MiB − 256 MiB
+/// for the web server) ÷ (2 workers × F)), clamped to [8 MiB, 32 MiB]. The
+/// spike measured 6.4 MiB/s for pastes (12.8 MiB in 2 s) and a doc-memory
+/// factor F = 24 (a pass on a page of interleaved one-character typing,
+/// whose items never squash), so memory bounds it at 5.3 MiB and the floor
+/// applies: at F = 24 only one worker fits the chart's 512 Mi limit
+/// (24 × 8 MiB = 192 MiB).
+pub const DEFAULT_HISTORY_REPLAY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -138,6 +150,19 @@ pub struct Config {
     /// Days a deleted doc stays in the archive (restorable) before the
     /// hourly purge job deletes it for good. Minimum 1.
     pub archive_retention_days: u32,
+
+    /// Page history builder workers on this replica: each replays one page
+    /// at a time on its own thread. `0` turns the builder and the history
+    /// size sampler off on this replica.
+    pub history_workers: u32,
+    /// The most input bytes one history replay reads (a checkpoint or
+    /// baseline, rows, gap states, snapshots), builds and word counts
+    /// alike. Peak memory is about `history_workers` × 24 × this. Minimum
+    /// 1 MiB.
+    pub history_replay_max_bytes: u64,
+    /// The share of one core each history worker may use on average: after
+    /// each page it sleeps `compute × (1 / share − 1)`. In (0, 1].
+    pub history_cpu_share: f64,
 }
 
 impl Default for Config {
@@ -174,6 +199,9 @@ impl Default for Config {
             s3_region: "us-east-1".into(),
             s3_prefix: String::new(),
             archive_retention_days: 30,
+            history_workers: 1,
+            history_replay_max_bytes: DEFAULT_HISTORY_REPLAY_MAX_BYTES,
+            history_cpu_share: 0.5,
         }
     }
 }
@@ -229,6 +257,18 @@ impl Config {
         if self.archive_retention_days == 0 {
             return Err(ConfigError::Invalid(
                 "KNOT_ARCHIVE_RETENTION_DAYS must be >= 1".into(),
+            ));
+        }
+        if self.history_replay_max_bytes < 1024 * 1024 {
+            return Err(ConfigError::Invalid(
+                "KNOT_HISTORY_REPLAY_MAX_BYTES must be >= 1048576".into(),
+            ));
+        }
+        // Written so that NaN fails too.
+        let cpu_share_valid = self.history_cpu_share > 0.0 && self.history_cpu_share <= 1.0;
+        if !cpu_share_valid {
+            return Err(ConfigError::Invalid(
+                "KNOT_HISTORY_CPU_SHARE must be > 0 and <= 1".into(),
             ));
         }
         if self.db_max_connections == 0 {
@@ -380,6 +420,89 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn history_defaults() {
+        let c = Config::default();
+        assert_eq!(
+            (c.history_workers, c.history_replay_max_bytes),
+            (1, DEFAULT_HISTORY_REPLAY_MAX_BYTES)
+        );
+        assert_eq!(c.history_cpu_share, 0.5);
+    }
+
+    #[test]
+    fn history_workers_zero_disables_the_builder() {
+        let cfg = Config {
+            session_key: KEY.into(),
+            history_workers: 0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn replay_cap_below_one_mib_is_invalid() {
+        let at = |bytes: u64| Config {
+            session_key: KEY.into(),
+            history_replay_max_bytes: bytes,
+            ..Default::default()
+        };
+        let err = at(1_048_575).validate().unwrap_err().to_string();
+        assert!(
+            err.contains("KNOT_HISTORY_REPLAY_MAX_BYTES must be >= 1048576"),
+            "{err}"
+        );
+        assert!(at(1_048_576).validate().is_ok());
+    }
+
+    #[test]
+    fn cpu_share_must_be_in_zero_one() {
+        assert_eq!(Config::default().history_cpu_share, 0.5);
+        let at = |share: f64| Config {
+            session_key: KEY.into(),
+            history_cpu_share: share,
+            ..Default::default()
+        };
+        for bad in [0.0, 1.5, -0.1, f64::NAN] {
+            let err = at(bad).validate().unwrap_err().to_string();
+            assert!(
+                err.contains("KNOT_HISTORY_CPU_SHARE must be > 0 and <= 1"),
+                "{bad}: {err}"
+            );
+        }
+        assert!(at(1.0).validate().is_ok());
+        assert!(at(0.01).validate().is_ok());
+    }
+
+    #[test]
+    fn history_settings_parse_from_the_environment() {
+        // SAFETY: single-threaded test; no concurrent env reads (nextest
+        // runs each test in its own process).
+        unsafe {
+            std::env::set_var("KNOT_SESSION_KEY", KEY);
+            std::env::set_var("KNOT_HISTORY_WORKERS", "0");
+            std::env::set_var("KNOT_HISTORY_REPLAY_MAX_BYTES", "16777216");
+            std::env::set_var("KNOT_HISTORY_CPU_SHARE", "0.25");
+        }
+        let cfg = Config::load(None::<&str>).expect("load");
+        assert_eq!(cfg.history_workers, 0);
+        assert_eq!(cfg.history_replay_max_bytes, 16 * 1024 * 1024);
+        assert_eq!(cfg.history_cpu_share, 0.25);
+        // SAFETY: same as above.
+        unsafe {
+            for k in [
+                "KNOT_SESSION_KEY",
+                "KNOT_HISTORY_WORKERS",
+                "KNOT_HISTORY_REPLAY_MAX_BYTES",
+                "KNOT_HISTORY_CPU_SHARE",
+            ] {
+                std::env::remove_var(k);
+            }
+        }
     }
 
     #[test]
