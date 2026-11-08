@@ -10,6 +10,8 @@ name: Helm upgrade test
 #   3. the seeded doc reads back        -> schema + migrations survived
 #   4. its content reads back, takes an -> the new release opens a page from
 #      append and a task toggle            the edits the old one stored
+#   5. its history entries list a       -> the history builder runs and builds
+#      session and the imports             over the old release's rows
 #
 # Deliberately a separate workflow from helm-ci.yaml: this builds an image and
 # runs a kind cluster (~10 min) where `ct lint` takes ~10 s, and the two want
@@ -402,6 +404,47 @@ jobs:
           done
           if grep -qxF -- '- [ ] upgrade canary task' /tmp/doc.after.md; then
             echo "::error::the canary task is still unchecked after PATCH /api/docs/$DOC/tasks/0"
+            exit 1
+          fi
+
+          # 5. The history builder runs on the new release: the toggle's
+          # `task` row builds a session (the builder ticks every 2 s), over
+          # the base release's rows, the migration's tables and genesis.
+          BUILT=""
+          for _ in $(seq 1 30); do
+            if api GET "/api/docs/$DOC/history/entries" > /tmp/entries.json \
+               && jq -e '.catching_up == false and ([.entries[] | select(.kind == "session")] | length) >= 1' \
+                    /tmp/entries.json > /dev/null; then
+              BUILT=1
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$BUILT" ]; then
+            echo "::error::the history builder built no session for the canary page within 60 s after the upgrade"
+            cat /tmp/entries.json || true
+            exit 1
+          fi
+          echo "--- canary history entries on $NEW_VER:"
+          cat /tmp/entries.json
+          if ! jq -e '.history_complete == true' /tmp/entries.json > /dev/null; then
+            echo "::error::the canary page's history is not complete (it was created by $BASE_VER, after history_since)"
+            exit 1
+          fi
+          if ! jq -e '.unavailable == false' /tmp/entries.json > /dev/null; then
+            echo "::error::the history builder gave the canary page up"
+            exit 1
+          fi
+          if ! jq -e 'any(.entries[]; .kind == "import")' /tmp/entries.json > /dev/null; then
+            echo "::error::the canary page's history lists no import entry (Markdown replace through $BASE_VER, append after the upgrade)"
+            exit 1
+          fi
+          if ! jq -e 'any(.entries[]; .kind == "import" and .meta.mode == "append")' /tmp/entries.json > /dev/null; then
+            echo "::error::the canary page's history lists no import entry with mode append (the append after the upgrade, tagged by $NEW_VER)"
+            exit 1
+          fi
+          if ! jq -e 'all(.entries[] | select(.kind == "session"); .author.key != null)' /tmp/entries.json > /dev/null; then
+            echo "::error::a session entry of the canary page has no author (all its rows are by the setup user)"
             exit 1
           fi
 

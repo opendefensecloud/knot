@@ -23,6 +23,8 @@
 //!   in the crate-private `store`).
 //! - [`people`]: how a history author is shown to readers, the one place
 //!   that hides a former member (also used by the contributors API).
+//! - [`list`]: one page of a page's entries, newest first, and its response
+//!   body with every entry's `meta` rebuilt from an allowlist.
 
 pub mod builder;
 pub mod canonical;
@@ -30,6 +32,7 @@ pub mod claims;
 pub mod diff;
 pub mod genesis;
 pub mod isolate;
+pub mod list;
 pub mod pass;
 pub mod people;
 pub mod replay;
@@ -47,6 +50,10 @@ pub use diff::{
 };
 pub use genesis::{BaselineInput, GenesisError, GenesisInput, GenesisOutput, build_genesis};
 pub use isolate::{IsolateError, run_isolated};
+pub use list::{
+    CATCHING_UP_REVS, Cursor, CursorError, DEFAULT_LIMIT, EntryRow, HistoryPage, MAX_LIMIT,
+    list_entries, referenced_docs, referenced_people, render_page,
+};
 pub use pass::{
     CHECKPOINT_FLOOR_BYTES, CHECKPOINT_STATE_FRACTION, CheckpointKind, CheckpointWrite, KeptGap,
     PassInput, PassOutput, PassStats, Progress, ReplayHooks, SnapshotProbe, Stage,

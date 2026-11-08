@@ -94,6 +94,10 @@ pub fn router(state: AppState) -> Router<AppState> {
             get(crate::routes::api::history::list),
         )
         .route(
+            "/api/docs/{id}/history/entries",
+            get(crate::routes::api::history::entries),
+        )
+        .route(
             "/api/docs/{id}/history/{seq}/markdown",
             get(crate::routes::api::history::preview_markdown),
         )
