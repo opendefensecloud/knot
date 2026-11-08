@@ -13,7 +13,7 @@ use knot_history::canonical::visible_content;
 use knot_history::{
     BaselineInput, CheckpointKind, CheckpointWrite, Claims, EntryDraft, EntryKind, GenesisError,
     GenesisInput, GenesisOutput, KeptGap, PassInput, PassOutput, Progress, ReplayError,
-    ReplayHooks, ReplayMode, Replayer, RowOutcome, SnapshotProbe, Stage, WindowInput,
+    ReplayHooks, ReplayMode, Replayer, RowOutcome, SnapshotProbe, Stage, WindowError, WindowInput,
     build_genesis, checkpoint_threshold, replay_window, run_pass,
 };
 use knot_storage::{DocUpdate, UpdateSource};
@@ -260,6 +260,8 @@ struct Page {
     /// Passes that resumed from a periodic checkpoint holding pending content.
     pending_resumes: usize,
     passes: usize,
+    /// Parked rows the passes re-applied (`PassStats::retried`).
+    retried: u64,
 }
 
 impl Page {
@@ -287,6 +289,7 @@ impl Page {
             skip_revs: BTreeSet::new(),
             pending_resumes: 0,
             passes: 0,
+            retried: 0,
         };
         page.checkpoints.insert(0, g.checkpoint);
         page
@@ -386,6 +389,7 @@ impl Page {
         self.snapshot_checked_rev = out.snapshot_checked_rev;
         self.skip_revs.extend(out.refused_revs.iter().copied());
         self.passes += 1;
+        self.retried += out.stats.retried;
     }
 
     fn entries(&self) -> Vec<EntryDraft> {
@@ -403,6 +407,7 @@ struct Built {
     checkpoints: Vec<CheckpointWrite>,
     skip_revs: BTreeSet<i64>,
     pending_resumes: usize,
+    retried: u64,
 }
 
 /// Builds `rows` from genesis with passes of at most `max_rows` rows; each
@@ -412,6 +417,23 @@ fn build_all(
     snapshots: &[(usize, SnapshotProbe)],
     max_rows: usize,
     checkpoint_floor: u64,
+) -> Built {
+    build_all_with(
+        rows,
+        snapshots,
+        max_rows,
+        checkpoint_floor,
+        ReplayHooks::default(),
+    )
+}
+
+/// [`build_all`], every pass run with `hooks`.
+fn build_all_with(
+    rows: &[DocUpdate],
+    snapshots: &[(usize, SnapshotProbe)],
+    max_rows: usize,
+    checkpoint_floor: u64,
+    hooks: ReplayHooks,
 ) -> Built {
     let mut page = Page::new();
     let head = rows.last().and_then(|r| r.rev).unwrap_or(0);
@@ -430,7 +452,8 @@ fn build_all(
         if page.built_rev >= head && p > last_visible && !pending_snapshot {
             break;
         }
-        let inp = page.input(rows, &visible, max_rows, checkpoint_floor, now);
+        let mut inp = page.input(rows, &visible, max_rows, checkpoint_floor, now);
+        inp.hooks = hooks.clone();
         let out = run_pass(inp).expect("a pass");
         page.absorb(&out);
         p += 1;
@@ -441,6 +464,7 @@ fn build_all(
         checkpoints: page.checkpoints(),
         skip_revs: page.skip_revs.clone(),
         pending_resumes: page.pending_resumes,
+        retried: page.retried,
     }
 }
 
@@ -1788,13 +1812,45 @@ fn genesis_records_a_claim_per_parking_legacy_row() {
     assert_eq!(g.stats.parked, 2);
 }
 
+/// A v1 update that decodes but that yrs rejects part-way: client 1's
+/// text "ab" in `default`, then an item whose parent is that text (an
+/// `InvalidParent`).
+fn apply_error_update() -> Vec<u8> {
+    use yrs::ID;
+    use yrs::block::ClientID;
+    use yrs::encoding::write::Write;
+    use yrs::updates::encoder::{Encoder, EncoderV1};
+    const STRING: u8 = 4;
+    let mut e = EncoderV1::new();
+    e.write_var(1u32); // clients
+    e.write_var(2u32); // blocks
+    e.write_client(ClientID::new(1));
+    e.write_var(0u32); // clock
+    e.write_info(STRING);
+    e.write_parent_info(true);
+    e.write_string("default");
+    e.write_string("ab");
+    e.write_info(STRING);
+    e.write_parent_info(false);
+    e.write_left_id(&ID::new(ClientID::new(1), 0));
+    e.write_string("x");
+    e.write_var(0u32); // delete set: no clients
+    e.to_vec()
+}
+
 #[test]
 fn genesis_reports_a_baseline_that_does_not_apply() {
     let mut h = History::new(19);
     h.type_para(0, "old baseline", at(-300));
     let older = h.room_snapshot();
     h.type_para(1, "a legacy row", at(-200));
-    let rejected = vec![0xff, 0xff, 0xff];
+    let rejected = apply_error_update();
+    assert!(Update::decode_v1(&rejected).is_ok());
+    let mut fresh = Replayer::new(ReplayMode::Gc);
+    assert!(matches!(
+        fresh.merge_state(&rejected).outcome,
+        RowOutcome::ApplyError(_)
+    ));
     let baseline = |id: i64, seq: i64, bytes: Option<Vec<u8>>| BaselineInput {
         id,
         snapshot_seq: seq,
@@ -1836,4 +1892,240 @@ fn checkpoint_kinds_use_their_sql_spellings() {
         assert_eq!(k.as_str().parse::<CheckpointKind>().unwrap(), k);
     }
     assert!("other".parse::<CheckpointKind>().is_err());
+}
+
+// ---------------------------------------------------------------------------
+// The rows a checkpoint's replay re-applies, and retrying parked rows
+// ---------------------------------------------------------------------------
+
+/// Row 1: A types into a paragraph of B's that never arrives, so it parks
+/// for good. Then C, which has seen nothing else, types `n` paragraphs of
+/// about 120 bytes each, a minute apart.
+fn parked_for_good_then_typing(n: usize) -> History {
+    let mut h = History::new(5);
+    let b_para = h.clients[1].txn(|txn, frag| {
+        let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
+        p.push_back(txn, XmlTextPrelim::new("never delivered"));
+    });
+    h.clients[0]
+        .doc
+        .transact_mut()
+        .apply_update(Update::decode_v1(&b_para).unwrap())
+        .unwrap();
+    let a_text = h.clients[0].txn(|txn, frag| {
+        common::fixtures::text_at(frag, txn, 0)
+            .unwrap()
+            .insert(txn, 0, "x");
+    });
+    h.edit_at(0, a_text, at(0));
+    for i in 0..n {
+        let text = format!("line {i} of c: {}", "lorem ipsum ".repeat(8));
+        h.type_para(2, &text, at(1 + i as i64));
+    }
+    h
+}
+
+/// A pass resuming from `cp` (its pending rows re-applied) over the rows
+/// after it.
+fn resume_from(cp: &CheckpointWrite, rows: &[DocUpdate], claims: &Claims) -> PassInput {
+    let mut inp = input(cp.state_bytes.clone(), &rows_in(rows, cp.rev, i64::MAX));
+    inp.checkpoint_rev = cp.rev;
+    inp.built_rev = cp.rev;
+    inp.snapshot_checked_rev = cp.rev;
+    inp.reapply = reapply_of(cp, rows);
+    inp.claims = claims.clone();
+    inp
+}
+
+#[test]
+fn a_failing_reapply_row_blames_the_checkpoint() {
+    let h = parked_for_good_then_typing(8);
+    let first = pass(input(empty_state(), &h.rows()[..6]));
+    let cp = first
+        .checkpoints
+        .iter()
+        .rfind(|c| c.kind == CheckpointKind::Periodic)
+        .expect("a periodic checkpoint")
+        .clone();
+    assert_eq!(cp.pending_revs, vec![1]);
+    let resumed = pass(resume_from(&cp, h.rows(), &first.claims));
+    assert_eq!(resumed.built_rev, 9);
+
+    // A re-applied row that corrupts the decoded checkpoint: the
+    // checkpoint is blamed, and no checkpoint comes from that replay.
+    let mut inp = resume_from(&cp, h.rows(), &first.claims);
+    inp.hooks.corrupt_at_rev = Some(1);
+    assert!(matches!(run_pass(inp), Err(ReplayError::Prefix { rev: 1 })));
+
+    // A panic while re-applying it is blamed on the same stage.
+    let mut inp = resume_from(&cp, h.rows(), &first.claims);
+    inp.hooks.panic_at_rev = Some(1);
+    let progress = inp.progress.clone();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_pass(inp)));
+    assert!(r.is_err());
+    assert_eq!(progress.get(), Stage::Prefix(1));
+
+    // Cancelled before the re-applied rows.
+    let inp = resume_from(&cp, h.rows(), &first.claims);
+    inp.progress.cancel();
+    assert!(matches!(run_pass(inp), Err(ReplayError::Cancelled)));
+}
+
+#[test]
+fn a_row_parked_for_good_is_not_retried_on_every_row() {
+    let h = parked_for_good_then_typing(30);
+    let out = pass(input(empty_state(), h.rows()));
+    assert_eq!(out.claims.revs(), vec![1]);
+    // Retried once, at the first apply after it parked; nothing C types
+    // is anything it waits for.
+    assert_eq!(out.stats.retried, 1);
+
+    let mut inp = input(empty_state(), h.rows());
+    inp.hooks.retry_every_row = true;
+    let every = pass(inp);
+    assert!(every.stats.retried >= 30, "{}", every.stats.retried);
+    assert_same_entries(&out.entries, &every.entries, "retry every row");
+    assert_eq!(out.claims.revs(), every.claims.revs());
+}
+
+#[test]
+fn retrying_only_what_parked_rows_wait_for_changes_nothing() {
+    let mut retries_saved = 0;
+    for seed in 1..=100u64 {
+        let (rows, snapshots) = generated(seed, 50);
+        for max_rows in [usize::MAX, 3] {
+            let gated = build_all(&rows, &snapshots, max_rows, 256);
+            let every = build_all_with(
+                &rows,
+                &snapshots,
+                max_rows,
+                256,
+                ReplayHooks {
+                    retry_every_row: true,
+                    ..Default::default()
+                },
+            );
+            let what = format!("seed {seed}, passes of {max_rows}");
+            assert_same_entries(&gated.entries, &every.entries, &what);
+            assert_eq!(gated.skip_revs, every.skip_revs, "{what}");
+            assert_eq!(gated.checkpoints.len(), every.checkpoints.len(), "{what}");
+            for (g, e) in gated.checkpoints.iter().zip(&every.checkpoints) {
+                assert_eq!(
+                    (g.rev, g.kind, &g.pending_revs, &g.state_vector),
+                    (e.rev, e.kind, &e.pending_revs, &e.state_vector),
+                    "{what}"
+                );
+                let decode = |c: &CheckpointWrite| {
+                    Replayer::from_state(ReplayMode::Gc, &c.state_bytes).unwrap()
+                };
+                assert!(same_replay(&decode(g), &decode(e)), "{what}, rev {}", g.rev);
+            }
+            retries_saved += every.retried - gated.retried;
+        }
+    }
+    eprintln!("re-applies the gate saved: {retries_saved}");
+    assert!(retries_saved > 0);
+}
+
+#[test]
+fn a_window_checks_cancellation_before_each_gap_merge() {
+    let (_h, gap, _x) = gap_at_three();
+    let progress = Progress::default();
+    progress.cancel();
+    let r = replay_window(WindowInput {
+        mode: ReplayMode::KeepDeleted,
+        checkpoint_state: empty_state(),
+        reapply: Vec::new(),
+        rows: Vec::new(),
+        gap_states: vec![(3, gap)],
+        skip_revs: BTreeSet::new(),
+        end_rev: 3,
+        merge_gap_at_end: true,
+        progress,
+    });
+    let r = r.err();
+    assert!(matches!(r, Some(WindowError::Cancelled)), "{r:?}");
+}
+
+#[test]
+fn a_gap_checkpoint_sets_the_state_size_the_policy_uses() {
+    let mut h = a_types(1);
+    let x = extra_paragraph(&h.room_snapshot(), &"a long paragraph ".repeat(250));
+    let snap = merged(&[h.room_snapshot(), x]);
+    for i in 1..7 {
+        let text = format!("line {i} of a: {}", "lorem ipsum ".repeat(8));
+        h.type_para(0, &text, at(i));
+    }
+    let mut inp = input(empty_state(), h.rows());
+    inp.snapshots = vec![snapshot(1, at(0), snap)];
+    let out = pass(inp);
+    let gap = checkpoint_at(&out.checkpoints, 1).expect("a gap checkpoint at 1");
+    assert_eq!(gap.kind, CheckpointKind::Gap);
+    assert!(gap.state_bytes.len() > 4000);
+    let after: u64 = rows_in(h.rows(), 1, 7)
+        .iter()
+        .map(|r| r.update_bytes.len() as u64)
+        .sum();
+    assert!(after < 4000);
+    // Fewer row bytes than the gap checkpoint's state: nothing to encode.
+    assert!(out.stats.encodes.is_empty(), "{:?}", out.stats.encodes);
+    assert_eq!(out.checkpoints.len(), 1);
+}
+
+/// The (client, clock) pairs of a v1 state vector, in their encoded order.
+fn sv_pairs(bytes: &[u8]) -> Vec<(u64, u32)> {
+    use yrs::encoding::read::{Cursor, Read};
+    let mut c = Cursor::new(bytes);
+    let n: u32 = c.read_var().unwrap();
+    (0..n)
+        .map(|_| (c.read_var().unwrap(), c.read_var().unwrap()))
+        .collect()
+}
+
+#[test]
+fn checkpoint_state_vectors_are_encoded_in_client_order() {
+    let clients = [
+        3u64,
+        1_000_003,
+        77,
+        42,
+        9_999_999_999,
+        5,
+        123_456,
+        8,
+        65_537,
+    ];
+    let paragraphs: Vec<Vec<u8>> = clients
+        .iter()
+        .map(|&id| {
+            Client::new(id).txn(|txn, frag| {
+                let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
+                p.push_back(txn, XmlTextPrelim::new("lorem ipsum ".repeat(40)));
+            })
+        })
+        .collect();
+    let mut r = Replayer::new(ReplayMode::Gc);
+    for p in &paragraphs {
+        r.apply(p);
+    }
+    let pairs = sv_pairs(&r.state_vector());
+    assert_eq!(pairs.len(), clients.len());
+    assert!(pairs.windows(2).all(|w| w[0].0 < w[1].0), "{pairs:?}");
+
+    // One row by all of them: the checkpoint after it names every client.
+    let mut h = History::new(23);
+    h.edit_at(0, merged(&paragraphs), at(0));
+    let out = pass(input(empty_state(), h.rows()));
+    assert_eq!(out.checkpoints.len(), 1);
+    for cp in &out.checkpoints {
+        assert_eq!(sv_pairs(&cp.state_vector).len(), clients.len());
+        let pairs = sv_pairs(&cp.state_vector);
+        assert!(
+            pairs.windows(2).all(|w| w[0].0 < w[1].0),
+            "rev {}: {pairs:?}",
+            cp.rev
+        );
+        let decoded = Replayer::from_state(ReplayMode::Gc, &cp.state_bytes).unwrap();
+        assert_eq!(decoded.state_vector(), cp.state_vector);
+    }
 }

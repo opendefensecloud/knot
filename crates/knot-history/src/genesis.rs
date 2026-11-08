@@ -12,7 +12,7 @@
 //! written when genesis shows something the baseline it started from does
 //! not.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 use knot_storage::DocUpdate;
@@ -25,7 +25,7 @@ use crate::claims::Claims;
 use crate::pass::{
     CheckpointKind, CheckpointWrite, PassStats, Progress, ReplayHooks, Stage, verified_state,
 };
-use crate::replay::{ReplayMode, Replayer, RowOutcome};
+use crate::replay::{Parked, ReplayMode, Replayer, RowOutcome};
 use crate::sessions::{EntryDraft, EntryKind};
 
 /// One `doc_history_baselines` row of the page.
@@ -129,10 +129,8 @@ pub fn build_genesis(input: GenesisInput) -> Result<GenesisOutput, GenesisError>
         None => None,
     };
 
-    let by_rev: BTreeMap<i64, &[u8]> = rows
-        .iter()
-        .map(|r| (r.rev.unwrap_or(0), r.update_bytes.as_slice()))
-        .collect();
+    // Parked legacy rows, retried from their bytes as a pass does.
+    let mut parked = Parked::new(hooks.retry_every_row);
     for row in rows.iter().filter(|r| r.rev.unwrap_or(0) <= genesis_rev) {
         let rev = row.rev.unwrap_or(0);
         if progress.is_cancelled() {
@@ -148,13 +146,9 @@ pub fn build_genesis(input: GenesisInput) -> Result<GenesisOutput, GenesisError>
         if e.outcome == RowOutcome::Corrupt || hooks.corrupt_at_rev == Some(rev) {
             return Err(GenesisError::Corrupt { rev });
         }
-        // Parked legacy rows retried from their bytes, as a pass does.
-        if !e.inserted.is_empty() {
-            let revs = claims.revs();
-            let parked = revs.iter().filter_map(|r| by_rev.get(r).copied());
-            if !replayer.retry(parked, &mut e) {
-                return Err(GenesisError::Corrupt { rev });
-            }
+        parked.mark(&e.inserted);
+        if !e.inserted.is_empty() && !parked.retry(&mut replayer, &mut e) {
+            return Err(GenesisError::Corrupt { rev });
         }
         progress.set(Stage::Idle);
         if let Some(reason) = e.outcome.metric_reason() {
@@ -165,13 +159,17 @@ pub fn build_genesis(input: GenesisInput) -> Result<GenesisOutput, GenesisError>
         }
         // What an earlier legacy row parked and this one drained is
         // genesis content: the claim shrinks, nobody is credited.
-        claims.credit(&mut e.inserted, &mut e.deleted);
+        if !claims.credit(&mut e.inserted, &mut e.deleted).is_empty() {
+            parked.retain(&claims.revs());
+        }
         if !(e.parked_inserts.is_empty() && e.parked_deletes.is_empty()) {
             claims.record(rev, None, e.parked_inserts, e.parked_deletes);
+            parked.add(rev, &row.update_bytes);
             stats.parked += 1;
         }
         stats.rows += 1;
     }
+    stats.retried = parked.retried;
 
     progress.set(Stage::Emit(genesis_rev));
     let state = replayer.encode_state();

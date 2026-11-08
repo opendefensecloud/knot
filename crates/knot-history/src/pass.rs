@@ -23,7 +23,7 @@ use thiserror::Error;
 use yrs::{ReadTxn, Transact};
 
 use crate::claims::Claims;
-use crate::replay::{ReplayError, ReplayMode, Replayer, RowEffect, RowOutcome};
+use crate::replay::{Parked, ReplayError, ReplayMode, Replayer, RowEffect, RowOutcome};
 use crate::sessions::{Contribution, ContributionKind, EntryDraft, Grouper};
 
 /// The smallest number of row bytes between two checkpoints.
@@ -130,13 +130,15 @@ pub enum Stage {
     Idle,
     /// Decoding the starting checkpoint; in genesis, merging the baseline.
     Checkpoint,
-    /// Re-applying a row at or below `built_rev` (the replay prefix).
+    /// Re-applying a row at or below `built_rev`: a row of the starting
+    /// checkpoint's `pending_revs`, or of the replay prefix.
     Prefix(i64),
     /// Applying a new row.
     Row(i64),
     /// Probing (or gap-merging) the snapshot at this rev.
     Probe(i64),
-    /// Merging the kept gap state at this rev.
+    /// Merging the kept gap state at this rev (in [`replay_window`], the
+    /// gap state at this rev).
     KeptGap(i64),
     /// Encoding and verifying a checkpoint at this rev.
     Emit(i64),
@@ -212,7 +214,8 @@ impl fmt::Debug for Progress {
 #[derive(Debug, Clone, Default)]
 pub struct ReplayHooks {
     /// Panics while that row's apply is in progress (`Row(rev)`, or
-    /// `Prefix(rev)` when the replay prefix re-applies it).
+    /// `Prefix(rev)` when the replay re-applies it from the checkpoint's
+    /// `pending_revs` or in the prefix).
     pub panic_at_rev: Option<i64>,
     /// Turns that row's outcome into `Corrupt` after its apply.
     pub corrupt_at_rev: Option<i64>,
@@ -229,6 +232,9 @@ pub struct ReplayHooks {
     pub sleep_at_baseline: Option<(i64, Duration)>,
     /// Turns the merge of the kept gap at that rev into `Corrupt`.
     pub corrupt_kept_gap_at: Option<i64>,
+    /// Retries every parked row in every retry round, as if each waited
+    /// for what just arrived (the retry gate off: `replay::Parked`).
+    pub retry_every_row: bool,
 }
 
 impl ReplayHooks {
@@ -301,6 +307,8 @@ pub struct PassStats {
     pub stopped_early: bool,
     /// Rev and size of every `encode_state` the checkpoint policy ran.
     pub encodes: Vec<(i64, usize)>,
+    /// Parked rows re-applied from their bytes (`Replayer::retry`).
+    pub retried: u64,
 }
 
 /// What a pass built.
@@ -343,16 +351,8 @@ pub fn run_pass(input: PassInput) -> Result<PassOutput, ReplayError> {
         hooks,
     } = input;
 
-    // Every row this pass holds: the open claims' rows are retried from
-    // these bytes (`Replayer::retry`).
-    let bytes: BTreeMap<i64, &[u8]> = reapply
-        .iter()
-        .chain(&replay)
-        .chain(&rows)
-        .map(|r| (rev_of(r), r.update_bytes.as_slice()))
-        .collect();
     let mut pass = Pass {
-        bytes,
+        parked: Parked::new(hooks.retry_every_row),
         grouper: Grouper::new(open),
         claims,
         genesis_rev,
@@ -363,6 +363,7 @@ pub fn run_pass(input: PassInput) -> Result<PassOutput, ReplayError> {
         emitted: false,
         bytes_since_cp: 0,
         encoded_at: None,
+        last_state_size: checkpoint_state.len(),
     };
     let mut built_rev = built_rev;
     let mut snapshot_checked_rev = snapshot_checked_rev;
@@ -379,11 +380,28 @@ pub fn run_pass(input: PassInput) -> Result<PassOutput, ReplayError> {
 
         // The rows retried in the prefix: the claims open at the checkpoint,
         // then every prefix row that parks (the claims of the prefix are
-        // not known; retrying a row that drained changes nothing).
-        let mut parking: Vec<&[u8]> = Vec::new();
+        // not known; a row that drained waits for nothing and is not
+        // retried). A re-applied row that fails blames the checkpoint, as a
+        // prefix row does: its block layout can differ from the live one.
         for row in &reapply {
-            replayer.apply(&row.update_bytes);
-            parking.push(&row.update_bytes);
+            let rev = rev_of(row);
+            if skip_revs.contains(&rev) {
+                continue;
+            }
+            if pass.progress.is_cancelled() {
+                return Err(ReplayError::Cancelled);
+            }
+            pass.progress.set(Stage::Prefix(rev));
+            pass.hooks.at_row(rev);
+            let e = replayer.apply(&row.update_bytes);
+            if matches!(e.outcome, RowOutcome::Corrupt | RowOutcome::Refused)
+                || pass.hooks.corrupt_at_rev == Some(rev)
+            {
+                return Err(ReplayError::Prefix { rev });
+            }
+            pass.parked.mark(&e.inserted);
+            pass.parked.add(rev, &row.update_bytes);
+            pass.progress.set(Stage::Idle);
         }
 
         for row in replay.iter().filter(|r| rev_of(r) <= built_rev) {
@@ -402,16 +420,18 @@ pub fn run_pass(input: PassInput) -> Result<PassOutput, ReplayError> {
             {
                 return Err(ReplayError::Prefix { rev });
             }
-            if !e.inserted.is_empty() && !replayer.retry(parking.iter().copied(), &mut e) {
+            pass.parked.mark(&e.inserted);
+            if !e.inserted.is_empty() && !pass.parked.retry(&mut replayer, &mut e) {
                 return Err(ReplayError::Prefix { rev });
             }
             if !(e.parked_inserts.is_empty() && e.parked_deletes.is_empty()) {
-                parking.push(&row.update_bytes);
+                pass.parked.add(rev, &row.update_bytes);
             }
             pass.progress.set(Stage::Idle);
             pass.bytes_since_cp += row.update_bytes.len() as u64;
         }
-        let mut last_state_size = checkpoint_state.len();
+        // From here on, the open claims' rows.
+        pass.parked.retain(&pass.claims.revs());
 
         // Late snapshots: written after the builder passed their rev.
         let (late, ahead): (Vec<_>, Vec<_>) = snapshots.iter().partition(|s| s.rev <= built_rev);
@@ -447,7 +467,8 @@ pub fn run_pass(input: PassInput) -> Result<PassOutput, ReplayError> {
                     return Err(ReplayError::Corrupt { rev });
                 }
                 // What this row brought may be what parked rows waited for.
-                if !effect.inserted.is_empty() && !pass.retry_claims(&mut replayer, &mut effect) {
+                pass.parked.mark(&effect.inserted);
+                if !effect.inserted.is_empty() && !pass.parked.retry(&mut replayer, &mut effect) {
                     return Err(ReplayError::Corrupt { rev });
                 }
                 pass.progress.set(Stage::Idle);
@@ -471,6 +492,7 @@ pub fn run_pass(input: PassInput) -> Result<PassOutput, ReplayError> {
                         effect.parked_inserts.clone(),
                         effect.parked_deletes.clone(),
                     );
+                    pass.parked.add(rev, &row.update_bytes);
                     pass.stats.parked += 1;
                 }
                 let first_copy = rev == genesis_rev + 1 && row.source == Some(UpdateSource::Copy);
@@ -506,12 +528,12 @@ pub fn run_pass(input: PassInput) -> Result<PassOutput, ReplayError> {
                     .is_none_or(|at| pass.bytes_since_cp - at >= checkpoint_floor);
                 if spaced
                     && pass.bytes_since_cp
-                        >= checkpoint_threshold(checkpoint_floor, last_state_size)
+                        >= checkpoint_threshold(checkpoint_floor, pass.last_state_size)
                 {
                     pass.progress.set(Stage::Emit(rev));
                     let state = replayer.encode_state();
                     pass.progress.set(Stage::Idle);
-                    last_state_size = state.len();
+                    pass.last_state_size = state.len();
                     pass.stats.encodes.push((rev, state.len()));
                     pass.encoded_at = Some(pass.bytes_since_cp);
                     if pass.bytes_since_cp >= checkpoint_threshold(checkpoint_floor, state.len()) {
@@ -536,6 +558,7 @@ pub fn run_pass(input: PassInput) -> Result<PassOutput, ReplayError> {
     if rows_exhausted && !pass.stats.rev_gap && !pass.stats.stopped_early {
         pass.grouper.seal_idle(now);
     }
+    pass.stats.retried = pass.parked.retried;
     Ok(PassOutput {
         built_rev,
         snapshot_checked_rev,
@@ -586,8 +609,9 @@ pub(crate) fn verified_state(replayer: &Replayer, state: Vec<u8>) -> Option<Chec
 
 /// A pass's running state, apart from the replay itself.
 struct Pass<'a> {
-    /// The bytes of every row the pass holds, by rev.
-    bytes: BTreeMap<i64, &'a [u8]>,
+    /// The open claims' rows (in the prefix, every row that parked), retried
+    /// once the replay gains what they wait for.
+    parked: Parked<'a>,
     grouper: Grouper,
     claims: Claims,
     genesis_rev: i64,
@@ -601,6 +625,10 @@ struct Pass<'a> {
     bytes_since_cp: u64,
     /// `bytes_since_cp` at the policy's last encode since that checkpoint.
     encoded_at: Option<u64>,
+    /// The size of the state last encoded (the starting checkpoint's, a
+    /// policy encode's or an emitted checkpoint's), which sets the next
+    /// checkpoint's threshold.
+    last_state_size: usize,
 }
 
 impl Pass<'_> {
@@ -614,10 +642,14 @@ impl Pass<'_> {
         at: DateTime<Utc>,
         kind: ContributionKind,
     ) {
-        for c in self
+        let credits = self
             .claims
-            .credit(&mut effect.inserted, &mut effect.deleted)
-        {
+            .credit(&mut effect.inserted, &mut effect.deleted);
+        if !credits.is_empty() {
+            // A drained claim's row waits for nothing any more.
+            self.parked.retain(&self.claims.revs());
+        }
+        for c in credits {
             if c.parked_rev <= self.genesis_rev {
                 // Genesis content, never credited (Rulings).
                 continue;
@@ -659,6 +691,7 @@ impl Pass<'_> {
             }
         }
         let state = state.unwrap_or_else(|| replayer.encode_state());
+        self.last_state_size = state.len();
         let verified = verified_state(replayer, state);
         self.progress.set(Stage::Idle);
         let Some(mut cp) = verified else {
@@ -812,15 +845,13 @@ impl Pass<'_> {
         Ok(())
     }
 
-    /// Retries the open claims' rows from their original bytes
-    /// ([`Replayer::retry`]), adding what they integrate now to `e`, where
-    /// [`Pass::credit`] finds it. After a union, which replaced the replay
-    /// and dropped its pending content, this also parks that content again.
-    /// `false` when a retried row corrupts the replay.
-    fn retry_claims(&self, replayer: &mut Replayer, e: &mut RowEffect) -> bool {
-        let revs = self.claims.revs();
-        let rows = revs.iter().filter_map(|rev| self.bytes.get(rev).copied());
-        replayer.retry(rows, e)
+    /// Retries every open claim's row from its original bytes after a gap
+    /// merge ([`Parked::retry_all`]), adding what they integrate now to `e`,
+    /// where [`Pass::credit`] finds it. After a union, which replaced the
+    /// replay and dropped its pending content, this also parks that content
+    /// again. `false` when a retried row corrupts the replay.
+    fn retry_claims(&mut self, replayer: &mut Replayer, e: &mut RowEffect) -> bool {
+        self.parked.retry_all(replayer, e)
     }
 
     fn unchecked(&mut self, reason: &'static str) {
@@ -890,32 +921,36 @@ pub fn replay_window(input: WindowInput) -> Result<Replayer, WindowError> {
     let mut replayer = Replayer::from_state(mode, &checkpoint_state)
         .map_err(|e| WindowError::State(e.to_string()))?;
     // Rows whose content may still be pending, retried from their bytes
-    // after every apply that integrated something (`Replayer::retry`), as
-    // the pass does.
-    let mut parking: Vec<&[u8]> = Vec::new();
+    // once the replay gains what they wait for (`replay::Parked`), as the
+    // pass does. The window knows no claims: every row that parks stays,
+    // and one that drained waits for nothing.
+    let mut parked = Parked::new(false);
     for row in &reapply {
-        replayer.apply(&row.update_bytes);
-        parking.push(&row.update_bytes);
+        let rev = rev_of(row);
+        if skip_revs.contains(&rev) {
+            continue;
+        }
+        if progress.is_cancelled() {
+            return Err(WindowError::Cancelled);
+        }
+        progress.set(Stage::Prefix(rev));
+        let e = replayer.apply(&row.update_bytes);
+        if e.outcome == RowOutcome::Corrupt {
+            return Err(WindowError::Corrupt { rev });
+        }
+        parked.mark(&e.inserted);
+        parked.add(rev, &row.update_bytes);
+        progress.set(Stage::Idle);
     }
     let mut gaps = gap_states
         .iter()
         .filter(|(rev, _)| *rev < end_rev || (*rev == end_rev && merge_gap_at_end))
         .peekable();
-    // `Replayer::merge_gap_state`, then the parked rows retried (after a
-    // union, which drops the replay's pending content, that parks it again).
-    let merge = |replayer: &mut Replayer, parking: &[&[u8]], rev: i64, state: &[u8]| {
-        let mut e = replayer.merge_gap_state(state);
-        if took(&e) && replayer.retry(parking.iter().copied(), &mut e) {
-            Ok(())
-        } else {
-            Err(WindowError::GapState { rev })
-        }
-    };
     for row in rows.iter().filter(|r| rev_of(r) <= end_rev) {
         let rev = rev_of(row);
         // The replay has passed every gap state below this row.
         while let Some((at, state)) = gaps.next_if(|(at, _)| *at < rev) {
-            merge(&mut replayer, &parking, *at, state)?;
+            merge_window_gap(&mut replayer, &mut parked, &progress, *at, state)?;
         }
         if progress.is_cancelled() {
             return Err(WindowError::Cancelled);
@@ -925,18 +960,42 @@ pub fn replay_window(input: WindowInput) -> Result<Replayer, WindowError> {
         }
         progress.set(Stage::Row(rev));
         let mut e = replayer.apply(&row.update_bytes);
-        if e.outcome == RowOutcome::Corrupt
-            || (!e.inserted.is_empty() && !replayer.retry(parking.iter().copied(), &mut e))
-        {
+        if e.outcome == RowOutcome::Corrupt {
+            return Err(WindowError::Corrupt { rev });
+        }
+        parked.mark(&e.inserted);
+        if !e.inserted.is_empty() && !parked.retry(&mut replayer, &mut e) {
             return Err(WindowError::Corrupt { rev });
         }
         progress.set(Stage::Idle);
         if !(e.parked_inserts.is_empty() && e.parked_deletes.is_empty()) {
-            parking.push(&row.update_bytes);
+            parked.add(rev, &row.update_bytes);
         }
     }
     for (at, state) in gaps {
-        merge(&mut replayer, &parking, *at, state)?;
+        merge_window_gap(&mut replayer, &mut parked, &progress, *at, state)?;
     }
     Ok(replayer)
+}
+
+/// A window's gap state at `rev`: `Replayer::merge_gap_state` at
+/// `Stage::KeptGap(rev)`, then every parked row retried (after a union,
+/// which drops the replay's pending content, that parks it again).
+fn merge_window_gap(
+    replayer: &mut Replayer,
+    parked: &mut Parked<'_>,
+    progress: &Progress,
+    rev: i64,
+    state: &[u8],
+) -> Result<(), WindowError> {
+    if progress.is_cancelled() {
+        return Err(WindowError::Cancelled);
+    }
+    progress.set(Stage::KeptGap(rev));
+    let mut e = replayer.merge_gap_state(state);
+    if !(took(&e) && parked.retry_all(replayer, &mut e)) {
+        return Err(WindowError::GapState { rev });
+    }
+    progress.set(Stage::Idle);
+    Ok(())
 }

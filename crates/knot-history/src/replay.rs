@@ -28,9 +28,14 @@
 
 use std::collections::BTreeMap;
 
-use yrs::block::ClientID;
-use yrs::updates::decoder::Decode;
-use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+use yrs::block::{
+    BLOCK_GC_REF_NUMBER, BLOCK_SKIP_REF_NUMBER, ClientID, HAS_ORIGIN, HAS_PARENT_SUB,
+    HAS_RIGHT_ORIGIN, ItemContent,
+};
+use yrs::encoding::read::{Cursor, Read};
+use yrs::encoding::write::Write;
+use yrs::updates::decoder::{Decode, Decoder, DecoderV1};
+use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{Doc, ID, IdSet, Options, ReadTxn, StateVector, Transact, Update};
 
 /// How the replay's doc keeps deleted content.
@@ -282,9 +287,10 @@ impl Replayer {
     /// cases where the row's own bytes do; so whether parked content
     /// integrates once everything it needs is there would depend on how the
     /// replay got there (a replay resumed from a checkpoint re-parks the
-    /// rows afresh). Every replay calls this after each apply that
-    /// integrated something, with the rows parked so far: parked content
-    /// then integrates at the first apply after which it can, whatever the
+    /// rows afresh). Every replay retries its parked rows through
+    /// `Parked` after each apply that integrated something, re-applying
+    /// those that gained something they wait for: parked content then
+    /// integrates at the first apply after which it can, whatever the
     /// replay's past. Already-held blocks are trimmed, so a row that drained
     /// long ago changes nothing. `false` when one of them corrupts the
     /// replay, which must not be used again.
@@ -310,9 +316,20 @@ impl Replayer {
         own_state(&self.doc.transact())
     }
 
-    /// The replay's state vector, v1-encoded.
+    /// The replay's state vector, v1-encoded in client order (yrs's own
+    /// `encode_v1` follows a hash map's order, so equal state vectors could
+    /// differ as bytes).
     pub fn state_vector(&self) -> Vec<u8> {
-        self.doc.transact().state_vector().encode_v1()
+        let sv = self.doc.transact().state_vector();
+        let mut pairs: Vec<(u64, u32)> = sv.iter().map(|(c, clock)| (c.get(), *clock)).collect();
+        pairs.sort_unstable();
+        let mut encoder = EncoderV1::new();
+        encoder.write_var(pairs.len());
+        for (client, clock) in pairs {
+            encoder.write_var(client);
+            encoder.write_var(clock);
+        }
+        encoder.to_vec()
     }
 
     pub fn doc(&self) -> &Doc {
@@ -412,6 +429,162 @@ impl Replayer {
         let gc = update.insertions(true).diff(&update.insertions(false));
         gc_block_straddles_a_skip_end(&gc, &self.past_gap)
     }
+}
+
+/// Rows whose content may still be pending, each retried from its original
+/// bytes ([`Replayer::retry`]) only once something it waits for arrived.
+///
+/// Re-applying a row can integrate something only when the replay newly
+/// holds an id the row's integration depends on: yrs trims the blocks a doc
+/// holds, integrates a block once it holds the block's origin, right origin
+/// and parent (`Update::missing_dependency`, `update.rs:381-417`; a block
+/// behind a missing one of its client is integrated behind a Skip), and
+/// applies a deletion once it holds the deleted id. A row's *triggers* are
+/// those ids: its own blocks, every origin, right origin and parent id its
+/// items name, and its delete set. Every apply's insert set is checked
+/// against them ([`Parked::mark`]); a row none of whose triggers the replay
+/// gained since its last apply would integrate nothing, so it is not
+/// re-applied. A row parked for good (a resend of the whole page that waits
+/// for content that never comes) then costs a set intersection per apply,
+/// not a decode and trim of its bytes.
+pub(crate) struct Parked<'a> {
+    rows: BTreeMap<i64, Waiting<'a>>,
+    /// Test hook: retry every row in every round (the gate off).
+    every: bool,
+    /// Rows re-applied by [`Parked::retry`].
+    pub(crate) retried: u64,
+}
+
+struct Waiting<'a> {
+    bytes: &'a [u8],
+    /// `None`: the bytes do not decode as blocks (never seen for a row
+    /// that parked); such a row is retried in every round.
+    triggers: Option<IdSet>,
+    /// The replay gained a trigger since the row's last apply.
+    dirty: bool,
+}
+
+impl<'a> Parked<'a> {
+    pub(crate) fn new(every: bool) -> Self {
+        Parked {
+            rows: BTreeMap::new(),
+            every,
+            retried: 0,
+        }
+    }
+
+    /// Adds the row `rev` that just parked content. It is retried at the
+    /// next round once whatever it waits for, as every row was before the
+    /// gate: one extra apply per parking row.
+    pub(crate) fn add(&mut self, rev: i64, bytes: &'a [u8]) {
+        self.rows.entry(rev).or_insert_with(|| Waiting {
+            bytes,
+            triggers: retry_triggers(bytes),
+            dirty: true,
+        });
+    }
+
+    /// Keeps only the rows `keep` names (the open claims' rows).
+    pub(crate) fn retain(&mut self, keep: &[i64]) {
+        self.rows.retain(|rev, _| keep.binary_search(rev).is_ok());
+    }
+
+    /// Records that the replay gained `inserted`.
+    pub(crate) fn mark(&mut self, inserted: &IdSet) {
+        if inserted.is_empty() {
+            return;
+        }
+        for w in self.rows.values_mut().filter(|w| !w.dirty) {
+            w.dirty = w
+                .triggers
+                .as_ref()
+                .is_none_or(|t| !t.intersect(inserted).is_empty());
+        }
+    }
+
+    /// Retries the rows the replay gained a trigger of, in rev order, until
+    /// none is left (a retry that integrates something marks the others
+    /// again), adding what they integrate to `effect`. `false` when one of
+    /// them corrupts the replay, which must not be used again.
+    pub(crate) fn retry(&mut self, replayer: &mut Replayer, effect: &mut RowEffect) -> bool {
+        if self.every {
+            self.rows.values_mut().for_each(|w| w.dirty = true);
+        }
+        self.drain(replayer, effect)
+    }
+
+    /// Retries every row: after a `union`, which dropped the replay's
+    /// pending content, this parks it again.
+    pub(crate) fn retry_all(&mut self, replayer: &mut Replayer, effect: &mut RowEffect) -> bool {
+        self.rows.values_mut().for_each(|w| w.dirty = true);
+        self.drain(replayer, effect)
+    }
+
+    fn drain(&mut self, replayer: &mut Replayer, effect: &mut RowEffect) -> bool {
+        while let Some(rev) = self.rows.iter().find(|(_, w)| w.dirty).map(|(r, _)| *r) {
+            let w = self.rows.get_mut(&rev).expect("a dirty row");
+            w.dirty = false;
+            let bytes = w.bytes;
+            let mut e = RowEffect::nothing(RowOutcome::Applied);
+            if !replayer.retry([bytes], &mut e) {
+                return false;
+            }
+            self.retried += 1;
+            self.mark(&e.inserted);
+            effect.inserted.merge_with(e.inserted);
+            effect.deleted.merge_with(e.deleted);
+        }
+        true
+    }
+}
+
+/// What a re-apply of `update` depends on ([`Parked`]): the ids of its
+/// blocks, the origin, right origin and parent ids its items name, and its
+/// delete set. `None` when the bytes do not decode.
+fn retry_triggers(update: &[u8]) -> Option<IdSet> {
+    let u = Update::decode_v1(update).ok()?;
+    let mut triggers = u.insertions(true);
+    triggers.merge_with(u.delete_set().clone());
+    // yrs does not expose an update's blocks: walk them as
+    // `Update::decode_block` (`update.rs:544-597`) reads them.
+    let mut d = DecoderV1::new(Cursor::new(update));
+    let clients: u32 = d.read_var().ok()?;
+    for _ in 0..clients {
+        let blocks: u32 = d.read_var().ok()?;
+        d.read_client().ok()?;
+        let _clock: u32 = d.read_var().ok()?;
+        for _ in 0..blocks {
+            match d.read_info().ok()? {
+                BLOCK_SKIP_REF_NUMBER => {
+                    let _len: u32 = d.read_var().ok()?;
+                }
+                BLOCK_GC_REF_NUMBER => {
+                    d.read_len().ok()?;
+                }
+                info => {
+                    let cant_copy_parent_info = info & (HAS_ORIGIN | HAS_RIGHT_ORIGIN) == 0;
+                    if info & HAS_ORIGIN != 0 {
+                        triggers.insert(d.read_left_id().ok()?, 1);
+                    }
+                    if info & HAS_RIGHT_ORIGIN != 0 {
+                        triggers.insert(d.read_right_id().ok()?, 1);
+                    }
+                    if cant_copy_parent_info {
+                        if d.read_parent_info().ok()? {
+                            d.read_string().ok()?;
+                        } else {
+                            triggers.insert(d.read_left_id().ok()?, 1);
+                        }
+                        if info & HAS_PARENT_SUB != 0 {
+                            d.read_string().ok()?;
+                        }
+                    }
+                    ItemContent::decode(&mut d, info).ok()?;
+                }
+            }
+        }
+    }
+    Some(triggers)
 }
 
 /// Whether a range of `gc` starts before and ends after the start of a
