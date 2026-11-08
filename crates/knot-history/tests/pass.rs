@@ -1975,6 +1975,147 @@ fn a_failing_reapply_row_blames_the_checkpoint() {
     assert!(matches!(run_pass(inp), Err(ReplayError::Cancelled)));
 }
 
+/// A row whose content parks at rev `parks_at` (A types into B's
+/// paragraph, which no row has delivered yet), with A's rows before it;
+/// returns the history and B's undelivered paragraph.
+fn parks_at(parks_at: i64) -> (History, Vec<u8>) {
+    let mut h = History::new(13);
+    for i in 1..parks_at {
+        h.type_para(0, &format!("a writes line {i}"), at(i));
+    }
+    let b_para = h.clients[1].txn(|txn, frag| {
+        let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
+        p.push_back(txn, XmlTextPrelim::new("base"));
+    });
+    h.clients[0]
+        .doc
+        .transact_mut()
+        .apply_update(Update::decode_v1(&b_para).unwrap())
+        .unwrap();
+    let a_text = h.clients[0].txn(|txn, frag| {
+        let n = frag.len(txn);
+        common::fixtures::text_at(frag, txn, n - 1)
+            .unwrap()
+            .insert(txn, 4, " and more");
+    });
+    assert_eq!(h.edit_at(0, a_text, at(parks_at)), parks_at);
+    (h, b_para)
+}
+
+/// Runs `inp` with `panic_at_retry` set and returns the stage the panic was
+/// blamed on.
+fn stage_of_retry_panic(mut inp: PassInput, rev: i64) -> Stage {
+    inp.hooks.panic_at_retry = Some(rev);
+    let progress = inp.progress.clone();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_pass(inp)));
+    assert!(r.is_err());
+    progress.get()
+}
+
+#[test]
+fn a_failed_retry_blames_the_retried_row_not_the_input_that_triggered_it() {
+    // A new row triggers the retry: row 2 (parked) is blamed, not row 3.
+    let (mut h, b_para) = parks_at(2);
+    h.edit_at(1, b_para.clone(), at(3));
+    let ok = pass(input(empty_state(), h.rows()));
+    assert_eq!((ok.built_rev, ok.claims.len()), (3, 0));
+    let mut inp = input(empty_state(), h.rows());
+    inp.hooks.corrupt_at_retry = Some(2);
+    assert!(matches!(
+        run_pass(inp),
+        Err(ReplayError::Corrupt { rev: 2 })
+    ));
+    assert_eq!(
+        stage_of_retry_panic(input(empty_state(), h.rows()), 2),
+        Stage::Row(2)
+    );
+
+    // A claim of an earlier pass (row 2, at or below `built_rev`): its
+    // retry blames the starting checkpoint, never row 3.
+    let first = pass(input(empty_state(), &h.rows()[..2]));
+    assert_eq!(first.claims.revs(), vec![2]);
+    let resume = || {
+        let mut inp = input(empty_state(), &h.rows()[2..]);
+        inp.replay = h.rows()[..2].to_vec();
+        inp.built_rev = 2;
+        inp.snapshot_checked_rev = 2;
+        inp.claims = first.claims.clone();
+        inp
+    };
+    assert_eq!(pass(resume()).built_rev, 3);
+    let mut inp = resume();
+    inp.hooks.corrupt_at_retry = Some(2);
+    assert!(matches!(run_pass(inp), Err(ReplayError::Prefix { rev: 2 })));
+    assert_eq!(stage_of_retry_panic(resume(), 2), Stage::Prefix(2));
+}
+
+#[test]
+fn a_failed_retry_after_a_gap_merge_blames_the_row_not_the_snapshot_or_kept_gap() {
+    // The snapshot at 2 holds B's paragraph: its gap merge retries row 2.
+    let (h, b_para) = parks_at(2);
+    let snap = snapshot(2, at(2), merged(&[h.room_snapshot(), b_para]));
+    let probed = |hooks: ReplayHooks| {
+        let mut inp = input(empty_state(), h.rows());
+        inp.snapshots = vec![snap.clone()];
+        inp.hooks = hooks;
+        inp
+    };
+    let ok = pass(probed(ReplayHooks::default()));
+    assert!(ok.claims.iter().all(|c| c.gap), "{:?}", ok.claims);
+    let corrupt = ReplayHooks {
+        corrupt_at_retry: Some(2),
+        ..ReplayHooks::default()
+    };
+    let r = run_pass(probed(corrupt.clone()));
+    assert!(matches!(r, Err(ReplayError::Corrupt { rev: 2 })), "{r:?}");
+    assert_eq!(
+        stage_of_retry_panic(probed(ReplayHooks::default()), 2),
+        Stage::Row(2)
+    );
+
+    // The same gap kept across a rebuild: the kept gap is never blamed
+    // (dropping it would lose its content for good).
+    let k = checkpoint_at(&ok.checkpoints, 2)
+        .filter(|c| c.kind == CheckpointKind::Gap)
+        .expect("the gap checkpoint")
+        .clone();
+    let rebuilt = |hooks: ReplayHooks| {
+        let mut inp = input(empty_state(), h.rows());
+        inp.kept_gaps = vec![KeptGap {
+            rev: 2,
+            created_at: snap.created_at,
+            state_bytes: k.state_bytes.clone(),
+        }];
+        inp.hooks = hooks;
+        inp
+    };
+    assert_eq!(pass(rebuilt(ReplayHooks::default())).built_rev, 2);
+    let r = run_pass(rebuilt(corrupt));
+    assert!(matches!(r, Err(ReplayError::Corrupt { rev: 2 })), "{r:?}");
+    assert_eq!(
+        stage_of_retry_panic(rebuilt(ReplayHooks::default()), 2),
+        Stage::Row(2)
+    );
+}
+
+#[test]
+fn a_failed_retry_in_genesis_skips_the_retried_legacy_row() {
+    let (mut h, b_para) = parks_at(2);
+    h.edit_at(1, b_para, at(3));
+    let mut inp = genesis_input(3, h.rows());
+    inp.hooks.corrupt_at_retry = Some(2);
+    assert!(matches!(
+        build_genesis(inp),
+        Err(GenesisError::Corrupt { rev: 2 })
+    ));
+    let mut inp = genesis_input(3, h.rows());
+    inp.hooks.panic_at_retry = Some(2);
+    let progress = inp.progress.clone();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_genesis(inp)));
+    assert!(r.is_err());
+    assert_eq!(progress.get(), Stage::Row(2));
+}
+
 /// A window from `cp` (its pending rows re-applied) through `end_rev`.
 fn window_from(cp: &CheckpointWrite, rows: &[DocUpdate], end_rev: i64) -> WindowInput {
     WindowInput {

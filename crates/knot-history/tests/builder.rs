@@ -932,6 +932,72 @@ async fn a_clean_page_is_not_rebuilt_by_a_late_claimant() {
     assert!(db.entries(doc).await.iter().all(|e| e.sealed));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_gap_over_a_periodic_checkpoint_takes_the_snapshots_time() {
+    let db = db().await;
+    let doc = db.page().await;
+    let b = db.builder(limits_with(|l| l.checkpoint_floor = 256));
+    let mut h = History::new(1);
+    // One row per pass until the policy checkpoints a pass's last row.
+    let mut at_built = None;
+    for i in 0..60 {
+        let u = typed(
+            &mut h,
+            0,
+            &format!("line {i} of a: {}", "lorem ipsum ".repeat(8)),
+        );
+        db.append(doc, 0, &u).await;
+        build_clean(&b, doc).await;
+        let built = db.state(doc).await.built_rev;
+        if db
+            .checkpoints(doc)
+            .await
+            .iter()
+            .any(|c| c.rev == built && c.kind == "periodic")
+        {
+            at_built = Some(built);
+            break;
+        }
+    }
+    let r = at_built.expect("a periodic checkpoint at built_rev");
+    db.exec(
+        "UPDATE doc_history_checkpoints SET created_at = created_at - interval '1 hour'
+          WHERE doc_id = $1",
+        doc,
+    )
+    .await;
+    let (s, _) = with_paragraph(9, &db.state_at(doc, r).await, "late");
+    db.snapshot(doc, r, &s).await;
+    let snapshot_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM doc_snapshots WHERE doc_id = $1 AND snapshot_rev = $2",
+    )
+    .bind(doc)
+    .bind(r)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    build_clean(&b, doc).await;
+    let cp = db
+        .checkpoints(doc)
+        .await
+        .into_iter()
+        .find(|c| c.rev == r)
+        .unwrap();
+    assert_eq!(cp.kind, "gap");
+    assert_eq!(
+        cp.created_at, snapshot_at,
+        "the gap's time, not the periodic's"
+    );
+    let gaps: Vec<_> = db
+        .entries(doc)
+        .await
+        .into_iter()
+        .filter(|e| e.kind == "gap")
+        .collect();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].started_at, cp.created_at);
+}
+
 async fn wait_for(what: &str, mut f: impl AsyncFnMut() -> bool) {
     let t = Instant::now();
     while !f().await {
@@ -968,7 +1034,8 @@ async fn a_first_build_racing_another_builder_is_busy_not_failed() {
     claimed_by(&db, doc, a.id()).await;
     let t = Instant::now();
     let r = b.build_page(doc).await;
-    assert!(t.elapsed() < Duration::from_millis(1500));
+    // Well under A's 6 s hold: B did not wait for A's lease.
+    assert!(t.elapsed() < Duration::from_secs(4));
     assert!(
         matches!(r, PassResult::Busy | PassResult::Deferred),
         "{r:?}"
@@ -1160,13 +1227,15 @@ async fn a_long_pass_holds_no_lock_on_the_page() {
         .await
         .expect("restrict");
     let grants = PgGrantStore::new(db.pool.clone());
-    let b = db.builder(holding(Duration::from_secs(3)));
+    let b = db.builder(holding(Duration::from_secs(6)));
     let pass = {
         let b = b.clone();
         tokio::spawn(async move { b.build_page(doc).await })
     };
     claimed_by(&db, doc, b.id()).await;
-    let quick = Duration::from_millis(500);
+    // The four writes take at most 4.8 s together, inside the 6 s hold: one
+    // that waited for the builder would wait out the rest of the hold.
+    let quick = Duration::from_millis(1200);
     tokio::time::timeout(
         quick,
         db.docs.move_to(db.ws, doc, author(0), Some(parent), "m"),
@@ -1356,7 +1425,8 @@ async fn a_hung_replay_times_out_and_backs_off_the_page() {
     );
     let t0 = Instant::now();
     assert_eq!(b.build_page(p).await, PassResult::Failed);
-    assert!(t0.elapsed() < Duration::from_secs(2));
+    // At the 1 s timeout, not after the 4 s hold.
+    assert!(t0.elapsed() < Duration::from_secs(3));
     let s = db.state(p).await;
     assert!(
         s.last_error
@@ -1658,10 +1728,11 @@ async fn a_build_is_paced_by_the_cpu_share() {
         "the pacing held the permit"
     );
     assert_eq!(first.await.unwrap(), genesis(0));
-    let unpaced = db.builder(holding(Duration::from_secs(1)));
+    // Paced at 0.5, a 2 s compute would hold the permit 4 s.
+    let unpaced = db.builder(holding(Duration::from_secs(2)));
     let t1 = Instant::now();
     assert_eq!(unpaced.build_page(r).await, genesis(0));
-    assert!(t1.elapsed() < Duration::from_millis(1800));
+    assert!(t1.elapsed() < Duration::from_millis(3500));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1879,8 +1950,14 @@ async fn a_page_that_keeps_failing_is_given_up() {
     assert!(is_built(&b.build_page(doc).await));
     let u = typed(&mut h, 0, "two");
     db.append(doc, 0, &u).await;
+    // Two rebuilds already asked for: any give-up clears the count, so a
+    // re-enabled page does not give up at its next rejected checkpoint.
     db.exec(
-        &format!("UPDATE doc_history_state SET failures = {MAX_FAILURES} WHERE doc_id = $1"),
+        &format!(
+            "UPDATE doc_history_state SET failures = {MAX_FAILURES}, rebuilds = {}
+              WHERE doc_id = $1",
+            MAX_REBUILDS - 1
+        ),
         doc,
     )
     .await;
@@ -1888,6 +1965,7 @@ async fn a_page_that_keeps_failing_is_given_up() {
     let s = db.state(doc).await;
     assert!(s.given_up);
     assert_eq!((s.builder_version, s.claimed_by), (BUILDER_VERSION, None));
+    assert_eq!(s.rebuilds, 0);
     assert!(
         s.last_error.as_deref().unwrap().contains("failed passes"),
         "{s:?}"
@@ -2008,6 +2086,93 @@ async fn a_row_that_always_panics_is_skipped() {
     let row2 = common::db::insertions(&rows[1]);
     for e in db.entries(doc).await {
         assert!(e.inserted().intersect(&row2).is_empty(), "{e:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_record_that_fails_once_is_tried_again() {
+    let db = db().await;
+    let doc = db.page().await;
+    genesis_then_rows(&db, doc).await;
+    let failed_records = Arc::new(std::sync::atomic::AtomicU8::new(1));
+    let b = db.builder(limits_with(|l| {
+        l.hooks.replay.corrupt_at_rev = Some(2);
+        l.hooks.failed_records = Some(failed_records.clone());
+    }));
+    assert_eq!(b.build_page(doc).await, PassResult::Failed);
+    assert_eq!(failed_records.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let s = db.state(doc).await;
+    // Recorded: no crash marker or lease left for the next claim to count
+    // as a crash.
+    assert_eq!(s.claimed_by, None);
+    assert!(
+        s.last_error.as_deref().unwrap().contains("row 2"),
+        "{:?}",
+        s.last_error
+    );
+    assert_eq!((s.skip_revs, s.failures), (vec![2], 1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_row_whose_retry_fails_is_skipped_not_the_row_that_triggered_it() {
+    let db = db().await;
+    for corrupt in [false, true] {
+        let doc = db.page().await;
+        assert_eq!(db.builder(limits()).build_page(doc).await, genesis(0));
+        // B makes a paragraph and does not deliver it yet; A types into it
+        // (row 1 parks), then B delivers it (row 2 retries row 1).
+        let h = History::new(3);
+        let b_para = h.clients[1].txn(|txn, frag| {
+            let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(txn, XmlTextPrelim::new("base"));
+        });
+        h.clients[0]
+            .doc
+            .transact_mut()
+            .apply_update(yrs::Update::decode_v1(&b_para).unwrap())
+            .unwrap();
+        let a_text = h.clients[0].txn(|txn, frag| {
+            common::fixtures::text_at(frag, txn, 0)
+                .unwrap()
+                .insert(txn, 4, " and more");
+        });
+        let parked = db.append(doc, 0, &a_text).await;
+        let trigger = db.append(doc, 1, &b_para).await;
+        let hooked = db.builder(limits_with(|l| {
+            if corrupt {
+                l.hooks.replay.corrupt_at_retry = Some(parked);
+            } else {
+                l.hooks.replay.panic_at_retry = Some(parked);
+            }
+        }));
+        assert_eq!(hooked.build_page(doc).await, PassResult::Failed);
+        let s = db.state(doc).await;
+        assert_eq!(
+            s.skip_revs,
+            vec![parked],
+            "the retried row is skipped, never row {trigger} (corrupt: {corrupt})"
+        );
+        db.retry_now(doc).await;
+        assert_eq!(
+            hooked.build_page(doc).await,
+            PassResult::Built {
+                built_rev: trigger,
+                rows: 1
+            }
+        );
+        let entries = db.entries(doc).await;
+        let delivered = common::db::insertions(&b_para);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.author == Some(author(1))
+                    && !e.inserted().intersect(&delivered).is_empty()),
+            "{entries:?}"
+        );
+        let typed_in = common::db::insertions(&a_text);
+        for e in &entries {
+            assert!(e.inserted().intersect(&typed_in).is_empty(), "{e:?}");
+        }
     }
 }
 

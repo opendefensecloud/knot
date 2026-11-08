@@ -9,7 +9,9 @@
 //! keeps failing, times out twice with nothing to blame, crashes the
 //! process three times or exceeds the replay cap is given up. A panic or a
 //! timeout is blamed on the input that was running when it happened
-//! (`Progress`), never on an innocent row.
+//! (`Progress`), never on an innocent row: the retry of a parked row's
+//! content is that row's own stage, not the stage of the row, snapshot or
+//! kept gap whose apply triggered it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
@@ -67,6 +69,8 @@ pub const MAX_CRASHES: i32 = 3;
 /// recurs after every rebuild cannot loop forever, at the cost of giving
 /// up a page whose three rejections were unrelated (Rulings).
 pub const MAX_REBUILDS: i32 = 3;
+/// How long a failure record that failed waits before its second try.
+pub const RECORD_RETRY: Duration = Duration::from_secs(2);
 /// New rows one pass replays at most.
 pub const PASS_MAX_ROWS: i64 = 5_000;
 /// New row bytes one pass loads at most.
@@ -120,6 +124,8 @@ pub struct TestHooks {
     pub fail_words: bool,
     /// Receives the byte size of every replay input `build_page` loaded.
     pub input_log: Option<Arc<Mutex<Vec<i64>>>>,
+    /// That many `record_failure` attempts fail before one runs.
+    pub failed_records: Option<Arc<AtomicU8>>,
 }
 
 /// What the builder may load and spend per page.
@@ -660,19 +666,41 @@ impl Run<'_> {
         PassResult::Failed
     }
 
-    /// Records a failed pass → `Failed`.
-    async fn fail(&mut self, f: Failure) -> PassResult {
-        let doc_id = self.doc_id;
-        match store::record_failure(
+    /// One `record_failure` attempt.
+    async fn record(&self, f: &Failure) -> Result<Recorded, store::StoreError> {
+        if let Some(n) = &self.hooks().failed_records
+            && n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Err(store::StoreError::Invalid(
+                "test hook: failed record".to_string(),
+            ));
+        }
+        store::record_failure(
             &self.b.pool,
-            doc_id,
+            self.doc_id,
             self.b.id,
             &f.message,
             f.action,
             f.timed_out,
         )
         .await
-        {
+    }
+
+    /// Records a failed pass → `Failed`. A record that fails is tried once
+    /// more after `RECORD_RETRY`: an unrecorded failure leaves the claim's
+    /// crash marker, and the next claim would count it as a crash (three
+    /// give the page up). An attempt that committed but lost its reply
+    /// finds the lease released and changes nothing.
+    async fn fail(&mut self, f: Failure) -> PassResult {
+        let doc_id = self.doc_id;
+        let mut recorded = self.record(&f).await;
+        if let Err(e) = &recorded {
+            tracing::warn!(%doc_id, error = %e, "history failure not recorded, trying again");
+            tokio::time::sleep(RECORD_RETRY).await;
+            recorded = self.record(&f).await;
+        }
+        match recorded {
             Ok(Recorded::GaveUp) => {
                 self.gave_up("timeout", &f.message);
                 return PassResult::Failed;

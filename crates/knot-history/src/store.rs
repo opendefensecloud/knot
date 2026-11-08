@@ -267,15 +267,13 @@ pub(crate) async fn claim(pool: &PgPool, doc_id: Uuid, me: Uuid, lease: Duration
         ))
     } else if rebuilds >= MAX_REBUILDS {
         // Given up by this builder version, so that only a newer one lifts
-        // it, and with the count cleared for that newer builder (or for an
-        // operator who re-enables the page).
-        sqlx::query(
-            "UPDATE doc_history_state SET builder_version = $2, rebuilds = 0 WHERE doc_id = $1",
-        )
-        .bind(doc_id)
-        .bind(BUILDER_VERSION)
-        .execute(&mut *tx)
-        .await?;
+        // it (`give_up_in` clears the count, as every give-up does, for that
+        // newer builder or for an operator who re-enables the page).
+        sqlx::query("UPDATE doc_history_state SET builder_version = $2 WHERE doc_id = $1")
+            .bind(doc_id)
+            .bind(BUILDER_VERSION)
+            .execute(&mut *tx)
+            .await?;
         Some((
             "failures",
             format!(
@@ -373,7 +371,9 @@ pub(crate) async fn renew_lease(
 
 /// Gives the page up in the caller's transaction (which holds the page's
 /// KEY SHARE): `me` `None` is the claim form (no `claimed_by` predicate;
-/// nobody holds the lease), `Some` the after-claim form. When genesis was
+/// nobody holds the lease), `Some` the after-claim form. Every give-up
+/// clears `rebuilds`, so a page re-enabled by an operator or lifted by a
+/// newer builder starts its rebuild count at 0. When genesis was
 /// never built, also lists the page's baselines (Rulings). Returns whether
 /// the state row matched.
 async fn give_up_in(
@@ -384,7 +384,7 @@ async fn give_up_in(
 ) -> Result<bool> {
     let before_genesis: Option<bool> = sqlx::query_scalar(
         "UPDATE doc_history_state
-            SET retry_after = 'infinity',
+            SET retry_after = 'infinity', rebuilds = 0,
                 builder_version = CASE WHEN genesis_rev IS NULL THEN $3 ELSE builder_version END,
                 last_error = $2, claimed_by = NULL, claimed_until = NULL, updated_at = now()
           WHERE doc_id = $1 AND ($4::uuid IS NULL OR claimed_by = $4)
@@ -1337,16 +1337,22 @@ async fn insert_checkpoint(
     cp: &CheckpointWrite,
     created_at: Option<DateTime<Utc>>,
 ) -> Result<()> {
-    // A gap checkpoint replaces whatever is at its rev, except its
-    // `created_at`: a kept gap re-emitted by a rebuild keeps the time it
-    // was first found. Any other kind leaves an existing row alone.
+    // A gap checkpoint replaces whatever is at its rev. A gap one there
+    // keeps its `created_at` (a kept gap re-emitted by a rebuild keeps the
+    // time it was first found); a periodic one there (a late snapshot
+    // probed at a rev the policy had checkpointed) takes the gap's, which
+    // a rebuild reads back as the kept gap's time. Any other kind leaves
+    // an existing row alone.
     sqlx::query(
         "INSERT INTO doc_history_checkpoints
              (doc_id, rev, kind, state_bytes, state_vector, pending_revs, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, coalesce($7, now()))
          ON CONFLICT (doc_id, rev) DO UPDATE
             SET kind = EXCLUDED.kind, state_bytes = EXCLUDED.state_bytes,
-                state_vector = EXCLUDED.state_vector, pending_revs = EXCLUDED.pending_revs
+                state_vector = EXCLUDED.state_vector, pending_revs = EXCLUDED.pending_revs,
+                created_at = CASE WHEN doc_history_checkpoints.kind = 'gap'
+                                  THEN doc_history_checkpoints.created_at
+                                  ELSE EXCLUDED.created_at END
           WHERE EXCLUDED.kind = 'gap'",
     )
     .bind(doc_id)

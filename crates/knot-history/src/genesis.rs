@@ -130,7 +130,8 @@ pub fn build_genesis(input: GenesisInput) -> Result<GenesisOutput, GenesisError>
     };
 
     // Parked legacy rows, retried from their bytes as a pass does.
-    let mut parked = Parked::new(hooks.retry_every_row);
+    // Every legacy row is new: a failed retry skips the retried row.
+    let mut parked = Parked::new(&hooks).watch(progress.clone(), i64::MIN);
     for row in rows.iter().filter(|r| r.rev.unwrap_or(0) <= genesis_rev) {
         let rev = row.rev.unwrap_or(0);
         if progress.is_cancelled() {
@@ -147,8 +148,10 @@ pub fn build_genesis(input: GenesisInput) -> Result<GenesisOutput, GenesisError>
             return Err(GenesisError::Corrupt { rev });
         }
         parked.mark(&e.inserted);
-        if !e.inserted.is_empty() && !parked.retry(&mut replayer, &mut e) {
-            return Err(GenesisError::Corrupt { rev });
+        if !e.inserted.is_empty() {
+            parked
+                .retry(&mut replayer, &mut e)
+                .map_err(|rev| GenesisError::Corrupt { rev })?;
         }
         progress.set(Stage::Idle);
         if let Some(reason) = e.outcome.metric_reason() {

@@ -38,6 +38,8 @@ use yrs::updates::decoder::{Decode, Decoder, DecoderV1};
 use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{Doc, ID, IdSet, Options, ReadTxn, StateVector, Transact, Update};
 
+use crate::pass::{Progress, ReplayHooks, Stage};
+
 /// How the replay's doc keeps deleted content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayMode {
@@ -133,10 +135,13 @@ pub enum ReplayError {
     #[error("the starting state does not apply: {0}")]
     State(String),
     /// A row at or below `built_rev` that the replay prefix re-applies is
-    /// `Corrupt` or `Refused`: the checkpoint is blamed, never the row.
+    /// `Corrupt` or `Refused`, or whose parked content's retry corrupts the
+    /// replay at any point of the pass: the checkpoint is blamed, never the
+    /// row.
     #[error("row {rev} of the replay prefix failed")]
     Prefix { rev: i64 },
-    /// A new row corrupted the replay.
+    /// A new row corrupted the replay, on its apply or on a retry of its
+    /// parked content (whatever input's apply triggered that retry).
     #[error("row {rev} corrupted the replay")]
     Corrupt { rev: i64 },
     /// A gap merge of a snapshot corrupted the replay.
@@ -447,10 +452,21 @@ impl Replayer {
 /// re-applied. A row parked for good (a resend of the whole page that waits
 /// for content that never comes) then costs a set intersection per apply,
 /// not a decode and trim of its bytes.
+///
+/// A re-apply that panics, hangs or corrupts the replay is the retried
+/// row's own failure, never the input whose apply triggered the retry: a
+/// watched `Parked` ([`Parked::watch`]) publishes the retried row's stage
+/// while it re-applies it, and a failed drain names that row.
 pub(crate) struct Parked<'a> {
     rows: BTreeMap<i64, Waiting<'a>>,
     /// Test hook: retry every row in every round (the gate off).
     every: bool,
+    /// Test hooks: panic in, or report `Corrupt` from, that row's re-apply.
+    panic_at: Option<i64>,
+    corrupt_at: Option<i64>,
+    /// Where each re-apply's stage is published: `Stage::Row(rev)` for a
+    /// row above the rev, `Stage::Prefix(rev)` for one at or below it.
+    watch: Option<(Progress, i64)>,
     /// Rows re-applied by [`Parked::retry`].
     pub(crate) retried: u64,
 }
@@ -465,12 +481,24 @@ struct Waiting<'a> {
 }
 
 impl<'a> Parked<'a> {
-    pub(crate) fn new(every: bool) -> Self {
+    pub(crate) fn new(hooks: &ReplayHooks) -> Self {
         Parked {
             rows: BTreeMap::new(),
-            every,
+            every: hooks.retry_every_row,
+            panic_at: hooks.panic_at_retry,
+            corrupt_at: hooks.corrupt_at_retry,
+            watch: None,
             retried: 0,
         }
+    }
+
+    /// Publishes each re-apply's stage to `progress`: `Stage::Row(rev)`
+    /// for a row after `built_rev` (new in this replay), `Stage::Prefix(rev)`
+    /// for one at or below it. The stage current before a drain is set
+    /// again after it.
+    pub(crate) fn watch(mut self, progress: Progress, built_rev: i64) -> Self {
+        self.watch = Some((progress, built_rev));
+        self
     }
 
     /// Adds the row `rev` that just parked content. It is retried at the
@@ -504,9 +532,14 @@ impl<'a> Parked<'a> {
 
     /// Retries the rows the replay gained a trigger of, in rev order, until
     /// none is left (a retry that integrates something marks the others
-    /// again), adding what they integrate to `effect`. `false` when one of
-    /// them corrupts the replay, which must not be used again.
-    pub(crate) fn retry(&mut self, replayer: &mut Replayer, effect: &mut RowEffect) -> bool {
+    /// again), adding what they integrate to `effect`. `Err(rev)` when the
+    /// re-apply of row `rev` corrupts the replay, which must not be used
+    /// again.
+    pub(crate) fn retry(
+        &mut self,
+        replayer: &mut Replayer,
+        effect: &mut RowEffect,
+    ) -> Result<(), i64> {
         if self.every {
             self.rows.values_mut().for_each(|w| w.dirty = true);
         }
@@ -515,26 +548,44 @@ impl<'a> Parked<'a> {
 
     /// Retries every row: after a `union`, which dropped the replay's
     /// pending content, this parks it again.
-    pub(crate) fn retry_all(&mut self, replayer: &mut Replayer, effect: &mut RowEffect) -> bool {
+    pub(crate) fn retry_all(
+        &mut self,
+        replayer: &mut Replayer,
+        effect: &mut RowEffect,
+    ) -> Result<(), i64> {
         self.rows.values_mut().for_each(|w| w.dirty = true);
         self.drain(replayer, effect)
     }
 
-    fn drain(&mut self, replayer: &mut Replayer, effect: &mut RowEffect) -> bool {
+    fn drain(&mut self, replayer: &mut Replayer, effect: &mut RowEffect) -> Result<(), i64> {
+        let before = self.watch.as_ref().map(|(p, _)| p.get());
         while let Some(rev) = self.rows.iter().find(|(_, w)| w.dirty).map(|(r, _)| *r) {
             let w = self.rows.get_mut(&rev).expect("a dirty row");
             w.dirty = false;
             let bytes = w.bytes;
+            if let Some((progress, built_rev)) = &self.watch {
+                progress.set(if rev > *built_rev {
+                    Stage::Row(rev)
+                } else {
+                    Stage::Prefix(rev)
+                });
+            }
+            if self.panic_at == Some(rev) {
+                panic!("test hook: panic re-applying row {rev}");
+            }
             let mut e = RowEffect::nothing(RowOutcome::Applied);
-            if !replayer.retry([bytes], &mut e) {
-                return false;
+            if !replayer.retry([bytes], &mut e) || self.corrupt_at == Some(rev) {
+                return Err(rev);
             }
             self.retried += 1;
             self.mark(&e.inserted);
             effect.inserted.merge_with(e.inserted);
             effect.deleted.merge_with(e.deleted);
         }
-        true
+        if let (Some((progress, _)), Some(stage)) = (&self.watch, before) {
+            progress.set(stage);
+        }
+        Ok(())
     }
 }
 

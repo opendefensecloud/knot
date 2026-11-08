@@ -881,6 +881,19 @@ async fn entry_of(fx: &Fixture, m: &Member, doc: Uuid, kind: &str) -> (Value, St
     (found[0].clone(), a.body)
 }
 
+/// The owner grants the editor read access to the restricted page `doc`.
+async fn grant_viewer(fx: &Fixture, doc: Uuid) {
+    let a = send(
+        fx,
+        Some(&fx.owner.session),
+        "PUT",
+        &format!("/api/docs/{doc}/grants/user:{}", fx.editor.id),
+        Some(json!({"role": "viewer", "inherit": true})),
+    )
+    .await;
+    assert!(a.status.is_success(), "grant: {} {}", a.status, a.body);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn copy_and_template_sources_are_hidden_from_readers_who_cannot_see_them() {
     let fx = fixture().await;
@@ -927,6 +940,14 @@ async fn copy_and_template_sources_are_hidden_from_readers_who_cannot_see_them()
         e["meta"],
         json!({"template_doc_id": template, "template_title": "Secret template"})
     );
+    // A reader who is not an owner sees it once granted the template: the
+    // source's access decides, not the page's role or ownership.
+    grant_viewer(&fx, template).await;
+    let (e, _) = entry_of(&fx, &fx.editor, monday, "template").await;
+    assert_eq!(
+        e["meta"],
+        json!({"template_doc_id": template, "template_title": "Secret template"})
+    );
 
     // A copy of a restricted page: restricted too, with only its actor as
     // owner, so the editor gets a grant on the copy (not on the source).
@@ -967,6 +988,12 @@ async fn copy_and_template_sources_are_hidden_from_readers_who_cannot_see_them()
     assert!(!body.contains(&source.to_string()), "{body}");
     assert!(!body.contains("Secret source"), "{body}");
     let (e, _) = entry_of(&fx, &fx.owner, copy, "copy").await;
+    assert_eq!(
+        e["meta"],
+        json!({"source_doc_id": source, "source_title": "Secret source", "version_at": null})
+    );
+    grant_viewer(&fx, source).await;
+    let (e, _) = entry_of(&fx, &fx.editor, copy, "copy").await;
     assert_eq!(
         e["meta"],
         json!({"source_doc_id": source, "source_title": "Secret source", "version_at": null})
