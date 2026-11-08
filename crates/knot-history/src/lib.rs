@@ -21,6 +21,8 @@
 //! - [`builder`]: the background builder that claims dirty pages, runs
 //!   genesis and passes on them and writes what they built (its SQL lives
 //!   in the crate-private `store`).
+//! - [`people`]: how a history author is shown to readers, the one place
+//!   that hides a former member (also used by the contributors API).
 
 pub mod builder;
 pub mod canonical;
@@ -29,6 +31,7 @@ pub mod diff;
 pub mod genesis;
 pub mod isolate;
 pub mod pass;
+pub mod people;
 pub mod replay;
 pub mod sessions;
 mod store;
@@ -48,6 +51,9 @@ pub use pass::{
     CHECKPOINT_FLOOR_BYTES, CHECKPOINT_STATE_FRACTION, CheckpointKind, CheckpointWrite, KeptGap,
     PassInput, PassOutput, PassStats, Progress, ReplayHooks, SnapshotProbe, Stage,
     UnknownCheckpointKind, WindowError, WindowInput, checkpoint_threshold, replay_window, run_pass,
+};
+pub use people::{
+    ANONYMIZED_SQL, AuthorView, HistoryPerson, byline_view, history_author_view, load_people,
 };
 pub use replay::{ReplayError, ReplayMode, Replayer, RowEffect, RowOutcome};
 pub use sessions::{

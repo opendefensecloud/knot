@@ -883,7 +883,7 @@ async fn viewer_reads_the_byline() {
     );
     assert_eq!(
         v["created_by"],
-        serde_json::json!({"id": fx.alice.id, "display_name": "Alice"})
+        serde_json::json!({"id": fx.alice.id, "display_name": "Alice", "former": false})
     );
     assert_eq!(ts(&v["created_at"]), fx.doc_created_at);
     assert_eq!(
@@ -903,12 +903,14 @@ async fn viewer_reads_the_byline() {
             [
                 "display_name",
                 "first_edited_at",
+                "former",
                 "last_edited_at",
                 "user_id"
             ]
         );
         assert_eq!(c["user_id"], serde_json::json!(id));
         assert_eq!(c["display_name"], name);
+        assert_eq!(c["former"], false);
         assert_eq!(ts(&c["first_edited_at"]), first);
         assert_eq!(ts(&c["last_edited_at"]), last);
     }
@@ -956,9 +958,11 @@ async fn byline_is_denied_without_access_to_the_doc() {
     assert_eq!(v["error"]["code"], "acl.no_grant");
 }
 
-/// Leaving the workspace does not erase what someone wrote.
+/// Leaving the workspace does not erase what someone wrote. Someone who
+/// left keeps `former: false`: `former` means anonymized in history (M4),
+/// not "no longer a member".
 #[tokio::test(flavor = "multi_thread")]
-async fn byline_still_names_a_former_member() {
+async fn byline_still_names_someone_who_left_the_workspace() {
     let fx = fixture().await;
     contribute(&fx, fx.bob.id, at(9), at(11)).await;
     fx.state
@@ -977,6 +981,7 @@ async fn byline_still_names_a_former_member() {
         serde_json::json!([{
             "user_id": fx.bob.id,
             "display_name": "Bob",
+            "former": false,
             "first_edited_at": v["contributors"][0]["first_edited_at"],
             "last_edited_at": v["contributors"][0]["last_edited_at"],
         }])
