@@ -1,10 +1,13 @@
 //! `knot_history_table_bytes{table}`: the on-disk size of each table page
 //! history stores, sampled by one replica at a time.
 //!
-//! Every replica runs the sampler; whichever wins `SIZE_LOCK_KEY` on a
-//! detached connection samples (the GC's pattern, `knot_crdt::gc`), so one
-//! replica reports the sizes and the others skip. Dashboards read the gauge
-//! with `max`.
+//! Every replica runs the sampler on its own 10-minute interval and samples
+//! under `SIZE_LOCK_KEY` on a detached connection (the GC's pattern,
+//! `knot_crdt::gc`). The lock is held only for the one size query, so it
+//! keeps two samples from running at once, not replicas from sampling: a
+//! replica skips only when another is sampling at that moment, and usually
+//! every replica samples and exports the gauge. Dashboards read it with
+//! `max`.
 
 use std::time::Duration;
 
@@ -13,7 +16,7 @@ use sqlx::PgPool;
 /// How often the sizes are sampled.
 pub const SIZE_SAMPLE_EVERY: Duration = Duration::from_secs(10 * 60);
 
-/// The session-level advisory lock one sampling replica holds ("knoths" + 1).
+/// The session-level advisory lock a replica holds while it samples ("knoths" + 1).
 pub const SIZE_LOCK_KEY: i64 = 0x6b6e_6f74_6873_0001;
 
 /// The tables page history writes (M1.2's log and M1.3's builder output),

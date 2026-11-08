@@ -37,8 +37,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   `doc_updates`, and by history entries (small). Backups grow the
   same. (#TBD)
 - A page whose history cannot be built is given up after ten failed
-  attempts, three rebuilds that did not help, two replay timeouts or
-  three crashes in a row, or when its
+  attempts, two replay timeouts or three crashes in a row, the third
+  time its stored state is found damaged (each earlier time rebuilds the
+  page; the count runs until the page is given up or a later release
+  changes the builder, and rebuilds that worked count too), or when its
   replay would read more than `history.replayMaxBytes`. The chart
   README says how to find such pages and re-enable them. (#TBD)
 - The old snapshot thinning is unchanged. (#TBD)

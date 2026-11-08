@@ -134,7 +134,7 @@ fn describe_history_metrics() {
     describe_gauge!(
         "knot_history_table_bytes",
         Unit::Bytes,
-        "On-disk size (heap, indexes and TOAST) of each table page history stores, by table; sampled every 10 minutes by the one replica holding the sampling lock, so read it with max"
+        "On-disk size (heap, indexes and TOAST) of each table page history stores, by table; sampled every 10 minutes by each replica, one at a time under an advisory lock, so read it with max"
     );
     describe_gauge!(
         "knot_history_builder_lag_revs",
