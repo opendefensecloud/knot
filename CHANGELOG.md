@@ -64,8 +64,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   `knot_history_pages_given_up_total`,
   `knot_history_words_skipped_total` and `knot_history_replay_seconds`.
   The Helm chart README says which are worth an alert. (#TBD)
-- `knot-server history-stats` also reports checkpoint and entry
-  sizes. (#TBD)
+- `knot-server history-stats` also reports checkpoint sizes and the
+  number of history entries. (#TBD)
 
 ### Changed
 - `GET /api/docs/{id}/contributors` adds `former` to each person
