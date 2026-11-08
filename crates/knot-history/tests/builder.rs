@@ -1012,6 +1012,47 @@ async fn a_pass_that_lost_its_lease_writes_nothing() {
     assert!(is_built(&second.await.unwrap()));
 }
 
+/// A pass whose own lease expired (nobody claimed the page since) records
+/// a failure when its write finds the lease gone, so the claim's crash
+/// marker does not make the next claim count a crash.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_that_outlived_its_lease_is_not_counted_as_a_crash() {
+    let db = db().await;
+    let (doc, _) = page_with_rows(&db, &[(0, "alpha beta", 0), (0, "gamma", 30)]).await;
+    let a = db.builder(limits_with(|l| l.hooks.hold_words = Duration::from_secs(2)));
+    assert_eq!(a.build_page(doc).await, genesis(0));
+    let pass = {
+        let a = a.clone();
+        tokio::spawn(async move { a.build_page(doc).await })
+    };
+    wait_for("the count's take", async || {
+        db.entries(doc)
+            .await
+            .iter()
+            .any(|e| e.sealed && !e.words_pending && e.words_added.is_none())
+    })
+    .await;
+    db.expire_lease(doc).await;
+    assert_eq!(pass.await.unwrap(), PassResult::Failed);
+    let s = db.state(doc).await;
+    assert_eq!(s.claimed_by, None, "{s:?}");
+    assert!(
+        s.last_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("lease lost")),
+        "{s:?}"
+    );
+    db.retry_now(doc).await;
+    let b = db.builder(holding(Duration::from_secs(2)));
+    let next = {
+        let b = b.clone();
+        tokio::spawn(async move { b.build_page(doc).await })
+    };
+    claimed_by(&db, doc, b.id()).await;
+    assert_eq!(db.state(doc).await.crashes, 0, "no crash counted");
+    next.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_long_pass_holds_no_lock_on_the_page() {
     let db = db().await;

@@ -471,7 +471,7 @@ pub(crate) async fn record_failure(
     action: FailureAction,
     timed_out: bool,
 ) -> Result<Recorded> {
-    let Some(mut tx) = begin_page_write(pool, doc_id, "1s").await? else {
+    let Some(mut tx) = begin_page_write(pool, doc_id, "10s").await? else {
         return Ok(Recorded::NoMatch);
     };
     let row: Option<(i64, i32)> = sqlx::query_as(

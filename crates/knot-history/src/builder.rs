@@ -612,7 +612,7 @@ impl Run<'_> {
                     tracing::info!(%doc_id, "history page rebuilt for a newer builder");
                     genesis = true;
                 }
-                Ok(w) => return self.lost(w, "the rebuild"),
+                Ok(w) => return self.lost(w, "the rebuild").await,
                 Err(e) => return self.fail(Failure::plain(format!("rebuild: {e}"))).await,
             }
         }
@@ -623,13 +623,17 @@ impl Run<'_> {
         }
     }
 
-    /// A write that found the page gone or the lease not ours.
-    fn lost(&self, w: Write, what: &str) -> PassResult {
+    /// A write that found the page gone or the lease not ours. The failure
+    /// is still recorded, which writes only while `claimed_by` is this
+    /// builder: when the lease merely expired and nobody claimed the page
+    /// since, that clears the claim's crash marker, so the next claim does
+    /// not count a crash for a pass that outlived its lease.
+    async fn lost(&mut self, w: Write, what: &str) -> PassResult {
         match w {
             Write::Gone => PassResult::Gone,
             _ => {
-                tracing::warn!(doc_id = %self.doc_id, "history build failed: lease lost ({what})");
-                PassResult::Failed
+                self.fail(Failure::plain(format!("lease lost ({what})")))
+                    .await
             }
         }
     }
@@ -697,7 +701,7 @@ impl Run<'_> {
     async fn renew(&mut self) -> Result<(), PassResult> {
         match store::renew_lease(&self.b.pool, self.doc_id, self.b.id, self.limits().lease).await {
             Ok(Write::Done) => Ok(()),
-            Ok(w) => Err(self.lost(w, "renewal")),
+            Ok(w) => Err(self.lost(w, "renewal").await),
             Err(e) => Err(self
                 .fail(Failure::plain(format!("lease renewal: {e}")))
                 .await),
@@ -914,10 +918,7 @@ impl Run<'_> {
                         genesis_rev: out.checkpoint.rev,
                     }
                 }
-                Ok(w) => match self.lost(w, "the genesis write") {
-                    PassResult::Gone => PassResult::Gone,
-                    _ => self.fail(Failure::plain("lease lost")).await,
-                },
+                Ok(w) => self.lost(w, "the genesis write").await,
                 Err(e) => {
                     self.fail(Failure::plain(format!("genesis write: {e}")))
                         .await
@@ -1081,7 +1082,7 @@ impl Run<'_> {
                 }
                 self.release(built).await
             }
-            Ok(PassWrite::LeaseLost) => self.fail(Failure::plain("lease lost")).await,
+            Ok(PassWrite::LeaseLost) => self.lost(Write::LeaseLost, "the pass write").await,
             Ok(PassWrite::Gone) => PassResult::Gone,
             Err(e) => self.fail(Failure::plain(format!("pass write: {e}"))).await,
         }
@@ -1097,10 +1098,11 @@ impl Run<'_> {
             Ok(Write::Done) => built,
             Ok(Write::Gone) => PassResult::Gone,
             Ok(Write::LeaseLost) => {
-                // The lease is someone else's: nothing to record.
+                // The pass was written; only the crash marker is left to
+                // clear, and only if nobody claimed the page since.
+                let r = self.lost(Write::LeaseLost, "the release").await;
                 self.count_failure = false;
-                tracing::warn!(doc_id = %self.doc_id, "history release failed: lease lost");
-                PassResult::Failed
+                r
             }
             Err(e) => self.fail(Failure::plain(format!("release: {e}"))).await,
         }
@@ -1123,7 +1125,7 @@ impl Run<'_> {
             };
             match store::take_words_entry(&pool, doc_id, me, entry.id).await {
                 Ok(Write::Done) => {}
-                Ok(w) => return Err(self.lost(w, "the word count")),
+                Ok(w) => return Err(self.lost(w, "the word count").await),
                 Err(e) => return Err(self.fail(Failure::plain(format!("words: {e}"))).await),
             }
             attempted += 1;
@@ -1210,7 +1212,7 @@ impl Run<'_> {
             };
             match store::write_words(&pool, doc_id, me, entry.id, counts).await {
                 Ok(Write::Done) => {}
-                Ok(w) => return Err(self.lost(w, "the word count write")),
+                Ok(w) => return Err(self.lost(w, "the word count write").await),
                 Err(e) => return Err(self.fail(Failure::plain(format!("words write: {e}"))).await),
             }
         }
