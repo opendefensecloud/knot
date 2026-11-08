@@ -138,6 +138,7 @@ pub struct State {
     pub snapshot_checked_rev: i64,
     pub skip_revs: Vec<i64>,
     pub skip_baselines: Vec<i64>,
+    pub skip_snapshots: Vec<i64>,
     pub failures: i32,
     pub timeouts: i32,
     pub crashes: i32,
@@ -498,7 +499,7 @@ impl Db {
                     coalesce(claimed_until > now(), false),
                     coalesce(retry_after = 'infinity', false),
                     coalesce(retry_after > now(), false),
-                    retry_after IS NULL, parked, updated_at
+                    retry_after IS NULL, parked, updated_at, skip_snapshots
                FROM doc_history_state WHERE doc_id = $1",
         )
         .bind(doc)
@@ -523,6 +524,7 @@ impl Db {
             retry_null: r.get(14),
             parked: r.get(15),
             updated_at: r.get(16),
+            skip_snapshots: r.get(17),
         }
     }
 

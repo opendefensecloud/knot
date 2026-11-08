@@ -272,7 +272,10 @@ pub(crate) async fn claim(pool: &PgPool, doc_id: Uuid, me: Uuid, lease: Duration
                 "SELECT coalesce((SELECT head_rev FROM doc_history_heads WHERE doc_id = $1), 0),
                         coalesce((SELECT dirty FROM doc_history_heads WHERE doc_id = $1), false),
                         EXISTS (SELECT 1 FROM doc_snapshots
-                                 WHERE doc_id = $1 AND snapshot_rev > $2),
+                                 WHERE doc_id = $1 AND snapshot_rev > $2
+                                   AND snapshot_rev <> ALL (
+                                       SELECT unnest(skip_snapshots) FROM doc_history_state
+                                        WHERE doc_id = $1)),
                         EXISTS (SELECT 1 FROM doc_history_entries
                                  WHERE doc_id = $1 AND NOT sealed
                                    AND ended_at < now() - make_interval(secs => $3))",
@@ -465,7 +468,10 @@ pub(crate) async fn record_failure(
         tx.commit().await?;
         return Ok(Recorded::GaveUp);
     }
-    let (skip_rev, checked, skip_baseline, rebuild) = match action {
+    // A snapshot whose probe failed is left out by its rev alone:
+    // `snapshot_checked_rev` stays, so the snapshots below it that the
+    // failed pass had gap-checked (its output is discarded) are probed again.
+    let (skip_rev, skip_snapshot, skip_baseline, rebuild) = match action {
         FailureAction::SkipRev(rev) => (Some(rev), None, None, false),
         FailureAction::SkipSnapshot(rev) => (None, Some(rev), None, false),
         FailureAction::SkipBaseline(id) => (None, None, Some(id), false),
@@ -478,7 +484,9 @@ pub(crate) async fn record_failure(
                 timeouts = timeouts + $3,
                 skip_revs = CASE WHEN $4::bigint IS NULL OR $4 = ANY(skip_revs) THEN skip_revs
                                  ELSE array_append(skip_revs, $4) END,
-                snapshot_checked_rev = greatest(snapshot_checked_rev, coalesce($5, 0)),
+                skip_snapshots = CASE WHEN $5::bigint IS NULL OR $5 = ANY(skip_snapshots)
+                                      THEN skip_snapshots
+                                      ELSE array_append(skip_snapshots, $5) END,
                 skip_baselines = CASE WHEN $6::bigint IS NULL OR $6 = ANY(skip_baselines)
                                       THEN skip_baselines
                                       ELSE array_append(skip_baselines, $6) END,
@@ -489,7 +497,7 @@ pub(crate) async fn record_failure(
     .bind(message)
     .bind(i32::from(count_timeout))
     .bind(skip_rev)
-    .bind(checked)
+    .bind(skip_snapshot)
     .bind(skip_baseline)
     .bind(rebuild)
     .execute(&mut *tx)
@@ -586,7 +594,8 @@ pub(crate) async fn release_on_shutdown(pool: &PgPool, me: Uuid, ids: &[Uuid]) -
 /// Starts a rebuild (Rulings): deletes the page's entries except `erase`
 /// ones and its genesis and periodic checkpoints (gap checkpoints are
 /// source data and stay), resets the state row's build columns
-/// (`skip_revs` and `skip_baselines` stay) and marks the page dirty.
+/// (`skip_revs`, `skip_baselines` and `skip_snapshots` stay) and marks the
+/// page dirty.
 pub(crate) async fn reset_for_rebuild(pool: &PgPool, doc_id: Uuid, me: Uuid) -> Result<Write> {
     let (mut tx, _, _) = match begin_leased(pool, doc_id, me).await? {
         Ok(t) => t,
@@ -997,7 +1006,10 @@ pub(crate) async fn load_pass_inputs(
            FROM (SELECT DISTINCT ON (snapshot_rev)
                         snapshot_rev, snapshot_seq, created_at,
                         octet_length(state_bytes)::bigint AS size
-                   FROM doc_snapshots WHERE doc_id = $1 AND snapshot_rev > $2
+                   FROM doc_snapshots
+                  WHERE doc_id = $1 AND snapshot_rev > $2
+                    AND snapshot_rev <> ALL (
+                        SELECT unnest(skip_snapshots) FROM doc_history_state WHERE doc_id = $1)
                   ORDER BY snapshot_rev, snapshot_seq DESC) s
           ORDER BY s.snapshot_rev LIMIT $4",
     )
@@ -1715,7 +1727,8 @@ pub(crate) async fn sweep_candidates(
         "SELECT s.doc_id FROM doc_history_state s
           WHERE s.genesis_rev IS NOT NULL AND {FILTER} AND NOT s.doc_id = ANY($2)
             AND EXISTS (SELECT 1 FROM doc_snapshots n
-                         WHERE n.doc_id = s.doc_id AND n.snapshot_rev > s.snapshot_checked_rev)
+                         WHERE n.doc_id = s.doc_id AND n.snapshot_rev > s.snapshot_checked_rev
+                           AND NOT n.snapshot_rev = ANY(s.skip_snapshots))
           ORDER BY s.updated_at LIMIT $3"
     )))
     .bind(BUILDER_VERSION)

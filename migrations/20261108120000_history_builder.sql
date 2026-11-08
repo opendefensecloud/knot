@@ -11,8 +11,10 @@
 --                            watermark (built_rev, genesis_rev,
 --                            snapshot_checked_rev, builder_version), the
 --                            claims of content still parked as of built_rev,
---                            the rows (skip_revs) and baselines
---                            (skip_baselines) every replay leaves out, the
+--                            the rows (skip_revs), baselines
+--                            (skip_baselines) and snapshot revs
+--                            (skip_snapshots, whose probe failed) every
+--                            replay or gap check leaves out, the
 --                            failure counts and backoff (retry_after =
 --                            'infinity' means given up), and the builder's
 --                            lease (claimed_by, claimed_until). Every claim
@@ -73,6 +75,7 @@ CREATE TABLE doc_history_state (
   parked               jsonb NOT NULL DEFAULT '[]',
   skip_revs            bigint[] NOT NULL DEFAULT '{}',
   skip_baselines       bigint[] NOT NULL DEFAULT '{}',
+  skip_snapshots       bigint[] NOT NULL DEFAULT '{}',
   failures             int NOT NULL DEFAULT 0,
   timeouts             int NOT NULL DEFAULT 0,
   crashes              int NOT NULL DEFAULT 0,

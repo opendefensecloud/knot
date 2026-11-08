@@ -1999,7 +1999,7 @@ async fn a_snapshot_whose_gap_merge_corrupts_is_skipped_not_a_row() {
         assert_eq!(b.build_page(doc).await, PassResult::Failed);
         let s = db.state(doc).await;
         assert!(s.skip_revs.is_empty());
-        assert!(s.snapshot_checked_rev >= 2);
+        assert_eq!((s.skip_snapshots, s.snapshot_checked_rev), (vec![2], 0));
         db.retry_now(doc).await;
         assert!(matches!(
             b.build_page(doc).await,
@@ -2027,12 +2027,65 @@ async fn a_snapshot_whose_probe_panics_is_skipped() {
     let b = db.builder(limits_with(|l| l.hooks.replay.panic_probe_at = Some(2)));
     assert_eq!(b.build_page(doc).await, PassResult::Failed);
     let s = db.state(doc).await;
-    assert!(s.skip_revs.is_empty() && s.snapshot_checked_rev >= 2);
+    assert!(s.skip_revs.is_empty());
+    assert_eq!((s.skip_snapshots, s.snapshot_checked_rev), (vec![2], 0));
     db.retry_now(doc).await;
     assert!(matches!(
         b.build_page(doc).await,
         PassResult::Built { built_rev: 3, .. }
     ));
+}
+
+/// A probe that fails at a later snapshot leaves only that snapshot out:
+/// the earlier snapshots the same pass had gap-checked are probed again by
+/// the next pass, so content only they held still enters history.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_probe_skips_only_its_own_snapshot_not_earlier_ones() {
+    let db = db().await;
+    for panic_probe in [false, true] {
+        let doc = db.page().await;
+        assert_eq!(db.builder(limits()).build_page(doc).await, genesis(0));
+        let mut h = History::new(1);
+        for t in ["one", "two", "three", "four"] {
+            let u = typed(&mut h, 0, t);
+            db.append(doc, 0, &u).await;
+        }
+        let (s2, x) = with_paragraph(9, &db.state_at(doc, 2).await, "unlogged x");
+        db.snapshot(doc, 2, &s2).await;
+        let (s4, _) = with_paragraph(8, &db.state_at(doc, 4).await, "unlogged y");
+        db.snapshot(doc, 4, &s4).await;
+        let b = db.builder(limits_with(|l| {
+            if panic_probe {
+                l.hooks.replay.panic_probe_at = Some(4);
+            } else {
+                l.hooks.replay.corrupt_merge_at = Some(4);
+            }
+        }));
+        assert_eq!(b.build_page(doc).await, PassResult::Failed);
+        let s = db.state(doc).await;
+        assert_eq!(
+            (s.skip_snapshots.clone(), s.snapshot_checked_rev),
+            (vec![4], 0),
+            "only the snapshot at 4 is left out: {s:?}"
+        );
+        db.retry_now(doc).await;
+        build_clean(&b, doc).await;
+        let entries = db.entries(doc).await;
+        let gaps = of_kind(&entries, "gap");
+        assert_eq!(gaps.len(), 1, "panic {panic_probe}: {entries:#?}");
+        assert_eq!(gaps[0].end_rev, Some(2));
+        assert_eq!(gaps[0].inserted(), common::db::insertions(&x));
+        let cps = db.checkpoints(doc).await;
+        assert!(cps.iter().any(|c| c.rev == 2 && c.kind == "gap"));
+        assert!(
+            !cps.iter().any(|c| c.rev == 4 && c.kind == "gap"),
+            "the failed snapshot stays out"
+        );
+        assert!(
+            !b.sweep_candidates().await.contains(&doc),
+            "a skipped snapshot is not a late one"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
