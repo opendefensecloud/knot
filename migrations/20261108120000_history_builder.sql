@@ -15,7 +15,9 @@
 --                            (skip_baselines) and snapshot revs
 --                            (skip_snapshots, whose probe failed) every
 --                            replay or gap check leaves out, the
---                            failure counts and backoff (retry_after =
+--                            failure counts (rebuilds: the rebuilds a
+--                            rejected starting checkpoint asked for) and
+--                            backoff (retry_after =
 --                            'infinity' means given up), and the builder's
 --                            lease (claimed_by, claimed_until). Every claim
 --                            commits a crash marker (last_error = 'pass
@@ -79,6 +81,7 @@ CREATE TABLE doc_history_state (
   failures             int NOT NULL DEFAULT 0,
   timeouts             int NOT NULL DEFAULT 0,
   crashes              int NOT NULL DEFAULT 0,
+  rebuilds             int NOT NULL DEFAULT 0,
   retry_after          timestamptz NULL,
   last_error           text NULL,
   claimed_by           uuid NULL,

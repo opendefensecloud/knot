@@ -15,7 +15,7 @@ use common::db::{
 };
 use common::underflow::skip_underflow_case;
 use common::{Client, History, author};
-use knot_history::builder::{DEBOUNCE_MAX_LAG_REVS, MAX_FAILURES};
+use knot_history::builder::{DEBOUNCE_MAX_LAG_REVS, MAX_FAILURES, MAX_REBUILDS};
 use knot_history::{BUILDER_VERSION, PassResult, history_permits};
 use knot_storage::{DocStore, GrantStore, PgGrantStore, UpdateSource};
 use uuid::Uuid;
@@ -2086,6 +2086,53 @@ async fn a_failed_probe_skips_only_its_own_snapshot_not_earlier_ones() {
             "a skipped snapshot is not a late one"
         );
     }
+}
+
+/// A genesis checkpoint that every pass rejects, again after each rebuild,
+/// ends in a give-up after `MAX_REBUILDS` rebuilds: the claim's lift of the
+/// rebuild request clears the failure counts, and each written genesis
+/// releases them, so only the rebuild count can end the loop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_genesis_rejected_after_every_rebuild_gives_the_page_up() {
+    let db = db().await;
+    let b = db.builder(limits());
+    let doc = db.page().await;
+    let mut h = History::new(1);
+    let u = typed(&mut h, 0, "one");
+    db.append(doc, 0, &u).await;
+    for cycle in 1..=MAX_REBUILDS {
+        assert_eq!(b.build_page(doc).await, genesis(0), "cycle {cycle}");
+        db.exec(
+            "UPDATE doc_history_checkpoints SET state_bytes = '\\xffffff'
+              WHERE doc_id = $1 AND kind = 'genesis'",
+            doc,
+        )
+        .await;
+        assert_eq!(b.build_page(doc).await, PassResult::Failed);
+        let s = db.state(doc).await;
+        assert_eq!((s.builder_version, s.rebuilds), (0, cycle), "{s:?}");
+        assert!(!s.given_up);
+        db.retry_now(doc).await;
+    }
+    assert_eq!(b.build_page(doc).await, PassResult::Failed);
+    let s = db.state(doc).await;
+    assert!(s.given_up, "{s:?}");
+    assert_eq!((s.builder_version, s.rebuilds), (BUILDER_VERSION, 0));
+    assert!(
+        s.last_error.as_deref().unwrap_or("").contains("rebuilds"),
+        "{s:?}"
+    );
+    assert_eq!(b.build_page(doc).await, PassResult::Deferred);
+    assert!(!b.sweep_candidates().await.contains(&doc));
+
+    // A newer builder lifts it with a fresh count.
+    db.exec(
+        "UPDATE doc_history_state SET builder_version = 0 WHERE doc_id = $1",
+        doc,
+    )
+    .await;
+    assert_eq!(b.build_page(doc).await, genesis(0));
+    assert!(is_built(&b.build_page(doc).await));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -59,6 +59,12 @@ pub const MAX_FAILURES: i32 = 10;
 pub const MAX_TIMEOUTS: i32 = 2;
 /// Passes that died with the process after which a page is given up.
 pub const MAX_CRASHES: i32 = 3;
+/// Rebuilds asked for by a rejected genesis or gap starting checkpoint
+/// after which a page is given up. Only a give-up and a newer builder
+/// version reset the count (not a written genesis or pass, nor the claim's
+/// lift of the rebuild request), so a rejection that recurs after every
+/// rebuild cannot loop forever.
+pub const MAX_REBUILDS: i32 = 3;
 /// New rows one pass replays at most.
 pub const PASS_MAX_ROWS: i64 = 5_000;
 /// New row bytes one pass loads at most.

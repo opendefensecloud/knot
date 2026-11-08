@@ -23,7 +23,7 @@ use yrs::IdSet;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 
-use crate::builder::{BUILDER_VERSION, MAX_CRASHES, MAX_FAILURES, MAX_TIMEOUTS};
+use crate::builder::{BUILDER_VERSION, MAX_CRASHES, MAX_FAILURES, MAX_REBUILDS, MAX_TIMEOUTS};
 use crate::claims::{Claims, ClaimsError};
 use crate::genesis::{BaselineInput, GenesisOutput};
 use crate::pass::{CheckpointKind, CheckpointWrite, KeptGap, PassOutput, SnapshotProbe};
@@ -169,6 +169,7 @@ type StateRead = (
     i32,
     i32,
     i32,
+    i32,
     Option<String>,
     bool,
     bool,
@@ -196,7 +197,7 @@ pub(crate) async fn claim(pool: &PgPool, doc_id: Uuid, me: Uuid, lease: Duration
     .await?;
     let row: Option<StateRead> = sqlx::query_as(
         "SELECT built_rev, genesis_rev, builder_version, snapshot_checked_rev,
-                failures, timeouts, crashes, last_error,
+                failures, timeouts, crashes, rebuilds, last_error,
                 coalesce(retry_after = 'infinity', false) AS given_up,
                 coalesce(retry_after > now(), false) AS deferred,
                 coalesce(claimed_until > now(), false) AS leased
@@ -214,6 +215,7 @@ pub(crate) async fn claim(pool: &PgPool, doc_id: Uuid, me: Uuid, lease: Duration
         mut failures,
         mut timeouts,
         mut crashes,
+        mut rebuilds,
         last_error,
         given_up,
         mut deferred,
@@ -224,12 +226,19 @@ pub(crate) async fn claim(pool: &PgPool, doc_id: Uuid, me: Uuid, lease: Duration
     };
 
     // The version lift, before every other check (Rulings): a page an older
-    // builder built or gave up starts over with clean counts.
+    // builder built or gave up starts over with clean counts. `rebuilds`
+    // only when an older builder (not a rejected starting checkpoint, which
+    // asks for its rebuild with `builder_version = 0`) set the version: no
+    // pass and no genesis clears it otherwise, so a rejection that recurs
+    // after every rebuild ends in a give-up instead of a loop.
     if builder_version < BUILDER_VERSION && (given_up || genesis_rev.is_some()) {
         failures = 0;
         timeouts = 0;
         crashes = 0;
         deferred = false;
+        if builder_version > 0 {
+            rebuilds = 0;
+        }
     }
     if builder_version > BUILDER_VERSION || deferred {
         tx.commit().await?;
@@ -255,6 +264,24 @@ pub(crate) async fn claim(pool: &PgPool, doc_id: Uuid, me: Uuid, lease: Duration
         Some((
             "crash",
             format!("given up after {crashes} passes that crashed the process"),
+        ))
+    } else if rebuilds >= MAX_REBUILDS {
+        // Given up by this builder version, so that only a newer one lifts
+        // it, and with the count cleared for that newer builder (or for an
+        // operator who re-enables the page).
+        sqlx::query(
+            "UPDATE doc_history_state SET builder_version = $2, rebuilds = 0 WHERE doc_id = $1",
+        )
+        .bind(doc_id)
+        .bind(BUILDER_VERSION)
+        .execute(&mut *tx)
+        .await?;
+        Some((
+            "failures",
+            format!(
+                "given up after {rebuilds} rebuilds that did not help (last: {})",
+                last_error.as_deref().unwrap_or("none")
+            ),
         ))
     } else {
         None
@@ -297,7 +324,7 @@ pub(crate) async fn claim(pool: &PgPool, doc_id: Uuid, me: Uuid, lease: Duration
     sqlx::query(
         "UPDATE doc_history_state
             SET claimed_by = $2, claimed_until = now() + make_interval(secs => $3),
-                failures = $4, timeouts = $5, crashes = $6,
+                failures = $4, timeouts = $5, crashes = $6, rebuilds = $9,
                 retry_after = now() + make_interval(secs => $7),
                 last_error = $8, updated_at = now()
           WHERE doc_id = $1",
@@ -310,6 +337,7 @@ pub(crate) async fn claim(pool: &PgPool, doc_id: Uuid, me: Uuid, lease: Duration
     .bind(crashes)
     .bind(backoff.num_seconds() as f64)
     .bind(PASS_INTERRUPTED)
+    .bind(rebuilds)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -490,7 +518,8 @@ pub(crate) async fn record_failure(
                 skip_baselines = CASE WHEN $6::bigint IS NULL OR $6 = ANY(skip_baselines)
                                       THEN skip_baselines
                                       ELSE array_append(skip_baselines, $6) END,
-                builder_version = CASE WHEN $7 THEN 0 ELSE builder_version END
+                builder_version = CASE WHEN $7 THEN 0 ELSE builder_version END,
+                rebuilds = rebuilds + CASE WHEN $7 THEN 1 ELSE 0 END
           WHERE doc_id = $1",
     )
     .bind(doc_id)
