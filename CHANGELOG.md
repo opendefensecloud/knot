@@ -19,12 +19,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   updates for at most 100 ms each; once it has its locks it commits at
   once. Edit saves and page loads go on. 0.9.10 pods that restart after
   the migration commits crash-loop until new pods replace them; rolling
-  back needs a database restore. (#TBD)
+  back needs a database restore. (#83)
 - After the upgrade, every page's history is built once in the
   background, pages edited longest ago first. Expect extra CPU and
   database reads for a while (about one read of `doc_updates`), and
   watch `knot_history_builder_lag_revs` fall to 0. Pages given up are
-  left out of it and counted by `knot_history_given_up_pages`. (#TBD)
+  left out of it and counted by `knot_history_given_up_pages`. (#83)
 - The builder runs one replay at a time per replica by default
   (`history.workers: 1`), paced to half a CPU core on average
   (`history.cpuShare: 0.5`). Unpaced, one worker can take a whole core,
@@ -32,30 +32,30 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   to about 160 MiB of memory at the default `history.replayMaxBytes`
   (4 MiB), so raise `resources.limits.memory` before raising
   `history.workers`; the chart README has the formula.
-  `history.workers: 0` turns the builder off on a replica. (#TBD)
+  `history.workers: 0` turns the builder off on a replica. (#83)
 - The database grows by checkpoints, about as much again as
   `doc_updates`, and by history entries (small). Backups grow the
-  same. (#TBD)
+  same. (#83)
 - A page whose history cannot be built is given up after ten failed
   attempts, two replay timeouts or three crashes in a row, the third
   time its stored state is found damaged (each earlier time rebuilds the
   page; the count runs until the page is given up or a later release
   changes the builder, and rebuilds that worked count too), or when its
   replay would read more than `history.replayMaxBytes`. The chart
-  README says how to find such pages and re-enable them. (#TBD)
-- The old snapshot thinning is unchanged. (#TBD)
+  README says how to find such pages and re-enable them. (#83)
+- The old snapshot thinning is unchanged. (#83)
 
 ### Added
 - knot now builds every page's history in the background: who edited,
   when, and how much, per editing session, back to the page's creation
   (or to the 0.9.9 upgrade for older pages). The History drawer is
-  unchanged in this release; the new timeline arrives in the next. (#TBD)
+  unchanged in this release; the new timeline arrives in the next. (#83)
 - `GET /api/docs/{id}/history/entries` lists a page's history entries
   for its editors. The web app doesn't use it yet, and its format may
-  change in the next release. (#TBD)
+  change in the next release. (#83)
 - Chart values `history.workers`, `history.replayMaxBytes` and
   `history.cpuShare` (`KNOT_HISTORY_WORKERS`,
-  `KNOT_HISTORY_REPLAY_MAX_BYTES`, `KNOT_HISTORY_CPU_SHARE`). (#TBD)
+  `KNOT_HISTORY_REPLAY_MAX_BYTES`, `KNOT_HISTORY_CPU_SHARE`). (#83)
 - Metrics `knot_history_table_bytes`, `knot_history_builder_lag_revs`,
   `knot_history_given_up_pages`, `knot_history_replay_threads_stalled`,
   `knot_history_rows_built_total`, `knot_history_rows_unapplied_total`,
@@ -65,13 +65,13 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   `knot_history_replay_timeouts_total`,
   `knot_history_pages_given_up_total`,
   `knot_history_words_skipped_total` and `knot_history_replay_seconds`.
-  The Helm chart README says which are worth an alert. (#TBD)
+  The Helm chart README says which are worth an alert. (#83)
 - `knot-server history-stats` also reports checkpoint sizes and the
-  number of history entries. (#TBD)
+  number of history entries. (#83)
 
 ### Changed
 - `GET /api/docs/{id}/contributors` adds `former` to each person
-  (always `false` for now). (#TBD)
+  (always `false` for now). (#83)
 
 ## [0.9.10] - 2026-11-08
 
