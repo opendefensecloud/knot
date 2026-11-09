@@ -8,6 +8,17 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Fixed
+- Signing in with SSO from a page link lands on that page. The OIDC
+  callback always redirected to the start page, which opens the first page
+  in the tree, so a colleague who followed a link while signed out lost it.
+  The SSO button now passes the page along, and the server only accepts a
+  path on this site, so a crafted link can't send a fresh session to
+  another host.
+- Signing in from a link to a comment or suggestion (`?thread=`,
+  `?suggestion=`) keeps that part of the link, for SSO and password
+  sign-in alike; it used to open the page without it.
+
 ## [0.9.10] - 2026-11-08
 
 ### Upgrading
