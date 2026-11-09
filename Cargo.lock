@@ -2078,6 +2078,8 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "knot-config",
+ "knot-crdt",
+ "knot-markdown",
  "knot-storage",
  "knot-test-support",
  "metrics",

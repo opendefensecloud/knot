@@ -14,6 +14,8 @@
 //! - [`words`]: the words an entry added and removed, counted in that diff.
 //! - [`canonical`]: a page's visible content as plain JSON, for comparing
 //!   two states by what a reader sees.
+//! - [`pm_json`]: a page as y-tiptap's ProseMirror JSON, what the history
+//!   viewer shows (M1.4).
 //! - [`pass`]: one builder pass as pure compute (attribution, gap check,
 //!   checkpoints), and the window replay every other reader uses.
 //! - [`genesis`]: a page's history before `history_since`, as one
@@ -37,6 +39,7 @@ pub mod isolate;
 pub mod list;
 pub mod pass;
 pub mod people;
+pub mod pm_json;
 pub mod replay;
 pub mod sessions;
 pub mod sizes;
@@ -65,6 +68,7 @@ pub use pass::{
 pub use people::{
     ANONYMIZED_SQL, AuthorView, HistoryPerson, byline_view, history_author_view, load_people,
 };
+pub use pm_json::{KNOWN_MARKS, KNOWN_NODES, RENDERER_VERSION, mark_name, placeholder, pm_json};
 pub use replay::{ReplayError, ReplayMode, Replayer, RowEffect, RowOutcome};
 pub use sessions::{
     Contribution, ContributionKind, EntryDraft, EntryKind, Grouper, SEAL_MARGIN, SESSION_GAP,

@@ -23,4 +23,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 knot-test-support = { path = "../knot-test-support" }
+# tests/pm_json.rs includes knot-markdown's test corpus, which builds its
+# documents through knot-crdt.
+knot-markdown = { path = "../knot-markdown" }
+knot-crdt = { path = "../knot-crdt" }
 tokio = { workspace = true, features = ["test-util"] }
