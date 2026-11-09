@@ -10,7 +10,7 @@
 
 - **Storage** (`knot-storage/src/short_links.rs`, migration `20261109120000_doc_short_links`).
   - Table `doc_short_links(code PK, doc_id UNIQUE → documents ON DELETE CASCADE, created_by, created_at)`, with a CHECK on the code shape.
-  - The migration takes its `documents` lock through `knot_lock_tables` with a 5 s lock timeout.
+  - The migration takes its `documents` and `users` locks through `knot_lock_tables` with a 5 s lock timeout.
   - `ShortLinkStore` has three methods: `get_or_create`, `find_for_doc` and `resolve`.
   - Codes are 7 symbols from a 56-symbol alphabet without look-alikes, always with a digit, drawn from the OS CSPRNG by rejection sampling.
 - **Server** (`knot-server/src/routes/api/short_links.rs`).
@@ -32,8 +32,8 @@
 
 ## Non-obvious
 
-- `CREATE TABLE … REFERENCES documents` takes SHARE ROW EXCLUSIVE on `documents`. That is why the migration uses the bounded lock loop from the page-history work rather than a bare `CREATE TABLE`.
-- The digit rule is what keeps codes from colliding with app routes. No fixed route name contains a digit, and a unit test checks every current route name. A future top-level route with a digit in its name would need a look here.
+- `CREATE TABLE … REFERENCES documents … REFERENCES users` takes SHARE ROW EXCLUSIVE on both tables (the final review caught that the first version locked only `documents`). That is why the migration uses the bounded lock loop from the page-history work rather than a bare `CREATE TABLE`.
+- The digit rule is what keeps codes from colliding with app routes. No fixed route name contains a digit, and a unit test checks a hand-kept list of today's route names (not read from `routes.tsx`). A future top-level route with a digit in its name would need a look here.
 - Resolving in the SPA after sign-in, not with a server 302, means a signed-out request learns nothing: no page UUID, and not whether the code exists.
 - The test fixture's second page needed its own sort key. Two root pages with the same key make `move_to` return `Conflict`.
 

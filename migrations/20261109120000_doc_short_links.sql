@@ -4,13 +4,14 @@
 -- page; opening it still checks the reader's access. Codes never change and
 -- are never reused; purging the page removes its code.
 --
--- The FK takes SHARE ROW EXCLUSIVE on documents. Take it up front in
--- bounded attempts (knot_lock_tables, 20261107120000), so a long
--- transaction on documents makes this migration give up instead of
--- queueing every page write behind it.
+-- The two FKs take SHARE ROW EXCLUSIVE on documents and users. Take both
+-- up front in bounded attempts (knot_lock_tables, 20261107120000), which
+-- never waits on one table while holding the other, so a long transaction
+-- on either makes this migration give up instead of queueing every page
+-- write behind it.
 SET LOCAL lock_timeout = '5s';
 SELECT knot_lock_tables('doc_short_links',
-                        ARRAY['documents']::regclass[],
+                        ARRAY['documents', 'users']::regclass[],
                         'SHARE ROW EXCLUSIVE');
 
 CREATE TABLE doc_short_links (

@@ -10,9 +10,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ### Upgrading
 - One migration adds the `doc_short_links` table. It needs a short lock on
-  `documents` for the foreign key and gives up after a few seconds instead
-  of holding up page writes; if it gives up, re-run the upgrade once the
-  long transaction on `documents` has finished.
+  `documents` and `users` for its foreign keys and gives up after a few
+  seconds instead of holding up page writes or sign-ins; if it gives up,
+  re-run the upgrade once the long transaction on `documents` or `users`
+  has finished.
 
 ### Added
 - Short links to pages. "Copy link" in the page header copies

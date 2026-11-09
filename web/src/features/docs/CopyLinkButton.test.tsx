@@ -51,6 +51,30 @@ describe("CopyLinkButton", () => {
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/doc/d1`));
   });
 
+  it("hands the clipboard its write inside the click, before the link arrives", async () => {
+    // WebKit refuses a clipboard write that starts after an await, so the
+    // write must be requested in the click itself, with the text to follow.
+    let release: (v: { ok: typeof LINK }) => void = () => {};
+    vi.spyOn(shortLinksApi, "getOrCreate").mockReturnValue(
+      new Promise((r) => {
+        release = r;
+      }),
+    );
+    const write = vi.fn<(items: unknown[]) => Promise<void>>().mockResolvedValue(undefined);
+    class FakeItem {
+      constructor(public items: Record<string, Promise<Blob>>) {}
+    }
+    vi.stubGlobal("ClipboardItem", FakeItem);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText, write }, configurable: true });
+    render(<CopyLinkButton docId="d1" archived={false} />);
+    fireEvent.click(screen.getByTestId("copy-link"));
+    expect(write).toHaveBeenCalledTimes(1);
+    release({ ok: LINK });
+    const item = write.mock.calls[0]![0][0] as FakeItem;
+    expect(await (await item.items["text/plain"]!).text()).toBe(LINK.url);
+    vi.unstubAllGlobals();
+  });
+
   it("falls back to showing the link when the clipboard refuses", async () => {
     vi.spyOn(shortLinksApi, "getOrCreate").mockResolvedValue({ ok: LINK });
     writeText.mockRejectedValue(new Error("denied"));

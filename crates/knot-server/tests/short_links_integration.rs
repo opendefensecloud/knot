@@ -313,6 +313,51 @@ async fn resolve_hides_restricted_page_like_unknown_code() {
     assert_eq!(restricted, malformed);
 }
 
+/// The link went out first; then the page moves under a restricted parent.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_hides_page_moved_under_a_restricted_parent() {
+    let fx = fixture().await;
+    let (_, created) = create(&fx, fx.doc, &fx.owner).await;
+    let code = created["code"].as_str().unwrap().to_string();
+    let uri = format!("/api/short-links/{code}");
+    assert_eq!(
+        call(&fx.app, "GET", &uri, Some(&fx.viewer), None).await.0,
+        StatusCode::OK
+    );
+
+    let parent = second_doc(&fx).await;
+    let (s, _) = call(
+        &fx.app,
+        "PUT",
+        &format!("/api/docs/{parent}/restricted"),
+        Some(&fx.owner),
+        Some(serde_json::json!({"restricted": true})),
+    )
+    .await;
+    assert!(s.is_success(), "restrict: {s}");
+    let (s, b) = call(
+        &fx.app,
+        "POST",
+        &format!("/api/docs/{}/move", fx.doc),
+        Some(&fx.owner),
+        Some(serde_json::json!({"parent_id": parent})),
+    )
+    .await;
+    assert!(s.is_success(), "move: {s} {}", String::from_utf8_lossy(&b));
+
+    let moved = call(&fx.app, "GET", &uri, Some(&fx.viewer), None).await;
+    let unknown = call(
+        &fx.app,
+        "GET",
+        "/api/short-links/Zz9Zz9Z",
+        Some(&fx.viewer),
+        None,
+    )
+    .await;
+    assert_eq!(moved.0, StatusCode::NOT_FOUND);
+    assert_eq!(moved, unknown);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn resolve_hides_archived_page_from_viewer() {
     let fx = fixture().await;

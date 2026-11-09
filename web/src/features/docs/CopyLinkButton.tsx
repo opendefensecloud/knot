@@ -22,22 +22,41 @@ export function CopyLinkButton({ docId, archived }: { docId: string; archived: b
     return null;
   }
 
+  /**
+   * Start the clipboard write now, inside the click: WebKit refuses a write
+   * that begins after an await (the link is fetched first), so where
+   * `ClipboardItem` exists the write gets a promise of the text instead.
+   */
+  function copy(url: Promise<string | null>): Promise<void> {
+    const clip = typeof navigator !== "undefined" ? navigator.clipboard : undefined;
+    if (clip?.write && typeof ClipboardItem !== "undefined") {
+      const blob = url.then((u) =>
+        u ? new Blob([u], { type: "text/plain" }) : Promise.reject(new Error("no link")),
+      );
+      return clip.write([new ClipboardItem({ "text/plain": blob })]);
+    }
+    return url.then((u) => (u ? navigator.clipboard.writeText(u) : Promise.reject(new Error("no link"))));
+  }
+
   async function onClick() {
     setBusy(true);
+    const url = linkToCopy();
+    const copied = copy(url);
     try {
-      const url = await linkToCopy();
-      if (!url) {
+      const link = await url;
+      if (!link) {
         notify("error", "Couldn't get a link for this page.");
         return;
       }
       try {
-        await navigator.clipboard.writeText(url);
+        await copied;
         setFallback(null);
         notify("info", "Copied!");
       } catch {
-        setFallback(url);
+        setFallback(link);
       }
     } finally {
+      copied.catch(() => {});
       setBusy(false);
     }
   }

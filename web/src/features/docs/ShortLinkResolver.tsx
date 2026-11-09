@@ -8,7 +8,7 @@ import { shortLinksApi } from "../../lib/shortLinks.api";
 export function ShortLinkResolver() {
   const { code = "" } = useParams();
   const nav = useNavigate();
-  const [missing, setMissing] = useState(false);
+  const [failure, setFailure] = useState<"missing" | "error" | null>(null);
   const valid = isShortCode(code);
 
   useEffect(() => {
@@ -17,7 +17,8 @@ export function ShortLinkResolver() {
     void shortLinksApi.resolve(code).then((r) => {
       if (!live) return;
       if ("ok" in r) void nav(`/doc/${r.ok.doc_id}`, { replace: true });
-      else setMissing(true);
+      // Only a 404 means the link is dead; anything else may pass.
+      else setFailure(r.error.status === 404 ? "missing" : "error");
     });
     return () => {
       live = false;
@@ -26,7 +27,14 @@ export function ShortLinkResolver() {
 
   // Any other top-level path keeps today's behaviour: back to the start.
   if (!valid) return <Navigate to="/" replace />;
-  if (missing) {
+  if (failure === "error") {
+    return (
+      <div className="doc-shell text-fg-muted" data-testid="short-link-error">
+        Couldn&apos;t open this link. Try again in a moment.
+      </div>
+    );
+  }
+  if (failure === "missing") {
     return (
       <div className="doc-shell text-fg-muted" data-testid="short-link-missing">
         This link doesn&apos;t exist or you don&apos;t have access to it.

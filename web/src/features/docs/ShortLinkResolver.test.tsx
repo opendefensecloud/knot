@@ -52,6 +52,15 @@ describe("ShortLinkResolver", () => {
     ).toBeTruthy();
   });
 
+  it("doesn't call a link dead when the server fails", async () => {
+    vi.spyOn(shortLinksApi, "resolve").mockResolvedValue({
+      error: { code: "internal", message: "", details: {}, status: 500 },
+    });
+    renderAt("/k3x9Fa7");
+    expect(await screen.findByText("Couldn't open this link. Try again in a moment.")).toBeTruthy();
+    expect(screen.queryByText("This link doesn't exist or you don't have access to it.")).toBeNull();
+  });
+
   it("ignores a path that is not a code", async () => {
     const resolve = vi.spyOn(shortLinksApi, "resolve");
     for (const path of ["/abcdefg", "/favicon.ico"]) {
