@@ -388,6 +388,7 @@ fn limits() -> BuildLimits {
         checkpoint_floor: CHECKPOINT_FLOOR_BYTES,
         debounce: Duration::ZERO,
         cpu_share: 1.0,
+        compute_wait: Duration::from_secs(5 * 60),
         hooks: TestHooks::default(),
     }
 }

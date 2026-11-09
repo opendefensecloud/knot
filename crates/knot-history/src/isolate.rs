@@ -24,11 +24,12 @@ pub enum IsolateError {
 /// Runs `f` on a new `knot-history-replay` thread with a [`REPLAY_STACK`]
 /// stack, inside `catch_unwind`, and waits at most `timeout` for it.
 ///
-/// The thread owns `guard` (the builder's worker permit) while it runs and
-/// hands it back with the result. On a timeout the guard stays with the
-/// thread and is dropped when the thread ends, so the guard bounds live
-/// replay threads, abandoned ones included: the second value is `None`
-/// then (and when the thread could not be started, which drops the guard).
+/// The thread owns `guard` (a compute permit, `permits::ComputeGuard`)
+/// while it runs and hands it back with the result. On a timeout the guard
+/// stays with the thread and is dropped when the thread ends, so the guard
+/// bounds live replay threads, abandoned ones included: the second value
+/// is `None` then (and when the thread could not be started, which drops
+/// the guard).
 pub async fn run_isolated<T: Send + 'static, G: Send + 'static>(
     guard: G,
     timeout: Duration,

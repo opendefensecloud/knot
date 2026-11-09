@@ -21,6 +21,8 @@
 //!   the builder's memory rule.
 //! - [`pass`]: one builder pass as pure compute (attribution, gap check,
 //!   checkpoints), and the window replay every other reader uses.
+//! - [`permits`]: the process's compute permits, shared by the builder and
+//!   the views, and the builder slots its pacing holds instead.
 //! - [`genesis`]: a page's history before `history_since`, as one
 //!   checkpoint and its pre-rollout entries.
 //! - [`builder`]: the background builder that claims dirty pages, runs
@@ -42,6 +44,7 @@ pub mod isolate;
 pub mod list;
 pub mod pass;
 pub mod people;
+pub mod permits;
 pub mod pm_json;
 pub mod replay;
 pub mod sessions;
@@ -51,8 +54,7 @@ pub mod view;
 pub mod words;
 
 pub use builder::{
-    BUILDER_VERSION, BuildLimits, Builder, PassResult, TestHooks, failure_backoff, history_permits,
-    pacing_delay,
+    BUILDER_VERSION, BuildLimits, Builder, PassResult, TestHooks, failure_backoff, pacing_delay,
 };
 pub use claims::{Claims, ClaimsError, Credit, ParkedClaim};
 pub use diff::{
@@ -72,6 +74,7 @@ pub use pass::{
 pub use people::{
     ANONYMIZED_SQL, AuthorView, HistoryPerson, byline_view, history_author_view, load_people,
 };
+pub use permits::{ComputeGuard, HistoryPermits, StallWatch, history_permits};
 pub use pm_json::{
     HISTORY_CHANGE, HISTORY_DELETE, HISTORY_INSERT, KNOWN_MARKS, KNOWN_NODES, RENDERER_VERSION,
     mark_name, placeholder, pm_json, pm_json_diff,

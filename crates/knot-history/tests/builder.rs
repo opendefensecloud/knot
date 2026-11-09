@@ -2992,3 +2992,568 @@ async fn a_page_edited_seconds_ago_waits_unless_far_behind() {
     db.append(late, 0, &v).await;
     assert!(b.sweep_candidates().await.contains(&late));
 }
+
+// ---------------------------------------------------------------------------
+// Permits (M1.4): builder slots, a compute permit per compute, the wait
+// ---------------------------------------------------------------------------
+
+/// `store::PERMIT_WAIT`.
+const PERMIT_WAIT: &str = "waited too long for a replay slot";
+
+/// A page with one row by A, so it has a heads row and needs a genesis.
+async fn page_with_a_row(db: &Db) -> Uuid {
+    let doc = db.page().await;
+    let mut h = History::new(1);
+    let u = typed(&mut h, 0, "one");
+    db.append(doc, 0, &u).await;
+    doc
+}
+
+/// Of `docs`: how many have a genesis, how many are claimed without one,
+/// and how many are claimed at all.
+async fn genesis_progress(db: &Db, docs: &[Uuid]) -> (i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE genesis_rev IS NOT NULL),
+                count(*) FILTER (WHERE claimed_by IS NOT NULL AND genesis_rev IS NULL),
+                count(*) FILTER (WHERE claimed_by IS NOT NULL)
+           FROM doc_history_state WHERE doc_id = ANY($1)",
+    )
+    .bind(docs)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
+async fn claimed_until(db: &Db, doc: Uuid) -> chrono::DateTime<Utc> {
+    sqlx::query_scalar("SELECT claimed_until FROM doc_history_state WHERE doc_id = $1")
+        .bind(doc)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+async fn entry_by_id(db: &Db, doc: Uuid, id: i64) -> Entry {
+    db.entries(doc)
+        .await
+        .into_iter()
+        .find(|e| e.id == id)
+        .expect("the entry")
+}
+
+/// `word_counts_wait_for_the_budget`'s first page after its first pass:
+/// three sealed sessions left uncounted; returns the page and the oldest of
+/// them (the next one the words phase takes).
+async fn page_with_uncounted_sessions(db: &Db) -> (Uuid, Entry) {
+    let (doc, _) = page_with_rows(
+        db,
+        &[
+            (0, "a one", 0),
+            (1, "b one", 0),
+            (0, "a two", 30),
+            (1, "b two", 30),
+        ],
+    )
+    .await;
+    let b = db.builder(limits_with(|l| l.words_budget = Duration::ZERO));
+    assert_eq!(b.build_page(doc).await, genesis(0));
+    assert!(is_built(&b.build_page(doc).await));
+    let entries = db.entries(doc).await;
+    let uncounted: Vec<_> = entries
+        .iter()
+        .filter(|e| e.sealed && e.words_pending)
+        .collect();
+    assert_eq!(uncounted.len(), 3, "{entries:#?}");
+    let oldest = (*uncounted.iter().min_by_key(|e| (e.end_rev, e.id)).unwrap()).clone();
+    (doc, oldest)
+}
+
+/// Starts `build_page(doc)` and, while its pass compute runs, queues the
+/// test's own acquire, so FIFO puts it ahead of the words phase's; returns
+/// the build and the permit, granted when the pass compute ended.
+async fn take_the_permit_from_the_words_phase(
+    permits: &knot_history::HistoryPermits,
+    b: &Arc<knot_history::Builder>,
+    doc: Uuid,
+) -> (
+    tokio::task::JoinHandle<PassResult>,
+    knot_history::ComputeGuard,
+) {
+    let build = {
+        let b = b.clone();
+        tokio::spawn(async move { b.build_page(doc).await })
+    };
+    wait_for("the pass compute", async || {
+        permits.available_compute() == 0
+    })
+    .await;
+    let mine = {
+        let p = permits.clone();
+        tokio::spawn(async move { p.compute().await })
+    };
+    wait_for("the test's acquire to queue", async || {
+        permits.waiting() == 1
+    })
+    .await;
+    let guard = mine.await.unwrap();
+    (build, guard)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_waits_for_at_most_one_builder_compute_per_worker() {
+    let db = db().await;
+    let mut docs = Vec::new();
+    for _ in 0..5 {
+        docs.push(page_with_a_row(&db).await);
+    }
+    let permits = history_permits(1);
+    let b = db.builder_with(holding(Duration::from_secs(1)), permits.clone());
+    let builds: Vec<_> = docs
+        .iter()
+        .map(|&doc| {
+            let b = b.clone();
+            tokio::spawn(async move { b.build_page(doc).await })
+        })
+        .collect();
+    wait_for("a claim", async || {
+        genesis_progress(&db, &docs).await.2 >= 1
+    })
+    .await;
+    let t0 = Instant::now();
+    let view = permits
+        .compute_within(Duration::from_secs(4))
+        .await
+        .expect("a permit within 4 s");
+    // The one claimed build's compute, running or queued, is all it waited
+    // for: FIFO behind the other four builds would take 4 s or more.
+    assert!(
+        t0.elapsed() < Duration::from_millis(2500),
+        "{:?}",
+        t0.elapsed()
+    );
+    let held = Instant::now();
+    while held.elapsed() < Duration::from_secs(1) {
+        let (built, waiting, _) = genesis_progress(&db, &docs).await;
+        assert!(
+            built <= 1,
+            "{built} builds computed while the view held the permit"
+        );
+        assert!(
+            waiting <= 1,
+            "{waiting} builds claimed at once: one builder slot"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(view);
+    for build in builds {
+        assert_eq!(build.await.unwrap(), genesis(0));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_queued_after_a_builder_waits_for_its_compute() {
+    let db = db().await;
+    let doc = page_with_a_row(&db).await;
+    let permits = history_permits(1);
+    let b = db.builder_with(holding(Duration::from_secs(1)), permits.clone());
+    let v1 = permits.compute().await;
+    let build = {
+        let b = b.clone();
+        tokio::spawn(async move { b.build_page(doc).await })
+    };
+    wait_for("the builder to queue", async || permits.waiting() == 1).await;
+    let v2 = {
+        let p = permits.clone();
+        tokio::spawn(async move {
+            let g = p.compute_within(Duration::from_secs(4)).await;
+            (g, Instant::now())
+        })
+    };
+    wait_for("the second view to queue", async || permits.waiting() == 2).await;
+    let t0 = Instant::now();
+    drop(v1);
+    let (g, granted) = v2.await.unwrap();
+    let g = g.expect("V2 is granted within 4 s");
+    let waited = granted.duration_since(t0);
+    // The builder's 1 s compute ran first (FIFO); a V2 granted ahead of it
+    // would come back within milliseconds.
+    assert!(
+        waited >= Duration::from_millis(900) && waited < Duration::from_millis(2500),
+        "{waited:?}"
+    );
+    drop(g);
+    assert_eq!(build.await.unwrap(), genesis(0));
+    let t = Instant::now();
+    while db.state(doc).await.genesis_rev.is_none() {
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "genesis_rev is written"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pacing_holds_the_builder_slot_not_the_compute_permit() {
+    let db = db().await;
+    let (p, q) = (page_with_a_row(&db).await, page_with_a_row(&db).await);
+    let permits = history_permits(1);
+    // A 1 s compute at a quarter of a core: 3 s of pacing.
+    let b = db.builder_with(
+        limits_with(|l| {
+            l.cpu_share = 0.25;
+            l.hooks.hold_compute = Duration::from_secs(1);
+        }),
+        permits.clone(),
+    );
+    let first = {
+        let b = b.clone();
+        tokio::spawn(async move { b.build_page(p).await })
+    };
+    wait_for("p's genesis", async || {
+        genesis_progress(&db, &[p]).await.0 == 1
+    })
+    .await;
+    let paced = Instant::now();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        permits.available_compute(),
+        1,
+        "pacing holds no compute permit"
+    );
+    let second = {
+        let b = b.clone();
+        tokio::spawn(async move { b.build_page(q).await })
+    };
+    while paced.elapsed() < Duration::from_millis(2500) {
+        assert_eq!(
+            genesis_progress(&db, &[q]).await.2,
+            0,
+            "q is not claimed while p's build paces"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!first.is_finished(), "p's build still paces");
+    assert_eq!(first.await.unwrap(), genesis(0));
+    assert_eq!(second.await.unwrap(), genesis(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lease_is_renewed_while_the_build_waits_for_a_permit() {
+    let db = db().await;
+    let doc = page_with_a_row(&db).await;
+    let permits = history_permits(1);
+    let b = db.builder_with(
+        limits_with(|l| {
+            l.lease = Duration::from_secs(3);
+            l.replay_timeout = Duration::from_secs(2);
+            l.words_timeout = Duration::from_secs(2);
+            l.hooks.hold_compute = Duration::from_millis(1500);
+        }),
+        permits.clone(),
+    );
+    let held = permits.compute().await;
+    let t0 = Instant::now();
+    let build = {
+        let b = b.clone();
+        tokio::spawn(async move { b.build_page(doc).await })
+    };
+    claimed_by(&db, doc, b.id()).await;
+    let at_claim = claimed_until(&db, doc).await;
+    tokio::time::sleep(Duration::from_millis(2500).saturating_sub(t0.elapsed())).await;
+    let later = claimed_until(&db, doc).await;
+    assert!(
+        later > at_claim + chrono::Duration::milliseconds(500),
+        "renewed while waiting: {at_claim} → {later}"
+    );
+    // Longer than the lease.
+    tokio::time::sleep(Duration::from_secs(4).saturating_sub(t0.elapsed())).await;
+    drop(held);
+    assert_eq!(build.await.unwrap(), genesis(0), "not a lost lease");
+    let s = db.state(doc).await;
+    assert_eq!((s.failures, s.last_error), (0, None));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_that_waits_too_long_for_a_permit_gives_the_page_back() {
+    let rec = common::metrics::CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&rec);
+    let db = db().await;
+    let doc = page_with_a_row(&db).await;
+    let permits = history_permits(1);
+    let b = db.builder_with(
+        limits_with(|l| l.compute_wait = Duration::from_secs(1)),
+        permits.clone(),
+    );
+    let held = permits.compute().await;
+    let failures = rec.counter("knot_history_build_failures_total", &[]);
+    let t0 = Instant::now();
+    assert_eq!(b.build_page(doc).await, PassResult::Busy);
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    let s = db.state(doc).await;
+    assert_eq!(
+        (s.claimed_by, s.failures, s.last_error.as_deref()),
+        (None, 0, Some(PERMIT_WAIT))
+    );
+    assert!(s.retry_null && !s.leased, "{s:?}");
+    assert!(db.head(doc).await.1, "the page stays dirty");
+    assert_eq!(
+        rec.counter("knot_history_build_failures_total", &[]),
+        failures
+    );
+    tokio::time::sleep(Duration::from_secs(3).saturating_sub(t0.elapsed())).await;
+    drop(held);
+    assert_eq!(b.build_page(doc).await, genesis(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_permit_wait_in_the_words_phase_keeps_the_count_pending() {
+    let db = db().await;
+    let (doc, oldest) = page_with_uncounted_sessions(&db).await;
+    let permits = history_permits(1);
+    let b = db.builder_with(
+        limits_with(|l| {
+            l.compute_wait = Duration::from_secs(1);
+            l.hooks.hold_compute = Duration::from_millis(500);
+        }),
+        permits.clone(),
+    );
+    let (build, guard) = take_the_permit_from_the_words_phase(&permits, &b, doc).await;
+    assert_eq!(build.await.unwrap(), PassResult::Busy);
+    let e = entry_by_id(&db, doc, oldest.id).await;
+    assert!(
+        e.updated_at > oldest.updated_at,
+        "the words phase took it, so the expired wait was its own"
+    );
+    assert!(e.words_pending && e.words_added.is_none(), "{e:?}");
+    let s = db.state(doc).await;
+    assert_eq!(
+        (s.claimed_by, s.failures, s.last_error.as_deref()),
+        (None, 0, Some(PERMIT_WAIT))
+    );
+    drop(guard);
+    assert!(is_built(&b.build_page(doc).await));
+    assert!(entry_by_id(&db, doc, oldest.id).await.words_added.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shutdown_during_a_words_permit_wait_keeps_the_count_pending() {
+    let db = db().await;
+    let (doc, oldest) = page_with_uncounted_sessions(&db).await;
+    let permits = history_permits(1);
+    let b = db.builder_with(
+        limits_with(|l| l.hooks.hold_compute = Duration::from_millis(500)),
+        permits.clone(),
+    );
+    let (build, guard) = take_the_permit_from_the_words_phase(&permits, &b, doc).await;
+    wait_for("the words phase to queue", async || permits.waiting() == 1).await;
+    assert!(entry_by_id(&db, doc, oldest.id).await.updated_at > oldest.updated_at);
+    // As the shutdown aborts its passes.
+    build.abort();
+    let _ = build.await;
+    b.release_on_shutdown(&[doc]).await;
+    let e = entry_by_id(&db, doc, oldest.id).await;
+    assert!(e.words_pending && e.words_added.is_none(), "{e:?}");
+    let s = db.state(doc).await;
+    assert_eq!(
+        (s.claimed_by, s.failures, s.last_error.as_deref()),
+        (None, 0, Some("shutdown"))
+    );
+    drop(guard);
+    assert!(is_built(&b.build_page(doc).await));
+    assert!(entry_by_id(&db, doc, oldest.id).await.words_added.is_some());
+}
+
+#[tokio::test]
+async fn waiting_leaves_the_count_when_its_acquire_is_dropped() {
+    let permits = history_permits(1);
+    let held = permits.compute().await;
+    assert_eq!(permits.waiting(), 0, "a granted acquire is not waiting");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), permits.compute())
+            .await
+            .is_err()
+    );
+    assert_eq!(permits.waiting(), 0, "a timed-out acquire");
+    assert!(
+        permits
+            .compute_within(Duration::from_millis(100))
+            .await
+            .is_none()
+    );
+    assert_eq!(permits.waiting(), 0, "compute_within's None");
+    let waiter = {
+        let p = permits.clone();
+        tokio::spawn(async move { p.compute().await })
+    };
+    let t = Instant::now();
+    while permits.waiting() != 1 {
+        assert!(t.elapsed() < Duration::from_secs(2), "the waiter queues");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    waiter.abort();
+    let _ = waiter.await;
+    assert_eq!(permits.waiting(), 0, "an aborted acquire");
+    drop(held);
+    assert_eq!(permits.available_compute(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pacing_leaves_out_the_permit_wait() {
+    let db = db().await;
+    let doc = db.page().await;
+    let permits = history_permits(1);
+    // Paced at 0.5: as long as the compute itself.
+    let b = db.builder_with(
+        limits_with(|l| {
+            l.cpu_share = 0.5;
+            l.hooks.hold_compute = Duration::from_millis(500);
+        }),
+        permits.clone(),
+    );
+    let held = permits.compute().await;
+    let t0 = Instant::now();
+    let build = {
+        let b = b.clone();
+        tokio::spawn(async move { b.build_page(doc).await })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(held);
+    assert_eq!(build.await.unwrap(), genesis(0));
+    // Wait 1 s + compute 0.5 s + pacing 0.5 s; a clock started before the
+    // wait would pace 1.5 s and return after 3 s or more.
+    let took = t0.elapsed();
+    assert!(
+        took >= Duration::from_millis(1900) && took < Duration::from_millis(2600),
+        "{took:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timed_out_compute_keeps_its_permit_until_its_thread_ends() {
+    use knot_history::{IsolateError, run_isolated};
+
+    // Through the builder: the hung replay keeps the permit.
+    let db = db().await;
+    let doc = db.page().await;
+    let permits = history_permits(1);
+    let b = db.builder_with(
+        limits_with(|l| {
+            l.replay_timeout = Duration::from_millis(500);
+            l.hooks.hold_compute = Duration::from_secs(2);
+        }),
+        permits.clone(),
+    );
+    let t0 = Instant::now();
+    assert_eq!(b.build_page(doc).await, PassResult::Failed);
+    assert_eq!((permits.available_compute(), permits.stalled()), (0, 1));
+    wait_for("the hung thread to end", async || {
+        permits.available_compute() == 1
+    })
+    .await;
+    assert!(
+        t0.elapsed() >= Duration::from_millis(1900),
+        "{:?}",
+        t0.elapsed()
+    );
+    assert_eq!(permits.stalled(), 0);
+
+    // The watch of a guard that rides a timed-out thread.
+    let permits = history_permits(1);
+    let guard = permits.compute().await;
+    let watch = guard.stall_watch();
+    let t0 = tokio::time::Instant::now();
+    let (r, back) = run_isolated(guard, Duration::from_millis(300), || {
+        std::thread::sleep(Duration::from_millis(1500))
+    })
+    .await;
+    assert!(matches!(r, Err(IsolateError::TimedOut)) && back.is_none());
+    watch.timed_out();
+    watch.timed_out();
+    assert_eq!((permits.available_compute(), permits.stalled()), (0, 1));
+    assert!(watch.running());
+    let ended = watch.ended();
+    tokio::pin!(ended);
+    assert!(
+        tokio::time::timeout_at(t0 + Duration::from_millis(1400), &mut ended)
+            .await
+            .is_err(),
+        "ended() is pending while the thread sleeps"
+    );
+    assert!(watch.running());
+    tokio::time::timeout_at(t0 + Duration::from_millis(1700), &mut ended)
+        .await
+        .expect("ended() resolves once the thread ends");
+    assert!(!watch.running());
+    assert_eq!((permits.available_compute(), permits.stalled()), (1, 0));
+
+    // A watch whose guard already dropped.
+    let guard = permits.compute().await;
+    let watch = guard.stall_watch();
+    drop(guard);
+    assert!(!watch.running());
+    tokio::time::timeout(Duration::from_millis(10), watch.ended())
+        .await
+        .expect("resolves at once");
+    assert_eq!(permits.stalled(), 0, "a guard that never timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_words_wait_on_an_idle_sealed_page_marks_it_dirty() {
+    let db = db().await;
+    let normal = db.builder(limits());
+    let mut docs = Vec::new();
+    for _ in 0..2 {
+        let doc = page_with_a_row(&db).await;
+        build_clean(&normal, doc).await;
+        db.exec(
+            "UPDATE doc_history_entries SET ended_at = ended_at - interval '22 minutes'
+              WHERE doc_id = $1",
+            doc,
+        )
+        .await;
+        assert!(!db.head(doc).await.1, "release_in left it clean");
+        docs.push(doc);
+    }
+    let session = async |doc: Uuid| -> Entry {
+        let entries = db.entries(doc).await;
+        let s = sessions(&entries);
+        assert_eq!(s.len(), 1, "{entries:#?}");
+        s[0].clone()
+    };
+    for (i, &doc) in docs.iter().enumerate() {
+        let shutdown = i == 1;
+        let id = session(doc).await.id;
+        let permits = history_permits(1);
+        let b = db.builder_with(
+            limits_with(|l| {
+                if !shutdown {
+                    l.compute_wait = Duration::from_secs(1);
+                }
+                l.hooks.hold_compute = Duration::from_millis(500);
+            }),
+            permits.clone(),
+        );
+        let (build, guard) = take_the_permit_from_the_words_phase(&permits, &b, doc).await;
+        if shutdown {
+            wait_for("the words phase to queue", async || permits.waiting() == 1).await;
+            build.abort();
+            let _ = build.await;
+            b.release_on_shutdown(&[doc]).await;
+        } else {
+            assert_eq!(build.await.unwrap(), PassResult::Busy);
+        }
+        let e = entry_by_id(&db, doc, id).await;
+        assert!(
+            e.sealed && e.words_pending && e.words_added.is_none(),
+            "shutdown {shutdown}: {e:?}"
+        );
+        assert!(db.head(doc).await.1, "shutdown {shutdown}: dirty");
+        drop(guard);
+        // Not the sweep: the session is no longer open.
+        assert!(is_built(&b.build_page(doc).await), "shutdown {shutdown}");
+        assert!(
+            entry_by_id(&db, doc, id).await.words_added.is_some(),
+            "shutdown {shutdown}"
+        );
+    }
+}

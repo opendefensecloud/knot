@@ -294,7 +294,8 @@ async fn run_server(cfg: Config) {
             tracing::warn!("history builder disabled");
         } else {
             // M1.4: share with AppState for the view endpoint
-            let history_permits = knot_history::history_permits(cfg.history_workers as usize);
+            let history_permits: knot_history::HistoryPermits =
+                knot_history::history_permits(cfg.history_workers as usize);
             knot_history::spawn_size_sampler(pool.clone());
             let handle = std::sync::Arc::new(knot_history::Builder::new(
                 pool,

@@ -38,6 +38,9 @@ pub(crate) const PASS_INTERRUPTED: &str = "pass interrupted";
 /// What a graceful shutdown writes instead (not a crash).
 pub(crate) const SHUTDOWN: &str = "shutdown";
 
+/// What a pass that waited out `BuildLimits::compute_wait` writes.
+pub(crate) const PERMIT_WAIT: &str = "waited too long for a replay slot";
+
 const PAGE_KEY_SHARE: &str = "SELECT 1 FROM documents WHERE id = $1 FOR KEY SHARE";
 
 /// The state row, under `FOR UPDATE`, while `$2` holds a live lease.
@@ -597,11 +600,23 @@ pub(crate) async fn release(pool: &PgPool, doc_id: Uuid, me: Uuid) -> Result<Wri
     Ok(Write::Done)
 }
 
-/// A graceful shutdown's release of the pages this builder had in flight:
-/// not a crash, so the claim's `failures` is taken back.
-pub(crate) async fn release_on_shutdown(pool: &PgPool, me: Uuid, ids: &[Uuid]) -> Result<u64> {
+/// A pass that ended before its work: the pages of `ids` this builder
+/// still holds are released with `last_error = reason` and the claim's
+/// failure taken back (a graceful shutdown or an expired permit wait is not
+/// a failed pass), and the word counts of `repend_words` that the passes
+/// took but never attempted are pending again, with their pages dirty (a
+/// sweep-claimed idle page is clean otherwise, Rulings). Lock order:
+/// documents, state, entries, heads; only the returned pages, the ones this
+/// builder held, are touched.
+pub(crate) async fn release_unfinished(
+    pool: &PgPool,
+    me: Uuid,
+    ids: &[Uuid],
+    reason: &str,
+    repend_words: &[i64],
+) -> Result<Vec<Uuid>> {
     if ids.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let mut tx = begin(pool).await?;
     sqlx::query("SET LOCAL lock_timeout = '10s'")
@@ -611,19 +626,39 @@ pub(crate) async fn release_on_shutdown(pool: &PgPool, me: Uuid, ids: &[Uuid]) -
         .bind(ids)
         .execute(&mut *tx)
         .await?;
-    let done = sqlx::query(
+    let released: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE doc_history_state
             SET claimed_by = NULL, claimed_until = NULL, failures = greatest(failures - 1, 0),
                 retry_after = NULL, last_error = $3, updated_at = now()
-          WHERE doc_id = ANY($1) AND claimed_by = $2",
+          WHERE doc_id = ANY($1) AND claimed_by = $2
+         RETURNING doc_id",
     )
     .bind(ids)
     .bind(me)
-    .bind(SHUTDOWN)
-    .execute(&mut *tx)
+    .bind(reason)
+    .fetch_all(&mut *tx)
     .await?;
+    if !repend_words.is_empty() && !released.is_empty() {
+        let mut repended: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE doc_history_entries SET words_pending = true, updated_at = now()
+              WHERE id = ANY($1) AND doc_id = ANY($2)
+             RETURNING doc_id",
+        )
+        .bind(repend_words)
+        .bind(&released)
+        .fetch_all(&mut *tx)
+        .await?;
+        repended.sort_unstable();
+        repended.dedup();
+        if !repended.is_empty() {
+            sqlx::query("UPDATE doc_history_heads SET dirty = true WHERE doc_id = ANY($1)")
+                .bind(&repended)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
     tx.commit().await?;
-    Ok(done.rows_affected())
+    Ok(released)
 }
 
 /// Starts a rebuild (Rulings): deletes the page's entries except `erase`
