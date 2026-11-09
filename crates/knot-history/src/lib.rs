@@ -16,6 +16,9 @@
 //!   two states by what a reader sees.
 //! - [`mod@pm_json`]: a page as y-tiptap's ProseMirror JSON, what the history
 //!   viewer shows (M1.4), and an entry's "Show changes" render on its diff.
+//! - [`view`]: a past version rendered for the viewer (M1.4), plain or
+//!   with the entry's own changes, and the input caps that keep it within
+//!   the builder's memory rule.
 //! - [`pass`]: one builder pass as pure compute (attribution, gap check,
 //!   checkpoints), and the window replay every other reader uses.
 //! - [`genesis`]: a page's history before `history_since`, as one
@@ -44,6 +47,7 @@ pub mod replay;
 pub mod sessions;
 pub mod sizes;
 mod store;
+pub mod view;
 pub mod words;
 
 pub use builder::{
