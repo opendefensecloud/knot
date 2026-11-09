@@ -6,6 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { RequireAuth } from "./auth/RequireAuth";
 import { AppShell } from "./components/AppShell";
 import { docsApi } from "./features/docs/docs.api";
+import { ShortLinkResolver } from "./features/docs/ShortLinkResolver";
 
 const LoginPage = lazy(() => import("./features/auth/LoginPage"));
 const SetupPage = lazy(() => import("./features/auth/SetupPage"));
@@ -74,6 +75,8 @@ export const router = createBrowserRouter([
           { path: "notifications", element: <Lazy><NotificationsPage /></Lazy> },
           { path: "archive", element: <Lazy><ArchivePage /></Lazy> },
           { path: "about", element: <Lazy><AboutPage /></Lazy> },
+          // After every fixed route: `/<code>` short links (see ShortLinkResolver).
+          { path: ":code", element: <ShortLinkResolver /> },
         ],
       },
     ],

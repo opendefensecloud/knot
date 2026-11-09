@@ -24,6 +24,7 @@ import { CommentSidebar } from "../comments/CommentSidebar";
 import { MarkdownView } from "../editor/MarkdownView";
 import type { KnotEditorHandle } from "../editor/readingCaret";
 import { ExportMenu } from "../export/ExportMenu";
+import { CopyLinkButton } from "./CopyLinkButton";
 import { archiveErrorText, purgeConfirmText, purgeErrorText } from "./archive";
 import { ArchivedBanner } from "./ArchivedBanner";
 import { Breadcrumb } from "./Breadcrumb";
@@ -521,6 +522,7 @@ export default function DocPage() {
               is the user-facing affordance now. */}
           <span className="sr-only"><StatusDot status={status} /></span>
           {meta.within_restricted && <RestrictedChip linksToPermissions={isDocOwner} />}
+          <CopyLinkButton docId={id} archived={archived} />
           {isDocOwner && (
             <Link
               to="permissions"
