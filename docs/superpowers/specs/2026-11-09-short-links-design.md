@@ -62,7 +62,7 @@ the start page. The branch builds on #84's branch and merges after it.
   one digit**, so it can never equal an app route word. *(The digit rule and
   the following details are the designer's call, not the requester's.)*
   Proposed: 7 characters from an alphabet without look-alikes
-  (`23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ`, 57 symbols),
+  (`23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ`, 56 symbols),
   random, re-drawn when it has no digit or collides.
 - **One code per page, never changes, never reused.** Created the first time
   someone clicks "Copy link" for that page, not for all pages up front.
