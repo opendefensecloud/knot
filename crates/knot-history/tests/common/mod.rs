@@ -7,6 +7,7 @@ pub mod underflow;
 #[path = "../../../knot-crdt/tests/common/fixtures.rs"]
 pub mod fixtures;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +20,7 @@ use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{
     Any, Doc, ID, IdSet, ReadTxn, StateVector, Subscription, Text, Transact, TransactionMut,
-    Update, XmlElementPrelim, XmlFragment, XmlFragmentRef, XmlTextPrelim,
+    Update, Xml, XmlElementPrelim, XmlFragment, XmlFragmentRef, XmlOut, XmlTextPrelim,
 };
 
 /// The page every generated row belongs to.
@@ -357,6 +358,44 @@ impl History {
         h.type_para(1, "b two", at(20));
         h.type_para(0, "a three", at(30));
         h.type_para(0, "a four", at(40));
+        h
+    }
+
+    /// B (09:00) writes a code block (attribute `language` = `rust`)
+    /// holding "let x = 1;\n" and a paragraph "see "; A (09:05), on B's
+    /// page, appends "let y = 2;" to the code block's text and an inline
+    /// code "y" to the paragraph, its mark stored as y-tiptap stores a mark
+    /// without attributes (`{}`).
+    pub fn code_case() -> History {
+        let mut h = History::new(1);
+        let b = h.clients[1].txn(|txn, frag| {
+            let code = frag.push_back(txn, XmlElementPrelim::empty("code_block"));
+            code.insert_attribute(txn, "language", Any::String("rust".into()));
+            code.push_back(txn, XmlTextPrelim::new("let x = 1;\n"));
+            let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(txn, XmlTextPrelim::new("see "));
+        });
+        h.edit_at(1, b, at(0));
+        h.pull(0);
+        let a = h.clients[0].txn(|txn, frag| {
+            let text = |txn: &TransactionMut, i: u32| match frag.get(txn, i) {
+                Some(XmlOut::Element(e)) => match e.get(txn, 0) {
+                    Some(XmlOut::Text(t)) => t,
+                    other => panic!("block {i} holds no text: {other:?}"),
+                },
+                other => panic!("no block at {i}: {other:?}"),
+            };
+            let code = text(txn, 0);
+            let len = code.len(txn);
+            code.insert(txn, len, "let y = 2;");
+            let para = text(txn, 1);
+            let len = para.len(txn);
+            let mark: Attrs = [("code".into(), Any::Map(Arc::new(HashMap::new())))]
+                .into_iter()
+                .collect();
+            para.insert_with_attributes(txn, len, "y", mark);
+        });
+        h.edit_at(0, a, at(5));
         h
     }
 }

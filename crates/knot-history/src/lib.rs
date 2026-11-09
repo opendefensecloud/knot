@@ -14,8 +14,8 @@
 //! - [`words`]: the words an entry added and removed, counted in that diff.
 //! - [`canonical`]: a page's visible content as plain JSON, for comparing
 //!   two states by what a reader sees.
-//! - [`pm_json`]: a page as y-tiptap's ProseMirror JSON, what the history
-//!   viewer shows (M1.4).
+//! - [`mod@pm_json`]: a page as y-tiptap's ProseMirror JSON, what the history
+//!   viewer shows (M1.4), and an entry's "Show changes" render on its diff.
 //! - [`pass`]: one builder pass as pure compute (attribution, gap check,
 //!   checkpoints), and the window replay every other reader uses.
 //! - [`genesis`]: a page's history before `history_since`, as one
@@ -52,7 +52,7 @@ pub use builder::{
 };
 pub use claims::{Claims, ClaimsError, Credit, ParkedClaim};
 pub use diff::{
-    ChunkKind, DiffError, EntryDiff, TextChunk, entry_diff, strip_zero_clocks, text_chunks,
+    ChunkKind, DiffError, EntryDiff, TextChunk, entry_diff, lo_doc, strip_zero_clocks, text_chunks,
 };
 pub use genesis::{BaselineInput, GenesisError, GenesisInput, GenesisOutput, build_genesis};
 pub use isolate::{IsolateError, run_isolated};
@@ -68,7 +68,10 @@ pub use pass::{
 pub use people::{
     ANONYMIZED_SQL, AuthorView, HistoryPerson, byline_view, history_author_view, load_people,
 };
-pub use pm_json::{KNOWN_MARKS, KNOWN_NODES, RENDERER_VERSION, mark_name, placeholder, pm_json};
+pub use pm_json::{
+    HISTORY_CHANGE, HISTORY_DELETE, HISTORY_INSERT, KNOWN_MARKS, KNOWN_NODES, RENDERER_VERSION,
+    mark_name, placeholder, pm_json, pm_json_diff,
+};
 pub use replay::{ReplayError, ReplayMode, Replayer, RowEffect, RowOutcome};
 pub use sessions::{
     Contribution, ContributionKind, EntryDraft, EntryKind, Grouper, SEAL_MARGIN, SESSION_GAP,

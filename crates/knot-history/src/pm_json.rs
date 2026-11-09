@@ -33,11 +33,24 @@
 //! load), and integral numbers are emitted as integers (`Any::Number` is an
 //! `f64`; y-prosemirror stores JavaScript numbers, which JSON prints without
 //! a fraction).
+//!
+//! [`pm_json_diff`] is the "Show changes" render: the same rule over the
+//! union doc of an entry's diff ([`crate::diff`]), the entry's own text
+//! changes as the marks [`HISTORY_INSERT`] / [`HISTORY_DELETE`] and its
+//! element changes as the node attribute [`HISTORY_CHANGE`].
+
+use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
-use yrs::types::text::YChange;
+use yrs::types::text::{ChangeKind, YChange};
 use yrs::types::{Attrs, ToJson};
-use yrs::{Any, Doc, Out, ReadTxn, Text, Transact, Xml, XmlElementRef, XmlFragment, XmlOut};
+use yrs::{
+    Any, BranchID, Doc, ID, Out, ReadTxn, Text, Transact, Xml, XmlElementRef, XmlFragment, XmlOut,
+    XmlTextRef,
+};
+
+use crate::diff::{DiffError, EntryDiff, diff_text, lo_doc};
+use crate::pass::Progress;
 
 /// The version of the rendering rule. A cache of rendered versions keys on
 /// it, so a change to the rule is a bump here.
@@ -139,8 +152,7 @@ fn push_node<T: ReadTxn>(txn: &T, node: XmlOut, parent: &str, out: &mut Vec<Valu
 
 fn element_json<T: ReadTxn>(txn: &T, el: &XmlElementRef, parent: &str) -> Value {
     let tag = el.tag();
-    // `doc` and `text` are schema kinds, but never an element's.
-    if !KNOWN_NODES.contains(&tag.as_ref()) || matches!(tag.as_ref(), "doc" | "text") {
+    if !renders_as_itself(tag) {
         return placeholder(tag, parent);
     }
     let mut node = Map::new();
@@ -157,6 +169,13 @@ fn element_json<T: ReadTxn>(txn: &T, el: &XmlElementRef, parent: &str) -> Value 
         node.insert("content".into(), Value::Array(content));
     }
     Value::Object(node)
+}
+
+/// Whether an element tagged `tag` renders as a node of that type, not as
+/// a [`placeholder`]: `tag` is a node kind of `tools/schema.json`, and not
+/// `doc` or `text`, which are schema kinds but never an element's.
+fn renders_as_itself(tag: &str) -> bool {
+    KNOWN_NODES.contains(&tag) && !matches!(tag, "doc" | "text")
 }
 
 /// `el`'s attributes as JSON; `None` when it has none.
@@ -203,6 +222,257 @@ pub(crate) fn push_text(out: &mut Vec<Value>, text: &str, marks: Vec<Value>) {
         node.insert("marks".into(), Value::Array(marks));
     }
     out.push(Value::Object(node));
+}
+
+/// The mark on text the entry inserted and that is still there at its end.
+pub const HISTORY_INSERT: &str = "historyInsert";
+
+/// The mark on text that was there before the entry and that it deleted.
+pub const HISTORY_DELETE: &str = "historyDelete";
+
+/// The node attribute saying how the entry changed an element: `"added"`,
+/// `"removed"` or `"changed"` (absent when it did not).
+pub const HISTORY_CHANGE: &str = "historyChange";
+
+/// The page at the end of `d`'s entry as ProseMirror JSON with the entry's
+/// own changes marked: [`pm_json`]'s rule applied to `d`'s union doc, which
+/// shows what the page shows with or without the entry's changes.
+///
+/// `h` is the skip-GC replay `d` was built on ([`crate::diff::entry_diff`]).
+/// - Text: each text is diffed between the page at the entry's end and the
+///   page without its changes (`diff::diff_text`); an added chunk gets the mark
+///   [`HISTORY_INSERT`], a removed one [`HISTORY_DELETE`], both without
+///   `attrs` and sorted with the other marks by `type`. Formatting renders
+///   as of the entry's end; formatting the entry changed is not marked.
+/// - Elements: [`HISTORY_CHANGE`] is `"added"` when the element's item is
+///   one of the entry's insertions still alive (`d.added`), `"removed"`
+///   when it is a pre-existing item the entry deleted (`d.removed`), and
+///   `"changed"` when it is alive at the entry's end and its attributes
+///   differ from those it has in [`lo_doc`]. Attributes come from `h` for
+///   an element alive there and from the union doc for a removed one.
+///   Elements the entry inserted and deleted again, or that another author
+///   deleted, are deleted in the union doc and not rendered.
+/// - Unknown tags and marks follow [`pm_json`]: a placeholder paragraph
+///   carries its element's `historyChange`, inline placeholder text the
+///   mark of an added or removed element (`changed` has no inline form).
+///
+/// Checks `progress` before diffing each text and returns
+/// [`DiffError::Cancelled`] once it is cancelled.
+pub fn pm_json_diff(h: &Doc, d: &EntryDiff, progress: &Progress) -> Result<Value, DiffError> {
+    // The whole tree is read first, and the union doc's read transaction
+    // dropped: every `diff_text` takes the union doc's write lock, which a
+    // read transaction held on this thread would block for good.
+    let root = {
+        let union = d.union.transact();
+        let h = h.transact();
+        match union.get_xml_fragment("default") {
+            Some(root) => collect_union(&union, &h, d, root.children(&union)),
+            None => Vec::new(),
+        }
+    };
+    let lo = lo_doc(h, d)?;
+    let lo = lo.transact();
+    let mut content = Vec::new();
+    for node in root {
+        push_diff_node(d, &lo, progress, node, "doc", &mut content)?;
+    }
+    Ok(json!({"type": "doc", "content": content}))
+}
+
+/// How an entry changed an element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Added,
+    Removed,
+    Changed,
+}
+
+impl Change {
+    /// The value of [`HISTORY_CHANGE`].
+    fn attr(self) -> &'static str {
+        match self {
+            Change::Added => "added",
+            Change::Removed => "removed",
+            Change::Changed => "changed",
+        }
+    }
+
+    /// The mark an inline placeholder of the element carries.
+    fn mark(self) -> Option<&'static str> {
+        match self {
+            Change::Added => Some(HISTORY_INSERT),
+            Change::Removed => Some(HISTORY_DELETE),
+            Change::Changed => None,
+        }
+    }
+}
+
+/// A node of the union doc's tree, as read before any text is diffed.
+enum UnionNode {
+    Element(UnionElement),
+    Text(XmlTextRef),
+    /// A nested fragment: a Y child that renders as nothing, as in
+    /// [`pm_json`].
+    Fragment,
+}
+
+struct UnionElement {
+    tag: Arc<str>,
+    /// From `h` when the element is alive there, else from the union doc.
+    attrs: Option<Map<String, Value>>,
+    /// `Added` or `Removed` from the entry's sets; `Changed` is decided at
+    /// render time against `D_lo`.
+    change: Option<Change>,
+    /// The element's id when it is alive in `h` and neither added nor
+    /// removed, so its attributes are compared with `D_lo`'s.
+    compare: Option<ID>,
+    /// Empty for an element that renders as a placeholder.
+    children: Vec<UnionNode>,
+}
+
+fn collect_union<U: ReadTxn, H: ReadTxn>(
+    union: &U,
+    h: &H,
+    d: &EntryDiff,
+    nodes: impl Iterator<Item = XmlOut>,
+) -> Vec<UnionNode> {
+    nodes
+        .map(|node| {
+            let id = match node.id() {
+                BranchID::Nested(id) => Some(id),
+                BranchID::Root(_) => None,
+            };
+            match node {
+                XmlOut::Text(text) => UnionNode::Text(text),
+                XmlOut::Fragment(_) => UnionNode::Fragment,
+                XmlOut::Element(el) => {
+                    let change = id.and_then(|id| {
+                        if d.added.contains(&id) {
+                            Some(Change::Added)
+                        } else if d.removed.contains(&id) {
+                            Some(Change::Removed)
+                        } else {
+                            None
+                        }
+                    });
+                    let in_h = id.and_then(|id| alive_element(h, &id));
+                    let attrs = match &in_h {
+                        Some(el) => attrs_json(h, el),
+                        None => attrs_json(union, &el),
+                    };
+                    let tag = el.tag().clone();
+                    let children = if renders_as_itself(&tag) {
+                        collect_union(union, h, d, el.children(union))
+                    } else {
+                        Vec::new()
+                    };
+                    UnionNode::Element(UnionElement {
+                        tag,
+                        attrs,
+                        change,
+                        compare: id.filter(|_| change.is_none() && in_h.is_some()),
+                        children,
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
+/// The element with item id `id` in `txn`'s doc, when it is there and not
+/// deleted. The lookup alone also finds deleted elements: a skip-GC doc
+/// keeps their content.
+fn alive_element<T: ReadTxn>(txn: &T, id: &ID) -> Option<XmlElementRef> {
+    BranchID::Nested(*id)
+        .get_branch(txn)
+        .filter(|branch| !branch.is_deleted())
+        .map(XmlElementRef::from)
+}
+
+/// [`push_node`] for a node of the union doc: appends its nodes, a child
+/// of a node of type `parent`, to `out`, texts diffed and marked.
+fn push_diff_node<T: ReadTxn>(
+    d: &EntryDiff,
+    lo: &T,
+    progress: &Progress,
+    node: UnionNode,
+    parent: &str,
+    out: &mut Vec<Value>,
+) -> Result<(), DiffError> {
+    match node {
+        UnionNode::Element(el) => out.push(diff_element_json(d, lo, progress, el, parent)?),
+        UnionNode::Text(text) => {
+            if progress.is_cancelled() {
+                return Err(DiffError::Cancelled);
+            }
+            for chunk in diff_text(d, &text) {
+                // An embed is not text; the editor never writes one.
+                if let Out::Any(Any::String(s)) = &chunk.insert {
+                    let mut marks = marks_json(chunk.attributes.as_deref());
+                    match chunk.ychange.map(|c| c.kind) {
+                        Some(ChangeKind::Added) => insert_mark(&mut marks, HISTORY_INSERT),
+                        Some(ChangeKind::Removed) => insert_mark(&mut marks, HISTORY_DELETE),
+                        None => {}
+                    }
+                    push_text(out, s, marks);
+                }
+            }
+        }
+        UnionNode::Fragment => {}
+    }
+    Ok(())
+}
+
+/// [`element_json`] for an element of the union doc, with its
+/// [`HISTORY_CHANGE`].
+fn diff_element_json<T: ReadTxn>(
+    d: &EntryDiff,
+    lo: &T,
+    progress: &Progress,
+    el: UnionElement,
+    parent: &str,
+) -> Result<Value, DiffError> {
+    let change = el.change.or_else(|| {
+        let before = alive_element(lo, &el.compare?)?;
+        (attrs_json(lo, &before) != el.attrs).then_some(Change::Changed)
+    });
+    if !renders_as_itself(&el.tag) {
+        let mut node = placeholder(&el.tag, parent);
+        match change {
+            Some(change) if node["type"] == "text" => {
+                if let Some(mark) = change.mark() {
+                    node["marks"] = json!([{"type": mark}]);
+                }
+            }
+            Some(change) => node["attrs"] = json!({HISTORY_CHANGE: change.attr()}),
+            None => {}
+        }
+        return Ok(node);
+    }
+    let mut node = Map::new();
+    node.insert("type".into(), Value::String(el.tag.to_string()));
+    let mut attrs = el.attrs.unwrap_or_default();
+    if let Some(change) = change {
+        attrs.insert(HISTORY_CHANGE.into(), Value::String(change.attr().into()));
+    }
+    if !attrs.is_empty() {
+        node.insert("attrs".into(), Value::Object(attrs));
+    }
+    if !el.children.is_empty() {
+        let mut content = Vec::new();
+        for child in el.children {
+            push_diff_node(d, lo, progress, child, &el.tag, &mut content)?;
+        }
+        node.insert("content".into(), Value::Array(content));
+    }
+    Ok(Value::Object(node))
+}
+
+/// Inserts the mark `name` (without `attrs`) into `marks`, which are sorted
+/// by `type`, keeping them sorted.
+fn insert_mark(marks: &mut Vec<Value>, name: &str) {
+    let at = marks.partition_point(|m| m["type"].as_str().is_some_and(|t| t < name));
+    marks.insert(at, json!({"type": name}));
 }
 
 /// `any` as JSON, an integral finite number within JavaScript's safe
