@@ -8,6 +8,23 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Upgrading
+- One migration adds the `doc_short_links` table. It needs a short lock on
+  `documents` and `users` for its foreign keys and gives up after a few
+  seconds instead of holding up page writes or sign-ins; if it gives up,
+  re-run the upgrade once the long transaction on `documents` or `users`
+  has finished.
+
+### Added
+- Short links to pages. "Copy link" in the page header copies
+  `https://<host>/<code>`, a 7-character code that stays the same when the
+  page is renamed, moved or archived. Every reader of the page can copy it.
+  The link names the page and grants nothing: opening it needs a session
+  and read access, after sign-in (SSO included) if needed, and a link to a
+  page the reader can't see looks the same as an unknown one. On an
+  archived page the button copies the page's existing short link, or its
+  long link if it never had one.
+
 ### Fixed
 - Signing in with SSO from a page link lands on that page. The OIDC
   callback always redirected to the start page, which opens the first page

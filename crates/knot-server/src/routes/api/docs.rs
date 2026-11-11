@@ -112,6 +112,11 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/api/docs/{id}/contributors",
             get(crate::routes::api::contributors::byline),
         )
+        .route(
+            "/api/docs/{id}/short-link",
+            get(crate::routes::api::short_links::get_inline)
+                .post(crate::routes::api::short_links::get_or_create_inline),
+        )
         .route("/api/docs/{id}/template", post(set_template_inline))
         .route("/api/docs/{id}/restricted", put(set_restricted_inline))
         .route(

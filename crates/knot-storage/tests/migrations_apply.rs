@@ -74,6 +74,7 @@ async fn migrations_apply_cleanly() {
         "doc_history_state",
         "doc_markdown_cache",
         "doc_markdown_sweep_attempts",
+        "doc_short_links",
         "doc_snapshots",
         "doc_tasks",
         "doc_updates",
