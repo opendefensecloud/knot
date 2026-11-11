@@ -14,6 +14,11 @@ export default function LoginPage() {
   const qc = useQueryClient();
 
   const from = ((loc.state as { from?: string } | null)?.from) ?? "/";
+  // The SSO round-trip leaves the SPA, so the target travels to the server,
+  // which checks it and redirects there after the callback.
+  const ssoHref = from === "/"
+    ? "/auth/oidc/login"
+    : `/auth/oidc/login?return_to=${encodeURIComponent(from)}`;
 
   const cfgQuery = useQuery({ queryKey: ["auth-config"], queryFn: () => authApi.config() });
   const config = cfgQuery.data && "ok" in cfgQuery.data ? cfgQuery.data.ok : undefined;
@@ -47,7 +52,7 @@ export default function LoginPage() {
           <div className="mb-4">
             <a
               data-testid="login-sso"
-              href="/auth/oidc/login"
+              href={ssoHref}
               className="flex items-center justify-center h-9 w-full rounded bg-accent text-accent-fg text-sm font-medium hover:opacity-90 transition-opacity"
             >
               Continue with SSO
