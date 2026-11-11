@@ -270,6 +270,11 @@ async fn append_into_non_empty_doc_keeps_both() {
     let md = export(&f.app, &sid, &csrf, f.doc_id).await;
     assert!(md.contains("First"), "append lost the original: {md:?}");
     assert!(md.contains("Second"), "append lost the import: {md:?}");
+    // The row says how it was imported (page history lists "imported").
+    assert_eq!(
+        newest_import_meta(&f.pool, f.doc_id).await,
+        Some(serde_json::json!({"mode": "append"}))
+    );
 }
 
 /// What the UI uses: the imported file becomes the page, not an addition
@@ -355,6 +360,22 @@ async fn replace_records_the_importing_user() {
         authors.contains(&Some(f.owner_id)),
         "expected an update attributed to the importer, got {authors:?}"
     );
+    // The row says how it was imported (page history lists "replaced").
+    assert_eq!(
+        newest_import_meta(&f.pool, f.doc_id).await,
+        Some(serde_json::json!({"mode": "replace"}))
+    );
+}
+
+/// `meta` of the page's newest `import` row.
+async fn newest_import_meta(pool: &PgPool, doc_id: Uuid) -> Option<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT meta FROM doc_updates WHERE doc_id = $1 AND source = 'import' ORDER BY rev DESC LIMIT 1",
+    )
+    .bind(doc_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -418,6 +418,54 @@ pub async fn append_in_tx(
         .collect())
 }
 
+/// The page's numbered rows with `after_rev < rev <= through_rev` (no upper
+/// bound when `None`), in rev order: at most `max_rows` of them, and only as
+/// many as keep the summed `octet_length(update_bytes)` at or below
+/// `max_bytes`, stopping before the row that would cross it. The first row
+/// comes back even when it alone is over `max_bytes`, so a caller that
+/// admitted it (the history builder's size check) always makes progress.
+/// Legacy rows not numbered yet (rev NULL) are never returned.
+///
+/// The limits are applied in SQL to the rows' sizes before any bytes are
+/// read: the first `max_rows` revs come in order from the `(doc_id, rev)`
+/// index, so rows past them are never scanned, and only the rows kept are
+/// fetched, one index probe each. Runs on the caller's connection, so it
+/// reads inside the caller's (repeatable-read) transaction.
+pub async fn rows_in_range(
+    conn: &mut PgConnection,
+    doc_id: Uuid,
+    after_rev: i64,
+    through_rev: Option<i64>,
+    max_rows: i64,
+    max_bytes: i64,
+) -> Result<Vec<DocUpdate>, UpdatesStoreError> {
+    // `sized` names its columns apart from doc_updates', so UPDATE_COLS
+    // resolve to the joined row.
+    let rows: Vec<UpdateRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPDATE_COLS}
+           FROM (SELECT page.rev AS kept_rev,
+                        row_number() OVER w AS kept_n,
+                        sum(page.len) OVER w AS kept_bytes
+                   FROM (SELECT rev, octet_length(update_bytes) AS len
+                           FROM doc_updates
+                          WHERE doc_id = $1 AND rev > $2 AND rev <= $3
+                          ORDER BY rev
+                          LIMIT $4) page
+                 WINDOW w AS (ORDER BY page.rev ROWS UNBOUNDED PRECEDING)) sized
+           JOIN doc_updates ON doc_id = $1 AND rev = sized.kept_rev
+          WHERE sized.kept_n = 1 OR sized.kept_bytes <= $5
+          ORDER BY rev"
+    )))
+    .bind(doc_id)
+    .bind(after_rev)
+    .bind(through_rev.unwrap_or(i64::MAX))
+    .bind(max_rows.max(0))
+    .bind(max_bytes)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.into_iter().map(doc_update).collect()
+}
+
 /// While armed, cancels the append's statement in Postgres when the append
 /// future is dropped (the writer's `attempt_timeout` abandoned it).
 /// Dropping the future sends no CancelRequest: the statement keeps running,
