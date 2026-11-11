@@ -498,7 +498,12 @@ async fn markdown_import_is_labelled_import() {
     let fx = fixture().await;
     import_markdown(&fx, &fx.bob.session, fx.doc_id, "# Appended\n", "").await;
     let appended = newest_row(&fx.pool, fx.doc_id).await;
-    assert_labelled(&appended, UpdateSource::Import, fx.bob.id, None);
+    assert_labelled(
+        &appended,
+        UpdateSource::Import,
+        fx.bob.id,
+        Some(json!({"mode": "append"})),
+    );
 
     import_markdown(
         &fx,
@@ -510,7 +515,12 @@ async fn markdown_import_is_labelled_import() {
     .await;
     let replaced = newest_row(&fx.pool, fx.doc_id).await;
     assert!(replaced.rev > appended.rev, "{replaced:?}");
-    assert_labelled(&replaced, UpdateSource::Import, fx.alice.id, None);
+    assert_labelled(
+        &replaced,
+        UpdateSource::Import,
+        fx.alice.id,
+        Some(json!({"mode": "replace"})),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

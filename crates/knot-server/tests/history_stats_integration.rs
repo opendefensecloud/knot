@@ -63,6 +63,25 @@ async fn history_stats_reports_rows_bytes_and_daily_rates() {
     .execute(pool)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO doc_history_checkpoints (doc_id, rev, kind, state_bytes, state_vector)
+         VALUES ($1, 0, 'genesis', decode(repeat('ab', 100), 'hex'), decode(repeat('cd', 7), 'hex'))",
+    )
+    .bind(a)
+    .execute(pool)
+    .await
+    .unwrap();
+    for rev in [3_i64, 6] {
+        sqlx::query(
+            "INSERT INTO doc_history_entries (doc_id, kind, started_at, ended_at, start_rev, end_rev, sealed)
+             VALUES ($1, 'session', now(), now(), $2, $2, true)",
+        )
+        .bind(a)
+        .bind(rev)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 
     let s = knot_server::history_stats::collect(pool, 30).await.unwrap();
     // Rows: 4 + 2 + 1 + 1 old = 8. Bytes: 40 + 20 + 40 + 20 = 120.
@@ -76,6 +95,9 @@ async fn history_stats_reports_rows_bytes_and_daily_rates() {
     assert_eq!(s.baseline_rows, 1);
     assert_eq!(s.baseline_bytes_total, 107);
     assert!(s.doc_updates_relation_bytes > 0);
+    assert_eq!(s.checkpoint_rows, 1);
+    assert_eq!(s.checkpoint_bytes_total, 107);
+    assert_eq!(s.entry_rows, 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -91,9 +113,12 @@ async fn history_stats_on_empty_db_reports_zeros() {
             s.pages_with_updates,
             s.rows_per_page_day_max,
             s.baseline_rows,
-            s.baseline_bytes_total
+            s.baseline_bytes_total,
+            s.checkpoint_rows,
+            s.checkpoint_bytes_total,
+            s.entry_rows
         ),
-        (0, 0, 0, 0, 0, 0)
+        (0, 0, 0, 0, 0, 0, 0, 0, 0)
     );
     assert_eq!(
         (
@@ -102,5 +127,23 @@ async fn history_stats_on_empty_db_reports_zeros() {
             s.rows_per_page_day_p95
         ),
         (0.0, 0.0, 0.0)
+    );
+}
+
+/// A database before 0.9.11 has no checkpoints or entries tables: the
+/// command still runs and reports them as 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_stats_before_the_builder_tables_reports_zeros() {
+    let db = knot_test_support::fresh_db().await;
+    sqlx::query("DROP TABLE doc_history_entries, doc_history_checkpoints")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let s = knot_server::history_stats::collect(&db.pool, 30)
+        .await
+        .unwrap();
+    assert_eq!(
+        (s.checkpoint_rows, s.checkpoint_bytes_total, s.entry_rows),
+        (0, 0, 0)
     );
 }

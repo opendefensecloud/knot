@@ -133,6 +133,24 @@ blob:
 archive:
   retentionDays: 30
 
+# Page history is built in the background on every replica. workers bounds
+# concurrent replays per replica; cpuShare is the share of one CPU core each
+# worker may use on average (it sleeps after each page in proportion to its
+# compute time): unpaced, one worker can use a whole core, the default
+# resources.limits.cpu, which it shares with the web server; raise either
+# only with CPU headroom; workers: 0 turns the builder off on that replica
+# (an incident switch; history then waits). replayMaxBytes caps the input of
+# every replay, builds and word counts alike (the page's state plus the edits
+# and snapshots it reads); a replay holds up to about 40 times its input in
+# memory (measured), so peak builder memory is about workers × 40 ×
+# replayMaxBytes (160 MiB at the defaults),
+# which must fit resources.limits.memory next to the web server. A page whose
+# input exceeds the cap gets no further history until the cap is raised.
+history:
+  workers: 1
+  replayMaxBytes: 4194304
+  cpuShare: 0.5
+
 resources:
   requests:
     cpu: 100m

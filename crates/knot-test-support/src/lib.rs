@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 pub mod crafted;
 pub mod locks;
+pub mod migrate;
 pub mod old_sql;
 
 /// Connection string for the dev-compose Postgres. Override with the
