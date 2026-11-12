@@ -65,6 +65,7 @@ pub struct AppState {
     pub markdown_cache: Option<Arc<dyn MarkdownCacheStore>>,
     pub search: Option<Arc<dyn SearchStore>>,
     pub shares: Option<Arc<dyn ShareTokenStore>>,
+    pub short_links: Option<Arc<dyn knot_storage::ShortLinkStore>>,
     pub comments: Option<Arc<dyn CommentStore>>,
     /// Change suggestions and their reply threads.
     pub suggestions: Option<Arc<dyn SuggestionStore>>,
@@ -119,6 +120,7 @@ impl AppState {
             markdown_cache: None,
             search: None,
             shares: None,
+            short_links: None,
             comments: None,
             suggestions: None,
             blob_store: None,
@@ -172,6 +174,8 @@ impl AppState {
             Arc::new(PgMarkdownCache::new(pool.clone()));
         let search: Arc<dyn SearchStore> = Arc::new(PgSearchStore::new(pool.clone()));
         let shares: Arc<dyn ShareTokenStore> = Arc::new(PgShareTokenStore::new(pool.clone()));
+        let short_links: Arc<dyn knot_storage::ShortLinkStore> =
+            Arc::new(knot_storage::PgShortLinkStore::new(pool.clone()));
         let comments: Arc<dyn CommentStore> = Arc::new(PgCommentStore::new(pool.clone()));
         let suggestions: Arc<dyn SuggestionStore> = Arc::new(PgSuggestionStore::new(pool.clone()));
         let blob_store: Arc<dyn BlobStore> = Arc::new(PgBytesStore::new(pool.clone()));
@@ -198,6 +202,7 @@ impl AppState {
             markdown_cache: Some(markdown_cache),
             search: Some(search),
             shares: Some(shares),
+            short_links: Some(short_links),
             comments: Some(comments),
             suggestions: Some(suggestions),
             blob_store: Some(blob_store),

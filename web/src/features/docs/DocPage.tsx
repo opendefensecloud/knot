@@ -24,13 +24,19 @@ import { CommentSidebar } from "../comments/CommentSidebar";
 import { MarkdownView } from "../editor/MarkdownView";
 import type { KnotEditorHandle } from "../editor/readingCaret";
 import { ExportMenu } from "../export/ExportMenu";
+import { CopyLinkButton } from "./CopyLinkButton";
 import { archiveErrorText, purgeConfirmText, purgeErrorText } from "./archive";
 import { ArchivedBanner } from "./ArchivedBanner";
 import { Breadcrumb } from "./Breadcrumb";
 import { DocByline } from "./DocByline";
 import { DocDockBar, DocDockControls } from "./DocDock";
 import { docsApi } from "./docs.api";
-import { editModeKey, isEditModeShortcut } from "./editMode";
+import {
+  editModeAriaKeyshortcuts,
+  editModeKey,
+  editModeShortcutLabel,
+  isEditModeShortcut,
+} from "./editMode";
 import { HistoryDrawer } from "./HistoryDrawer";
 import { DocWidthToggle } from "./DocWidthToggle";
 import { ImportMarkdownButton } from "./ImportMarkdownButton";
@@ -120,8 +126,9 @@ export default function DocPage() {
     if (!editModeKeyOrNull) return;
     window.sessionStorage.setItem(editModeKeyOrNull, editMode ? "1" : "0");
   }, [editMode, editModeKeyOrNull]);
-  // ⌘⇧F / Ctrl+Shift+F toggles the layout width. Collision-free: the ⌘E
-  // handler above bails on e.shiftKey, and no browser binds ⌘⇧F.
+  // ⌘⇧F / Ctrl+Shift+F toggles the layout width. Collision-free: the edit
+  // toggle's handler below (⌘E / Ctrl+E) bails on e.shiftKey, and no browser
+  // binds ⌘⇧F.
   const toggleDocWidth = useUi((s) => s.toggleDocWidth);
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -268,16 +275,23 @@ export default function DocPage() {
     const active = document.activeElement as HTMLElement | null;
     const inProse = !!active?.closest(".ProseMirror");
     const inToolbar = !!active?.closest("[data-testid='editor-toolbar']");
-    const onToggle = !!active?.closest("[data-doc-controls]") || active === actionEditToggleRef.current;
     const unfocused = active === document.body || active === null;
-    // Focus may follow the toggle only from where the reader was working: the
-    // text, the toolbar or a toggle. A title input, the comment composer, the
-    // comment rail or the history drawer keeps its focus.
-    const mayMoveFocus = inProse || inToolbar || onToggle || unfocused;
+    // Focus follows the toggle into the text unless it is somewhere the
+    // reader is busy: typing outside the text (the title input, the comment
+    // composer, a search field) or inside a dialog or menu (the comment rail,
+    // the history drawer, a popover). A deny-list rather than an allow-list:
+    // most pages are opened from a link in the tree, the breadcrumb or a
+    // backlink, which keeps focus, and from there the shortcut must still
+    // put the caret in the text (#86).
+    const typingElsewhere =
+      !inProse && !!active?.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])");
+    const inOverlay = !!active?.closest("[role='dialog'], [role='menu'], [role='listbox'], [aria-modal='true']");
+    const mayMoveFocus = !typingElsewhere && !inOverlay;
     const entering = !editModeRef.current;
     pendingToggleRef.current = {
       entering,
-      // Only mid-document: at the top, toggling behaves as it always has.
+      // Only mid-document: at the top the header's toolbar slides in visibly
+      // and there is no reading position to hold.
       anchor: condensedRef.current && section && scroller && prose
         ? captureReadingAnchor(scroller, prose, section)
         : null,
@@ -304,13 +318,26 @@ export default function DocPage() {
       ? holdReadingPosition(scroller, pending.anchor, { durationMs: 0, scope: section })
       : undefined;
     let revealFrame = 0;
-    if (pending.entering && pending.anchor && pending.mayMoveFocus) {
+    if (pending.entering && pending.mayMoveFocus) {
+      // Entering edit mode puts the caret in the text, at the top of the page
+      // as mid-document (#86). Without it, focus stayed on <body> or the
+      // Edit button: the editor showed no caret, typing went nowhere, and
+      // End/Home scrolled <main> instead of moving within a line. The caret
+      // keeps a click made before the toggle, or lands on the first visible
+      // line; the editor is focused without scrolling. On touch this opens
+      // the on-screen keyboard, as the dock's Edit already does mid-document:
+      // the user asked to edit.
       editorHandleRef.current?.placeCaretAtReadingLine();
-      // After the toolbar's own re-render for the new caret (a table adds a
-      // row of buttons), make sure the caret's line is not under it.
-      revealFrame = window.requestAnimationFrame(() => {
-        editorHandleRef.current?.revealCaretBelowBand();
-      });
+      // Only mid-document is there a sticky band over the text to clear:
+      // after the toolbar's own re-render for the new caret (a table adds a
+      // row of buttons), make sure the caret's line is not under it. Gated
+      // on the page being condensed, not on the anchor: when no reading
+      // anchor could be captured the band is there all the same.
+      if (pending.anchor || condensedRef.current) {
+        revealFrame = window.requestAnimationFrame(() => {
+          editorHandleRef.current?.revealCaretBelowBand();
+        });
+      }
     }
     if (!pending.entering && pending.refocusToggle) {
       // Mid-document, only the dock's toggle is on screen; without one (the
@@ -341,10 +368,12 @@ export default function DocPage() {
     return anchor ? holdReadingPosition(scroller, anchor, { durationMs: 250 }) : undefined;
   }, [commentSidebarOpen]);
 
-  // ⌘E / Ctrl+E toggles edit mode for editor+ on a live doc. Viewers stay
-  // read-only. On an archived doc the chord is still claimed, as it always
-  // was, so it never falls through to the browser's own Ctrl+E (search) —
-  // it just does nothing; held-down repeats and IME composition likewise.
+  // Mod+E toggles edit mode for editor+ on a live doc: ⌘E on a Mac, Ctrl+E
+  // elsewhere (see isEditModeShortcut — a Mac's Ctrl+E is end-of-line and is
+  // left to the editor). Viewers stay read-only. On an archived doc the
+  // chord is still claimed, as it always was, so it never falls through to
+  // the browser's own binding (Ctrl+E focuses the search bar) — it just does
+  // nothing; held-down repeats and IME composition likewise.
   const claimsEditShortcut = effRole === "owner" || effRole === "editor";
   const canToggleEdit = !archived && claimsEditShortcut;
   useEffect(() => {
@@ -521,6 +550,7 @@ export default function DocPage() {
               is the user-facing affordance now. */}
           <span className="sr-only"><StatusDot status={status} /></span>
           {meta.within_restricted && <RestrictedChip linksToPermissions={isDocOwner} />}
+          <CopyLinkButton docId={id} archived={archived} />
           {isDocOwner && (
             <Link
               to="permissions"
@@ -538,9 +568,9 @@ export default function DocPage() {
             <IconButton
               ref={actionEditToggleRef}
               data-testid="toggle-edit-mode"
-              label={editMode ? "Stop editing (⌘E)" : "Edit (⌘E)"}
+              label={editMode ? `Stop editing (${editModeShortcutLabel()})` : `Edit (${editModeShortcutLabel()})`}
               active={editMode}
-              aria-keyshortcuts="Control+E Meta+E"
+              aria-keyshortcuts={editModeAriaKeyshortcuts()}
               onClick={toggleEditMode}
             >
               {editMode ? <Eye size={16} aria-hidden /> : <Pencil size={16} aria-hidden />}

@@ -28,10 +28,14 @@ import { BulletList, ListItem, OrderedList } from "@tiptap/extension-list";
  * (`toggleList("bullet_list", "list_item")`), which is why the keyboard
  * shortcuts could be broken this long without anyone noticing.
  *
- * ListItem also declares `bulletListTypeName` / `orderedListTypeName` options,
- * but nothing in the v2 extension reads them — its Enter/Tab/Shift-Tab keymaps
- * all pass `this.name`, which the rename already corrected. They are left
- * unconfigured rather than set to a plausible-looking value that does nothing.
+ * ListItem's own options have the same problem. Its Enter/Tab/Shift-Tab
+ * keymaps pass `this.name`, which the rename corrected, but since v3 it also
+ * registers a Delete keymap for branching sublists (Delete at the end of an
+ * item followed by a sublist whose items have sublists of their own: upstream
+ * moves that sublist's items up beside the item, where `joinForward` could
+ * not restructure them). That keymap only recognises the list types named by
+ * `bulletListTypeName` / `orderedListTypeName`, which default to camelCase,
+ * so against this schema it never matched and Delete there did nothing.
  */
 export const KnotBulletList = BulletList.extend({
   name: "bullet_list",
@@ -49,7 +53,7 @@ export const KnotListItem = ListItem.extend({
   name: "list_item",
   // Content stays the same expression because it uses node groups + names
   // that aren't list-internal ("paragraph block*").
-});
+}).configure({ bulletListTypeName: "bullet_list", orderedListTypeName: "ordered_list" });
 
 export const KnotHardBreak = HardBreak.extend({
   name: "hard_break",

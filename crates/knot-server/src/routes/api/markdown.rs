@@ -533,7 +533,9 @@ pub(super) async fn import_inline(
                 update_bytes,
                 by_user: Some(ctx.user_id),
                 source: knot_storage::UpdateSource::Import,
-                meta: None,
+                // Both modes are `import` rows; the mode tells page history
+                // "replaced the content" from "imported content".
+                meta: Some(serde_json::json!({"mode": "replace"})),
                 reply: tx,
             })
             .await
@@ -553,7 +555,7 @@ pub(super) async fn import_inline(
                 update_bytes,
                 by_user: Some(ctx.user_id),
                 source: knot_storage::UpdateSource::Import,
-                meta: None,
+                meta: Some(serde_json::json!({"mode": "append"})),
                 reply: tx,
             })
             .await

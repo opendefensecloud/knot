@@ -16,6 +16,12 @@ pub struct HistoryStats {
     pub baseline_rows: i64,
     pub baseline_bytes_total: i64,
     pub doc_updates_relation_bytes: i64,
+    /// `doc_history_checkpoints` rows; 0 on a database before 0.9.11.
+    pub checkpoint_rows: i64,
+    /// Their `state_bytes` plus `state_vector` bytes; 0 before 0.9.11.
+    pub checkpoint_bytes_total: i64,
+    /// `doc_history_entries` rows; 0 before 0.9.11.
+    pub entry_rows: i64,
 }
 
 /// Collects the growth numbers. The per-page-per-day rates cover the last
@@ -62,6 +68,26 @@ pub async fn collect(pool: &PgPool, days: i32) -> Result<HistoryStats, sqlx::Err
             .fetch_one(pool)
             .await?;
 
+    // The builder's tables arrive with 0.9.11; this command may run against
+    // an older database.
+    let has_builder_tables: bool =
+        sqlx::query_scalar("SELECT to_regclass('doc_history_checkpoints') IS NOT NULL")
+            .fetch_one(pool)
+            .await?;
+    let (checkpoint_rows, checkpoint_bytes_total, entry_rows): (i64, i64, i64) =
+        if has_builder_tables {
+            sqlx::query_as(
+                "SELECT (SELECT count(*) FROM doc_history_checkpoints),
+                        (SELECT COALESCE(sum(octet_length(state_bytes) + octet_length(state_vector)), 0)::int8
+                           FROM doc_history_checkpoints),
+                        (SELECT count(*) FROM doc_history_entries)",
+            )
+            .fetch_one(pool)
+            .await?
+        } else {
+            (0, 0, 0)
+        };
+
     Ok(HistoryStats {
         update_rows,
         update_bytes_total,
@@ -73,6 +99,9 @@ pub async fn collect(pool: &PgPool, days: i32) -> Result<HistoryStats, sqlx::Err
         baseline_rows,
         baseline_bytes_total,
         doc_updates_relation_bytes,
+        checkpoint_rows,
+        checkpoint_bytes_total,
+        entry_rows,
     })
 }
 
@@ -138,6 +167,13 @@ pub async fn run(cfg: knot_config::Config, days: i32) -> anyhow::Result<()> {
         s.doc_updates_relation_bytes,
         human(s.doc_updates_relation_bytes as f64)
     );
+    println!("checkpoint_rows: {}", s.checkpoint_rows);
+    println!(
+        "checkpoint_bytes_total: {} ({})",
+        s.checkpoint_bytes_total,
+        human(s.checkpoint_bytes_total as f64)
+    );
+    println!("entry_rows: {}", s.entry_rows);
     Ok(())
 }
 

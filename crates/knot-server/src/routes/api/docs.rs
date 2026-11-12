@@ -94,6 +94,10 @@ pub fn router(state: AppState) -> Router<AppState> {
             get(crate::routes::api::history::list),
         )
         .route(
+            "/api/docs/{id}/history/entries",
+            get(crate::routes::api::history::entries),
+        )
+        .route(
             "/api/docs/{id}/history/{seq}/markdown",
             get(crate::routes::api::history::preview_markdown),
         )
@@ -107,6 +111,11 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/docs/{id}/contributors",
             get(crate::routes::api::contributors::byline),
+        )
+        .route(
+            "/api/docs/{id}/short-link",
+            get(crate::routes::api::short_links::get_inline)
+                .post(crate::routes::api::short_links::get_or_create_inline),
         )
         .route("/api/docs/{id}/template", post(set_template_inline))
         .route("/api/docs/{id}/restricted", put(set_restricted_inline))

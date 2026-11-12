@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use knot_test_support::migrate::{bare_db, migrate_all, migrate_up_to};
 use knot_test_support::old_sql::{OLD_INSERT_UPDATES_SQL, OLD_SNAPSHOT_UPSERT_SQL};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -68,9 +69,13 @@ async fn migrations_apply_cleanly() {
         "comments",
         "doc_contributors",
         "doc_history_baselines",
+        "doc_history_checkpoints",
+        "doc_history_entries",
         "doc_history_heads",
+        "doc_history_state",
         "doc_markdown_cache",
         "doc_markdown_sweep_attempts",
+        "doc_short_links",
         "doc_snapshots",
         "doc_tasks",
         "doc_updates",
@@ -1813,50 +1818,6 @@ fn kh002(e: &sqlx::Error) -> bool {
     sqlstate(e).as_deref() == Some("KH002")
 }
 
-/// The embedded migrations up to and including `last`.
-fn migrator_up_to(last: i64) -> sqlx::migrate::Migrator {
-    let full = sqlx::migrate!("../../migrations");
-    assert!(
-        full.migrations.iter().any(|m| m.version == last),
-        "migration {last} not embedded (cargo clean -p knot-storage?)"
-    );
-    sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(
-            full.migrations
-                .iter()
-                .filter(|m| m.version <= last)
-                .cloned()
-                .collect(),
-        ),
-        ..sqlx::migrate::Migrator::DEFAULT
-    }
-}
-
-async fn migrate_up_to(pool: &PgPool, last: i64) {
-    migrator_up_to(last)
-        .run(pool)
-        .await
-        .unwrap_or_else(|e| panic!("migrate up to {last}: {e}"));
-}
-
-async fn migrate_all(pool: &PgPool) {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("migrate");
-}
-
-/// A fresh database with no migrations applied, and a pool on it.
-async fn bare_db(max_connections: u32) -> (String, PgPool) {
-    let url = knot_test_support::fresh_db_url().await;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(max_connections)
-        .connect(&url)
-        .await
-        .expect("connect");
-    (url, pool)
-}
-
 async fn try_new_page<'e>(
     ex: impl sqlx::PgExecutor<'e>,
     ws: Uuid,
@@ -2018,11 +1979,17 @@ struct Loop {
     handle: tokio::task::JoinHandle<LoopReport>,
     /// The longest single run so far, in microseconds.
     longest_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Runs finished so far, failed ones included.
+    runs: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Loop {
     fn longest(&self) -> std::time::Duration {
         std::time::Duration::from_micros(self.longest_us.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn runs(&self) -> u64 {
+        self.runs.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -2041,8 +2008,10 @@ where
 {
     use std::sync::atomic::Ordering::SeqCst;
     let longest_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let runs = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let handle = tokio::spawn({
         let longest_us = longest_us.clone();
+        let runs = runs.clone();
         async move {
             let mut report = LoopReport::default();
             while !stop.load(SeqCst) {
@@ -2052,6 +2021,7 @@ where
                 }
                 longest_us.fetch_max(started.elapsed().as_micros() as u64, SeqCst);
                 report.runs += 1;
+                runs.store(report.runs, SeqCst);
                 if !pause.is_zero() {
                     tokio::time::sleep(pause).await;
                 }
@@ -2060,7 +2030,11 @@ where
             report
         }
     });
-    Loop { handle, longest_us }
+    Loop {
+        handle,
+        longest_us,
+        runs,
+    }
 }
 
 async fn loop_pool(url: &str) -> PgPool {
@@ -3181,7 +3155,494 @@ async fn index_check_takes_no_lock_when_the_index_is_valid() {
 }
 
 // ---------------------------------------------------------------------------
-// API keys and bots (20261108120000_api_keys_and_bots)
+// Page history M1.3: the builder's state, checkpoints and entries
+// ---------------------------------------------------------------------------
+
+/// 0.9.10's schema: M1.2's last migration.
+const V0_9_10_SCHEMA: i64 = 20261107120004;
+
+/// A baseline of `doc` at `seq`; returns its id.
+async fn new_baseline(pool: &PgPool, doc: Uuid, seq: i64) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO doc_history_baselines
+             (doc_id, snapshot_seq, state_bytes, state_vector, created_at)
+         VALUES ($1, $2, '\\x00', '\\x00', now()) RETURNING id",
+    )
+    .bind(doc)
+    .bind(seq)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A sealed entry of `doc` with `start_rev = end_rev = rev`; returns its id.
+async fn insert_entry(
+    pool: &PgPool,
+    doc: Uuid,
+    kind: &str,
+    author: Option<Uuid>,
+    baseline: Option<i64>,
+    rev: Option<i64>,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO doc_history_entries
+             (doc_id, kind, author_id, started_at, ended_at, start_rev, end_rev, sealed,
+              baseline_id)
+         VALUES ($1, $2, $3, now(), now(), $4, $4, true, $5) RETURNING id",
+    )
+    .bind(doc)
+    .bind(kind)
+    .bind(author)
+    .bind(rev)
+    .bind(baseline)
+    .fetch_one(pool)
+    .await
+}
+
+/// The page's rows in (doc_history_state, doc_history_checkpoints,
+/// doc_history_entries).
+async fn builder_rows(pool: &PgPool, doc: Uuid) -> (i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM doc_history_state WHERE doc_id = $1),
+                (SELECT count(*) FROM doc_history_checkpoints WHERE doc_id = $1),
+                (SELECT count(*) FROM doc_history_entries WHERE doc_id = $1)",
+    )
+    .bind(doc)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A purge takes the page's builder state, checkpoints and entries with it,
+/// and the entries' baseline index is there for the cascade from each
+/// purged baseline to probe.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_builder_tables_cascade_with_their_page() {
+    use knot_storage::{DocStore, PgDocStore};
+
+    let pool = knot_test_support::fresh_db().await.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let doc = new_page(&pool, ws, user).await;
+    let other = new_page(&pool, ws, user).await;
+    for d in [doc, other] {
+        sqlx::query("INSERT INTO doc_history_state (doc_id) VALUES ($1)")
+            .bind(d)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO doc_history_checkpoints (doc_id, rev, kind, state_bytes, state_vector)
+             VALUES ($1, 0, 'genesis', '\\x00', '\\x00')",
+        )
+        .bind(d)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let baseline = new_baseline(&pool, d, 1).await;
+        insert_entry(&pool, d, "session", Some(user), Some(baseline), Some(1))
+            .await
+            .unwrap();
+    }
+    assert_eq!(builder_rows(&pool, doc).await, (1, 1, 1));
+    // The column defaults the builder relies on: genesis not built, not
+    // deferred, not given up, nothing parked or skipped.
+    let defaults: (
+        i64,
+        Option<i64>,
+        Option<bool>,
+        bool,
+        serde_json::Value,
+        Vec<i64>,
+    ) = sqlx::query_as(
+        "SELECT built_rev, genesis_rev, retry_after = 'infinity',
+                    coalesce(retry_after > now(), false), parked, skip_revs
+               FROM doc_history_state WHERE doc_id = $1",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        defaults,
+        (0, None, None, false, serde_json::json!([]), vec![])
+    );
+    let pending_revs: Vec<i64> =
+        sqlx::query_scalar("SELECT pending_revs FROM doc_history_checkpoints WHERE doc_id = $1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(pending_revs.is_empty());
+
+    let store = PgDocStore::new(pool.clone());
+    store.archive(ws, doc, user).await.unwrap();
+    store.begin_purge(ws, doc).await.unwrap();
+    store.purge(ws, doc, None).await.unwrap();
+    assert_eq!(
+        builder_rows(&pool, doc).await,
+        (0, 0, 0),
+        "purged with its page"
+    );
+    assert_eq!(
+        builder_rows(&pool, other).await,
+        (1, 1, 1),
+        "other pages keep theirs"
+    );
+
+    let indexes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT indexname::text, indexdef FROM pg_indexes
+          WHERE schemaname = 'public' AND tablename = 'doc_history_entries'
+          ORDER BY indexname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        indexes.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        [
+            "doc_history_entries_baseline_idx",
+            "doc_history_entries_idle_idx",
+            "doc_history_entries_log_idx",
+            "doc_history_entries_open_idx",
+            "doc_history_entries_pkey",
+            "doc_history_entries_words_idx",
+        ]
+    );
+    let baseline_idx = &indexes[0].1;
+    assert!(
+        baseline_idx.ends_with("(baseline_id) WHERE (baseline_id IS NOT NULL)"),
+        "{baseline_idx}"
+    );
+
+    // 1,000 entries of other pages, ten per baseline.
+    for _ in 0..10 {
+        let p = new_page(&pool, ws, user).await;
+        sqlx::query(
+            "INSERT INTO doc_history_baselines
+                 (doc_id, snapshot_seq, state_bytes, state_vector, created_at)
+             SELECT $1, g, '\\x00', '\\x00', now() FROM generate_series(1, 10) g",
+        )
+        .bind(p)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO doc_history_entries (doc_id, kind, started_at, ended_at, sealed, baseline_id)
+         SELECT b.doc_id, 'baseline', now(), now(), true, b.id
+           FROM doc_history_baselines b CROSS JOIN generate_series(1, 10)
+          WHERE b.doc_id NOT IN ($1, $2)",
+    )
+    .bind(doc)
+    .bind(other)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE doc_history_entries")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let probe: i64 = sqlx::query_scalar("SELECT max(id) FROM doc_history_baselines")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let explain = format!("EXPLAIN DELETE FROM doc_history_entries WHERE baseline_id = {probe}");
+    let mut plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(explain.clone()))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    if !plan.concat().contains("doc_history_entries_baseline_idx") {
+        // The planner may still prefer a scan of so small a table; the
+        // index must at least be usable for the cascade's probe.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        plan = sqlx::query_scalar(sqlx::AssertSqlSafe(explain))
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+    }
+    assert!(
+        plan.concat().contains("doc_history_entries_baseline_idx"),
+        "{}",
+        plan.join("\n")
+    );
+}
+
+/// Only a baseline entry may lack an `end_rev`: every other kind is placed
+/// on the timeline by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn entries_need_an_end_rev_unless_baseline() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let doc = new_page(&pool, ws, user).await;
+
+    for kind in ["session", "gap", "restore"] {
+        let e = insert_entry(&pool, doc, kind, Some(user), None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(sqlstate(&e).as_deref(), Some("23514"), "{kind}: {e}");
+    }
+    insert_entry(&pool, doc, "baseline", None, None, None)
+        .await
+        .unwrap();
+    insert_entry(&pool, doc, "session", Some(user), None, Some(1))
+        .await
+        .unwrap();
+    let e = insert_entry(&pool, doc, "edit", Some(user), None, Some(1))
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate(&e).as_deref(), Some("23514"), "unknown kind: {e}");
+}
+
+/// Rows of one 0.9.10 edit save of `n` rows by `user`.
+fn edits(user: Uuid, n: usize) -> Vec<knot_storage::NewUpdate> {
+    (0..n)
+        .map(|_| knot_storage::NewUpdate {
+            by_user_id: Some(user),
+            bytes: vec![1],
+            source: knot_storage::UpdateSource::Edit,
+            meta: None,
+        })
+        .collect()
+}
+
+/// The M1.3 migration takes SHARE ROW EXCLUSIVE on `documents`, `users` and
+/// `doc_history_baselines` (the new foreign keys need it) while 0.9.10 pods
+/// keep serving: every kind of write they make waits at most for the lock
+/// helper's short attempts, none fails, and nothing deadlocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn history_builder_migration_runs_under_live_0_9_10_traffic() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::time::{Duration, Instant};
+
+    use knot_storage::{
+        DocStore, PgDocStore, PgSnapshotStore, PgUpdatesStore, SnapshotStamp, SnapshotStore,
+        UpdatesStore,
+    };
+    use sqlx::Connection;
+
+    let (url, pool) = bare_db(4).await;
+    migrate_up_to(&pool, V0_9_10_SCHEMA).await;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let p = new_page(&pool, ws, user).await;
+        PgUpdatesStore::new(pool.clone())
+            .append(p, 0, &edits(user, 3))
+            .await
+            .unwrap();
+        pages.push(p);
+    }
+    let (a, b) = (pages[0], pages[1]);
+    let deadlocks0: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut loops = Vec::new();
+    // (i) One back-to-back appender per page.
+    for &p in &pages {
+        loops.push((
+            "append",
+            spawn_loop(
+                loop_pool(&url).await,
+                stop.clone(),
+                Duration::ZERO,
+                move |pool, n| async move {
+                    PgUpdatesStore::new(pool)
+                        .append(p, 0, &edits(user, 1 + (n % 3) as usize))
+                        .await
+                        .map(drop)
+                        .map_err(|e| format!("append: {e:?}"))
+                },
+            ),
+        ));
+    }
+    // (ii) A page write on A.
+    loops.push((
+        "page write",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(20),
+            move |pool, n| async move {
+                let mut tx = pool.begin().await.map_err(err_text)?;
+                sqlx::query("SELECT id FROM documents WHERE id = $1 FOR UPDATE")
+                    .bind(a)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(err_text)?;
+                sqlx::query("UPDATE documents SET title = 'w' || $2::text WHERE id = $1")
+                    .bind(a)
+                    .bind(n as i64)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(err_text)?;
+                tx.commit().await.map_err(err_text)
+            },
+        ),
+    ));
+    // (iii) A users write.
+    loops.push((
+        "users write",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(20),
+            move |pool, n| async move {
+                sqlx::query("UPDATE users SET display_name = 'Alice ' || $2::text WHERE id = $1")
+                    .bind(user)
+                    .bind(n as i64)
+                    .execute(&pool)
+                    .await
+                    .map(drop)
+                    .map_err(err_text)
+            },
+        ),
+    ));
+    // (iv) Create, archive and purge a throwaway page.
+    loops.push((
+        "purge",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(50),
+            move |pool, _| async move {
+                let t = try_new_page(&pool, ws, user).await.map_err(err_text)?;
+                PgUpdatesStore::new(pool.clone())
+                    .append(t, 0, &edits(user, 1))
+                    .await
+                    .map_err(|e| format!("append: {e:?}"))?;
+                let store = PgDocStore::new(pool);
+                store
+                    .archive(ws, t, user)
+                    .await
+                    .map_err(|e| format!("archive: {e:?}"))?;
+                store
+                    .begin_purge(ws, t)
+                    .await
+                    .map_err(|e| format!("begin_purge: {e:?}"))?;
+                store
+                    .purge(ws, t, None)
+                    .await
+                    .map_err(|e| format!("purge: {e:?}"))?;
+                Ok(())
+            },
+        ),
+    ));
+    // (v) A stamped snapshot write on B.
+    loops.push((
+        "snapshot",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(50),
+            move |pool, n| async move {
+                let stamp = SnapshotStamp {
+                    snapshot_seq: n as i64 + 1,
+                    snapshot_rev: Some(1),
+                    epoch: Some(0),
+                };
+                PgSnapshotStore::new(pool)
+                    .insert_stamped(b, stamp, b"b", b"sv")
+                    .await
+                    .map_err(|e| format!("snapshot: {e:?}"))
+            },
+        ),
+    ));
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let started = Instant::now();
+    // Panics (failing the test) when the migration fails.
+    let migrated = tokio::time::timeout(Duration::from_secs(30), migrate_all(&pool)).await;
+    let took = started.elapsed();
+    let at_migration: Vec<u64> = loops.iter().map(|(_, l)| l.runs()).collect();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    stop.store(true, SeqCst);
+    let mut reports = Vec::new();
+    for ((name, l), before) in loops.into_iter().zip(at_migration) {
+        reports.push((name, before, l.handle.await.unwrap()));
+    }
+
+    assert!(migrated.is_ok(), "migrator still running after 30 s");
+    eprintln!("the builder migration under load took {took:?}");
+    for (name, before, report) in &reports {
+        eprintln!(
+            "{name}: {} runs, {before} by the end of the migration",
+            report.runs
+        );
+        assert!(report.errors.is_empty(), "{name}: {:?}", report.errors);
+        assert!(
+            report.runs > *before,
+            "{name} made no progress after the migration"
+        );
+    }
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN ('doc_history_state', 'doc_history_checkpoints',
+                               'doc_history_entries')
+          ORDER BY table_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tables,
+        [
+            "doc_history_checkpoints",
+            "doc_history_entries",
+            "doc_history_state"
+        ]
+    );
+
+    // Every backend but this probe has exited, so each flushed its
+    // statistics; a 40P01 anywhere (even one a retry hid) shows here.
+    pool.close().await;
+    let mut probe = sqlx::PgConnection::connect(&url).await.unwrap();
+    let mut others: i64 = -1;
+    for _ in 0..50 {
+        sqlx::query("SELECT pg_stat_clear_snapshot()")
+            .execute(&mut probe)
+            .await
+            .unwrap();
+        others = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database() AND backend_type = 'client backend'
+                AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(&mut probe)
+        .await
+        .unwrap();
+        if others == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(others, 0, "every loop backend exited within 5 s");
+    sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(&mut probe)
+        .await
+        .unwrap();
+    let deadlocks: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&mut probe)
+    .await
+    .unwrap();
+    assert_eq!(deadlocks, deadlocks0, "no deadlock anywhere");
+}
+
+// ---------------------------------------------------------------------------
+// API keys and bots (20261112120000_api_keys_and_bots)
 // ---------------------------------------------------------------------------
 
 /// A workspace plus one user of the given shape. `kind` is 'human' or 'bot'.
@@ -4156,7 +4617,7 @@ async fn bot_owner_guard_matches_every_uuid_spelling() {
 /// holds inside a transaction, so the file must not opt out of sqlx's.
 #[test]
 fn api_keys_migration_bounds_its_lock_wait() {
-    let sql = include_str!("../../../migrations/20261108120000_api_keys_and_bots.sql");
+    let sql = include_str!("../../../migrations/20261112120000_api_keys_and_bots.sql");
     assert!(
         sql.contains("SET LOCAL lock_timeout = '5s';"),
         "lock_timeout went missing"

@@ -200,6 +200,28 @@ describe("AppShell sidebar", () => {
   });
 });
 
+// Structural only: jsdom has no layout, so these pin the classes the fix for
+// #87 rests on, not the behaviour. The behaviour (the window itself never
+// scrolls, and each pane is the containing block of what it holds) is
+// covered end to end in e2e/flows/doc-dock.spec.ts (a long document) and
+// e2e/flows/layout-scroll.spec.ts (a tall tree with a planted probe).
+describe("AppShell panes contain their own absolutely positioned content (#87)", () => {
+  it("makes <main> and the desktop sidebar containing blocks, and clips the shell", () => {
+    const { sidebar, grid } = renderShell();
+    expect(screen.getByRole("main")).toHaveClass("relative");
+    expect(sidebar).toHaveClass("relative");
+    expect(grid).toHaveClass("overflow-clip");
+  });
+
+  it("keeps <main> a containing block on a phone, where the drawer is fixed", () => {
+    setViewportWidth(500);
+    const { sidebar, grid } = renderShell();
+    expect(screen.getByRole("main")).toHaveClass("relative");
+    expect(sidebar).toHaveClass("fixed");
+    expect(grid).toHaveClass("overflow-clip");
+  });
+});
+
 describe("AppShell sidebar, dragging its edge", () => {
   // jsdom has no pointer capture; the handle only needs to be able to ask.
   beforeAll(() => {

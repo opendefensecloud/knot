@@ -2072,6 +2072,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "knot-history"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "knot-config",
+ "knot-storage",
+ "knot-test-support",
+ "metrics",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "yrs",
+]
+
+[[package]]
 name = "knot-markdown"
 version = "0.0.0"
 dependencies = [
@@ -2125,6 +2146,7 @@ dependencies = [
  "knot-crdt",
  "knot-docs",
  "knot-export",
+ "knot-history",
  "knot-markdown",
  "knot-obs",
  "knot-storage",

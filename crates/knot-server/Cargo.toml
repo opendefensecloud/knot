@@ -20,6 +20,7 @@ knot-config = { path = "../knot-config" }
 knot-crdt = { path = "../knot-crdt" }
 knot-docs = { path = "../knot-docs" }
 knot-export = { path = "../knot-export" }
+knot-history = { path = "../knot-history" }
 knot-markdown = { path = "../knot-markdown" }
 knot-obs = { path = "../knot-obs" }
 knot-storage = { path = "../knot-storage" }

@@ -57,7 +57,10 @@ const TABLES = [
   "boards",
   "doc_contributors",
   "doc_history_baselines",
+  "doc_history_checkpoints",
+  "doc_history_entries",
   "doc_history_heads",
+  "doc_history_state",
   "doc_markdown_cache",
   "doc_snapshots",
   "doc_tasks",
@@ -73,8 +76,19 @@ const TABLES = [
 
 const SQL = `SET lock_timeout = '${LOCK_TIMEOUT}'; TRUNCATE TABLE ${TABLES} CASCADE`;
 
+// A deadlock (40P01) is retried like a lock timeout. TRUNCATE takes ACCESS
+// EXCLUSIVE table by table in TABLES order, the doc_history_* tables before
+// documents, while a history builder's write transaction holds documents (the
+// page row FOR KEY SHARE, so ROW SHARE) and then writes the history tables,
+// and an append holds documents before doc_history_heads. A reset that holds
+// a history table and waits for documents closes a cycle with it, and
+// Postgres aborts one side well before the lock timeout.
 function isLockTimeout(detail: string): boolean {
-  return detail.includes("lock_timeout") || detail.includes("canceling statement");
+  return (
+    detail.includes("lock_timeout") ||
+    detail.includes("canceling statement") ||
+    detail.includes("deadlock detected")
+  );
 }
 
 export function reset(): void {

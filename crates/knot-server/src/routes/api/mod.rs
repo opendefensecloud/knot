@@ -19,6 +19,7 @@ pub mod markdown;
 pub mod notifications;
 pub mod search;
 pub mod shares;
+pub mod short_links;
 pub mod suggestions;
 pub mod tasks;
 pub mod whats_new;
@@ -32,6 +33,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(blobs::router())
         .merge(search::router())
         .merge(shares::router())
+        .merge(short_links::router())
         .merge(boards::router())
         .merge(tasks::router())
         .merge(notifications::router())

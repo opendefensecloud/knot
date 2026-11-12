@@ -2,6 +2,7 @@ import { Eye, MessageSquare, Pencil } from "lucide-react";
 import type { ReactNode, Ref } from "react";
 
 import { IconButton } from "../../components/ui/IconButton";
+import { editModeAriaKeyshortcuts, editModeShortcutLabel } from "./editMode";
 
 /**
  * Edit and Comments, for when the header's action row has scrolled away.
@@ -37,9 +38,9 @@ export function DocDockControls({
           data-dock-control="edit"
           ref={editToggleRef}
           size={size}
-          label={editMode ? "Stop editing (⌘E)" : "Edit (⌘E)"}
+          label={editMode ? `Stop editing (${editModeShortcutLabel()})` : `Edit (${editModeShortcutLabel()})`}
           active={editMode}
-          aria-keyshortcuts="Control+E Meta+E"
+          aria-keyshortcuts={editModeAriaKeyshortcuts()}
           onClick={onToggleEdit}
         >
           {editMode ? <Eye size={16} aria-hidden /> : <Pencil size={16} aria-hidden />}

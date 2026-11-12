@@ -18,6 +18,7 @@ pub mod pool;
 pub mod search;
 pub mod session_store;
 pub mod share_tokens;
+pub mod short_links;
 pub mod snapshot_store;
 pub mod suggestions;
 pub mod tasks;
@@ -51,6 +52,10 @@ pub use pool::{Pool, PoolError, begin, connect};
 pub use search::{PgSearchStore, SearchHit, SearchStore, SearchStoreError};
 pub use session_store::{PgSessionStore, Session, SessionStore, SessionStoreError};
 pub use share_tokens::{PgShareTokenStore, ShareStoreError, ShareToken, ShareTokenStore};
+pub use short_links::{
+    PgShortLinkStore, SHORT_CODE_LEN, ShortLink, ShortLinkStore, ShortLinkStoreError,
+    is_short_code, new_short_code,
+};
 pub use snapshot_store::{
     DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStamp, SnapshotStore, SnapshotStoreError,
 };
@@ -64,6 +69,7 @@ pub use tasks::{
 pub use updates_store::{
     APPEND_STATEMENT_TIMEOUT, DocUpdate, HistoryHead, NewUpdate, Persisted, PgUpdatesStore,
     RowsAfter, UnknownUpdateSource, UpdateSource, UpdatesStore, UpdatesStoreError, append_in_tx,
+    rows_in_range,
 };
 pub use user_store::{PgUserStore, User, UserStore, UserStoreError};
 pub use workspace_store::{

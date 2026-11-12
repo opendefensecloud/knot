@@ -109,6 +109,63 @@ async function scrollTop(page: Page): Promise<number> {
   return page.evaluate(() => document.querySelector("main")!.scrollTop);
 }
 
+/** How far the window itself could scroll down: the root's scrollable
+ *  overflow past the viewport. Zero or less means the window has no
+ *  scrollbar of its own and only the panes inside it scroll. */
+async function windowOverflow(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const root = document.scrollingElement!;
+    return root.scrollHeight - root.clientHeight;
+  });
+}
+
+/** The window has nothing to scroll, here and in every state the test put
+ *  the page in. Asks it to scroll anyway, so a page whose overflow only
+ *  shows up under a scroll fails here too. scrollTo rather than the mouse
+ *  wheel: a wheel lands in <main> first and reaches the window only once
+ *  main has run out. */
+async function expectWindowNeverScrolls(page: Page) {
+  expect(await windowOverflow(page)).toBeLessThanOrEqual(0);
+  await page.evaluate(() => window.scrollTo(0, 1e6));
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+}
+
+/** #87: the edit-mode announcer, a visually hidden live region at the foot of
+ *  the document, once escaped <main>'s scrolling and gave the window a third
+ *  scrollbar the length of the document, over the sidebar's and the
+ *  content's own. It is there in view mode too, and gets its text on the
+ *  switch to edit mode.
+ *
+ *  The window checks are the user-visible result, and the shell's
+ *  overflow-clip backstop alone would also pass them. What pins the fix
+ *  itself is the first check: the announcer resolves against <main> (its
+ *  offsetParent, the nearest positioned ancestor of a positioned element), so
+ *  <main> scrolls and clips it. AppShell.test.tsx pins the classes too. */
+async function expectOnlyThePanesScroll(page: Page) {
+  await expect(page.getByTestId("edit-mode-announcer")).toHaveCount(1);
+  expect(
+    await page
+      .getByTestId("edit-mode-announcer")
+      .evaluate((announcer) => (announcer as HTMLElement).offsetParent?.tagName),
+  ).toBe("MAIN");
+  expect(await windowOverflow(page)).toBeLessThanOrEqual(0);
+
+  await scrollMid(page);
+  expect(await windowOverflow(page)).toBeLessThanOrEqual(0);
+
+  await page.getByTestId("dock-toggle-edit-mode").click();
+  await expect(page.getByTestId("toggle-edit-mode")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("edit-mode-announcer")).toHaveText("Editing");
+  await expectWindowNeverScrolls(page);
+  // The document itself still scrolls, inside <main>.
+  expect(await scrollTop(page)).toBeGreaterThan(0);
+}
+
+test("a long document scrolls inside <main>; the window itself never scrolls (#87)", async ({ page }) => {
+  await longDocInViewMode(page);
+  await expectOnlyThePanesScroll(page);
+});
+
 test("mid-document, the dock enters and leaves edit mode without moving the text", async ({ page }) => {
   await longDocInViewMode(page);
   await scrollMid(page);
@@ -161,9 +218,9 @@ test("a click in the text before ⌘E keeps the caret at the click", async ({ pa
   await expect(paragraph(page, n)).toContainText("Q");
 });
 
-test("a caret placed in a table stays clear of the toolbar's table row", async ({ page }) => {
-  // The toolbar adds table buttons once the caret is in a table and wraps to
-  // a second row; the caret's line must not end up under it.
+test("a caret placed in a table stays clear of the toolbar", async ({ page }) => {
+  // The toolbar swaps Insert table for the table menu once the caret is in a
+  // table; the caret's line must not end up under the toolbar.
   const blocks = LONG_MARKDOWN.split("\n\n");
   const table = ["| Item | Notes |", "| --- | --- |", ...Array.from({ length: 12 }, (_, i) => `| Row ${i + 1} | Cell text ${i + 1} |`)].join("\n");
   const markdown = [...blocks.slice(0, 80), table, ...blocks.slice(80)].join("\n\n");
@@ -177,7 +234,7 @@ test("a caret placed in a table stays clear of the toolbar's table row", async (
   });
   await expect(page.getByTestId("doc-dock")).toBeInViewport();
   await page.getByTestId("dock-toggle-edit-mode").click();
-  await expect(page.getByTestId("toolbar-table-add-row")).toBeVisible();
+  await expect(page.getByTestId("toolbar-table-menu")).toBeVisible();
   // Let the reveal frame run after the toolbar's re-render.
   await page.waitForTimeout(100);
 
@@ -233,6 +290,38 @@ test("at the top the toolbar stays one row and the dock goes away", async ({ pag
   await expect(page.getByTestId("doc-dock")).toHaveCount(0);
 });
 
+test("at the top, the shortcut puts the caret in the text, and End stays on the line", async ({ page }) => {
+  // #86: entering edit mode at the top left focus outside the editor, so
+  // End scrolled <main> to the bottom instead of moving the caret. Lines that
+  // fit on one row each, so the end of the caret's line is the end of its
+  // block. ControlOrMeta is the toggle's Mod: ⌘ on a Mac, Ctrl elsewhere.
+  const shortLines = Array.from({ length: PARAGRAPHS }, (_, i) => `Line ${i + 1} fits on one row.`).join("\n\n");
+  await longDocInViewMode(page, shortLines, PARAGRAPHS);
+  const startScrollTop = await scrollTop(page);
+
+  await page.keyboard.press("ControlOrMeta+e");
+  await expect(page.getByTestId("toggle-edit-mode")).toHaveAttribute("aria-pressed", "true");
+  await expect(prose(page)).toBeFocused();
+  // Focused without scrolling.
+  expect(Math.abs((await scrollTop(page)) - startScrollTop)).toBeLessThanOrEqual(2);
+
+  // The top-level block holding the caret: its 1-based index and text.
+  const caretBlock = await prose(page).evaluate((root) => {
+    const focusNode = window.getSelection()?.focusNode ?? null;
+    const focusElement = focusNode?.nodeType === Node.TEXT_NODE ? focusNode.parentElement : (focusNode as Element | null);
+    const block = Array.from(root.children).find((child) => child.contains(focusElement));
+    return block ? { index: Array.from(root.children).indexOf(block) + 1, text: block.textContent ?? "" } : null;
+  });
+  expect(caretBlock).not.toBeNull();
+
+  const beforeEnd = await scrollTop(page);
+  await page.keyboard.press("End");
+  expect(Math.abs((await scrollTop(page)) - beforeEnd)).toBeLessThanOrEqual(2);
+  await page.keyboard.type("X");
+  await expect(prose(page).locator(`> :nth-child(${caretBlock!.index})`)).toHaveText(`${caretBlock!.text}X`);
+  expect(Math.abs((await scrollTop(page)) - beforeEnd)).toBeLessThanOrEqual(2);
+});
+
 test.describe("on a phone", () => {
   test.use({ viewport: { width: 375, height: 667 } });
 
@@ -259,5 +348,12 @@ test.describe("on a phone", () => {
     expect(bold.x).toBeGreaterThanOrEqual(menu.x + menu.width);
     const toolbarBox = (await page.getByTestId("editor-toolbar").boundingBox())!;
     expect(await top(paragraph(page, n))).toBeGreaterThanOrEqual(toolbarBox.y + toolbarBox.height - 1);
+  });
+
+  test("a long document scrolls inside <main>; the window itself never scrolls (#87)", async ({ page }) => {
+    // The phone shell is a plain block, not a grid, and <main> is its own
+    // h-dvh scroller there: the announcer escaped it the same way.
+    await longDocInViewMode(page);
+    await expectOnlyThePanesScroll(page);
   });
 });
