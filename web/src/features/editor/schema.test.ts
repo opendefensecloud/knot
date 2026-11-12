@@ -74,14 +74,18 @@ const REGISTERED_EXTENSIONS = [
   "keymap",
   "knotDateTime",
   "knotInternalLink",
+  // Input rules that nest list items on a typed indent, and a paste transform
+  // that nests aria-level list items. Both produce ordinary nested lists.
+  "knotListNesting",
   "knotMention",
   "knotTaskList",
   // Keymap-only: End/Home move the DOM selection on a Mac; no document change.
   "lineBoundaryKeys",
   "link",
   "list_item",
-  // v3: ListItem registers this keymap itself, named after the node — so it
-  // is active against the renamed list_item rather than inert.
+  // v3: ListItem registers this keymap itself, named after the node. It
+  // only matches the renamed lists because KnotListItem names them in its
+  // bulletListTypeName / orderedListTypeName options.
   "list_itemBranchingDeleteKeymap",
   "ordered_list",
   "paragraph",
