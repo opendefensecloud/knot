@@ -3,6 +3,8 @@ import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent
 
 import type { ConnStatus } from "../../components/StatusDot";
 import { IconButton } from "../../components/ui/IconButton";
+import { useUi } from "../../stores/ui";
+import { downloadFile } from "./downloadFile";
 import { useExport } from "./useExport";
 
 type Props = {
@@ -25,6 +27,8 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
   const menuRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
   const { exporting, run } = useExport({ docId, title, status, pendingBytes });
+  const notify = useUi((s) => s.notify);
+  const [downloadingZip, setDownloadingZip] = useState(false);
 
   const enabledItems = () =>
     Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]:not(:disabled)') ?? []);
@@ -89,11 +93,18 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
     action();
   }
 
-  function downloadZip(descendants: boolean) {
-    const a = document.createElement("a");
-    a.href = `/api/docs/${docId}/export?descendants=${descendants ? "true" : "false"}`;
-    a.download = `${title || "doc"}.zip`;
-    a.click();
+  async function downloadZip(descendants: boolean) {
+    setDownloadingZip(true);
+    try {
+      await downloadFile({
+        path: `/api/docs/${docId}/export?descendants=${descendants ? "true" : "false"}`,
+        fileName: `${title || "doc"}.zip`,
+        notify,
+        failureText: "Couldn't export this page.",
+      });
+    } finally {
+      setDownloadingZip(false);
+    }
   }
 
   return (
@@ -107,7 +118,7 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
         aria-controls={open ? menuId : undefined}
         onClick={() => setOpen((v) => !v)}
       >
-        {exporting ? (
+        {exporting || downloadingZip ? (
           <LoaderCircle size={16} className="animate-spin" aria-hidden />
         ) : (
           <Download size={16} aria-hidden />
@@ -151,7 +162,8 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
                 type="button"
                 role="menuitem"
                 data-testid="export-md"
-                onClick={() => choose(() => downloadZip(false))}
+                disabled={downloadingZip}
+                onClick={() => choose(() => void downloadZip(false))}
                 className={ITEM_CLS}
               >
                 <span>Markdown (zip)</span>
@@ -160,7 +172,8 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
                 type="button"
                 role="menuitem"
                 data-testid="export-md-subtree"
-                onClick={() => choose(() => downloadZip(true))}
+                disabled={downloadingZip}
+                onClick={() => choose(() => void downloadZip(true))}
                 className={ITEM_CLS}
               >
                 <span>Markdown with subpages (zip)</span>

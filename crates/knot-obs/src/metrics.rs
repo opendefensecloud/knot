@@ -26,6 +26,15 @@ const REPLAY_BUCKETS_SECONDS: [f64; 14] = [
     0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 180.0, 270.0, 300.0,
 ];
 
+/// `knot_collab_throttle_wait_seconds` only: a collab read loop waits off the
+/// byte or message debt of the frame it last read. One socket owes at most one
+/// frame (4 MiB): about 4 s for a page and 1 s for a board by default, up to
+/// 64 s at the byte floor (64 KiB/s on a low `rate_limit_scale`). Several of
+/// one user's sockets flooding at once share the budget, so their waits add up.
+const THROTTLE_WAIT_BUCKETS_SECONDS: [f64; 12] = [
+    0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0,
+];
+
 /// Install the global metrics recorder and start the HTTP exporter
 /// on `addr` (e.g. ":9090" or "0.0.0.0:9090").
 pub fn init(addr: &str) -> Result<(), MetricsError> {
@@ -43,6 +52,11 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         .set_buckets_for_metric(
             Matcher::Full("knot_history_replay_seconds".into()),
             &REPLAY_BUCKETS_SECONDS,
+        )
+        .map_err(|e| MetricsError::Install(e.to_string()))?
+        .set_buckets_for_metric(
+            Matcher::Full("knot_collab_throttle_wait_seconds".into()),
+            &THROTTLE_WAIT_BUCKETS_SECONDS,
         )
         .map_err(|e| MetricsError::Install(e.to_string()))?
         .install()
@@ -90,6 +104,7 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     );
 
     describe_history_metrics();
+    describe_limit_metrics();
 
     // Notifications
     describe_counter!(
@@ -195,6 +210,36 @@ fn describe_history_metrics() {
     );
 }
 
+/// Rate limits, quotas and client-IP resolution (issue #88). Labels never
+/// carry user ids or IP addresses.
+fn describe_limit_metrics() {
+    describe_counter!(
+        "knot_rate_limited_total",
+        "Requests a rate limit refused with 429 rate.limited, by bucket: the HTTP buckets (expensive|export|upload|board_preview|write per user, sign_in|public per client IP) and refused collab WebSocket upgrades (collab_upgrade: reconnects to one doc or board too fast; collab_sockets: too many open sockets for one user on this replica). Buckets live in each replica's memory"
+    );
+    describe_counter!(
+        "knot_collab_throttled_total",
+        "Collab WebSocket frames a per-user budget held back, by kind and action: bytes|messages delayed (the read loop waited before reading on; nothing is dropped), awareness coalesced (a presence frame replaced by a newer one from the same socket), sync_step1 ignored (a repeated SyncStep1 on one connection, left unanswered)"
+    );
+    describe_histogram!(
+        "knot_collab_throttle_wait_seconds",
+        Unit::Seconds,
+        "How long a collab read loop waited before its next read to pay off a byte or message debt, one sample per wait"
+    );
+    describe_counter!(
+        "knot_quota_exceeded_total",
+        "Writes refused with 403 quota.exceeded, by quota (pages|blob_bytes) and scope (user|workspace)"
+    );
+    describe_counter!(
+        "knot_client_ip_unresolved_total",
+        "Requests to a per-IP rate-limited route (sign-in, public share pages) that carried X-Forwarded-For from a peer not in trusted_proxies, by reason: no_trusted_proxies (trusted_proxies is empty, so knot seems to be behind a proxy it was not told about; the per-IP buckets were skipped; set trusted_proxies to the proxy's addresses) or untrusted_peer (proxies are trusted but this peer is not one; the header was ignored and the peer limited as the client; a proxy left out of the list, or a direct client sending the header). Counted only while rate limits are on"
+    );
+    describe_counter!(
+        "knot_client_ip_malformed_forwarded_total",
+        "Requests to a per-IP rate-limited route, from a trusted proxy, whose X-Forwarded-For held a malformed entry (including an empty one); the walk stopped there and took the last valid address, or the peer"
+    );
+}
+
 fn normalize_addr(addr: &str) -> Result<String, MetricsError> {
     if let Some(port) = addr.strip_prefix(':')
         && port.parse::<u16>().is_ok()
@@ -213,7 +258,8 @@ mod tests {
     };
 
     use super::{
-        LATENCY_BUCKETS_SECONDS, REPLAY_BUCKETS_SECONDS, describe_history_metrics, normalize_addr,
+        LATENCY_BUCKETS_SECONDS, REPLAY_BUCKETS_SECONDS, THROTTLE_WAIT_BUCKETS_SECONDS,
+        describe_history_metrics, describe_limit_metrics, normalize_addr,
     };
 
     #[test]
@@ -301,6 +347,54 @@ mod tests {
         };
         assert_eq!(unit("knot_history_table_bytes"), Some(Unit::Bytes));
         assert_eq!(unit("knot_history_replay_seconds"), Some(Unit::Seconds));
+    }
+
+    #[test]
+    fn limit_metrics_are_described() {
+        let rec = Descriptions::default();
+        metrics::with_local_recorder(&rec, describe_limit_metrics);
+        let mut got: Vec<(String, &str)> = rec
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(n, k, _)| (n.clone(), *k))
+            .collect();
+        got.sort();
+        let mut want = vec![
+            ("knot_rate_limited_total", "counter"),
+            ("knot_collab_throttled_total", "counter"),
+            ("knot_collab_throttle_wait_seconds", "histogram"),
+            ("knot_quota_exceeded_total", "counter"),
+            ("knot_client_ip_unresolved_total", "counter"),
+            ("knot_client_ip_malformed_forwarded_total", "counter"),
+        ];
+        want.sort();
+        let want: Vec<(String, &str)> = want.into_iter().map(|(n, k)| (n.to_owned(), k)).collect();
+        assert_eq!(got, want);
+
+        let unit = rec
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(n, _, _)| n == "knot_collab_throttle_wait_seconds")
+            .and_then(|(_, _, u)| *u);
+        assert_eq!(unit, Some(Unit::Seconds));
+    }
+
+    #[test]
+    fn throttle_wait_has_buckets_past_the_longest_default_wait() {
+        // One 4 MiB frame at the 64 KiB/s byte floor waits 64 s, past the
+        // latency buckets' 30 s.
+        const LONGEST_DEFAULT_WAIT_SECS: f64 = 64.0;
+        assert!(
+            THROTTLE_WAIT_BUCKETS_SECONDS
+                .windows(2)
+                .all(|w| w[0] < w[1]),
+            "{THROTTLE_WAIT_BUCKETS_SECONDS:?} is not ascending"
+        );
+        assert!(*THROTTLE_WAIT_BUCKETS_SECONDS.last().unwrap() > LONGEST_DEFAULT_WAIT_SECS);
     }
 
     #[test]

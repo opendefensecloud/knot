@@ -2008,6 +2008,7 @@ name = "knot-config"
 version = "0.0.0"
 dependencies = [
  "figment",
+ "ipnet",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -2141,6 +2142,7 @@ dependencies = [
  "futures-util",
  "hmac 0.12.1",
  "http-body-util",
+ "ipnet",
  "knot-auth",
  "knot-config",
  "knot-crdt",

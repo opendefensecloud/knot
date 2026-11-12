@@ -1,18 +1,29 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const hook = vi.hoisted(() => ({ exporting: false, run: vi.fn() }));
 vi.mock("./useExport", () => ({
   useExport: () => ({ exporting: hook.exporting, run: hook.run }),
 }));
+const saved = vi.hoisted(() => ({ saveBlob: vi.fn() }));
+vi.mock("./exportFile", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./exportFile")>()),
+  saveBlob: saved.saveBlob,
+}));
 
+import { useUi } from "../../stores/ui";
 import { ExportMenu } from "./ExportMenu";
 
 beforeEach(() => {
   hook.exporting = false;
   hook.run.mockReset();
+  saved.saveBlob.mockReset();
+  useUi.setState({ toasts: [] });
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 function mount(isTemplate = false) {
   render(
@@ -140,23 +151,51 @@ describe("ExportMenu", () => {
     expect(hook.run).toHaveBeenCalledWith("odt");
   });
 
-  it("downloads Markdown zips with and without subpages", () => {
-    const hrefs: string[] = [];
-    const click = vi
-      .spyOn(HTMLAnchorElement.prototype, "click")
-      .mockImplementation(function (this: HTMLAnchorElement) {
-        hrefs.push(`${this.getAttribute("href")}|${this.download}`);
-      });
+  it("downloads Markdown zips with and without subpages", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(new Response("zip", { status: 200, headers: { "Content-Type": "application/zip" } })),
+    );
     mount();
     open();
     fireEvent.click(screen.getByTestId("export-md"));
     expect(screen.queryByRole("menu")).toBeNull();
+    await waitFor(() => expect(saved.saveBlob).toHaveBeenCalledTimes(1));
     open();
     fireEvent.click(screen.getByTestId("export-md-subtree"));
-    expect(hrefs).toEqual([
-      "/api/docs/d1/export?descendants=false|Runbook.zip",
-      "/api/docs/d1/export?descendants=true|Runbook.zip",
+    await waitFor(() => expect(saved.saveBlob).toHaveBeenCalledTimes(2));
+    expect(fetchSpy.mock.calls.map((call) => call[0])).toEqual([
+      "/api/docs/d1/export?descendants=false",
+      "/api/docs/d1/export?descendants=true",
     ]);
-    click.mockRestore();
+    expect(saved.saveBlob.mock.calls.map((call): unknown => call[1])).toEqual(["Runbook.zip", "Runbook.zip"]);
+    expect(useUi.getState().toasts).toEqual([]);
+  });
+
+  it("says when a Markdown zip is refused for going too fast", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 9 } } }),
+        { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "9" } },
+      ),
+    );
+    mount();
+    open();
+    fireEvent.click(screen.getByTestId("export-md"));
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([
+        { kind: "warn", text: "You're doing that too fast. Try again in 9 s.", key: "limit" },
+      ]),
+    );
+    expect(saved.saveBlob).not.toHaveBeenCalled();
+  });
+
+  it("says when a Markdown zip fails for another reason", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", { status: 500 }));
+    mount();
+    open();
+    fireEvent.click(screen.getByTestId("export-md-subtree"));
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([{ kind: "error", text: "Couldn't export this page." }]),
+    );
   });
 });

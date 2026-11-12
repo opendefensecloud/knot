@@ -5,6 +5,7 @@ import { useState } from "react";
 import { IconButton } from "../../components/ui/IconButton";
 import { commentsApi, type Comment } from "../../lib/comments.api";
 import { suggestionsApi } from "../../lib/suggestions.api";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi, type SidebarTab } from "../../stores/ui";
 import { isOpenStatus } from "../suggestions/SuggestionCard";
 import { SuggestionsPanel } from "../suggestions/SuggestionsPanel";
@@ -108,7 +109,7 @@ export function CommentSidebar({ docId }: { docId: string }) {
         v.mentions,
       ),
     onSuccess: async (r) => {
-      if ("error" in r) { notify("error", "Couldn't post comment"); return; }
+      if ("error" in r) { notifyFailure(notify, r.error, "Couldn't post comment"); return; }
       clearPendingAnchor();
       await qc.invalidateQueries({ queryKey: ["comments", docId] });
     },

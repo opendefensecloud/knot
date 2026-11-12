@@ -4,6 +4,7 @@ import { Fragment, useState } from "react";
 import type { Member } from "../../lib/validators";
 
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 import { ApiKeysSection } from "../apiKeys/ApiKeysSection";
 import { API_KEYS_ROOT_KEY } from "../apiKeys/apiKeys.api";
@@ -55,7 +56,7 @@ export default function MembersPage() {
                 : r.error.code === "workspace.email_taken"
                   ? "That email already belongs to an account. Use a new email for a bot."
                   : "Invite failed.";
-        notify("error", msg);
+        notifyFailure(notify, r.error, msg);
         return;
       }
       setInviteEmail("");
@@ -79,7 +80,7 @@ export default function MembersPage() {
     mutationFn: async (a: { userId: string; role: "owner" | "editor" | "viewer" }) =>
       workspaceApi.setRole(a.userId, a.role),
     onSuccess: async (r) => {
-      if ("error" in r) notify("error", "Role change failed");
+      if ("error" in r) notifyFailure(notify, r.error, "Role change failed");
       else await refreshAfterRevokingChange();
     },
   });
@@ -87,7 +88,7 @@ export default function MembersPage() {
   const remove = useMutation({
     mutationFn: async (userId: string) => workspaceApi.remove(userId),
     onSuccess: async (r) => {
-      if ("error" in r) notify("error", "Remove failed");
+      if ("error" in r) notifyFailure(notify, r.error, "Remove failed");
       else await refreshAfterRevokingChange();
     },
   });

@@ -349,6 +349,9 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
+    if let Err(response) = crate::quota::enforce_pages(&state, &ctx, 1).await {
+        return response;
+    }
     let title = body.title.unwrap_or_else(|| "Untitled".into());
     // No anchor: first at its level, where "New page" puts it.
     let placement = body.after_id.map_or(Placement::First, Placement::After);
@@ -734,6 +737,10 @@ async fn duplicate(
     if let Err(e) = crate::duplicate::check(&state, &ctx, role.0, doc_id).await {
         return duplicate_error(e);
     }
+    // The copy is at least one page; `run` checks all of it once planned.
+    if let Err(response) = crate::quota::enforce_pages(&state, &ctx, 1).await {
+        return response;
+    }
     // Taken before the copy starts, and held until its refresh ends, so no
     // more than the permitted copies are held in memory at once.
     let permit = tokio::time::timeout(
@@ -811,6 +818,8 @@ fn duplicate_error(e: DuplicateError) -> Response {
         DuplicateError::SortKeyConflict => {
             json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "")
         }
+        // Recorded (metric, audit) where it was refused, in `run`.
+        DuplicateError::QuotaExceeded(refusal) => crate::quota::refusal_response(&refusal),
         DuplicateError::Internal(e) => {
             tracing::error!(error = %e, "duplicate");
             internal()
@@ -1232,6 +1241,9 @@ async fn create_from_template_inline(
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
+    if let Err(response) = crate::quota::enforce_pages(&state, &ctx, 1).await {
+        return response;
+    }
 
     // Pull the template's current markdown via the shared
     // export-from-room path so we get exactly what the user sees.

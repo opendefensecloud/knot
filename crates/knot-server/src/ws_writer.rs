@@ -7,6 +7,8 @@
 //! open until both halves are gone. The end is signalled explicitly instead.
 
 use axum::extract::ws::{CloseFrame, Message};
+use std::time::Duration;
+
 use futures::{Sink, SinkExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -30,9 +32,15 @@ use tokio_util::sync::CancellationToken;
 ///   Without it the session would stay open on a room that no longer
 ///   applies, persists or shares anything. A refused sender is closed with
 ///   4422, which is checked first.
-/// - `done` (the read half ended — the client went away): stop. Without it
-///   this task would wait on the still-open channel forever, leaking itself
-///   and the socket for every disconnect.
+/// - `done` (the read half ended — the client went away): stop, even in the
+///   middle of a send that hangs on a vanished client. Without it this task
+///   would wait on the still-open channel forever, leaking itself and the
+///   socket for every disconnect.
+///
+/// With `ping_interval`, a ping goes out that often, so the read half hears
+/// a pong from a live client however quiet its room is (see
+/// [`crate::rate_limit::Liveness`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run<S>(
     mut sink: S,
     mut out_rx: mpsc::Receiver<Vec<u8>>,
@@ -41,9 +49,15 @@ pub(crate) async fn run<S>(
     refused: CancellationToken,
     room_ended: CancellationToken,
     done: CancellationToken,
+    ping_interval: Option<Duration>,
 ) where
     S: Sink<Message> + Unpin,
 {
+    let mut ping_timer = ping_interval.map(|every| {
+        let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        timer
+    });
     loop {
         tokio::select! {
             biased;
@@ -66,16 +80,50 @@ pub(crate) async fn run<S>(
             _ = done.cancelled() => break,
             maybe = out_rx.recv() => match maybe {
                 Some(bytes) => {
-                    if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                    if !send_unless_done(&mut sink, Message::Binary(bytes.into()), &done).await {
                         break;
                     }
                 }
                 // Every sender is gone; nothing more can arrive.
                 None => break,
             },
+            _ = next_ping(ping_timer.as_mut()) => {
+                if !send_unless_done(&mut sink, Message::Ping(Default::default()), &done).await {
+                    break;
+                }
+            }
         }
     }
     done.cancel();
+}
+
+/// Send `message`, giving up when `done` is cancelled first: whether it was
+/// sent. A client that vanished without closing (a laptop that slept) never
+/// ACKs, so once the kernel's send buffer is full a send hangs until TCP
+/// gives up, many minutes later. When the read half has ended meanwhile
+/// (it heard nothing for the silence limit, see
+/// [`crate::rate_limit::Liveness`]), the session must end now: it holds a
+/// place under the per-user socket cap until it does. The read half cancels
+/// `done` only once it has stopped, so nothing a live session needs is cut.
+async fn send_unless_done<S>(sink: &mut S, message: Message, done: &CancellationToken) -> bool
+where
+    S: Sink<Message> + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = done.cancelled() => false,
+        sent = sink.send(message) => sent.is_ok(),
+    }
+}
+
+/// Resolves at the timer's next tick, never without a timer.
+async fn next_ping(ping_timer: Option<&mut tokio::time::Interval>) {
+    match ping_timer {
+        Some(timer) => {
+            timer.tick().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 async fn close<S>(sink: &mut S, code: u16, reason: &'static str)
@@ -94,7 +142,6 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use std::time::Duration;
 
     struct Harness {
         out_tx: mpsc::Sender<Vec<u8>>,
@@ -108,6 +155,10 @@ mod tests {
     }
 
     fn start() -> Harness {
+        start_pinging(None)
+    }
+
+    fn start_pinging(ping_interval: Option<Duration>) -> Harness {
         let (sink, sent) = futures::channel::mpsc::unbounded::<Message>();
         let (out_tx, out_rx) = mpsc::channel(8);
         let (shutdown, revoked, refused, room_ended, done) = (
@@ -125,6 +176,7 @@ mod tests {
             refused.clone(),
             room_ended.clone(),
             done.clone(),
+            ping_interval,
         ));
         Harness {
             out_tx,
@@ -163,6 +215,67 @@ mod tests {
         assert!(matches!(m, Message::Binary(b) if b.as_ref() == [1, 2, 3]));
         h.done.cancel();
         finished(h.task).await;
+    }
+
+    /// A socket whose peer vanished without closing: the kernel's send
+    /// buffer is full and no ACK ever comes, so a send never completes.
+    struct StalledSink;
+
+    impl futures::Sink<Message> for StalledSink {
+        type Error = ();
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, _message: Message) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// The read half gave up on a vanished client (it heard nothing for the
+    /// silence limit) while a send to it hangs: the writer must stop at
+    /// once, not when TCP gives up many minutes later, since the session,
+    /// and its place under the per-user socket cap, lasts until it does.
+    #[tokio::test]
+    async fn stops_when_the_read_half_ends_during_a_send_that_never_completes() {
+        for ping_interval in [None, Some(Duration::from_millis(10))] {
+            let (out_tx, out_rx) = mpsc::channel(8);
+            let done = CancellationToken::new();
+            let task = tokio::spawn(run(
+                StalledSink,
+                out_rx,
+                CancellationToken::new(),
+                CancellationToken::new(),
+                CancellationToken::new(),
+                CancellationToken::new(),
+                done.clone(),
+                ping_interval,
+            ));
+            out_tx.send(vec![1, 2, 3]).await.unwrap();
+            // Let the writer take the frame (or a ping) and stall on it.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!task.is_finished(), "the stalled send must be pending");
+            done.cancel();
+            finished(task).await;
+        }
     }
 
     /// The leak: the read half still holds a sender when the client goes
@@ -223,6 +336,27 @@ mod tests {
         finished(h.task).await;
         let m = h.sent.next().await.expect("no close frame sent");
         assert_eq!(close_code(&m), Some(4422));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pings_the_client_every_interval_and_not_at_once() {
+        let mut h = start_pinging(Some(Duration::from_secs(30)));
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        h.out_tx.send(vec![7]).await.unwrap();
+        let first = h.sent.next().await.unwrap();
+        assert!(
+            matches!(first, Message::Binary(_)),
+            "no ping before the interval: {first:?}"
+        );
+        for _ in 0..2 {
+            let m = tokio::time::timeout(Duration::from_secs(31), h.sent.next())
+                .await
+                .expect("no ping within the interval")
+                .unwrap();
+            assert!(matches!(m, Message::Ping(_)), "{m:?}");
+        }
+        h.done.cancel();
+        finished(h.task).await;
     }
 
     #[tokio::test]

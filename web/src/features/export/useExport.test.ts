@@ -103,6 +103,24 @@ describe("useExport", () => {
     expect(result.current.exporting).toBe(false);
   });
 
+  it("shows the rate-limit text, once and without a retry, on a 429", async () => {
+    const tooFast = {
+      error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 6 }, status: 429 },
+    };
+    const { deps, file, mocks } = makeDeps(vi.fn(() => Promise.resolve(tooFast)));
+    const { result } = setup(deps);
+    await act(async () => {
+      await result.current.run("odt");
+    });
+    expect(file).toHaveBeenCalledTimes(1);
+    expect(mocks.notify).toHaveBeenCalledExactlyOnceWith(
+      "warn",
+      "You're doing that too fast. Try again in 6 s.",
+      { key: "limit" },
+    );
+    expect(mocks.saveBlob).not.toHaveBeenCalled();
+  });
+
   it("second_click_while_exporting_does_nothing", async () => {
     const { deps, diagrams, mocks } = makeDeps();
     const { result } = setup(deps);

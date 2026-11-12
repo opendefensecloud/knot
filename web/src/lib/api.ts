@@ -9,6 +9,60 @@ export type ApiError = {
 
 export type ApiResult<T> = { ok: T } | { error: ApiError };
 
+/** An `ApiError` thrown, for code that fails a mutation by throwing. The
+ *  message is the error's code, as a plain `new Error(code)` had it. */
+export class ApiRequestError extends Error {
+  readonly apiError: ApiError;
+
+  constructor(apiError: ApiError) {
+    super(apiError.code);
+    this.name = "ApiRequestError";
+    this.apiError = apiError;
+  }
+}
+
+/** The error a failed response's parsed body describes: the server's
+ *  `{"error":{code,message,details}}` envelope, else a bare `http_error`. */
+export function apiErrorFrom(status: number, body: unknown): ApiError {
+  const env = body as { error?: Partial<ApiError> } | undefined;
+  const envelope = typeof env === "object" && env !== null ? env.error : undefined;
+  return {
+    code: envelope?.code ?? "http_error",
+    message: envelope?.message ?? `HTTP ${status}`,
+    details: envelope?.details ?? {},
+    status,
+  };
+}
+
+/** Reads a failed response's body into an `ApiError`, for the paths that
+ *  fetch by hand (downloads, uploads). */
+export async function readApiError(res: Response): Promise<ApiError> {
+  const text = await res.text().catch(() => "");
+  let body: unknown;
+  try { body = JSON.parse(text); } catch { body = undefined; }
+  return apiErrorFrom(res.status, body);
+}
+
+const NETWORK_ERROR: ApiError = { code: "network", message: "Network error", details: {}, status: 0 };
+
+/** GETs a file the browser should save: its body as a blob, or the error,
+ *  so a refused download (a 429, say) can be shown instead of a failed
+ *  browser download. */
+export async function fetchBlob(path: string): Promise<ApiResult<Blob>> {
+  let res: Response;
+  try {
+    res = await fetch(path, { credentials: "include" });
+  } catch {
+    return { error: { ...NETWORK_ERROR } };
+  }
+  if (!res.ok) return { error: await readApiError(res) };
+  try {
+    return { ok: await res.blob() };
+  } catch {
+    return { error: { ...NETWORK_ERROR } };
+  }
+}
+
 type Body = Record<string, unknown> | string | null;
 
 type Opts = {
@@ -47,17 +101,7 @@ export async function apiFetch<T>(path: string, opts: Opts = {}): Promise<ApiRes
       data = text;
     }
   }
-  if (!res.ok) {
-    const env = data as { error?: Partial<ApiError> } | undefined;
-    return {
-      error: {
-        code: env?.error?.code ?? "http_error",
-        message: env?.error?.message ?? `HTTP ${res.status}`,
-        details: env?.error?.details ?? {},
-        status: res.status,
-      },
-    };
-  }
+  if (!res.ok) return { error: apiErrorFrom(res.status, data) };
   const parsed = opts.parser ? opts.parser(data) : data;
   return { ok: parsed as T };
 }

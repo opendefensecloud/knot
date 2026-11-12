@@ -8,6 +8,7 @@ import { Avatar } from "../../components/ui/Avatar";
 import { commentsApi, ALLOWED_EMOJIS, type Comment } from "../../lib/comments.api";
 import { relTime } from "../../lib/relTime";
 import { workspaceApi } from "../workspace/workspace.api";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 import { CommentComposer } from "./CommentComposer";
 
@@ -32,7 +33,7 @@ function ReactionRow({
     mutationFn: (emoji: string) =>
       commentsApi.addReaction(docId, comment.id, emoji as (typeof ALLOWED_EMOJIS)[number]),
     onSuccess: async (r) => {
-      if ("error" in r) { notify("error", "Couldn't add reaction"); return; }
+      if ("error" in r) { notifyFailure(notify, r.error, "Couldn't add reaction"); return; }
       await qc.invalidateQueries({ queryKey: ["comments", docId] });
     },
   });
@@ -40,7 +41,7 @@ function ReactionRow({
   const removeReaction = useMutation({
     mutationFn: (emoji: string) => commentsApi.removeReaction(docId, comment.id, emoji),
     onSuccess: async (r) => {
-      if ("error" in r) { notify("error", "Couldn't remove reaction"); return; }
+      if ("error" in r) { notifyFailure(notify, r.error, "Couldn't remove reaction"); return; }
       await qc.invalidateQueries({ queryKey: ["comments", docId] });
     },
   });
@@ -170,7 +171,7 @@ export function CommentThread({ docId, threadId, root, replies }: Props) {
   const resolve = useMutation({
     mutationFn: () => commentsApi.resolve(docId, threadId),
     onSuccess: async (r) => {
-      if ("error" in r) { notify("error", "Couldn't resolve thread"); return; }
+      if ("error" in r) { notifyFailure(notify, r.error, "Couldn't resolve thread"); return; }
       await qc.invalidateQueries({ queryKey: ["comments", docId] });
     },
   });
@@ -178,7 +179,7 @@ export function CommentThread({ docId, threadId, root, replies }: Props) {
   const unresolve = useMutation({
     mutationFn: () => commentsApi.unresolve(docId, threadId),
     onSuccess: async (r) => {
-      if ("error" in r) { notify("error", "Couldn't unresolve thread"); return; }
+      if ("error" in r) { notifyFailure(notify, r.error, "Couldn't unresolve thread"); return; }
       await qc.invalidateQueries({ queryKey: ["comments", docId] });
     },
   });
@@ -187,7 +188,7 @@ export function CommentThread({ docId, threadId, root, replies }: Props) {
     mutationFn: (v: { body: string; mentions: string[] }) =>
       commentsApi.reply(docId, threadId, v.body, v.mentions),
     onSuccess: async (r) => {
-      if ("error" in r) { notify("error", "Couldn't post reply"); return; }
+      if ("error" in r) { notifyFailure(notify, r.error, "Couldn't post reply"); return; }
       await qc.invalidateQueries({ queryKey: ["comments", docId] });
     },
   });

@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Member } from "../../lib/validators";
+import { useUi } from "../../stores/ui";
 
 import { apiKeysApi } from "../apiKeys/apiKeys.api";
 import MembersPage, { filterMembers } from "./MembersPage";
@@ -236,5 +237,30 @@ describe("MembersPage bots", () => {
     fireEvent.click(within(row).getByTestId("member-api-keys"));
     expect(await screen.findByTestId("member-api-keys-panel-b1")).toBeInTheDocument();
     await waitFor(() => expect(list).toHaveBeenCalledWith("b1"));
+  });
+});
+
+describe("MembersPage when a limit refuses a change", () => {
+  beforeEach(() => {
+    vi.spyOn(workspaceApi, "listMembers").mockResolvedValue({ ok: MEMBERS });
+    useUi.setState({ toasts: [] });
+  });
+
+  it("says to slow down when an invite is refused", async () => {
+    vi.spyOn(workspaceApi, "invite").mockResolvedValue({
+      error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 9 }, status: 429 },
+    });
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MembersPage />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(await screen.findByTestId("invite-email"), { target: { value: "dora@example.org" } });
+    fireEvent.submit(screen.getByTestId("invite-form"));
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([
+        { kind: "warn", text: "You're doing that too fast. Try again in 9 s.", key: "limit" },
+      ]),
+    );
   });
 });

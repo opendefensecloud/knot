@@ -12,20 +12,17 @@ pub async fn record(
     target_kind: &str,
     target_id: Uuid,
 ) {
-    let result = sqlx::query(
-        "INSERT INTO audit_events (workspace_id, actor_id, action, target_kind, target_id)
-         VALUES ($1, $2, $3, $4, $5)",
+    let no_data = JsonValue::Object(Default::default());
+    record_with_data(
+        pool,
+        workspace_id,
+        actor,
+        action,
+        target_kind,
+        target_id,
+        &no_data,
     )
-    .bind(workspace_id)
-    .bind(actor)
-    .bind(action)
-    .bind(target_kind)
-    .bind(target_id)
-    .execute(pool)
-    .await;
-    if let Err(e) = result {
-        tracing::warn!(error=?e, action, "audit write failed (best-effort)");
-    }
+    .await
 }
 
 /// Same as `record`, with details about the event in `data` (a JSON

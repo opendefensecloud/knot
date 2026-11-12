@@ -1,7 +1,7 @@
 -- Scoped API keys for humans, bots and AI agents, step 2 of 2.
 --
 -- Forward-only. Adds the api_keys table and six guard triggers on top of
--- users.kind (20261112120000_api_keys_users_kind). Keys are stored only as
+-- users.kind (20261112120001_api_keys_users_kind). Keys are stored only as
 -- HMAC-SHA256(KNOT_SESSION_KEY, secret); rotating the session key therefore
 -- invalidates every session AND every API key.
 --
@@ -21,7 +21,7 @@ SET LOCAL lock_timeout = '5s';
 ALTER TABLE users VALIDATE CONSTRAINT users_kind_check;
 ALTER TABLE users VALIDATE CONSTRAINT users_bot_has_no_credentials;
 
-SELECT knot_lock_tables('20261112120001_api_keys_and_bots',
+SELECT knot_lock_tables('20261112120002_api_keys_and_bots',
                         ARRAY['users', 'document_grants', 'workspace_members', 'workspaces']::regclass[],
                         'SHARE ROW EXCLUSIVE');
 

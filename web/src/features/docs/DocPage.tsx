@@ -18,6 +18,7 @@ import { IconButton } from "../../components/ui/IconButton";
 import { useViewport } from "../../hooks/useViewport";
 import type { ApiError } from "../../lib/api";
 import type { Doc } from "../../lib/validators";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 
 import { CommentSidebar } from "../comments/CommentSidebar";
@@ -69,7 +70,7 @@ export function DocTitle({
     mutationFn: async (next: string) => docsApi.patch(id, { title: next }),
     onSuccess: async (r) => {
       if ("error" in r) {
-        notify("error", "Couldn't rename");
+        notifyFailure(notify, r.error, "Couldn't rename");
         return;
       }
       await qc.invalidateQueries({ queryKey: ["docs"] });
@@ -470,8 +471,9 @@ export default function DocPage() {
     const r = await docsApi.restore(id!);
     setArchiveBusy(false);
     if ("error" in r) {
-      notify(
-        "error",
+      notifyFailure(
+        notify,
+        r.error,
         r.error.code === "doc.restore_restricted_parent_archived"
           ? archiveErrorText(r.error.code)
           : "Couldn't restore",
@@ -492,7 +494,7 @@ export default function DocPage() {
     setArchiveBusy(false);
     if ("error" in r) {
       leaving.current = false;
-      notify("error", purgeErrorText(r.error.code, "Couldn't delete permanently"));
+      notifyFailure(notify, r.error, purgeErrorText(r.error.code, "Couldn't delete permanently"));
       return;
     }
     notify("info", "Deleted permanently");
@@ -508,7 +510,7 @@ export default function DocPage() {
     const next = !meta.is_template;
     const r = await docsApi.setTemplate(id!, next);
     if ("error" in r) {
-      notify("error", next ? "Couldn't save as template" : "Couldn't unmark");
+      notifyFailure(notify, r.error, next ? "Couldn't save as template" : "Couldn't unmark");
       return;
     }
     notify("info", next ? "Saved as template" : "Removed from templates");

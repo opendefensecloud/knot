@@ -3642,7 +3642,7 @@ async fn history_builder_migration_runs_under_live_0_9_10_traffic() {
 }
 
 // ---------------------------------------------------------------------------
-// API keys and bots (20261112120000_api_keys_users_kind, 20261112120001_api_keys_and_bots)
+// API keys and bots (20261112120001_api_keys_users_kind, 20261112120002_api_keys_and_bots)
 // ---------------------------------------------------------------------------
 
 /// A workspace plus one user of the given shape. `kind` is 'human' or 'bot'.
@@ -4622,11 +4622,11 @@ fn api_keys_migrations_take_their_locks_through_the_helper() {
     for (name, sql) in [
         (
             "users_kind",
-            include_str!("../../../migrations/20261112120000_api_keys_users_kind.sql"),
+            include_str!("../../../migrations/20261112120001_api_keys_users_kind.sql"),
         ),
         (
             "api_keys_and_bots",
-            include_str!("../../../migrations/20261112120001_api_keys_and_bots.sql"),
+            include_str!("../../../migrations/20261112120002_api_keys_and_bots.sql"),
         ),
     ] {
         assert!(

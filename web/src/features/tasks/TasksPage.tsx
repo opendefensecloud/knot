@@ -16,7 +16,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { Calendar, CheckSquare, RefreshCw, Square } from "lucide-react";
 
+import { ApiRequestError } from "../../lib/api";
+import { notifyFailure } from "../../lib/limitErrors";
 import { tasksApi, type Task } from "../../lib/tasks.api";
+import { useUi } from "../../stores/ui";
 
 type Bucket = "overdue" | "today" | "week" | "later" | "none";
 
@@ -60,6 +63,7 @@ function formatDue(iso: string): string {
 
 export default function TasksPage() {
   const qc = useQueryClient();
+  const notify = useUi((s) => s.notify);
   const [includeCompleted, setIncludeCompleted] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -71,7 +75,12 @@ export default function TasksPage() {
   });
 
   const toggle = useMutation({
-    mutationFn: async (t: Task) => tasksApi.setChecked(t.doc_id, t.item_index, !t.checked),
+    // A refusal throws, so `onError` puts the checkbox back.
+    mutationFn: async (t: Task) => {
+      const result = await tasksApi.setChecked(t.doc_id, t.item_index, !t.checked);
+      if ("error" in result) throw new ApiRequestError(result.error);
+      return result;
+    },
     onMutate: async (t: Task) => {
       const key = ["tasks", { includeCompleted }] as const;
       await qc.cancelQueries({ queryKey: key });
@@ -85,9 +94,10 @@ export default function TasksPage() {
       });
       return { prev };
     },
-    onError: (_e, _t, ctx) => {
+    onError: (error, _t, ctx) => {
       if (ctx?.prev) qc.setQueryData(["tasks", { includeCompleted }], ctx.prev);
       void qc.invalidateQueries({ queryKey: ["tasks"] });
+      notifyFailure(notify, error instanceof ApiRequestError ? error.apiError : null, "Couldn't update the task.");
     },
   });
 

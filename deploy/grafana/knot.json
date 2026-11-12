@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "knot — top-line + HTTP + CRDT/DB internals. Imports cleanly into Grafana 9+ with a Prometheus datasource named 'prometheus' (or pick at import).",
+  "description": "knot — top-line + HTTP + CRDT/DB internals + limits. Imports cleanly into Grafana 9+ with a Prometheus datasource named 'prometheus' (or pick at import).",
   "editable": true,
   "graphTooltip": 1,
   "id": null,
@@ -303,6 +303,99 @@
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "expr": "(sum(knot_db_pool_size{instance=~\"$instance\"}) - sum(knot_db_pool_idle{instance=~\"$instance\"})) / clamp_min(sum(knot_db_pool_size{instance=~\"$instance\"}), 1)",
           "legendFormat": "busy"
+        }
+      ]
+    },
+    {
+      "title": "Limits",
+      "type": "row",
+      "id": 103,
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "panels": []
+    },
+    {
+      "id": 30,
+      "title": "Rate-limited requests / sec by bucket",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (bucket) (rate(knot_rate_limited_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{bucket}}"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "title": "Quota refusals / sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (quota, scope) (rate(knot_quota_exceeded_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{quota}} / {{scope}}"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "title": "Collab throttling / sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (kind, action) (rate(knot_collab_throttled_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{kind}} {{action}}"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "title": "Collab throttle wait P95",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(knot_collab_throttle_wait_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "title": "Unresolved client IPs / sec by reason",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 57 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (reason) (rate(knot_client_ip_unresolved_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{reason}}"
         }
       ]
     }

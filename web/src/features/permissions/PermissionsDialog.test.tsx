@@ -530,3 +530,28 @@ describe("PermissionsDialog people list", () => {
     consoleError.mockRestore();
   });
 });
+
+describe("PermissionsDialog when a limit refuses a change", () => {
+  const TOO_FAST = {
+    status: 429,
+    body: { error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 5 } } },
+  };
+
+  it("says to slow down when adding a grant is refused", async () => {
+    renderDialog({ write: TOO_FAST });
+    const picker = await screen.findByTestId("grant-user");
+    fireEvent.focus(picker);
+    fireEvent.mouseDown(await screen.findByTestId(`grant-user-option-${ADA}`));
+    fireEvent.click(screen.getByTestId("grant-add"));
+
+    expect(await screen.findByTestId("toast-warn")).toHaveTextContent("You're doing that too fast. Try again in 5 s.");
+    expect(screen.queryByTestId("toast-error")).toBeNull();
+  });
+
+  it("says to slow down when making a share link is refused", async () => {
+    renderDialog({ write: TOO_FAST });
+    fireEvent.click(await screen.findByTestId("share-enable"));
+
+    expect(await screen.findByTestId("toast-warn")).toHaveTextContent("You're doing that too fast. Try again in 5 s.");
+  });
+});

@@ -20,6 +20,22 @@ data:
   KNOT_HISTORY_WORKERS: {{ .Values.history.workers | quote }}
   KNOT_HISTORY_REPLAY_MAX_BYTES: {{ .Values.history.replayMaxBytes | int64 | quote }}
   KNOT_HISTORY_CPU_SHARE: {{ .Values.history.cpuShare | quote }}
+  {{- /*
+  Numbers from a values file are float64 to Helm: without `int64`, a large one
+  renders as e.g. "1.073741824e+10", which the server refuses to read as an
+  integer. deploy/helm/check-render.sh asserts no value here contains "e+".
+  */}}
+  KNOT_RATE_LIMIT_ENABLED: {{ .Values.rateLimit.enabled | quote }}
+  KNOT_RATE_LIMIT_SCALE: {{ .Values.rateLimit.scale | toString | quote }}
+  KNOT_RATE_LIMIT_COLLAB_MAX_SOCKETS: {{ .Values.rateLimit.collabMaxSockets | int64 | quote }}
+  {{- with .Values.trustedProxies }}
+  {{- /* a list or one comma-separated string; join passes a string through */}}
+  KNOT_TRUSTED_PROXIES: {{ join "," . | quote }}
+  {{- end }}
+  KNOT_QUOTA_PAGES_PER_USER: {{ .Values.quotas.pagesPerUser | int64 | quote }}
+  KNOT_QUOTA_PAGES_PER_WORKSPACE: {{ .Values.quotas.pagesPerWorkspace | int64 | quote }}
+  KNOT_QUOTA_BLOB_BYTES_PER_USER: {{ .Values.quotas.blobBytesPerUser | int64 | quote }}
+  KNOT_QUOTA_BLOB_BYTES_PER_WORKSPACE: {{ .Values.quotas.blobBytesPerWorkspace | int64 | quote }}
   {{- if .Values.oidc.enabled }}
   KNOT_OIDC_ENABLED: "true"
   KNOT_OIDC_ISSUER: {{ .Values.oidc.issuer | quote }}

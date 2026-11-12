@@ -168,6 +168,276 @@ EKS users with IRSA: knot uses static creds out of the box. For IRSA, expose the
 
 The credentials need `s3:DeleteObject` as well as read and write: knot deletes the files of the archived pages it purges (with "Delete permanently" or after the retention period), and the hourly job deletes the files of a Duplicate that didn't finish. When the bucket refuses a delete, the purge keeps the page and the hourly job tries again; until it gets through, "Delete permanently" fails for that page and it can't be restored.
 
+## Rate limits and quotas
+
+knot limits how fast one signed-in user can write, and how fast one client
+address can sign in or open share links. The limits are abuse guards, sized
+far above normal use (seeding a 40-page tree, dropping many files, an hour on
+a board, a morning sign-in rush); owners are not exempt. Many clients behind
+one NAT or egress proxy share one address and its limits (see
+[Client IP behind a proxy](#client-ip-behind-a-proxy)).
+
+```yaml
+rateLimit:
+  enabled: true          # KNOT_RATE_LIMIT_ENABLED; false turns off every HTTP and collab rate limit
+  scale: 1               # KNOT_RATE_LIMIT_SCALE; multiplies every number below; above 0, at most 100
+  collabMaxSockets: 64   # KNOT_RATE_LIMIT_COLLAB_MAX_SOCKETS; open collab sockets per user per replica; at least 1
+trustedProxies: []       # KNOT_TRUSTED_PROXIES; see "Client IP behind a proxy" below
+quotas:                  # 0 = off
+  pagesPerUser: 0            # KNOT_QUOTA_PAGES_PER_USER
+  pagesPerWorkspace: 0       # KNOT_QUOTA_PAGES_PER_WORKSPACE
+  blobBytesPerUser: 0        # KNOT_QUOTA_BLOB_BYTES_PER_USER
+  blobBytesPerWorkspace: 0   # KNOT_QUOTA_BLOB_BYTES_PER_WORKSPACE
+```
+
+### HTTP limits
+
+Each limit is a token bucket: a burst of requests, refilled at a steady rate
+(for every HTTP bucket, the burst and the per-minute rate are the same
+number). Every limited request takes one token from exactly one bucket:
+
+| Bucket | Per | Requests | Burst and per minute |
+|---|---|---|---|
+| `expensive` | user | duplicate a page, workspace import, change password | 10 |
+| `export` | user | workspace zip export, page (and subtree) zip export, DOCX/ODT export | 20 |
+| `upload` | user | file uploads | 60 |
+| `board_preview` | user | board preview images (sent shortly after every board change) | 300 |
+| `write` | user | every other `POST`, `PUT`, `PATCH` and `DELETE` under `/api` | 120 |
+| `sign_in` | client IP | `/auth/login`, `/auth/setup` | 30 |
+| `public` | client IP | share links (`/p/…`), their files and board images | 600 |
+
+Reads (page loads, search, history), health and version checks, static
+files, `/auth/session`, `/auth/config`, `/auth/logout`, the OIDC sign-in
+routes and short links are not limited. `rateLimit.scale` multiplies every
+burst and rate, here and on the collab WebSocket below; no scale takes a
+bucket below one request a minute. Set a fractional scale in a values file
+or with `--set-json rateLimit.scale=0.5`: `--set rateLimit.scale=0.5` passes
+the string `"0.5"`, which the chart's schema refuses.
+A request over its limit gets `429 Too Many Requests` with a `Retry-After`
+header and the body
+`{"error":{"code":"rate.limited","message":"too many requests","details":{"retry_after_secs":N}}}`;
+the web app shows "You're doing that too fast" with the wait. Requests
+refused for a missing session or a failed CSRF check cost nothing. API
+scripts that write in bulk should read `Retry-After` and wait.
+
+### Collab WebSocket limits
+
+The editor's and the board's WebSocket never refuse or drop an edit. When a
+user sends more than their budget, the server waits before reading that
+user's next message (backpressure), so their edits arrive later, all of them,
+and in order; the client keeps receiving meanwhile. Pages and boards have
+separate budgets per user and replica: pages 32 MiB burst then 1 MiB/s and
+1 000 messages burst then 300/s; boards 64 MiB then 4 MiB/s and 2 000 then
+600/s. Typing stays far below that. Dragging many board elements at once
+(an estimated 5 MB/s for 100 elements) uses up the board burst only after
+a minute or more, since the budget refills at 4 MiB/s meanwhile, and the
+drag then slows, but nothing fails. A sustained paste flood shows
+"Saving…" until the server has read it. Presence (cursors) beyond 120
+updates a second per user is coalesced: the latest position always arrives. A client's
+repeated request for the page's full state on one socket is ignored.
+
+A user may hold `rateLimit.collabMaxSockets` (default 64) collab sockets
+open per replica, one per open page or board tab, and may connect to one
+page or board 20 times, then 20 times a minute. Past either, the upgrade
+gets 429 and the client backs off and retries, as after any failed connect.
+With rate limits on, knot pings every collab socket every 30 s and ends a
+session it has heard nothing from (not even the pong browsers send by
+themselves) for 75 s, so a socket left half-open by a laptop that slept or
+a network change frees its place within about 75 s, behind a proxy too.
+
+A socket waiting off its user's debt doesn't read meanwhile, so it reads the
+client's Close only once the wait ends, unless a write to the client fails
+first (a revoke, a refused update, the room ending or server shutdown end
+the wait at once). A socket reads only once its user's budget is out of
+debt, so on its own it owes at most the one frame it read last, at most
+4 MiB: its wait is bounded by the time that frame takes to refill, about
+4 s for a page and 1 s for a board at the default scale, longer at a lower
+scale, and up to 64 s at the lowest byte rate (64 KiB/s). When the same
+user floods on several sockets at once, their frames add up, and the wait
+grows with the number of those sockets (some 32 s for eight page sockets
+at the default scale). In `knot_collab_throttle_wait_seconds`, waits well
+past those single-socket bounds mean one user flooding on several sockets.
+Until a wait ends, that socket keeps its place under `collabMaxSockets`,
+so a user who floods and reloads many tabs can reach the socket cap for
+that long.
+
+Keep the idle and read timeouts of every proxy in front of knot above one
+minute (ingress-nginx defaults to 60 s; `nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"`
+is a common choice for WebSockets): a socket closed by the proxy during a
+wait reconnects, and nothing is lost while the tab is open, but the editor
+shows the reconnect.
+
+### Client IP behind a proxy
+
+The `sign_in` and `public` buckets, the login and password failure throttles
+and the IP recorded on a password sign-in's session use the client's IP.
+knot has to be told which proxies to believe:
+
+```yaml
+trustedProxies:          # IPs or CIDRs; a list or one comma-separated string
+  - 10.42.0.0/16         # the ingress controller's pod CIDR, for example
+```
+
+- **Empty (the default):** the client is the TCP peer. Behind an ingress
+  that is the ingress pod, the same for everyone, so when a request carries
+  `X-Forwarded-For` knot **skips** the per-IP buckets for it instead of
+  sharing one bucket among all clients, logs a warning once per process and
+  counts it in `knot_client_ip_unresolved_total{reason="no_trusted_proxies"}`.
+  The login and password failure throttles then still key on the proxy's
+  address, as in earlier releases: failed logins from anyone count together.
+- **Set:** for a request from a trusted peer, knot reads `X-Forwarded-For`
+  from the right, skipping trusted addresses; the first untrusted one is the
+  client. A peer outside the list is the client whatever the header says, so
+  nobody else can choose their bucket: when it sends the header anyway,
+  knot logs a warning once per process and counts the request in
+  `knot_client_ip_unresolved_total{reason="untrusted_peer"}`. That can be a
+  proxy left out of the list, or a direct client sending the header itself.
+  IPv6 clients are grouped per `/64`. A malformed (or empty) header entry
+  from a trusted proxy stops the walk at the last valid address and is
+  counted in `knot_client_ip_malformed_forwarded_total`.
+
+Both counters count only while rate limits are on (`rateLimit.enabled`).
+
+**Without `X-Forwarded-For`, every client shares one address.** Behind an L4
+(TCP) load balancer or proxy that adds no `X-Forwarded-For`, or a node port
+that rewrites the source address, the TCP peer is the balancer or the node
+for everyone, and nothing is counted as unresolved: all clients then share
+one `sign_in` bucket (30 sign-ins a minute) and one `public` bucket, and
+failed logins from anyone count together. The same holds when
+`trustedProxies` lists one hop but not the ingress in front of it, which
+then becomes the client. Fix it at the balancer: keep the client address
+(PROXY protocol into the ingress controller, or `externalTrafficPolicy:
+Local` on its Service) and let the ingress add `X-Forwarded-For`, then list
+every proxy hop in front of knot in `trustedProxies`.
+
+**Clients behind one NAT or egress proxy share an address too.** knot sees
+the one public address an office's NAT or outbound proxy uses, so even with
+`trustedProxies` set correctly every client behind it counts against one
+`sign_in` bucket (a burst of 30 password sign-ins and setups, then 30 a
+minute) and one `public` bucket (600 share-link requests a minute). When
+more people than that sign in with a password at once, say 150 within two
+minutes as an office starts its day, about 90 get in and the rest get
+"You're doing that too fast" with a wait of a few seconds. Five failed
+logins from anyone behind the address also hold up password sign-in for
+all of them, as before. OIDC sign-in is not limited, and sessions last, so
+only password sign-ins of people who aren't signed in count. The only way
+to raise the per-IP buckets is `rateLimit.scale`, which raises every bucket
+with them (it doesn't change the failed-login throttle); each replica has
+its own buckets (see Replicas under [Operational notes](#operational-notes)).
+
+List **only** the addresses of your ingress controller (its pods, or the
+nodes when it runs with host networking): any address you list can name any
+client IP it likes. `0.0.0.0/0`, `::/0` and every other prefix of length 0
+are refused. The chart's schema also refuses characters outside IPs and
+CIDRs; knot checks the rest when it starts and refuses to start, with an
+error naming `KNOT_TRUSTED_PROXIES` and the entry, on a malformed entry,
+host bits after the prefix (`10.0.0.5/8`: write `10.0.0.0/8`, or the bare
+address for one proxy) or an IPv4-mapped network shorter than `/96`
+(`::ffff:10.0.0.0/104` is read as `10.0.0.0/8`). When you list a pod CIDR,
+which other pods share, also enable `networkPolicy` and restrict
+`networkPolicy.ingressFrom` to the ingress controller:
+
+```yaml
+networkPolicy:
+  enabled: true
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+```
+
+### Import caps
+
+Always on: one workspace import may create at most 10 000 pages, write at
+most 256 MiB of page Markdown and 512 MiB of attachments and board files,
+and hold at most 20 000 attachment and board references, checked from the
+archive's manifest and declared sizes (a file named by two pages counts
+twice) before anything is written. A larger import is refused with
+`413 import.too_large` (details `pages`, `markdown_bytes`, `bytes`,
+`references` and their `max_*`); split it, or import it in parts. The upload itself is at most 50 MiB compressed. Entries larger than
+they declare, or than 32 MiB, are skipped, with one warning per import
+(`import: zip entries skipped`, field `skipped_entries`).
+
+### Quotas
+
+Off by default. When set, knot refuses a write that would take a user or the
+workspace past its quota with `403 quota.exceeded`, and the web app says
+which limit was reached:
+
+- `quotas.pagesPerUser` / `quotas.pagesPerWorkspace` count pages: those the
+  user created, or all of the workspace's. Archived pages and templates count
+  until they are purged, so restoring a page never goes over a quota.
+- `quotas.blobBytesPerUser` / `quotas.blobBytesPerWorkspace` count the bytes
+  of uploaded files: those the user uploaded, or all of the workspace's.
+  Files count until they are purged. Board preview images don't count.
+- Duplicated pages and their copied files count for the user who
+  duplicated them. An import counts all its pages and declared attachment
+  bytes (not its board files) at once, before it writes anything, and is
+  refused whole.
+
+A workspace quota without a per-user one lets one account use all of it:
+set both. Quotas are counted in Postgres and hold across replicas, but they
+are best effort: requests that run at the same time can each pass the check,
+so a quota can be overshot by what runs at once. Each refusal is counted in
+`knot_quota_exceeded_total{quota,scope}`; it is audited as `quota.exceeded`
+(with the limit, the usage and the request) and logged as `quota exceeded`
+at most once per user, quota and scope every 10 minutes on each replica.
+
+### What the limits don't cap
+
+Quotas cover pages and files only, and only when set. Without them, one user
+can upload 60 files of up to 10 MiB a minute per replica, and duplicates and
+imports fill storage faster still: they share the `expensive` bucket (10 a
+minute), and each duplicate copies up to 200 pages and 200 MiB of files,
+each import up to 10 000 pages and 512 MiB of files and board images (20 000
+references). Set `quotas.*` if that matters. What one user can still add, per
+replica, at the default limits, whatever the quotas:
+
+- **Page edits** — up to 1 MiB/s after a 32 MiB burst on page sockets, kept
+  forever in the edit log (see "Storage growth from page history" in
+  [Operational notes](#operational-notes)).
+- **Board edits** — up to 4 MiB/s after a 64 MiB burst on board sockets.
+- **Board previews** — 1 MiB each, 300 a minute, but each overwrites the
+  board's one preview, so they don't accumulate.
+- **Other writes** (comments, titles, tasks, grants, …) — 120 a minute, each
+  at most the 2 MiB request body.
+
+Those budgets guard CPU and the fan-out between replicas, not storage: watch
+`knot_history_table_bytes` and database size for growth.
+
+### Metrics
+
+- `knot_rate_limited_total{bucket}` — requests refused with 429, by bucket
+  (above), plus `collab_upgrade` and `collab_sockets` for refused WebSocket
+  upgrades. Normal use keeps it at 0; the `KnotRateLimitedSustained` alert
+  (`alerting.rateLimitedPerSecond`, default 1 refusal a second per bucket,
+  15-minute average over all replicas, for 30 minutes) fires on a sustained
+  rate. The server logs a warning when a user or client starts being
+  limited, not one per refused request: `rate limit reached; refusing with
+  429 until the bucket refills` (with `bucket` and the user or client),
+  `too many open collab sockets for one user; refusing upgrades with 429`
+  and `collab socket reconnecting to one target too fast; refusing upgrades
+  with 429`.
+- `knot_collab_throttled_total{kind,action}` and the histogram
+  `knot_collab_throttle_wait_seconds` — collab messages delayed by
+  backpressure, presence updates coalesced and repeated full-state requests
+  ignored, and how long the waits last.
+- `knot_quota_exceeded_total{quota,scope}` — quota refusals.
+- `knot_client_ip_unresolved_total{reason}` — requests to a per-IP limited
+  route from an untrusted peer that carried `X-Forwarded-For`.
+  `reason="no_trusted_proxies"`: `trustedProxies` is empty and knot is behind
+  a proxy; set `trustedProxies` when it isn't 0. `reason="untrusted_peer"`:
+  the peer isn't in the list, a proxy left out or a client sending the
+  header itself. Counted only while rate limits are on.
+- `knot_client_ip_malformed_forwarded_total` — requests from a trusted proxy
+  whose `X-Forwarded-For` held a malformed entry.
+
+The Grafana dashboard (`deploy/grafana/knot.json`) shows them in its "Limits"
+row.
+
 ## Upgrading
 
 ```bash
@@ -260,15 +530,15 @@ Upgrade to 0.9.11 from 0.9.10 with a plain `helm upgrade`: it has no migrations,
 
 ### Upgrading from 0.9.10 or 0.9.11
 
-Upgrade to this release from 0.9.10 or 0.9.11. Coming from 0.9.9, upgrade to 0.9.10 first and let its rollout finish (see [Upgrading from 0.9.9](#upgrading-from-099)): this release builds page history from the numbered edit log that 0.9.10 starts. The `pre-upgrade` Job applies four migrations, each in its own transaction, while 0.9.10 pods keep serving: `20261108120000_history_builder`, `20261109120000_doc_short_links`, `20261112120000_api_keys_users_kind` and `20261112120001_api_keys_and_bots`. The first creates three new, empty tables (`doc_history_state`, `doc_history_checkpoints` and `doc_history_entries`) and their indexes, and copies or rewrites nothing.
+Upgrade to this release from 0.9.10 or 0.9.11. Coming from 0.9.9, upgrade to 0.9.10 first and let its rollout finish (see [Upgrading from 0.9.9](#upgrading-from-099)): this release builds page history from the numbered edit log that 0.9.10 starts. The `pre-upgrade` Job applies five migrations, each in its own transaction, in this order, while 0.9.10 pods keep serving and saving edits: `20261108120000_history_builder` creates three new, empty tables (`doc_history_state`, `doc_history_checkpoints` and `doc_history_entries`) and their indexes, and copies or rewrites nothing; `20261109120000_doc_short_links` creates the empty `doc_short_links` table; `20261112120000_quota_indexes` builds two indexes for the [quotas](#rate-limits-and-quotas) (see below); `20261112120001_api_keys_users_kind` adds the `users.kind` column and `20261112120002_api_keys_and_bots` creates the empty `api_keys` table and its triggers (both below). Each of the five takes its locks first, in its own bounded lock loop.
 
-The new tables' foreign keys need `SHARE ROW EXCLUSIVE` locks on `documents`, `users` and `doc_history_baselines`, so the migration takes those first, in attempts 0.5 s apart: each attempt waits at most 100 ms for `documents` and asks for the other two without waiting. While an attempt waits, and from when it has the locks until the migration commits (at once, since it only creates empty tables), page writes (creating, renaming, moving, archiving, restoring and purging pages, among others) and writes to `users` (new accounts, a first OIDC sign-in, password changes) pause. Edit saves, snapshot writes and page loads go on. As in 0.9.9 and 0.9.10, an ordinary autovacuum in the way is cancelled, and if the migration doesn't get its locks within 45 s it fails with a message naming up to three sessions that hold them, and the Job retries (see [Upgrading from 0.9.8](#upgrading-from-098)). Don't upgrade while `pg_dump`, another long transaction or an anti-wraparound autovacuum runs on the database. Follow the Job's log as described for 0.9.8.
+The new tables' foreign keys need `SHARE ROW EXCLUSIVE` locks on `documents`, `users` and `doc_history_baselines`, so the migration takes those first, in attempts 0.5 s apart: each attempt waits at most 100 ms for `documents` and asks for the other two without waiting. While an attempt waits, and from when it has the locks until the migration commits (at once, since it only creates empty tables), page writes (creating, renaming, moving, archiving, restoring and purging pages, among others) and writes to `users` (new accounts, a first OIDC sign-in, password changes) pause. Edit saves, snapshot writes and page loads go on. As in 0.9.9 and 0.9.10, an ordinary autovacuum in the way is cancelled, and if the migration doesn't get its locks within 45 s it fails with a message naming up to three sessions that hold them, and the Job retries (see [Upgrading from 0.9.8](#upgrading-from-098)). `20261109120000_doc_short_links` needs `SHARE ROW EXCLUSIVE` on `documents` and `users` for its foreign keys and takes them the same way, with the same pauses, and commits at once. Don't upgrade while `pg_dump`, another long transaction or an anti-wraparound autovacuum runs on the database. Follow the Job's log as described for 0.9.8.
 
-The other three migrations take their locks the same way (`knot_lock_tables`, never waiting for one table while holding another, giving up after 45 s). `doc_short_links` takes `SHARE ROW EXCLUSIVE` on `documents` and `users`. `api_keys_users_kind` adds the `users.kind` column under an `ACCESS EXCLUSIVE` lock on `users` for an instant, which pauses every statement that touches `users`, sign-ins and edit saves included, and scans nothing (its two checks are added `NOT VALID`). `api_keys_and_bots` validates those checks without blocking anyone, then takes `SHARE ROW EXCLUSIVE` on `users`, `document_grants`, `workspace_members` and `workspaces` while it creates the empty `api_keys` table and its triggers, so grant, member and `users` writes wait until it commits; reads, edit saves and page loads go on.
+The two API-keys migrations take their locks the same way (`knot_lock_tables`, never waiting for one table while holding another, giving up after 45 s). `api_keys_users_kind` adds the `users.kind` column under an `ACCESS EXCLUSIVE` lock on `users` for an instant, which pauses every statement that touches `users`, sign-ins and edit saves included, and scans nothing (its two checks are added `NOT VALID`). `api_keys_and_bots` validates those checks without blocking anyone, then takes `SHARE ROW EXCLUSIVE` on `users`, `document_grants`, `workspace_members` and `workspaces` while it creates the empty `api_keys` table and its triggers, so grant, member and `users` writes wait until it commits; reads, edit saves and page loads go on.
 
-The `--timeout` needs no allowance for data, since the migrations copy none, only for their four lock loops. Each migration commits on its own, so a retry starts at the first one not yet applied. In the worst case that still succeeds, each of the four migrations waits up to 45 s for its locks before it gets them, two Job attempts each give up after another 45 s, and the restart backoff between attempts adds about 30 s: about 5 minutes, plus the Job pods' image pulls and container starts. Pass `helm upgrade --timeout` of at least 6 minutes plus the time your rollout usually takes; Helm's default of 5 minutes is not enough.
+The `--timeout` needs almost no allowance for data, since only `20261112120000_quota_indexes` reads anything (`documents` and `blobs` once; small tables, see below), but each of the five migrations has a lock loop that waits up to 45 s. A migration that committed is not run again, so in the worst case that still succeeds each loop spends up to 45 s getting its locks once, and two Job attempts each give up after another 45 s in a loop: 7 × 45 s in all, plus about 30 s of restart backoff and the Job pod's image pull and container starts. Pass `helm upgrade --timeout` of at least 7 minutes plus the time your rollout usually takes: Helm's default of 5 minutes is too short for that worst case.
 
-If the upgrade halts, `SELECT version FROM _sqlx_migrations WHERE version >= 20261108120000` shows how many of the four committed. No rows: nothing was applied, 0.9.10 keeps working, pod restarts included; find what held the locks and re-run the upgrade. One to three rows: the upgrade stopped part-way (usually Helm's timeout fired while the Job still ran, or a later migration could not get its locks); re-run the upgrade now, since 0.9.10 pods that restart crash-loop on a database with a migration they don't know. Four rows: all are done. For the same reason, rolling back to 0.9.10 needs a database restore once the first migration has committed, and during a normal upgrade a 0.9.10 pod that restarts after that crash-loops until a new pod replaces it.
+If the upgrade halts, `SELECT version FROM _sqlx_migrations WHERE version >= 20261108120000 ORDER BY version` lists the migrations that committed, of `20261108120000`, `20261109120000`, `20261112120000`, `20261112120001` and `20261112120002`. No rows: nothing was applied, 0.9.10 keeps working, pod restarts included; find what held the locks and re-run the upgrade. One to four rows: the migrations listed are done and the next one didn't commit (usually its lock loop gave up, or Helm's timeout fired while the Job still ran); find what held its locks and re-run the upgrade now, which applies only what is left. All five rows, `20261112120002` included: every migration is done (usually Helm's timeout fired while the Job still ran); re-run the upgrade now. Re-run it soon in both cases, since 0.9.10 pods that restart crash-loop on a database with a migration they don't know. For the same reason, rolling back to 0.9.10 needs a database restore once any of the five has committed, and during a normal upgrade a 0.9.10 pod that restarts after that crash-loops until a new pod replaces it.
 
 The release adds three chart values, which the [page history builder](#operational-notes) note explains:
 
@@ -289,13 +559,38 @@ Watch it with `knot_history_builder_lag_revs` (the largest number of edits any p
 
 The old snapshot thinning (the 5 newest per page plus one a day for 30 days) is unchanged.
 
+This release also adds [rate limits and quotas](#rate-limits-and-quotas). The migration `20261112120000_quota_indexes` builds two indexes, on `documents` and on `blobs`, holding a `SHARE` lock on both while they build: writes to pages (creating, renaming, moving, archiving pages, among others) and file uploads wait meanwhile; page loads go on. It takes its locks in the same bounded attempts as the migrations above and gives up after 45 s rather than queueing writes behind a long transaction; the `--timeout` above counts its lock loop. The build reads both tables once, which are small: file contents live in a separate table (`blob_bytes`) and are not read. `SELECT pg_size_pretty(pg_relation_size('documents')), pg_size_pretty(pg_relation_size('blobs'))` shows what it reads. It runs last, so until the query under "If the upgrade halts" above lists `20261112120000`, the upgrade's migrations are not all done.
+
+The release adds these chart values; the defaults turn the rate limits on and leave quotas off:
+
+```yaml
+rateLimit:
+  enabled: true          # KNOT_RATE_LIMIT_ENABLED
+  scale: 1               # KNOT_RATE_LIMIT_SCALE; above 0, at most 100
+  collabMaxSockets: 64   # KNOT_RATE_LIMIT_COLLAB_MAX_SOCKETS; at least 1
+trustedProxies: []       # KNOT_TRUSTED_PROXIES; your ingress controller's addresses
+quotas:                  # 0 = off
+  pagesPerUser: 0
+  pagesPerWorkspace: 0
+  blobBytesPerUser: 0
+  blobBytesPerWorkspace: 0
+alerting:
+  rateLimitedPerSecond: 1  # KnotRateLimitedSustained threshold
+```
+
+- **Behind an ingress, set `trustedProxies`** to the ingress controller's addresses (see [Client IP behind a proxy](#client-ip-behind-a-proxy)). Until you do, the per-IP sign-in and share-link limits are skipped for proxied requests (counted in `knot_client_ip_unresolved_total{reason="no_trusted_proxies"}`), and failed logins from all clients still count together in one throttle, as before. Once it is set, each client gets its own sign-in throttle. An entry knot can't use (malformed, or `10.0.0.5/8` with host bits after the prefix) stops it from starting, with an error naming `KNOT_TRUSTED_PROXIES`. Behind an L4 balancer that adds no `X-Forwarded-For`, all clients share one sign-in bucket; see the same section.
+- **API clients and scripts** can now get `429 rate.limited` on writes, exports, uploads and sign-in, with `Retry-After`; ones that write in bulk should wait and retry. Workspace imports above 10 000 pages, 256 MiB of page Markdown, 512 MiB of files or 20 000 file and board references are refused with `413 import.too_large`.
+- **Several replicas:** the limits are per replica (see Replicas in [Operational notes](#operational-notes)).
+- Keep proxy idle and read timeouts above one minute (see [Collab WebSocket limits](#collab-websocket-limits)).
+
 ## Operational notes
 
 - **Healthchecks** — readiness `/api/readyz`, liveness `/api/healthz`. Disable with `probes.enabled=false` if you want to debug a wedged pod.
 - **Image size** — the runtime image is `scratch` + a static musl binary (mimalloc allocator). Expect ~20 MB.
 - **Resources** — defaults `100m/128Mi` requests, `1000m/512Mi` limits. Right-size based on workspace volume.
-- **Replicas** — knot's CRDT room actor is per-pod and discovers peers via Postgres `LISTEN/NOTIFY`, so `replicaCount > 1` works without sticky sessions. Each room is hosted by exactly one pod at a time; failover takes one TCP roundtrip.
+- **Replicas** — knot's CRDT room actor is per-pod and discovers peers via Postgres `LISTEN/NOTIFY`, so `replicaCount > 1` works without sticky sessions. Each room is hosted by exactly one pod at a time; failover takes one TCP roundtrip. Rate limits, the login and password throttles and the collab socket cap are kept in each replica's memory: the Service balances requests across pods without affinity, so a user or client spread over N replicas gets up to N times each limit. To hold the rate-limit totals, divide with `rateLimit.scale` (for example `0.5` with two replicas); the scale doesn't change the login and password throttles or the socket cap (lower `rateLimit.collabMaxSockets` for that). Quotas are counted in Postgres and need no change.
 - **Notifications** — every replica checks for overdue tasks and deletes old notifications every 15 minutes, with nothing to configure and no coordination needed between replicas. Read notifications are deleted after 90 days, all after 180, and a page's go with it when it is deleted for good. They hold short excerpts (comment text, task text), so an excerpt of a deleted comment stays in its recipients' inboxes until then. `knot_notifications_emitted_total{kind}` counts them as they are written.
+- **Rate limits and quotas** — worth an alert: a sustained `knot_rate_limited_total{bucket}` (the chart's `KnotRateLimitedSustained`, ticket severity, at `alerting.rateLimitedPerSecond`, default 1 refusal a second per bucket for 30 minutes); normal use doesn't reach the limits, so look for the script or client in the log line written when a user or client starts being limited before raising `rateLimit.scale`. `knot_client_ip_unresolved_total{reason="no_trusted_proxies"}` above 0 means knot is behind a proxy and `trustedProxies` is empty; `reason="untrusted_peer"` is a peer outside the list sending `X-Forwarded-For` (a proxy left out, or a client sending the header itself). Both count only while rate limits are on. `knot_quota_exceeded_total{quota,scope}` shows users at a quota; the audit log has a `quota.exceeded` entry per user, quota and scope at most every 10 minutes per replica. See [Rate limits and quotas](#rate-limits-and-quotas).
 - **Request body size** — image uploads and Word/OpenDocument exports (which upload the page's diagram pictures) send up to 10 MiB. A reverse proxy or ingress in front of knot must allow request bodies of at least 10 MiB. With ingress-nginx (default 1 MiB), set `nginx.ingress.kubernetes.io/proxy-body-size: 10m` in `ingress.annotations`.
 - **Storage growth from page history** — the edit log is kept forever, so size it as rows/day × average row bytes × ~1.6 (tuple, index and TOAST overhead). Backups and point-in-time recovery grow at the same rate. `knot-server history-stats [--days N]` (read-only, no migration; `--days` defaults to 30, minimum 1) prints the inputs. It needs the same `KNOT_*` environment as the server (config validation requires `KNOT_SESSION_KEY`, for one), so run it inside a knot pod: `kubectl exec -n knot deploy/knot -c knot -- /knot-server history-stats`. The Deployment is named as `knot.fullname` in `templates/_helpers.tpl` computes it: `fullnameOverride` when it is set; otherwise `<release>` when the release name contains the chart's name (`nameOverride` when set, else `knot`), as with `helm upgrade knot` above, and `<release>-<name>` when it doesn't; cut to 63 characters, then a trailing `-` removed. Its per-day rates cover the last `--days` days, and before the upgrade the old cleanup deleted edits, so run it at least 30 days after upgrading, or pass a `--days` below the days since the upgrade. To get rows/day, run it twice, some days apart: the difference in `update_rows` divided by the days between the runs is rows/day, and `update_bytes_avg` is the average row bytes. It also prints the current size of `doc_updates`. From 0.9.10 rows are smaller: each holds only what its edit changed (a reconnecting editor's resend no longer stores again what the page already has), so measure rows/day and row bytes again after upgrading. From the release after 0.9.11 it also prints `checkpoint_rows`, `checkpoint_bytes_total` and `entry_rows`, the page history builder's tables (next note).
 - **Page history builder** — every replica runs a background builder that replays each edited page's stored edits outside the editor and records the page's history: one entry per person's editing session (closed after 20 idle minutes, with the words added and removed), plus restores, copies, imports, templates, the versions from before the 0.9.9 upgrade, and changes that reached the page without being stored as an edit, which no one is credited for. A page's history trails its edits by about 10 s (by up to 200 edits while it is edited without a pause). Replicas share the work through a short lease per page in `doc_history_state`, so no two build one page at once, and no lock is held while a page replays: archiving, restoring, moving or purging a page never waits for the builder.

@@ -14,7 +14,7 @@
 -- users keeps it from the lock it gives up after 45 s, naming the holder, and
 -- the Job retries.
 SET LOCAL lock_timeout = '5s';
-SELECT knot_lock_tables('20261112120000_api_keys_users_kind',
+SELECT knot_lock_tables('20261112120001_api_keys_users_kind',
                         ARRAY['users']::regclass[],
                         'ACCESS EXCLUSIVE');
 
