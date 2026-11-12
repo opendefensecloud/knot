@@ -71,7 +71,18 @@ export function AppShell() {
   return (
     <div
       // Relative: the resize handle is positioned against the grid.
-      className={`h-dvh font-sans text-fg ${mobile ? "block" : "relative grid"}`}
+      //
+      // overflow-clip: a backstop for #87. The shell is exactly the window,
+      // so anything painting past it would only grow the root's scrollable
+      // overflow and give the window a scrollbar of its own over two panes
+      // that already scroll. The panes below are the real fix: they contain
+      // their own absolutely positioned content. Clip, not hidden: hidden
+      // would make the shell a scroll container that focus() or
+      // scrollIntoView() could still shift, with no scrollbar to undo it.
+      // It does not clip the position:fixed children (toast, palette,
+      // drawer, comment rail), whose containing block is the viewport, nor
+      // the resize handle, which sits inside the grid's box.
+      className={`h-dvh overflow-clip font-sans text-fg ${mobile ? "block" : "relative grid"}`}
       style={mobile ? undefined : gridStyle}
     >
       {mobile && !sidebarOpen && (
@@ -92,13 +103,22 @@ export function AppShell() {
           className="fixed inset-0 bg-black/40 z-20 backdrop-blur-sm"
         />
       )}
+      {/* Relative on a desktop, as hardening for the same reason as <main>
+          below (#87): any absolutely positioned descendant without a
+          positioned host of its own then scrolls, and is clipped, with the
+          tree instead of overflowing the window. Nothing in the tree does
+          that today: its live region is a child of the flex column, and an
+          absolutely positioned flex child sits where it would as the only
+          item, at the top; the rows that carry sr-only text are relative
+          themselves. The phone drawer is fixed, which already makes it the
+          containing block. */}
       <aside
         id={SIDEBAR_ID}
         data-testid="sidebar"
         className={`bg-bg border-r border-border overflow-y-auto ${
           mobile
             ? `fixed top-0 h-dvh w-[260px] z-30 transition-[left] duration-200 ease-swift ${sidebarOpen ? "left-0" : "-left-[280px]"}`
-            : "static"
+            : "relative"
         }`}
       >
         <DocTree />
@@ -108,7 +128,18 @@ export function AppShell() {
           to trade space with. Straight inside the grid, never wrapped: a
           drag sizes the sidebar column through the handle's parent. */}
       {!mobile && sidebarOpen && <SidebarResizeHandle controls={SIDEBAR_ID} />}
-      <main className={`overflow-y-auto bg-bg ${mobile ? "h-dvh" : ""}`}>
+      {/* Relative so <main> is the containing block of every absolutely
+          positioned element inside it that has no positioned host of its
+          own, such as the sr-only live region at the end of the unpositioned
+          .doc-shell. A scroll container only scrolls and clips descendants
+          whose containing block it is or lies within; without this they
+          resolve against the shell, keep their static position at the foot
+          of the whole document, and overflow the window, which grew a third
+          scrollbar that moved sidebar and content together into empty space
+          (#87). Relative without a z-index makes no stacking context and,
+          unlike transform and friends (see layout.css), leaves the fixed
+          comment rail and history drawer anchored to the viewport. */}
+      <main className={`relative overflow-y-auto bg-bg ${mobile ? "h-dvh" : ""}`}>
         <Outlet />
       </main>
       <WhatsNewCard />

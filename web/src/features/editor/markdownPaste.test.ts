@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
+import { fragmentXml, mountBoundEditor, type BoundEditor } from "../../test/boundEditor";
 import { looksLikeMarkdown, markdownToHtml } from "./markdownPaste";
 
 describe("looksLikeMarkdown — converts", () => {
@@ -101,5 +102,46 @@ describe("markdownToHtml", () => {
     const html = markdownToHtml("# Hi\n\n<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>");
     expect(html).not.toContain("script");
     expect(html).not.toContain("onerror");
+  });
+});
+
+/**
+ * Nested lists survive a Markdown paste into the shared document. #78 had
+ * every content path checked; this one already nested, and this pins it.
+ */
+describe("pasting a nested Markdown list", () => {
+  let bound: BoundEditor | null = null;
+
+  afterEach(() => {
+    bound?.destroy();
+    bound = null;
+  });
+
+  const NESTED =
+    "<bullet_list>" +
+    "<list_item><paragraph>a</paragraph><bullet_list>" +
+    "<list_item><paragraph>b</paragraph><bullet_list>" +
+    "<list_item><paragraph>c</paragraph></list_item>" +
+    "</bullet_list></list_item>" +
+    "</bullet_list></list_item>" +
+    "<list_item><paragraph>d</paragraph></list_item>" +
+    "</bullet_list>";
+
+  it.each([
+    ["two-space", "- a\n  - b\n    - c\n- d"],
+    ["four-space", "- a\n    - b\n        - c\n- d"],
+    ["tab", "- a\n\t- b\n\t\t- c\n- d"],
+  ])("keeps a %s indented list nested", (_indent, markdown) => {
+    bound = mountBoundEditor();
+    bound.editor.commands.insertContent(markdownToHtml(markdown));
+    expect(fragmentXml(bound)).toBe(NESTED);
+  });
+
+  it("keeps a bullet sublist nested in an ordered item", () => {
+    bound = mountBoundEditor();
+    bound.editor.commands.insertContent(markdownToHtml("1. a\n   - b\n2. c"));
+    expect(fragmentXml(bound)).toMatch(
+      /^<ordered_list[^>]*><list_item><paragraph>a<\/paragraph><bullet_list><list_item><paragraph>b<\/paragraph>/,
+    );
   });
 });

@@ -7,7 +7,7 @@ import { useUi } from "../../stores/ui";
 /**
  * Switches the document between the fixed reading column and the wide
  * layout. Not role-gated — width is a reading preference, so viewers get it
- * too, unlike the ⌘E edit toggle it sits beside.
+ * too, unlike the edit toggle (⌘E / Ctrl+E) it sits beside.
  *
  * Hidden below the desktop breakpoint: wide mode's media query starts at the
  * same 1024px, and a control that provably does nothing is worse than none.
