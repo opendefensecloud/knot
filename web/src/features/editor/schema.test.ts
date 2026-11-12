@@ -76,6 +76,8 @@ const REGISTERED_EXTENSIONS = [
   "knotInternalLink",
   "knotMention",
   "knotTaskList",
+  // Keymap-only: End/Home move the DOM selection on a Mac; no document change.
+  "lineBoundaryKeys",
   "link",
   "list_item",
   // v3: ListItem registers this keymap itself, named after the node — so it

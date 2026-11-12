@@ -337,10 +337,13 @@ function EditorBody({
       editorProps: {
         handleDOMEvents: {
           keydown: (_view, event) => {
-            // ⌘E toggles edit mode (DocPage listens on window).
-            // @tiptap/extension-code binds the same chord to toggleCode;
-            // returning true skips ProseMirror's keymaps, and the event
-            // still bubbles to the window listener.
+            // Mod+E (⌘E on a Mac, Ctrl+E elsewhere) toggles edit mode
+            // (DocPage listens on window). @tiptap/extension-code binds the
+            // same chord, `Mod-e`, to toggleCode; returning true skips
+            // ProseMirror's keymaps, and the event still bubbles to the
+            // window listener. isEditModeShortcut reads Mod the way
+            // prosemirror-keymap does, so a Mac's Ctrl+E is not caught here
+            // and reaches Tiptap's end-of-line binding.
             if (isEditModeShortcut(event)) return true;
             if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v") {
               plainPasteRef.current = event.shiftKey;

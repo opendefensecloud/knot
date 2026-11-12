@@ -2,9 +2,13 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { createRef } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { restorePlatform, stubPlatform } from "../../test/platform";
 import { DocDockBar, DocDockControls } from "./DocDock";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  restorePlatform();
+});
 
 function controls(overrides: Partial<Parameters<typeof DocDockControls>[0]> = {}) {
   return (
@@ -25,15 +29,24 @@ function controls(overrides: Partial<Parameters<typeof DocDockControls>[0]> = {}
 
 describe("DocDockControls", () => {
   it("labels the edit toggle by mode and advertises the shortcut", () => {
+    stubPlatform("Linux x86_64");
     const { rerender } = render(controls());
     const edit = screen.getByTestId("dock-toggle-edit-mode");
-    expect(edit).toHaveAttribute("aria-label", "Edit (⌘E)");
+    expect(edit).toHaveAttribute("aria-label", "Edit (Ctrl+E)");
     expect(edit).toHaveAttribute("aria-pressed", "false");
-    expect(edit).toHaveAttribute("aria-keyshortcuts", "Control+E Meta+E");
+    expect(edit).toHaveAttribute("aria-keyshortcuts", "Control+E");
 
     rerender(controls({ editMode: true }));
-    expect(edit).toHaveAttribute("aria-label", "Stop editing (⌘E)");
+    expect(edit).toHaveAttribute("aria-label", "Stop editing (Ctrl+E)");
     expect(edit).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("advertises ⌘E on a Mac, where Ctrl+E is left to the editor", () => {
+    stubPlatform("MacIntel");
+    render(controls());
+    const edit = screen.getByTestId("dock-toggle-edit-mode");
+    expect(edit).toHaveAttribute("aria-label", "Edit (⌘E)");
+    expect(edit).toHaveAttribute("aria-keyshortcuts", "Meta+E");
   });
 
   it("presses Comments while the rail is open", () => {
