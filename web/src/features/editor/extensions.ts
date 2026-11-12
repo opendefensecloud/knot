@@ -27,6 +27,7 @@ import { TaskListExtension } from "./TaskListExtension";
 import { InternalLinkExtension } from "./InternalLinkExtension";
 import { MentionExtension, type MentionMember } from "./MentionExtension";
 import { DateTimeExtension } from "./DateTimeExtension";
+import { LineBoundaryKeys } from "./LineBoundaryKeys";
 import {
   KnotTable,
   KnotTableRow,
@@ -331,6 +332,8 @@ export function createExtensions(opts: {
       fetchMembers: opts.fetchMembers ?? (() => Promise.resolve([])),
     }),
     DateTimeExtension,
+    // End/Home move within the line on a Mac too, instead of scrolling.
+    LineBoundaryKeys,
     KnotTable,
     KnotTableRow,
     KnotTableCell,

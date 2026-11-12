@@ -290,6 +290,38 @@ test("at the top the toolbar stays one row and the dock goes away", async ({ pag
   await expect(page.getByTestId("doc-dock")).toHaveCount(0);
 });
 
+test("at the top, the shortcut puts the caret in the text, and End stays on the line", async ({ page }) => {
+  // #86: entering edit mode at the top left focus outside the editor, so
+  // End scrolled <main> to the bottom instead of moving the caret. Lines that
+  // fit on one row each, so the end of the caret's line is the end of its
+  // block. ControlOrMeta is the toggle's Mod: ⌘ on a Mac, Ctrl elsewhere.
+  const shortLines = Array.from({ length: PARAGRAPHS }, (_, i) => `Line ${i + 1} fits on one row.`).join("\n\n");
+  await longDocInViewMode(page, shortLines, PARAGRAPHS);
+  const startScrollTop = await scrollTop(page);
+
+  await page.keyboard.press("ControlOrMeta+e");
+  await expect(page.getByTestId("toggle-edit-mode")).toHaveAttribute("aria-pressed", "true");
+  await expect(prose(page)).toBeFocused();
+  // Focused without scrolling.
+  expect(Math.abs((await scrollTop(page)) - startScrollTop)).toBeLessThanOrEqual(2);
+
+  // The top-level block holding the caret: its 1-based index and text.
+  const caretBlock = await prose(page).evaluate((root) => {
+    const focusNode = window.getSelection()?.focusNode ?? null;
+    const focusElement = focusNode?.nodeType === Node.TEXT_NODE ? focusNode.parentElement : (focusNode as Element | null);
+    const block = Array.from(root.children).find((child) => child.contains(focusElement));
+    return block ? { index: Array.from(root.children).indexOf(block) + 1, text: block.textContent ?? "" } : null;
+  });
+  expect(caretBlock).not.toBeNull();
+
+  const beforeEnd = await scrollTop(page);
+  await page.keyboard.press("End");
+  expect(Math.abs((await scrollTop(page)) - beforeEnd)).toBeLessThanOrEqual(2);
+  await page.keyboard.type("X");
+  await expect(prose(page).locator(`> :nth-child(${caretBlock!.index})`)).toHaveText(`${caretBlock!.text}X`);
+  expect(Math.abs((await scrollTop(page)) - beforeEnd)).toBeLessThanOrEqual(2);
+});
+
 test.describe("on a phone", () => {
   test.use({ viewport: { width: 375, height: 667 } });
 
