@@ -8,6 +8,47 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.11] - 2026-11-12
+
+A fix release: nested lists, tables, keyboard shortcuts, the page
+scrollbar and SSO links.
+
+### Upgrading
+- No database migrations. Upgrade from 0.9.10 in place, and roll back to
+  0.9.10 without a restore. Coming from 0.9.9, upgrade to 0.9.10 first.
+
+### Added
+- **Indent** and **Outdent** buttons in the editor toolbar while the
+  caret is in a list, for touch screens without a Tab key. Inside a list
+  they take the place of the two diagram buttons. (#78)
+
+### Changed
+- The edit-mode shortcut is ⌘E on macOS and stays Ctrl+E elsewhere, so on
+  a Mac Ctrl+E and Ctrl+A move to the end and start of the line again
+  while editing. (#86)
+
+### Fixed
+- Typing `  - ` or `  1. ` at the start of a list item nests it, whether
+  you indent by 2 or 4 spaces, and the same indent on the next line stays
+  a sibling. (#78)
+- Lists pasted from Word for the web keep their nesting. (#78)
+- Delete at the end of a list item whose nested list has sublists of its
+  own works; it did nothing. (#78)
+- Starting to edit from the top of a page puts the caret in the text, so
+  End and Home no longer scroll the page; on a Mac they now move within
+  the line. (#86)
+- Long pages no longer show a third scrollbar that scrolled the sidebar
+  and the page together. (#87)
+- Clicking into a table no longer makes the page jump: the row and column
+  actions moved into a **Table** menu in place of **Insert table**. (#77)
+- Inside a table cell, Tab and Shift+Tab indent list items and code lines
+  instead of jumping to the next cell. (#77)
+- Tables can no longer end up inside tables, and a table at the end of a
+  page no longer traps the cursor. (#77)
+- Signing in with SSO from a link to a page, comment or suggestion opens
+  that link instead of the start page. Password sign-in keeps comment and
+  suggestion links too. (#84)
+
 ## [0.9.10] - 2026-11-08
 
 ### Upgrading
@@ -1224,7 +1265,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.10...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.11...HEAD
+[0.9.11]: https://github.com/opendefensecloud/knot/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/opendefensecloud/knot/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/opendefensecloud/knot/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/opendefensecloud/knot/compare/v0.9.7...v0.9.8

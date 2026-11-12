@@ -254,6 +254,10 @@ Two log lines and metrics are new and worth an alert:
 
 Edits that cannot be saved during a database outage are now kept and retried in order, also when a pod shuts down: after the HTTP drain, a pod waits up to 10 s more to save edits it still holds. The shutdown budget is `preStopSleepSeconds` (default 5) + 30 s (the HTTP request timeout) + 10 s, plus a few seconds of slack, and the chart's default `terminationGracePeriodSeconds` is now 50, which includes that slack. A shorter value can lose buffered edits when a pod stops during a database outage.
 
+### Upgrading from 0.9.10
+
+Upgrade to 0.9.11 from 0.9.10 with a plain `helm upgrade`: it has no migrations, so the `pre-upgrade` Job finds nothing to apply, and rolling back to 0.9.10 needs no database restore. Coming from 0.9.9, upgrade to 0.9.10 first (see [Upgrading from 0.9.9](#upgrading-from-099)).
+
 ## Operational notes
 
 - **Healthchecks** — readiness `/api/readyz`, liveness `/api/healthz`. Disable with `probes.enabled=false` if you want to debug a wedged pod.
