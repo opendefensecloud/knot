@@ -130,8 +130,8 @@ async fn history_stats_on_empty_db_reports_zeros() {
     );
 }
 
-/// A database before 0.9.11 has no checkpoints or entries tables: the
-/// command still runs and reports them as 0.
+/// A database before the history builder migration has no checkpoints or
+/// entries tables: the command still runs and reports them as 0.
 #[tokio::test(flavor = "multi_thread")]
 async fn history_stats_before_the_builder_tables_reports_zeros() {
     let db = knot_test_support::fresh_db().await;
