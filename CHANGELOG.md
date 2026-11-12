@@ -24,8 +24,40 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   page the reader can't see looks the same as an unknown one. On an
   archived page the button copies the page's existing short link, or its
   long link if it never had one.
+- Indent and Outdent buttons in the editor toolbar while the caret is in
+  a list item. They do what Tab and Shift+Tab do, which a touch screen
+  has no key for. To fit on one row they take the
+  place of the two diagram buttons inside a list; a diagram can still be
+  inserted after the list. (#78)
+
+### Changed
+- The edit-mode shortcut is ⌘E on macOS and Ctrl+E elsewhere. On a Mac,
+  Ctrl+E toggled editing too, so it no longer moved the caret to the end
+  of the line the way it does in every other Mac text field; Ctrl+A and
+  Ctrl+E now move to the start and end of the line while editing. The
+  button tooltips show the shortcut for your platform. (#86)
 
 ### Fixed
+- Typing a Markdown-style indented list marker nests the item. `  - `
+  (or `  1. `) at the start of a list item moves it one level in per two
+  spaces or one tab, and the same indent on the next line keeps it a
+  sibling instead of nesting deeper. After a list, `  - ` on a new line
+  nests under the list's last item instead of joining it at the top
+  level. A bare `- ` still starts a top-level item. (#78)
+- Lists pasted from apps that mark nesting with `aria-level` (Word for
+  the web, among others) keep their nesting instead of landing all on
+  the top level. (#78)
+- Delete at the end of a list item whose nested list has sublists of its
+  own moves the nested items up beside it; it did nothing. (#78)
+- Starting to edit from the top of a page puts the caret in the text, so
+  End, Home and the arrow keys move in the text instead of scrolling the
+  page. (#86)
+- On a Mac, End and Home move to the end and start of the line while
+  editing, instead of scrolling to the bottom or top of the page. (#86)
+- A long page no longer shows a third scrollbar on the window that moved
+  the sidebar and the page together. A visually hidden status message at
+  the foot of the page sat outside the scrolling pane and stretched the
+  window. (#87)
 - Signing in with SSO from a page link lands on that page. The OIDC
   callback always redirected to the start page, which opens the first page
   in the tree, so a colleague who followed a link while signed out lost it.
