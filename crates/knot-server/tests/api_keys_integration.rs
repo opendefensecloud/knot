@@ -579,6 +579,45 @@ async fn api_key_lifecycle() {
     assert_eq!(body["error"]["code"], "api_key.not_found", "{body}");
 }
 
+/// The 201 carries the only copy of the secret, so nothing on the way may
+/// store it; the listing gets the same header.
+#[tokio::test(flavor = "multi_thread")]
+async fn key_responses_are_never_cached() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    for (method, body) in [
+        (
+            "POST",
+            Body::from(serde_json::json!({"name": "ci", "scopes": ["read"]}).to_string()),
+        ),
+        ("GET", Body::empty()),
+    ] {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/api/auth/api-keys")
+                    .header("cookie", &s.cookie)
+                    .header("x-csrf-token", &s.csrf)
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "{method}: {}", r.status());
+        assert_eq!(
+            r.headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap()),
+            Some("no-store"),
+            "{method}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn api_key_create_validates_name_and_scopes() {
     let state = state_with_owner("owner@example.com", "ownerpass1").await;
@@ -1370,6 +1409,134 @@ async fn update_key_scope_matrix() {
 
     let (st, body) = guards_bearer(&app, &key, "DELETE", &format!("/api/docs/{doc}"), None).await;
     assert_scope_denied(st, &body, "delete");
+}
+
+/// Restrict a page through the session.
+async fn restrict_doc(app: &axum::Router, s: &Session, doc: &str) {
+    let (st, body) = send(
+        app,
+        s,
+        "PUT",
+        &format!("/api/docs/{doc}/restricted"),
+        Some(serde_json::json!({"restricted": true})),
+    )
+    .await;
+    assert!(st.is_success(), "restrict {doc}: {st} {body}");
+}
+
+/// Move a page through the session; it must succeed.
+async fn session_move(app: &axum::Router, s: &Session, doc: &str, parent: serde_json::Value) {
+    let (st, body) = send(
+        app,
+        s,
+        "POST",
+        &format!("/api/docs/{doc}/move"),
+        Some(serde_json::json!({ "parent_id": parent })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "session move of {doc}: {body}");
+}
+
+/// The page's parent as the session sees it.
+async fn parent_of(app: &axum::Router, s: &Session, doc: &str) -> serde_json::Value {
+    let (st, body) = send(app, s, "GET", &format!("/api/docs/{doc}"), None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    body["parent_id"].clone()
+}
+
+/// A move across a restriction boundary changes who can reach the page, like
+/// `PUT /restricted` or a grant, and that outlives the key (S2). So even a
+/// page owner's key may not do it: out of a restricted subtree, into one, or
+/// between two. Moves inside one subtree, or between open pages, stay open
+/// to an `update` key, and the owner's session may still cross.
+#[tokio::test(flavor = "multi_thread")]
+async fn key_cannot_move_a_page_across_a_restriction_boundary() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let owner = login(&app, "owner@example.com", "ownerpass1").await;
+    let colleague = add_human(&app, &owner, "colleague@example.com", "colleaguepass1").await;
+
+    // Two restricted folders; R holds two subpages.
+    let folder_r = matrix_doc(&app, &owner, "R").await;
+    let folder_s = matrix_doc(&app, &owner, "S").await;
+    restrict_doc(&app, &owner, &folder_r).await;
+    restrict_doc(&app, &owner, &folder_s).await;
+    let inside_r = matrix_doc(&app, &owner, "inside R").await;
+    let sibling_in_r = matrix_doc(&app, &owner, "sibling in R").await;
+    let outside = matrix_doc(&app, &owner, "outside").await;
+    let other_outside = matrix_doc(&app, &owner, "other outside").await;
+    session_move(&app, &owner, &inside_r, serde_json::json!(folder_r)).await;
+    session_move(&app, &owner, &sibling_in_r, serde_json::json!(folder_r)).await;
+
+    let key = matrix_key(&app, &owner, &["read", "update"]).await;
+
+    for (what, doc, target) in [
+        (
+            "out of R to the top level",
+            &inside_r,
+            serde_json::Value::Null,
+        ),
+        (
+            "out of R under an open page",
+            &inside_r,
+            serde_json::json!(outside),
+        ),
+        ("into R", &outside, serde_json::json!(folder_r)),
+        ("from R into S", &inside_r, serde_json::json!(folder_s)),
+    ] {
+        let before = parent_of(&app, &owner, doc).await;
+        let (st, body) = guards_bearer(
+            &app,
+            &key,
+            "POST",
+            &format!("/api/docs/{doc}/move"),
+            Some(serde_json::json!({ "parent_id": target })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{what}: {body}");
+        assert_eq!(
+            body["error"]["code"], "api_key.session_required",
+            "{what}: {body}"
+        );
+        assert_eq!(
+            parent_of(&app, &owner, doc).await,
+            before,
+            "{what}: the page moved"
+        );
+    }
+    // The page stayed out of the colleague's reach.
+    let (st, body) = send(
+        &app,
+        &colleague,
+        "GET",
+        &format!("/api/docs/{inside_r}"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+
+    // Inside one subtree, and between open pages, a key still moves pages.
+    for (what, doc, target) in [
+        ("within R", &inside_r, serde_json::json!(sibling_in_r)),
+        (
+            "between open pages",
+            &outside,
+            serde_json::json!(other_outside),
+        ),
+    ] {
+        let (st, body) = guards_bearer(
+            &app,
+            &key,
+            "POST",
+            &format!("/api/docs/{doc}/move"),
+            Some(serde_json::json!({ "parent_id": target })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{what}: {body}");
+    }
+
+    // The owner's session may still cross.
+    session_move(&app, &owner, &inside_r, serde_json::Value::Null).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2755,7 +2922,7 @@ async fn a_bearer_header_wins_over_a_valid_cookie() {
     assert_scope_denied(st, &body, "create");
 
     let (st, body) =
-        cookie_and_authorization(&app, &s, "Bearer nope", "GET", "/api/docs", None).await;
+        cookie_and_authorization(&app, &s, "Bearer knot_nope", "GET", "/api/docs", None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
     assert_eq!(body["error"]["code"], "api_key.invalid", "{body}");
 
@@ -2778,6 +2945,48 @@ async fn a_bearer_header_wins_over_a_valid_cookie() {
     // from the header.
     let (st, body) = send(&app, &s, "POST", "/api/docs", Some(new_doc)).await;
     assert_eq!(st, StatusCode::CREATED, "{body}");
+}
+
+/// A Bearer token that isn't a knot key, as an auth proxy in front of knot
+/// forwards with every request, is ignored: the cookie session answers, as it
+/// did before API keys existed, and so do the health checks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proxy_bearer_token_next_to_a_cookie_is_ignored() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let jwt = "Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln";
+
+    let (st, body) = cookie_and_authorization(&app, &s, jwt, "GET", "/api/docs", None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let (st, body) = cookie_and_authorization(
+        &app,
+        &s,
+        jwt,
+        "POST",
+        "/api/docs",
+        Some(serde_json::json!({"title": "through the proxy"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CREATED,
+        "a write is served from the cookie: {body}"
+    );
+    for path in ["/api/healthz", "/api/readyz", "/api/version"] {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("authorization", jwt)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "{path}");
+    }
 }
 
 /// S9, over a real socket: the HTTP parser trims trailing whitespace, so

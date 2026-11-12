@@ -36,7 +36,9 @@ export type CreateApiKeyInput = {
   userId?: string;
 };
 
-export const apiKeysQueryKey = (userId?: string) => ["api-keys", userId ?? "self"] as const;
+/** Prefix of every key list's query key: invalidating it refreshes them all. */
+export const API_KEYS_ROOT_KEY = ["api-keys"] as const;
+export const apiKeysQueryKey = (userId?: string) => [...API_KEYS_ROOT_KEY, userId ?? "self"] as const;
 
 function userQuery(userId?: string) {
   return userId ? `?user_id=${encodeURIComponent(userId)}` : "";

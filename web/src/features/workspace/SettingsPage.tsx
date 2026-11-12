@@ -9,6 +9,7 @@ import { useSession } from "../../auth/SessionContext";
 import { useUi } from "../../stores/ui";
 
 import { ApiKeysSection } from "../apiKeys/ApiKeysSection";
+import { API_KEYS_ROOT_KEY } from "../apiKeys/apiKeys.api";
 import { readCookie } from "../../lib/csrf";
 import { SkinPicker } from "./SkinPicker";
 import { workspaceApi } from "./workspace.api";
@@ -41,6 +42,8 @@ export default function SettingsPage() {
         return;
       }
       setPwCurrent(""); setPwNew(""); setPwOk(true);
+      // The change revoked this user's keys and the bot keys they minted.
+      void qc.invalidateQueries({ queryKey: API_KEYS_ROOT_KEY });
     },
   });
 

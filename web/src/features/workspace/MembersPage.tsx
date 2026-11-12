@@ -6,6 +6,7 @@ import type { Member } from "../../lib/validators";
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { useUi } from "../../stores/ui";
 import { ApiKeysSection } from "../apiKeys/ApiKeysSection";
+import { API_KEYS_ROOT_KEY } from "../apiKeys/apiKeys.api";
 
 import { memberMatches } from "./memberSearch";
 import { workspaceApi } from "./workspace.api";
@@ -65,12 +66,21 @@ export default function MembersPage() {
     },
   });
 
+  // A removal or an owner's demotion revokes keys server-side (the member's
+  // own, and the bot keys an owner minted), so every open key list is stale.
+  async function refreshAfterRevokingChange() {
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ["members"] }),
+      qc.invalidateQueries({ queryKey: API_KEYS_ROOT_KEY }),
+    ]);
+  }
+
   const setRole = useMutation({
     mutationFn: async (a: { userId: string; role: "owner" | "editor" | "viewer" }) =>
       workspaceApi.setRole(a.userId, a.role),
     onSuccess: async (r) => {
       if ("error" in r) notify("error", "Role change failed");
-      else await qc.invalidateQueries({ queryKey: ["members"] });
+      else await refreshAfterRevokingChange();
     },
   });
 
@@ -78,7 +88,7 @@ export default function MembersPage() {
     mutationFn: async (userId: string) => workspaceApi.remove(userId),
     onSuccess: async (r) => {
       if ("error" in r) notify("error", "Remove failed");
-      else await qc.invalidateQueries({ queryKey: ["members"] });
+      else await refreshAfterRevokingChange();
     },
   });
 
