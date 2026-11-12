@@ -109,6 +109,63 @@ async function scrollTop(page: Page): Promise<number> {
   return page.evaluate(() => document.querySelector("main")!.scrollTop);
 }
 
+/** How far the window itself could scroll down: the root's scrollable
+ *  overflow past the viewport. Zero or less means the window has no
+ *  scrollbar of its own and only the panes inside it scroll. */
+async function windowOverflow(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const root = document.scrollingElement!;
+    return root.scrollHeight - root.clientHeight;
+  });
+}
+
+/** The window has nothing to scroll, here and in every state the test put
+ *  the page in. Asks it to scroll anyway, so a page whose overflow only
+ *  shows up under a scroll fails here too. scrollTo rather than the mouse
+ *  wheel: a wheel lands in <main> first and reaches the window only once
+ *  main has run out. */
+async function expectWindowNeverScrolls(page: Page) {
+  expect(await windowOverflow(page)).toBeLessThanOrEqual(0);
+  await page.evaluate(() => window.scrollTo(0, 1e6));
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+}
+
+/** #87: the edit-mode announcer, a visually hidden live region at the foot of
+ *  the document, once escaped <main>'s scrolling and gave the window a third
+ *  scrollbar the length of the document, over the sidebar's and the
+ *  content's own. It is there in view mode too, and gets its text on the
+ *  switch to edit mode.
+ *
+ *  The window checks are the user-visible result, and the shell's
+ *  overflow-clip backstop alone would also pass them. What pins the fix
+ *  itself is the first check: the announcer resolves against <main> (its
+ *  offsetParent, the nearest positioned ancestor of a positioned element), so
+ *  <main> scrolls and clips it. AppShell.test.tsx pins the classes too. */
+async function expectOnlyThePanesScroll(page: Page) {
+  await expect(page.getByTestId("edit-mode-announcer")).toHaveCount(1);
+  expect(
+    await page
+      .getByTestId("edit-mode-announcer")
+      .evaluate((announcer) => (announcer as HTMLElement).offsetParent?.tagName),
+  ).toBe("MAIN");
+  expect(await windowOverflow(page)).toBeLessThanOrEqual(0);
+
+  await scrollMid(page);
+  expect(await windowOverflow(page)).toBeLessThanOrEqual(0);
+
+  await page.getByTestId("dock-toggle-edit-mode").click();
+  await expect(page.getByTestId("toggle-edit-mode")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("edit-mode-announcer")).toHaveText("Editing");
+  await expectWindowNeverScrolls(page);
+  // The document itself still scrolls, inside <main>.
+  expect(await scrollTop(page)).toBeGreaterThan(0);
+}
+
+test("a long document scrolls inside <main>; the window itself never scrolls (#87)", async ({ page }) => {
+  await longDocInViewMode(page);
+  await expectOnlyThePanesScroll(page);
+});
+
 test("mid-document, the dock enters and leaves edit mode without moving the text", async ({ page }) => {
   await longDocInViewMode(page);
   await scrollMid(page);
@@ -259,5 +316,12 @@ test.describe("on a phone", () => {
     expect(bold.x).toBeGreaterThanOrEqual(menu.x + menu.width);
     const toolbarBox = (await page.getByTestId("editor-toolbar").boundingBox())!;
     expect(await top(paragraph(page, n))).toBeGreaterThanOrEqual(toolbarBox.y + toolbarBox.height - 1);
+  });
+
+  test("a long document scrolls inside <main>; the window itself never scrolls (#87)", async ({ page }) => {
+    // The phone shell is a plain block, not a grid, and <main> is its own
+    // h-dvh scroller there: the announcer escaped it the same way.
+    await longDocInViewMode(page);
+    await expectOnlyThePanesScroll(page);
   });
 });
