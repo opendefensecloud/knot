@@ -971,6 +971,10 @@ impl ImportPlan {
     /// of page Markdown or `MAX_IMPORT_BYTES` of files and board images, or
     /// hold more than `MAX_IMPORT_REFERENCES` attachment and board
     /// references.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the Err is the ready axum Response, returned unboxed like the async handlers do"
+    )]
     fn enforce_caps(&self) -> Result<(), Response> {
         if self.pages <= MAX_IMPORT_PAGES
             && self.markdown_bytes <= MAX_IMPORT_MARKDOWN_BYTES

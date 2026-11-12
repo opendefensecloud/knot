@@ -21,7 +21,7 @@
 - Time comes from `tokio::time::Instant` so tests use `#[tokio::test(start_paused = true)]`.
 - Migrations forward-only; bound lock waits with `knot_lock_tables` (see `migrations/20261109120000_doc_short_links.sql`). After adding one, `touch crates/knot-test-support/src/lib.rs`.
 - Tests: `knot_test_support::fresh_db()`, never testcontainers. DB-backed tests need Postgres on `KNOT_TEST_DATABASE_URL` (default `127.0.0.1:5432`). If none is reachable, still write them, make them compile (`cargo test --workspace --no-run`), run every non-DB test, and say in the task report which tests were not run.
-- Local toolchain differs from CI: clippy with `cargo clippy --workspace --all-targets -- -D warnings -A clippy::result_large_err -A deprecated`; `cargo test` (nextest is not installed); vitest with `NODE_OPTIONS=--no-experimental-webstorage` and pnpm via `npx pnpm`.
+- Local toolchain differs from CI: clippy with `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test` (nextest is not installed); vitest with `NODE_OPTIONS=--no-experimental-webstorage` and pnpm via `npx pnpm`.
 - **Do not commit or push** (the session's permissions refuse it; the user commits). Leave each task's changes in the working tree; don't run `git add`, `git stash`, `git checkout -- …` or `git reset` either — other agents may be working in `web/` or `deploy/` at the same time. The commit messages named in each task are for the user's later commits.
 - Descriptive variable names (user rule).
 

@@ -80,7 +80,7 @@ The spec and plan were updated to match each of these.
 All run on the final tree.
 
 - **Rust:**
-  - `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings -A clippy::result_large_err -A deprecated`: clean.
+  - `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` (the CI command): clean.
   - `cargo test --workspace` against a throwaway Postgres 18 (tmpfs, own compose project): everything passes. The first run had 1702 passed and 89 failed:
     - 86 failures came from the throwaway database's tmpfs filling up (`could not extend file … No space left on device`), all in knot-storage. After recycling the container, `cargo test -p knot-storage` passed 303/303.
     - 3 failures were real, in `collab_rate_limit_integration.rs`: its fixture created every extra page with the same top-level sort key, so the second `create` hit the unique constraint (`Conflict`). The fixture now hands out increasing keys, and the target passes 8/8.

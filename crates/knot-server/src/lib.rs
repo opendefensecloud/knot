@@ -388,6 +388,10 @@ pub fn collab_write_access(
 /// bucket per user and target. A refusal is a 429 `rate.limited` with
 /// `Retry-After`, which the browser sees as a failed upgrade (close 1006)
 /// and both providers back off from; no new close code.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is the ready axum Response, returned unboxed like the async handlers do"
+)]
 fn admit_collab_socket(
     state: &AppState,
     ctx: &crate::auth::AuthContext,

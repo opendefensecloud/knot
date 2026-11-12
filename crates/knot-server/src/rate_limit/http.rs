@@ -222,6 +222,10 @@ impl HttpLimits {
     }
 
     /// [`HttpLimits::check`] as a response: `Err` holds the 429.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the Err is the ready axum Response, returned unboxed like the async handlers do"
+    )]
     fn check_response(
         &self,
         bucket: HttpBucket,
@@ -233,6 +237,10 @@ impl HttpLimits {
     }
 
     /// [`HttpLimits::check_response`], with the 429 as an HTML page.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the Err is the ready axum Response, returned unboxed like the async handlers do"
+    )]
     fn check_page_response(
         &self,
         bucket: HttpBucket,
@@ -406,6 +414,10 @@ impl UnresolvedReason {
 
 /// Take one token from `user_id`'s `bucket`, from a handler. Success spends
 /// the token; `Err` holds the 429 and spends nothing.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is the ready axum Response, returned unboxed like the async handlers do"
+)]
 pub fn take_user_token(
     state: &AppState,
     bucket: HttpBucket,
