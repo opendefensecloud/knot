@@ -16,6 +16,8 @@ import {
   Link as LinkIcon,
   List,
   ListChecks,
+  ListIndentDecrease,
+  ListIndentIncrease,
   ListOrdered,
   Lock,
   MessageSquarePlus,
@@ -129,6 +131,7 @@ export function EditorToolbar({
   const scope = suggestionScope(editor.state);
   const canSuggest = Boolean(onSuggest) && scope.ok && scope.kind === "insert";
   const suggestTitle = onSuggest && !scope.ok ? SCOPE_TOOLTIP[scope.reason] : undefined;
+  const inListItem = editor.isActive("list_item");
 
   return (
     // The band spans the full shell so wide content scrolling under it is
@@ -232,47 +235,77 @@ export function EditorToolbar({
           onClick={() => c().toggleCodeBlock().run()}>
           <Code2 size={15} aria-hidden />
         </Btn>
-        <Btn
-          testId="toolbar-mermaid"
-          label="Insert diagram"
-          onClick={() =>
-            c()
-              .insertContent({
-                type: "code_block",
-                attrs: { language: "mermaid" },
-                content: [
-                  {
-                    type: "text",
-                    text: "graph TD\n  A[Start] --> B{Decision}\n  B -->|Yes| C[OK]\n  B -->|No| D[End]",
-                  },
-                ],
-              })
-              .run()
-          }
-        >
-          <Network size={15} aria-hidden />
-        </Btn>
-        <Btn
-          testId="toolbar-excalidraw"
-          label="Insert Excalidraw diagram"
-          onClick={() => {
-            void (async () => {
-              const res = await boardsApi.create(docId, null);
-              if ("error" in res) {
-                notify("error", "Failed to create diagram.");
-                return;
+        {/* In a list item, Indent and Outdent take the two diagram buttons'
+            slot. They do what Tab and Shift-Tab do, but a touch screen has
+            no Tab, and nothing else told anyone those nest (#78). Shown next to
+            the rest, they would push the row past its width and wrap it,
+            moving the page under the caret every time it entered a list —
+            what the table actions sharing one menu avoids. A diagram can
+            still be inserted after the list. */}
+        {inListItem ? (
+          <>
+            <Btn
+              testId="toolbar-indent"
+              label="Indent (Tab)"
+              disabled={!editor.can().sinkListItem("list_item")}
+              onClick={() => c().sinkListItem("list_item").run()}
+            >
+              <ListIndentIncrease size={15} aria-hidden />
+            </Btn>
+            <Btn
+              testId="toolbar-outdent"
+              label="Outdent (Shift+Tab)"
+              disabled={!editor.can().liftListItem("list_item")}
+              onClick={() => c().liftListItem("list_item").run()}
+            >
+              <ListIndentDecrease size={15} aria-hidden />
+            </Btn>
+          </>
+        ) : (
+          <>
+            <Btn
+              testId="toolbar-mermaid"
+              label="Insert diagram"
+              onClick={() =>
+                c()
+                  .insertContent({
+                    type: "code_block",
+                    attrs: { language: "mermaid" },
+                    content: [
+                      {
+                        type: "text",
+                        text: "graph TD\n  A[Start] --> B{Decision}\n  B -->|Yes| C[OK]\n  B -->|No| D[End]",
+                      },
+                    ],
+                  })
+                  .run()
               }
-              c()
-                .insertContent({
-                  type: "excalidraw_board",
-                  attrs: { board_id: res.ok.id, label: null },
-                })
-                .run();
-            })();
-          }}
-        >
-          <PenSquare size={15} aria-hidden />
-        </Btn>
+            >
+              <Network size={15} aria-hidden />
+            </Btn>
+            <Btn
+              testId="toolbar-excalidraw"
+              label="Insert Excalidraw diagram"
+              onClick={() => {
+                void (async () => {
+                  const res = await boardsApi.create(docId, null);
+                  if ("error" in res) {
+                    notify("error", "Failed to create diagram.");
+                    return;
+                  }
+                  c()
+                    .insertContent({
+                      type: "excalidraw_board",
+                      attrs: { board_id: res.ok.id, label: null },
+                    })
+                    .run();
+                })();
+              }}
+            >
+              <PenSquare size={15} aria-hidden />
+            </Btn>
+          </>
+        )}
         <Btn
           testId="toolbar-suggest"
           label="Suggest an insertion"
