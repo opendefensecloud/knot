@@ -6,7 +6,8 @@
 //! `GET /auth/oidc/callback` — verify state, exchange code, verify
 //!                              id_token + nonce, look up or
 //!                              auto-provision the user, mint a session,
-//!                              redirect to base_url.
+//!                              redirect to base_url, or to the
+//!                              `return_to` path `login` was given.
 
 use std::collections::HashMap;
 
@@ -36,11 +37,43 @@ pub struct CallbackQuery {
     pub state: String,
 }
 
+#[derive(Deserialize)]
+pub struct LoginQuery {
+    /// Where to land after sign-in, a path on this site (`/doc/…`).
+    pub return_to: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct FlowState {
     state: String,
     nonce: String,
     pkce: String,
+    /// The checked `return_to`; absent in cookies minted before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    return_to: Option<String>,
+}
+
+/// Upper bound on a kept `return_to`, so it can't bloat the flow cookie.
+const MAX_RETURN_PATH: usize = 2048;
+
+/// `raw` when it is a path on this site, else `None`. A path must start with
+/// a single `/`: `//host` and `/\host` are other hosts to a browser, and
+/// browsers drop tabs and newlines from URLs, so `/<tab>/host` becomes
+/// `//host`, hence no control characters at all.
+fn return_path(raw: &str) -> Option<&str> {
+    let rest = raw.strip_prefix('/')?;
+    if rest.starts_with('/') || rest.starts_with('\\') {
+        return None;
+    }
+    // JSON doubles `"` and `\` in the flow cookie, so a crafted run of them
+    // could push it past the browser's cookie limit. With them gone, the
+    // cookie stays under ~3 KB for the longest accepted path. A browser
+    // never leaves `"` raw and turns `\` into `/` in the path; a raw `\` in
+    // the query or hash only costs the return target (fails safe to `/`).
+    if raw.len() > MAX_RETURN_PATH || raw.chars().any(|c| c.is_control() || c == '"' || c == '\\') {
+        return None;
+    }
+    Some(raw)
 }
 
 pub fn router() -> Router<AppState> {
@@ -49,7 +82,7 @@ pub fn router() -> Router<AppState> {
         .route("/auth/oidc/callback", get(callback))
 }
 
-async fn login(State(state): State<AppState>) -> Response {
+async fn login(State(state): State<AppState>, Query(q): Query<LoginQuery>) -> Response {
     let Some(oidc) = state.oidc.clone() else {
         return json_err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -62,6 +95,11 @@ async fn login(State(state): State<AppState>) -> Response {
         state: start.csrf_state.clone(),
         nonce: start.nonce.clone(),
         pkce: start.pkce_verifier.clone(),
+        return_to: q
+            .return_to
+            .as_deref()
+            .and_then(return_path)
+            .map(str::to_owned),
     };
     let encoded = match serde_json::to_vec(&flow) {
         Ok(b) => URL_SAFE_NO_PAD.encode(b),
@@ -211,7 +249,12 @@ async fn callback(
 
     let (sid, csrf) = build_session_cookies(&state, &token);
     let flow_clear = build_flow_clear_cookie();
-    let mut resp = Redirect::to(&state.base_url).into_response();
+    // Checked again here: the cookie came back from the browser.
+    let target = match flow.return_to.as_deref().and_then(return_path) {
+        Some(path) => format!("{}{path}", state.base_url.trim_end_matches('/')),
+        None => state.base_url.clone(),
+    };
+    let mut resp = Redirect::to(&target).into_response();
     append_session_cookies(&mut resp, &sid, &csrf);
     resp.headers_mut().append(
         header::SET_COOKIE,
@@ -329,7 +372,46 @@ fn always_policy_allows(email_verified: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{always_policy_allows, domain_policy_allows};
+    use super::{always_policy_allows, domain_policy_allows, return_path};
+
+    // ---- return path after login ----
+
+    #[test]
+    fn return_path_keeps_a_page_on_this_site() {
+        assert_eq!(return_path("/doc/0b9f6a4e"), Some("/doc/0b9f6a4e"));
+        assert_eq!(
+            return_path("/doc/0b9f6a4e/permissions?x=1#h"),
+            Some("/doc/0b9f6a4e/permissions?x=1#h")
+        );
+    }
+
+    #[test]
+    fn return_path_never_leaves_this_site() {
+        // Each of these would send the freshly signed-in user to another host.
+        for target in [
+            "//evil.example/doc/1",
+            "/\\evil.example",
+            "/\t/evil.example",
+            "/\n/evil.example",
+            "https://evil.example/",
+            "evil.example",
+            "",
+        ] {
+            assert_eq!(return_path(target), None, "{target:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn return_path_refuses_what_a_browser_path_never_holds() {
+        // A browser percent-encodes `"` and `\` in a path, so only a crafted
+        // link carries them raw, and JSON doubles each one in the flow
+        // cookie: a long run of them pushed it past the browser's 4 KB limit
+        // and the browser dropped it, failing that sign-in.
+        let long_run = format!("/{}", "\"".repeat(2047));
+        for target in ["/doc/\"x", "/doc\\x", long_run.as_str()] {
+            assert_eq!(return_path(target), None, "{target:?} must be refused");
+        }
+    }
 
     // ---- always policy ----
 
