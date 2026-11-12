@@ -1,6 +1,8 @@
 import { Link as LinkIcon } from "lucide-react";
 import { useState } from "react";
 
+import type { ApiError } from "../../lib/api";
+import { notifyFailure } from "../../lib/limitErrors";
 import { shortLinksApi } from "../../lib/shortLinks.api";
 import { useUi } from "../../stores/ui";
 
@@ -8,18 +10,20 @@ import { useUi } from "../../stores/ui";
  * Copies the page's short link, for every reader. A live page gets its code
  * on first use; an archived page only copies a code it already has, else
  * its long `/doc/<id>` link. When the clipboard refuses (insecure context,
- * denied permission) the link is shown to copy by hand.
+ * denied permission) the link is shown to copy by hand. A refused link (a
+ * rate limit, say) is said in a toast.
  */
 export function CopyLinkButton({ docId, archived }: { docId: string; archived: boolean }) {
   const notify = useUi((s) => s.notify);
   const [fallback, setFallback] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  async function linkToCopy(): Promise<string | null> {
+  /** The link to copy, or why there is none. */
+  async function linkToCopy(): Promise<{ link: string } | { error: ApiError }> {
     const r = archived ? await shortLinksApi.get(docId) : await shortLinksApi.getOrCreate(docId);
-    if ("ok" in r) return r.ok.url;
-    if (archived && r.error.status === 404) return `${window.location.origin}/doc/${docId}`;
-    return null;
+    if ("ok" in r) return { link: r.ok.url };
+    if (archived && r.error.status === 404) return { link: `${window.location.origin}/doc/${docId}` };
+    return { error: r.error };
   }
 
   /**
@@ -40,14 +44,16 @@ export function CopyLinkButton({ docId, archived }: { docId: string; archived: b
 
   async function onClick() {
     setBusy(true);
-    const url = linkToCopy();
+    const answer = linkToCopy();
+    const url = answer.then((a) => ("link" in a ? a.link : null));
     const copied = copy(url);
     try {
-      const link = await url;
-      if (!link) {
-        notify("error", "Couldn't get a link for this page.");
+      const outcome = await answer;
+      if ("error" in outcome) {
+        notifyFailure(notify, outcome.error, "Couldn't get a link for this page.");
         return;
       }
+      const link = outcome.link;
       try {
         await copied;
         setFallback(null);

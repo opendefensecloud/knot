@@ -15,7 +15,7 @@ Targets apply to a single knot deployment serving a single workspace. Multi-regi
 | `/auth/login`, `/auth/setup`, `/auth/password` | **99 %** successful | 30-day rolling |
 | `/auth/oidc/*` | follows the IdP's own SLO, never tighter than 99 % | 30-day rolling |
 
-A response with status `5xx` or a dropped TCP connection counts against the budget. `4xx` does not (user error).
+A response with status `5xx` or a dropped TCP connection counts against the budget. `4xx` does not (user error), and neither does a `429 rate.limited` refusal or a refused collab WebSocket upgrade (429): a client past a rate limit is not an outage. Watch those separately (below).
 
 PromQL — error rate:
 
@@ -63,6 +63,9 @@ These aren't SLOs but operating bounds:
 
 - **DB pool busy** — alert if `(pool_size − pool_idle) / pool_size > 0.8` for 5 minutes. Default pool: 16 connections per replica (`KNOT_DB_MAX_CONNECTIONS` / chart `database.maxConnections`).
 - **Active rooms per pod** — soft cap at 1000. Beyond that, raise `room_idle_evict_sec` lower so cold rooms unload.
+- **Rate-limited requests** — normal use never reaches a rate limit, so a sustained `knot_rate_limited_total{bucket}` means a script or misbehaving client: ticket if any bucket refuses more than 1 request a second for 30 minutes (the chart's `KnotRateLimitedSustained`, threshold `alerting.rateLimitedPerSecond`). Limits: `KNOT_RATE_LIMIT_ENABLED`, `KNOT_RATE_LIMIT_SCALE`, `KNOT_RATE_LIMIT_COLLAB_MAX_SOCKETS` / chart `rateLimit.*`; per replica. `knot_client_ip_unresolved_total{reason="no_trusted_proxies"}` above 0 means knot is behind a proxy and `KNOT_TRUSTED_PROXIES` / chart `trustedProxies` is empty (the per-IP limits are skipped for those requests); `reason="untrusted_peer"` counts a peer outside the list that sent `X-Forwarded-For`, a proxy left out or a client sending the header itself. Both count only while rate limits are on.
+- **Quotas** — `knot_quota_exceeded_total{quota,scope}` counts refusals once a quota (`KNOT_QUOTA_*` / chart `quotas.*`, off by default) is reached; it is a capacity signal for the operator, not an error.
+- **Collab throttling** — `knot_collab_throttled_total{kind,action}` and `knot_collab_throttle_wait_seconds`: a user's edits waiting for their WebSocket budget. They arrive later, never lost; a steady rate means a user is pasting or scripting far above typing speed.
 - **Memory** — knot-server with mimalloc keeps RSS proportional to active rooms + connected clients. The `requests: 128Mi / limits: 512Mi` default in the chart fits a few hundred active rooms; right-size for your scale.
 
 ## Error budget
@@ -84,6 +87,7 @@ These map to the `PrometheusRule` shipped in the chart
 - **Fast burn** — error rate × 14.4 (= ~2 % of budget in 1 hour) → page immediately.
 - **Slow burn** — error rate × 6 (= ~5 % of budget in 6 hours) → ticket / Slack within business hours.
 - **Latency burn** — P95 above target for 30 consecutive minutes → ticket.
+- **Sustained rate limiting** — any bucket refusing more than `alerting.rateLimitedPerSecond` (default 1) requests a second for 30 minutes → ticket (`KnotRateLimitedSustained`, group `knot.limits`).
 
 ## Pointers
 

@@ -156,6 +156,10 @@ async fn upload(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Re
     let Some(blobs) = state.blob_meta.clone() else {
         return internal();
     };
+    if let Err(response) = crate::quota::enforce_blob_bytes(&state, &ctx, bytes.len() as u64).await
+    {
+        return response;
+    }
 
     // Insert metadata first so the FK from blob_bytes → blobs is satisfied.
     if let Err(e) = blobs.insert(&meta).await {

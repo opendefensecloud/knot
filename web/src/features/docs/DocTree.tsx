@@ -23,7 +23,8 @@ import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { useUi } from "../../stores/ui";
 import { IconButton } from "../../components/ui/IconButton";
 import { type Doc } from "../../lib/validators";
-import { type ApiError } from "../../lib/api";
+import { ApiRequestError, type ApiError } from "../../lib/api";
+import { LIMIT_TOAST_KEY, limitErrorText, notifyFailure } from "../../lib/limitErrors";
 
 import { SidebarVersion } from "../about/SidebarVersion";
 import { WorkspaceHeader } from "../workspace/WorkspaceHeader";
@@ -118,7 +119,7 @@ export function DocTree() {
       docsApi.create({ title: "Untitled", parent_id }),
     onSuccess: async (r) => {
       if ("error" in r) {
-        notify("error", "Couldn't create document");
+        notifyFailure(notify, r.error, "Couldn't create document");
         return;
       }
       await qc.invalidateQueries({ queryKey: ["docs"] });
@@ -143,8 +144,9 @@ export function DocTree() {
     scope: { id: MOVE_SCOPE },
     mutationFn: async (a: { id: string; body: MoveArgs }) => {
       const r = await docsApi.move(a.id, a.body);
-      // Thrown, so a refused move (409, 422) is rolled back like a failed request.
-      if ("error" in r) throw new Error(r.error.code);
+      // Thrown, so a refused move (409, 422, 429) is rolled back like a
+      // failed request. The message is the code; the error rides along.
+      if ("error" in r) throw new ApiRequestError(r.error);
       return r.ok;
     },
     onMutate: async (a) => {
@@ -163,7 +165,7 @@ export function DocTree() {
       // after it: that list lacks the later moves' optimistic updates. Either
       // way the refetch after the last queued move shows the server's list.
       if (ctx?.prev && pendingMoves() === 1) qc.setQueryData(["docs"], ctx.prev);
-      notify("error", moveErrorText(error.message));
+      notifyFailure(notify, error instanceof ApiRequestError ? error.apiError : null, moveErrorText(error.message));
       setAnnouncement(`Couldn't move “${ctx?.title ?? ""}”.`);
     },
     onSettled: () => {
@@ -345,11 +347,14 @@ export function DocTree() {
   }
 
   /** Says why a duplicate failed: in its dialog while that is open, else in
-   *  a toast. The list is fetched again: the copy may have been stored all
-   *  the same, when the request timed out (408) or its answer was lost. */
-  function duplicateFailed(id: string, text: string) {
+   *  a toast (a limit's as a warning). The list is fetched again: the copy
+   *  may have been stored all the same, when the request timed out (408) or
+   *  its answer was lost. */
+  function duplicateFailed(id: string, error?: ApiError) {
     void qc.invalidateQueries({ queryKey: ["docs"] });
+    const text = duplicateErrorText(error);
     if (dupOpen.current === id) setDupError(text);
+    else if (error && limitErrorText(error) !== null) notify("warn", text, { key: LIMIT_TOAST_KEY });
     else notify("error", text);
   }
 
@@ -358,7 +363,7 @@ export function DocTree() {
     mutationFn: (a: DuplicateArgs) => docsApi.duplicate(a.id, { include_subpages: a.include_subpages }),
     onSuccess: async (r, a) => {
       if ("error" in r) {
-        duplicateFailed(a.id, duplicateErrorText(r.error));
+        duplicateFailed(a.id, r.error);
         return;
       }
       await qc.invalidateQueries({ queryKey: ["docs"] });
@@ -370,7 +375,7 @@ export function DocTree() {
       await nav(`/doc/${r.ok.id}`);
     },
     // No answer, or one that isn't a page.
-    onError: (_e, a) => duplicateFailed(a.id, duplicateErrorText()),
+    onError: (_e, a) => duplicateFailed(a.id),
     // The live region speaks only when its text changes: cleared, a later
     // copy of the same page is heard again.
     onSettled: (_r, _e, a) =>
@@ -413,7 +418,7 @@ export function DocTree() {
       ...(parentId ? { parent_id: parentId } : {}),
     });
     if ("error" in r) {
-      notify("error", "Couldn't create from template");
+      notifyFailure(notify, r.error, "Couldn't create from template");
       return;
     }
     await qc.invalidateQueries({ queryKey: ["docs"] });

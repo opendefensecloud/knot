@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 
 import { boardsApi } from "../../lib/boards.api";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 import { SCOPE_TOOLTIP, suggestionScope } from "../suggestions/scope";
 import { TableMenu } from "./TableMenu";
@@ -290,7 +291,7 @@ export function EditorToolbar({
                 void (async () => {
                   const res = await boardsApi.create(docId, null);
                   if ("error" in res) {
-                    notify("error", "Failed to create diagram.");
+                    notifyFailure(notify, res.error, "Failed to create diagram.");
                     return;
                   }
                   c()

@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useId, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 import { sharesApi, type Share } from "../../lib/shares.api";
 import type { DocAccessPerson, Member } from "../../lib/validators";
@@ -96,8 +97,9 @@ export default function PermissionsDialog() {
     mutationFn: async (nextRestricted: boolean) => docsApi.setRestricted(id!, nextRestricted),
     onSuccess: async (r) => {
       if ("error" in r) {
-        notify(
-          "error",
+        notifyFailure(
+          notify,
+          r.error,
           r.error.code === "acl.owner_required"
             ? "Only an owner can change who can see this page."
             : "Couldn't change access",
@@ -161,13 +163,13 @@ export default function PermissionsDialog() {
 
   const onEnable = async () => {
     const r = await sharesApi.create(id!, null);
-    if ("error" in r) { notify("error", "Couldn't create share link"); return; }
+    if ("error" in r) { notifyFailure(notify, r.error, "Couldn't create share link"); return; }
     await qc.invalidateQueries({ queryKey: ["shares", id] });
   };
   const onRevoke = async () => {
     if (!publicLink) return;
     const r = await sharesApi.revoke(id!, publicLink.id);
-    if ("error" in r) { notify("error", "Couldn't revoke share link"); return; }
+    if ("error" in r) { notifyFailure(notify, r.error, "Couldn't revoke share link"); return; }
     await qc.invalidateQueries({ queryKey: ["shares", id] });
   };
   const updateExpiry = async () => {
@@ -176,7 +178,7 @@ export default function PermissionsDialog() {
     await sharesApi.revoke(id!, publicLink.id);
     const iso = localExpiry ? new Date(localExpiry).toISOString() : null;
     const r = await sharesApi.create(id!, iso);
-    if ("error" in r) { notify("error", "Couldn't update expiry"); return; }
+    if ("error" in r) { notifyFailure(notify, r.error, "Couldn't update expiry"); return; }
     await qc.invalidateQueries({ queryKey: ["shares", id] });
   };
 
@@ -193,7 +195,7 @@ export default function PermissionsDialog() {
     mutationFn: async () =>
       grantsApi.put(id!, `user:${addUser}`, addRole, addInherit),
     onSuccess: async (r) => {
-      if ("error" in r) notify("error", grantErrorText(r.error.code, "Couldn't add grant"));
+      if ("error" in r) notifyFailure(notify, r.error, grantErrorText(r.error.code, "Couldn't add grant"));
       else {
         setAddUser("");
         await refetchGrants();
@@ -203,7 +205,7 @@ export default function PermissionsDialog() {
   const remove = useMutation({
     mutationFn: async (principal: string) => grantsApi.remove(id!, principal),
     onSuccess: async (r) => {
-      if ("error" in r) notify("error", grantErrorText(r.error.code, "Couldn't remove grant"));
+      if ("error" in r) notifyFailure(notify, r.error, grantErrorText(r.error.code, "Couldn't remove grant"));
       else await refetchGrants();
     },
   });

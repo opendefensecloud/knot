@@ -7,6 +7,7 @@ import { Link, useNavigate } from "react-router-dom";
 import type { Role } from "../../auth/useEffectiveRole";
 import { ContextMenu, type ContextMenuItem } from "../../components/ContextMenu";
 import { IconButton } from "../../components/ui/IconButton";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 
 import { archiveConfirmText, archiveErrorText } from "./archive";
@@ -111,7 +112,7 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
     const next = window.prompt("Rename to:", node.title);
     if (!next || next === node.title) return;
     const r = await docsApi.patch(node.id, { title: next });
-    if ("error" in r) notify("error", "Rename failed");
+    if ("error" in r) notifyFailure(notify, r.error, "Rename failed");
     else await qc.invalidateQueries({ queryKey: ["docs"] });
   }
 
@@ -119,7 +120,7 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
     if (!window.confirm(archiveConfirmText(node.title, countDescendants(node), tree.retentionDays))) return;
     const r = await docsApi.archive(node.id);
     if ("error" in r) {
-      notify("error", archiveErrorText(r.error.code));
+      notifyFailure(notify, r.error, archiveErrorText(r.error.code));
       return;
     }
     notify("info", "Moved to archive");
@@ -133,7 +134,7 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
     const next = !node.is_template;
     const r = await docsApi.setTemplate(node.id, next);
     if ("error" in r) {
-      notify("error", next ? "Couldn't save as template" : "Couldn't remove template");
+      notifyFailure(notify, r.error, next ? "Couldn't save as template" : "Couldn't remove template");
       return;
     }
     notify("info", next ? "Saved as template" : "Removed from templates");

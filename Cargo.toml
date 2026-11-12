@@ -79,6 +79,8 @@ futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 ipnetwork = "0.21"
+# CIDR lists (trusted proxies); already in the graph via reqwest/hyper-util.
+ipnet = "2"
 
 # Caching
 moka = { version = "0.12", features = ["future"] }

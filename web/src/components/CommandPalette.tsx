@@ -7,6 +7,7 @@ import { docsApi } from "../features/docs/docs.api";
 import { markDocEditMode } from "../features/docs/editMode";
 import { useViewport } from "../hooks/useViewport";
 import { searchApi, type SearchHit } from "../lib/search.api";
+import { notifyFailure } from "../lib/limitErrors";
 import { useUi } from "../stores/ui";
 
 // Snippets come from Postgres ts_headline, configured to emit only <b>…</b>.
@@ -125,7 +126,8 @@ export function CommandPalette() {
             activeDocId ? { title: "Untitled", parent_id: activeDocId } : { title: "Untitled" },
           );
           close();
-          if ("error" in r) return;
+          // Other failures stay silent, as they always were here.
+          if ("error" in r) { notifyFailure(useUi.getState().notify, r.error, null); return; }
           const created = r.ok as { id: string };
           await qc.invalidateQueries({ queryKey: ["docs"] });
           markDocEditMode(created.id);

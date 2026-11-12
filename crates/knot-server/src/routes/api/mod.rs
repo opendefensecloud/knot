@@ -25,6 +25,10 @@ pub mod whats_new;
 pub mod workspace;
 
 pub fn router(state: AppState) -> Router<AppState> {
+    // Inside the session and CSRF layers (a 401 or a CSRF failure costs no
+    // token), outside the doc-role layer and the handlers (a refused request
+    // costs no ACL lookup).
+    let rate_limit = middleware::from_fn_with_state(state.clone(), crate::rate_limit::http::api_mw);
     Router::new()
         .merge(workspace::router())
         .merge(docs::router(state))
@@ -37,6 +41,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(notifications::router())
         .merge(export_import::router())
         .merge(whats_new::router())
+        .layer(rate_limit)
         .layer(middleware::from_fn(csrf_mw))
         .layer(middleware::from_fn(require_session_mw))
 }

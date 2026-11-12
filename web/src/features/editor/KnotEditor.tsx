@@ -48,6 +48,7 @@ import { KnotProvider, type CommentChangeMsg, type ProviderStatus } from "./Knot
 import { looksLikeMarkdown, markdownToHtml } from "./markdownPaste";
 import { type KnotEditorHandle, placeCaretAtReadingLine, revealCaretBelowBand } from "./readingCaret";
 import { useReadableDocIds } from "./readableDocIds";
+import { abortableWait, uploadFiles } from "./uploadFiles";
 
 type Pair = { doc: Y.Doc; provider: KnotProvider };
 
@@ -274,33 +275,49 @@ function EditorBody({
     return () => { provider.off("comments", onComments); };
   }, [pair, docId, qc]);
 
+  // Drops still uploading. This body stays mounted when DocPage moves to a
+  // cached doc, so `editorRef` then points at that doc's editor: a drop is
+  // aborted when the doc or its connection changes, or on unmount, before
+  // it can upload to the old doc or insert into the new one. A layout
+  // effect, so the abort lands in the same commit as the switch.
+  const runningUploads = useRef(new Set<AbortController>());
+  useLayoutEffect(() => {
+    const uploadsForThisDoc = runningUploads.current;
+    return () => {
+      for (const uploadAbort of uploadsForThisDoc) uploadAbort.abort();
+      uploadsForThisDoc.clear();
+    };
+  }, [docId, pair]);
+
   const uploadAndInsert = useCallback(async (files: File[]) => {
-    for (const f of files) {
-      const r = await blobsApi.upload(docId, f);
-      if ("error" in r) {
-        notify(
-          "error",
-          r.error.code === "blob.too_large" ? "File too large (10 MB cap)."
-            : r.error.code === "blob.blocked_type" ? "File type not allowed."
-            : r.error.code === "acl.no_grant" ? "You don't have permission to upload here."
-            : "Upload failed.",
-        );
-        continue;
-      }
-      const blob = r.ok;
-      if (isImageType(blob.content_type)) {
-        editorRef.current?.chain().focus().setImage({ src: blob.url }).run();
-      } else {
-        editorRef.current?.chain().focus().insertContent({
-          type: "attachment",
-          attrs: {
-            url: blob.url,
-            name: blob.original_name ?? f.name,
-            size: blob.byte_size,
-            contentType: blob.content_type,
-          },
-        }).run();
-      }
+    const uploadAbort = new AbortController();
+    runningUploads.current.add(uploadAbort);
+    try {
+      await uploadFiles(files, {
+        upload: (file) => blobsApi.upload(docId, file),
+        insert: (blob, file) => {
+          const currentEditor = editorRef.current;
+          if (!currentEditor || currentEditor.isDestroyed) return;
+          if (isImageType(blob.content_type)) {
+            currentEditor.chain().focus().setImage({ src: blob.url }).run();
+          } else {
+            currentEditor.chain().focus().insertContent({
+              type: "attachment",
+              attrs: {
+                url: blob.url,
+                name: blob.original_name ?? file.name,
+                size: blob.byte_size,
+                contentType: blob.content_type,
+              },
+            }).run();
+          }
+        },
+        notify,
+        wait: (ms) => abortableWait(ms, uploadAbort.signal),
+        signal: uploadAbort.signal,
+      });
+    } finally {
+      runningUploads.current.delete(uploadAbort);
     }
   }, [docId, notify]);
 

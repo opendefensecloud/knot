@@ -93,6 +93,11 @@ lint: ## cargo clippy + cargo fmt --check + tsc --noEmit
 	$(CARGO) fmt --all -- --check
 	cd web && $(PNPM) tsc --noEmit
 
+.PHONY: helm.check
+helm.check: ## helm lint + render the chart with test values (numbers must not render as 1e+09)
+	helm lint deploy/helm/knot -f deploy/helm/knot/ci/ct-values.yaml
+	deploy/helm/check-render.sh
+
 .PHONY: fmt
 fmt: ## cargo fmt + prettier write
 	$(CARGO) fmt --all
