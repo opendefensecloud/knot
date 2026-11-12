@@ -168,10 +168,17 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - A key works only on `/api/*`. It can't open the live editor websocket,
   change the password, log out, create, list or revoke keys, invite,
   re-role or remove members, create or list public share links, or change
-  a page's grants or restriction (`403 api_key.session_required`, whatever
-  its scopes), so a leaked key can't take over the account or the workspace,
-  raise its own scopes, or leave behind a public link or page access that
-  outlives it. Reading a page's grants and access still works with `read`.
+  a page's grants or restriction, or move a page into or out of a
+  restricted subtree (`403 api_key.session_required`, whatever its scopes),
+  so a leaked key can't take over the account or the workspace, raise its
+  own scopes, or leave behind a public link or page access that outlives
+  it. Reading a page's grants and access still works with `read`.
+- A broken key (`Authorization: Bearer knot_…`, also with the scheme
+  doubled or the key quoted, or a bare `Bearer`) is always
+  `401 api_key.invalid`, never served from the session cookie. A
+  Bearer token that isn't a knot key, such as the JWT an auth proxy in
+  front of knot forwards, is ignored as before, so the cookie session and
+  the health checks keep working behind such a proxy.
 - Requests refused by a key's scopes and writes made with a key are logged
   with the key's id, the method and the route, never the key itself, so an
   incident can be narrowed to one key.

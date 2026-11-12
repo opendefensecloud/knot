@@ -38,15 +38,42 @@ fn invalid() -> Response {
     json_err(StatusCode::UNAUTHORIZED, "api_key.invalid", "")
 }
 
-/// `true` when the header uses the Bearer scheme (case-insensitive per
-/// RFC 7235), with or without credentials: the HTTP parser trims trailing
-/// whitespace, so a script with an unset key sends a bare `Bearer`. Checked
-/// on raw bytes so a non-ASCII value cannot hide one.
-fn is_bearer(v: &HeaderValue) -> bool {
+/// `true` when the header is an attempt to use a knot API key: the Bearer
+/// scheme (case-insensitive per RFC 7235) with credentials that are empty or
+/// hold a token starting with the key prefix (`knot_`, in any case). The HTTP
+/// parser trims trailing whitespace, so a script with an unset key sends a
+/// bare `Bearer`, and that is an attempt too. So is a key mangled on its way
+/// into the header: tokens are split on whitespace and commas, and leading
+/// quotes and non-ASCII bytes (a pasted zero-width space) are skipped, so
+/// `Bearer Bearer knot_…`, a quoted key or two joined values still count.
+/// Any other Bearer token is not ours: an auth proxy in front of knot
+/// (oauth2-proxy, an Istio or Envoy JWT gateway) may forward its own JWT with
+/// every request, and knot ignored the header before API keys existed.
+/// Checked on raw bytes, since the value need not be valid UTF-8.
+fn is_key_attempt(v: &HeaderValue) -> bool {
     let Some((scheme, rest)) = v.as_bytes().split_at_checked(BEARER.len()) else {
         return false;
     };
-    scheme.eq_ignore_ascii_case(BEARER) && matches!(rest.first(), None | Some(b' ' | b'\t'))
+    if !scheme.eq_ignore_ascii_case(BEARER) || !matches!(rest.first(), None | Some(b' ' | b'\t')) {
+        return false;
+    }
+    let prefix = knot_auth::api_key::KEY_PREFIX.as_bytes();
+    let credentials = rest.trim_ascii();
+    credentials.is_empty()
+        || credentials
+            .split(|byte| byte.is_ascii_whitespace() || *byte == b',')
+            .map(|token| {
+                let start = token
+                    .iter()
+                    .position(|byte| byte.is_ascii() && !matches!(byte, b'"' | b'\''))
+                    .unwrap_or(token.len());
+                &token[start..]
+            })
+            .any(|token| {
+                token
+                    .get(..prefix.len())
+                    .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+            })
 }
 
 /// Whether a request should spend a task and a pool connection on a touch.
@@ -61,11 +88,12 @@ fn touch_is_due(last_used_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool
 /// Bearer authentication for /api/* only. Ok(None) means "no usable
 /// Authorization header, fall through to the cookie path".
 ///
-/// A header with another scheme (e.g. Basic added by a reverse proxy) is not
-/// an API-key attempt and also falls through. Once a Bearer header is
-/// present, any failure is a 401 `api_key.invalid`; there is never a
-/// fallback to the cookie, so a broken key cannot silently downgrade to
-/// another identity.
+/// A header with another scheme (e.g. Basic added by a reverse proxy), or a
+/// Bearer token that isn't a knot key (a proxy's JWT), is not an API-key
+/// attempt and also falls through. Once a key attempt is present (`Bearer
+/// knot_…`, or a bare `Bearer`), any failure is a 401 `api_key.invalid`;
+/// there is never a fallback to the cookie, so a broken key cannot silently
+/// downgrade to another identity.
 ///
 /// On success returns the context and the principal (the key is touched
 /// fire-and-forget, like a session).
@@ -96,10 +124,10 @@ fn presented_key(deps: &SessionDeps, req: &Request<Body>) -> Presented {
         return Presented::Nothing;
     }
     let values: Vec<&HeaderValue> = req.headers().get_all(AUTHORIZATION).iter().collect();
-    if !values.iter().any(|v| is_bearer(v)) {
+    if !values.iter().any(|v| is_key_attempt(v)) {
         return Presented::Nothing;
     }
-    // A Bearer header next to another Authorization header is ambiguous.
+    // A key next to another Authorization header is ambiguous.
     let [only] = values.as_slice() else {
         return Presented::Malformed;
     };
@@ -321,7 +349,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_unknown_revoked_and_removed_member_keys_all_get_the_same_401() {
         let fx = setup().await;
-        assert_invalid(&fx.deps, req("/api/docs", Some("Bearer nope"))).await;
+        assert_invalid(&fx.deps, req("/api/docs", Some("Bearer knot_nope"))).await;
+        assert_invalid(&fx.deps, req("/api/docs", Some("Bearer KNOT_nope"))).await;
         assert_invalid(&fx.deps, req("/api/docs", Some("Bearer "))).await;
         let unknown = ApiKeySecret::generate();
         let auth = format!("Bearer {}", unknown.as_str());
@@ -343,9 +372,82 @@ mod tests {
     #[tokio::test]
     async fn a_bare_or_tab_separated_bearer_scheme_is_judged_not_passed_to_the_cookie() {
         let fx = setup().await;
-        for value in ["Bearer", "bearer", "BEARER", "Bearer\tnope"] {
+        for value in ["Bearer", "bearer", "BEARER", "Bearer\tknot_nope"] {
             assert_invalid(&fx.deps, req("/api/docs", Some(value))).await;
         }
+    }
+
+    /// A Bearer token that isn't a knot key, such as the JWT an auth proxy
+    /// (oauth2-proxy, an Istio or Envoy JWT gateway) forwards with every
+    /// request, is not an API-key attempt: before API keys knot ignored it
+    /// and served the cookie, and it still does. Without this, putting knot
+    /// behind such a proxy would fail every /api call, health checks too.
+    #[tokio::test]
+    async fn a_bearer_token_that_is_not_a_knot_key_falls_through_to_cookie() {
+        let fx = setup().await;
+        for value in [
+            "Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln",
+            "bearer opaque-gateway-token",
+            "Bearer\tya29.a0AfH6SMB",
+        ] {
+            for path in ["/api/docs", "/api/healthz"] {
+                let r = req(path, Some(value));
+                assert!(
+                    authenticate(&fx.deps, &r).await.unwrap().is_none(),
+                    "{value} on {path}"
+                );
+            }
+        }
+        // Next to another Authorization header it is still not ours.
+        let r = Request::builder()
+            .uri("/api/docs")
+            .header(AUTHORIZATION, "Bearer eyJhbGciOiJSUzI1NiJ9.e30.c2ln")
+            .header(AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .body(Body::empty())
+            .unwrap();
+        assert!(authenticate(&fx.deps, &r).await.unwrap().is_none());
+    }
+
+    /// A knot key mangled on its way into the header is still an attempt to
+    /// use one, so still a 401, never the cookie: the scheme twice (the
+    /// variable already held `Bearer …`), quotes kept by an env file, a
+    /// zero-width space pasted in front, or a proxy joining two values.
+    #[tokio::test]
+    async fn a_mangled_knot_key_is_judged_not_passed_to_the_cookie() {
+        let fx = setup().await;
+        let (secret, _) = mint(&fx).await;
+        let key = secret.as_str();
+        for value in [
+            format!("Bearer Bearer {key}"),
+            format!("Bearer \"{key}\""),
+            format!("Bearer '{key}'"),
+            format!("Bearer \u{200b}{key}"),
+            format!("Bearer eyJhbGciOiJSUzI1NiJ9.e30.c2ln, Bearer {key}"),
+        ] {
+            let r = Request::builder()
+                .uri("/api/docs")
+                .header(
+                    AUTHORIZATION,
+                    HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+                )
+                .body(Body::empty())
+                .unwrap();
+            assert_invalid(&fx.deps, r).await;
+        }
+    }
+
+    /// A knot key next to a proxy's Bearer token is ambiguous, so refused.
+    #[tokio::test]
+    async fn a_knot_key_next_to_a_foreign_bearer_token_is_refused() {
+        let fx = setup().await;
+        let (secret, _) = mint(&fx).await;
+        let r = Request::builder()
+            .uri("/api/docs")
+            .header(AUTHORIZATION, "Bearer eyJhbGciOiJSUzI1NiJ9.e30.c2ln")
+            .header(AUTHORIZATION, format!("Bearer {}", secret.as_str()))
+            .body(Body::empty())
+            .unwrap();
+        assert_invalid(&fx.deps, r).await;
     }
 
     #[tokio::test]

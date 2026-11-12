@@ -170,9 +170,47 @@ test("bot key works but cannot reach owner-only actions (S4)", async ({ request 
   const tasks = await request.get(`${SERVER}/api/workspace/tasks`, { headers: bearer(botKey) });
   expect(tasks.status()).toBe(200);
 
-  const refusals: Array<[string, Promise<APIResponse>]> = [
+  // A bearer write goes through: the bot creates a page of its own.
+  const botPage = await request.post(`${SERVER}/api/docs`, {
+    headers: bearer(botKey),
+    data: { title: "Written by the bot" },
+  });
+  expect(botPage.status()).toBe(201);
+
+  // A restricted page the bot may edit under, so the refusal below is the
+  // bot rule, not a missing grant. A person's key would pass it.
+  const members = await page.request.get("/api/workspace/members");
+  expect(members.status()).toBe(200);
+  const botId = ((await members.json()) as Array<{ user_id: string; kind: string }>).find(
+    (m) => m.kind === "bot",
+  )!.user_id;
+  const secret = await page.request.post("/api/docs", {
+    headers: await writeHeaders(),
+    data: { title: "Restricted for the bot" },
+  });
+  expect(secret.status()).toBe(201);
+  const secretId = ((await secret.json()) as { id: string }).id;
+  expect(
+    (
+      await page.request.put(`/api/docs/${secretId}/restricted`, {
+        headers: await writeHeaders(),
+        data: { restricted: true },
+      })
+    ).status(),
+  ).toBe(200);
+  expect(
+    (
+      await page.request.put(`/api/docs/${secretId}/grants/user:${botId}`, {
+        headers: await writeHeaders(),
+        data: { role: "editor", inherit: true },
+      })
+    ).status(),
+  ).toBe(204);
+
+  const refusals: Array<[string, string, Promise<APIResponse>]> = [
     [
       "POST /api/workspace/members",
+      "api_key.session_required",
       request.post(`${SERVER}/api/workspace/members`, {
         headers: bearer(botKey),
         data: { email: "escalate@example.com", role: "owner", password: "hunter22hunter22" },
@@ -180,18 +218,31 @@ test("bot key works but cannot reach owner-only actions (S4)", async ({ request 
     ],
     [
       "PUT /api/docs/{id}/restricted",
+      "api_key.session_required",
       request.put(`${SERVER}/api/docs/${docId}/restricted`, {
         headers: bearer(botKey),
         data: { restricted: true },
       }),
     ],
-    // Purge is a POST route (scope override: delete).
-    ["POST /api/docs/{id}/purge", request.post(`${SERVER}/api/docs/${docId}/purge`, { headers: bearer(botKey) })],
+    // Purge is a POST route (scope override: delete); the bot is an editor.
+    [
+      "POST /api/docs/{id}/purge",
+      "acl.owner_required",
+      request.post(`${SERVER}/api/docs/${docId}/purge`, { headers: bearer(botKey) }),
+    ],
+    [
+      "POST /api/docs under a restricted page",
+      "bot.restricted_forbidden",
+      request.post(`${SERVER}/api/docs`, {
+        headers: bearer(botKey),
+        data: { title: "child", parent_id: secretId },
+      }),
+    ],
   ];
-  for (const [label, pending] of refusals) {
+  for (const [label, code, pending] of refusals) {
     const res = await pending;
     expect(res.status(), label).toBe(403);
-    expect(await errorCode(res), label).not.toBe("api_key.scope_denied");
+    expect(await errorCode(res), label).toBe(code);
   }
 });
 

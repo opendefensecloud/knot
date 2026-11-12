@@ -9,7 +9,7 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get},
 };
@@ -32,6 +32,16 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/auth/api-keys", get(list_keys).post(create_key))
         .route("/api/auth/api-keys/{id}", delete(revoke_key))
+        .layer(axum::middleware::map_response(no_store))
+}
+
+/// The 201 of a create carries the only copy of the secret, so no browser
+/// cache, proxy or intermediary may keep any of these responses.
+async fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 #[derive(Serialize)]

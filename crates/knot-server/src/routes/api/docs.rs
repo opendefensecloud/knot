@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::archive::{PurgeError, PurgeTrigger};
-use crate::auth::{AuthContext, DocArchived, EffectiveDocRole, require_doc_role_mw};
+use crate::auth::{ApiPrincipal, AuthContext, DocArchived, EffectiveDocRole, require_doc_role_mw};
 use crate::duplicate::{BUSY_WAIT, DuplicateError, MAX_DUPLICATE_BLOB_BYTES, MAX_DUPLICATE_PAGES};
 use crate::http_error::{doc_archived, json_err};
 
@@ -615,6 +615,8 @@ async fn move_doc(
     if role.0 == WorkspaceRole::Viewer {
         return json_err(StatusCode::FORBIDDEN, "acl.editor_required", "");
     }
+    // Read before the body consumes the request.
+    let api_key = req.extensions().get::<ApiPrincipal>().copied();
     let Ok(body) = read_json::<MoveRequest>(req).await else {
         return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
     };
@@ -644,7 +646,11 @@ async fn move_doc(
     };
     // Into a restricted subtree, out of one, or between two: owners only.
     // Storage decides whether the move crosses, under the move's lock.
-    let allow_boundary_cross = role.0 == WorkspaceRole::Owner;
+    // Crossing changes who can reach the page, like `PUT /restricted` or a
+    // grant, and that outlives the key, so no API key may do it, not even an
+    // owner's (threat S2). It is session-only, decided here and not in
+    // `SESSION_ONLY` because only storage knows whether a move crosses.
+    let allow_boundary_cross = role.0 == WorkspaceRole::Owner && api_key.is_none();
 
     match docs
         .move_placed(
@@ -664,9 +670,22 @@ async fn move_doc(
             crate::archive::evict_local_subtree(&state, doc_id).await;
             doc_answer(&state, &ctx, StatusCode::OK, &d).await
         }
-        Err(knot_storage::DocStoreError::RestrictionBoundary) => {
-            json_err(StatusCode::FORBIDDEN, "acl.restricted_move", "")
-        }
+        Err(knot_storage::DocStoreError::RestrictionBoundary) => match api_key {
+            // The owner's session could make this move; the key may not.
+            Some(principal) if role.0 == WorkspaceRole::Owner => {
+                tracing::info!(
+                    key_id = %principal.key_id,
+                    %doc_id,
+                    "api key refused a move across a restriction boundary"
+                );
+                json_err(
+                    StatusCode::FORBIDDEN,
+                    "api_key.session_required",
+                    "moving a page into or out of a restricted subtree needs a signed-in session, not an API key",
+                )
+            }
+            _ => json_err(StatusCode::FORBIDDEN, "acl.restricted_move", ""),
+        },
         Err(knot_storage::DocStoreError::NotFound) => {
             json_err(StatusCode::NOT_FOUND, "doc.not_found", "")
         }

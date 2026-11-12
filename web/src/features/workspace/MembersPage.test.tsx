@@ -105,6 +105,22 @@ describe("MembersPage remove", () => {
     );
     expect(remove).not.toHaveBeenCalled();
   });
+
+  it("refreshes every API key list once a removal revoked the member's keys", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.spyOn(workspaceApi, "remove").mockResolvedValue({ ok: undefined });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidate = vi.spyOn(qc, "invalidateQueries");
+    render(
+      <QueryClientProvider client={qc}>
+        <MembersPage />
+      </QueryClientProvider>,
+    );
+
+    const row = await screen.findByTestId("member-u2");
+    fireEvent.click(within(row).getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["api-keys"] }));
+  });
 });
 
 describe("MembersPage role change", () => {
@@ -141,6 +157,20 @@ describe("MembersPage role change", () => {
     renderPage();
     await chooseRole("u1", "editor");
     await waitFor(() => expect(setRole).toHaveBeenCalledWith("u1", "editor"));
+  });
+
+  it("refreshes every API key list once a demotion revoked the bot keys the owner minted", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.spyOn(workspaceApi, "setRole").mockResolvedValue({ ok: undefined });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidate = vi.spyOn(qc, "invalidateQueries");
+    render(
+      <QueryClientProvider client={qc}>
+        <MembersPage />
+      </QueryClientProvider>,
+    );
+    await chooseRole("u1", "editor");
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["api-keys"] }));
   });
 
   it("doesn't ask when the member isn't an owner, since no key is at stake", async () => {
