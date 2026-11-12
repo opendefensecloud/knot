@@ -19,10 +19,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   up after 45 seconds instead of holding up page writes or sign-ins; if it
   gives up, re-run the upgrade once the long transaction it names has
   finished.
-- `doc_short_links` needs a short lock on `documents` and `users` for its
-  foreign keys.
-- Upgrade from 0.9.10, and don't skip 0.9.10 on the way from 0.9.9:
-  this release builds on the numbered edit log that 0.9.10 starts. The
+- Upgrade from 0.9.10 or 0.9.11, and don't skip 0.9.10 on the way from
+  0.9.9: this release builds on the numbered edit log that 0.9.10 starts. The
   first migration, `20261108120000_history_builder`, creates three empty
   tables. Its lock attempts pause page writes
   (creating, moving, archiving or purging pages, among others) and user
@@ -30,6 +28,11 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   once. Edit saves and page loads go on. 0.9.10 pods that restart after
   the migration commits crash-loop until new pods replace them; rolling
   back needs a database restore. (#83)
+- `20261109120000_doc_short_links` adds the `doc_short_links` table. It needs a short lock on
+  `documents` and `users` for its foreign keys and gives up after a few
+  seconds instead of holding up page writes or sign-ins; if it gives up,
+  re-run the upgrade once the long transaction on `documents` or `users`
+  has finished.
 - After the upgrade, every page's history is built once in the
   background, pages edited longest ago first. Expect extra CPU and
   database reads for a while (about one read of `doc_updates`), and
@@ -75,11 +78,6 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   page the reader can't see looks the same as an unknown one. On an
   archived page the button copies the page's existing short link, or its
   long link if it never had one.
-- Indent and Outdent buttons in the editor toolbar while the caret is in
-  a list item. They do what Tab and Shift+Tab do, which a touch screen
-  has no key for. To fit on one row they take the
-  place of the two diagram buttons inside a list; a diagram can still be
-  inserted after the list. (#78)
 - knot now builds every page's history in the background: who edited,
   when, and how much, per editing session, back to the page's creation
   (or to the 0.9.9 upgrade for older pages). The History drawer is
@@ -122,45 +120,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   never expire when the owner minting them has a password. The member list
   shows each member's kind.
 
+
 ### Changed
-- The edit-mode shortcut is ⌘E on macOS and Ctrl+E elsewhere. On a Mac,
-  Ctrl+E toggled editing too, so it no longer moved the caret to the end
-  of the line the way it does in every other Mac text field; Ctrl+A and
-  Ctrl+E now move to the start and end of the line while editing. The
-  button tooltips show the shortcut for your platform. (#86)
 - `GET /api/docs/{id}/contributors` adds `former` to each person
   (always `false` for now). (#83)
-
-### Fixed
-- Typing a Markdown-style indented list marker nests the item. `  - `
-  (or `  1. `) at the start of a list item moves it one level in per two
-  spaces or one tab, and the same indent on the next line keeps it a
-  sibling instead of nesting deeper. After a list, `  - ` on a new line
-  nests under the list's last item instead of joining it at the top
-  level. A bare `- ` still starts a top-level item. (#78)
-- Lists pasted from apps that mark nesting with `aria-level` (Word for
-  the web, among others) keep their nesting instead of landing all on
-  the top level. (#78)
-- Delete at the end of a list item whose nested list has sublists of its
-  own moves the nested items up beside it; it did nothing. (#78)
-- Starting to edit from the top of a page puts the caret in the text, so
-  End, Home and the arrow keys move in the text instead of scrolling the
-  page. (#86)
-- On a Mac, End and Home move to the end and start of the line while
-  editing, instead of scrolling to the bottom or top of the page. (#86)
-- A long page no longer shows a third scrollbar on the window that moved
-  the sidebar and the page together. A visually hidden status message at
-  the foot of the page sat outside the scrolling pane and stretched the
-  window. (#87)
-- Signing in with SSO from a page link lands on that page. The OIDC
-  callback always redirected to the start page, which opens the first page
-  in the tree, so a colleague who followed a link while signed out lost it.
-  The SSO button now passes the page along, and the server only accepts a
-  path on this site, so a crafted link can't send a fresh session to
-  another host.
-- Signing in from a link to a comment or suggestion (`?thread=`,
-  `?suggestion=`) keeps that part of the link, for SSO and password
-  sign-in alike; it used to open the page without it.
 
 ### Security
 - API keys are stored only as an HMAC-SHA256 under `KNOT_SESSION_KEY`; the
@@ -214,6 +177,47 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   UUID spelling the request used (upper case, without hyphens, braced,
   `urn:uuid:`), and removed by any of them, so one person never holds
   several rows that member removal would miss.
+
+## [0.9.11] - 2026-11-12
+
+A fix release: nested lists, tables, keyboard shortcuts, the page
+scrollbar and SSO links.
+
+### Upgrading
+- No database migrations. Upgrade from 0.9.10 in place, and roll back to
+  0.9.10 without a restore. Coming from 0.9.9, upgrade to 0.9.10 first.
+
+### Added
+- **Indent** and **Outdent** buttons in the editor toolbar while the
+  caret is in a list, for touch screens without a Tab key. Inside a list
+  they take the place of the two diagram buttons. (#78)
+
+### Changed
+- The edit-mode shortcut is ⌘E on macOS and stays Ctrl+E elsewhere, so on
+  a Mac Ctrl+E and Ctrl+A move to the end and start of the line again
+  while editing. (#86)
+
+### Fixed
+- Typing `  - ` or `  1. ` at the start of a list item nests it, whether
+  you indent by 2 or 4 spaces, and the same indent on the next line stays
+  a sibling. (#78)
+- Lists pasted from Word for the web keep their nesting. (#78)
+- Delete at the end of a list item whose nested list has sublists of its
+  own works; it did nothing. (#78)
+- Starting to edit from the top of a page puts the caret in the text, so
+  End and Home no longer scroll the page; on a Mac they now move within
+  the line. (#86)
+- Long pages no longer show a third scrollbar that scrolled the sidebar
+  and the page together. (#87)
+- Clicking into a table no longer makes the page jump: the row and column
+  actions moved into a **Table** menu in place of **Insert table**. (#77)
+- Inside a table cell, Tab and Shift+Tab indent list items and code lines
+  instead of jumping to the next cell. (#77)
+- Tables can no longer end up inside tables, and a table at the end of a
+  page no longer traps the cursor. (#77)
+- Signing in with SSO from a link to a page, comment or suggestion opens
+  that link instead of the start page. Password sign-in keeps comment and
+  suggestion links too. (#84)
 
 ## [0.9.10] - 2026-11-08
 
@@ -399,21 +403,6 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   and Tab jumped to the next cell instead of picking the highlighted
   person. Tab in a list item no longer indents it while the list is open.
   (#76)
-- Clicking into a table no longer makes the page jump. The toolbar grew a
-  second row of table buttons as soon as the cursor entered a table, which
-  pushed the page down under the pointer: dragging across cells selected
-  the cells a row above, so bold or delete hit the wrong ones. The row and
-  column actions now sit in a **Table** menu that takes the place of
-  **Insert table** while the cursor is in a table. (#77)
-- Tab and Shift+Tab indent and outdent list items and code lines inside a
-  table cell, instead of jumping to the next or previous cell and selecting
-  everything in it, which the next keystroke then replaced. (#77)
-- A table can no longer end up inside another table, which Markdown can't
-  hold and the export wrote as escaped text. **Insert table** isn't offered
-  inside a table, and a Markdown table pasted into a cell fills the cells
-  from there on. (#77)
-- A table at the end of a page no longer traps the cursor: ArrowDown from
-  its last row, or a click below it, starts a new line after it. (#77)
 
 ## [0.9.8] - 2026-11-03
 
@@ -1446,7 +1435,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.10...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.11...HEAD
+[0.9.11]: https://github.com/opendefensecloud/knot/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/opendefensecloud/knot/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/opendefensecloud/knot/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/opendefensecloud/knot/compare/v0.9.7...v0.9.8
