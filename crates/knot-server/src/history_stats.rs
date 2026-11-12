@@ -16,11 +16,11 @@ pub struct HistoryStats {
     pub baseline_rows: i64,
     pub baseline_bytes_total: i64,
     pub doc_updates_relation_bytes: i64,
-    /// `doc_history_checkpoints` rows; 0 on a database before 0.9.11.
+    /// `doc_history_checkpoints` rows; 0 before the history builder migration.
     pub checkpoint_rows: i64,
-    /// Their `state_bytes` plus `state_vector` bytes; 0 before 0.9.11.
+    /// Their `state_bytes` plus `state_vector` bytes; 0 before that migration.
     pub checkpoint_bytes_total: i64,
-    /// `doc_history_entries` rows; 0 before 0.9.11.
+    /// `doc_history_entries` rows; 0 before that migration.
     pub entry_rows: i64,
 }
 
@@ -68,8 +68,8 @@ pub async fn collect(pool: &PgPool, days: i32) -> Result<HistoryStats, sqlx::Err
             .fetch_one(pool)
             .await?;
 
-    // The builder's tables arrive with 0.9.11; this command may run against
-    // an older database.
+    // The builder's tables arrive with `20261108120000_history_builder`; this
+    // command may run against an older database.
     let has_builder_tables: bool =
         sqlx::query_scalar("SELECT to_regclass('doc_history_checkpoints') IS NOT NULL")
             .fetch_one(pool)
