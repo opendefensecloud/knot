@@ -3642,7 +3642,7 @@ async fn history_builder_migration_runs_under_live_0_9_10_traffic() {
 }
 
 // ---------------------------------------------------------------------------
-// API keys and bots (20261112120000_api_keys_and_bots)
+// API keys and bots (20261112120000_api_keys_users_kind, 20261112120001_api_keys_and_bots)
 // ---------------------------------------------------------------------------
 
 /// A workspace plus one user of the given shape. `kind` is 'human' or 'bot'.
@@ -4613,17 +4613,246 @@ async fn bot_owner_guard_matches_every_uuid_spelling() {
     .expect("a human may own a document in any spelling");
 }
 
-/// The migration waits at most 5 s for its table locks. `SET LOCAL` only
-/// holds inside a transaction, so the file must not opt out of sqlx's.
+/// Both API-keys migrations take their table locks through
+/// `knot_lock_tables`, which never waits for one table while holding another.
+/// `SET LOCAL` only holds inside a transaction, so neither file may opt out
+/// of sqlx's.
 #[test]
-fn api_keys_migration_bounds_its_lock_wait() {
-    let sql = include_str!("../../../migrations/20261112120000_api_keys_and_bots.sql");
-    assert!(
-        sql.contains("SET LOCAL lock_timeout = '5s';"),
-        "lock_timeout went missing"
-    );
-    assert!(
-        !sql.lines().any(|l| l.trim() == "-- no-transaction"),
-        "SET LOCAL does nothing outside sqlx's migration transaction"
-    );
+fn api_keys_migrations_take_their_locks_through_the_helper() {
+    for (name, sql) in [
+        (
+            "users_kind",
+            include_str!("../../../migrations/20261112120000_api_keys_users_kind.sql"),
+        ),
+        (
+            "api_keys_and_bots",
+            include_str!("../../../migrations/20261112120001_api_keys_and_bots.sql"),
+        ),
+    ] {
+        assert!(
+            sql.contains("SET LOCAL lock_timeout = '5s';"),
+            "{name}: lock_timeout went missing"
+        );
+        assert!(
+            sql.contains("SELECT knot_lock_tables("),
+            "{name}: no helper"
+        );
+        assert!(
+            !sql.lines().any(|l| l.trim() == "-- no-transaction"),
+            "{name}: SET LOCAL does nothing outside sqlx's migration transaction"
+        );
+        // DROP TRIGGER IF EXISTS takes ACCESS EXCLUSIVE even when the trigger
+        // is absent, undoing the helper's lock plan.
+        assert!(
+            !sql.lines()
+                .any(|l| !l.trim_start().starts_with("--") && l.contains("DROP TRIGGER")),
+            "{name}: DROP TRIGGER bypasses the lock plan"
+        );
+    }
+}
+
+/// The API-keys migrations run while the previous release serves: grant and
+/// member writes (whose foreign keys read `users`), edit saves and `users`
+/// reads/writes all keep working, nothing deadlocks, and the two CHECKs end
+/// validated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn api_keys_migrations_run_under_live_previous_release_traffic() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::time::Duration;
+
+    use knot_storage::{PgUpdatesStore, UpdatesStore};
+    use sqlx::Connection;
+
+    /// The short-links migration: the last one before the API-keys pair.
+    const BEFORE_API_KEYS: i64 = 20261109120000;
+
+    let (url, pool) = bare_db(4).await;
+    migrate_up_to(&pool, BEFORE_API_KEYS).await;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let other: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, display_name) VALUES ('b@x.test', 'Bob') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let page = new_page(&pool, ws, user).await;
+    let deadlocks0: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut loops = Vec::new();
+    loops.push((
+        "append",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::ZERO,
+            move |pool, n| async move {
+                PgUpdatesStore::new(pool)
+                    .append(page, 0, &edits(user, 1 + (n % 3) as usize))
+                    .await
+                    .map(drop)
+                    .map_err(|e| format!("append: {e:?}"))
+            },
+        ),
+    ));
+    // A grant write: locks document_grants, then its FK reads users.
+    loops.push((
+        "grant write",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(5),
+            move |pool, n| async move {
+                sqlx::query(
+                    "INSERT INTO document_grants (doc_id, principal, role, granted_by)
+                     VALUES ($1, 'user:' || $2::text, CASE WHEN $3 % 2 = 0 THEN 'viewer' ELSE 'editor' END, $4)
+                     ON CONFLICT (doc_id, principal) DO UPDATE SET role = EXCLUDED.role",
+                )
+                .bind(page)
+                .bind(other)
+                .bind(n as i64)
+                .bind(user)
+                .execute(&pool)
+                .await
+                .map(drop)
+                .map_err(err_text)
+            },
+        ),
+    ));
+    // A member added and removed: locks workspace_members, FKs read users.
+    loops.push((
+        "member write",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(5),
+            move |pool, _| async move {
+                let mut tx = pool.begin().await.map_err(err_text)?;
+                sqlx::query(
+                    "INSERT INTO workspace_members (workspace_id, user_id, role)
+                     VALUES ($1, $2, 'viewer') ON CONFLICT DO NOTHING",
+                )
+                .bind(ws)
+                .bind(other)
+                .execute(&mut *tx)
+                .await
+                .map_err(err_text)?;
+                sqlx::query(
+                    "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+                )
+                .bind(ws)
+                .bind(other)
+                .execute(&mut *tx)
+                .await
+                .map_err(err_text)?;
+                tx.commit().await.map_err(err_text)
+            },
+        ),
+    ));
+    loops.push((
+        "users read",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(5),
+            move |pool, _| async move {
+                sqlx::query("SELECT count(*) FROM users")
+                    .fetch_one(&pool)
+                    .await
+                    .map(drop)
+                    .map_err(err_text)
+            },
+        ),
+    ));
+    loops.push((
+        "users write",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(5),
+            move |pool, n| async move {
+                sqlx::query("UPDATE users SET display_name = 'Alice ' || $2::text WHERE id = $1")
+                    .bind(user)
+                    .bind(n as i64)
+                    .execute(&pool)
+                    .await
+                    .map(drop)
+                    .map_err(err_text)
+            },
+        ),
+    ));
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Panics (failing the test) when a migration fails.
+    let migrated = tokio::time::timeout(Duration::from_secs(30), migrate_all(&pool)).await;
+    let at_migration: Vec<u64> = loops.iter().map(|(_, l)| l.runs()).collect();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    stop.store(true, SeqCst);
+    let mut reports = Vec::new();
+    for ((name, l), before) in loops.into_iter().zip(at_migration) {
+        let longest = l.longest();
+        reports.push((name, before, longest, l.handle.await.unwrap()));
+    }
+
+    assert!(migrated.is_ok(), "migrator still running after 30 s");
+    for (name, before, longest, report) in &reports {
+        eprintln!("{name}: {} runs, longest {longest:?}", report.runs);
+        assert!(report.errors.is_empty(), "{name}: {:?}", report.errors);
+        assert!(
+            report.runs > *before,
+            "{name} made no progress after the migration"
+        );
+        assert!(
+            *longest < Duration::from_secs(5),
+            "{name} stalled for {longest:?}"
+        );
+    }
+    let unvalidated: Vec<String> = sqlx::query_scalar(
+        "SELECT conname::text FROM pg_constraint
+          WHERE conrelid = 'users'::regclass AND NOT convalidated",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(unvalidated.is_empty(), "left NOT VALID: {unvalidated:?}");
+
+    pool.close().await;
+    let mut probe = sqlx::PgConnection::connect(&url).await.unwrap();
+    let mut others: i64 = -1;
+    for _ in 0..50 {
+        sqlx::query("SELECT pg_stat_clear_snapshot()")
+            .execute(&mut probe)
+            .await
+            .unwrap();
+        others = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database() AND backend_type = 'client backend'
+                AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(&mut probe)
+        .await
+        .unwrap();
+        if others == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(others, 0, "every loop backend exited within 5 s");
+    sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(&mut probe)
+        .await
+        .unwrap();
+    let deadlocks: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&mut probe)
+    .await
+    .unwrap();
+    assert_eq!(deadlocks, deadlocks0, "no deadlock anywhere");
 }

@@ -1,22 +1,29 @@
--- Scoped API keys for humans, bots and AI agents.
+-- Scoped API keys for humans, bots and AI agents, step 2 of 2.
 --
--- Forward-only. Adds users.kind, the api_keys table and six guard triggers.
--- Keys are stored only as HMAC-SHA256(KNOT_SESSION_KEY, secret); rotating the
--- session key therefore invalidates every session AND every API key.
-
--- The ALTERs below lock users, and CREATE TRIGGER locks workspace_members and
--- document_grants: fail fast behind a long transaction rather than queue all
--- authenticated traffic. sqlx runs this file in one transaction.
+-- Forward-only. Adds the api_keys table and six guard triggers on top of
+-- users.kind (20261112120000_api_keys_users_kind). Keys are stored only as
+-- HMAC-SHA256(KNOT_SESSION_KEY, secret); rotating the session key therefore
+-- invalidates every session AND every API key.
+--
+-- sqlx runs this file in one transaction while the previous release keeps
+-- serving. VALIDATE CONSTRAINT scans users under SHARE UPDATE EXCLUSIVE only,
+-- which blocks no reader or writer, so it runs first, alone. Then
+-- knot_lock_tables (20261107120000) takes SHARE ROW EXCLUSIVE, which the new
+-- foreign keys and CREATE TRIGGER need, on all four tables in bounded
+-- attempts, users (the busiest) first; it never waits for one table while
+-- holding another, so it cannot deadlock with an app transaction that holds
+-- one of them and asks for another. Once it holds them nothing below waits
+-- for a lock the app holds: the statements only create the new, empty table
+-- and its triggers. Writes to users, workspace_members and document_grants
+-- wait until COMMIT; reads, edit saves and page loads go on.
 SET LOCAL lock_timeout = '5s';
 
--- Constant DEFAULT: no table rewrite. This CHECK and the next each scan users
--- once under the lock.
-ALTER TABLE users ADD COLUMN kind text NOT NULL DEFAULT 'human'
-    CHECK (kind IN ('human','bot'));
+ALTER TABLE users VALIDATE CONSTRAINT users_kind_check;
+ALTER TABLE users VALIDATE CONSTRAINT users_bot_has_no_credentials;
 
--- A bot can never log in interactively: no password, no OIDC identity.
-ALTER TABLE users ADD CONSTRAINT users_bot_has_no_credentials
-    CHECK (kind <> 'bot' OR (password_hash IS NULL AND oidc_subject IS NULL));
+SELECT knot_lock_tables('20261112120001_api_keys_and_bots',
+                        ARRAY['users', 'document_grants', 'workspace_members', 'workspaces']::regclass[],
+                        'SHARE ROW EXCLUSIVE');
 
 CREATE TABLE api_keys (
     id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -187,37 +194,32 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------
--- Triggers (DROP + CREATE so a later CREATE OR REPLACE FUNCTION takes effect)
+-- Triggers (no DROP TRIGGER IF EXISTS: it takes ACCESS EXCLUSIVE on the table
+-- even when the trigger is absent, which would undo the lock plan above)
 -- ---------------------------------------------------------------------
 
-DROP TRIGGER IF EXISTS users_revoke_api_keys_on_password_change ON users;
 CREATE TRIGGER users_revoke_api_keys_on_password_change
   AFTER UPDATE OF password_hash ON users
   FOR EACH ROW
   WHEN (OLD.password_hash IS DISTINCT FROM NEW.password_hash)
   EXECUTE FUNCTION users_revoke_api_keys_on_password_change();
 
-DROP TRIGGER IF EXISTS workspace_members_bot_not_owner ON workspace_members;
 CREATE TRIGGER workspace_members_bot_not_owner
   BEFORE INSERT OR UPDATE ON workspace_members
   FOR EACH ROW EXECUTE FUNCTION workspace_members_bot_not_owner();
 
-DROP TRIGGER IF EXISTS document_grants_bot_not_owner ON document_grants;
 CREATE TRIGGER document_grants_bot_not_owner
   BEFORE INSERT OR UPDATE OF role, principal ON document_grants
   FOR EACH ROW EXECUTE FUNCTION document_grants_bot_not_owner();
 
-DROP TRIGGER IF EXISTS api_keys_sso_ttl_guard ON api_keys;
 CREATE TRIGGER api_keys_sso_ttl_guard
   BEFORE INSERT OR UPDATE OF expires_at, user_id, created_by ON api_keys
   FOR EACH ROW EXECUTE FUNCTION api_keys_sso_ttl_guard();
 
-DROP TRIGGER IF EXISTS workspace_members_revoke_api_keys ON workspace_members;
 CREATE TRIGGER workspace_members_revoke_api_keys
   AFTER DELETE OR UPDATE OF role ON workspace_members
   FOR EACH ROW EXECUTE FUNCTION workspace_members_revoke_api_keys();
 
-DROP TRIGGER IF EXISTS users_kind_immutable ON users;
 CREATE TRIGGER users_kind_immutable
   BEFORE UPDATE OF kind ON users
   FOR EACH ROW

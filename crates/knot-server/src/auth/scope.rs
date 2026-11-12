@@ -337,6 +337,20 @@ mod tests {
     }
 
     #[test]
+    fn short_link_scopes_follow_the_method() {
+        // Get-or-create writes a permanent row, so it is a create; the
+        // short-link reads need only `read`.
+        let p = "/api/docs/{id}/short-link";
+        assert_eq!(required_scope(&Method::POST, p), Scope::Create);
+        assert_eq!(required_scope(&Method::GET, p), Scope::Read);
+        assert_eq!(
+            required_scope(&Method::GET, "/api/short-links/{code}"),
+            Scope::Read
+        );
+        assert!(!session_only(&Method::POST, p));
+    }
+
+    #[test]
     fn every_override_row_is_covered_by_a_test_above() {
         // Guards against adding a row without its dedicated test.
         assert_eq!(OVERRIDES.len(), 14);

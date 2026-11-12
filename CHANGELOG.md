@@ -9,15 +9,22 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ## [Unreleased]
 
 ### Upgrading
-- One migration adds the `doc_short_links` table. It needs a short lock on
-  `documents` and `users` for its foreign keys and gives up after a few
-  seconds instead of holding up page writes or sign-ins; if it gives up,
-  re-run the upgrade once the long transaction on `documents` or `users`
-  has finished.
+- Four database migrations run on upgrade, in this order:
+  `20261108120000_history_builder`, `20261109120000_doc_short_links`,
+  `20261112120000_api_keys_users_kind` and
+  `20261112120001_api_keys_and_bots`. Each commits on its own; if the
+  Job halts between them, re-run the upgrade (see the Helm chart README).
+  Each takes its table locks through `knot_lock_tables`, in short bounded
+  attempts that never wait for one table while holding another, and gives
+  up after 45 seconds instead of holding up page writes or sign-ins; if it
+  gives up, re-run the upgrade once the long transaction it names has
+  finished.
+- `doc_short_links` needs a short lock on `documents` and `users` for its
+  foreign keys.
 - Upgrade from 0.9.10, and don't skip 0.9.10 on the way from 0.9.9:
-  this release builds on the numbered edit log that 0.9.10 starts. One
-  database migration runs on upgrade, `20261108120000_history_builder`,
-  which creates three empty tables. Its lock attempts pause page writes
+  this release builds on the numbered edit log that 0.9.10 starts. The
+  first migration, `20261108120000_history_builder`, creates three empty
+  tables. Its lock attempts pause page writes
   (creating, moving, archiving or purging pages, among others) and user
   updates for at most 100 ms each; once it has its locks it commits at
   once. Edit saves and page loads go on. 0.9.10 pods that restart after
@@ -47,13 +54,14 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   replay would read more than `history.replayMaxBytes`. The chart
   README says how to find such pages and re-enable them. (#83)
 - The old snapshot thinning is unchanged. (#83)
-- One additive database migration (`20261112120000_api_keys_and_bots`)
-  adds `users.kind`, the `api_keys` table and triggers. It needs no
-  downtime: no table is rewritten, and its two checks on `users` each scan
-  that table once under the lock. It waits at most 5 seconds for a table
-  lock (`lock_timeout`) rather than queue
-  sign-ins behind a long transaction; if it gives up, run the upgrade
-  again once that transaction has ended.
+- The API-keys migrations are additive. `20261112120000_api_keys_users_kind`
+  adds `users.kind` and two unvalidated checks: it holds an exclusive lock
+  on `users` for an instant, so sign-ins and edit saves pause briefly,
+  and scans nothing. `20261112120001_api_keys_and_bots` validates the
+  checks without blocking anyone, then holds a share lock on `users`,
+  `workspaces`, `workspace_members` and `document_grants` while it creates
+  the `api_keys` table and its triggers: writes to those tables wait,
+  reads, edit saves and page loads go on.
 - Rotating `KNOT_SESSION_KEY` now invalidates every API key as well as
   every session: keys are stored as an HMAC under that key. After a
   rotation, every user and bot needs new keys.
