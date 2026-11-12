@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Member } from "../../lib/validators";
+import { useUi } from "../../stores/ui";
 
 import MembersPage, { filterMembers } from "./MembersPage";
 import { workspaceApi } from "./workspace.api";
@@ -99,5 +100,30 @@ describe("MembersPage remove", () => {
       "Remove bob@example.org? They also lose every page-level grant, including access to restricted pages.",
     );
     expect(remove).not.toHaveBeenCalled();
+  });
+});
+
+describe("MembersPage when a limit refuses a change", () => {
+  beforeEach(() => {
+    vi.spyOn(workspaceApi, "listMembers").mockResolvedValue({ ok: MEMBERS });
+    useUi.setState({ toasts: [] });
+  });
+
+  it("says to slow down when an invite is refused", async () => {
+    vi.spyOn(workspaceApi, "invite").mockResolvedValue({
+      error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 9 }, status: 429 },
+    });
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MembersPage />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(await screen.findByTestId("invite-email"), { target: { value: "dora@example.org" } });
+    fireEvent.submit(screen.getByTestId("invite-form"));
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([
+        { kind: "warn", text: "You're doing that too fast. Try again in 9 s.", key: "limit" },
+      ]),
+    );
   });
 });

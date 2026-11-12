@@ -8,9 +8,41 @@ import { authApi } from "../../auth/session.api";
 import { useSession } from "../../auth/SessionContext";
 import { useUi } from "../../stores/ui";
 
+import { readApiError } from "../../lib/api";
 import { readCookie } from "../../lib/csrf";
+import { limitErrorText, notifyFailure } from "../../lib/limitErrors";
+import { downloadFile } from "../export/downloadFile";
 import { SkinPicker } from "./SkinPicker";
 import { workspaceApi } from "./workspace.api";
+
+/** The server's import caps, `MAX_IMPORT_PAGES` and `MAX_IMPORT_BYTES` in
+ *  `crates/knot-server/src/routes/api/export_import.rs`, for a 413 whose
+ *  details don't name them. */
+const DEFAULT_MAX_IMPORT_PAGES = 10_000;
+const DEFAULT_MAX_IMPORT_BYTES = 512 * 1024 * 1024;
+
+const BYTES_PER_MEBIBYTE = 1024 * 1024;
+
+function positiveNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/** Shown on a 413 `import.too_large`: the caps from its details
+ *  (`max_pages`, `max_bytes` and, when present, `max_markdown_bytes` and
+ *  `max_references`), else the server's defaults. */
+function importTooLargeText(details: Record<string, unknown>): string {
+  const maxPages = positiveNumber(details.max_pages) ?? DEFAULT_MAX_IMPORT_PAGES;
+  const maxBytes = positiveNumber(details.max_bytes) ?? DEFAULT_MAX_IMPORT_BYTES;
+  const maxMarkdownBytes = positiveNumber(details.max_markdown_bytes);
+  const maxReferences = positiveNumber(details.max_references);
+  const asMebibytes = (bytes: number) =>
+    (bytes / BYTES_PER_MEBIBYTE).toLocaleString("en-US", { maximumFractionDigits: 1 });
+  const caps = [`${maxPages.toLocaleString("en-US")} pages`, `${asMebibytes(maxBytes)} MiB of files`];
+  if (maxMarkdownBytes !== null) caps.push(`${asMebibytes(maxMarkdownBytes)} MiB of page text`);
+  if (maxReferences !== null) caps.push(`${maxReferences.toLocaleString("en-US")} file references`);
+  const lastCap = caps.pop();
+  return `This archive is too large to import (over ${caps.join(", ")} or ${lastCap}).`;
+}
 
 export default function SettingsPage() {
   const ws = useQuery({ queryKey: ["workspace"], queryFn: () => workspaceApi.get() });
@@ -25,6 +57,21 @@ export default function SettingsPage() {
   const [pwNew, setPwNew] = useState("");
   const [pwError, setPwError] = useState<string | null>(null);
   const [pwOk, setPwOk] = useState(false);
+  const [exportingWorkspace, setExportingWorkspace] = useState(false);
+
+  async function exportWorkspace() {
+    setExportingWorkspace(true);
+    try {
+      await downloadFile({
+        path: "/api/workspace/export",
+        fileName: "knot-workspace-export.zip",
+        notify,
+        failureText: "Couldn't export the workspace.",
+      });
+    } finally {
+      setExportingWorkspace(false);
+    }
+  }
 
   const changePw = useMutation({
     mutationFn: async () => authApi.changePassword(pwCurrent, pwNew),
@@ -32,10 +79,11 @@ export default function SettingsPage() {
     onSuccess: (r) => {
       if ("error" in r) {
         setPwError(
-          r.error.code === "auth.invalid_credentials" ? "Current password is wrong."
+          limitErrorText(r.error)
+            ?? (r.error.code === "auth.invalid_credentials" ? "Current password is wrong."
             : r.error.code === "auth.weak_password" ? "New password must be at least 8 characters."
             : r.error.code === "auth.password_reuse" ? "New password must differ from current."
-            : "Couldn't change password.",
+            : "Couldn't change password."),
         );
         return;
       }
@@ -105,14 +153,15 @@ export default function SettingsPage() {
               Export the whole workspace as a zip — markdown bodies, attachments, board previews. Import a previously-exported zip to seed a new instance. Reach out to support if you need to migrate boards' edit history (v1 imports recreate boards with their preview only).
             </p>
             <div className="flex gap-2">
-              <a
+              <button
+                type="button"
                 data-testid="workspace-export"
-                href="/api/workspace/export"
-                download="knot-workspace-export.zip"
-                className="inline-flex items-center h-9 px-3 rounded border border-border bg-surface text-fg text-sm font-medium hover:bg-muted transition-colors"
+                disabled={exportingWorkspace}
+                onClick={() => { void exportWorkspace(); }}
+                className="inline-flex items-center h-9 px-3 rounded border border-border bg-surface text-fg text-sm font-medium hover:bg-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Export workspace
-              </a>
+                {exportingWorkspace ? "Exporting…" : "Export workspace"}
+              </button>
               <label
                 data-testid="workspace-import"
                 className="inline-flex items-center h-9 px-3 rounded bg-accent text-accent-fg text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer"
@@ -136,7 +185,12 @@ export default function SettingsPage() {
                           body: file,
                         });
                         if (!res.ok) {
-                          notify("error", `Import failed (${res.status}).`);
+                          const error = await readApiError(res);
+                          notifyFailure(
+                            notify,
+                            error,
+                            error.code === "import.too_large" ? importTooLargeText(error.details) : `Import failed (${res.status}).`,
+                          );
                           return;
                         }
                         const body = (await res.json()) as { imported_docs?: number };

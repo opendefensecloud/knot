@@ -14,17 +14,30 @@
 //! upgrade before the access check. Once joined, a different epoch means a
 //! revoke landed between that check and the join and may have missed this
 //! connection, which is then closed with 4403 before it is sent anything.
+//!
+//! `rate_limits` holds the collab budgets (`rate_limit::collab`): before every
+//! read the loop waits off the user's byte and message debt (backpressure;
+//! nothing is dropped), presence past its budget is coalesced to the newest
+//! state per awareness client, and a second client `SyncStep1` is left
+//! unanswered. With limits on, the writer also pings the client, and a
+//! client the loop hears nothing from for the silence limit is let go
+//! (`rate_limit::Liveness`). With limits off, the loop behaves exactly as
+//! without them.
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::StreamExt;
 use knot_crdt::{ConnHandle, ConnId, Event, InMsg};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::protocol::{YSyncMessage, decode, encode_sync_step1, encode_sync_step2};
+use crate::rate_limit::collab::{silence_deadline, sleep_until_due};
+use crate::rate_limit::{CollabKind, ConnectionThrottle, RateLimits, SessionSignals, WaitOutcome};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     rooms: Arc<knot_crdt::Rooms>,
     doc_id: Uuid,
@@ -33,6 +46,7 @@ pub async fn serve(
     can_write: bool,
     acl_epoch_at_check: u64,
     shutdown: CancellationToken,
+    rate_limits: Arc<RateLimits>,
 ) {
     let join_started = std::time::Instant::now();
     let handle = match rooms.acquire(doc_id).await {
@@ -127,9 +141,31 @@ pub async fn serve(
         refused.clone(),
         handle.shutdown.clone(),
         done.clone(),
+        rate_limits.liveness.map(|liveness| liveness.ping_interval),
     ));
 
+    let liveness = rate_limits.liveness;
+    let mut throttle = ConnectionThrottle::new(rate_limits, user_id, CollabKind::Doc);
+    let signals = SessionSignals {
+        shutdown: &shutdown,
+        revoked: &revoked,
+        refused: &refused,
+        room_ended: &handle.shutdown,
+        done: &done,
+    };
+    // When the loop last read anything from the client (see `Liveness`).
+    let mut heard_from_client_at = Instant::now();
     loop {
+        // Before every read, the first included: wait off this user's debt.
+        // The writer keeps sending meanwhile; any end of the session ends
+        // the wait at once.
+        let wait_started_at = Instant::now();
+        if throttle.wait_for_budget(&signals).await == WaitOutcome::Stop {
+            break;
+        }
+        // The loop read nothing while it waited: not the client's silence.
+        heard_from_client_at += wait_started_at.elapsed();
+        let awareness_due = throttle.pending_awareness_due();
         let msg = tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
@@ -137,15 +173,40 @@ pub async fn serve(
             // Forward nothing more from a revoked connection: the room may
             // still hold it (one revoked for the join race) until it leaves.
             _ = revoked.cancelled() => break,
+            // A presence frame held for want of a token (never with limits
+            // off): forward it once one is back.
+            _ = sleep_until_due(awareness_due) => {
+                if let Some(payload) = throttle.take_due_awareness() {
+                    let _ = handle
+                        .tx
+                        .send(Event::AwarenessIn {
+                            from: conn_id,
+                            payload,
+                        })
+                        .await;
+                }
+                continue;
+            }
             m = stream.next() => match m {
                 Some(Ok(m)) => m,
                 _ => break,
             },
+            // Nothing read, not even a pong, for the silence limit: the
+            // client vanished without closing (see `Liveness`).
+            _ = sleep_until_due(silence_deadline(liveness, heard_from_client_at)) => {
+                tracing::debug!(user = %user_id, "collab client silent; ending the session");
+                break;
+            }
         };
+        heard_from_client_at = Instant::now();
+        throttle.charge_inbound(&msg);
         match msg {
             Message::Binary(bytes) => {
                 match decode(&bytes) {
-                    Ok(YSyncMessage::SyncStep1(_sv)) => {
+                    // With limits on, only the first is answered: the full
+                    // state went out on join, and each answer costs a
+                    // full-state encode in the room actor.
+                    Ok(YSyncMessage::SyncStep1(_sv)) if throttle.admit_sync_step1() => {
                         // Reply with full state again — cheap, idempotent.
                         let (rtx, rrx) = oneshot::channel();
                         let _ = handle
@@ -174,20 +235,42 @@ pub async fn serve(
                                 .await;
                         }
                     }
+                    Ok(YSyncMessage::SyncStep1(_sv)) => {}
                     Ok(YSyncMessage::Awareness) => {
-                        let _ = handle
-                            .tx
-                            .send(Event::AwarenessIn {
-                                from: conn_id,
-                                payload: bytes.to_vec(),
-                            })
-                            .await;
+                        // Past the presence budget the frame is held, and a
+                        // newer one is merged into it (per awareness client
+                        // the newest state always arrives).
+                        if let Some(payload) = throttle.admit_awareness(bytes.to_vec()) {
+                            let _ = handle
+                                .tx
+                                .send(Event::AwarenessIn {
+                                    from: conn_id,
+                                    payload,
+                                })
+                                .await;
+                        }
                     }
                     Err(_) => {}
                 }
             }
             Message::Close(_) => break,
             _ => {}
+        }
+    }
+    // The client is gone (a send to it failed), possibly during a budget
+    // wait that left frames it had already sent unread: forward the edits
+    // among them that are readable now, so none is lost. Not after a revoke,
+    // a refusal, a room end or a shutdown, which forward nothing more.
+    if can_write && signals.client_gone() {
+        for update in throttle.drain_readable_updates(&mut stream) {
+            let _ = handle
+                .tx
+                .send(Event::Inbound(InMsg {
+                    from: conn_id,
+                    by_user: Some(user_id),
+                    bytes: update,
+                }))
+                .await;
         }
     }
     // Stop the writer before waiting for it: this function still holds a

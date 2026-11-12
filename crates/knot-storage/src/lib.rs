@@ -14,6 +14,7 @@ pub mod markdown_cache;
 pub mod notifications;
 pub mod placement;
 pub mod pool;
+pub mod quota;
 pub mod search;
 pub mod session_store;
 pub mod share_tokens;

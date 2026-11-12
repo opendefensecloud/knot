@@ -3,6 +3,7 @@ import React, { useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
 import { authApi } from "../../auth/session.api";
+import { limitErrorText } from "../../lib/limitErrors";
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
@@ -33,9 +34,10 @@ export default function LoginPage() {
     const r = await authApi.login(email, password);
     setBusy(false);
     if ("error" in r) {
-      setError(r.error.code === "auth.invalid_credentials"
-        ? "Invalid email or password."
-        : "Login failed.");
+      setError(
+        limitErrorText(r.error)
+          ?? (r.error.code === "auth.invalid_credentials" ? "Invalid email or password." : "Login failed."),
+      );
       return;
     }
     await qc.invalidateQueries({ queryKey: ["session"] });

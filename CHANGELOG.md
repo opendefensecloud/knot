@@ -10,8 +10,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ### Upgrading
 - Upgrade from 0.9.10 or 0.9.11, and don't skip 0.9.10 on the way from
-  0.9.9: this release builds on the numbered edit log that 0.9.10 starts. Two
-  database migrations run on upgrade. `20261108120000_history_builder`
+  0.9.9: this release builds on the numbered edit log that 0.9.10 starts.
+  Three database migrations run on upgrade. `20261108120000_history_builder`
   creates three empty tables. Its lock attempts pause page writes
   (creating, moving, archiving or purging pages, among others) and user
   updates for at most 100 ms each; once it has its locks it commits at
@@ -47,6 +47,47 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   replay would read more than `history.replayMaxBytes`. The chart
   README says how to find such pages and re-enable them. (#83)
 - The old snapshot thinning is unchanged. (#83)
+- `20261112120000_quota_indexes` adds two indexes, on `documents` and on
+  `blobs`, for the quotas. While they build it holds a `SHARE` lock on
+  both: page writes (creating, renaming, moving or archiving pages, among
+  others) and file uploads wait; page loads go on. It takes its locks in
+  bounded attempts and gives up after 45 s instead of queueing writes
+  behind a long transaction; if it gives up, re-run the upgrade once that
+  transaction has finished. Both tables are small, since file contents
+  live in `blob_bytes`, which it doesn't read. With three migrations that
+  each wait up to 45 s for their locks, pass `helm upgrade --timeout` of
+  at least 5 minutes plus your rollout time; the chart README explains the
+  budget and how to tell which migrations committed. (#88)
+- Writes are now rate limited per user, and sign-in and share links per
+  client address; the limits are on by default and far above normal use.
+  API clients and scripts that write in bulk can get
+  `429 rate.limited` with a `Retry-After` header and should wait and
+  retry. `rateLimit.enabled: false` turns every rate limit off. (#88)
+- Behind an ingress, set `trustedProxies` to the ingress controller's
+  addresses, and only those: any address listed can name any client IP.
+  Until you do, the per-IP sign-in and share-link limits are skipped for
+  requests that carry `X-Forwarded-For` (counted in
+  `knot_client_ip_unresolved_total{reason="no_trusted_proxies"}`), and
+  failed logins from all clients still count together, as before. knot
+  refuses to start on an entry it can't use (malformed, a `/0`, or host
+  bits after the prefix such as `10.0.0.5/8`), with an error naming
+  `KNOT_TRUSTED_PROXIES`. Behind an L4 balancer that adds no
+  `X-Forwarded-For`, all clients share one sign-in bucket; the chart
+  README says how to keep the client address. Clients behind one NAT or
+  egress proxy share its address and so one sign-in bucket (30 a minute)
+  too; OIDC sign-in isn't limited, and `rateLimit.scale` raises every
+  bucket. (#88)
+- The rate limits, the login throttle and the collab socket cap are kept
+  in each replica's memory, so a user spread over N replicas gets up to N
+  times each limit. Divide with `rateLimit.scale` (for example `0.5` with
+  two replicas), set in a values file or with `--set-json`: `--set`
+  passes a string, which the chart's schema refuses. The scale doesn't
+  change the login throttle or the socket cap. Quotas are counted in
+  Postgres and hold across replicas. (#88)
+- Keep the idle and read timeouts of every proxy in front of knot above
+  one minute: a collab socket the server is slowing down may otherwise be
+  closed by the proxy and reconnect. Nothing is lost, but the editor shows
+  the reconnect. (#88)
 
 ### Added
 - Short links to pages. "Copy link" in the page header copies
@@ -79,10 +120,82 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   The Helm chart README says which are worth an alert. (#83)
 - `knot-server history-stats` also reports checkpoint sizes and the
   number of history entries. (#83)
+- Rate limits on writes, per user: a request over its limit gets
+  `429 Too Many Requests` with `Retry-After` and the error code
+  `rate.limited`, and the web app says "You're doing that too fast. Try
+  again in N s." in place of its generic error. Most writes allow 120 a
+  minute; duplicates, imports and password changes share a tighter
+  bucket (10 a minute), and exports, uploads and board previews have
+  their own. Sign-in allows 30 a minute and share links 600 a minute per
+  client address. Reads, health checks and static files aren't limited.
+  The chart README lists every bucket. (#88)
+- Backpressure on the page and board WebSockets: when one user sends more
+  than their budget, the server reads that user's next message later
+  instead of refusing it, so no edit is lost; typing and drawing stay far
+  below the budget. Presence updates past 120 a second are coalesced to
+  the latest, and a repeated request for the full page state on one
+  socket is ignored. A user may hold 64 collab sockets per replica and
+  connect to one page or board 20 times, then 20 times a minute; past
+  either, the connect gets 429 and the editor backs off and retries. (#88)
+- Optional quotas, off by default: pages and uploaded file bytes, per
+  user and per workspace. A write that would go past one is refused with
+  `403 quota.exceeded`, and the web app says which limit was reached.
+  Archived pages, templates and files count until purged, and duplicated
+  pages count for the user who duplicated them. A refusal is audited as
+  `quota.exceeded` at most once per user, quota and scope every
+  10 minutes. Quotas are best effort: requests running at the same time
+  can overshoot by what runs at once. Set a per-user quota along with a
+  workspace one, or one account can use all of it. (#88)
+- `trustedProxies` (`KNOT_TRUSTED_PROXIES`): the proxies whose
+  `X-Forwarded-For` knot believes, read from the right. The resolved
+  client address feeds the per-IP limits, the login and password failure
+  throttles and the IP stored on a password sign-in's session. IPv6
+  clients are grouped per `/64`. (#88)
+- Chart values `rateLimit.enabled`, `rateLimit.scale`,
+  `rateLimit.collabMaxSockets`, `trustedProxies`, `quotas.pagesPerUser`,
+  `quotas.pagesPerWorkspace`, `quotas.blobBytesPerUser`,
+  `quotas.blobBytesPerWorkspace` and `alerting.rateLimitedPerSecond`
+  (`KNOT_RATE_LIMIT_ENABLED`, `KNOT_RATE_LIMIT_SCALE`,
+  `KNOT_RATE_LIMIT_COLLAB_MAX_SOCKETS`, `KNOT_TRUSTED_PROXIES`,
+  `KNOT_QUOTA_PAGES_PER_USER`, `KNOT_QUOTA_PAGES_PER_WORKSPACE`,
+  `KNOT_QUOTA_BLOB_BYTES_PER_USER`, `KNOT_QUOTA_BLOB_BYTES_PER_WORKSPACE`).
+  The schema refuses a quota above 2^53 − 1, a `/0` proxy and characters
+  outside IPs and CIDRs. (#88)
+- Metrics `knot_rate_limited_total{bucket}`,
+  `knot_collab_throttled_total{kind,action}`,
+  `knot_collab_throttle_wait_seconds`,
+  `knot_quota_exceeded_total{quota,scope}`,
+  `knot_client_ip_unresolved_total{reason}` and
+  `knot_client_ip_malformed_forwarded_total`; the alert
+  `KnotRateLimitedSustained` (ticket severity) in the chart's
+  PrometheusRule; and a "Limits" row in the Grafana dashboard. Normal use
+  keeps them at 0. (#88)
 
 ### Changed
 - `GET /api/docs/{id}/contributors` adds `former` to each person
   (always `false` for now). (#83)
+- A workspace import may create at most 10 000 pages, write at most
+  256 MiB of page Markdown and 512 MiB of files and board images and hold
+  at most 20 000 file and board references. These caps are always on and checked before anything
+  is written; a larger import is refused with `413 import.too_large`, and
+  the web app names the caps. Split larger archives. (#88)
+- Dropping many files at once pauses on a rate limit: the editor shows
+  "Uploads paused — continuing in N s…" for a wait over 2 s, retries the
+  file once, and on a quota stops with one message saying how many files
+  weren't uploaded. (#88)
+- Workspace and page zip exports download through the app, so a refused
+  export shows a message instead of a failed browser download. (#88)
+
+### Fixed
+- With `trustedProxies` set, five failed logins from one client no longer
+  block password sign-in for everyone behind the same ingress: the login
+  and password failure throttles key on the client's own address. (#88)
+- An import whose manifest names one large file many times can no longer
+  write gigabytes: each reference counts toward the 512 MiB cap, and an
+  entry larger than it declares is skipped. (#88)
+- The login throttle no longer grows without bound: idle keys are
+  removed, it holds at most 100 000, and email keys are cut at
+  320 bytes. (#88)
 
 ## [0.9.11] - 2026-11-12
 

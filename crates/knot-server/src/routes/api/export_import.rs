@@ -30,7 +30,7 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 
 use crate::AppState;
 use crate::auth::AuthContext;
-use crate::http_error::json_err;
+use crate::http_error::{json_err, json_err_with_details};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -512,6 +512,29 @@ async fn import(
         Ok(m) => m,
         Err(code) => return json_err(StatusCode::UNPROCESSABLE_ENTITY, code, ""),
     };
+    // What this import may write, checked before anything is: the body cap
+    // bounds compressed bytes only, and the manifest may name one entry any
+    // number of times.
+    let import_plan = ImportPlan::of(&manifest, &zip);
+    if let Err(refusal) = import_plan.enforce_caps() {
+        tracing::warn!(
+            pages = import_plan.pages,
+            bytes = import_plan.total_bytes(),
+            references = import_plan.references,
+            "import: refused, over the per-import caps"
+        );
+        return refusal;
+    }
+    // The quotas, once, for every page and the declared attachment bytes
+    // (board SVGs aren't counted): over either, nothing is imported.
+    if let Err(response) = crate::quota::enforce_pages(&state, &ctx, import_plan.pages).await {
+        return response;
+    }
+    if let Err(response) =
+        crate::quota::enforce_blob_bytes(&state, &ctx, import_plan.blob_bytes).await
+    {
+        return response;
+    }
 
     // 2. ID remap tables — populated as we create new records below.
     let mut doc_remap: HashMap<String, Uuid> = HashMap::new();
@@ -622,6 +645,10 @@ async fn import(
         }
     }
 
+    // Entries the loops below skip as too large or unreadable, warned
+    // about once at the end.
+    let mut skipped_entries = 0usize;
+
     // 4. Import attachments. New ids, but doc_id remapped to the new doc.
     for a in &manifest.attachments {
         let new_id = Uuid::new_v4();
@@ -634,7 +661,7 @@ async fn import(
         if Uuid::parse_str(&a.id).is_err() {
             continue;
         }
-        let Some(bytes_vec) = read_zip_entry(&mut zip, &a.path) else {
+        let Some(bytes_vec) = read_import_entry(&mut zip, &a.path, &mut skipped_entries) else {
             continue;
         };
         // Trust the BYTES, not the manifest. Recompute sha + size from the
@@ -689,7 +716,7 @@ async fn import(
         board_remap.insert(b.id.clone(), created.id);
         if b.has_svg
             && let Some(path) = &b.path
-            && let Some(svg) = read_zip_entry(&mut zip, path)
+            && let Some(svg) = read_import_entry(&mut zip, path, &mut skipped_entries)
             && boards.set_svg(created.id, &svg).await.is_err()
         {
             tracing::warn!(old_id=?b.id, "import: set_svg failed");
@@ -702,7 +729,7 @@ async fn import(
         let Some(new_doc_id) = doc_remap.get(&d.id).copied() else {
             continue;
         };
-        let Some(md_bytes) = read_zip_entry(&mut zip, &d.path) else {
+        let Some(md_bytes) = read_import_entry(&mut zip, &d.path, &mut skipped_entries) else {
             continue;
         };
         let md = match std::str::from_utf8(&md_bytes) {
@@ -753,6 +780,14 @@ async fn import(
                 super::markdown::refresh_markdown_and_index(&state, new_doc_id, Some(ctx.user_id))
                     .await;
         }
+    }
+
+    if skipped_entries > 0 {
+        tracing::warn!(
+            skipped_entries,
+            "import: zip entries skipped, larger than they declare (or than an entry may be) \
+             or unreadable"
+        );
     }
 
     Response::builder()
@@ -854,22 +889,187 @@ fn unique_path(
 /// any individual entry above this limit is almost certainly malicious.
 const MAX_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Most pages one import may create.
+const MAX_IMPORT_PAGES: u64 = 10_000;
+
+/// Most attachment and board SVG bytes one import may write, together.
+const MAX_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Most page Markdown bytes one import may read and write into its pages.
+/// Each page parses its entry and stores it as CRDT updates, a Markdown
+/// cache and search text, so an entry named by many pages costs its size
+/// once per page.
+const MAX_IMPORT_MARKDOWN_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Most attachment and board references one import may hold, together.
+/// Each one costs a zip lookup when planned and a row (and a copy) when
+/// imported, whatever bytes it names.
+const MAX_IMPORT_REFERENCES: u64 = 20_000;
+
+/// What an import would write, from the manifest and the zip entries'
+/// declared sizes, known before the first page is created. The per-import
+/// caps are checked against it, and so are the quotas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImportPlan {
+    /// Pages in the manifest.
+    pub(crate) pages: u64,
+    /// Page Markdown bytes: the declared size of the entry behind every
+    /// page, summed per page.
+    pub(crate) markdown_bytes: u64,
+    /// Attachment bytes: the declared size of the entry behind every
+    /// attachment reference, summed per reference.
+    pub(crate) blob_bytes: u64,
+    /// Board SVG bytes, counted the same way.
+    pub(crate) board_svg_bytes: u64,
+    /// Attachment and board references in the manifest, boards without an
+    /// SVG included.
+    pub(crate) references: u64,
+}
+
+impl ImportPlan {
+    /// Counts every page of `manifest`, and for each page's Markdown and each
+    /// attachment and board SVG reference the uncompressed size its zip
+    /// entry declares, at most `MAX_ENTRY_BYTES` (a larger one is skipped
+    /// when read). An entry named twice counts twice, since each reference
+    /// writes its own copy. A missing entry counts zero; it is skipped when
+    /// read. The manifest's own `byte_size` is never trusted.
+    fn of<R: Read + std::io::Seek>(manifest: &Manifest, zip: &zip::ZipArchive<R>) -> Self {
+        let markdown_bytes = manifest
+            .docs
+            .iter()
+            .map(|doc| declared_entry_size(zip, &doc.path))
+            .fold(0u64, u64::saturating_add);
+        let blob_bytes = manifest
+            .attachments
+            .iter()
+            .map(|attachment| declared_entry_size(zip, &attachment.path))
+            .fold(0u64, u64::saturating_add);
+        let board_svg_bytes = manifest
+            .boards
+            .iter()
+            .filter(|board| board.has_svg)
+            .filter_map(|board| board.path.as_deref())
+            .map(|path| declared_entry_size(zip, path))
+            .fold(0u64, u64::saturating_add);
+        Self {
+            pages: manifest.docs.len() as u64,
+            markdown_bytes,
+            blob_bytes,
+            board_svg_bytes,
+            references: (manifest.attachments.len() as u64)
+                .saturating_add(manifest.boards.len() as u64),
+        }
+    }
+
+    /// Attachment and board SVG bytes together.
+    fn total_bytes(&self) -> u64 {
+        self.blob_bytes.saturating_add(self.board_svg_bytes)
+    }
+
+    /// `413 import.too_large` when the import would create more than
+    /// `MAX_IMPORT_PAGES` pages, write more than `MAX_IMPORT_MARKDOWN_BYTES`
+    /// of page Markdown or `MAX_IMPORT_BYTES` of files and board images, or
+    /// hold more than `MAX_IMPORT_REFERENCES` attachment and board
+    /// references.
+    fn enforce_caps(&self) -> Result<(), Response> {
+        if self.pages <= MAX_IMPORT_PAGES
+            && self.markdown_bytes <= MAX_IMPORT_MARKDOWN_BYTES
+            && self.total_bytes() <= MAX_IMPORT_BYTES
+            && self.references <= MAX_IMPORT_REFERENCES
+        {
+            return Ok(());
+        }
+        Err(json_err_with_details(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "import.too_large",
+            "this import is too large",
+            serde_json::json!({
+                "pages": self.pages,
+                "bytes": self.total_bytes(),
+                "markdown_bytes": self.markdown_bytes,
+                "max_pages": MAX_IMPORT_PAGES,
+                "max_bytes": MAX_IMPORT_BYTES,
+                "max_markdown_bytes": MAX_IMPORT_MARKDOWN_BYTES,
+                "references": self.references,
+                "max_references": MAX_IMPORT_REFERENCES,
+            }),
+        ))
+    }
+}
+
+/// The index of the zip entry named exactly `name`. Unlike
+/// `ZipArchive::index_for_name`, a miss never falls back to scanning every
+/// entry's decoded name (a manifest naming many missing entries would cost
+/// references × entries); it only matters for CP437 names, and export
+/// paths are ASCII.
+fn zip_entry_index<R: Read + std::io::Seek>(zip: &zip::ZipArchive<R>, name: &str) -> Option<usize> {
+    zip.index_for_name_raw(name.as_bytes())
+}
+
+/// The uncompressed size the zip entry `name` declares, at most
+/// `MAX_ENTRY_BYTES`; zero when there is no such entry. Reads only the
+/// central directory.
+fn declared_entry_size<R: Read + std::io::Seek>(zip: &zip::ZipArchive<R>, name: &str) -> u64 {
+    zip_entry_index(zip, name)
+        .and_then(|index| zip.by_index_data(index).ok())
+        .map_or(0, |entry| entry.size().min(MAX_ENTRY_BYTES))
+}
+
+/// Why [`read_zip_entry`] has no bytes for an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreadEntry {
+    /// No entry of that name.
+    Missing,
+    /// It declares more than `MAX_ENTRY_BYTES`.
+    DeclaredTooLarge,
+    /// It holds more than it declares, or doesn't decompress.
+    LargerThanDeclaredOrUnreadable,
+}
+
+/// The bytes of the zip entry `name`, or why there are none: there is no
+/// such entry, it declares more than `MAX_ENTRY_BYTES`, or it holds more
+/// than it declares. The last makes the declared sizes `ImportPlan` checks
+/// an upper bound on what import writes.
 fn read_zip_entry<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     name: &str,
-) -> Option<Vec<u8>> {
-    let entry = zip.by_name(name).ok()?;
+) -> Result<Vec<u8>, UnreadEntry> {
+    let index = zip_entry_index(zip, name).ok_or(UnreadEntry::Missing)?;
+    let entry = zip.by_index(index).map_err(|_| UnreadEntry::Missing)?;
     // Reject entries that DECLARE absurd decompressed sizes outright —
     // their `size()` is attacker-controlled but lets us short-circuit
     // before allocating anything. The take() limit below catches lies.
-    if entry.size() > MAX_ENTRY_BYTES {
-        return None;
+    let declared_size = entry.size();
+    if declared_size > MAX_ENTRY_BYTES {
+        return Err(UnreadEntry::DeclaredTooLarge);
     }
-    let cap = (entry.size() as usize).min(MAX_ENTRY_BYTES as usize);
-    let mut out = Vec::with_capacity(cap);
-    let mut limited = entry.take(MAX_ENTRY_BYTES);
-    limited.read_to_end(&mut out).ok()?;
-    Some(out)
+    let mut out = Vec::with_capacity(declared_size as usize);
+    // One byte past the declared size is enough to tell that it lied.
+    let mut limited = entry.take(declared_size + 1);
+    if limited.read_to_end(&mut out).is_err() || out.len() as u64 > declared_size {
+        return Err(UnreadEntry::LargerThanDeclaredOrUnreadable);
+    }
+    Ok(out)
+}
+
+/// [`read_zip_entry`] for the import loops: `None` for an entry without
+/// bytes. One that is too large or unreadable is logged at debug and
+/// counted in `skipped_entries`, for one warning per import; a missing one
+/// is skipped silently, as before.
+fn read_import_entry<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    name: &str,
+    skipped_entries: &mut usize,
+) -> Option<Vec<u8>> {
+    match read_zip_entry(zip, name) {
+        Ok(bytes) => Some(bytes),
+        Err(UnreadEntry::Missing) => None,
+        Err(reason) => {
+            tracing::debug!(entry = name, ?reason, "import: zip entry skipped");
+            *skipped_entries += 1;
+            None
+        }
+    }
 }
 
 /// Which docs of the manifest import may still create, as it goes through
@@ -1203,7 +1403,7 @@ fn open_import_zip(bytes: &[u8]) -> Result<zip::ZipArchive<Cursor<&[u8]>>, &'sta
 fn read_manifest<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
 ) -> Result<Manifest, &'static str> {
-    let bytes = read_zip_entry(zip, "index.json").ok_or("import.no_manifest")?;
+    let bytes = read_zip_entry(zip, "index.json").map_err(|_| "import.no_manifest")?;
     let m: Manifest = serde_json::from_slice(&bytes).map_err(|_| "import.bad_manifest")?;
     if m.knot_export_version != MANIFEST_VERSION {
         return Err("import.version_mismatch");
@@ -1606,5 +1806,440 @@ mod tests {
             .map(|e| e.id.parse().unwrap())
             .collect();
         assert!(ids.into_iter().eq(0..n), "parents before children");
+    }
+
+    // -----------------------------------------------------------------------
+    // Import caps
+    // -----------------------------------------------------------------------
+
+    /// A manifest attachment of the page `doc_id`, stored at `path`. Its
+    /// `byte_size` claims nothing: the caps must not trust it.
+    fn manifest_attachment(doc_id: &str, path: &str) -> AttachmentEntry {
+        AttachmentEntry {
+            id: Uuid::new_v4().to_string(),
+            doc_id: doc_id.to_string(),
+            content_type: "application/octet-stream".to_string(),
+            original_name: None,
+            byte_size: 0,
+            path: path.to_string(),
+        }
+    }
+
+    /// A manifest board of the page `doc_id`, with its SVG at `path`.
+    fn manifest_board(doc_id: &str, path: Option<&str>) -> BoardEntry {
+        BoardEntry {
+            id: Uuid::new_v4().to_string(),
+            doc_id: doc_id.to_string(),
+            label: None,
+            has_svg: path.is_some(),
+            path: path.map(str::to_string),
+        }
+    }
+
+    /// A version-2 manifest of `docs`, `attachments` and `boards`.
+    fn manifest_of(
+        docs: Vec<DocEntry>,
+        attachments: Vec<AttachmentEntry>,
+        boards: Vec<BoardEntry>,
+    ) -> Manifest {
+        Manifest {
+            knot_export_version: MANIFEST_VERSION.to_string(),
+            docs,
+            attachments,
+            boards,
+        }
+    }
+
+    /// `zip` with the uncompressed size of `entry_name` rewritten to
+    /// `declared_size`, in its local header and in the central directory
+    /// alike, so the archive is consistent but lies about that entry.
+    fn with_declared_size(zip: &[u8], entry_name: &str, declared_size: u32) -> Vec<u8> {
+        const LOCAL_HEADER: &[u8] = b"PK\x03\x04";
+        const CENTRAL_HEADER: &[u8] = b"PK\x01\x02";
+        let mut patched = zip.to_vec();
+        let name = entry_name.as_bytes();
+        let name_at =
+            |bytes: &[u8], offset: usize| bytes.get(offset..offset + name.len()) == Some(name);
+        let mut patched_headers = 0;
+        for offset in 0..patched.len().saturating_sub(4) {
+            let size_offset = match &patched[offset..offset + 4] {
+                signature if signature == LOCAL_HEADER && name_at(&patched, offset + 30) => 22,
+                signature if signature == CENTRAL_HEADER && name_at(&patched, offset + 46) => 24,
+                _ => continue,
+            };
+            patched[offset + size_offset..offset + size_offset + 4]
+                .copy_from_slice(&declared_size.to_le_bytes());
+            patched_headers += 1;
+        }
+        assert_eq!(
+            patched_headers, 2,
+            "local and central header of {entry_name}"
+        );
+        patched
+    }
+
+    /// The plan counts every page, and the declared size of the zip entry
+    /// behind every attachment and board SVG reference: an entry named twice
+    /// counts twice, the manifest's `byte_size` counts for nothing, a missing
+    /// entry or a board without an SVG counts zero.
+    #[test]
+    fn import_plan_counts_every_reference_by_declared_size() {
+        let photo = vec![7u8; 1000];
+        let svg = b"<svg/>".to_vec();
+        let zip_bytes = build_zip(&[
+            ("attachments/photo.png", &photo),
+            ("boards/sketch.svg", &svg),
+        ]);
+        let zip = open_import_zip(&zip_bytes).unwrap();
+        let manifest = manifest_of(
+            vec![
+                manifest_doc("a", None, false),
+                manifest_doc("b", Some("a"), false),
+                manifest_doc("c", None, true),
+            ],
+            vec![
+                manifest_attachment("a", "attachments/photo.png"),
+                manifest_attachment("b", "attachments/photo.png"),
+                manifest_attachment("c", "attachments/missing.png"),
+            ],
+            vec![
+                manifest_board("a", Some("boards/sketch.svg")),
+                manifest_board("b", None),
+            ],
+        );
+
+        let plan = ImportPlan::of(&manifest, &zip);
+
+        assert_eq!(
+            plan,
+            ImportPlan {
+                pages: 3,
+                markdown_bytes: 0,
+                blob_bytes: 2000,
+                board_svg_bytes: svg.len() as u64,
+                references: 5,
+            }
+        );
+        assert_eq!(plan.total_bytes(), 2000 + svg.len() as u64);
+    }
+
+    /// An entry that declares more than one entry may hold is skipped when
+    /// read, so it counts as at most `MAX_ENTRY_BYTES` per reference.
+    #[test]
+    fn import_plan_counts_an_oversized_declaration_at_the_entry_cap() {
+        let zip_bytes = with_declared_size(
+            &build_zip(&[("attachments/huge.bin", b"tiny")]),
+            "attachments/huge.bin",
+            u32::MAX,
+        );
+        let zip = open_import_zip(&zip_bytes).unwrap();
+        let manifest = manifest_of(
+            vec![manifest_doc("a", None, false)],
+            vec![manifest_attachment("a", "attachments/huge.bin")],
+            vec![],
+        );
+
+        assert_eq!(ImportPlan::of(&manifest, &zip).blob_bytes, MAX_ENTRY_BYTES);
+    }
+
+    /// The body of a refusal, as JSON.
+    async fn refusal_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn import_caps_refuse_one_page_too_many() {
+        let at_the_cap = ImportPlan {
+            pages: MAX_IMPORT_PAGES,
+            markdown_bytes: 0,
+            blob_bytes: 0,
+            board_svg_bytes: 0,
+            references: 0,
+        };
+        assert!(at_the_cap.enforce_caps().is_ok());
+
+        let over_the_cap = ImportPlan {
+            pages: MAX_IMPORT_PAGES + 1,
+            ..at_the_cap
+        };
+        let refusal = over_the_cap.enforce_caps().unwrap_err();
+        assert_eq!(refusal.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            refusal_json(refusal).await["error"],
+            serde_json::json!({
+                "code": "import.too_large",
+                "message": "this import is too large",
+                "details": {
+                    "pages": MAX_IMPORT_PAGES + 1,
+                    "bytes": 0,
+                    "markdown_bytes": 0,
+                    "max_pages": MAX_IMPORT_PAGES,
+                    "max_bytes": MAX_IMPORT_BYTES,
+                    "max_markdown_bytes": MAX_IMPORT_MARKDOWN_BYTES,
+                    "references": 0,
+                    "max_references": MAX_IMPORT_REFERENCES,
+                },
+            })
+        );
+    }
+
+    /// Attachment and board SVG bytes share one cap.
+    #[tokio::test]
+    async fn import_caps_refuse_one_byte_too_many() {
+        let at_the_cap = ImportPlan {
+            pages: 1,
+            markdown_bytes: 0,
+            blob_bytes: MAX_IMPORT_BYTES - 10,
+            board_svg_bytes: 10,
+            references: 2,
+        };
+        assert!(at_the_cap.enforce_caps().is_ok());
+
+        let over_the_cap = ImportPlan {
+            board_svg_bytes: 11,
+            ..at_the_cap
+        };
+        let refusal = over_the_cap.enforce_caps().unwrap_err();
+        assert_eq!(refusal.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let details = refusal_json(refusal).await["error"]["details"].clone();
+        assert_eq!(details["bytes"], MAX_IMPORT_BYTES + 1);
+        assert_eq!(details["max_bytes"], MAX_IMPORT_BYTES);
+    }
+
+    /// Every page's Markdown is read and written once per page, so the plan
+    /// counts the declared size of the entry behind every doc, per
+    /// reference: many pages naming one large entry count it each time.
+    #[test]
+    fn import_plan_counts_page_markdown_per_reference() {
+        let shared_markdown = vec![b'x'; 5000];
+        let zip_bytes = build_zip(&[("docs/shared.md", &shared_markdown)]);
+        let zip = open_import_zip(&zip_bytes).unwrap();
+        let docs: Vec<DocEntry> = (0..3)
+            .map(|index| DocEntry {
+                path: "docs/shared.md".to_string(),
+                ..manifest_doc(&format!("page-{index}"), None, false)
+            })
+            .chain([manifest_doc("missing", None, false)])
+            .collect();
+        let manifest = manifest_of(docs, vec![], vec![]);
+
+        let plan = ImportPlan::of(&manifest, &zip);
+
+        assert_eq!(plan.pages, 4);
+        assert_eq!(plan.markdown_bytes, 3 * 5000);
+        assert_eq!(plan.total_bytes(), 0, "files and board images only");
+    }
+
+    /// Page Markdown has a cap of its own, refused like the others.
+    #[tokio::test]
+    async fn import_caps_refuse_one_markdown_byte_too_many() {
+        let at_the_cap = ImportPlan {
+            pages: 1,
+            markdown_bytes: MAX_IMPORT_MARKDOWN_BYTES,
+            blob_bytes: 0,
+            board_svg_bytes: 0,
+            references: 0,
+        };
+        assert!(at_the_cap.enforce_caps().is_ok());
+
+        let over_the_cap = ImportPlan {
+            markdown_bytes: MAX_IMPORT_MARKDOWN_BYTES + 1,
+            ..at_the_cap
+        };
+        let refusal = over_the_cap.enforce_caps().unwrap_err();
+        assert_eq!(refusal.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let details = refusal_json(refusal).await["error"]["details"].clone();
+        assert_eq!(details["markdown_bytes"], MAX_IMPORT_MARKDOWN_BYTES + 1);
+        assert_eq!(details["max_markdown_bytes"], MAX_IMPORT_MARKDOWN_BYTES);
+    }
+
+    /// Attachment and board references share one cap, checked like the
+    /// others: one too many is refused with every count in the details.
+    #[tokio::test]
+    async fn import_caps_refuse_one_reference_too_many() {
+        let at_the_cap = ImportPlan {
+            pages: 1,
+            markdown_bytes: 0,
+            blob_bytes: 0,
+            board_svg_bytes: 0,
+            references: MAX_IMPORT_REFERENCES,
+        };
+        assert!(at_the_cap.enforce_caps().is_ok());
+
+        let over_the_cap = ImportPlan {
+            references: MAX_IMPORT_REFERENCES + 1,
+            ..at_the_cap
+        };
+        let refusal = over_the_cap.enforce_caps().unwrap_err();
+        assert_eq!(refusal.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let error = refusal_json(refusal).await["error"].clone();
+        assert_eq!(error["code"], "import.too_large");
+        assert_eq!(
+            error["details"],
+            serde_json::json!({
+                "pages": 1,
+                "bytes": 0,
+                "markdown_bytes": 0,
+                "max_pages": MAX_IMPORT_PAGES,
+                "max_bytes": MAX_IMPORT_BYTES,
+                "max_markdown_bytes": MAX_IMPORT_MARKDOWN_BYTES,
+                "references": MAX_IMPORT_REFERENCES + 1,
+                "max_references": MAX_IMPORT_REFERENCES,
+            })
+        );
+    }
+
+    /// Missing entries cost no bytes, but every reference counts against the
+    /// reference cap: boards with and without an SVG, attachments whose
+    /// entry isn't there.
+    #[test]
+    fn import_caps_count_references_to_missing_entries() {
+        let zip_bytes = build_zip(&[("docs/a.md", b"# A\n")]);
+        let zip = open_import_zip(&zip_bytes).unwrap();
+        let attachment_count = MAX_IMPORT_REFERENCES as usize / 2;
+        let board_count = MAX_IMPORT_REFERENCES as usize - attachment_count;
+        let attachments = |count: usize| {
+            (0..count)
+                .map(|index| manifest_attachment("a", &format!("attachments/missing-{index}.bin")))
+                .collect::<Vec<_>>()
+        };
+        let boards = |count: usize| {
+            (0..count)
+                .map(|index| {
+                    let svg_path = format!("boards/missing-{index}.svg");
+                    manifest_board("a", (index % 2 == 0).then_some(svg_path.as_str()))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let at_the_cap = ImportPlan::of(
+            &manifest_of(
+                vec![manifest_doc("a", None, false)],
+                attachments(attachment_count),
+                boards(board_count),
+            ),
+            &zip,
+        );
+        assert_eq!(at_the_cap.references, MAX_IMPORT_REFERENCES);
+        assert_eq!(at_the_cap.total_bytes(), 0);
+        assert!(at_the_cap.enforce_caps().is_ok());
+
+        let over_the_cap = ImportPlan::of(
+            &manifest_of(
+                vec![manifest_doc("a", None, false)],
+                attachments(attachment_count + 1),
+                boards(board_count),
+            ),
+            &zip,
+        );
+        assert_eq!(over_the_cap.references, MAX_IMPORT_REFERENCES + 1);
+        assert!(over_the_cap.enforce_caps().is_err());
+    }
+
+    /// A small, highly compressible entry named by enough attachments goes
+    /// over the byte cap, though the zip itself is tiny.
+    #[test]
+    fn import_caps_count_an_entry_referenced_many_times() {
+        let one_mebibyte = vec![0u8; 1024 * 1024];
+        let zip_bytes = build_zip(&[("attachments/zeros.bin", &one_mebibyte)]);
+        assert!(zip_bytes.len() < 64 * 1024, "the zip stays small");
+        let zip = open_import_zip(&zip_bytes).unwrap();
+        let references = (MAX_IMPORT_BYTES / one_mebibyte.len() as u64) as usize + 1;
+        assert!(
+            (references as u64) <= MAX_IMPORT_REFERENCES,
+            "the byte cap, not the reference cap, refuses this"
+        );
+        let manifest = manifest_of(
+            vec![manifest_doc("a", None, false)],
+            (0..references)
+                .map(|_| manifest_attachment("a", "attachments/zeros.bin"))
+                .collect(),
+            vec![],
+        );
+
+        let plan = ImportPlan::of(&manifest, &zip);
+
+        assert_eq!(plan.blob_bytes, references as u64 * 1024 * 1024);
+        assert!(plan.enforce_caps().is_err());
+    }
+
+    #[test]
+    fn read_zip_entry_reads_an_entry_of_its_declared_size() {
+        let zip_bytes = build_zip(&[("docs/a.md", b"# Hello\n")]);
+        let mut zip = open_import_zip(&zip_bytes).unwrap();
+        assert_eq!(
+            read_zip_entry(&mut zip, "docs/a.md").as_deref(),
+            Ok(&b"# Hello\n"[..])
+        );
+        assert_eq!(
+            read_zip_entry(&mut zip, "docs/missing.md"),
+            Err(UnreadEntry::Missing)
+        );
+    }
+
+    /// An entry that holds more than it declares is skipped, so an import
+    /// never writes more bytes than its caps checked. This also pins the zip
+    /// crate's own guard: its reader fails an entry that runs past its
+    /// declared size, and either that error or our one-byte-past check
+    /// must skip the entry.
+    #[test]
+    fn read_zip_entry_skips_an_entry_larger_than_declared() {
+        let zip_bytes = with_declared_size(
+            &build_zip(&[("attachments/liar.bin", &[1u8; 4096])]),
+            "attachments/liar.bin",
+            16,
+        );
+        let mut zip = open_import_zip(&zip_bytes).unwrap();
+        assert_eq!(
+            read_zip_entry(&mut zip, "attachments/liar.bin"),
+            Err(UnreadEntry::LargerThanDeclaredOrUnreadable)
+        );
+    }
+
+    /// The import loops count entries skipped as too large or unreadable,
+    /// for one warning per import, but not missing ones.
+    #[test]
+    fn read_import_entry_counts_skipped_entries_but_not_missing_ones() {
+        let zip_bytes = with_declared_size(
+            &build_zip(&[
+                ("attachments/honest.bin", &[2u8; 64]),
+                ("attachments/liar.bin", &[1u8; 4096]),
+            ]),
+            "attachments/liar.bin",
+            16,
+        );
+        let mut zip = open_import_zip(&zip_bytes).unwrap();
+        let mut skipped_entries = 0;
+
+        assert_eq!(
+            read_import_entry(&mut zip, "attachments/honest.bin", &mut skipped_entries),
+            Some(vec![2u8; 64])
+        );
+        assert_eq!(
+            read_import_entry(&mut zip, "attachments/missing.bin", &mut skipped_entries),
+            None
+        );
+        assert_eq!(skipped_entries, 0);
+        for _ in 0..2 {
+            assert_eq!(
+                read_import_entry(&mut zip, "attachments/liar.bin", &mut skipped_entries),
+                None
+            );
+        }
+        assert_eq!(skipped_entries, 2);
+    }
+
+    /// Entries are found by their exact name only.
+    #[test]
+    fn zip_entries_are_looked_up_by_exact_name() {
+        let zip_bytes = build_zip(&[("attachments/photo.png", b"png")]);
+        let zip = open_import_zip(&zip_bytes).unwrap();
+        assert!(zip_entry_index(&zip, "attachments/photo.png").is_some());
+        assert_eq!(zip_entry_index(&zip, "attachments/Photo.png"), None);
+        assert_eq!(declared_entry_size(&zip, "attachments/photo.png"), 3);
+        assert_eq!(declared_entry_size(&zip, "attachments/none.png"), 0);
     }
 }

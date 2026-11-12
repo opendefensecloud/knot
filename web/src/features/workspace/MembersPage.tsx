@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { Member } from "../../lib/validators";
 
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 
 import { memberMatches } from "./memberSearch";
@@ -45,7 +46,7 @@ export default function MembersPage() {
             : r.error.code === "auth.weak_password"
               ? "Password must be at least 8 characters."
               : "Invite failed.";
-        notify("error", msg);
+        notifyFailure(notify, r.error, msg);
         return;
       }
       setInviteEmail("");
@@ -59,7 +60,7 @@ export default function MembersPage() {
     mutationFn: async (a: { userId: string; role: "owner" | "editor" | "viewer" }) =>
       workspaceApi.setRole(a.userId, a.role),
     onSuccess: async (r) => {
-      if ("error" in r) notify("error", "Role change failed");
+      if ("error" in r) notifyFailure(notify, r.error, "Role change failed");
       else await qc.invalidateQueries({ queryKey: ["members"] });
     },
   });
@@ -67,7 +68,7 @@ export default function MembersPage() {
   const remove = useMutation({
     mutationFn: async (userId: string) => workspaceApi.remove(userId),
     onSuccess: async (r) => {
-      if ("error" in r) notify("error", "Remove failed");
+      if ("error" in r) notifyFailure(notify, r.error, "Remove failed");
       else await qc.invalidateQueries({ queryKey: ["members"] });
     },
   });

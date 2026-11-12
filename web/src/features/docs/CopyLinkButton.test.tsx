@@ -75,6 +75,35 @@ describe("CopyLinkButton", () => {
     vi.unstubAllGlobals();
   });
 
+  it("shows the rate-limit text when getting the link is refused", async () => {
+    vi.spyOn(shortLinksApi, "getOrCreate").mockResolvedValue({
+      error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 8 }, status: 429 },
+    });
+    const notify = vi.fn();
+    useUi.setState({ notify });
+    render(<CopyLinkButton docId="d1" archived={false} />);
+    fireEvent.click(screen.getByTestId("copy-link"));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledExactlyOnceWith("warn", "You're doing that too fast. Try again in 8 s.", {
+        key: "limit",
+      }),
+    );
+    expect(writeText).not.toHaveBeenCalled();
+  });
+
+  it("says it couldn't get a link for any other failure", async () => {
+    vi.spyOn(shortLinksApi, "getOrCreate").mockResolvedValue({
+      error: { code: "internal", message: "", details: {}, status: 500 },
+    });
+    const notify = vi.fn();
+    useUi.setState({ notify });
+    render(<CopyLinkButton docId="d1" archived={false} />);
+    fireEvent.click(screen.getByTestId("copy-link"));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledExactlyOnceWith("error", "Couldn't get a link for this page."),
+    );
+  });
+
   it("falls back to showing the link when the clipboard refuses", async () => {
     vi.spyOn(shortLinksApi, "getOrCreate").mockResolvedValue({ ok: LINK });
     writeText.mockRejectedValue(new Error("denied"));
