@@ -13,6 +13,8 @@ vi.mock("../../auth/SessionContext", () => ({
     data: { ok: { user_id: "u1", email: "anna@example.org", display_name: "Anna", role: "owner" } },
   }),
 }));
+// The key list fetches on mount, which would eat the tests' stubbed responses.
+vi.mock("../apiKeys/ApiKeysSection", () => ({ ApiKeysSection: () => null }));
 const saved = vi.hoisted(() => ({ saveBlob: vi.fn() }));
 vi.mock("../export/exportFile", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../export/exportFile")>()),
@@ -30,13 +32,15 @@ const TOO_FAST_TEXT = "You're doing that too fast. Try again in 8 s.";
 
 function renderPage() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const invalidate = vi.spyOn(qc, "invalidateQueries");
+  render(
     <QueryClientProvider client={qc}>
       <MemoryRouter>
         <SettingsPage />
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { invalidate };
 }
 
 function pickArchive() {
@@ -173,5 +177,35 @@ describe("SettingsPage change password", () => {
     fireEvent.change(screen.getByTestId("pw-new"), { target: { value: "new-password" } });
     fireEvent.click(screen.getByTestId("pw-submit"));
     expect(await screen.findByTestId("pw-error")).toHaveTextContent(TOO_FAST_TEXT);
+  });
+});
+
+describe("SettingsPage password change revokes keys", () => {
+  function submitPasswordChange() {
+    fireEvent.change(screen.getByTestId("pw-current"), { target: { value: "oldpassword1" } });
+    fireEvent.change(screen.getByTestId("pw-new"), { target: { value: "newpassword1" } });
+    fireEvent.click(screen.getByTestId("pw-submit"));
+  }
+
+  it("refreshes every API key list once the change revoked the keys", async () => {
+    vi.spyOn(authApi, "changePassword").mockResolvedValue({ ok: undefined });
+    const { invalidate } = renderPage();
+
+    submitPasswordChange();
+
+    expect(await screen.findByTestId("pw-ok")).toBeInTheDocument();
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["api-keys"] }));
+  });
+
+  it("leaves the key lists alone when the change failed", async () => {
+    vi.spyOn(authApi, "changePassword").mockResolvedValue({
+      error: { code: "auth.invalid_credentials", message: "", details: {} },
+    } as never);
+    const { invalidate } = renderPage();
+
+    submitPasswordChange();
+
+    expect(await screen.findByTestId("pw-error")).toHaveTextContent("Current password is wrong.");
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ["api-keys"] });
   });
 });

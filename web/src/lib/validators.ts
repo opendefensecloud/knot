@@ -34,6 +34,8 @@ const memberSchema = v.object({
   email: v.string(),
   display_name: v.string(),
   role: v.picklist(["owner", "editor", "viewer"]),
+  // Older servers send no kind: everyone is human there.
+  kind: v.optional(v.picklist(["human", "bot"]), "human"),
 });
 export type Member = v.InferOutput<typeof memberSchema>;
 export const Member = memberSchema;
@@ -303,6 +305,6 @@ const docAuditPageSchema = v.object({
 export type DocAuditPage = v.InferOutput<typeof docAuditPageSchema>;
 export const DocAuditPage = docAuditPageSchema;
 
-export function parse<T>(schema: v.GenericSchema<T>, data: unknown): T {
+export function parse<T>(schema: v.GenericSchema<unknown, T>, data: unknown): T {
   return v.parse(schema, data);
 }

@@ -5,17 +5,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Member } from "../../lib/validators";
 import { useUi } from "../../stores/ui";
 
+import { apiKeysApi } from "../apiKeys/apiKeys.api";
 import MembersPage, { filterMembers } from "./MembersPage";
 import { workspaceApi } from "./workspace.api";
+
+vi.mock("../../auth/SessionContext", () => ({
+  useSession: () => ({ data: undefined }),
+}));
 
 vi.mock("../../auth/useEffectiveRole", () => ({
   useEffectiveRole: () => ({ workspace: "owner", doc: null }),
 }));
 
 const MEMBERS: Member[] = [
-  { user_id: "u1", email: "anna@example.org", display_name: "Anna Schmidt", role: "owner" },
-  { user_id: "u2", email: "bob@example.org", display_name: "Bob Meyer", role: "editor" },
-  { user_id: "u3", email: "carla@other.net", display_name: "Carla Jansen", role: "viewer" },
+  { user_id: "u1", email: "anna@example.org", display_name: "Anna Schmidt", role: "owner", kind: "human" },
+  { user_id: "u2", email: "bob@example.org", display_name: "Bob Meyer", role: "editor", kind: "human" },
+  { user_id: "u3", email: "carla@other.net", display_name: "Carla Jansen", role: "viewer", kind: "human" },
 ];
 
 afterEach(() => {
@@ -84,7 +89,7 @@ describe("MembersPage remove", () => {
     vi.spyOn(workspaceApi, "listMembers").mockResolvedValue({ ok: MEMBERS });
   });
 
-  it("warns that a removed member loses their page grants too", async () => {
+  it("warns that a removed member loses their page grants and API keys too", async () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     const remove = vi.spyOn(workspaceApi, "remove");
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -97,9 +102,141 @@ describe("MembersPage remove", () => {
     const row = await screen.findByTestId("member-u2");
     fireEvent.click(within(row).getByRole("button", { name: "Remove" }));
     expect(confirm).toHaveBeenCalledWith(
-      "Remove bob@example.org? They also lose every page-level grant, including access to restricted pages.",
+      "Remove bob@example.org? They also lose every page-level grant, including access to restricted pages. Their API keys and any bot keys they created stop working.",
     );
     expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("refreshes every API key list once a removal revoked the member's keys", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.spyOn(workspaceApi, "remove").mockResolvedValue({ ok: undefined });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidate = vi.spyOn(qc, "invalidateQueries");
+    render(
+      <QueryClientProvider client={qc}>
+        <MembersPage />
+      </QueryClientProvider>,
+    );
+
+    const row = await screen.findByTestId("member-u2");
+    fireEvent.click(within(row).getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["api-keys"] }));
+  });
+});
+
+describe("MembersPage role change", () => {
+  beforeEach(() => {
+    vi.spyOn(workspaceApi, "listMembers").mockResolvedValue({ ok: MEMBERS });
+  });
+
+  function renderPage() {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={qc}>
+        <MembersPage />
+      </QueryClientProvider>,
+    );
+  }
+
+  async function chooseRole(userId: string, role: string) {
+    const row = await screen.findByTestId(`member-${userId}`);
+    fireEvent.change(within(row).getByRole("combobox"), { target: { value: role } });
+  }
+
+  it("asks before demoting an owner, and changes nothing if declined", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const setRole = vi.spyOn(workspaceApi, "setRole");
+    renderPage();
+    await chooseRole("u1", "editor");
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("bot keys"));
+    expect(setRole).not.toHaveBeenCalled();
+  });
+
+  it("demotes an owner once confirmed", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const setRole = vi.spyOn(workspaceApi, "setRole").mockResolvedValue({ ok: undefined });
+    renderPage();
+    await chooseRole("u1", "editor");
+    await waitFor(() => expect(setRole).toHaveBeenCalledWith("u1", "editor"));
+  });
+
+  it("refreshes every API key list once a demotion revoked the bot keys the owner minted", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.spyOn(workspaceApi, "setRole").mockResolvedValue({ ok: undefined });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidate = vi.spyOn(qc, "invalidateQueries");
+    render(
+      <QueryClientProvider client={qc}>
+        <MembersPage />
+      </QueryClientProvider>,
+    );
+    await chooseRole("u1", "editor");
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["api-keys"] }));
+  });
+
+  it("doesn't ask when the member isn't an owner, since no key is at stake", async () => {
+    const confirm = vi.spyOn(window, "confirm");
+    const setRole = vi.spyOn(workspaceApi, "setRole").mockResolvedValue({ ok: undefined });
+    renderPage();
+    await chooseRole("u2", "viewer");
+    await waitFor(() => expect(setRole).toHaveBeenCalledWith("u2", "viewer"));
+    expect(confirm).not.toHaveBeenCalled();
+  });
+});
+
+describe("MembersPage bots", () => {
+  const BOT: Member = { user_id: "b1", email: "ci@bots.example.org", display_name: "CI", role: "editor", kind: "bot" };
+
+  function renderPage() {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={qc}>
+        <MembersPage />
+      </QueryClientProvider>,
+    );
+  }
+
+  beforeEach(() => {
+    vi.spyOn(workspaceApi, "listMembers").mockResolvedValue({ ok: [...MEMBERS, BOT] });
+  });
+
+  it("a bot invite sends kind bot, no password, and never the owner role", async () => {
+    const invite = vi.spyOn(workspaceApi, "invite").mockResolvedValue({ ok: undefined });
+    renderPage();
+    const form = await screen.findByTestId("invite-form");
+    fireEvent.change(screen.getByTestId("invite-email"), { target: { value: "ci@bots.example.org" } });
+    fireEvent.change(screen.getByTestId("invite-role"), { target: { value: "owner" } });
+    fireEvent.change(screen.getByTestId("invite-password"), { target: { value: "secret123" } });
+
+    fireEvent.click(screen.getByTestId("invite-kind-bot"));
+    expect(screen.queryByTestId("invite-password")).not.toBeInTheDocument();
+    expect(screen.getByTestId("invite-bot-hint")).toHaveTextContent("API key");
+    const roleSelect = screen.getByTestId("invite-role");
+    expect(within(roleSelect).queryByRole("option", { name: "Owner" })).not.toBeInTheDocument();
+    expect(roleSelect).toHaveValue("editor");
+
+    fireEvent.submit(form);
+    await waitFor(() => expect(invite).toHaveBeenCalledTimes(1));
+    expect(invite).toHaveBeenCalledWith("ci@bots.example.org", "editor", undefined, undefined, "bot");
+  });
+
+  it("renders the bot badge and offers no owner role on a bot row", async () => {
+    renderPage();
+    const row = await screen.findByTestId("member-b1");
+    expect(within(row).getByTestId("member-bot-badge")).toHaveTextContent("Bot");
+    expect(within(row).queryByRole("option", { name: "Owner" })).not.toBeInTheDocument();
+    expect(within(screen.getByTestId("member-u2")).queryByTestId("member-bot-badge")).not.toBeInTheDocument();
+    expect(within(screen.getByTestId("member-u2")).getByRole("option", { name: "Owner" })).toBeInTheDocument();
+  });
+
+  it("opens the API keys section for a bot row", async () => {
+    const list = vi.spyOn(apiKeysApi, "list").mockResolvedValue({ ok: [] });
+    renderPage();
+    const row = await screen.findByTestId("member-b1");
+    expect(within(screen.getByTestId("member-u2")).queryByTestId("member-api-keys")).not.toBeInTheDocument();
+    fireEvent.click(within(row).getByTestId("member-api-keys"));
+    expect(await screen.findByTestId("member-api-keys-panel-b1")).toBeInTheDocument();
+    await waitFor(() => expect(list).toHaveBeenCalledWith("b1"));
   });
 });
 
