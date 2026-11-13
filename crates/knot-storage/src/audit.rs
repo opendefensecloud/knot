@@ -26,7 +26,7 @@ pub async fn record(
 }
 
 /// Same as `record`, with details about the event in `data` (a JSON
-/// object). Best effort too.
+/// object). Best-effort: failures are logged and swallowed.
 pub async fn record_with_data(
     pool: &PgPool,
     workspace_id: Uuid,
@@ -36,19 +36,22 @@ pub async fn record_with_data(
     target_id: Uuid,
     data: &JsonValue,
 ) {
-    let result = sqlx::query(
-        "INSERT INTO audit_events (workspace_id, actor_id, action, target_kind, target_id, data)
-         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(workspace_id)
-    .bind(actor)
-    .bind(action)
-    .bind(target_kind)
-    .bind(target_id)
-    .bind(data)
-    .execute(pool)
-    .await;
-    if let Err(e) = result {
+    let written = match pool.acquire().await {
+        Ok(mut conn) => {
+            record_in_tx_with_data(
+                &mut conn,
+                workspace_id,
+                actor,
+                action,
+                target_kind,
+                target_id,
+                data,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = written {
         tracing::warn!(error=?e, action, "audit write failed (best-effort)");
     }
 }

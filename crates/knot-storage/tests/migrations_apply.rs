@@ -57,6 +57,7 @@ async fn migrations_apply_cleanly() {
 
     let expected: &[&str] = &[
         "acl_invalidations",
+        "api_keys",
         "audit_events",
         "blob_bytes",
         "blob_copy_pending",
@@ -3605,6 +3606,1222 @@ async fn history_builder_migration_runs_under_live_0_9_10_traffic() {
 
     // Every backend but this probe has exited, so each flushed its
     // statistics; a 40P01 anywhere (even one a retry hid) shows here.
+    pool.close().await;
+    let mut probe = sqlx::PgConnection::connect(&url).await.unwrap();
+    let mut others: i64 = -1;
+    for _ in 0..50 {
+        sqlx::query("SELECT pg_stat_clear_snapshot()")
+            .execute(&mut probe)
+            .await
+            .unwrap();
+        others = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database() AND backend_type = 'client backend'
+                AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(&mut probe)
+        .await
+        .unwrap();
+        if others == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(others, 0, "every loop backend exited within 5 s");
+    sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(&mut probe)
+        .await
+        .unwrap();
+    let deadlocks: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&mut probe)
+    .await
+    .unwrap();
+    assert_eq!(deadlocks, deadlocks0, "no deadlock anywhere");
+}
+
+// ---------------------------------------------------------------------------
+// API keys and bots (20261112120001_api_keys_users_kind, 20261112120002_api_keys_and_bots)
+// ---------------------------------------------------------------------------
+
+/// A workspace plus one user of the given shape. `kind` is 'human' or 'bot'.
+async fn seed_user(
+    pool: &PgPool,
+    email: &str,
+    kind: &str,
+    password_hash: Option<&str>,
+    oidc_subject: Option<&str>,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO users (email, display_name, kind, password_hash, oidc_issuer, oidc_subject)
+         VALUES ($1, $1, $2, $3, CASE WHEN $4::text IS NULL THEN NULL ELSE 'https://idp.test' END, $4)
+         RETURNING id",
+    )
+    .bind(email)
+    .bind(kind)
+    .bind(password_hash)
+    .bind(oidc_subject)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn seed_workspace(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar("INSERT INTO workspaces (slug, name) VALUES ('default', 'W') RETURNING id")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Insert a key with a fresh random hash; `expires` is an SQL expression.
+async fn insert_key(
+    pool: &PgPool,
+    ws: Uuid,
+    user: Uuid,
+    created_by: Uuid,
+    expires: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let sql = format!(
+        "INSERT INTO api_keys (workspace_id, user_id, name, key_hash, scopes, created_by, expires_at)
+         VALUES ($1, $2, 'k', gen_random_uuid()::text::bytea, ARRAY['read'], $3, {expires})
+         RETURNING id"
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(ws)
+        .bind(user)
+        .bind(created_by)
+        .fetch_one(pool)
+        .await
+}
+
+async fn revoked_at(pool: &PgPool, key: Uuid) -> Option<chrono::DateTime<chrono::Utc>> {
+    sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = $1")
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_keys_table_has_expected_columns_and_constraints() {
+    let pool = knot_test_support::fresh_db().await.pool;
+
+    let cols: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name::text, data_type::text, is_nullable::text
+           FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'api_keys'
+          ORDER BY ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let cols: Vec<(&str, &str, &str)> = cols
+        .iter()
+        .map(|(n, t, null)| (n.as_str(), t.as_str(), null.as_str()))
+        .collect();
+    assert_eq!(
+        cols,
+        [
+            ("id", "uuid", "NO"),
+            ("workspace_id", "uuid", "NO"),
+            ("user_id", "uuid", "NO"),
+            ("name", "text", "NO"),
+            ("key_hash", "bytea", "NO"),
+            ("scopes", "ARRAY", "NO"),
+            ("created_by", "uuid", "NO"),
+            ("created_at", "timestamp with time zone", "NO"),
+            ("expires_at", "timestamp with time zone", "YES"),
+            ("last_used_at", "timestamp with time zone", "YES"),
+            ("revoked_at", "timestamp with time zone", "YES"),
+        ],
+        "api_keys columns drifted from the spec"
+    );
+
+    // key_hash is UNIQUE: the auth lookup relies on it.
+    let unique: Vec<String> = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+          WHERE conrelid = 'api_keys'::regclass AND contype = 'u'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unique, ["UNIQUE (key_hash)"], "key_hash must be UNIQUE");
+
+    // Foreign keys: workspace and owner cascade, created_by does not.
+    let fks: BTreeSet<(String, String)> = sqlx::query_as(
+        "SELECT a.attname::text, c.confdeltype::text
+           FROM pg_constraint c
+           JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+          WHERE c.conrelid = 'api_keys'::regclass AND c.contype = 'f'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    let want: BTreeSet<(String, String)> =
+        [("created_by", "a"), ("user_id", "c"), ("workspace_id", "c")]
+            .into_iter()
+            .map(|(a, b)| (a.to_owned(), b.to_owned()))
+            .collect();
+    assert_eq!(fks, want, "api_keys foreign keys / ON DELETE rules drifted");
+
+    let idx: Option<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'api_keys_user_live_idx'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    let idx = idx.expect("partial index api_keys_user_live_idx missing");
+    assert!(
+        idx.contains("(user_id)") && idx.contains("WHERE (revoked_at IS NULL)"),
+        "api_keys_user_live_idx must be a partial index on live keys: {idx}"
+    );
+
+    // Behaviour of the CHECK constraints.
+    let ws = seed_workspace(&pool).await;
+    let user = seed_user(&pool, "h@x.test", "human", Some("pw"), None).await;
+    let try_insert = |name: &'static str, scopes: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let sql = format!(
+                "INSERT INTO api_keys (workspace_id, user_id, name, key_hash, scopes, created_by)
+                 VALUES ($1, $2, $3, gen_random_uuid()::text::bytea, {scopes}, $2)"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(ws)
+                .bind(user)
+                .bind(name)
+                .execute(&pool)
+                .await
+        }
+    };
+    try_insert("ok", "ARRAY['read','create','update','delete']")
+        .await
+        .expect("all four known scopes are accepted");
+    for (name, scopes, why) in [
+        ("k", "ARRAY[]::text[]", "empty scopes"),
+        ("k", "ARRAY['admin']", "unknown scope"),
+        (
+            "k",
+            "ARRAY['read','write']",
+            "unknown scope mixed with a known one",
+        ),
+        ("   ", "ARRAY['read']", "blank name"),
+        ("", "ARRAY['read']", "empty name"),
+    ] {
+        let err = try_insert(name, scopes)
+            .await
+            .expect_err(&format!("api_keys CHECK must reject {why}"));
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("23514"),
+            "{why}: expected check_violation, got {err}"
+        );
+    }
+    let long: &'static str = Box::leak("n".repeat(101).into_boxed_str());
+    let err = try_insert(long, "ARRAY['read']")
+        .await
+        .expect_err("api_keys CHECK must reject a 101-char name");
+    assert_eq!(sqlstate(&err).as_deref(), Some("23514"), "{err}");
+
+    // users.kind and the bot-credential constraint.
+    let err = sqlx::query(
+        "INSERT INTO users (email, display_name, kind) VALUES ('r@x.test', 'R', 'robot')",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("users.kind must only allow human|bot");
+    assert_eq!(sqlstate(&err).as_deref(), Some("23514"), "{err}");
+    let err = sqlx::query(
+        "INSERT INTO users (email, display_name, kind, password_hash) VALUES ('b@x.test', 'B', 'bot', 'pw')",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("users_bot_has_no_credentials must reject a bot with a password");
+    assert_eq!(sqlstate(&err).as_deref(), Some("23514"), "{err}");
+    let kind: String = sqlx::query_scalar("SELECT kind FROM users WHERE id = $1")
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kind, "human", "users.kind defaults to human");
+}
+
+/// S5: any write that changes password_hash revokes the user's live keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn password_change_revokes_api_keys() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let user = seed_user(&pool, "h@x.test", "human", Some("old"), None).await;
+    let other = seed_user(&pool, "o@x.test", "human", Some("old"), None).await;
+
+    let live = insert_key(&pool, ws, user, user, "NULL").await.unwrap();
+    let old_revoked = insert_key(&pool, ws, user, user, "NULL").await.unwrap();
+    let others = insert_key(&pool, ws, other, other, "NULL").await.unwrap();
+    // A bot key `user` minted: a stolen session must not leave it behind.
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    let minted = insert_key(&pool, ws, bot, user, "NULL").await.unwrap();
+    let past: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("UPDATE api_keys SET revoked_at = '2020-01-01T00:00:00Z' WHERE id = $1 RETURNING revoked_at")
+            .bind(old_revoked)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    sqlx::query("UPDATE users SET password_hash = 'x' WHERE id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        revoked_at(&pool, live).await.is_some(),
+        "S5 broken: password change left the user's key live"
+    );
+    assert!(
+        revoked_at(&pool, minted).await.is_some(),
+        "S5 broken: password change left a bot key the user minted live"
+    );
+    assert_eq!(
+        revoked_at(&pool, old_revoked).await,
+        Some(past),
+        "S5 trigger must not overwrite an earlier revocation timestamp"
+    );
+    assert_eq!(
+        revoked_at(&pool, others).await,
+        None,
+        "S5 trigger revoked another user's key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn updating_the_same_password_hash_does_not_revoke() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let user = seed_user(&pool, "h@x.test", "human", Some("same"), None).await;
+    let key = insert_key(&pool, ws, user, user, "NULL").await.unwrap();
+
+    sqlx::query("UPDATE users SET password_hash = password_hash, display_name = 'N' WHERE id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        revoked_at(&pool, key).await,
+        None,
+        "S5 trigger must only fire when password_hash actually changes"
+    );
+}
+
+/// S4 backstop: KB001.
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_cannot_be_workspace_owner() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    let bot2 = seed_user(&pool, "bot2@x.test", "bot", None, None).await;
+
+    let err = sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+    )
+    .bind(ws)
+    .bind(bot)
+    .execute(&pool)
+    .await
+    .expect_err("S4 broken: bot inserted as workspace owner");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("KB001"),
+        "S4: bot owner insert must raise KB001, got {err}"
+    );
+
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'editor')",
+    )
+    .bind(ws)
+    .bind(bot)
+    .execute(&pool)
+    .await
+    .expect("a bot may be an editor");
+
+    let err = sqlx::query(
+        "UPDATE workspace_members SET role = 'owner' WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(ws)
+    .bind(bot)
+    .execute(&pool)
+    .await
+    .expect_err("S4 broken: bot promoted to workspace owner");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("KB001"),
+        "S4: bot owner update must raise KB001, got {err}"
+    );
+
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    )
+    .bind(ws)
+    .bind(bot2)
+    .execute(&pool)
+    .await
+    .expect("a bot may be a viewer");
+}
+
+/// S4 backstop: KB002.
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_cannot_hold_doc_owner_grant() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let human = seed_user(&pool, "h@x.test", "human", Some("pw"), None).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    let doc: Uuid = sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, title, sort_key, created_by)
+         VALUES ($1, 'D', 'm', $2) RETURNING id",
+    )
+    .bind(ws)
+    .bind(human)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let principal = format!("user:{bot}");
+    let grant = |principal: String, role: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("INSERT INTO document_grants (doc_id, principal, role, granted_by) VALUES ($1, $2, $3, $4)")
+                .bind(doc)
+                .bind(principal)
+                .bind(role)
+                .bind(human)
+                .execute(&pool)
+                .await
+        }
+    };
+
+    let err = grant(principal.clone(), "owner")
+        .await
+        .expect_err("S4 broken: bot granted document owner");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("KB002"),
+        "S4: bot doc-owner grant must raise KB002, got {err}"
+    );
+
+    grant(principal.clone(), "editor")
+        .await
+        .expect("a bot may hold an editor grant");
+
+    let err = sqlx::query(
+        "UPDATE document_grants SET role = 'owner' WHERE doc_id = $1 AND principal = $2",
+    )
+    .bind(doc)
+    .bind(&principal)
+    .execute(&pool)
+    .await
+    .expect_err("S4 broken: bot grant promoted to owner");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("KB002"),
+        "S4: bot doc-owner update must raise KB002, got {err}"
+    );
+
+    grant("group:engineering".into(), "owner")
+        .await
+        .expect("KB002 regex guard: a group principal must not trip the bot trigger");
+    grant("legacy-text".into(), "owner")
+        .await
+        .expect("KB002 regex guard: non-user principal must not error on ::uuid cast");
+    grant(format!("user:{human}"), "owner")
+        .await
+        .expect("a human may own a document");
+}
+
+/// S6: pure-OIDC humans get keys of at most 90 days, in the DB.
+#[tokio::test(flavor = "multi_thread")]
+async fn sso_user_key_capped_at_90_days() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let sso = seed_user(&pool, "sso@x.test", "human", None, Some("sub-1")).await;
+
+    for (expires, why) in [
+        ("NULL", "a never-expiring key"),
+        ("now() + interval '91 days'", "a 91-day key"),
+    ] {
+        let err = insert_key(&pool, ws, sso, sso, expires)
+            .await
+            .expect_err(&format!("S6 broken: OIDC-only user got {why}"));
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("KB003"),
+            "S6: {why} for an OIDC-only user must raise KB003, got {err}"
+        );
+    }
+
+    let key = insert_key(&pool, ws, sso, sso, "now() + interval '90 days'")
+        .await
+        .expect("S6: exactly 90 days is allowed");
+
+    let err = sqlx::query("UPDATE api_keys SET expires_at = NULL WHERE id = $1")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .expect_err("S6 broken: OIDC-only key extended to never expire");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("KB003"),
+        "S6: extending an OIDC-only key must raise KB003, got {err}"
+    );
+
+    // A human with a password is not capped by the DB.
+    let pw = seed_user(&pool, "pw@x.test", "human", Some("pw"), Some("sub-2")).await;
+    insert_key(&pool, ws, pw, pw, "NULL")
+        .await
+        .expect("S6 must only apply to users without a password");
+}
+
+/// S6: S5 can't revoke a bot key whose minter has no password to change, so
+/// the cap follows the minter too. Catches a trigger that checks only
+/// `user_id`, or that loses the `90 days` bound or the strict comparison.
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_key_minted_by_a_pure_oidc_owner_is_capped_at_90_days() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let owner = seed_user(&pool, "o@x.test", "human", None, Some("sub-1")).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+
+    for (expires, why) in [
+        ("NULL", "a never-expiring bot key"),
+        ("now() + interval '91 days'", "a 91-day bot key"),
+    ] {
+        let err = insert_key(&pool, ws, bot, owner, expires)
+            .await
+            .expect_err(&format!("S6 broken: OIDC-only owner minted {why}"));
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("KB003"),
+            "S6: {why} minted by an OIDC-only owner must raise KB003, got {err}"
+        );
+    }
+
+    let key = insert_key(&pool, ws, bot, owner, "now() + interval '90 days'")
+        .await
+        .expect("S6: exactly 90 days is allowed");
+
+    let err = sqlx::query("UPDATE api_keys SET expires_at = NULL WHERE id = $1")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .expect_err("S6 broken: OIDC-minted bot key extended to never expire");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("KB003"),
+        "S6: extending an OIDC-minted bot key must raise KB003, got {err}"
+    );
+}
+
+/// S6: re-pointing a key's minter is checked too. Catches `created_by` missing
+/// from the trigger's `UPDATE OF` list.
+#[tokio::test(flavor = "multi_thread")]
+async fn setting_created_by_to_a_pure_oidc_user_on_an_unbounded_key_is_refused() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let local = seed_user(&pool, "l@x.test", "human", Some("pw"), None).await;
+    let oidc = seed_user(&pool, "o@x.test", "human", None, Some("sub-1")).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    let key = insert_key(&pool, ws, bot, local, "NULL").await.unwrap();
+
+    let err = sqlx::query("UPDATE api_keys SET created_by = $1 WHERE id = $2")
+        .bind(oidc)
+        .bind(key)
+        .execute(&pool)
+        .await
+        .expect_err("S6 broken: an unbounded key was handed to an OIDC-only minter");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("KB003"),
+        "S6: moving an unbounded key to an OIDC-only minter must raise KB003, got {err}"
+    );
+}
+
+/// S5 can revoke a bot key whose minter has a password, so it stays uncapped,
+/// whether or not that owner also has an OIDC link. Catches a trigger that caps
+/// every bot key or tests only `oidc_subject`.
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_key_minted_by_a_password_owner_may_never_expire() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let local = seed_user(&pool, "l@x.test", "human", Some("pw"), None).await;
+    let linked = seed_user(&pool, "pw@x.test", "human", Some("pw"), Some("sub-2")).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+
+    for owner in [local, linked] {
+        let key = insert_key(&pool, ws, bot, owner, "NULL")
+            .await
+            .expect("a password owner's bot key may have NULL expires_at");
+        let exp: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT expires_at FROM api_keys WHERE id = $1")
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(exp, None);
+    }
+}
+
+async fn add_member(pool: &PgPool, ws: Uuid, user: Uuid, role: &str) {
+    sqlx::query("INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)")
+        .bind(ws)
+        .bind(user)
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// S8: leaving the workspace revokes the member's keys and the keys it
+/// minted for others, so a re-invite brings nothing back and a departed
+/// owner keeps no bot access.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_member_revokes_its_keys_and_the_keys_it_minted() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let owner = seed_user(&pool, "o@x.test", "human", Some("pw"), None).await;
+    let owner2 = seed_user(&pool, "o2@x.test", "human", Some("pw"), None).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    for (u, role) in [(owner, "owner"), (owner2, "owner"), (bot, "editor")] {
+        add_member(&pool, ws, u, role).await;
+    }
+    let owners_own = insert_key(&pool, ws, owner, owner, "NULL").await.unwrap();
+    let minted_for_bot = insert_key(&pool, ws, bot, owner, "NULL").await.unwrap();
+    let other_bot_key = insert_key(&pool, ws, bot, owner2, "NULL").await.unwrap();
+    let owner2_own = insert_key(&pool, ws, owner2, owner2, "NULL").await.unwrap();
+
+    sqlx::query("DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2")
+        .bind(ws)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        revoked_at(&pool, owners_own).await.is_some(),
+        "own key live"
+    );
+    assert!(
+        revoked_at(&pool, minted_for_bot).await.is_some(),
+        "a key the departed owner minted for a bot stays live"
+    );
+    assert_eq!(revoked_at(&pool, other_bot_key).await, None);
+    assert_eq!(revoked_at(&pool, owner2_own).await, None);
+
+    // Removing the bot revokes its remaining key; re-adding it revives none.
+    sqlx::query("DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2")
+        .bind(ws)
+        .bind(bot)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(revoked_at(&pool, other_bot_key).await.is_some());
+    add_member(&pool, ws, bot, "editor").await;
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM api_keys WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(bot)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 0, "re-adding the bot brought a key back");
+    assert_eq!(revoked_at(&pool, owner2_own).await, None);
+
+    // Cascading deletes still work with the trigger in place.
+    sqlx::query("DELETE FROM api_keys WHERE created_by = $1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("deleting a user with no minted keys left");
+    sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(ws)
+        .execute(&pool)
+        .await
+        .expect("deleting a workspace cascades through members and keys");
+}
+
+/// Losing the owner role revokes the keys the user minted for others; its
+/// own keys stay (its role is read at auth time).
+#[tokio::test(flavor = "multi_thread")]
+async fn demoting_an_owner_revokes_the_keys_it_minted_for_others() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let owner = seed_user(&pool, "o@x.test", "human", Some("pw"), None).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    add_member(&pool, ws, owner, "owner").await;
+    add_member(&pool, ws, bot, "editor").await;
+    let own = insert_key(&pool, ws, owner, owner, "NULL").await.unwrap();
+    let for_bot = insert_key(&pool, ws, bot, owner, "NULL").await.unwrap();
+
+    // A bot changing between editor and viewer is not a demotion from owner.
+    sqlx::query("UPDATE workspace_members SET role = 'viewer' WHERE user_id = $1")
+        .bind(bot)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(revoked_at(&pool, for_bot).await, None);
+
+    sqlx::query("UPDATE workspace_members SET role = 'editor' WHERE user_id = $1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        revoked_at(&pool, for_bot).await.is_some(),
+        "bot key outlived the demotion"
+    );
+    assert_eq!(
+        revoked_at(&pool, own).await,
+        None,
+        "own key revoked on demotion"
+    );
+}
+
+/// One `api-key.revoke-cascade` audit row: its workspace, actor, target, the
+/// recorded cause and the sorted key ids.
+#[derive(Debug, PartialEq)]
+struct CascadeRow {
+    workspace: Uuid,
+    actor: Option<Uuid>,
+    target: Uuid,
+    cause: String,
+    keys: Vec<Uuid>,
+}
+
+async fn cascade_rows(pool: &PgPool) -> Vec<CascadeRow> {
+    let rows: Vec<(Uuid, Option<Uuid>, Uuid, serde_json::Value)> = sqlx::query_as(
+        "SELECT workspace_id, actor_id, target_id, data FROM audit_events
+          WHERE action = 'api-key.revoke-cascade' AND target_kind = 'user'
+          ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(workspace, actor, target, data)| {
+            let mut keys: Vec<Uuid> =
+                serde_json::from_value(data["key_ids"].clone()).expect("key_ids");
+            keys.sort();
+            CascadeRow {
+                workspace,
+                actor,
+                target,
+                cause: data["cause"].as_str().expect("cause").to_string(),
+                keys,
+            }
+        })
+        .collect()
+}
+
+fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
+    ids.sort();
+    ids
+}
+
+/// A trigger-driven revocation answers later requests exactly like a typo
+/// (`api_key.invalid`), so the audit log is where an operator finds the cause.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_change_audits_the_keys_it_revoked() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let user = seed_user(&pool, "h@x.test", "human", Some("old"), None).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    let own = insert_key(&pool, ws, user, user, "NULL").await.unwrap();
+    let minted = insert_key(&pool, ws, bot, user, "NULL").await.unwrap();
+    let already_gone = insert_key(&pool, ws, user, user, "NULL").await.unwrap();
+    sqlx::query("UPDATE api_keys SET revoked_at = '2020-01-01T00:00:00Z' WHERE id = $1")
+        .bind(already_gone)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE users SET password_hash = 'x' WHERE id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cascade_rows(&pool).await,
+        vec![CascadeRow {
+            workspace: ws,
+            actor: None,
+            target: user,
+            cause: "password_change".into(),
+            keys: sorted(vec![own, minted]),
+        }]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_change_that_revokes_nothing_writes_no_audit_row() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    seed_workspace(&pool).await;
+    let user = seed_user(&pool, "h@x.test", "human", Some("old"), None).await;
+
+    sqlx::query("UPDATE users SET password_hash = 'x' WHERE id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(cascade_rows(&pool).await, vec![]);
+}
+
+/// A user with keys in two workspaces gets one row in each, so neither
+/// workspace's owners see the other's key ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_change_audits_each_workspace_separately() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws_a = seed_workspace(&pool).await;
+    let ws_b: Uuid =
+        sqlx::query_scalar("INSERT INTO workspaces (slug, name) VALUES ('b', 'B') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let user = seed_user(&pool, "h@x.test", "human", Some("old"), None).await;
+    let in_a = insert_key(&pool, ws_a, user, user, "NULL").await.unwrap();
+    let in_b = insert_key(&pool, ws_b, user, user, "NULL").await.unwrap();
+
+    sqlx::query("UPDATE users SET password_hash = 'x' WHERE id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let rows = cascade_rows(&pool).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for (ws, key) in [(ws_a, in_a), (ws_b, in_b)] {
+        let row = rows.iter().find(|r| r.workspace == ws).expect("row");
+        assert_eq!(row.keys, vec![key]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_member_audits_the_keys_it_revoked() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let owner = seed_user(&pool, "o@x.test", "human", Some("pw"), None).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    add_member(&pool, ws, owner, "owner").await;
+    add_member(&pool, ws, bot, "editor").await;
+    let own = insert_key(&pool, ws, owner, owner, "NULL").await.unwrap();
+    let minted = insert_key(&pool, ws, bot, owner, "NULL").await.unwrap();
+
+    sqlx::query("DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2")
+        .bind(ws)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cascade_rows(&pool).await,
+        vec![CascadeRow {
+            workspace: ws,
+            actor: None,
+            target: owner,
+            cause: "member_removed".into(),
+            keys: sorted(vec![own, minted]),
+        }]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn demoting_an_owner_audits_the_keys_it_revoked() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let owner = seed_user(&pool, "o@x.test", "human", Some("pw"), None).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    add_member(&pool, ws, owner, "owner").await;
+    add_member(&pool, ws, bot, "editor").await;
+    insert_key(&pool, ws, owner, owner, "NULL").await.unwrap();
+    let minted = insert_key(&pool, ws, bot, owner, "NULL").await.unwrap();
+
+    // Not a demotion from owner, so nothing is revoked or audited.
+    sqlx::query("UPDATE workspace_members SET role = 'viewer' WHERE user_id = $1")
+        .bind(bot)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(cascade_rows(&pool).await, vec![]);
+
+    sqlx::query("UPDATE workspace_members SET role = 'editor' WHERE user_id = $1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cascade_rows(&pool).await,
+        vec![CascadeRow {
+            workspace: ws,
+            actor: None,
+            target: owner,
+            cause: "owner_demoted".into(),
+            keys: vec![minted],
+        }]
+    );
+}
+
+/// S4: users.kind is immutable, so an owner can never become a bot owner.
+#[tokio::test(flavor = "multi_thread")]
+async fn user_kind_cannot_change() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let human = seed_user(&pool, "h@x.test", "human", None, None).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    add_member(&pool, ws, human, "owner").await;
+    for (id, to) in [(human, "bot"), (bot, "human")] {
+        let err = sqlx::query("UPDATE users SET kind = $2 WHERE id = $1")
+            .bind(id)
+            .bind(to)
+            .execute(&pool)
+            .await
+            .expect_err("users.kind changed");
+        assert_eq!(sqlstate(&err).as_deref(), Some("KB004"), "{err}");
+    }
+    sqlx::query("UPDATE users SET kind = kind, display_name = 'N' WHERE id = $1")
+        .bind(human)
+        .execute(&pool)
+        .await
+        .expect("writing the same kind is not a change");
+}
+
+/// KB002 matches only canonical user principals: a 36-char hex-and-hyphen
+/// string that is not a UUID passes instead of failing the ::uuid cast.
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_owner_guard_ignores_non_uuid_user_principals() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let human = seed_user(&pool, "h@x.test", "human", Some("pw"), None).await;
+    let doc: Uuid = sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, title, sort_key, created_by)
+         VALUES ($1, 'D', 'm', $2) RETURNING id",
+    )
+    .bind(ws)
+    .bind(human)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for principal in [
+        format!("user:{}", "a".repeat(36)),
+        format!("user:{}", "-".repeat(36)),
+    ] {
+        sqlx::query(
+            "INSERT INTO document_grants (doc_id, principal, role, granted_by)
+             VALUES ($1, $2, 'owner', $3)",
+        )
+        .bind(doc)
+        .bind(&principal)
+        .bind(human)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{principal}: {e}"));
+    }
+}
+
+/// KB002 recognises the bot in every spelling the app's UUID parser takes,
+/// so a row written past the app's canonicalisation can't make it an owner.
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_owner_guard_matches_every_uuid_spelling() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = seed_workspace(&pool).await;
+    let human = seed_user(&pool, "h@x.test", "human", Some("pw"), None).await;
+    let bot = seed_user(&pool, "bot@x.test", "bot", None, None).await;
+    let doc: Uuid = sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, title, sort_key, created_by)
+         VALUES ($1, 'D', 'm', $2) RETURNING id",
+    )
+    .bind(ws)
+    .bind(human)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let simple = bot.simple().to_string();
+    for spelling in [
+        bot.to_string().to_uppercase(),
+        simple.clone(),
+        simple.to_uppercase(),
+        format!("{{{bot}}}"),
+        format!("urn:uuid:{bot}"),
+    ] {
+        let principal = format!("user:{spelling}");
+        let err = sqlx::query(
+            "INSERT INTO document_grants (doc_id, principal, role, granted_by)
+             VALUES ($1, $2, 'owner', $3)",
+        )
+        .bind(doc)
+        .bind(&principal)
+        .bind(human)
+        .execute(&pool)
+        .await
+        .expect_err(&format!("S4 broken: {principal} inserted as owner"));
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("KB002"),
+            "{principal}: {err}"
+        );
+
+        sqlx::query(
+            "INSERT INTO document_grants (doc_id, principal, role, granted_by)
+             VALUES ($1, $2, 'editor', $3)",
+        )
+        .bind(doc)
+        .bind(&principal)
+        .bind(human)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let err = sqlx::query(
+            "UPDATE document_grants SET role = 'owner' WHERE doc_id = $1 AND principal = $2",
+        )
+        .bind(doc)
+        .bind(&principal)
+        .execute(&pool)
+        .await
+        .expect_err(&format!("S4 broken: {principal} promoted to owner"));
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("KB002"),
+            "{principal}: {err}"
+        );
+    }
+    // A human in a non-canonical spelling is not refused.
+    sqlx::query(
+        "INSERT INTO document_grants (doc_id, principal, role, granted_by)
+         VALUES ($1, $2, 'owner', $3)",
+    )
+    .bind(doc)
+    .bind(format!("user:{}", human.simple()))
+    .bind(human)
+    .execute(&pool)
+    .await
+    .expect("a human may own a document in any spelling");
+}
+
+/// Both API-keys migrations take their table locks through
+/// `knot_lock_tables`, which never waits for one table while holding another.
+/// `SET LOCAL` only holds inside a transaction, so neither file may opt out
+/// of sqlx's.
+#[test]
+fn api_keys_migrations_take_their_locks_through_the_helper() {
+    for (name, sql) in [
+        (
+            "users_kind",
+            include_str!("../../../migrations/20261112120001_api_keys_users_kind.sql"),
+        ),
+        (
+            "api_keys_and_bots",
+            include_str!("../../../migrations/20261112120002_api_keys_and_bots.sql"),
+        ),
+    ] {
+        assert!(
+            sql.contains("SET LOCAL lock_timeout = '5s';"),
+            "{name}: lock_timeout went missing"
+        );
+        assert!(
+            sql.contains("SELECT knot_lock_tables("),
+            "{name}: no helper"
+        );
+        assert!(
+            !sql.lines().any(|l| l.trim() == "-- no-transaction"),
+            "{name}: SET LOCAL does nothing outside sqlx's migration transaction"
+        );
+        // DROP TRIGGER IF EXISTS takes ACCESS EXCLUSIVE even when the trigger
+        // is absent, undoing the helper's lock plan.
+        assert!(
+            !sql.lines()
+                .any(|l| !l.trim_start().starts_with("--") && l.contains("DROP TRIGGER")),
+            "{name}: DROP TRIGGER bypasses the lock plan"
+        );
+    }
+}
+
+/// The API-keys migrations run while the previous release serves: grant and
+/// member writes (whose foreign keys read `users`), edit saves and `users`
+/// reads/writes all keep working, nothing deadlocks, and the two CHECKs end
+/// validated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn api_keys_migrations_run_under_live_previous_release_traffic() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::time::Duration;
+
+    use knot_storage::{PgUpdatesStore, UpdatesStore};
+    use sqlx::Connection;
+
+    /// The short-links migration: the last one before the API-keys pair.
+    const BEFORE_API_KEYS: i64 = 20261109120000;
+
+    let (url, pool) = bare_db(4).await;
+    migrate_up_to(&pool, BEFORE_API_KEYS).await;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let other: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, display_name) VALUES ('b@x.test', 'Bob') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let page = new_page(&pool, ws, user).await;
+    let deadlocks0: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut loops = Vec::new();
+    loops.push((
+        "append",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::ZERO,
+            move |pool, n| async move {
+                PgUpdatesStore::new(pool)
+                    .append(page, 0, &edits(user, 1 + (n % 3) as usize))
+                    .await
+                    .map(drop)
+                    .map_err(|e| format!("append: {e:?}"))
+            },
+        ),
+    ));
+    // A grant write: locks document_grants, then its FK reads users.
+    loops.push((
+        "grant write",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(5),
+            move |pool, n| async move {
+                sqlx::query(
+                    "INSERT INTO document_grants (doc_id, principal, role, granted_by)
+                     VALUES ($1, 'user:' || $2::text, CASE WHEN $3 % 2 = 0 THEN 'viewer' ELSE 'editor' END, $4)
+                     ON CONFLICT (doc_id, principal) DO UPDATE SET role = EXCLUDED.role",
+                )
+                .bind(page)
+                .bind(other)
+                .bind(n as i64)
+                .bind(user)
+                .execute(&pool)
+                .await
+                .map(drop)
+                .map_err(err_text)
+            },
+        ),
+    ));
+    // A member added and removed: locks workspace_members, FKs read users.
+    loops.push((
+        "member write",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(5),
+            move |pool, _| async move {
+                let mut tx = pool.begin().await.map_err(err_text)?;
+                sqlx::query(
+                    "INSERT INTO workspace_members (workspace_id, user_id, role)
+                     VALUES ($1, $2, 'viewer') ON CONFLICT DO NOTHING",
+                )
+                .bind(ws)
+                .bind(other)
+                .execute(&mut *tx)
+                .await
+                .map_err(err_text)?;
+                sqlx::query(
+                    "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+                )
+                .bind(ws)
+                .bind(other)
+                .execute(&mut *tx)
+                .await
+                .map_err(err_text)?;
+                tx.commit().await.map_err(err_text)
+            },
+        ),
+    ));
+    loops.push((
+        "users read",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(5),
+            move |pool, _| async move {
+                sqlx::query("SELECT count(*) FROM users")
+                    .fetch_one(&pool)
+                    .await
+                    .map(drop)
+                    .map_err(err_text)
+            },
+        ),
+    ));
+    loops.push((
+        "users write",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(5),
+            move |pool, n| async move {
+                sqlx::query("UPDATE users SET display_name = 'Alice ' || $2::text WHERE id = $1")
+                    .bind(user)
+                    .bind(n as i64)
+                    .execute(&pool)
+                    .await
+                    .map(drop)
+                    .map_err(err_text)
+            },
+        ),
+    ));
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Panics (failing the test) when a migration fails.
+    let migrated = tokio::time::timeout(Duration::from_secs(30), migrate_all(&pool)).await;
+    let at_migration: Vec<u64> = loops.iter().map(|(_, l)| l.runs()).collect();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    stop.store(true, SeqCst);
+    let mut reports = Vec::new();
+    for ((name, l), before) in loops.into_iter().zip(at_migration) {
+        let longest = l.longest();
+        reports.push((name, before, longest, l.handle.await.unwrap()));
+    }
+
+    assert!(migrated.is_ok(), "migrator still running after 30 s");
+    for (name, before, longest, report) in &reports {
+        eprintln!("{name}: {} runs, longest {longest:?}", report.runs);
+        assert!(report.errors.is_empty(), "{name}: {:?}", report.errors);
+        assert!(
+            report.runs > *before,
+            "{name} made no progress after the migration"
+        );
+        assert!(
+            *longest < Duration::from_secs(5),
+            "{name} stalled for {longest:?}"
+        );
+    }
+    let unvalidated: Vec<String> = sqlx::query_scalar(
+        "SELECT conname::text FROM pg_constraint
+          WHERE conrelid = 'users'::regclass AND NOT convalidated",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(unvalidated.is_empty(), "left NOT VALID: {unvalidated:?}");
+
     pool.close().await;
     let mut probe = sqlx::PgConnection::connect(&url).await.unwrap();
     let mut others: i64 = -1;

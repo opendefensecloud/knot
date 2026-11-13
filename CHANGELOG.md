@@ -9,10 +9,20 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ## [Unreleased]
 
 ### Upgrading
+- Five database migrations run on upgrade, in this order:
+  `20261108120000_history_builder`, `20261109120000_doc_short_links`,
+  `20261112120000_quota_indexes`, `20261112120001_api_keys_users_kind` and
+  `20261112120002_api_keys_and_bots`. Each commits on its own; if the
+  Job halts between them, re-run the upgrade (see the Helm chart README).
+  Each takes its table locks through `knot_lock_tables`, in short bounded
+  attempts that never wait for one table while holding another, and gives
+  up after 45 seconds instead of holding up page writes or sign-ins; if it
+  gives up, re-run the upgrade once the long transaction it names has
+  finished.
 - Upgrade from 0.9.10 or 0.9.11, and don't skip 0.9.10 on the way from
   0.9.9: this release builds on the numbered edit log that 0.9.10 starts.
-  Three database migrations run on upgrade. `20261108120000_history_builder`
-  creates three empty tables. Its lock attempts pause page writes
+  The first migration, `20261108120000_history_builder`, creates three empty
+  tables. Its lock attempts pause page writes
   (creating, moving, archiving or purging pages, among others) and user
   updates for at most 100 ms each; once it has its locks it commits at
   once. Edit saves and page loads go on. 0.9.10 pods that restart after
@@ -47,6 +57,17 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   replay would read more than `history.replayMaxBytes`. The chart
   README says how to find such pages and re-enable them. (#83)
 - The old snapshot thinning is unchanged. (#83)
+- The API-keys migrations are additive. `20261112120001_api_keys_users_kind`
+  adds `users.kind` and two unvalidated checks: it holds an exclusive lock
+  on `users` for an instant, so sign-ins and edit saves pause briefly,
+  and scans nothing. `20261112120002_api_keys_and_bots` validates the
+  checks without blocking anyone, then holds a share lock on `users`,
+  `workspaces`, `workspace_members` and `document_grants` while it creates
+  the `api_keys` table and its triggers: writes to those tables wait,
+  reads, edit saves and page loads go on.
+- Rotating `KNOT_SESSION_KEY` now invalidates every API key as well as
+  every session: keys are stored as an HMAC under that key. After a
+  rotation, every user and bot needs new keys.
 - `20261112120000_quota_indexes` adds two indexes, on `documents` and on
   `blobs`, for the quotas. While they build it holds a `SHARE` lock on
   both: page writes (creating, renaming, moving or archiving pages, among
@@ -54,9 +75,9 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   bounded attempts and gives up after 45 s instead of queueing writes
   behind a long transaction; if it gives up, re-run the upgrade once that
   transaction has finished. Both tables are small, since file contents
-  live in `blob_bytes`, which it doesn't read. With three migrations that
+  live in `blob_bytes`, which it doesn't read. With five migrations that
   each wait up to 45 s for their locks, pass `helm upgrade --timeout` of
-  at least 5 minutes plus your rollout time; the chart README explains the
+  at least 7 minutes plus your rollout time; the chart README explains the
   budget and how to tell which migrations committed. (#88)
 - Writes are now rate limited per user, and sign-in and share links per
   client address; the limits are on by default and far above normal use.
@@ -120,6 +141,26 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   The Helm chart README says which are worth an alert. (#83)
 - `knot-server history-stats` also reports checkpoint sizes and the
   number of history entries. (#83)
+- Create scoped API keys under Settings, or with
+  `POST /api/auth/api-keys` from a logged-in session, and call `/api/*`
+  with `Authorization: Bearer knot_…`. The key is shown exactly once.
+- Give each key any mix of four scopes: `read`, `create`, `update` and
+  `delete`. A request the key's scopes don't cover gets
+  `403 api_key.scope_denied`.
+- Pick a key's lifetime: at least 30 days, or no expiry. Keys of
+  single-sign-on users, and bot keys they mint, expire within 90 days.
+- See your keys and when each was last used, and revoke any live one. A
+  bot's keys also show who created each. The list shows live keys and those
+  revoked or expired in the last 30 days.
+- Each user or bot holds at most 50 live keys; creating another answers
+  `409 api_key.limit_reached` until one is revoked or expires.
+- Workspace owners can add bot accounts (Members, or
+  `POST /api/workspace/members` with `"kind":"bot"`) as editor or viewer
+  for scripts and AI agents, and manage the bots' keys. A bot has no
+  password and no SSO login; it signs in only with its API keys, which may
+  never expire when the owner minting them has a password. The member list
+  shows each member's kind.
+
 - Rate limits on writes, per user: a request over its limit gets
   `429 Too Many Requests` with `Retry-After` and the error code
   `rate.limited`, and the web app says "You're doing that too fast. Try
@@ -198,6 +239,57 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   320 bytes. (#88)
 
 ### Security
+- API keys are stored only as an HMAC-SHA256 under `KNOT_SESSION_KEY`; the
+  plaintext never reaches the database, logs, traces or the audit log.
+- A key works only on `/api/*`. It can't open the live editor websocket,
+  change the password, log out, create, list or revoke keys, invite,
+  re-role or remove members, create or list public share links, or change
+  a page's grants or restriction, or move a page into or out of a
+  restricted subtree (`403 api_key.session_required`, whatever its scopes),
+  so a leaked key can't take over the account or the workspace, raise its
+  own scopes, or leave behind a public link or page access that outlives
+  it. Reading a page's grants and access still works with `read`.
+- A broken key (`Authorization: Bearer knot_…`, also with the scheme
+  doubled or the key quoted, or a bare `Bearer`) is always
+  `401 api_key.invalid`, never served from the session cookie. A
+  Bearer token that isn't a knot key, such as the JWT an auth proxy in
+  front of knot forwards, is ignored as before, so the cookie session and
+  the health checks keep working behind such a proxy.
+- Requests refused by a key's scopes and writes made with a key are logged
+  with the key's id, the method and the route, never the key itself, so an
+  incident can be narrowed to one key.
+- Creating a key re-checks, in the same database transaction, that the
+  session asking for it still exists and that its user is still a member
+  (and still an owner, for a bot's key). A key requested just before a
+  password change, a removal or a demotion is refused instead of
+  outliving it. A password change now sets the new hash and ends every
+  session in one transaction.
+- Keys of single-sign-on users, and bot keys they mint, are capped at 90
+  days, by the server and by a database check.
+- Any change of a user's password hash (in the app, or a direct database
+  update) revokes all of that user's keys, and the bot keys that user
+  minted, so a stolen session can't leave a bot key behind before the
+  owner resets the password (a database trigger). Removing a member
+  revokes their keys, so re-inviting them brings none back, and
+  revokes the bot keys they minted; an owner who loses the owner role
+  loses the bot keys they minted too (database triggers). Each of these
+  writes an `api-key.revoke-cascade` audit event naming the cause and the
+  keys, and the app warns before a password change, a removal or an owner's
+  demotion.
+- A bot can't sign in through single sign-on, even when an identity
+  provider account has its email, and a user's kind (human or bot) never
+  changes (a database trigger).
+- A bot can never own the workspace or a page: the server refuses with
+  `422 bot.owner_forbidden`, and database triggers refuse it on every
+  other path. Bots also can't restrict pages (`403
+  api_key.session_required`: no key may), create or import pages
+  inside a restricted subtree, import restricted pages or duplicate a
+  restricted page (`403 bot.restricted_forbidden`). Where a person would
+  get an owner grant on a page they create, a bot gets an editor grant.
+- A page grant for `user:<id>` is stored under the canonical id whatever
+  UUID spelling the request used (upper case, without hyphens, braced,
+  `urn:uuid:`), and removed by any of them, so one person never holds
+  several rows that member removal would miss.
 - ammonia 4.1.9 fixes RUSTSEC-2026-0533 (mutation XSS through MathML
   and SVG integration points). knot was not affected: both of its
   sanitizers, for the public share page and for release notes, use

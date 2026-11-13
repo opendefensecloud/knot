@@ -1,7 +1,70 @@
-use knot_storage::{PgUserStore, UserStore, UserStoreError};
+use knot_storage::user_store::UserKind;
+use knot_storage::{
+    PgUserStore, PgWorkspaceStore, UserStore, UserStoreError, WorkspaceRole, WorkspaceStore,
+};
 
 async fn fresh_store() -> PgUserStore {
     PgUserStore::new(knot_test_support::fresh_db().await.pool)
+}
+
+/// Catches the user insert committing apart from the membership insert: the
+/// failed invite would leave a user no workspace lists, and its email taken.
+/// The two failures are real ones: the KB001 trigger and the workspace FK.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_bot_member_leaves_no_user_when_the_membership_insert_fails() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let users = PgUserStore::new(pool.clone());
+    let wss = PgWorkspaceStore::new(pool);
+    let ws = wss.create("acme", "Acme").await.unwrap();
+    let email = "bot@example.com";
+
+    users
+        .create_bot_member(ws.id, email, "Bot", WorkspaceRole::Owner)
+        .await
+        .expect_err("KB001 refuses a bot owner");
+    users
+        .create_bot_member(uuid::Uuid::new_v4(), email, "Bot", WorkspaceRole::Editor)
+        .await
+        .expect_err("no such workspace");
+    assert_eq!(users.find_by_email(email).await.unwrap(), None);
+    assert_eq!(users.count().await.unwrap(), 0);
+
+    // The email is not burned: the retry succeeds, as a bot member.
+    let bot = users
+        .create_bot_member(ws.id, email, "Bot", WorkspaceRole::Viewer)
+        .await
+        .unwrap();
+    assert_eq!(bot.kind, UserKind::Bot);
+    assert_eq!(
+        (bot.email.as_str(), bot.display_name.as_str()),
+        (email, "Bot")
+    );
+    assert_eq!(bot.password_hash, None);
+    assert_eq!(
+        wss.get_member_role(ws.id, bot.id).await.unwrap(),
+        Some(WorkspaceRole::Viewer)
+    );
+}
+
+/// Catches the email conflict losing its variant inside the transaction: the
+/// handler answers 409 `workspace.email_taken` from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_bot_member_reports_a_taken_email() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let users = PgUserStore::new(pool.clone());
+    let wss = PgWorkspaceStore::new(pool);
+    let ws = wss.create("acme", "Acme").await.unwrap();
+    users
+        .create_local("taken@example.com", "T", "$h$")
+        .await
+        .unwrap();
+
+    let err = users
+        .create_bot_member(ws.id, "TAKEN@example.com", "Bot", WorkspaceRole::Editor)
+        .await
+        .expect_err("citext email already exists");
+    assert!(matches!(err, UserStoreError::EmailExists), "{err:?}");
+    assert_eq!(users.count().await.unwrap(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

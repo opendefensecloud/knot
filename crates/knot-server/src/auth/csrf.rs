@@ -15,7 +15,7 @@ use axum::{
     response::Response,
 };
 
-use super::context::AuthContext;
+use super::{api_key_loader::ApiPrincipal, context::AuthContext};
 use crate::http_error::json_err;
 
 pub use crate::auth::cookies::CSRF_COOKIE;
@@ -27,6 +27,10 @@ pub async fn csrf_mw(req: Request<Body>, next: Next) -> Response {
         return next.run(req).await;
     }
     if req.extensions().get::<AuthContext>().is_none() {
+        return next.run(req).await;
+    }
+    // API keys travel in a header, never a cookie: nothing to forge.
+    if req.extensions().get::<ApiPrincipal>().is_some() {
         return next.run(req).await;
     }
 

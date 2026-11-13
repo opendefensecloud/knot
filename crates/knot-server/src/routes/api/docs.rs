@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::archive::{PurgeError, PurgeTrigger};
-use crate::auth::{AuthContext, DocArchived, EffectiveDocRole, require_doc_role_mw};
+use crate::auth::{ApiPrincipal, AuthContext, DocArchived, EffectiveDocRole, require_doc_role_mw};
 use crate::duplicate::{BUSY_WAIT, DuplicateError, MAX_DUPLICATE_BLOB_BYTES, MAX_DUPLICATE_PAGES};
 use crate::http_error::{doc_archived, json_err};
 
@@ -338,6 +338,14 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
     {
         return response;
     }
+    // Policy: a bot adds no page inside a restricted subtree. There, the editor
+    // grant `ensure_creator_can_edit` gives a bot is only the backstop for a
+    // restriction landing after this check.
+    if let Some(response) =
+        crate::bots::deny_bot_restricted_destination(&state, &ctx, body.parent_id).await
+    {
+        return response;
+    }
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
@@ -610,6 +618,8 @@ async fn move_doc(
     if role.0 == WorkspaceRole::Viewer {
         return json_err(StatusCode::FORBIDDEN, "acl.editor_required", "");
     }
+    // Read before the body consumes the request.
+    let api_key = req.extensions().get::<ApiPrincipal>().copied();
     let Ok(body) = read_json::<MoveRequest>(req).await else {
         return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
     };
@@ -639,7 +649,11 @@ async fn move_doc(
     };
     // Into a restricted subtree, out of one, or between two: owners only.
     // Storage decides whether the move crosses, under the move's lock.
-    let allow_boundary_cross = role.0 == WorkspaceRole::Owner;
+    // Crossing changes who can reach the page, like `PUT /restricted` or a
+    // grant, and that outlives the key, so no API key may do it, not even an
+    // owner's (threat S2). It is session-only, decided here and not in
+    // `SESSION_ONLY` because only storage knows whether a move crosses.
+    let allow_boundary_cross = role.0 == WorkspaceRole::Owner && api_key.is_none();
 
     match docs
         .move_placed(
@@ -659,9 +673,22 @@ async fn move_doc(
             crate::archive::evict_local_subtree(&state, doc_id).await;
             doc_answer(&state, &ctx, StatusCode::OK, &d).await
         }
-        Err(knot_storage::DocStoreError::RestrictionBoundary) => {
-            json_err(StatusCode::FORBIDDEN, "acl.restricted_move", "")
-        }
+        Err(knot_storage::DocStoreError::RestrictionBoundary) => match api_key {
+            // The owner's session could make this move; the key may not.
+            Some(principal) if role.0 == WorkspaceRole::Owner => {
+                tracing::info!(
+                    key_id = %principal.key_id,
+                    %doc_id,
+                    "api key refused a move across a restriction boundary"
+                );
+                json_err(
+                    StatusCode::FORBIDDEN,
+                    "api_key.session_required",
+                    "moving a page into or out of a restricted subtree needs a signed-in session, not an API key",
+                )
+            }
+            _ => json_err(StatusCode::FORBIDDEN, "acl.restricted_move", ""),
+        },
         Err(knot_storage::DocStoreError::NotFound) => {
             json_err(StatusCode::NOT_FOUND, "doc.not_found", "")
         }
@@ -1118,6 +1145,10 @@ async fn set_restricted_inline(
     if role.0 != WorkspaceRole::Owner {
         return json_err(StatusCode::FORBIDDEN, "acl.owner_required", "");
     }
+    // Restricting mints an owner grant, which a bot can never hold.
+    if let Some(response) = crate::bots::deny_bot_actor(&state, &ctx, "set_restricted").await {
+        return response;
+    }
     let Ok(body) = read_json::<SetRestrictedRequest>(req).await else {
         return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
     };
@@ -1197,6 +1228,14 @@ async fn create_from_template_inline(
     // gate for "can use as a template". Writing into the tree requires
     // editor+ where the copy goes.
     if let Err(response) = require_editable_destination(&state, &ctx, body.parent_id).await {
+        return response;
+    }
+    // Policy: a bot adds no page inside a restricted subtree. There, the editor
+    // grant `ensure_creator_can_edit` gives a bot is only the backstop for a
+    // restriction landing after this check.
+    if let Some(response) =
+        crate::bots::deny_bot_restricted_destination(&state, &ctx, body.parent_id).await
+    {
         return response;
     }
     let Some(docs) = state.docs.clone() else {
@@ -1331,4 +1370,41 @@ fn internal() -> Response {
 /// non-template page under the target parent, or it is the moved doc.
 fn bad_anchor() -> Response {
     json_err(StatusCode::UNPROCESSABLE_ENTITY, "doc.bad_anchor", "")
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+
+    use super::*;
+
+    /// Behind the ACL layer no bot ever reaches this handler as an owner
+    /// (S4), so the guard is pinned here, with the layer's verdict faked.
+    #[tokio::test]
+    async fn set_restricted_refuses_a_bot_even_with_owner_rights() {
+        let pool = knot_test_support::fresh_db().await.pool;
+        let bot: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (email, display_name, kind) VALUES ('b@x.test', 'B', 'bot') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let state = AppState::with_pool(pool);
+        let mut req = Request::builder()
+            .method("PUT")
+            .body(Body::from(r#"{"restricted":true}"#))
+            .unwrap();
+        req.extensions_mut().insert(AuthContext {
+            user_id: bot,
+            workspace_id: Uuid::new_v4(),
+            role: WorkspaceRole::Editor,
+        });
+        req.extensions_mut()
+            .insert(EffectiveDocRole(WorkspaceRole::Owner));
+        let r = set_restricted_inline(State(state), Path(Uuid::new_v4()), req).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], "bot.forbidden");
+    }
 }

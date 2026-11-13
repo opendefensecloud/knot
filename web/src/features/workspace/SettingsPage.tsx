@@ -8,6 +8,8 @@ import { authApi } from "../../auth/session.api";
 import { useSession } from "../../auth/SessionContext";
 import { useUi } from "../../stores/ui";
 
+import { ApiKeysSection } from "../apiKeys/ApiKeysSection";
+import { API_KEYS_ROOT_KEY } from "../apiKeys/apiKeys.api";
 import { readApiError } from "../../lib/api";
 import { readCookie } from "../../lib/csrf";
 import { limitErrorText, notifyFailure } from "../../lib/limitErrors";
@@ -88,6 +90,8 @@ export default function SettingsPage() {
         return;
       }
       setPwCurrent(""); setPwNew(""); setPwOk(true);
+      // The change revoked this user's keys and the bot keys they minted.
+      void qc.invalidateQueries({ queryKey: API_KEYS_ROOT_KEY });
     },
   });
 
@@ -116,6 +120,12 @@ export default function SettingsPage() {
             <h2 className="text-[13px] font-semibold uppercase tracking-wider text-fg-muted mb-2">Account</h2>
             <p className="text-sm text-fg m-0">{session.data.ok.display_name} <span className="text-fg-muted">({session.data.ok.email})</span></p>
             <p className="text-[13px] text-fg-muted mt-1">Role: <span className="text-fg">{session.data.ok.role}</span></p>
+          </section>
+        )}
+        {session.data && "ok" in session.data && (
+          <section data-testid="api-keys-section" className="bg-surface border border-border rounded-lg px-5 py-4">
+            <h2 className="text-[13px] font-semibold uppercase tracking-wider text-fg-muted mb-2">API keys</h2>
+            <ApiKeysSection />
           </section>
         )}
         <section data-testid="appearance" className="bg-surface border border-border rounded-lg px-5 py-4">
@@ -208,6 +218,9 @@ export default function SettingsPage() {
         )}
         <section data-testid="change-password" className="bg-surface border border-border rounded-lg px-5 py-4">
           <h2 className="text-[13px] font-semibold uppercase tracking-wider text-fg-muted mb-3">Change password</h2>
+          <p className="text-[13px] text-fg-muted m-0 mb-3">
+            Changing your password signs out your other devices and revokes your API keys, along with any bot keys you created.
+          </p>
           <form
             onSubmit={(e) => { e.preventDefault(); changePw.mutate(); }}
             className="grid gap-3 max-w-sm"
