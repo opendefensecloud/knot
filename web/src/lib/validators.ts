@@ -229,6 +229,80 @@ const diagramListSchema = v.object({
 export type DiagramList = v.InferOutput<typeof diagramListSchema>;
 export const DiagramList = diagramListSchema;
 
+/**
+ * A person on the page audit log (GET /api/docs/{id}/audit), as the page
+ * history shows them: `key` and `name` are null for a former or anonymized
+ * member, who reads "Former member". Never an email.
+ */
+const auditAuthorSchema = v.object({
+  key: v.nullable(v.string()),
+  name: v.nullable(v.string()),
+  former: v.boolean(),
+});
+export type AuditAuthor = v.InferOutput<typeof auditAuthorSchema>;
+export const AuditAuthor = auditAuthorSchema;
+
+/**
+ * One audited event on a page, newest first. `category` is `exports`,
+ * `access`, `changes` or `other`; `actor_kind` is `user`, `admin_cli`,
+ * `retention` or `system` (kept as plain strings so a newer server's value
+ * still renders). `details` is the server's per-action whitelist; the raw
+ * audit data never reaches the client. `id` is an opaque token, never the
+ * stored event id, and is what `cursor` takes back.
+ */
+const docAuditEventSchema = v.object({
+  id: v.string(),
+  at: v.string(),
+  action: v.string(),
+  category: v.string(),
+  actor_kind: v.string(),
+  actor: v.nullable(auditAuthorSchema),
+  details: v.fallback(v.record(v.string(), v.unknown()), {}),
+});
+export type DocAuditEvent = v.InferOutput<typeof docAuditEventSchema>;
+export const DocAuditEvent = docAuditEventSchema;
+
+const docAuditStatsSchema = v.object({
+  total: v.number(),
+  by_action: v.array(v.object({ action: v.string(), count: v.number(), last_at: v.string() })),
+  exports: v.object({
+    total: v.number(),
+    /** Distinct exporters; every former member counts as one. */
+    people: v.number(),
+    last_30_days: v.number(),
+    last: v.nullable(
+      v.object({
+        at: v.string(),
+        actor_kind: v.string(),
+        actor: v.nullable(auditAuthorSchema),
+        format: v.fallback(v.nullable(v.string()), null),
+        scope: v.fallback(v.nullable(v.string()), null),
+      }),
+    ),
+    /** `docx`, `odt`, `markdown_zip`; zero counts are left out. */
+    by_format: v.fallback(v.record(v.string(), v.number()), {}),
+    /** `page`, `subtree`, `workspace`; zero counts are left out. */
+    by_scope: v.fallback(v.record(v.string(), v.number()), {}),
+    /** Most recent exporter first, at most 50. */
+    by_person: v.array(v.object({ actor: auditAuthorSchema, count: v.number(), last_at: v.string() })),
+    by_person_truncated: v.fallback(v.boolean(), false),
+  }),
+});
+export type DocAuditStats = v.InferOutput<typeof docAuditStatsSchema>;
+export const DocAuditStats = docAuditStatsSchema;
+
+/**
+ * One page of a page's audit log. `stats` is only on the first page;
+ * `next_cursor` is the opaque id of its last event while older ones remain.
+ */
+const docAuditPageSchema = v.object({
+  events: v.array(docAuditEventSchema),
+  next_cursor: v.nullable(v.string()),
+  stats: v.nullable(docAuditStatsSchema),
+});
+export type DocAuditPage = v.InferOutput<typeof docAuditPageSchema>;
+export const DocAuditPage = docAuditPageSchema;
+
 export function parse<T>(schema: v.GenericSchema<T>, data: unknown): T {
   return v.parse(schema, data);
 }

@@ -11,7 +11,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ### Upgrading
 - Upgrade from 0.9.10 or 0.9.11, and don't skip 0.9.10 on the way from
   0.9.9: this release builds on the numbered edit log that 0.9.10 starts.
-  Three database migrations run on upgrade. `20261108120000_history_builder`
+  Four database migrations run on upgrade. `20261108120000_history_builder`
   creates three empty tables. Its lock attempts pause page writes
   (creating, moving, archiving or purging pages, among others) and user
   updates for at most 100 ms each; once it has its locks it commits at
@@ -54,10 +54,11 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   bounded attempts and gives up after 45 s instead of queueing writes
   behind a long transaction; if it gives up, re-run the upgrade once that
   transaction has finished. Both tables are small, since file contents
-  live in `blob_bytes`, which it doesn't read. With three migrations that
-  each wait up to 45 s for their locks, pass `helm upgrade --timeout` of
-  at least 5 minutes plus your rollout time; the chart README explains the
-  budget and how to tell which migrations committed. (#88)
+  live in `blob_bytes`, which it doesn't read. With four migrations that
+  each wait up to 45 s for their locks (the fourth is
+  `20261113120000_audit_doc_index`, below), pass `helm upgrade --timeout`
+  of at least 6 minutes plus your rollout time; the chart README explains
+  the budget and how to tell which migrations committed. (#88)
 - Writes are now rate limited per user, and sign-in and share links per
   client address; the limits are on by default and far above normal use.
   API clients and scripts that write in bulk can get
@@ -88,6 +89,28 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   one minute: a collab socket the server is slowing down may otherwise be
   closed by the proxy and reconnect. Nothing is lost, but the editor shows
   the reconnect. (#88)
+- `20261113120000_audit_doc_index` builds one index on `audit_events`,
+  for the page audit log. While it builds it holds a `SHARE` lock on the
+  table: creating, renaming, moving, archiving, restoring, duplicating and
+  purging pages (the archive retention job's purge too), marking and
+  unmarking templates, restricting pages and changing their access, and
+  member invites, role changes and removals pause meanwhile; edits and
+  page loads go on. It takes its lock in bounded attempts and gives up after 45 s
+  instead of queueing those writes behind a long transaction; if it gives
+  up, re-run the upgrade once that transaction has finished. It runs last;
+  its lock loop is in the `--timeout` above. The table is small unless
+  your instance wrote many audit rows; the chart README says how to build
+  the index ahead of time on a large `audit_events`.
+- `audit_events` now grows by one row per exported page: a Word or
+  OpenDocument export writes one, a Markdown zip one per page in it, so a
+  workspace export writes one per page. There is still no retention.
+- Exports now depend on the audit log: a file export is sent only once its
+  audit rows are written, and is refused with `503 audit.unavailable` when
+  they can't be (fail closed). An `audit_events` outage, or a database that
+  refuses inserts into it, blocks every Word, OpenDocument and Markdown zip
+  export until it is fixed. An insert that hangs (a lock on `audit_events`,
+  a lost synchronous standby) is given up on after 5 s and refused the same
+  way. Alert on `knot_audit_write_failures_total`.
 
 ### Added
 - Short links to pages. "Copy link" in the page header copies
@@ -170,6 +193,29 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   `KnotRateLimitedSustained` (ticket severity) in the chart's
   PrometheusRule; and a "Limits" row in the Grafana dashboard. Normal use
   keeps them at 0. (#88)
+- Each page has an audit log for its editors and owners, under "Audit
+  log" in the page header and the sidebar's menu: who exported the page
+  (Word, OpenDocument, Markdown zip, also as part of a subpage or
+  workspace export), when and how, and who changed its access or the
+  page, with export stats on top. Viewers can't open it; the export menu
+  tells everyone that exports are recorded. Exports made before this
+  release were not recorded, and reading the page, the Markdown view,
+  attachment downloads and public link views are not recorded.
+- `GET /api/docs/{id}/audit?category=&cursor=&limit=` lists a page's
+  audit events, newest first, and on the first page its export stats.
+  Editor+ on the page, also when it is archived.
+- File exports are recorded in `audit_events` as `doc.export`, one row
+  per page the file contains, with the person who exported it, before the
+  file is sent. An export that can't be recorded is refused with
+  `503 audit.unavailable` and no file, and the app says "Export blocked:
+  it couldn't be recorded in the audit log. Try again later." Failed,
+  refused and `HEAD` requests are not recorded.
+- Metric `knot_audit_write_failures_total{action}`: failed audit writes,
+  one per failed insert however many rows it held (an export insert given
+  up on after 5 s included). For `doc.export` each is one refused export,
+  however many pages it covered; for member changes
+  and quota refusals the request went on without its row. Normal use
+  keeps it at 0; the chart README says why it is worth an alert.
 
 ### Changed
 - `GET /api/docs/{id}/contributors` adds `former` to each person
@@ -185,6 +231,9 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   weren't uploaded. (#88)
 - Workspace and page zip exports download through the app, so a refused
   export shows a message instead of a failed browser download. (#88)
+- `doc.grant` audit rows now carry the principal, role and inherit flag,
+  and `doc.grant.delete` rows the principal. Older rows have neither and
+  show as "changed access" or "removed access" in the page audit log.
 
 ### Fixed
 - With `trustedProxies` set, five failed logins from one client no longer

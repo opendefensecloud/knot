@@ -165,6 +165,7 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
         onSelect: () => tree.onMove(node.id, m.cmd),
       });
     }
+    items.push({ label: "Audit log", testId: "ctx-audit", onSelect: () => void nav(`/doc/${node.id}/audit`) });
   }
   if (isOwner) {
     items.push({

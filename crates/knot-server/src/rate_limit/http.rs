@@ -498,6 +498,7 @@ mod tests {
         let unlimited = [
             (Method::GET, "/api/docs"),
             (Method::GET, "/api/docs/{id}"),
+            (Method::GET, "/api/docs/{id}/audit"),
             (Method::GET, "/api/search"),
             (Method::GET, "/api/short-links/{code}"),
             (Method::GET, "/api/healthz"),

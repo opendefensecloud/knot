@@ -6,6 +6,10 @@
 //!
 //! Both sit behind `require_doc_role_mw`, so viewers and up may export, and
 //! archived pages are refused. The export itself lives in [`crate::export`].
+//! A built export is recorded in the page's audit log as `doc.export` before
+//! the file goes out, and only then: exports fail closed, so one whose row
+//! can't be written (or a server without a database to write it to) is
+//! refused with `503 audit.unavailable` and no file.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -18,6 +22,7 @@ use axum::{
     routing::{get, post},
 };
 use knot_export::{DiagramRef, Fallbacks};
+use knot_storage::audit;
 use multer::{Constraints, Multipart, SizeLimit};
 use serde::Serialize;
 use tracing::Instrument;
@@ -26,7 +31,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::auth::{AuthContext, DocArchived, require_viewer};
 use crate::export::{self, DIAGRAM_SCALE, Format};
-use crate::http_error::{doc_archived, json_err};
+use crate::http_error::{AuditUnavailable, audit_unavailable, doc_archived, json_err};
 
 /// Largest request body: 10 MiB, as for blob uploads, so a proxy that lets
 /// image uploads through lets exports through too.
@@ -146,7 +151,7 @@ async fn export_file(
     let format = Format::parse(&format);
     let mut recorded = Recorded::start(format);
     let response = export_response(&state, doc_id, format, req).await;
-    recorded.status = Some(response.status());
+    recorded.outcome = Some(outcome(&response));
     response
 }
 
@@ -158,8 +163,8 @@ async fn export_file(
 struct Recorded {
     started: Instant,
     format: &'static str,
-    /// The response's status, once the handler has one.
-    status: Option<StatusCode>,
+    /// The response's `outcome` label, once the handler has one.
+    outcome: Option<&'static str>,
 }
 
 impl Recorded {
@@ -167,21 +172,21 @@ impl Recorded {
         Self {
             started: Instant::now(),
             format: format.map_or("unknown", Format::extension),
-            status: None,
+            outcome: None,
         }
     }
 }
 
 impl Drop for Recorded {
     fn drop(&mut self) {
-        let status = self.status.unwrap_or_else(|| {
+        let outcome = self.outcome.unwrap_or_else(|| {
             tracing::warn!(
                 format = self.format,
                 "export ended without a response: timed out or the client went away"
             );
-            StatusCode::REQUEST_TIMEOUT
+            status_outcome(StatusCode::REQUEST_TIMEOUT)
         });
-        let labels = [("format", self.format), ("outcome", outcome(status))];
+        let labels = [("format", self.format), ("outcome", outcome)];
         metrics::counter!("knot_export_total", &labels).increment(1);
         metrics::histogram!("knot_export_duration_seconds", &labels)
             .record(self.started.elapsed().as_secs_f64());
@@ -197,7 +202,7 @@ async fn export_response(
     if let Some(refusal) = require_viewer(&req) {
         return refusal;
     }
-    let Some(user_id) = req.extensions().get::<AuthContext>().map(|ctx| ctx.user_id) else {
+    let Some(auth_context) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
     let Some(format) = format else {
@@ -229,6 +234,8 @@ async fn export_response(
             "10 MiB cap",
         );
     };
+    // Counted before the pictures move into the build.
+    let diagram_picture_count = pictures.len();
     // The build runs on its own task, which owns the permit until the build
     // ends. Dropping this handler (the request timeout, or the client going
     // away) then can't hand the permit back while the build's blocking walk
@@ -236,6 +243,7 @@ async fn export_response(
     let build = tokio::spawn(
         {
             let state = state.clone();
+            let user_id = auth_context.user_id;
             async move {
                 let built = export::build(&state, user_id, doc_id, format, pictures).await;
                 drop(permit);
@@ -255,6 +263,32 @@ async fn export_response(
             return internal();
         }
     };
+    // The file is built. It goes out only once its audit row is written
+    // (fail closed): recorded here, not in the build task, so a request the
+    // timeout dropped during the build records nothing. An insert that
+    // hangs is given up on after `audit::EXPORT_AUDIT_WRITE_TIMEOUT` and
+    // refused like a failed one (503, counted), not left to run into the
+    // request timeout. Only a build that already ran close to that timeout
+    // can still end in 408 during the insert; a row that commits just as it
+    // fires is for a file the client never got, which errs on the safe side.
+    let Some(pool) = state.pool.as_ref() else {
+        tracing::error!("export refused: no database to record it in");
+        return audit_unavailable();
+    };
+    let audit_data = export_audit_data(format, diagram_picture_count, &built.fallbacks);
+    let recorded_in_audit_log = audit::record_for_targets(
+        pool,
+        auth_context.workspace_id,
+        Some(auth_context.user_id),
+        "doc.export",
+        "doc",
+        &[doc_id],
+        &audit_data,
+    )
+    .await;
+    if recorded_in_audit_log.is_err() {
+        return audit_unavailable();
+    }
     let file_name = export::file_name(&built.title, format);
     (
         [
@@ -268,6 +302,26 @@ async fn export_response(
         built.bytes,
     )
         .into_response()
+}
+
+/// The `data` of a docx/odt `doc.export` row. `fallbacks` is for operators;
+/// the audit log never sends it.
+fn export_audit_data(
+    format: Format,
+    diagram_picture_count: usize,
+    fallbacks: &Fallbacks,
+) -> serde_json::Value {
+    serde_json::json!({
+        "format": format.extension(),
+        "scope": "page",
+        "diagram_pictures": diagram_picture_count,
+        "fallbacks": {
+            "diagram": fallbacks.diagram,
+            "image_unavailable": fallbacks.image_unavailable,
+            "image_over_budget": fallbacks.image_over_budget,
+            "unknown_element": fallbacks.unknown_element,
+        },
+    })
 }
 
 /// The request body was over [`MAX_BODY_BYTES`].
@@ -345,8 +399,18 @@ fn fallbacks_header(fallbacks: &Fallbacks) -> String {
     )
 }
 
+/// The `outcome` label of `knot_export_total` for a response: a refusal for
+/// want of an audit row is the server's failure, not a busy export.
+fn outcome(response: &Response) -> &'static str {
+    if response.extensions().get::<AuditUnavailable>().is_some() {
+        "server_error"
+    } else {
+        status_outcome(response.status())
+    }
+}
+
 /// The `outcome` label of `knot_export_total` for a response status.
-fn outcome(status: StatusCode) -> &'static str {
+fn status_outcome(status: StatusCode) -> &'static str {
     if status == StatusCode::SERVICE_UNAVAILABLE {
         "busy"
     } else if status.is_server_error() {
@@ -449,7 +513,7 @@ mod tests {
             // The request timeout drops the handler mid-export.
             drop(Recorded::start(Some(Format::Docx)));
             let mut done = Recorded::start(Some(Format::Odt));
-            done.status = Some(StatusCode::OK);
+            done.outcome = Some(status_outcome(StatusCode::OK));
             drop(done);
         });
         let label = |format: &str, outcome: &str| {
@@ -474,7 +538,14 @@ mod tests {
             (StatusCode::SERVICE_UNAVAILABLE, "busy"),
             (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
         ] {
-            assert_eq!(outcome(status), label, "{status}");
+            assert_eq!(status_outcome(status), label, "{status}");
+            assert_eq!(outcome(&status.into_response()), label, "{status}");
         }
+    }
+
+    #[test]
+    fn an_export_refused_for_its_audit_row_is_a_server_error_not_busy() {
+        assert_eq!(outcome(&busy()), "busy");
+        assert_eq!(outcome(&audit_unavailable()), "server_error");
     }
 }

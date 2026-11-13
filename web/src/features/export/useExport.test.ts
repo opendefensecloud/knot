@@ -103,6 +103,21 @@ describe("useExport", () => {
     expect(result.current.exporting).toBe(false);
   });
 
+  it("says the export was blocked, without a retry, when the audit log couldn't record it", async () => {
+    const { deps, file, mocks } = makeDeps(vi.fn(() => Promise.resolve(err(503, "audit.unavailable"))));
+    const { result } = setup(deps);
+    await act(async () => {
+      await result.current.run("docx");
+    });
+    expect(file).toHaveBeenCalledTimes(1);
+    expect(mocks.notify).toHaveBeenCalledExactlyOnceWith(
+      "error",
+      "Export blocked: it couldn't be recorded in the audit log. Try again later.",
+    );
+    expect(mocks.saveBlob).not.toHaveBeenCalled();
+    expect(result.current.exporting).toBe(false);
+  });
+
   it("shows the rate-limit text, once and without a retry, on a 429", async () => {
     const tooFast = {
       error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 6 }, status: 429 },

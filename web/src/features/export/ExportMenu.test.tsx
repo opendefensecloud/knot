@@ -46,7 +46,8 @@ describe("ExportMenu", () => {
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("menu")).toBeInTheDocument();
     expect(screen.getAllByRole("menuitem")).toHaveLength(4);
-    expect(screen.getByRole("separator")).toBeInTheDocument();
+    // One between the file formats and the Markdown zips, one above the audit note.
+    expect(screen.getAllByRole("separator")).toHaveLength(2);
     expect(screen.getByTestId("export-docx")).toHaveTextContent("Word document");
     expect(screen.getByTestId("export-docx")).toHaveTextContent(
       ".docx · opens in Word, LibreOffice, Google Docs",
@@ -57,11 +58,30 @@ describe("ExportMenu", () => {
     expect(screen.getByTestId("export-md-subtree")).toHaveTextContent("Markdown with subpages (zip)");
   });
 
+  it("tells the exporter that exports are recorded, below the last item", () => {
+    mount();
+    open();
+    const note = screen.getByTestId("export-audit-note");
+    expect(note).toHaveTextContent("Exports are recorded in the page's audit log.");
+    expect(screen.getByRole("menu").lastElementChild).toBe(note);
+    // Not a menu item: arrow keys never land on it...
+    expect(screen.getAllByRole("menuitem")).not.toContain(note);
+    // ...so the menu carries it as its description, read when it opens.
+    expect(screen.getByRole("menu")).toHaveAccessibleDescription("Exports are recorded in the page's audit log.");
+  });
+
+  it("keeps the audit note on template pages", () => {
+    mount(true);
+    open();
+    expect(screen.getByTestId("export-audit-note")).toBeInTheDocument();
+  });
+
   it("hides the Markdown items on template pages", () => {
     mount(true);
     open();
     expect(screen.getAllByRole("menuitem")).toHaveLength(2);
-    expect(screen.queryByRole("separator")).toBeNull();
+    // Only the one above the audit note.
+    expect(screen.getAllByRole("separator")).toHaveLength(1);
     expect(screen.queryByTestId("export-md")).toBeNull();
     expect(screen.queryByTestId("export-md-subtree")).toBeNull();
   });
@@ -184,6 +204,26 @@ describe("ExportMenu", () => {
     await waitFor(() =>
       expect(useUi.getState().toasts).toMatchObject([
         { kind: "warn", text: "You're doing that too fast. Try again in 9 s.", key: "limit" },
+      ]),
+    );
+    expect(saved.saveBlob).not.toHaveBeenCalled();
+  });
+
+  it("says when a Markdown zip is blocked because the audit log couldn't record it", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: { code: "audit.unavailable", message: "the export couldn't be recorded in the audit log", details: {} },
+        }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    mount();
+    open();
+    fireEvent.click(screen.getByTestId("export-md-subtree"));
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([
+        { kind: "error", text: "Export blocked: it couldn't be recorded in the audit log. Try again later." },
       ]),
     );
     expect(saved.saveBlob).not.toHaveBeenCalled();

@@ -280,13 +280,21 @@ impl GrantStore for PgGrantStore {
             granted_by: Some(granted_by),
         };
         let inserted = upsert_in_tx(&mut tx, &grant).await?;
-        audit::record_in_tx(
+        // Who got which access, for the page audit log. The principals are
+        // no secret: any reader of the page can list its grants.
+        let audit_data = JsonValue::from_iter([
+            ("principal", JsonValue::from(grant.principal)),
+            ("role", JsonValue::from(grant.role.as_str())),
+            ("inherit", JsonValue::from(grant.inherit)),
+        ]);
+        audit::record_in_tx_with_data(
             &mut tx,
             workspace_id,
             Some(granted_by),
             "doc.grant",
             "doc",
             doc_id,
+            &audit_data,
         )
         .await?;
         tx.commit().await?;
@@ -345,13 +353,15 @@ impl GrantStore for PgGrantStore {
             .bind(principal)
             .execute(&mut *tx)
             .await?;
-        audit::record_in_tx(
+        let audit_data = JsonValue::from_iter([("principal", JsonValue::from(principal))]);
+        audit::record_in_tx_with_data(
             &mut tx,
             workspace_id,
             Some(actor),
             "doc.grant.delete",
             "doc",
             doc_id,
+            &audit_data,
         )
         .await?;
         invalidations::record_in_tx(&mut tx, workspace_id, doc_id, "grant-delete").await?;

@@ -5,6 +5,7 @@ use axum::{Router, middleware};
 use crate::AppState;
 use crate::auth::{csrf_mw, require_session_mw};
 
+pub mod audit;
 pub mod blobs;
 pub mod boards;
 pub mod comments;

@@ -58,6 +58,13 @@ afterEach(() => {
 });
 
 describe("SettingsPage workspace export", () => {
+  it("says the export is recorded on each page's audit log", () => {
+    renderPage();
+    expect(screen.getByTestId("workspace-export-audit-note")).toHaveTextContent(
+      "Exports are recorded in each page's audit log.",
+    );
+  });
+
   it("downloads the workspace zip through fetch and saves it", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response("zip", { status: 200, headers: { "Content-Type": "application/zip" } }),
@@ -75,6 +82,18 @@ describe("SettingsPage workspace export", () => {
     fireEvent.click(screen.getByTestId("workspace-export"));
     await waitFor(() =>
       expect(useUi.getState().toasts).toMatchObject([{ kind: "warn", text: TOO_FAST_TEXT, key: "limit" }]),
+    );
+    expect(saved.saveBlob).not.toHaveBeenCalled();
+  });
+
+  it("says the export was blocked when the audit log couldn't record it", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(envelope(503, "audit.unavailable"));
+    renderPage();
+    fireEvent.click(screen.getByTestId("workspace-export"));
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([
+        { kind: "error", text: "Export blocked: it couldn't be recorded in the audit log. Try again later." },
+      ]),
     );
     expect(saved.saveBlob).not.toHaveBeenCalled();
   });
