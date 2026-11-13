@@ -290,6 +290,11 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   UUID spelling the request used (upper case, without hyphens, braced,
   `urn:uuid:`), and removed by any of them, so one person never holds
   several rows that member removal would miss.
+- ammonia 4.1.9 fixes RUSTSEC-2026-0533 (mutation XSS through MathML
+  and SVG integration points). knot was not affected: both of its
+  sanitizers, for the public share page and for release notes, use
+  ammonia's default tags, which allow none of the raw-text tags the
+  attack needs.
 
 ## [0.9.11] - 2026-11-12
 
