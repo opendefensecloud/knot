@@ -7,17 +7,21 @@
 //! listed for it, so the operator fields (`doc_count`, `export_id`,
 //! `fallbacks`, `source_id`) and any future key stay on the server. Every
 //! person is shown through `history_author_view`; an id with no `users`
-//! row is a former member, its id not echoed.
+//! row is a former member, its id not echoed. A bot (`users.kind = 'bot'`)
+//! is shown the same way plus `"bot": true`; people carry no `bot` key. An
+//! export made with an API key shows `details.via_api_key: true`, never the
+//! key's id.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use knot_history::{AuthorView, HistoryPerson, history_author_view};
 use knot_storage::audit::{DocAuditRow, DocAuditStats};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use super::{EXPORT_ACTION, EventTokens, category_of};
+use super::{API_KEY_ID_FIELD, EXPORT_ACTION, EventTokens, category_of};
 
 /// The exporters `stats.exports.by_person` lists, most recent first.
 pub const MAX_LISTED_EXPORTERS: usize = 50;
@@ -27,6 +31,26 @@ const GRANT_ACTIONS: &[&str] = &["doc.grant", "doc.grant.delete", "admin.grant"]
 
 const KNOWN_FORMATS: &[&str] = &["docx", "odt", "markdown_zip"];
 const KNOWN_SCOPES: &[&str] = &["page", "subtree", "workspace"];
+
+/// The people a response may name, as the handler loaded them: their
+/// `users` rows (through `knot_history::load_people`) and which of them are
+/// bots.
+#[derive(Debug, Default)]
+pub struct AuditPeople {
+    pub people: HashMap<Uuid, HistoryPerson>,
+    pub bots: HashSet<Uuid>,
+}
+
+/// A person as the audit log shows them: the page history's view, plus
+/// `"bot": true` for a bot. Only here: the page history's own view stays
+/// as it is.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActorView {
+    #[serde(flatten)]
+    author: AuthorView,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    bot: bool,
+}
 
 /// A former member, a deleted user, or an anonymized person: no key, no
 /// name.
@@ -39,11 +63,15 @@ fn former() -> AuthorView {
 }
 
 /// How `person_id` is shown: by `history_author_view`, or as a former
-/// member when there is no `users` row for it.
-fn person_view(person_id: Uuid, people: &HashMap<Uuid, HistoryPerson>) -> AuthorView {
-    people
+/// member when there is no `users` row for it. A former member is never
+/// marked as a bot, so the mark can't tell former members apart.
+fn person_view(person_id: Uuid, people: &AuditPeople) -> ActorView {
+    let author = people
+        .people
         .get(&person_id)
-        .map_or_else(former, history_author_view)
+        .map_or_else(former, history_author_view);
+    let bot = !author.former && people.bots.contains(&person_id);
+    ActorView { author, bot }
 }
 
 /// Who did it, as a label for the reader: `user` when a person did; for a
@@ -120,7 +148,7 @@ pub fn referenced_people(rows: &[DocAuditRow], stats: Option<&DocAuditStats>) ->
     person_ids
 }
 
-fn principal_view(principal: Principal<'_>, people: &HashMap<Uuid, HistoryPerson>) -> Value {
+fn principal_view(principal: Principal<'_>, people: &AuditPeople) -> Value {
     match principal {
         Principal::User(user_id) => json!({"kind": "user", "person": person_view(user_id, people)}),
         Principal::Group(name) => json!({"kind": "group", "name": name}),
@@ -140,7 +168,7 @@ fn copy_field(details: &mut Map<String, Value>, data: &Value, key: &str, keep: f
 pub fn details(
     row: &DocAuditRow,
     doc_id: Uuid,
-    people: &HashMap<Uuid, HistoryPerson>,
+    people: &AuditPeople,
     roots: &HashMap<Uuid, String>,
 ) -> Value {
     let data = &row.data;
@@ -150,6 +178,10 @@ pub fn details(
             copy_field(&mut details, data, "format", Value::is_string);
             copy_field(&mut details, data, "scope", Value::is_string);
             copy_field(&mut details, data, "diagram_pictures", Value::is_u64);
+            // Whether, never which: the key's id stays on the server.
+            if data.get(API_KEY_ID_FIELD).is_some_and(Value::is_string) {
+                details.insert("via_api_key".into(), json!(true));
+            }
             if string_field(data, "scope") == Some("subtree") {
                 let root_id =
                     string_field(data, "root_id").and_then(|text| Uuid::parse_str(text).ok());
@@ -196,7 +228,7 @@ pub fn event_view(
     row: &DocAuditRow,
     doc_id: Uuid,
     tokens: &EventTokens,
-    people: &HashMap<Uuid, HistoryPerson>,
+    people: &AuditPeople,
     roots: &HashMap<Uuid, String>,
 ) -> Value {
     json!({
@@ -212,13 +244,13 @@ pub fn event_view(
 
 /// One `by_person` row.
 struct ExporterView {
-    actor: AuthorView,
+    actor: ActorView,
     count: i64,
     last_at: DateTime<Utc>,
 }
 
 /// The `stats` object of the first page.
-pub fn stats_view(stats: &DocAuditStats, people: &HashMap<Uuid, HistoryPerson>) -> Value {
+pub fn stats_view(stats: &DocAuditStats, people: &AuditPeople) -> Value {
     let total: i64 = stats.by_action.iter().map(|action| action.count).sum();
     let by_action: Vec<Value> = stats
         .by_action
@@ -255,7 +287,7 @@ pub fn stats_view(stats: &DocAuditStats, people: &HashMap<Uuid, HistoryPerson>) 
     let mut former_exporters: Option<ExporterView> = None;
     for exporter in &stats.exporters {
         let actor = person_view(exporter.actor_id, people);
-        if actor.former {
+        if actor.author.former {
             let merged = former_exporters.get_or_insert(ExporterView {
                 actor,
                 count: 0,
@@ -351,8 +383,11 @@ mod tests {
         }
     }
 
-    fn people_of(persons: &[HistoryPerson]) -> HashMap<Uuid, HistoryPerson> {
-        persons.iter().map(|p| (p.id, p.clone())).collect()
+    fn people_of(persons: &[HistoryPerson]) -> AuditPeople {
+        AuditPeople {
+            people: persons.iter().map(|p| (p.id, p.clone())).collect(),
+            bots: HashSet::new(),
+        }
     }
 
     #[test]
@@ -377,13 +412,90 @@ mod tests {
         let details = details(
             &row("doc.export", None, data),
             doc_id,
-            &HashMap::new(),
+            &AuditPeople::default(),
             &HashMap::new(),
         );
         assert_eq!(
             details,
             json!({"format": "docx", "scope": "page", "diagram_pictures": 2})
         );
+    }
+
+    #[test]
+    fn an_export_with_an_api_key_says_so_but_not_which() {
+        let key_id = Uuid::new_v4();
+        let data = json!({"format": "markdown_zip", "scope": "workspace",
+                          "api_key_id": key_id.to_string(), "export_id": "e"});
+        let shown = details(
+            &row("doc.export", None, data),
+            Uuid::new_v4(),
+            &AuditPeople::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            shown,
+            json!({"format": "markdown_zip", "scope": "workspace", "via_api_key": true})
+        );
+        assert!(!shown.to_string().contains(&key_id.to_string()));
+        // Only an export row says it; a malformed id says nothing.
+        for (action, data) in [
+            ("doc.rename", json!({"api_key_id": key_id.to_string()})),
+            ("doc.export", json!({"format": "odt", "api_key_id": 7})),
+        ] {
+            let shown = details(
+                &row(action, None, data),
+                Uuid::new_v4(),
+                &AuditPeople::default(),
+                &HashMap::new(),
+            );
+            assert!(shown.get("via_api_key").is_none(), "{action}: {shown}");
+        }
+    }
+
+    #[test]
+    fn a_bot_is_marked_and_a_person_or_former_bot_is_not() {
+        let (bot, ada, anonymized_bot, gone_bot) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let people = AuditPeople {
+            people: HashMap::from([
+                (bot, person(bot, "CI bot")),
+                (ada, person(ada, "Ada")),
+                (
+                    anonymized_bot,
+                    HistoryPerson {
+                        anonymized: true,
+                        ..person(anonymized_bot, "Old bot")
+                    },
+                ),
+            ]),
+            bots: HashSet::from([bot, anonymized_bot, gone_bot]),
+        };
+        assert_eq!(
+            serde_json::to_value(person_view(bot, &people)).unwrap(),
+            json!({"key": bot, "name": "CI bot", "former": false, "bot": true})
+        );
+        assert_eq!(
+            serde_json::to_value(person_view(ada, &people)).unwrap(),
+            json!({"key": ada, "name": "Ada", "former": false})
+        );
+        for former_bot in [anonymized_bot, gone_bot] {
+            assert_eq!(
+                serde_json::to_value(person_view(former_bot, &people)).unwrap(),
+                json!({"key": null, "name": null, "former": true})
+            );
+        }
+        let event = event_view(
+            &row("doc.export", Some(bot), json!({"format": "docx"})),
+            Uuid::new_v4(),
+            &EventTokens::new(b"test-key", Uuid::new_v4()),
+            &people,
+            &HashMap::new(),
+        );
+        assert_eq!(event["actor"]["bot"], true);
     }
 
     #[test]
@@ -402,7 +514,7 @@ mod tests {
             details(
                 &subtree(&doc_id.to_string()),
                 doc_id,
-                &HashMap::new(),
+                &AuditPeople::default(),
                 &roots
             ),
             json!({"format": "markdown_zip", "scope": "subtree"}),
@@ -412,14 +524,14 @@ mod tests {
             details(
                 &subtree(&root_id.to_string()),
                 doc_id,
-                &HashMap::new(),
+                &AuditPeople::default(),
                 &roots
             ),
             json!({"format": "markdown_zip", "scope": "subtree",
                    "root": {"id": root_id, "title": "Handbook"}, "root_hidden": false})
         );
         for hidden in [hidden_root_id.to_string(), "garbage".to_string()] {
-            let shown = details(&subtree(&hidden), doc_id, &HashMap::new(), &roots);
+            let shown = details(&subtree(&hidden), doc_id, &AuditPeople::default(), &roots);
             assert_eq!(
                 shown,
                 json!({"format": "markdown_zip", "scope": "subtree",
@@ -512,7 +624,7 @@ mod tests {
                 details(
                     &row(action, None, json!({"source_id": "s", "title": "t"})),
                     doc_id,
-                    &HashMap::new(),
+                    &AuditPeople::default(),
                     &HashMap::new()
                 ),
                 json!({}),

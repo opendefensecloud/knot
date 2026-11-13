@@ -1,7 +1,7 @@
 //! The page audit log's storage: `record_for_targets` (which hands a failed
 //! insert back, for the export routes to fail closed on) and the per-page
-//! reads (`list_doc_events`, `doc_stats`) over `audit_events`, and the
-//! index they run on.
+//! reads (`list_doc_events`, `doc_stats`) over `audit_events`, the index
+//! they run on, and `bots_among`, which marks the bots the log names.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -614,4 +614,29 @@ async fn the_cursor_bound_is_an_index_condition_in_the_generic_plan() {
         index_condition.contains("target_id = $2") && index_condition.contains("id <"),
         "the cursor bound is not part of the index condition:\n{plan}"
     );
+}
+
+/// Catches a person counted as a bot, a bot missed, and an unknown id
+/// failing the read.
+#[tokio::test(flavor = "multi_thread")]
+async fn bots_among_finds_only_the_bots() {
+    let f = setup().await;
+    let mut user_ids = Vec::new();
+    for (email, kind) in [("ada@audit.test", "human"), ("ci@audit.test", "bot")] {
+        let user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (email, display_name, kind) VALUES ($1, $1, $2) RETURNING id",
+        )
+        .bind(email)
+        .bind(kind)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        user_ids.push(user_id);
+    }
+    let (person, bot, unknown) = (user_ids[0], user_ids[1], Uuid::new_v4());
+    let bots = audit::bots_among(&f.pool, &[person, bot, unknown])
+        .await
+        .unwrap();
+    assert_eq!(bots, std::collections::HashSet::from([bot]));
+    assert!(audit::bots_among(&f.pool, &[]).await.unwrap().is_empty());
 }

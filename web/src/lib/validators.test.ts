@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { Doc, DocAccessInfo, DocWithRole, Member, parse } from "./validators";
+import { AuditAuthor, Doc, DocAccessInfo, DocWithRole, Member, parse } from "./validators";
 
 /** A sidebar row as servers before restricted documents sent it. */
 const LEGACY_DOC = {
@@ -84,5 +84,18 @@ describe("DocAccessInfo", () => {
     };
 
     expect(parse(DocAccessInfo, body)).toEqual(body);
+  });
+});
+
+describe("AuditAuthor", () => {
+  it("reads a person without the bot mark as no bot, and keeps a bot's", () => {
+    expect(parse(AuditAuthor, { key: "u1", name: "Ada", former: false })).toEqual({
+      key: "u1",
+      name: "Ada",
+      former: false,
+      bot: false,
+    });
+    expect(parse(AuditAuthor, { key: "u2", name: "CI bot", former: false, bot: true }).bot).toBe(true);
+    expect(parse(AuditAuthor, { key: "u3", name: "Odd", former: false, bot: "yes" }).bot).toBe(false);
   });
 });

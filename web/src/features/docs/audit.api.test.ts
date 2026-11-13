@@ -57,7 +57,36 @@ describe("auditApi.list", () => {
     expect(fetchSpy.mock.calls[0]?.[0]).toBe("/api/docs/d1/audit");
     expect(fetchSpy.mock.calls[0]?.[1]?.method).toBe("GET");
     if (!("ok" in result)) throw new Error("expected ok");
-    expect(result.ok).toEqual(FIRST_PAGE);
+    expect(result.ok).toMatchObject(FIRST_PAGE);
+    // A person the server didn't mark is no bot.
+    expect(result.ok.events[0]?.actor?.bot).toBe(false);
+    expect(result.ok.stats?.exports.by_person[0]?.actor.bot).toBe(false);
+  });
+
+  it("keeps a bot's mark wherever a person is named", async () => {
+    const ciBot = { key: "u-ci", name: "CI bot", former: false, bot: true };
+    const exports = FIRST_PAGE.stats.exports;
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({
+        ...FIRST_PAGE,
+        events: [{ ...FIRST_PAGE.events[0], actor: ciBot }],
+        stats: {
+          ...FIRST_PAGE.stats,
+          exports: {
+            ...exports,
+            last: { ...exports.last, actor: ciBot },
+            by_person: [{ ...exports.by_person[0], actor: ciBot }],
+          },
+        },
+      }),
+    );
+
+    const result = await auditApi.list("d1");
+
+    if (!("ok" in result)) throw new Error("expected ok");
+    expect(result.ok.events[0]?.actor?.bot).toBe(true);
+    expect(result.ok.stats?.exports.last?.actor?.bot).toBe(true);
+    expect(result.ok.stats?.exports.by_person[0]?.actor.bot).toBe(true);
   });
 
   it("encodes the id and sends only the parameters that are set", async () => {
