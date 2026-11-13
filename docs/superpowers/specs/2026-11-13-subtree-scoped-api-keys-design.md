@@ -49,8 +49,10 @@ CREATE INDEX api_keys_root_doc_idx ON api_keys (root_doc_id) WHERE root_doc_id I
   on update, `root_doc_id` must not change. `documents` has no
   `UNIQUE (workspace_id, id)`, so a composite foreign key isn't available;
   the trigger follows the `KB001`–`KB004` pattern.
-- Takes the same lock discipline as `20261112120002` (`knot_lock_tables`
-  on `api_keys`, `documents`).
+- Two migrations, because `knot_lock_tables` takes one mode for all its
+  tables: the column, index and trigger under ACCESS EXCLUSIVE on
+  `api_keys` alone; then the foreign key under SHARE ROW EXCLUSIVE on
+  `documents` and `api_keys`, which blocks no page load.
 
 ## Minting
 
@@ -113,9 +115,9 @@ Everything else follows from the rule without its own code:
 
 ## Workspace-wide routes
 
-`auth/scope.rs` gets `SUBTREE_DENIED: &[(Method, &str)]`, checked in
-`scope_mw` after `SESSION_ONLY`, refusing a key with a root with
-`403 api_key.subtree_denied`:
+`auth/scope.rs` gets `SUBTREE_DENIED: &[&str]` (route templates, every
+method), checked in `scope_mw` after `SESSION_ONLY`, refusing a key with a
+root with `403 api_key.subtree_denied`:
 
 | Route | Why |
 |---|---|
@@ -154,8 +156,7 @@ refusals (`key_id`, method, route template).
 - The key list shows a chip with the root's title, linking to the page, or
   "a page you can't see" when `root_title` is `null`.
 - Bot keys use the same form; `apiKeyErrorMessage` maps `doc.not_found` on
-  mint to "The bot can't read that page." (for one's own key: "That page
-  no longer exists.").
+  mint to "You or the bot can't read that page, or it no longer exists."
 - `apiKeys.api.ts`: `root_doc_id?: string` on create, `root_doc_id` and
   `root_title` on the listed key.
 
