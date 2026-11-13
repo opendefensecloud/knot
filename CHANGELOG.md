@@ -197,6 +197,13 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   removed, it holds at most 100 000, and email keys are cut at
   320 bytes. (#88)
 
+### Security
+- ammonia 4.1.9 fixes RUSTSEC-2026-0533 (mutation XSS through MathML
+  and SVG integration points). knot was not affected: both of its
+  sanitizers, for the public share page and for release notes, use
+  ammonia's default tags, which allow none of the raw-text tags the
+  attack needs.
+
 ## [0.9.11] - 2026-11-12
 
 A fix release: nested lists, tables, keyboard shortcuts, the page
