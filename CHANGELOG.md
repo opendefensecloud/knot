@@ -8,7 +8,19 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.12] - 2026-11-13
+
+A feature release: scoped API keys and bot accounts, rate limits and
+optional quotas, short links to pages, and page history built in the
+background (the timeline view follows in a later release). Five database
+migrations run on upgrade; read Upgrading first.
+
 ### Upgrading
+- Upgrade from 0.9.10 or 0.9.11, and don't skip 0.9.10 on the way from
+  0.9.9: this release builds on the numbered edit log that 0.9.10 starts.
+  0.9.10 and 0.9.11 pods that restart after the first migration commits
+  crash-loop until new pods replace them; rolling back needs a database
+  restore.
 - Five database migrations run on upgrade, in this order:
   `20261108120000_history_builder`, `20261109120000_doc_short_links`,
   `20261112120000_quota_indexes`, `20261112120001_api_keys_users_kind` and
@@ -19,20 +31,38 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   up after 45 seconds instead of holding up page writes or sign-ins; if it
   gives up, re-run the upgrade once the long transaction it names has
   finished.
-- Upgrade from 0.9.10 or 0.9.11, and don't skip 0.9.10 on the way from
-  0.9.9: this release builds on the numbered edit log that 0.9.10 starts.
-  The first migration, `20261108120000_history_builder`, creates three empty
-  tables. Its lock attempts pause page writes
-  (creating, moving, archiving or purging pages, among others) and user
-  updates for at most 100 ms each; once it has its locks it commits at
-  once. Edit saves and page loads go on. 0.9.10 pods that restart after
-  the migration commits crash-loop until new pods replace them; rolling
-  back needs a database restore. (#83)
-- `20261109120000_doc_short_links` adds the `doc_short_links` table. It needs a short lock on
-  `documents` and `users` for its foreign keys and gives up after a few
-  seconds instead of holding up page writes or sign-ins; if it gives up,
-  re-run the upgrade once the long transaction on `documents` or `users`
-  has finished.
+  With five migrations that each wait up to 45 s for their locks, pass
+  `helm upgrade --timeout` of at least 7 minutes plus your rollout time;
+  the chart README explains the budget and how to tell which migrations
+  committed.
+- `20261108120000_history_builder` creates three empty tables. Its lock
+  attempts pause page writes (creating, moving, archiving or purging
+  pages, among others) and user updates for at most 100 ms each; once it
+  has its locks it commits at once. Edit saves and page loads go on. (#83)
+- `20261109120000_doc_short_links` adds the `doc_short_links` table. It
+  needs a short lock on `documents` and `users` for its foreign keys and
+  gives up after 45 s instead of holding up page writes or sign-ins; if it
+  gives up, re-run the upgrade once the long transaction on `documents` or
+  `users` has finished.
+- `20261112120000_quota_indexes` adds two indexes, on `documents` and on
+  `blobs`, for the quotas. While they build it holds a `SHARE` lock on
+  both: page writes (creating, renaming, moving or archiving pages, among
+  others) and file uploads wait; page loads go on. It takes its locks in
+  bounded attempts and gives up after 45 s instead of queueing writes
+  behind a long transaction; if it gives up, re-run the upgrade once that
+  transaction has finished. Both tables are small, since file contents
+  live in `blob_bytes`, which it doesn't read. (#88)
+- The API-keys migrations are additive. `20261112120001_api_keys_users_kind`
+  adds `users.kind` and two unvalidated checks: it holds an exclusive lock
+  on `users` for an instant, so sign-ins and edit saves pause briefly,
+  and scans nothing. `20261112120002_api_keys_and_bots` validates the
+  checks without blocking anyone, then holds a share lock on `users`,
+  `workspaces`, `workspace_members` and `document_grants` while it creates
+  the `api_keys` table and its triggers: writes to those tables wait,
+  reads, edit saves and page loads go on. (#81)
+- Rotating `KNOT_SESSION_KEY` now invalidates every API key as well as
+  every session: keys are stored as an HMAC under that key. After a
+  rotation, every user and bot needs new keys. (#81)
 - After the upgrade, every page's history is built once in the
   background, pages edited longest ago first. Expect extra CPU and
   database reads for a while (about one read of `doc_updates`), and
@@ -57,28 +87,6 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   replay would read more than `history.replayMaxBytes`. The chart
   README says how to find such pages and re-enable them. (#83)
 - The old snapshot thinning is unchanged. (#83)
-- The API-keys migrations are additive. `20261112120001_api_keys_users_kind`
-  adds `users.kind` and two unvalidated checks: it holds an exclusive lock
-  on `users` for an instant, so sign-ins and edit saves pause briefly,
-  and scans nothing. `20261112120002_api_keys_and_bots` validates the
-  checks without blocking anyone, then holds a share lock on `users`,
-  `workspaces`, `workspace_members` and `document_grants` while it creates
-  the `api_keys` table and its triggers: writes to those tables wait,
-  reads, edit saves and page loads go on.
-- Rotating `KNOT_SESSION_KEY` now invalidates every API key as well as
-  every session: keys are stored as an HMAC under that key. After a
-  rotation, every user and bot needs new keys.
-- `20261112120000_quota_indexes` adds two indexes, on `documents` and on
-  `blobs`, for the quotas. While they build it holds a `SHARE` lock on
-  both: page writes (creating, renaming, moving or archiving pages, among
-  others) and file uploads wait; page loads go on. It takes its locks in
-  bounded attempts and gives up after 45 s instead of queueing writes
-  behind a long transaction; if it gives up, re-run the upgrade once that
-  transaction has finished. Both tables are small, since file contents
-  live in `blob_bytes`, which it doesn't read. With five migrations that
-  each wait up to 45 s for their locks, pass `helm upgrade --timeout` of
-  at least 7 minutes plus your rollout time; the chart README explains the
-  budget and how to tell which migrations committed. (#88)
 - Writes are now rate limited per user, and sign-in and share links per
   client address; the limits are on by default and far above normal use.
   API clients and scripts that write in bulk can get
@@ -1553,7 +1561,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.11...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.12...HEAD
+[0.9.12]: https://github.com/opendefensecloud/knot/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/opendefensecloud/knot/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/opendefensecloud/knot/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/opendefensecloud/knot/compare/v0.9.8...v0.9.9
