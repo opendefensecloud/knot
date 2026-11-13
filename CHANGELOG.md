@@ -14,6 +14,79 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   list's widest number, counting its start number, so "104." in a list
   that starts at 95 fits too. In the terminal skin even "1." to "9." were
   clipped; they fit now as well.
+### Upgrading
+- Upgrade from 0.9.12. One database migration runs on upgrade:
+  `20261113120000_audit_doc_index` builds one index on `audit_events`,
+  for the page audit log. While it builds it holds a `SHARE` lock on the
+  table, so every write that adds an audit row waits: creating, renaming,
+  moving, archiving, restoring, duplicating and purging pages (the archive
+  retention job's purge too), marking and unmarking templates, restricting
+  pages and changing their access, member invites, role changes and
+  removals, password changes, and creating and revoking API keys, whether
+  made in the app or with an API key, and quota refusals when quotas are
+  on. Edits, sign-ins and page loads go on.
+  Exports wait too, and one that waits more than 5 s is refused with
+  `503 audit.unavailable` (see below). The migration takes its lock
+  through `knot_lock_tables`, in bounded attempts, and gives up after 45 s
+  instead of queueing those writes behind a long transaction; if it gives
+  up, re-run the upgrade once that transaction has finished. Pass
+  `helm upgrade --timeout` of at least 3 minutes plus your rollout time.
+  The table is small unless your instance wrote many audit rows; the chart
+  README says how to build the index ahead of time on a large
+  `audit_events`. 0.9.12 pods that restart after it commits crash-loop
+  until new pods replace them, and rolling back to 0.9.12 needs a database
+  restore.
+- `audit_events` now grows by one row per exported page: a Word or
+  OpenDocument export writes one, a Markdown zip one per page in it, so a
+  workspace export writes one per page. There is still no retention.
+- Exports now depend on the audit log: a file export is sent only once its
+  audit rows are written, and is refused with `503 audit.unavailable` when
+  they can't be (fail closed). An `audit_events` outage, or a database that
+  refuses inserts into it, blocks every Word, OpenDocument and Markdown zip
+  export until it is fixed, those made with API keys included. An insert
+  that hangs (a lock on `audit_events`, a lost synchronous standby) is
+  given up on after 5 s and refused the same way. Alert on
+  `knot_audit_write_failures_total`.
+
+### Added
+- Each page has an audit log for its editors and owners, under "Audit
+  log" in the page header and the sidebar's menu: who exported the page
+  (Word, OpenDocument, Markdown zip, also as part of a subpage or
+  workspace export), when and how, and who changed its access or the
+  page, with export stats on top. Bots are marked "(bot)", and an export
+  made with an API key says so. Viewers can't open it; the export menu
+  tells everyone that exports are recorded. Exports made before this
+  release were not recorded, and reading the page, the Markdown view,
+  attachment downloads and public link views are not recorded.
+- `GET /api/docs/{id}/audit?category=&cursor=&limit=` lists a page's
+  audit events, newest first, and on the first page its export stats.
+  Editor+ on the page, also when it is archived. API keys need the `read`
+  scope, and the key's user (a bot's included) needs Editor+ on the page.
+  A bot is shown with `"bot": true`.
+- File exports are recorded in `audit_events` as `doc.export`, one row
+  per page the file contains, with the person who exported it, before the
+  file is sent. An export made with an API key names the key's user, and
+  its rows also keep the key's id (`data.api_key_id`) for operators; the
+  audit log shows only `details.via_api_key: true`, never the key. An
+  export that can't be recorded is refused with `503 audit.unavailable`
+  and no file, and the app says "Export blocked: it couldn't be recorded
+  in the audit log. Try again later." Failed, refused and `HEAD` requests
+  are not recorded.
+- Metric `knot_audit_write_failures_total{action}`: failed audit writes,
+  one per failed insert however many rows it held (an export insert given
+  up on after 5 s included). For `doc.export` each is one refused export,
+  however many pages it covered; for member invites, role changes that
+  don't demote an owner, API key creation and revocation and quota
+  refusals the request went on without its row. Member removals, owner
+  demotions and password changes also get an `api-key.revoke-cascade` row
+  from a database trigger in their own transaction, so while
+  `audit_events` refuses inserts they fail, uncounted. Normal use keeps it
+  at 0; the chart README says why it is worth an alert.
+
+### Changed
+- `doc.grant` audit rows now carry the principal, role and inherit flag,
+  and `doc.grant.delete` rows the principal. Older rows have neither and
+  show as "changed access" or "removed access" in the page audit log.
 
 ## [0.9.12] - 2026-11-13
 

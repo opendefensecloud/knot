@@ -93,7 +93,7 @@ pub const OVERRIDES: &[(Method, &str, Scope)] = &[
         "/api/docs/{id}/suggestions/{suggestion_id}/withdraw",
         Scope::Update,
     ),
-    // Renders a file; writes nothing.
+    // Renders a file; writes nothing but its `doc.export` audit row.
     (Method::POST, "/api/docs/{id}/export/{format}", Scope::Read),
     (Method::POST, "/api/docs/{id}/purge", Scope::Delete),
 ];
@@ -315,6 +315,16 @@ mod tests {
         // Seeing who has access stays readable to keys.
         assert!(!session_only(&Method::GET, "/api/docs/{id}/grants"));
         assert!(!session_only(&Method::GET, "/api/docs/{id}/access"));
+    }
+
+    /// The page audit log only reads: `read`, like the grants and access
+    /// listings, with the user's page role still deciding in the handler.
+    #[test]
+    fn the_page_audit_log_is_a_read_open_to_keys() {
+        let p = "/api/docs/{id}/audit";
+        assert_eq!(required_scope(&Method::GET, p), Scope::Read);
+        assert!(!session_only(&Method::GET, p));
+        assert!(!session_only(&Method::HEAD, p));
     }
 
     /// axum answers HEAD with the GET handler, so a GET row covers HEAD too.
