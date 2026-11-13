@@ -8,12 +8,13 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
-### Fixed
-- Numbered lists no longer cut off the first digit of their markers from
-  item 10 on ("10." showed as ".0.", #95). The gutter now grows with each
-  list's widest number, counting its start number, so "104." in a list
-  that starts at 95 fits too. In the terminal skin even "1." to "9." were
-  clipped; they fit now as well.
+## [0.9.13] - 2026-11-13
+
+A feature release: a per-page audit log that records every file export,
+and moving a selection to a new subpage with its comments. One database
+migration runs on upgrade, and exports now fail closed when they can't be
+recorded; read Upgrading first.
+
 ### Upgrading
 - Upgrade from 0.9.12. One database migration runs on upgrade:
   `20261113120000_audit_doc_index` builds one index on `audit_events`,
@@ -82,11 +83,28 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   from a database trigger in their own transaction, so while
   `audit_events` refuses inserts they fail, uncounted. Normal use keeps it
   at 0; the chart README says why it is worth an alert.
+- "Move to subpage" in the selection toolbar, for editors in edit mode
+  (#92): the top-level blocks a selection touches move to a new child
+  page, under the title you confirm, and a link to it takes their place.
+  Comment threads (with their replies, reactions and resolved state) and
+  suggestions that sit entirely inside the moved blocks move with them,
+  and their notifications now point to the new page; ones that cross the
+  edge of the selection stay on the page. It counts against the page
+  quota like any new page, and Ctrl+Z can't undo it. The new page's audit
+  log records it as `doc.move_to_subpage`. API:
+  `POST /api/docs/{id}/move-to-subpage`.
 
 ### Changed
 - `doc.grant` audit rows now carry the principal, role and inherit flag,
   and `doc.grant.delete` rows the principal. Older rows have neither and
   show as "changed access" or "removed access" in the page audit log.
+
+### Fixed
+- Numbered lists no longer cut off the first digit of their markers from
+  item 10 on ("10." showed as ".0.", #95). The gutter now grows with each
+  list's widest number, counting its start number, so "104." in a list
+  that starts at 95 fits too. In the terminal skin even "1." to "9." were
+  clipped; they fit now as well.
 
 ## [0.9.12] - 2026-11-13
 
@@ -1641,7 +1659,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.12...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.13...HEAD
+[0.9.13]: https://github.com/opendefensecloud/knot/compare/v0.9.12...v0.9.13
 [0.9.12]: https://github.com/opendefensecloud/knot/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/opendefensecloud/knot/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/opendefensecloud/knot/compare/v0.9.9...v0.9.10
