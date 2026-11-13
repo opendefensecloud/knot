@@ -9,7 +9,9 @@
 //! A built export is recorded in the page's audit log as `doc.export` before
 //! the file goes out, and only then: exports fail closed, so one whose row
 //! can't be written (or a server without a database to write it to) is
-//! refused with `503 audit.unavailable` and no file.
+//! refused with `503 audit.unavailable` and no file. The row names the
+//! person exporting, also when they used an API key; then it also keeps the
+//! key's id, for operators (the log shows only that a key was used).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -32,6 +34,7 @@ use crate::AppState;
 use crate::auth::{AuthContext, DocArchived, require_viewer};
 use crate::export::{self, DIAGRAM_SCALE, Format};
 use crate::http_error::{AuditUnavailable, audit_unavailable, doc_archived, json_err};
+use crate::routes::api::audit as page_audit;
 
 /// Largest request body: 10 MiB, as for blob uploads, so a proxy that lets
 /// image uploads through lets exports through too.
@@ -227,6 +230,8 @@ async fn export_response(
         }
         Err(_) => return busy(),
     };
+    // Read before the upload consumes the request.
+    let api_key_id = page_audit::api_key_id_of(&req);
     let Ok(pictures) = read_pictures(req).await else {
         return json_err(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -275,7 +280,10 @@ async fn export_response(
         tracing::error!("export refused: no database to record it in");
         return audit_unavailable();
     };
-    let audit_data = export_audit_data(format, diagram_picture_count, &built.fallbacks);
+    let audit_data = page_audit::with_api_key_id(
+        export_audit_data(format, diagram_picture_count, &built.fallbacks),
+        api_key_id,
+    );
     let recorded_in_audit_log = audit::record_for_targets(
         pool,
         auth_context.workspace_id,

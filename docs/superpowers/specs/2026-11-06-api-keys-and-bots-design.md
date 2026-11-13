@@ -88,7 +88,9 @@ The `OVERRIDES` table in `auth/scope.rs` is the single place where a POST is
 not a create: the doc mutations that move, restore, template, import
 markdown, resolve comments, accept/reject/withdraw suggestions, mark
 notifications read, and `purge` (delete). `POST /api/docs/{id}/export/{format}`
-needs `read` because it renders a file and writes nothing.
+needs `read` because it renders a file and writes nothing. (Since the page
+audit log, `docs/superpowers/specs/2026-11-13-doc-audit-page-design.md`, it
+also writes its `doc.export` audit rows; the scope stays `read`.)
 
 `SESSION_ONLY` lists what no key may do, whatever its scopes: create, list and
 revoke keys; invite, re-role and remove members; create and list public share
@@ -109,7 +111,8 @@ management.
 `key_id`, method and route template (`<unmatched>` without a route, never the
 raw path). Reads get no line, and neither the secret nor its hash is ever
 logged. Audit rows name only the key's user, so this log is what narrows an
-incident to one key.
+incident to one key. (Since the page audit log, `doc.export` rows also keep
+the key's id in `data.api_key_id`; see the 2026-11-13 doc-audit-page spec.)
 
 ## Bots
 

@@ -189,8 +189,14 @@ export").
 - `doc_count`, `export_id` and `fallbacks` are for operators (SQL). **They
   are never sent to the client.** `doc_count` would tell a root editor how
   many restricted subpages the exporter could read.
+- `api_key_id` (the key's id as text) is added to every path's `data` when
+  the request was authenticated by an API key (`ApiPrincipal` in the
+  request's extensions, read before the body is consumed). The row's
+  `actor_id` stays the key's user (0.9.12's convention: audit rows name only
+  the key's user). Operator-only, like `export_id`: the log sends only
+  `details.via_api_key: true`. See "API keys and bots".
 - Nothing else is stored: no file name (carries the title), no IP, no user
-  agent.
+  agent, never the key itself.
 
 **What counts as an export:** the server released the file, and it releases
 a file only once its rows are written. Recorded in the handler after the
@@ -247,6 +253,41 @@ top-level navigation can trigger a GET zip export with the SameSite=Lax
 session; the row is attributed to the victim, whose browser did receive the
 file; bounded by the Export bucket (20/min). Moving zip exports to POST is out
 of scope.
+
+### API keys and bots (merged with 0.9.12)
+
+0.9.12 (#81) added scoped API keys (`Authorization: Bearer knot_…`,
+`ApiPrincipal { key_id, scopes }`) and bot accounts (`users.kind = 'bot'`).
+How the audit log meets them:
+
+- **Scope.** `GET /api/docs/{id}/audit` needs `read` (the method default in
+  `auth/scope.rs`; no `OVERRIDES` row) and is not in `SESSION_ONLY`: like
+  the grants and access listings, it only reads, so a key may read it. The
+  key's user's effective role on the page still decides (Editor+), a bot's
+  included. Pinned by `scope.rs`'s
+  `the_page_audit_log_is_a_read_open_to_keys` and
+  `api_keys_read_the_audit_log_by_their_users_role_on_the_page`.
+- **Exports with a key.** Every export path (docx/odt in `export.rs`, the
+  page, subtree and workspace zips in `export_import.rs`) adds
+  `data.api_key_id` (above); `render::details` shows
+  `"via_api_key": true` for a `doc.export` row whose `api_key_id` is a
+  string, and nothing otherwise (no `false`, so the existing `details`
+  stay as they were). The web appends ", with an API key" to the sentence.
+- **Bots.** A bot is shown like a person plus `"bot": true`, wherever the
+  log names someone (actor, grant principal, `stats.exports.last`,
+  `by_person`); people have no `bot` key, and a former or anonymized
+  person is never marked. `render::ActorView` wraps history's
+  `AuthorView` for this, only in the audit module: the page history's
+  views don't change. Which people are bots is one query in the audit
+  route, `knot_storage::audit::bots_among(pool, ids)`, run next to
+  `knot_history::load_people`, rather than a new field on
+  `HistoryPerson`, which history constructs and serializes in many places
+  that must not show it. The web validator reads a missing `bot` as
+  `false` and shows "CI bot (bot)" in sentences and the Exported by list.
+- **New actions.** 0.9.12's `api-key.create`, `api-key.revoke` and
+  `api-key.revoke-cascade` are `target_kind = 'user'`, as are
+  `workspace.member.*`, so no page's log shows them (`DOC_ROWS` filters
+  `target_kind = 'doc'`); no category needed.
 
 ### Grant rows carry who and what (going forward)
 

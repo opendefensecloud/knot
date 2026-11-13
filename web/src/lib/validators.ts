@@ -234,12 +234,14 @@ export const DiagramList = diagramListSchema;
 /**
  * A person on the page audit log (GET /api/docs/{id}/audit), as the page
  * history shows them: `key` and `name` are null for a former or anonymized
- * member, who reads "Former member". Never an email.
+ * member, who reads "Former member". Never an email. `bot` is true for a
+ * bot account; the server sends it only then, so it defaults to false.
  */
 const auditAuthorSchema = v.object({
   key: v.nullable(v.string()),
   name: v.nullable(v.string()),
   former: v.boolean(),
+  bot: v.fallback(v.boolean(), false),
 });
 export type AuditAuthor = v.InferOutput<typeof auditAuthorSchema>;
 export const AuditAuthor = auditAuthorSchema;
@@ -249,8 +251,9 @@ export const AuditAuthor = auditAuthorSchema;
  * `access`, `changes` or `other`; `actor_kind` is `user`, `admin_cli`,
  * `retention` or `system` (kept as plain strings so a newer server's value
  * still renders). `details` is the server's per-action whitelist; the raw
- * audit data never reaches the client. `id` is an opaque token, never the
- * stored event id, and is what `cursor` takes back.
+ * audit data never reaches the client (a `doc.export` made with an API key
+ * has `via_api_key: true`, never the key). `id` is an opaque token, never
+ * the stored event id, and is what `cursor` takes back.
  */
 const docAuditEventSchema = v.object({
   id: v.string(),

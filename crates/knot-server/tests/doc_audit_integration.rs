@@ -225,12 +225,24 @@ async fn send(
     if let Some(content_type) = content_type {
         builder = builder.header("content-type", content_type);
     }
-    let response = fx
-        .app
-        .clone()
-        .oneshot(builder.body(Body::from(body)).unwrap())
-        .await
+    answer_to(fx, builder.body(Body::from(body)).unwrap()).await
+}
+
+/// `method uri` with an empty body, authenticated by the API key `key`
+/// (`Authorization: Bearer`, no cookie and no CSRF token).
+async fn send_with_key(fx: &Fixture, key: &str, method: &str, uri: &str) -> Answer {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {key}"))
+        .body(Body::empty())
         .unwrap();
+    answer_to(fx, request).await
+}
+
+/// What the app answers to `request`.
+async fn answer_to(fx: &Fixture, request: Request<Body>) -> Answer {
+    let response = fx.app.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let cache_control = header_text(response.headers(), "cache-control");
     let content_disposition = header_text(response.headers(), "content-disposition");
@@ -1156,6 +1168,13 @@ async fn operator_fields_never_reach_the_client() {
     )
     .await;
     export_zip(&fx, &fx.owner.session, "/api/workspace/export").await;
+    let (key_id, key) = mint_key(&fx, fx.owner.id, fx.owner.id, &["read"]).await;
+    for (method, uri) in [
+        ("POST", format!("/api/docs/{child}/export/docx")),
+        ("GET", format!("/api/docs/{root}/export?descendants=true")),
+    ] {
+        assert_exported(&send_with_key(&fx, &key, method, &uri).await, &uri);
+    }
     let answer = send_json(
         &fx,
         &fx.owner.session,
@@ -1171,10 +1190,18 @@ async fn operator_fields_never_reach_the_client() {
             .await
             .unwrap();
 
+    let key_id_text = key_id.to_string();
     for page in [root, child, copy] {
         let answer = audit_log(&fx, Some(&fx.editor.session), page, "").await;
         answer.ok();
-        for operator_field in ["doc_count", "export_id", "fallbacks", "source_id"] {
+        for operator_field in [
+            "doc_count",
+            "export_id",
+            "fallbacks",
+            "source_id",
+            "api_key_id",
+            &key_id_text,
+        ] {
             assert!(
                 !answer.body.contains(operator_field),
                 "{operator_field} on {page}: {}",
@@ -1554,3 +1581,238 @@ async fn grant_rows_name_the_principal() {
         json!({"principal": {"kind": "user", "person": eddie}})
     );
 }
+
+// ---------------------------------------------------------------------------
+// API keys and bots
+// ---------------------------------------------------------------------------
+
+/// A live API key of `user_id` with `scopes`, minted by `minter` (the user
+/// itself, or the workspace owner for a bot) straight through the store:
+/// its id and its secret.
+async fn mint_key(fx: &Fixture, user_id: Uuid, minter: Uuid, scopes: &[&str]) -> (Uuid, String) {
+    let secret = knot_auth::ApiKeySecret::generate();
+    let scope_names: Vec<String> = scopes.iter().map(|scope| scope.to_string()).collect();
+    let scopes = knot_storage::api_key_store::Scopes::from_names(&scope_names).unwrap();
+    let key = fx
+        .state
+        .api_keys
+        .as_ref()
+        .unwrap()
+        .create(knot_storage::api_key_store::NewApiKey {
+            workspace_id: fx.workspace_id,
+            user_id,
+            name: "audit-test",
+            key_hash: &knot_auth::api_key::hash(secret.as_str(), &fx.state.session_key),
+            scopes: &scopes,
+            created_by: minter,
+            expires_at: None,
+            session_hash: None,
+        })
+        .await
+        .unwrap();
+    (key.id, secret.as_str().to_string())
+}
+
+/// A bot member (`users.kind = 'bot'`) of the workspace with `role`.
+async fn bot_member(fx: &Fixture, email: &str, name: &str, role: WorkspaceRole) -> Uuid {
+    fx.state
+        .users
+        .as_ref()
+        .unwrap()
+        .create_bot_member(fx.workspace_id, email, name, role)
+        .await
+        .unwrap()
+        .id
+}
+
+/// The export goes out with the key, and its rows are written first.
+#[track_caller]
+fn assert_exported(answer: &Answer, what: &str) {
+    assert_eq!(answer.status, StatusCode::OK, "{what}: {}", answer.body);
+}
+
+/// An export made with an API key is the key's user's export (main's
+/// convention: audit rows name only the key's user), and the row also keeps
+/// the key's id for operators. The log says only that a key was used, never
+/// which. Catches an export path that drops the key, one that names the key
+/// as the actor, and the key id reaching the client.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_export_made_with_an_api_key_names_its_user_and_flags_the_key() {
+    let fx = fixture().await;
+    let root = create_page(&fx, "Runbook", None).await;
+    let child = create_page(&fx, "Steps", Some(root)).await;
+    let (editor_key_id, editor_key) = mint_key(&fx, fx.editor.id, fx.editor.id, &["read"]).await;
+    let (owner_key_id, owner_key) = mint_key(&fx, fx.owner.id, fx.owner.id, &["read"]).await;
+
+    for format in ["docx", "odt"] {
+        let uri = format!("/api/docs/{child}/export/{format}");
+        assert_exported(&send_with_key(&fx, &editor_key, "POST", &uri).await, &uri);
+    }
+    for uri in [
+        format!("/api/docs/{child}/export"),
+        format!("/api/docs/{root}/export?descendants=true"),
+    ] {
+        assert_exported(&send_with_key(&fx, &editor_key, "GET", &uri).await, &uri);
+    }
+    assert_exported(
+        &send_with_key(&fx, &owner_key, "GET", "/api/workspace/export").await,
+        "workspace export",
+    );
+    // The same person's session export, for contrast.
+    let answer = export_file(&fx, &fx.editor.session, child, "docx", &[]).await;
+    assert_exported(&answer, "session export");
+
+    let rows = export_rows(&fx, child).await;
+    let expected_rows = [
+        (fx.editor.id, Some(editor_key_id), "docx"),
+        (fx.editor.id, Some(editor_key_id), "odt"),
+        (fx.editor.id, Some(editor_key_id), "markdown_zip"),
+        (fx.editor.id, Some(editor_key_id), "markdown_zip"),
+        (fx.owner.id, Some(owner_key_id), "markdown_zip"),
+        (fx.editor.id, None, "docx"),
+    ];
+    assert_eq!(rows.len(), expected_rows.len(), "{rows:?}");
+    for ((actor_id, data), (expected_actor, expected_key_id, expected_format)) in
+        rows.iter().zip(expected_rows)
+    {
+        assert_eq!(*actor_id, Some(expected_actor), "{data}");
+        assert_eq!(data["format"], expected_format, "{data}");
+        assert_eq!(
+            data.get("api_key_id").and_then(Value::as_str),
+            expected_key_id.map(|key_id| key_id.to_string()).as_deref(),
+            "{data}"
+        );
+    }
+
+    let answer = audit_log(&fx, Some(&fx.owner.session), child, "category=exports").await;
+    let body = answer.ok();
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), expected_rows.len(), "{body}");
+    // Newest first: the session export, then the five made with a key.
+    assert_eq!(
+        events[0]["details"],
+        json!({"format": "docx", "scope": "page", "diagram_pictures": 0}),
+        "a session export has no via_api_key"
+    );
+    for event in &events[1..] {
+        assert_eq!(event["details"]["via_api_key"], true, "{event}");
+        assert_eq!(event["actor_kind"], "user", "{event}");
+    }
+    assert_eq!(
+        events[1]["details"],
+        json!({"format": "markdown_zip", "scope": "workspace", "via_api_key": true})
+    );
+    assert_eq!(events[1]["actor"]["name"], "Olga");
+    assert_eq!(
+        events[5]["details"],
+        json!({"format": "docx", "scope": "page", "diagram_pictures": 0, "via_api_key": true})
+    );
+    assert_eq!(
+        events[5]["actor"],
+        json!({"key": fx.editor.id, "name": "Eddie", "former": false})
+    );
+    for key_id in [editor_key_id, owner_key_id] {
+        assert!(
+            !answer.body.contains(&key_id.to_string()),
+            "a key id reached the client: {}",
+            answer.body
+        );
+    }
+    assert!(!answer.body.contains("api_key_id"), "{}", answer.body);
+}
+
+/// A bot can export and hold page access like a person; on the audit log it
+/// is marked as a bot wherever it is named, and people are not. Catches the
+/// mark missing from the events, the grant principal or the stats, and a
+/// human marked as one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_is_marked_as_a_bot_on_the_audit_log() {
+    let fx = fixture().await;
+    let page = create_page(&fx, "Status", None).await;
+    let bot = bot_member(&fx, "ci@audit.test", "CI bot", WorkspaceRole::Editor).await;
+    let (_, bot_key) = mint_key(&fx, bot, fx.owner.id, &["read"]).await;
+    let answer = send_json(
+        &fx,
+        &fx.owner.session,
+        "PUT",
+        &format!("/api/docs/{page}/grants/user:{bot}"),
+        json!({"role": "editor", "inherit": true}),
+    )
+    .await;
+    assert!(answer.status.is_success(), "grant: {}", answer.body);
+    let answer = export_file(&fx, &fx.viewer.session, page, "odt", &[]).await;
+    assert_exported(&answer, "the viewer's export");
+    let uri = format!("/api/docs/{page}/export/docx");
+    assert_exported(&send_with_key(&fx, &bot_key, "POST", &uri).await, &uri);
+
+    let answer = audit_log(&fx, Some(&fx.editor.session), page, "").await;
+    let body = answer.ok();
+    let bot_view = json!({"key": bot, "name": "CI bot", "former": false, "bot": true});
+    let vera = json!({"key": fx.viewer.id, "name": "Vera", "former": false});
+    let export = first_event(&body, "doc.export");
+    assert_eq!(export["actor"], bot_view);
+    assert_eq!(export["details"]["via_api_key"], true);
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events[1]["action"], "doc.export");
+    assert_eq!(events[1]["actor"], vera, "a person is not marked");
+    assert_eq!(
+        first_event(&body, "doc.grant")["details"]["principal"]["person"],
+        bot_view
+    );
+    assert_eq!(first_event(&body, "doc.create")["actor"]["name"], "Olga");
+    assert!(
+        first_event(&body, "doc.create")["actor"]
+            .get("bot")
+            .is_none()
+    );
+
+    let exports = &body["stats"]["exports"];
+    assert_eq!(exports["last"]["actor"], bot_view);
+    assert_eq!(exports["by_person"][0]["actor"], bot_view);
+    assert_eq!(exports["by_person"][1]["actor"], vera);
+    assert!(!answer.body.contains('@'), "an email: {}", answer.body);
+}
+
+/// The audit log is a read: a key needs `read`, and then its user's
+/// effective role on the page decides, as for a session. Catches the route
+/// becoming session-only, needing a write scope, or a key (a bot's
+/// included) skipping the editor check.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_keys_read_the_audit_log_by_their_users_role_on_the_page() {
+    let fx = fixture().await;
+    let page = create_page(&fx, "Plans", None).await;
+    let uri = format!("/api/docs/{page}/audit");
+
+    let (_, editor_read_key) = mint_key(&fx, fx.editor.id, fx.editor.id, &["read"]).await;
+    let answer = send_with_key(&fx, &editor_read_key, "GET", &uri).await;
+    let body = answer.ok();
+    assert_eq!(answer.cache_control.as_deref(), Some("private, no-store"));
+    assert_eq!(first_event(&body, "doc.create")["actor"]["name"], "Olga");
+
+    let editor_bot = bot_member(&fx, "agent@audit.test", "Agent", WorkspaceRole::Editor).await;
+    let (_, editor_bot_key) = mint_key(&fx, editor_bot, fx.owner.id, &["read"]).await;
+    send_with_key(&fx, &editor_bot_key, "GET", &uri).await.ok();
+
+    let (_, editor_write_key) = mint_key(
+        &fx,
+        fx.editor.id,
+        fx.editor.id,
+        &["create", "update", "delete"],
+    )
+    .await;
+    let answer = send_with_key(&fx, &editor_write_key, "GET", &uri).await;
+    answer.error(StatusCode::FORBIDDEN, "api_key.scope_denied");
+    assert_eq!(answer.json()["error"]["details"]["scope"], "read");
+
+    let (_, viewer_key) = mint_key(&fx, fx.viewer.id, fx.viewer.id, &ALL_SCOPES).await;
+    send_with_key(&fx, &viewer_key, "GET", &uri)
+        .await
+        .error(StatusCode::FORBIDDEN, "acl.editor_required");
+    let viewer_bot = bot_member(&fx, "watch@audit.test", "Watcher", WorkspaceRole::Viewer).await;
+    let (_, viewer_bot_key) = mint_key(&fx, viewer_bot, fx.owner.id, &ALL_SCOPES).await;
+    send_with_key(&fx, &viewer_bot_key, "GET", &uri)
+        .await
+        .error(StatusCode::FORBIDDEN, "acl.editor_required");
+}
+
+const ALL_SCOPES: [&str; 4] = ["read", "create", "update", "delete"];
