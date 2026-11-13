@@ -73,6 +73,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/docs/{id}", get(get_one).patch(rename).delete(archive))
         .route("/api/docs/{id}/move", post(move_doc))
         .route("/api/docs/{id}/duplicate", post(duplicate))
+        .route("/api/docs/{id}/move-to-subpage", post(move_to_subpage))
         .route(crate::auth::ARCHIVE_RESTORE_ROUTE, post(restore))
         .route(crate::auth::ARCHIVE_PURGE_ROUTE, post(purge))
         .route(
@@ -777,6 +778,93 @@ async fn duplicate(
         Ok(Err(e)) => duplicate_error(e),
         Err(_) => {
             tracing::error!("duplicate task ended without an answer");
+            internal()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MoveToSubpageRequest {
+    /// Base64 RelativePositions of the selection, as comment anchors.
+    start: String,
+    end: String,
+    title: String,
+}
+
+/// Move the top-level blocks a selection touches into a new child page,
+/// with their comments and suggestions. See `crate::move_to_subpage`.
+#[tracing::instrument(skip_all, name = "docs.move_to_subpage")]
+async fn move_to_subpage(
+    State(state): State<AppState>,
+    Path(doc_id): Path<Uuid>,
+    req: Request,
+) -> Response {
+    use crate::move_to_subpage::MoveError;
+    use base64::Engine as _;
+    let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
+        return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
+    };
+    let Some(role) = req.extensions().get::<EffectiveDocRole>().copied() else {
+        return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
+    };
+    let Ok(body) = read_json::<MoveToSubpageRequest>(req).await else {
+        return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
+    };
+    let decode = |s: &str| base64::engine::general_purpose::STANDARD.decode(s);
+    let (Ok(start), Ok(end)) = (decode(&body.start), decode(&body.end)) else {
+        return json_err(StatusCode::BAD_REQUEST, "move.invalid_anchor", "");
+    };
+    let title = match body.title.trim() {
+        "" => "Untitled".to_string(),
+        t => t.to_string(),
+    };
+    let result = match crate::move_to_subpage::check(&state, &ctx, role.0, doc_id).await {
+        Ok(_) => match crate::quota::enforce_pages(&state, &ctx, 1).await {
+            Ok(()) => match crate::move_to_subpage::start(
+                state.clone(),
+                ctx.clone(),
+                doc_id,
+                (start, end),
+                title,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(MoveError::Internal("move task ended".into())),
+            },
+            Err(response) => return response,
+        },
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(moved) => match caller_doc_response(&state, &ctx, &moved.doc).await {
+            Ok(doc) => (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "doc": doc,
+                    "moved": { "comments": moved.comments, "suggestions": moved.suggestions },
+                })),
+            )
+                .into_response(),
+            Err(response) => response,
+        },
+        Err(MoveError::EditorRequired) => {
+            json_err(StatusCode::FORBIDDEN, "acl.editor_required", "")
+        }
+        Err(MoveError::NotFound) => json_err(StatusCode::NOT_FOUND, "doc.not_found", ""),
+        Err(MoveError::IsTemplate) => {
+            json_err(StatusCode::UNPROCESSABLE_ENTITY, "doc.is_template", "")
+        }
+        Err(MoveError::Archived) => doc_archived(),
+        Err(MoveError::Destination(response)) => response,
+        Err(MoveError::AnchorLost) => {
+            json_err(StatusCode::UNPROCESSABLE_ENTITY, "move.anchor_lost", "")
+        }
+        Err(MoveError::SuggestionApplying) => {
+            json_err(StatusCode::CONFLICT, "move.suggestion_applying", "")
+        }
+        Err(MoveError::Internal(e)) => {
+            tracing::error!(error = %e, "move to subpage");
             internal()
         }
     }

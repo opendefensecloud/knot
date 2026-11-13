@@ -12,6 +12,7 @@ pub mod grant_store;
 pub mod invalidations;
 pub mod lexorank;
 pub mod markdown_cache;
+pub mod move_to_subpage;
 pub mod notifications;
 pub mod placement;
 pub mod pool;

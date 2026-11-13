@@ -73,6 +73,21 @@ export const docsApi = {
     if ("error" in r) return r;
     return { ok: parse(Doc, r.ok) };
   },
+  /** Move the top-level blocks a selection touches into a new child page,
+   *  with the comments and suggestions anchored inside them (editors and
+   *  owners). `start`/`end` are anchors as `encodeAnchorRange` makes them.
+   *  422 `move.anchor_lost` when they no longer resolve. */
+  async moveToSubpage(
+    id: string,
+    body: { start: string; end: string; title: string },
+  ): Promise<ApiResult<Doc>> {
+    const r = await apiFetch<{ doc: unknown }>(
+      `/api/docs/${encodeURIComponent(id)}/move-to-subpage`,
+      { method: "POST", body },
+    );
+    if ("error" in r) return r;
+    return { ok: parse(Doc, r.ok.doc) };
+  },
   /** Move a doc and its subpages to the archive (editors and owners). */
   archive(id: string) {
     return apiFetch<void>(`/api/docs/${encodeURIComponent(id)}`, { method: "DELETE" });
