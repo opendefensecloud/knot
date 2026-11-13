@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Eye, FileCode, History, LayoutTemplate, Lock, MessageSquare, Pencil, Share2 } from "lucide-react";
+import { Eye, FileCode, History, LayoutTemplate, Lock, MessageSquare, Pencil, ScrollText, Share2 } from "lucide-react";
 import {
   lazy,
   Suspense,
@@ -586,6 +586,19 @@ export default function DocPage() {
             >
               <History size={16} aria-hidden />
             </IconButton>
+          )}
+          {/* Editors and owners of this page, also while it is archived. A
+              link, since it navigates; classes as IconButton md. */}
+          {claimsEditShortcut && (
+            <Link
+              to={`/doc/${id}/audit`}
+              data-testid="open-audit"
+              aria-label="Audit log"
+              title="Audit log"
+              className="inline-flex items-center justify-center rounded h-9 w-9 transition-colors ease-swift duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent text-fg-muted hover:text-fg hover:bg-muted"
+            >
+              <ScrollText size={16} aria-hidden />
+            </Link>
           )}
           <IconButton
             data-testid="toggle-markdown"

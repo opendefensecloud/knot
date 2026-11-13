@@ -77,6 +77,24 @@ pub fn doc_archived() -> Response {
     json_err(StatusCode::CONFLICT, "doc.archived", "")
 }
 
+/// Marks an [`audit_unavailable`] response, so the export metrics can tell
+/// it apart from a `503 export.busy`.
+#[derive(Clone, Copy, Debug)]
+pub struct AuditUnavailable;
+
+/// 503 `audit.unavailable`: an export whose `doc.export` audit rows couldn't
+/// be written. Exports fail closed, so the file is not sent; the client may
+/// try again once the audit log takes writes.
+pub fn audit_unavailable() -> Response {
+    let mut response = json_err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "audit.unavailable",
+        "the export couldn't be recorded in the audit log",
+    );
+    response.extensions_mut().insert(AuditUnavailable);
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::to_bytes;

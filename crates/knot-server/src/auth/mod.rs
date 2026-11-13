@@ -20,5 +20,5 @@ pub use scope::{required_scope, scope_mw};
 pub mod require_doc_role;
 pub use require_doc_role::{
     ARCHIVE_PURGE_ROUTE, ARCHIVE_RESTORE_ROUTE, DocArchived, EffectiveDocRole, require_doc_role_mw,
-    require_viewer,
+    require_editor, require_viewer,
 };

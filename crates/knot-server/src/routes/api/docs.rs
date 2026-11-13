@@ -5,6 +5,7 @@
 //! - PATCH  /api/docs/{id}        rename / icon
 //! - PUT    /api/docs/{id}/restricted  body: {restricted}; make it a restriction boundary (owner)
 //! - GET    /api/docs/{id}/access  who can see it, for the permissions dialog (any reader)
+//! - GET    /api/docs/{id}/audit   the page audit log and its export stats (editor+, also archived; `routes::api::audit`)
 //! - POST   /api/docs/{id}/move   reparent / reorder
 //! - POST   /api/docs/{id}/duplicate  body: {include_subpages?}; copy right after it (editor+ here and on the parent)
 //! - DELETE /api/docs/{id}        move to the archive, with its subtree (editor+)
@@ -111,6 +112,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/docs/{id}/contributors",
             get(crate::routes::api::contributors::byline),
+        )
+        .route(
+            "/api/docs/{id}/audit",
+            get(crate::routes::api::audit::doc_audit),
         )
         .route(
             "/api/docs/{id}/short-link",

@@ -218,11 +218,20 @@ const CASES: [string, Cmd, MoveBody | null][] = [
 ];
 
 describe("DocTree — moves from the row menu", () => {
-  it("lists Move up, Move down, Indent and Outdent after Rename", async () => {
+  it("lists Move up, Move down, Indent and Outdent after Rename, then Audit log", async () => {
     renderTree(server());
     await editorRows();
     const items = within(openMenu("beta")).getAllByRole("menuitem").map((b) => b.textContent);
-    expect(items).toEqual(["Rename", "Duplicate…", "Move up", "Move down", "Indent", "Outdent", "Move to archive"]);
+    expect(items).toEqual([
+      "Rename",
+      "Duplicate…",
+      "Move up",
+      "Move down",
+      "Indent",
+      "Outdent",
+      "Audit log",
+      "Move to archive",
+    ]);
   });
 
   it("disables the moves a page can't make", async () => {

@@ -4,6 +4,7 @@ import type { ConnStatus } from "../../components/StatusDot";
 import type { ApiError } from "../../lib/api";
 import { LIMIT_TOAST_KEY, limitErrorText, type Notify } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
+import { AUDIT_UNAVAILABLE_TEXT, isAuditUnavailable } from "./auditRefusal";
 import { exportApi } from "./export.api";
 import { exportFileName, fallbackMessage, saveBlob } from "./exportFile";
 import { renderDiagrams } from "./renderDiagrams";
@@ -19,6 +20,9 @@ export type ExportDeps = {
 
 const SYNC_WAIT_MS = 5000;
 const SYNC_POLL_MS = 100;
+/** Failures worth one more try without the diagram pictures (a smaller,
+ *  quicker request). Never a 503: neither a busy server nor an export the
+ *  audit log couldn't record gets better without pictures. */
 const RETRY_STATUSES = new Set([413, 408, 0]);
 
 export function useExport(opts: {
@@ -102,5 +106,6 @@ function fail(d: ExportDeps, error?: ApiError): void {
   const limitText = error ? limitErrorText(error) : null;
   if (limitText !== null) d.notify("warn", limitText, { key: LIMIT_TOAST_KEY });
   else if (error?.code === "export.busy") d.notify("warn", "Export is busy, try again in a moment.");
+  else if (isAuditUnavailable(error)) d.notify("error", AUDIT_UNAVAILABLE_TEXT);
   else d.notify("error", "Couldn't export this page. Try again, or export as Markdown.");
 }

@@ -11,6 +11,7 @@ import { ShortLinkResolver } from "./features/docs/ShortLinkResolver";
 const LoginPage = lazy(() => import("./features/auth/LoginPage"));
 const SetupPage = lazy(() => import("./features/auth/SetupPage"));
 const DocPage = lazy(() => import("./features/docs/DocPage"));
+const DocAuditPage = lazy(() => import("./features/docs/DocAuditPage"));
 const PermissionsDialog = lazy(() => import("./features/permissions/PermissionsDialog"));
 const MembersPage = lazy(() => import("./features/workspace/MembersPage"));
 const SettingsPage = lazy(() => import("./features/workspace/SettingsPage"));
@@ -68,6 +69,8 @@ export const router = createBrowserRouter([
               { path: "permissions", element: <Lazy><PermissionsDialog /></Lazy> },
             ],
           },
+          // A page of its own (bookmark, back, new tab); DocPage unmounts.
+          { path: "doc/:id/audit", element: <Lazy><DocAuditPage /></Lazy> },
           { path: "members", element: <Lazy><MembersPage /></Lazy> },
           { path: "settings", element: <Lazy><SettingsPage /></Lazy> },
           { path: "tasks", element: <Lazy><TasksPage /></Lazy> },

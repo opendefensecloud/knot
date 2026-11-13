@@ -26,6 +26,7 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
   const buttonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
+  const auditNoteId = useId();
   const { exporting, run } = useExport({ docId, title, status, pendingBytes });
   const notify = useUi((s) => s.notify);
   const [downloadingZip, setDownloadingZip] = useState(false);
@@ -130,6 +131,7 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
           id={menuId}
           role="menu"
           aria-label="Export"
+          aria-describedby={auditNoteId}
           onKeyDown={onMenuKeyDown}
           className="absolute right-0 top-full z-30 mt-1 w-72 max-w-[calc(100vw-2rem)] rounded-md border border-border bg-surface shadow-lg py-1"
         >
@@ -180,6 +182,12 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
               </button>
             </>
           )}
+          {/* Viewers can export too: say who will see it. Focus never lands
+              on the note, so it is the menu's description for screen readers. */}
+          <div role="separator" className="my-1 border-t border-border" />
+          <p id={auditNoteId} role="none" data-testid="export-audit-note" className="m-0 px-3 py-1.5 text-[11px] text-fg-muted">
+            Exports are recorded in the page&apos;s audit log.
+          </p>
         </div>
       )}
     </div>

@@ -214,6 +214,9 @@ export default function SettingsPage() {
                 />
               </label>
             </div>
+            <p data-testid="workspace-export-audit-note" className="text-[12px] text-fg-muted m-0 mt-2">
+              Exports are recorded in each page&apos;s audit log.
+            </p>
           </section>
         )}
         <section data-testid="change-password" className="bg-surface border border-border rounded-lg px-5 py-4">

@@ -2,6 +2,12 @@
 //!
 //! Export: GET /api/workspace/export → zip with markdown bodies, an
 //! index.json manifest, attachment blob bytes, and cached board SVGs.
+//! GET /api/docs/{doc_id}/export?descendants= is the same zip of one page,
+//! or of it and the readable pages below it. The zip is built in memory,
+//! then recorded per included page as `doc.export`, and only then sent:
+//! exports fail closed, so a GET whose rows can't be written is refused
+//! with `503 audit.unavailable` and no zip. HEAD sends no zip, so it is
+//! neither recorded nor refused.
 //!
 //! Import: POST /api/workspace/import → multipart zip upload that creates
 //! new docs (with remapped ids) in the caller's workspace and seeds each
@@ -18,7 +24,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{Path, Query, Request, State},
-    http::{StatusCode, header},
+    http::{Method, StatusCode, header},
     response::Response,
     routing::{get, post},
 };
@@ -30,7 +36,7 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 
 use crate::AppState;
 use crate::auth::AuthContext;
-use crate::http_error::{json_err, json_err_with_details};
+use crate::http_error::{audit_unavailable, json_err, json_err_with_details};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -127,6 +133,7 @@ struct BoardEntry {
 // ---------------------------------------------------------------------------
 
 async fn export_workspace(State(state): State<AppState>, req: Request) -> Response {
+    let is_get = req.method() == Method::GET;
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
@@ -161,7 +168,21 @@ async fn export_workspace(State(state): State<AppState>, req: Request) -> Respon
         .into_iter()
         .filter(|d| visibility.readable(d.id))
         .collect();
-    write_export_zip(&state, ctx.workspace_id, readable_docs, &visibility).await
+    let exported_doc_ids: Vec<Uuid> = readable_docs.iter().map(|doc| doc.id).collect();
+    let response = write_export_zip(&state, ctx.workspace_id, readable_docs, &visibility).await;
+    if is_get
+        && response.status() == StatusCode::OK
+        && let Err(refusal) = record_zip_export(
+            &state,
+            &ctx,
+            &exported_doc_ids,
+            serde_json::json!({"scope": "workspace"}),
+        )
+        .await
+    {
+        return refusal;
+    }
+    response
 }
 
 /// Single-doc export. With `descendants=true`, includes every descendant
@@ -174,6 +195,7 @@ async fn export_doc(
     Query(q): Query<ExportDocQuery>,
     req: Request,
 ) -> Response {
+    let is_get = req.method() == Method::GET;
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
@@ -219,7 +241,62 @@ async fn export_doc(
     if subset.is_empty() {
         return json_err(StatusCode::NOT_FOUND, "doc.not_found", "");
     }
-    write_export_zip(&state, ctx.workspace_id, subset, &visibility).await
+    // The pages in the file: `subset`, never `subtree_ids`, which still
+    // holds the pages the caller can't read.
+    let exported_doc_ids: Vec<Uuid> = subset.iter().map(|doc| doc.id).collect();
+    let response = write_export_zip(&state, ctx.workspace_id, subset, &visibility).await;
+    if is_get && response.status() == StatusCode::OK {
+        let scope_fields = if q.descendants {
+            serde_json::json!({"scope": "subtree", "root_id": doc_id})
+        } else {
+            serde_json::json!({"scope": "page"})
+        };
+        if let Err(refusal) = record_zip_export(&state, &ctx, &exported_doc_ids, scope_fields).await
+        {
+            return refusal;
+        }
+    }
+    response
+}
+
+/// Records a built Markdown zip in the audit log before it is sent: one
+/// `doc.export` row per page in it, all sharing one `export_id`.
+/// `scope_fields` (`scope`, and `root_id` for a subtree) gain `format`,
+/// `export_id` and `doc_count`; those two are for operators, the audit log
+/// never sends them. Fail closed: when the rows can't be written (or there
+/// is no database to write them to) the refusal to send instead of the zip
+/// is the `Err`, `503 audit.unavailable`. So is an insert that hangs: it is
+/// given up on after `audit::EXPORT_AUDIT_WRITE_TIMEOUT`, well inside the
+/// request timeout. Only a zip that took nearly that long to build can
+/// still end in 408 during the insert; rows that commit just as it fires
+/// are for a zip the client never got, which errs on the safe side.
+async fn record_zip_export(
+    state: &AppState,
+    ctx: &AuthContext,
+    exported_doc_ids: &[Uuid],
+    scope_fields: serde_json::Value,
+) -> Result<(), Response> {
+    let Some(pool) = state.pool.as_ref() else {
+        tracing::error!("export refused: no database to record it in");
+        return Err(audit_unavailable());
+    };
+    let mut audit_data = scope_fields;
+    if let Some(fields) = audit_data.as_object_mut() {
+        fields.insert("format".into(), "markdown_zip".into());
+        fields.insert("export_id".into(), Uuid::new_v4().to_string().into());
+        fields.insert("doc_count".into(), exported_doc_ids.len().into());
+    }
+    knot_storage::audit::record_for_targets(
+        pool,
+        ctx.workspace_id,
+        Some(ctx.user_id),
+        "doc.export",
+        "doc",
+        exported_doc_ids,
+        &audit_data,
+    )
+    .await
+    .map_err(|_| audit_unavailable())
 }
 
 /// BFS collect of `root` + descendants from the flat doc list. Single O(N)

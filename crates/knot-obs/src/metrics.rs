@@ -105,6 +105,7 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
 
     describe_history_metrics();
     describe_limit_metrics();
+    describe_audit_metrics();
 
     // Notifications
     describe_counter!(
@@ -115,7 +116,7 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     // Export
     describe_counter!(
         "knot_export_total",
-        "Page exports to DOCX/ODT, by format (docx|odt|unknown) and outcome (ok|client_error|busy|server_error); a request timed out or abandoned before its response counts as client_error (408)"
+        "Page exports to DOCX/ODT, by format (docx|odt|unknown) and outcome (ok|client_error|busy|server_error); busy is 503 export.busy, while an export refused with 503 audit.unavailable (its audit row couldn't be written) is a server_error, also when its audit insert hung and was given up on after 5 s; a request timed out or abandoned before its response counts as client_error (408)"
     );
     describe_histogram!(
         "knot_export_duration_seconds",
@@ -240,6 +241,13 @@ fn describe_limit_metrics() {
     );
 }
 
+fn describe_audit_metrics() {
+    describe_counter!(
+        "knot_audit_write_failures_total",
+        "Failed audit writes, by action: one per failed insert, however many rows it held. For doc.export each is one refused export (503 audit.unavailable, no file sent), however many pages it covered, including an insert given up on after 5 s; for other actions the writer is best effort and the request went on"
+    );
+}
+
 fn normalize_addr(addr: &str) -> Result<String, MetricsError> {
     if let Some(port) = addr.strip_prefix(':')
         && port.parse::<u16>().is_ok()
@@ -259,7 +267,7 @@ mod tests {
 
     use super::{
         LATENCY_BUCKETS_SECONDS, REPLAY_BUCKETS_SECONDS, THROTTLE_WAIT_BUCKETS_SECONDS,
-        describe_history_metrics, describe_limit_metrics, normalize_addr,
+        describe_audit_metrics, describe_history_metrics, describe_limit_metrics, normalize_addr,
     };
 
     #[test]
@@ -381,6 +389,23 @@ mod tests {
             .find(|(n, _, _)| n == "knot_collab_throttle_wait_seconds")
             .and_then(|(_, _, u)| *u);
         assert_eq!(unit, Some(Unit::Seconds));
+    }
+
+    #[test]
+    fn audit_metrics_are_described() {
+        let rec = Descriptions::default();
+        metrics::with_local_recorder(&rec, describe_audit_metrics);
+        let got: Vec<(String, &str)> = rec
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(n, k, _)| (n.clone(), *k))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("knot_audit_write_failures_total".to_owned(), "counter")]
+        );
     }
 
     #[test]
