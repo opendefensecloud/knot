@@ -6,6 +6,7 @@ pub mod bus_pg;
 pub mod engine;
 pub mod gc;
 pub mod hydrate;
+pub mod move_blocks;
 pub mod nesting;
 pub mod presence;
 pub mod protocol;

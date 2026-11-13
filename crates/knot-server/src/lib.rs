@@ -39,6 +39,7 @@ pub mod export_check;
 pub mod history_stats;
 pub mod http_error;
 pub mod metrics;
+pub mod move_to_subpage;
 pub mod notifications_sweep;
 pub mod protocol;
 pub mod quota;
