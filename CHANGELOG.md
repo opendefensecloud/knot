@@ -8,6 +8,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Fixed
+- Numbered lists no longer cut off the first digit of their markers from
+  item 10 on ("10." showed as ".0.", #95). The gutter now grows with each
+  list's widest number, counting its start number, so "104." in a list
+  that starts at 95 fits too. In the terminal skin even "1." to "9." were
+  clipped; they fit now as well.
 ### Upgrading
 - Upgrade from 0.9.12. One database migration runs on upgrade:
   `20261113120000_audit_doc_index` builds one index on `audit_events`,

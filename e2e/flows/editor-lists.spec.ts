@@ -162,3 +162,90 @@ test("Tab nests a list item inside a table cell", async ({ page }) => {
   await connected(page);
   await expect(prose.locator("td").first().locator("ul > li > ul > li")).toHaveText("two");
 });
+
+/**
+ * Numbered-list markers past item 9 (#95, '"10." shows as ".0."').
+ *
+ * A marker hangs outside its item, in the list's left padding, and the editor
+ * host (`overflow-x: clip`) cuts off anything past its left edge. Its
+ * `overflow-clip-margin` does not help: Chromium applies it only when both
+ * axes clip. Typing the tenth item has to widen that padding enough for "10."
+ * in every skin's font (the terminal skin's monospace one needed more even
+ * for "1.").
+ *
+ * There is no layout API for a ::marker box. An outside marker ends where its
+ * item's content begins, so its left edge is the item's left minus the width
+ * of the marker text, measured with a probe span set in the marker's font.
+ */
+test("numbered-list markers from item 10 on stay inside the editor", async ({ page }) => {
+  const { prose } = await newDoc(page);
+  await prose.click();
+  await page.keyboard.type("1. item 1");
+  for (let itemNumber = 2; itemNumber <= 10; itemNumber++) {
+    await page.keyboard.press("Enter");
+    await page.keyboard.type(`item ${itemNumber}`);
+  }
+  await expect(prose.locator("ol > li")).toHaveCount(10);
+
+  for (const skin of ["light", "paper", "terminal"]) {
+    const room = await prose.evaluate(async (editorElement, skinId) => {
+      document.documentElement.setAttribute("data-skin", skinId);
+      // A face is only fetched once something uses it. Laying out under the
+      // new skin starts that fetch; measuring before it lands would measure
+      // the fallback font instead of the skin's.
+      editorElement.getBoundingClientRect();
+      await document.fonts.ready;
+      const clipEdge = editorElement.closest("[data-testid='editor-host']")!.getBoundingClientRect().left;
+      const items = Array.from(editorElement.querySelectorAll("ol > li"));
+      return items.map((item, index) => {
+        const probe = document.createElement("span");
+        probe.textContent = `${index + 1}. `;
+        probe.style.whiteSpace = "pre";
+        probe.style.fontVariantNumeric = getComputedStyle(item, "::marker").fontVariantNumeric;
+        item.appendChild(probe);
+        const markerWidth = probe.getBoundingClientRect().width;
+        probe.remove();
+        return item.getBoundingClientRect().left - markerWidth - clipEdge;
+      });
+    }, skin);
+    // Pixels between each marker's left edge and the clip: never negative.
+    const roomText = room.map((pixels) => pixels.toFixed(1)).join(", ");
+    expect(room.every((pixels) => pixels >= 0), `${skin}: ${roomText}`).toBe(true);
+  }
+});
+
+/**
+ * The wider gutter belongs to the long list alone. Custom properties inherit,
+ * so a short numbered list nested in a long one could take the long list's
+ * digit count, and every such sublist would shift right the moment the outer
+ * list reached item 10.
+ */
+test("a short list nested in a long numbered list keeps the narrow gutter", async ({ page }) => {
+  const { prose } = await newDoc(page);
+  const paragraph = (text: string) => ({ type: "paragraph", content: [{ type: "text", text }] });
+  const shortList = (label: string) => ({
+    type: "ordered_list",
+    content: [1, 2].map((n) => ({ type: "list_item", content: [paragraph(`${label} ${n}`)] })),
+  });
+  const longList = {
+    type: "ordered_list",
+    content: Array.from({ length: 10 }, (_, index) => ({
+      type: "list_item",
+      content: index === 0 ? [paragraph("item 1"), shortList("nested")] : [paragraph(`item ${index + 1}`)],
+    })),
+  };
+  await prose.evaluate((el, content) => {
+    (el as unknown as { editor: { commands: { setContent(c: unknown): void } } }).editor.commands.setContent({
+      type: "doc",
+      content,
+    });
+  }, [longList, shortList("separate")]);
+  await expect(prose.locator(":scope > ol")).toHaveCount(2);
+
+  const padding = (list: Locator) => list.evaluate((el) => parseFloat(getComputedStyle(el).paddingLeft));
+  const outer = await padding(prose.locator(":scope > ol").first());
+  const nested = await padding(prose.locator(":scope > ol > li > ol"));
+  const separate = await padding(prose.locator(":scope > ol").nth(1));
+  expect(nested).toBe(separate);
+  expect(outer).toBeGreaterThan(separate);
+});

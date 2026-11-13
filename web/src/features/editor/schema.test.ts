@@ -78,6 +78,9 @@ const REGISTERED_EXTENSIONS = [
   // that nests aria-level list items. Both produce ordinary nested lists.
   "knotListNesting",
   "knotMention",
+  // Plugin-only: node decorations giving each <ol> its widest marker's digit
+  // count, for the stylesheet's marker gutter. View-only; no document change.
+  "knotOrderedListMarkerGutter",
   "knotTaskList",
   // Keymap-only: End/Home move the DOM selection on a Mac; no document change.
   "lineBoundaryKeys",

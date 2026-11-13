@@ -185,5 +185,10 @@
   --color-destructive: #FF5C5C;
   --font-ui: var(--font-mono);
   --font-body: var(--font-mono);
+  /* A numbered list's gutter (prose.css). In a monospace font the ". "
+     after the digit is two full cells, so "1. " is 3ch, wider than the
+     default 1.4em: even single-digit markers were clipped. A skin with a
+     proportional body font doesn't set this. */
+  --knot-ol-gutter: calc(3ch + 0.25em);
   --radius-unit: 0px;
 }

@@ -24,6 +24,7 @@ import {
   KnotOrderedList,
 } from "./SchemaNameOverrides";
 import { ListNestingExtension } from "./ListNestingExtension";
+import { OrderedListMarkerGutter } from "./OrderedListMarkerGutter";
 import { TaskListExtension } from "./TaskListExtension";
 import { InternalLinkExtension } from "./InternalLinkExtension";
 import { MentionExtension, type MentionMember } from "./MentionExtension";
@@ -306,6 +307,7 @@ export function createExtensions(opts: {
     KnotOrderedList,
     KnotListItem,
     ListNestingExtension,
+    OrderedListMarkerGutter,
     KnotHardBreak,
     KnotHorizontalRule,
     MermaidCodeBlock,
