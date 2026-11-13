@@ -1021,6 +1021,31 @@ async fn claimed_by(db: &Db, doc: Uuid, id: Uuid) {
     .await;
 }
 
+/// Waits until `id` holds the page and renewed its lease since the state
+/// row's last write: its pass is past the renewal before a compute, so an
+/// expiry from now on is found by the pass's write. Expired before that
+/// renewal, the lease is found lost there, and the failure it records backs
+/// the page off. The claim sets `claimed_until = updated_at + lease` in one
+/// statement and pass writes move `updated_at` alone; only a renewal moves
+/// `claimed_until` past `updated_at + lease`.
+async fn renewed_by(db: &Db, doc: Uuid, id: Uuid) {
+    wait_for("the renewal", async || {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT coalesce(claimed_by = $2
+                             AND claimed_until > updated_at + make_interval(secs => $3), false)
+               FROM doc_history_state WHERE doc_id = $1",
+        )
+        .bind(doc)
+        .bind(id)
+        .bind(limits().lease.as_secs_f64())
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap()
+            == Some(true)
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_first_build_racing_another_builder_is_busy_not_failed() {
     let db = db().await;
@@ -1067,7 +1092,8 @@ async fn a_pass_that_lost_its_lease_writes_nothing() {
         let a = a.clone();
         tokio::spawn(async move { a.build_page(doc).await })
     };
-    claimed_by(&db, doc, a.id()).await;
+    // In its held compute, past the renewal: the lease is lost at the write.
+    renewed_by(&db, doc, a.id()).await;
     db.expire_lease(doc).await;
     assert!(is_built(&b.build_page(doc).await));
     let entries = db.entries(doc).await;
@@ -1117,6 +1143,8 @@ async fn a_pass_that_lost_its_lease_writes_nothing() {
         .into_iter()
         .find(|e| e.sealed && !e.words_pending && e.words_added.is_none())
         .unwrap();
+    // The take comes before the count's renewal: in its held compute too.
+    renewed_by(&db, doc, a.id()).await;
     db.expire_lease(doc).await;
     assert!(is_built(&b.build_page(doc).await));
     let s = db.state(doc).await;
@@ -1193,6 +1221,8 @@ async fn a_pass_that_outlived_its_lease_is_not_counted_as_a_crash() {
             .any(|e| e.sealed && !e.words_pending && e.words_added.is_none())
     })
     .await;
+    // Past the count's renewal, so that the write is what finds it gone.
+    renewed_by(&db, doc, a.id()).await;
     db.expire_lease(doc).await;
     assert_eq!(pass.await.unwrap(), PassResult::Failed);
     let s = db.state(doc).await;
