@@ -9,8 +9,8 @@
 //!
 //! Stored `meta` is never returned as is: [`render_page`] rebuilds each
 //! entry's `meta` from its kind's allowlist, shows authors through
-//! [`history_author_view`], and hides a copy's or a template's source page
-//! unless the reader may read it.
+//! [`history_author_view`], and hides a copy's (or a moved page's) or a
+//! template's source page unless the reader may read it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -296,14 +296,17 @@ fn accepted_by(meta: &Value) -> Vec<Option<Uuid>> {
 }
 
 /// The pages the entries name as their source: `meta.source_doc_id` of
-/// copy entries and `meta.template_doc_id` of template entries,
-/// deduplicated, in order of first appearance.
+/// copy entries (or, without one, the `meta.moved_from` Move to subpage
+/// writes) and `meta.template_doc_id` of template entries, deduplicated,
+/// in order of first appearance.
 pub fn referenced_docs(entries: &[EntryRow]) -> Vec<Uuid> {
     let mut seen = HashSet::new();
     entries
         .iter()
         .filter_map(|e| match e.kind {
-            EntryKind::Copy => uuid_at(&e.meta, "source_doc_id"),
+            EntryKind::Copy => {
+                uuid_at(&e.meta, "source_doc_id").or_else(|| uuid_at(&e.meta, "moved_from"))
+            }
             EntryKind::Template => uuid_at(&e.meta, "template_doc_id"),
             _ => None,
         })
@@ -338,12 +341,59 @@ fn author_json(id: Option<Uuid>, people: &HashMap<Uuid, HistoryPerson>) -> Value
     }
 }
 
+/// The current titles of the pages `ids`: what a moved page's entry shows
+/// of its source ([`render_page`]'s `titles`). A page that is gone is
+/// missing from the map.
+pub async fn load_titles(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, String>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, title FROM documents WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// A copy entry's `meta` as readers see it. A named source
+/// (`source_doc_id`) keeps the copy shapes; a page made by Move to
+/// subpage names its source only as `moved_from`, shown with the source's
+/// current title (`titles`, null when empty or not loaded).
+fn copy_meta(m: &Value, readable: &HashSet<Uuid>, titles: &HashMap<Uuid, String>) -> Value {
+    if let Some(id) = uuid_at(m, "source_doc_id") {
+        return if readable.contains(&id) {
+            json!({
+                "source_doc_id": id,
+                "source_title": string_at(m, "source_title"),
+                "version_at": string_at(m, "version_at"),
+            })
+        } else {
+            json!({ "source_hidden": true })
+        };
+    }
+    if m.get("moved_from").is_none() {
+        return json!({ "source_hidden": true });
+    }
+    match uuid_at(m, "moved_from") {
+        Some(id) if readable.contains(&id) => {
+            let title = titles.get(&id).filter(|t| !t.is_empty());
+            json!({ "moved": true, "moved_from": id, "source_title": title })
+        }
+        _ => json!({ "moved": true, "source_hidden": true }),
+    }
+}
+
 /// An entry's `meta` as readers see it: only its kind's allowlisted keys,
 /// each rebuilt from the stored value (Global Constraints).
 fn render_meta(
     e: &EntryRow,
     people: &HashMap<Uuid, HistoryPerson>,
     readable: &HashSet<Uuid>,
+    titles: &HashMap<Uuid, String>,
 ) -> Value {
     let m = &e.meta;
     match e.kind {
@@ -361,14 +411,7 @@ fn render_meta(
             "target_entry_id": m.get("target_entry_id").and_then(Value::as_i64),
             "fallback": m.get("fallback").and_then(Value::as_bool),
         }),
-        EntryKind::Copy => match uuid_at(m, "source_doc_id") {
-            Some(id) if readable.contains(&id) => json!({
-                "source_doc_id": id,
-                "source_title": string_at(m, "source_title"),
-                "version_at": string_at(m, "version_at"),
-            }),
-            _ => json!({ "source_hidden": true }),
-        },
+        EntryKind::Copy => copy_meta(m, readable, titles),
         EntryKind::Template => match uuid_at(m, "template_doc_id") {
             Some(id) if readable.contains(&id) => json!({
                 "template_doc_id": id,
@@ -393,11 +436,13 @@ fn render_meta(
 /// The response body of `GET /api/docs/{id}/history/entries`: `people`
 /// holds the authors and accepters to show ([`referenced_people`]),
 /// `readable` the referenced pages the reader may read
-/// ([`referenced_docs`]).
+/// ([`referenced_docs`]), `titles` the current titles of readable ones
+/// ([`load_titles`]; a moved page's entry shows its source's).
 pub fn render_page(
     page: &HistoryPage,
     people: &HashMap<Uuid, HistoryPerson>,
     readable: &HashSet<Uuid>,
+    titles: &HashMap<Uuid, String>,
 ) -> Value {
     let entries: Vec<Value> = page
         .entries
@@ -414,7 +459,7 @@ pub fn render_page(
                 "open": !e.sealed && !page.unavailable,
                 "words_added": e.words_added,
                 "words_removed": e.words_removed,
-                "meta": render_meta(e, people, readable),
+                "meta": render_meta(e, people, readable, titles),
             })
         })
         .collect();
@@ -526,7 +571,7 @@ mod tests {
             next_cursor: None,
         };
         let opens = |page: &HistoryPage| -> Vec<Value> {
-            render_page(page, &HashMap::new(), &HashSet::new())["entries"]
+            render_page(page, &HashMap::new(), &HashSet::new(), &HashMap::new())["entries"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -627,7 +672,7 @@ mod tests {
                 id: 17,
             }),
         };
-        let out = render_page(&page, &people, &readable);
+        let out = render_page(&page, &people, &readable, &HashMap::new());
         let listed = out["entries"].as_array().unwrap();
         let meta = |i: usize| listed[i]["meta"].clone();
         let ann_view = json!({"key": ann, "name": "Ann", "former": false});
@@ -714,6 +759,8 @@ mod tests {
                     "source_title",
                     "version_at",
                     "source_hidden",
+                    "moved",
+                    "moved_from",
                 ],
                 "template" => &["template_doc_id", "template_title", "template_hidden"],
                 "baseline" => &["rollout"],
@@ -771,5 +818,83 @@ mod tests {
         ];
         assert_eq!(referenced_docs(&entries), vec![s, t]);
         assert_eq!(referenced_people(&entries), vec![a, b, uid(3)]);
+    }
+
+    /// The copy entry Move to subpage writes (`{"moved_from": <source>}`,
+    /// no `source_doc_id`) names its source when the reader can read it,
+    /// with the title read at list time (Rulings).
+    #[test]
+    fn a_moved_copy_entry_names_its_readable_source() {
+        let (src, other, unreadable) = (uid(10), uid(11), uid(12));
+        let readable: HashSet<Uuid> = [src, other].into();
+        let meta_of = |meta: Value, titles: &HashMap<Uuid, String>| {
+            let page = HistoryPage {
+                history_since: t(0),
+                history_complete: true,
+                catching_up: false,
+                unavailable: false,
+                entries: vec![row(1, EntryKind::Copy, None, meta)],
+                next_cursor: None,
+            };
+            render_page(&page, &HashMap::new(), &readable, titles)["entries"][0]["meta"].clone()
+        };
+        let plan: HashMap<Uuid, String> = [(src, "Plan".to_string())].into();
+
+        assert_eq!(
+            meta_of(json!({"moved_from": src}), &plan),
+            json!({"moved": true, "moved_from": src, "source_title": "Plan"})
+        );
+        // An empty title, or none loaded (a failed read): null.
+        let empty: HashMap<Uuid, String> = [(src, String::new())].into();
+        for titles in [&empty, &HashMap::new()] {
+            assert_eq!(
+                meta_of(json!({"moved_from": src}), titles),
+                json!({"moved": true, "moved_from": src, "source_title": null})
+            );
+        }
+        // A source the reader cannot read, or not an id: hidden.
+        let hidden_title: HashMap<Uuid, String> = [(unreadable, "Secret".to_string())].into();
+        let hidden = meta_of(json!({"moved_from": unreadable}), &hidden_title);
+        assert_eq!(hidden, json!({"moved": true, "source_hidden": true}));
+        assert!(!hidden.to_string().contains("Secret"));
+        assert_eq!(
+            meta_of(json!({"moved_from": "garbage"}), &plan),
+            json!({"moved": true, "source_hidden": true})
+        );
+        // A named source wins over `moved_from`.
+        assert_eq!(
+            meta_of(
+                json!({"source_doc_id": other, "source_title": "Other", "moved_from": src}),
+                &plan
+            ),
+            json!({"source_doc_id": other, "source_title": "Other", "version_at": null})
+        );
+        assert_eq!(
+            meta_of(
+                json!({"source_doc_id": unreadable, "moved_from": src}),
+                &plan
+            ),
+            json!({"source_hidden": true})
+        );
+        // Every other copy meta keeps its shape.
+        assert_eq!(meta_of(json!({}), &plan), json!({"source_hidden": true}));
+        assert_eq!(
+            meta_of(json!({"source_doc_id": "garbage"}), &plan),
+            json!({"source_hidden": true})
+        );
+
+        let entries = vec![
+            row(1, EntryKind::Copy, None, json!({"moved_from": src})),
+            row(2, EntryKind::Copy, None, json!({"moved_from": "garbage"})),
+            row(
+                3,
+                EntryKind::Copy,
+                None,
+                json!({"source_doc_id": other, "moved_from": unreadable}),
+            ),
+            // Only a copy's `moved_from` is a source.
+            row(4, EntryKind::Session, None, json!({"moved_from": uid(13)})),
+        ];
+        assert_eq!(referenced_docs(&entries), vec![src, other]);
     }
 }

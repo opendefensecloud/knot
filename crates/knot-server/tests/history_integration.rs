@@ -279,31 +279,29 @@ async fn history_list_empty_when_no_snapshots() {
     );
 }
 
-/// 2. List returns snapshots sorted newest-first by snapshot_seq.
+/// 2. The list no longer lists snapshots: it answers `[]` through the
+/// combined page-history release (a 0.9.13 drawer may still call it).
 #[tokio::test(flavor = "multi_thread")]
-async fn history_list_sorted_newest_first() {
+async fn history_list_is_empty_even_with_snapshots() {
     let (state, _ws_id, doc_id, _user_id) = seeded_state(WorkspaceRole::Owner).await;
     let pool = state.pool.as_ref().unwrap().clone();
     let snaps = PgSnapshotStore::new(pool.clone());
 
     let (bytes1, sv1) = snapshot_bytes_from_md("# First");
     let (bytes2, sv2) = snapshot_bytes_from_md("# Second");
-    let (bytes3, sv3) = snapshot_bytes_from_md("# Third");
     snaps.insert(doc_id, 1, &bytes1, &sv1).await.unwrap();
     snaps.insert(doc_id, 2, &bytes2, &sv2).await.unwrap();
-    snaps.insert(doc_id, 3, &bytes3, &sv3).await.unwrap();
 
     let app = router_with_state(state);
     let (sid, csrf) = login(&app, "alice@example.com").await;
 
     let (status, json) = get_history(&app, &sid, &csrf, doc_id).await;
     assert_eq!(status, StatusCode::OK);
-    let arr = json.as_array().unwrap();
-    assert_eq!(arr.len(), 3, "expected 3 snapshots");
-    // Newest first: seq 3, 2, 1
-    assert_eq!(arr[0]["snapshot_seq"], 3);
-    assert_eq!(arr[1]["snapshot_seq"], 2);
-    assert_eq!(arr[2]["snapshot_seq"], 1);
+    assert_eq!(
+        json,
+        serde_json::json!([]),
+        "expected an empty list, got {json}"
+    );
 }
 
 /// 3. Preview returns markdown content from the seeded snapshot.

@@ -1831,7 +1831,7 @@ async fn comments_history_shares_and_grants_are_not_copied() {
     let world = &w;
     let lists = |doc_id: Uuid| async move {
         let mut lengths = Vec::new();
-        for list in ["comments", "shares", "grants", "history"] {
+        for list in ["comments", "shares", "grants"] {
             let (status, body) = world.fetch(&format!("/api/docs/{doc_id}/{list}")).await;
             assert_eq!(status, StatusCode::OK, "{list}");
             let body: Value = serde_json::from_slice(&body).unwrap();
@@ -1841,25 +1841,26 @@ async fn comments_history_shares_and_grants_are_not_copied() {
     };
     assert_eq!(
         lists(source).await,
-        [
-            ("comments", 1),
-            ("shares", 1),
-            ("grants", 1),
-            ("history", 2)
-        ]
+        [("comments", 1), ("shares", 1), ("grants", 1)]
     );
+    // History stays with the source: its snapshots (the seq list answers
+    // `[]` for every page since page history M1.4, so it pins nothing).
+    let snapshot_count = |doc_id: Uuid| async move {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM doc_snapshots WHERE doc_id = $1")
+            .bind(doc_id)
+            .fetch_one(world.pool())
+            .await
+            .unwrap()
+    };
+    assert_eq!(snapshot_count(source).await, 2);
 
     let copy = id_of(&w.duplicate_ok(source, None).await);
 
     assert_eq!(
         lists(copy).await,
-        [
-            ("comments", 0),
-            ("shares", 0),
-            ("grants", 0),
-            ("history", 0)
-        ]
+        [("comments", 0), ("shares", 0), ("grants", 0)]
     );
+    assert_eq!(snapshot_count(copy).await, 0);
     // The copy's whole history is the one update that holds its content.
     assert_eq!(updates.since(copy, 0).await.unwrap().len(), 1);
     assert!(w.markdown(copy).await.contains("Second draft."));

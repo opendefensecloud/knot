@@ -232,7 +232,17 @@ async fn run_server(cfg: Config) {
     // 4. Build router.
     let state = match pool {
         Some(p) => {
+            let views_pool = p.clone();
             let mut s = knot_server::AppState::with_pool(p);
+            // The process's one set of history permits (at least one compute
+            // permit, also with `history_workers` 0), shared by the builder
+            // below and the version views.
+            s.history_permits = knot_history::history_permits(cfg.history_workers as usize);
+            s.history_views = Some(std::sync::Arc::new(knot_history::Views::new(
+                views_pool,
+                s.history_permits.clone(),
+                knot_history::ViewLimits::from_config(&cfg),
+            )));
             s.session_key = cfg.session_key.clone().into_bytes();
             s.base_url = cfg.base_url.clone();
             s.cookie_secure = cfg.cookie_secure;
@@ -293,15 +303,12 @@ async fn run_server(cfg: Config) {
         if cfg.history_workers == 0 {
             tracing::warn!("history builder disabled");
         } else {
-            // M1.4: share with AppState for the view endpoint
-            let history_permits: knot_history::HistoryPermits =
-                knot_history::history_permits(cfg.history_workers as usize);
             knot_history::spawn_size_sampler(pool.clone());
             let handle = std::sync::Arc::new(knot_history::Builder::new(
                 pool,
                 history_updates,
                 knot_history::BuildLimits::from_config(&cfg),
-                history_permits.clone(),
+                state.history_permits.clone(),
             ))
             .spawn(state.shutdown.clone());
             history_builder = Some(handle);

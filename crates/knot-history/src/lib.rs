@@ -65,7 +65,7 @@ pub use genesis::{BaselineInput, GenesisError, GenesisInput, GenesisOutput, buil
 pub use isolate::{IsolateError, run_isolated};
 pub use list::{
     CATCHING_UP_REVS, Cursor, CursorError, DEFAULT_LIMIT, EntryRow, HistoryPage, MAX_LIMIT,
-    list_entries, referenced_docs, referenced_people, render_page,
+    list_entries, load_titles, referenced_docs, referenced_people, render_page,
 };
 pub use pass::{
     CHECKPOINT_FLOOR_BYTES, CHECKPOINT_STATE_FRACTION, CheckpointKind, CheckpointWrite, KeptGap,
