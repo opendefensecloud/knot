@@ -3861,3 +3861,38 @@ async fn subtree_key_cannot_reach_the_top_level_or_move_its_root() {
         "search leaked the parent: {body}"
     );
 }
+
+/// S10: restore puts a page at the top level when its parent is still
+/// archived; a subtree key may not do that, but restores under a live parent.
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_key_cannot_restore_a_page_to_the_top_level() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let top = matrix_doc(&app, &s, "top").await;
+    let root = child_doc(&app, &s, &top, "root").await;
+    let a = child_doc(&app, &s, &root, "a").await;
+    let b = child_doc(&app, &s, &a, "b").await;
+    let key = subtree_key(&app, &s, &root, &ALL_SCOPES).await;
+
+    for id in [&b, &a] {
+        let (st, body) =
+            guards_bearer(&app, &key, "DELETE", &format!("/api/docs/{id}"), None).await;
+        assert!(st.is_success(), "archive: {st} {body}");
+    }
+    let (st, body) =
+        guards_bearer(&app, &key, "POST", &format!("/api/docs/{b}/restore"), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "api_key.subtree_denied", "{body}");
+    // B is still archived: its restore as the owner is still a restore root.
+    let (st, body) = send(&app, &s, "GET", &format!("/api/docs/{b}"), None).await;
+    assert!(
+        st == StatusCode::OK && !body["archived_at"].is_null(),
+        "B must stay archived: {st} {body}"
+    );
+
+    // With the parent live again, the key restores under it.
+    let (st, body) =
+        guards_bearer(&app, &key, "POST", &format!("/api/docs/{a}/restore"), None).await;
+    assert!(st.is_success(), "restore under a live parent: {st} {body}");
+}

@@ -902,6 +902,24 @@ async fn restore(
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
+    // S10: with the parent archived, restore puts the page at the top level,
+    // outside every subtree.
+    if ctx.root_doc_id.is_some() {
+        let parent_live = match docs.get(doc_id).await {
+            Ok(Some(doc)) => match doc.parent_id {
+                Some(parent_id) => match docs.get(parent_id).await {
+                    Ok(parent) => parent.is_some_and(|p| p.archived_at.is_none()),
+                    Err(_) => return internal(),
+                },
+                None => false,
+            },
+            Ok(None) => return json_err(StatusCode::NOT_FOUND, "doc.not_found", ""),
+            Err(_) => return internal(),
+        };
+        if !parent_live {
+            return crate::auth::scope::subtree_denied();
+        }
+    }
     match docs.restore(ctx.workspace_id, doc_id, ctx.user_id).await {
         Ok(restored_ids) => {
             crate::archive::evict_local(&state, &restored_ids).await;

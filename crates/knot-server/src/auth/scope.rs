@@ -85,6 +85,8 @@ pub const SUBTREE_OK: &[&str] = &[
     // everything outside the root. Destinations are checked separately.
     "/api/docs/{id}",
     "/api/docs/{id}/purge",
+    // The handler refuses a restore that would land at the top level.
+    "/api/docs/{id}/restore",
     "/api/docs/{id}/template",
     "/api/docs/{id}/duplicate",
     "/api/docs/{id}/move",
@@ -484,6 +486,10 @@ mod tests {
         let mut routes = Vec::new();
         collect_route_paths(&src, &mut routes);
         assert!(routes.len() > 40, "route scan found too little: {routes:?}");
+        // Routes mounted through constants count, test-only routers do not.
+        for p in ["/api/docs/{id}/restore", "/api/docs/{id}/purge"] {
+            assert!(routes.iter().any(|r| r == p), "scan missed {p}");
+        }
         let unclassified: Vec<_> = routes
             .iter()
             .filter(|p| !SUBTREE_DENIED.contains(&p.as_str()) && !SUBTREE_OK.contains(&p.as_str()))
@@ -507,14 +513,24 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            for (at, _) in text.match_indices(".route(") {
-                let rest = text[at + ".route(".len()..].trim_start();
-                let Some(rest) = rest.strip_prefix('"') else {
-                    continue;
-                };
-                let literal = &rest[..rest.find('"').unwrap()];
-                if literal.starts_with("/api/") && !out.iter().any(|p| p == literal) {
-                    out.push(literal.to_string());
+            // Test modules sit at the end of a file, at column 0.
+            let text = text.split("\n#[cfg(test)]").next().unwrap();
+            for opener in [".route(", ": &str = "] {
+                for (at, _) in text.match_indices(opener) {
+                    let rest = text[at + opener.len()..].trim_start();
+                    let Some(rest) = rest.strip_prefix('"') else {
+                        continue;
+                    };
+                    let Some(end) = rest.find('"') else {
+                        continue;
+                    };
+                    let literal = &rest[..end];
+                    if literal.len() > "/api/".len()
+                        && literal.starts_with("/api/")
+                        && !out.iter().any(|p| p == literal)
+                    {
+                        out.push(literal.to_string());
+                    }
                 }
             }
         }
