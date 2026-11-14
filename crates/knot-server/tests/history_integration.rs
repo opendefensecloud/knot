@@ -280,7 +280,7 @@ async fn history_list_empty_when_no_snapshots() {
 }
 
 /// 2. The list no longer lists snapshots: it answers `[]` through the
-/// combined page-history release (a 0.9.13 drawer may still call it).
+/// combined page-history release (a 0.9.14 drawer may still call it).
 #[tokio::test(flavor = "multi_thread")]
 async fn history_list_is_empty_even_with_snapshots() {
     let (state, _ws_id, doc_id, _user_id) = seeded_state(WorkspaceRole::Owner).await;

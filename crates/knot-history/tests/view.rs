@@ -586,7 +586,7 @@ async fn an_entry_removed_by_a_rebuild_is_not_found() {
     ));
     assert!(matches!(
         views
-            .restore_input(anyone(), doc, s.id, |b| Ok(b.len()))
+            .restore_input(anyone(), doc, s.id, None, |b| Ok(b.len()))
             .await,
         Err(ViewError::NotFound)
     ));
@@ -606,7 +606,7 @@ async fn restore_input_is_the_state_at_the_entrys_end() {
     let views = views_with(&db.pool, &history_permits(1), |_| {});
     let view = views.view(anyone(), doc, a.id, false).await.unwrap();
     let r = views
-        .restore_input(anyone(), doc, a.id, |bytes| {
+        .restore_input(anyone(), doc, a.id, None, |bytes| {
             let d = Doc::new();
             d.transact_mut()
                 .apply_update(Update::decode_v1(bytes).map_err(|e| e.to_string())?)
@@ -696,7 +696,7 @@ async fn an_entry_of_another_page_is_not_found() {
     ));
     assert!(matches!(
         views
-            .restore_input(anyone(), other, s.id, |b| Ok(b.len()))
+            .restore_input(anyone(), other, s.id, None, |b| Ok(b.len()))
             .await,
         Err(ViewError::NotFound)
     ));
@@ -769,7 +769,7 @@ async fn plain_views_and_restores_use_the_plain_cap() {
     assert_eq!(outcome(&rec, "cached"), 1);
     assert_eq!(outcome(&rec, "rendered"), 0);
     let r = views
-        .restore_input(anyone(), doc, s.id, |b| Ok(b.len()))
+        .restore_input(anyone(), doc, s.id, None, |b| Ok(b.len()))
         .await
         .expect("the restore input");
     assert!(r.value > 0);
@@ -801,10 +801,203 @@ async fn plain_views_and_restores_use_the_plain_cap() {
     }
     assert!(matches!(
         small
-            .restore_input(anyone(), doc, s.id, |b| Ok(b.len()))
+            .restore_input(anyone(), doc, s.id, None, |b| Ok(b.len()))
             .await,
         Err(ViewError::TooLarge)
     ));
+}
+
+/// A Show changes view sizes its input against the diff cap before it
+/// waits for a permit, and the load sizes it again: an open session that
+/// outgrows the diff cap meanwhile (the builder commits onto it) is
+/// rendered plain, not diffed on input up to the plain cap.
+#[tokio::test]
+async fn a_session_that_outgrows_the_diff_cap_while_waiting_is_shown_plain() {
+    let db = db().await;
+    let (doc, s, mut h) = open_session_page(&db).await;
+    let cap = window_bytes(&db, doc, &s).await;
+    let permits = history_permits(1);
+    let views = views_with(&db.pool, &permits, |l| {
+        l.max_changes_input_bytes = cap;
+        l.permit_wait = Duration::from_secs(30);
+    });
+    let rec = CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&rec);
+    let held = permits.compute().await;
+    let (v, ()) = tokio::join!(views.view(anyone(), doc, s.id, true), async {
+        wait_until("the view's permit wait", Duration::from_secs(10), || {
+            permits.waiting() == 1
+        })
+        .await;
+        let u = typed(&mut h, 0, "gamma");
+        db.append(doc, 0, &u).await;
+        build_clean(&db.builder(limits()), doc).await;
+        let grown = session_of(&db.entries(doc).await, 0);
+        assert_eq!(grown.id, s.id);
+        assert!(window_bytes(&db, doc, &grown).await > cap, "{grown:?}");
+        drop(held);
+    });
+    let v = v.unwrap();
+    assert!(!v.changes, "rendered plain");
+    assert!(text_of(&json_of(&v)).contains("gamma"), "the grown session");
+    assert_eq!(outcome(&rec, "no_changes"), 1);
+    assert_eq!(outcome(&rec, "rendered"), 0);
+}
+
+/// A Show changes view the cache holds, or one already found over the
+/// diff cap, is served without sizing its input again.
+#[tokio::test]
+async fn a_repeated_show_changes_view_does_not_size_its_input_again() {
+    let db = db().await;
+    let (doc, s, _) = open_session_page(&db).await;
+    let views = views_with(&db.pool, &history_permits(1), |_| {});
+    let small = views_with(&db.pool, &history_permits(1), |l| {
+        l.max_changes_input_bytes = 64;
+    });
+    let diffed = views.view(anyone(), doc, s.id, true).await.unwrap();
+    assert!(diffed.changes);
+    let lowered = small.view(anyone(), doc, s.id, true).await.unwrap();
+    assert!(!lowered.changes);
+
+    // Sizing the input now finds no checkpoint (not found); the entry,
+    // and so the cache key, is unchanged.
+    sqlx::query("DELETE FROM doc_history_checkpoints WHERE doc_id = $1")
+        .bind(doc)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let again = views.view(anyone(), doc, s.id, true).await.unwrap();
+    assert!(Arc::ptr_eq(&again, &diffed));
+    let again = small.view(anyone(), doc, s.id, true).await.unwrap();
+    assert!(Arc::ptr_eq(&again, &lowered));
+}
+
+/// A restore of a version the reader saw end at another time is refused
+/// before it waits for a permit or replays; the same check after the load
+/// stays the authoritative one.
+#[tokio::test]
+async fn a_restore_of_a_moved_entry_is_refused_before_the_replay() {
+    let db = db().await;
+    let (doc, s, _) = open_session_page(&db).await;
+    let renders = counter();
+    let permits = history_permits(1);
+    let views = views_with(&db.pool, &permits, |l| {
+        l.hooks.renders = Some(renders.clone());
+    });
+    let len = |b: &[u8]| Ok(b.len());
+    // With the only permit held, a refusal after the permit wait would be
+    // Busy: Moved means it was refused before.
+    let held = permits.compute().await;
+    let seen = s.ended_at - chrono::Duration::seconds(1);
+    assert!(matches!(
+        views
+            .restore_input(anyone(), doc, s.id, Some(seen), len)
+            .await,
+        Err(ViewError::Moved)
+    ));
+    assert_eq!(count(&renders), 0);
+    drop(held);
+
+    let r = views
+        .restore_input(anyone(), doc, s.id, Some(s.ended_at), len)
+        .await
+        .expect("the version the reader saw");
+    assert_eq!(r.ended_at, s.ended_at);
+    assert_eq!(count(&renders), 1);
+}
+
+/// A restore that passes the early check and then waits for a permit
+/// while the builder extends its session is refused on the entry as the
+/// load read it, before the replay.
+#[tokio::test]
+async fn a_restore_of_an_entry_that_moves_while_it_waits_is_refused() {
+    let db = db().await;
+    let (doc, s, mut h) = open_session_page(&db).await;
+    let renders = counter();
+    let permits = history_permits(1);
+    let views = views_with(&db.pool, &permits, |l| {
+        l.hooks.renders = Some(renders.clone());
+        l.permit_wait = Duration::from_secs(30);
+    });
+    let len = |b: &[u8]| Ok(b.len());
+    let held = permits.compute().await;
+    let (r, ()) = tokio::join!(
+        views.restore_input(anyone(), doc, s.id, Some(s.ended_at), len),
+        async {
+            wait_until("the restore's permit wait", Duration::from_secs(10), || {
+                permits.waiting() == 1
+            })
+            .await;
+            let u = typed(&mut h, 0, "gamma");
+            db.append(doc, 0, &u).await;
+            build_clean(&db.builder(limits()), doc).await;
+            let moved = session_of(&db.entries(doc).await, 0);
+            assert_eq!(moved.id, s.id);
+            assert_ne!(moved.ended_at, s.ended_at);
+            drop(held);
+        }
+    );
+    assert!(
+        matches!(r, Err(ViewError::Moved)),
+        "{:?}",
+        r.map(|r| r.ended_at)
+    );
+    assert_eq!(count(&renders), 0, "no replay");
+}
+
+/// A Show changes render that found its input over the diff cap only at
+/// the load is filed as the plain view it is: while the cache key stands,
+/// a repeat is lowered without sizing again and a plain request shares it.
+#[tokio::test]
+async fn a_version_that_outgrew_the_diff_cap_is_served_plain_from_then_on() {
+    let db = db().await;
+    let (doc, s, mut h) = open_session_page(&db).await;
+    let cap = window_bytes(&db, doc, &s).await;
+    let renders = counter();
+    let permits = history_permits(1);
+    let views = views_with(&db.pool, &permits, |l| {
+        l.max_changes_input_bytes = cap;
+        l.permit_wait = Duration::from_secs(30);
+        l.hooks.renders = Some(renders.clone());
+    });
+    let updated_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM doc_history_entries WHERE id = $1")
+            .bind(s.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let rec = CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&rec);
+    let held = permits.compute().await;
+    let (v, ()) = tokio::join!(views.view(anyone(), doc, s.id, true), async {
+        wait_until("the view's permit wait", Duration::from_secs(10), || {
+            permits.waiting() == 1
+        })
+        .await;
+        let u = typed(&mut h, 0, "gamma");
+        db.append(doc, 0, &u).await;
+        build_clean(&db.builder(limits()), doc).await;
+        // The key stands while the input grows, as when the builder drops
+        // a checkpoint the window started at.
+        sqlx::query("UPDATE doc_history_entries SET updated_at = $2 WHERE id = $1")
+            .bind(s.id)
+            .bind(updated_at)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        drop(held);
+    });
+    let v = v.unwrap();
+    assert!(!v.changes);
+    assert_eq!(outcome(&rec, "no_changes"), 1);
+
+    let again = views.view(anyone(), doc, s.id, true).await.unwrap();
+    assert!(Arc::ptr_eq(&again, &v));
+    assert_eq!(outcome(&rec, "no_changes"), 2, "lowered, not a cached diff");
+    let plain = views.view(anyone(), doc, s.id, false).await.unwrap();
+    assert!(Arc::ptr_eq(&plain, &v));
+    assert_eq!(outcome(&rec, "cached"), 1);
+    assert_eq!(count(&renders), 1, "one replay for both keys");
 }
 
 #[tokio::test]
@@ -897,7 +1090,7 @@ async fn a_skipped_baseline_is_not_replayed() {
     ));
     assert!(matches!(
         views
-            .restore_input(anyone(), doc, baseline.id, |b| Ok(b.len()))
+            .restore_input(anyone(), doc, baseline.id, None, |b| Ok(b.len()))
             .await,
         Err(ViewError::Failed(_))
     ));
@@ -931,7 +1124,7 @@ async fn a_page_an_older_builder_built_refuses_views_and_restores() {
         }
         assert!(matches!(
             views
-                .restore_input(anyone(), doc, sealed.id, |b| Ok(b.len()))
+                .restore_input(anyone(), doc, sealed.id, None, |b| Ok(b.len()))
                 .await,
             Err(ViewError::Rebuilding)
         ));
@@ -1134,7 +1327,7 @@ async fn a_render_that_panics_fails_and_one_that_hangs_times_out_and_keeps_its_p
     }
     assert!(matches!(
         hanging
-            .restore_input(anyone(), doc, s.id, |b| Ok(b.len()))
+            .restore_input(anyone(), doc, s.id, None, |b| Ok(b.len()))
             .await,
         Err(ViewError::Failed(_))
     ));
@@ -1521,7 +1714,7 @@ async fn restore_input_is_bounded_like_a_plain_view() {
 
     let small = views_with(&db.pool, &permits, |l| l.max_plain_input_bytes = 64);
     assert!(matches!(
-        small.restore_input(anyone(), doc, s.id, len).await,
+        small.restore_input(anyone(), doc, s.id, None, len).await,
         Err(ViewError::TooLarge)
     ));
 
@@ -1532,12 +1725,12 @@ async fn restore_input_is_bounded_like_a_plain_view() {
     });
     let held = (permits.compute().await, permits.compute().await);
     assert!(matches!(
-        views.restore_input(anyone(), doc, s.id, len).await,
+        views.restore_input(anyone(), doc, s.id, None, len).await,
         Err(ViewError::Busy)
     ));
     drop(held);
     match views
-        .restore_input(anyone(), doc, s.id, |_| Err::<(), _>("x".to_string()))
+        .restore_input(anyone(), doc, s.id, None, |_| Err::<(), _>("x".to_string()))
         .await
     {
         Err(ViewError::Failed(m)) => assert_eq!(m, "x"),
@@ -1545,7 +1738,7 @@ async fn restore_input_is_bounded_like_a_plain_view() {
     }
     assert!(matches!(
         views
-            .restore_input(anyone(), doc, s.id, |_| -> Result<(), String> {
+            .restore_input(anyone(), doc, s.id, None, |_| -> Result<(), String> {
                 panic!("x")
             })
             .await,
@@ -1553,7 +1746,7 @@ async fn restore_input_is_bounded_like_a_plain_view() {
     ));
     assert!(matches!(
         views
-            .restore_input(anyone(), doc, s.id, |_| {
+            .restore_input(anyone(), doc, s.id, None, |_| {
                 std::thread::sleep(Duration::from_secs(1));
                 Ok(())
             })
@@ -1563,7 +1756,7 @@ async fn restore_input_is_bounded_like_a_plain_view() {
     assert_eq!(view_timeouts(&rec), 1);
     let before = count(&renders);
     assert!(matches!(
-        views.restore_input(anyone(), doc, s.id, len).await,
+        views.restore_input(anyone(), doc, s.id, None, len).await,
         Err(ViewError::Failed(_))
     ));
     assert_eq!(count(&renders), before, "no replay");
@@ -1743,7 +1936,7 @@ async fn a_baseline_that_may_be_shifted_views_and_restores_from_its_prefix() {
         let v = views.view(anyone(), doc, entry.id, false).await.unwrap();
         assert_eq!(json_of(&v), replayed(&prefix, &[]));
         let r = views
-            .restore_input(anyone(), doc, entry.id, |bytes| Ok(bytes.to_vec()))
+            .restore_input(anyone(), doc, entry.id, None, |bytes| Ok(bytes.to_vec()))
             .await
             .expect("the restore input");
         let held = insertions(&r.value);
@@ -1821,7 +2014,7 @@ async fn a_page_lifted_from_version_1_views_no_phantom() {
         assert!(
             matches!(
                 views
-                    .restore_input(anyone(), doc, e.id, |b| Ok(b.len()))
+                    .restore_input(anyone(), doc, e.id, None, |b| Ok(b.len()))
                     .await,
                 Err(ViewError::Rebuilding)
             ),
@@ -1850,7 +2043,7 @@ async fn a_page_lifted_from_version_1_views_no_phantom() {
         .merge(&insertions(&g));
     for e in &entries {
         let r = views
-            .restore_input(anyone(), doc, e.id, |bytes| Ok(bytes.to_vec()))
+            .restore_input(anyone(), doc, e.id, None, |bytes| Ok(bytes.to_vec()))
             .await
             .unwrap_or_else(|err| panic!("{e:?}: {err:?}"));
         let held = insertions(&r.value);
@@ -1928,7 +2121,8 @@ async fn a_baseline_over_the_shifted_cap_is_too_large() {
         Err(ViewError::TooLarge)
     ));
     assert!(matches!(
-        at.restore_input(anyone(), doc, baseline.id, len).await,
+        at.restore_input(anyone(), doc, baseline.id, None, len)
+            .await,
         Err(ViewError::TooLarge)
     ));
     // A window of the same size, relative to its cap, renders.
@@ -1937,7 +2131,7 @@ async fn a_baseline_over_the_shifted_cap_is_too_large() {
     at.view(anyone(), other, s.id, false)
         .await
         .expect("the window renders");
-    at.restore_input(anyone(), other, s.id, len)
+    at.restore_input(anyone(), other, s.id, None, len)
         .await
         .expect("the window restores");
     // The baseline, once the plain cap leaves room for the shifted one.
@@ -1949,7 +2143,7 @@ async fn a_baseline_over_the_shifted_cap_is_too_large() {
         .await
         .expect("the baseline renders");
     above
-        .restore_input(anyone(), doc, baseline.id, len)
+        .restore_input(anyone(), doc, baseline.id, None, len)
         .await
         .expect("the baseline restores");
 }

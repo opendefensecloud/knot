@@ -12,7 +12,7 @@
 //! GET  /api/docs/{doc_id}/history/{seq}/markdown → markdown preview of snapshot
 //! POST /api/docs/{doc_id}/history/{seq}/restore  → replace live doc with snapshot
 //!
-//! These three stay through the combined page-history release: a 0.9.13
+//! These three stay through the combined page-history release: a 0.9.14
 //! drawer whose list came from an old pod still previews and restores on
 //! a new pod during the upgrade, and the seq restore is the operator's
 //! workaround for a page without a restorable entry. No client of the
@@ -52,7 +52,7 @@ use crate::http_error::json_err;
 pub(crate) const RESTORE_ROOM_WAIT: Duration = Duration::from_secs(8);
 
 /// `GET /api/docs/{id}/history`: the snapshot list of the drawer before
-/// the timeline. It lists nothing (`[]`), behind its gates, so a 0.9.13
+/// the timeline. It lists nothing (`[]`), behind its gates, so a 0.9.14
 /// bundle that calls it during the upgrade gets JSON instead of the SPA's
 /// `index.html` (module doc).
 pub async fn list(req: Request) -> Response {
@@ -167,7 +167,7 @@ pub async fn restore(
         "target_snapshot_seq": seq,
         "target_ended_at": snap.created_at.to_rfc3339(),
     });
-    // No bound on the room: 0.9.13 drawers still call this during the
+    // No bound on the room: 0.9.14 drawers still call this during the
     // rollout and would read a 504 as a failure to retry (Rulings).
     send_replace(&state, doc_id, ctx.user_id, update_bytes, meta, None).await
 }
@@ -224,8 +224,10 @@ pub async fn restore_entry(
     };
 
     // The principal: the person, the bot, or the user an API key acts for.
+    // `seen` is compared as an instant (the reader may write the offset
+    // either way), before the replay and again on the entry it loaded.
     let restorable = match views
-        .restore_input(ctx.user_id, doc_id, entry_id, markdown_round_trip)
+        .restore_input(ctx.user_id, doc_id, entry_id, seen, markdown_round_trip)
         .await
     {
         Ok(r) => r,
@@ -236,14 +238,6 @@ pub async fn restore_entry(
             return view_error(&e);
         }
     };
-    // Compared as instants: the reader may write the offset either way.
-    if seen.is_some_and(|at| at != restorable.ended_at) {
-        return json_err(
-            StatusCode::CONFLICT,
-            "history.moved",
-            "the entry changed since it was read",
-        );
-    }
 
     let meta = serde_json::json!({
         "target_entry_id": entry_id,
@@ -557,6 +551,11 @@ pub(crate) fn view_error(e: &ViewError) -> Response {
             "history.view_failed",
             "the version could not be shown",
         ),
+        ViewError::Moved => json_err(
+            StatusCode::CONFLICT,
+            "history.moved",
+            "the entry changed since it was read",
+        ),
         ViewError::Store(_) => internal(),
     }
 }
@@ -745,7 +744,7 @@ mod tests {
         assert_eq!(status_and_code(r).await, (StatusCode::NO_CONTENT, None));
     }
 
-    /// The seq restore keeps its unbounded wait for 0.9.13 drawers.
+    /// The seq restore keeps its unbounded wait for 0.9.14 drawers.
     #[tokio::test]
     async fn a_seq_restore_waits_for_a_slow_room() {
         let r = replace(None, room(Room::Apply(Duration::from_millis(300)))).await;

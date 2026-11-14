@@ -2022,6 +2022,8 @@ pub(crate) enum ViewLoaded {
         del: IdSet,
         /// The entry as read in the load's transaction.
         entry: ViewEntry,
+        /// The input's size as the load checked it against the cap.
+        bytes: i64,
     },
 }
 
@@ -2062,13 +2064,13 @@ async fn load_baseline_state(
     Ok(StateLoaded::Load(state))
 }
 
-/// The genesis checkpoint's state, its `pending_revs` rows and its rev,
-/// the size of both checked in SQL first.
+/// The genesis checkpoint's state, its `pending_revs` rows, its rev and
+/// the size of both, checked in SQL first.
 async fn load_genesis_state(
     tx: &mut Tx,
     doc_id: Uuid,
     cap: i64,
-) -> Result<StateLoaded<(Vec<u8>, Vec<DocUpdate>, i64)>> {
+) -> Result<StateLoaded<(Vec<u8>, Vec<DocUpdate>, i64, i64)>> {
     let Some((size, pending_revs)) = genesis_size(tx, doc_id).await? else {
         return Ok(StateLoaded::Missing);
     };
@@ -2083,7 +2085,7 @@ async fn load_genesis_state(
     .fetch_one(&mut **tx)
     .await?;
     let reapply = rows_at(tx, doc_id, &pending_revs).await?;
-    Ok(StateLoaded::Load((state, reapply, rev)))
+    Ok(StateLoaded::Load((state, reapply, rev, size)))
 }
 
 /// Entry `entry_id`'s replay input, in one read transaction committed
@@ -2151,7 +2153,10 @@ pub(crate) async fn load_view_input(
                 tx.commit().await?;
                 return Ok(ViewLoaded::TooLarge);
             }
-            StateLoaded::Load(state) => Some(ViewInput::State(state)),
+            StateLoaded::Load(state) => {
+                let bytes = i64::try_from(state.len()).unwrap_or(i64::MAX);
+                Some((ViewInput::State(state), bytes))
+            }
         },
         ViewSource::Genesis => match load_genesis_state(&mut tx, doc_id, cap).await? {
             StateLoaded::Missing => None,
@@ -2159,13 +2164,13 @@ pub(crate) async fn load_view_input(
                 tx.commit().await?;
                 return Ok(ViewLoaded::TooLarge);
             }
-            StateLoaded::Load((checkpoint_state, reapply, rev)) => {
+            StateLoaded::Load((checkpoint_state, reapply, rev, bytes)) => {
                 let skip_revs: Vec<i64> =
                     sqlx::query_scalar("SELECT skip_revs FROM doc_history_state WHERE doc_id = $1")
                         .bind(doc_id)
                         .fetch_one(&mut *tx)
                         .await?;
-                Some(ViewInput::Window(WindowInput {
+                let input = ViewInput::Window(WindowInput {
                     mode: ReplayMode::KeepDeleted,
                     checkpoint_state,
                     reapply,
@@ -2176,7 +2181,8 @@ pub(crate) async fn load_view_input(
                     merge_gap_at_end: false,
                     progress: Progress::default(),
                     hooks: ReplayHooks::default(),
-                }))
+                });
+                Some((input, bytes))
             }
         },
         ViewSource::Window { start_rev, end_rev } => {
@@ -2186,29 +2192,33 @@ pub(crate) async fn load_view_input(
                     tx.commit().await?;
                     return Ok(ViewLoaded::TooLarge);
                 }
-                WindowLoaded::Load(l) => Some(ViewInput::Window(WindowInput {
-                    mode: ReplayMode::KeepDeleted,
-                    checkpoint_state: l.checkpoint_state,
-                    reapply: l.reapply,
-                    rows: l.rows,
-                    gap_states: l.gap_states,
-                    skip_revs: l.skip_revs,
-                    end_rev,
-                    merge_gap_at_end: merge_gap_at_end(entry.kind, &entry.meta, end_rev),
-                    progress: Progress::default(),
-                    hooks: ReplayHooks::default(),
-                })),
+                WindowLoaded::Load(l) => {
+                    let input = ViewInput::Window(WindowInput {
+                        mode: ReplayMode::KeepDeleted,
+                        checkpoint_state: l.checkpoint_state,
+                        reapply: l.reapply,
+                        rows: l.rows,
+                        gap_states: l.gap_states,
+                        skip_revs: l.skip_revs,
+                        end_rev,
+                        merge_gap_at_end: merge_gap_at_end(entry.kind, &entry.meta, end_rev),
+                        progress: Progress::default(),
+                        hooks: ReplayHooks::default(),
+                    });
+                    Some((input, l.bytes))
+                }
             }
         }
     };
     tx.commit().await?;
     Ok(match input {
         None => ViewLoaded::NotFound,
-        Some(input) => ViewLoaded::Load {
+        Some((input, bytes)) => ViewLoaded::Load {
             input,
             ins,
             del,
             entry,
+            bytes,
         },
     })
 }

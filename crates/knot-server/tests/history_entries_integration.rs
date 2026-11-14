@@ -1293,7 +1293,7 @@ async fn a_moved_subpage_names_the_page_it_came_from() {
 }
 
 /// The seq snapshot list stays routed through the combined release (a
-/// 0.9.13 drawer may call it on a new pod) and lists nothing (Rulings).
+/// 0.9.14 drawer may call it on a new pod) and lists nothing (Rulings).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_old_snapshot_list_answers_an_empty_json_list() {
     let fx = fixture().await;

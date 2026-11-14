@@ -101,7 +101,8 @@ version can be opened with its changes highlighted.
   an empty History list until they reload (the old snapshot list
   endpoint now answers an empty list), and browsers with the new app
   that reach a 0.9.14 pod read "This version can't be shown" until that
-  pod is replaced. (#TBD)
+  pod is replaced; a Restore here that reaches one fails with "Restore
+  failed" and changes nothing, so it can be tried again. (#TBD)
 - The hourly snapshot cleanup now keeps the 3 newest snapshots of each
   page, the newest one boot trusts, and those page history has still to
   check; pages not yet rebuilt keep the old rule (the 5 newest plus one

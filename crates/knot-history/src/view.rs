@@ -363,6 +363,8 @@ pub const PRINCIPAL_RENDERS: usize = 1;
 const TIMED_OUT_KEYS: u64 = 1_024;
 /// The principals map is pruned of dead slots past this many entries.
 const PRINCIPALS_PRUNE_AT: usize = 1_024;
+/// How many versions found over the diff cap are remembered.
+const OVER_DIFF_CAP_KEYS: u64 = 4_096;
 
 const EARLIER_TIMEOUT: &str = "an earlier render of this version timed out";
 const SKIPPED_BASELINE: &str = "the history builder skipped this baseline";
@@ -466,6 +468,9 @@ pub enum ViewError {
     /// The render did not finish within its timeout.
     #[error("the render timed out")]
     TimedOut,
+    /// A restore's entry no longer ends when the reader saw it end.
+    #[error("the entry changed since it was read")]
+    Moved,
     #[error("store: {0}")]
     Store(String),
 }
@@ -480,6 +485,8 @@ impl ViewError {
             ViewError::Busy => "busy",
             ViewError::Failed(_) | ViewError::Store(_) => "failed",
             ViewError::TimedOut => "timeout",
+            // Restores only, which are not counted.
+            ViewError::Moved => "moved",
         }
     }
 }
@@ -725,6 +732,9 @@ pub struct Views {
     limits: ViewLimits,
     cache: moka::future::Cache<ViewKey, Arc<RenderedView>>,
     records: Records,
+    /// `Changes` keys whose input was over the diff cap when sized, so a
+    /// repeat goes to the plain key without sizing it again.
+    over_diff_cap: moka::sync::Cache<ViewKey, ()>,
     /// Each principal's render slot, while someone holds or waits for it.
     principals: Mutex<HashMap<Uuid, Weak<Semaphore>>>,
 }
@@ -746,12 +756,17 @@ impl Views {
                 .build(),
             stalled_keys: Arc::new(Mutex::new(HashSet::new())),
         };
+        let over_diff_cap = moka::sync::Cache::builder()
+            .max_capacity(OVER_DIFF_CAP_KEYS)
+            .time_to_live(limits.cache_ttl)
+            .build();
         Views {
             pool,
             permits,
             limits,
             cache,
             records,
+            over_diff_cap,
             principals: Mutex::new(HashMap::new()),
         }
     }
@@ -795,30 +810,63 @@ impl Views {
         }
         let asked = changes && shows_changes(entry.kind);
         let diff = plain.with(ViewVariant::Changes);
-        let mut effective = asked && !entry.count_failed() && !self.records.recorded(&diff);
+        let mut effective = asked
+            && !entry.count_failed()
+            && !self.records.recorded(&diff)
+            && !self.over_diff_cap.contains_key(&diff);
         if effective {
+            // Whatever the diff key holds was sized for this same key.
+            if let Some(hit) = self.cache.get(&diff).await {
+                return Ok((hit, "cached"));
+            }
             let bytes = self.input_bytes(&entry).await?;
             effective = bytes <= self.limits.max_changes_input_bytes;
+            if !effective {
+                self.over_diff_cap.insert(diff.clone(), ());
+            }
         }
         let lowered = asked && !effective;
-        let key = if effective { diff } else { plain };
+        let key = if effective {
+            diff.clone()
+        } else {
+            plain.clone()
+        };
         if let Some(hit) = self.cache.get(&key).await {
             return Ok((hit, if lowered { "no_changes" } else { "cached" }));
         }
         let deadline = Instant::now() + self.limits.permit_wait;
         let slot = self.slot_within(principal, deadline).await?;
         let diff_failed = AtomicBool::new(false);
-        let init = self.render_view(entry, key.clone(), effective, slot, deadline, &diff_failed);
+        let outgrown = AtomicBool::new(false);
+        let init = self.render_view(
+            entry,
+            key.clone(),
+            effective,
+            slot,
+            deadline,
+            (&diff_failed, &outgrown),
+        );
         let got = self
             .cache
             .entry(key)
             .or_try_insert_with(init)
             .await
             .map_err(|e| (*e).clone())?;
+        if got.is_fresh() && outgrown.load(Ordering::SeqCst) {
+            // The render is plain: it belongs under the plain key, and the
+            // diff key is over the cap from now on, as if sized so first.
+            // (Only while the key stands: a session the builder extended
+            // has a new `updated_at`, and so new keys.)
+            self.over_diff_cap.insert(diff.clone(), ());
+            self.cache.invalidate(&diff).await;
+            self.cache.insert(plain, got.value().clone()).await;
+        }
         let outcome = if lowered {
             "no_changes"
         } else if !got.is_fresh() {
             "cached"
+        } else if outgrown.load(Ordering::SeqCst) {
+            "no_changes"
         } else if diff_failed.load(Ordering::SeqCst) {
             "diff_failed"
         } else {
@@ -829,6 +877,9 @@ impl Views {
 
     /// The cache's init for `key`: the size check, a compute permit, the
     /// load and the render. Records the render's time, or its timeout.
+    /// Sets `flags.0` when the diff failed and `flags.1` when the input
+    /// the load read had outgrown the diff cap (an open session the
+    /// builder extended while this waited), so it rendered plain.
     async fn render_view(
         &self,
         entry: ViewEntry,
@@ -836,12 +887,19 @@ impl Views {
         changes: bool,
         slot: OwnedSemaphorePermit,
         deadline: Instant,
-        diff_failed: &AtomicBool,
+        flags: (&AtomicBool, &AtomicBool),
     ) -> Result<Arc<RenderedView>, ViewError> {
+        let (diff_failed, outgrown) = flags;
         self.input_bytes(&entry).await?;
         let granted = self.compute_until(slot, deadline).await?;
-        let (input, ins, del, _) = self.load(&entry).await?;
-        let sets = changes.then_some((ins, del));
+        let (input, ins, del, _, bytes) = self.load(&entry).await?;
+        // The load sizes the input again: the diff cap is the memory rule,
+        // and it binds on what is rendered, not on what was sized first.
+        let fits = bytes <= self.limits.max_changes_input_bytes;
+        if changes && !fits {
+            outgrown.store(true, Ordering::SeqCst);
+        }
+        let sets = (changes && fits).then_some((ins, del));
         let hooks = RenderHooks {
             panic_in_diff: self.limits.hooks.panic_in_diff,
             hold_in_diff: self.limits.hooks.hold_in_diff,
@@ -884,14 +942,22 @@ impl Views {
     /// The input of restoring entry `entry_id`: its state at its end,
     /// replayed as its plain view is (without the cache) and handed to
     /// `finish` on the replay thread, within [`ViewLimits::restore_timeout`].
+    /// With `seen` (the end the reader saw), an entry that ends at another
+    /// time is [`ViewError::Moved`]: checked before any permit is taken,
+    /// and again on the entry as the load read it, which is authoritative.
     pub async fn restore_input<T: Send + 'static>(
         &self,
         principal: Uuid,
         doc_id: Uuid,
         entry_id: i64,
+        seen: Option<DateTime<Utc>>,
         finish: impl FnOnce(&[u8]) -> Result<T, String> + Send + 'static,
     ) -> Result<Restorable<T>, ViewError> {
+        let moved = |ended_at: DateTime<Utc>| seen.is_some_and(|at| at != ended_at);
         let entry = self.entry(doc_id, entry_id).await?;
+        if moved(entry.ended_at) {
+            return Err(ViewError::Moved);
+        }
         let plain = ViewKey::of(&entry, ViewVariant::Plain);
         let key = plain.with(ViewVariant::Restore);
         if self.records.recorded(&plain) || self.records.recorded(&key) {
@@ -901,7 +967,10 @@ impl Views {
         let deadline = Instant::now() + self.limits.permit_wait;
         let slot = self.slot_within(principal, deadline).await?;
         let granted = self.compute_until(slot, deadline).await?;
-        let (input, _, _, loaded) = self.load(&entry).await?;
+        let (input, _, _, loaded, _) = self.load(&entry).await?;
+        if moved(loaded.ended_at) {
+            return Err(ViewError::Moved);
+        }
         let stage = StageCell::default();
         let value = self
             .run(
@@ -1019,12 +1088,12 @@ impl Views {
         })
     }
 
-    /// The entry's replay input, its id sets and the entry as the load
-    /// read it.
+    /// The entry's replay input, its id sets, the entry as the load read
+    /// it and the input's size.
     async fn load(
         &self,
         entry: &ViewEntry,
-    ) -> Result<(ViewInput, IdSet, IdSet, ViewEntry), ViewError> {
+    ) -> Result<(ViewInput, IdSet, IdSet, ViewEntry, i64), ViewError> {
         match store::load_view_input(
             &self.pool,
             entry.doc_id,
@@ -1043,7 +1112,8 @@ impl Views {
                 ins,
                 del,
                 entry,
-            } => Ok((input, ins, del, entry)),
+                bytes,
+            } => Ok((input, ins, del, entry, bytes)),
         }
     }
 

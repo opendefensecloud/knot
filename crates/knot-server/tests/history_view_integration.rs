@@ -990,19 +990,33 @@ async fn a_page_an_older_builder_built_answers_409_rebuilding() {
 // ---------------------------------------------------------------------------
 
 /// Views on their own two compute permits whose renders each take 1 s,
-/// waiting at most 200 ms for a slot or a permit.
-fn slow_views(fx: &Fixture) -> Router {
+/// waiting at most 200 ms for a slot or a permit; `renders` counts the
+/// render threads started.
+fn slow_views(fx: &Fixture, renders: &Arc<AtomicUsize>) -> Router {
+    let renders = renders.clone();
     router_with_views(fx, history_permits(2), |l| {
         l.hooks.hold_render = Duration::from_secs(1);
         l.permit_wait = Duration::from_millis(200);
+        l.hooks.renders = Some(renders);
     })
+}
+
+/// Waits until `renders` counts `n` render threads started.
+async fn renders_started(renders: &Arc<AtomicUsize>, n: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while count(renders) < n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the render to start");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_user_renders_one_version_at_a_time() {
     let fx = fixture().await;
     let (doc, ids) = typed_page(&fx, &[fx.owner.id, fx.editor.id, fx.viewer.id]).await;
-    let app = slow_views(&fx);
+    let app = slow_views(&fx, &counter());
     let editor = Some(&fx.editor.session);
 
     let (e0, e1, owner) = tokio::join!(
@@ -1024,17 +1038,21 @@ async fn a_colleague_opening_the_same_version_is_not_blocked() {
     let fx = fixture().await;
     let (doc, ids) = typed_page(&fx, &[fx.owner.id, fx.editor.id]).await;
     let (e1, e2) = (ids[0], ids[1]);
-    let app = slow_views(&fx);
+    let renders = counter();
+    let app = slow_views(&fx, &renders);
     let editor = Some(&fx.editor.session);
 
+    // The editor's second request and the owner's start once the first
+    // render runs, so it holds the editor's slot (not after a fixed sleep,
+    // which a slow runner's auth and loads can outlast).
     let (first, second, colleague) = tokio::join!(
         view_on(&app, editor, doc, e1, ""),
         async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            renders_started(&renders, 1).await;
             view_on(&app, editor, doc, e2, "").await
         },
         async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            renders_started(&renders, 1).await;
             view_on(&app, Some(&fx.owner.session), doc, e2, "").await
         },
     );
