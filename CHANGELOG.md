@@ -11,6 +11,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 A fix for pages that lost an edit: snapshots, the first sync and exports
 no longer hold text at the wrong place. One database migration runs on
 upgrade, and every page's history is rebuilt once; read Upgrading first.
+The History drawer becomes a timeline of who changed what, and any
+version can be opened with its changes highlighted.
 
 ### Upgrading
 - Upgrade from 0.9.14. One database migration runs on upgrade:
@@ -89,6 +91,62 @@ upgrade, and every page's history is rebuilt once; read Upgrading first.
   serving any more): a tab that joined a 0.9.14 pod holds its misplaced
   text and sends it back when it reconnects, and a tab reloaded
   mid-rollout can land on a 0.9.14 pod again. (#TBD)
+- Opening a version in the History drawer is refused, with "History for
+  this page is being rebuilt", until this release's builder has rebuilt
+  the page's history (the rebuild above), and the drawer says history is
+  still being built meanwhile. Progress:
+  `SELECT count(*) FROM doc_history_state WHERE builder_version < 2`
+  falls to 0. (#TBD)
+- During the rolling upgrade, browsers still running the 0.9.14 app show
+  an empty History list until they reload (the old snapshot list
+  endpoint now answers an empty list), and browsers with the new app
+  that reach a 0.9.14 pod read "This version can't be shown" until that
+  pod is replaced. (#TBD)
+- The hourly snapshot cleanup now keeps the 3 newest snapshots of each
+  page, the newest one boot trusts, and those page history has still to
+  check; pages not yet rebuilt keep the old rule (the 5 newest plus one
+  a day for 30 days), so `doc_snapshots` shrinks once the rebuild is
+  done. (#TBD)
+- Version views share the `history.workers` replay slots and memory
+  bound with the history builder. A view waits behind the replays
+  running or queued when it arrives, at most one builder replay per
+  worker; the server answers "busy" after 5 s and the drawer retries for
+  about half a minute, so on a busy single-worker replica opening a
+  version can take that long, or end in "busy" behind a large page's
+  first build. Views still get one slot with `history.workers: 0`, but
+  with `history.workers: 0` on every replica no page is rebuilt after
+  the upgrade, so every version stays refused as being rebuilt: at least
+  one replica must run the builder. "Busy" answers (503) count as 5xx in
+  the error budget and can add to it while the builder catches up. A
+  builder that waits more than 5 minutes for a slot hands the page back
+  and retries it later. (#TBD)
+- Versions and restores whose replay input is over
+  `history.replayMaxBytes` (very large pages, or one very long editing
+  session) answer "too large" until `replayMaxBytes` is raised together
+  with the memory limit; restore by snapshot had no such limit. Earlier
+  versions from before page history answer "too large" from about
+  3.81 MiB at the default 4 MiB (3,813,003 bytes), since their replay
+  needs more memory. "Show changes" is skipped above about 0.44 MiB of
+  replay input at the default (466,033 bytes; the version is then shown
+  without highlighting), and it highlights nothing on many entries of
+  pages that lost an edit before this release. (#TBD)
+- Restore from the drawer needs a timeline entry, so pages whose history
+  was given up, pages still being rebuilt and every page on an instance
+  whose replicas all run `history.workers: 0` offer no restore of recent
+  states in the drawer. Operators can still restore by snapshot,
+  `POST /api/docs/{id}/history/{seq}/restore`, with a seq read from the
+  database (no endpoint lists them any more):
+  `SELECT snapshot_seq, created_at, pending_revs IS NOT NULL
+  FROM doc_snapshots WHERE doc_id = …`. Prefer a snapshot this release
+  wrote (`pending_revs IS NOT NULL`): an older one is restored as stored
+  and can hold misplaced text on a page that lost an edit. (#TBD)
+- The History drawer's snapshot list and its Markdown preview are gone.
+  Restore picks a timeline entry and still goes through Markdown, as
+  before (formatting outside the canonical schema is not kept).
+  `GET /api/docs/{id}/history` answers an empty list, and the snapshot
+  preview and restore endpoints by seq stay for operators. Version views
+  and restores run one at a time per person, bot or API key user (a
+  second one waits for the first, up to 5 s). (#TBD)
 
 ### Added
 - Metrics `knot_room_boot_fallbacks_total{reason}`,
@@ -96,6 +154,25 @@ upgrade, and every page's history is rebuilt once; read Upgrading first.
   `knot_room_pending_reparked_total{reason}` and
   `knot_room_updates_underflow_refused_total{source}`, and the `pending`
   reason of `knot_history_snapshots_unchecked_total`. (#TBD)
+- The History drawer is a timeline: day headings, one entry per editing
+  session with who, when and the words added and removed, plus restores,
+  copies (a page made with Move to subpage names the page it came from),
+  imports, templates, changes saved without an author and earlier
+  versions from before page history. Clicking an entry shows the page as
+  it was right after it, with that entry's changes highlighted (Show
+  changes). (#TBD)
+- `GET /api/docs/{id}/history/entries/{eid}/view` shows a version (API
+  keys need `read`; not rate-limited), and
+  `POST /api/docs/{id}/history/entries/{eid}/restore` restores it (API
+  keys need `update`; counts as a write for rate limits; not recorded in
+  the page audit log, the timeline shows it). Both need Editor+ on the
+  page. (#TBD)
+- Metrics `knot_history_views_total{outcome}` (alert on `failed` and
+  `timeout`; `not_found`, `rebuilding` and `no_changes` are normal),
+  `knot_history_view_seconds`, and
+  `knot_history_replay_timeouts_total{phase="view"}`;
+  `knot_history_replay_threads_stalled` also counts version views that
+  timed out or whose request was dropped while they still run. (#TBD)
 
 ### Fixed
 - Pages whose content was waiting for an edit the server never got could
