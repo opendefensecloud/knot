@@ -8,6 +8,7 @@ pub mod comments;
 pub mod contributors;
 pub mod doc_store;
 pub mod duplicate;
+pub mod favorites;
 pub mod grant_store;
 pub mod invalidations;
 pub mod lexorank;
@@ -40,6 +41,9 @@ pub use contributors::{
     Contributor, ContributorStore, ContributorStoreError, DocByline, PersonRef, PgContributorStore,
 };
 pub use doc_store::{ArchivedRoot, DocStore, DocStoreError, Document, PgDocStore, SubtreeRow};
+pub use favorites::{
+    AddOutcome, FAVORITES_LIMIT, Favorite, FavoriteStore, FavoriteStoreError, PgFavoriteStore,
+};
 pub use grant_store::{ChainNode, Grant, GrantStore, GrantStoreError, PgGrantStore};
 pub use markdown_cache::{
     MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore, PgMarkdownCache,
