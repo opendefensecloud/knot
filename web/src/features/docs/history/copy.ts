@@ -7,6 +7,7 @@ export const copy = {
   title: "History",
   close: "Close",
   loadMore: "Load more",
+  loading: "Loading…",
   back: "Back to history",
   empty: "No history yet.",
   loadError: "History couldn't be loaded.",
