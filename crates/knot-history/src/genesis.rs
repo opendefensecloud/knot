@@ -1,6 +1,7 @@
 //! Genesis: a page's history before `history_since`, as one checkpoint.
 //!
-//! The genesis state is the newest baseline that applies plus every row with
+//! The genesis state is the newest baseline that applies (its trusted
+//! prefix when its bytes may be shifted, Ruling 15) plus every row with
 //! `rev ≤ genesis_rev` (`G`), in rev order (Rulings: genesis ends at the
 //! highest rev written before `history_since`; replay is idempotent, so rows
 //! the baseline already holds change nothing). It is written as the
@@ -25,7 +26,7 @@ use crate::claims::Claims;
 use crate::pass::{
     CheckpointKind, CheckpointWrite, PassStats, Progress, ReplayHooks, Stage, verified_state,
 };
-use crate::replay::{Parked, ReplayMode, Replayer, RowOutcome};
+use crate::replay::{Parked, ReplayMode, Replayer, RowOutcome, may_be_shifted, trusted_prefix};
 use crate::sessions::{EntryDraft, EntryKind};
 
 /// One `doc_history_baselines` row of the page.
@@ -65,6 +66,9 @@ pub struct GenesisOutput {
     pub claims: Claims,
     /// Legacy rows whose outcome was `Refused`.
     pub refused_revs: Vec<i64>,
+    /// The baseline genesis started from when its bytes may be shifted:
+    /// genesis started from its trusted prefix instead (Ruling 15).
+    pub from_prefix: Option<i64>,
     pub stats: PassStats,
 }
 
@@ -102,6 +106,7 @@ pub fn build_genesis(input: GenesisInput) -> Result<GenesisOutput, GenesisError>
     let mut stats = PassStats::default();
     let mut claims = Claims::default();
     let mut refused_revs = Vec::new();
+    let mut from_prefix = None;
 
     // The baseline genesis starts from: the newest one whose bytes it got.
     let start = baselines
@@ -119,7 +124,17 @@ pub fn build_genesis(input: GenesisInput) -> Result<GenesisOutput, GenesisError>
             {
                 std::thread::sleep(d);
             }
-            let e = replayer.merge_state(bytes);
+            // A baseline is a copy of a room snapshot every release before
+            // the fix wrote with yrs's shifted encoding: a phantom in
+            // genesis would make a later real row at the colliding id read
+            // as already held (Ruling 15).
+            let start = if may_be_shifted(bytes) {
+                from_prefix = Some(id);
+                trusted_prefix(bytes).ok_or(GenesisError::BaselineRejected { id })?
+            } else {
+                bytes.to_vec()
+            };
+            let e = replayer.merge_state(&start);
             if e.outcome != RowOutcome::Applied {
                 return Err(GenesisError::BaselineRejected { id });
             }
@@ -232,6 +247,7 @@ pub fn build_genesis(input: GenesisInput) -> Result<GenesisOutput, GenesisError>
         entries,
         claims,
         refused_revs,
+        from_prefix,
         stats,
     })
 }

@@ -73,7 +73,9 @@ pub fn block_range<T: ReadTxn>(
 }
 
 /// `state` (a page's full state) with every top-level block but
-/// `first..=last` deleted.
+/// `first..=last` deleted, encoded without pending content
+/// ([`crate::pending::encode_without_pending`], Ruling 22): the new page
+/// gets only placed content.
 pub fn child_state(state: &[u8], first: u32, last: u32) -> Result<Vec<u8>, MoveBlocksError> {
     let doc = load(state)?;
     let frag = doc.get_or_insert_xml_fragment(FRAGMENT);
@@ -85,7 +87,10 @@ pub fn child_state(state: &[u8], first: u32, last: u32) -> Result<Vec<u8>, MoveB
     if first > 0 {
         frag.remove_range(&mut txn, 0, first);
     }
-    Ok(txn.encode_state_as_update_v1(&StateVector::default()))
+    Ok(crate::pending::encode_without_pending(
+        &txn,
+        &StateVector::default(),
+    ))
 }
 
 /// A page's state as a doc to read anchors against.

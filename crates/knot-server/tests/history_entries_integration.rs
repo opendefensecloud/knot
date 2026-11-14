@@ -863,6 +863,62 @@ async fn catching_up_is_set_while_the_builder_lags() {
     assert_eq!(flags(&fx, lagging).await, (false, true, 1));
 }
 
+/// `UPDATE doc_history_state SET {set} WHERE doc_id = $1`, with `$2` bound
+/// to `version`.
+async fn set_version(fx: &Fixture, doc: Uuid, set: &str, version: i32) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE doc_history_state SET {set} WHERE doc_id = $1"
+    )))
+    .bind(doc)
+    .bind(version)
+    .execute(&fx.pool)
+    .await
+    .unwrap_or_else(|e| panic!("{set}: {e}"));
+}
+
+/// Ruling 14: a page an older builder built lists as catching up until a
+/// builder of this version has rebuilt it, also when the older one gave it
+/// up (whose entries can hold phantoms, so it is not reported unavailable).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_an_older_builder_built_lists_as_catching_up() {
+    use knot_history::builder::BUILDER_VERSION;
+    let fx = fixture().await;
+    let older = page(&fx, "Older").await;
+    append(&fx, older, fx.editor.id, paragraphs(4, 3)).await;
+    build(&fx, older).await;
+    assert_eq!(flags(&fx, older).await, (false, false, 1));
+    set_version(&fx, older, "builder_version = $2", BUILDER_VERSION - 1).await;
+    assert_eq!(
+        flags(&fx, older).await,
+        (true, false, 1),
+        "the flag changes, not the entries"
+    );
+    build(&fx, older).await;
+    assert_eq!(flags(&fx, older).await, (false, false, 1));
+
+    // Never edited: neither a heads nor a state row.
+    let untouched = page(&fx, "Untouched").await;
+    assert_eq!(flags(&fx, untouched).await, (false, false, 0));
+
+    // Given up by the older builder after genesis: catching up, not
+    // unavailable; given up by this one: unavailable, as before.
+    let given_up = page(&fx, "Given up").await;
+    append(&fx, given_up, fx.editor.id, paragraphs(5, 2)).await;
+    build(&fx, given_up).await;
+    set_version(
+        &fx,
+        given_up,
+        "builder_version = $2, retry_after = 'infinity'",
+        BUILDER_VERSION - 1,
+    )
+    .await;
+    let (catching_up, unavailable, _) = flags(&fx, given_up).await;
+    assert_eq!((catching_up, unavailable), (true, false));
+    set_version(&fx, given_up, "builder_version = $2", BUILDER_VERSION).await;
+    let (catching_up, unavailable, _) = flags(&fx, given_up).await;
+    assert_eq!((catching_up, unavailable), (false, true));
+}
+
 // ---------------------------------------------------------------------------
 // Meta
 // ---------------------------------------------------------------------------

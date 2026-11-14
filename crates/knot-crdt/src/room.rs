@@ -1035,19 +1035,22 @@ impl Room {
         commit: crate::move_blocks::Commit,
     ) -> Result<i64, crate::move_blocks::MoveBlocksError> {
         use crate::move_blocks::{MoveBlocksError, Prepared, block_range, child_state, cut};
-        use yrs::{ReadTxn, StateVector, Transact};
+        use yrs::{StateVector, Transact};
         // As `on_apply_suggestion`: the selected text may come from another
         // replica's edit this room hasn't seen yet.
         let _ = self.catch_up().await;
         // Before any transaction (see `on_replace`).
         let frag = self.doc.inner().get_or_insert_xml_fragment("default");
+        // The source's placed content only (Ruling 22): yrs's own encoder
+        // would carry its pending content, at shifted clocks, into the new
+        // page, where its dependency never arrives.
         let (first, last, state) = {
             let txn = self.doc.inner().transact();
             let (first, last) = block_range(&txn, &frag, &start, &end)?;
             (
                 first,
                 last,
-                txn.encode_state_as_update_v1(&StateVector::default()),
+                crate::pending::encode_without_pending(&txn, &StateVector::default()),
             )
         };
         let child_state = child_state(&state, first, last)?;

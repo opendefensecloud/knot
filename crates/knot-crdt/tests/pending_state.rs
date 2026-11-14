@@ -1636,6 +1636,7 @@ fn history_pass(
             rev: *rev,
             created_at: minute(*rev),
             state_bytes: Some(state.clone()),
+            legacy: false,
         })
         .collect();
     let last = rows.last().map_or(0, |r| r.rev.unwrap_or(0));
@@ -2466,5 +2467,192 @@ fn a_cover_of_3000_keystroke_rows_stays_cheap() {
             check < Duration::from_millis(250),
             "the check took {check:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The guard: no production code encodes pending content
+// ---------------------------------------------------------------------------
+
+/// Whether `line` opens a module: `^(pub(\([^)]*\))? )?mod \w+ \{`.
+fn opens_a_module(line: &str) -> bool {
+    let mut rest = line;
+    if let Some(r) = rest.strip_prefix("pub") {
+        let r = match r.strip_prefix('(') {
+            Some(inner) => match inner.find(')') {
+                Some(end) => &inner[end + 1..],
+                None => return false,
+            },
+            None => r,
+        };
+        match r.strip_prefix(' ') {
+            Some(r) => rest = r,
+            None => return false,
+        }
+    }
+    let Some(r) = rest.strip_prefix("mod ") else {
+        return false;
+    };
+    let name_len = r
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(r.len());
+    name_len > 0 && r[name_len..].starts_with(" {")
+}
+
+/// The 1-based lines of `source` that call yrs's state encoders
+/// (`encode_state_as_update_v1(` or `encode_state_as_update_v2(`), outside
+/// comments and outside test modules: from a `#[cfg(test)]` line whose next
+/// non-empty line opens a module ([`opens_a_module`]) through the first
+/// later line that is exactly `}` (rustfmt puts a top-level module's
+/// closing brace at column 0, and nothing inside it is at column 0).
+fn encoder_calls(source: &str) -> Vec<usize> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim() == "#[cfg(test)]"
+            && let Some(next) = (i + 1..lines.len()).find(|&j| !lines[j].trim().is_empty())
+            && opens_a_module(lines[next])
+        {
+            i = (next + 1..lines.len())
+                .find(|&j| lines[j] == "}")
+                .map_or(lines.len(), |j| j + 1);
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("//")
+            && (line.contains("encode_state_as_update_v1(")
+                || line.contains("encode_state_as_update_v2("))
+        {
+            found.push(i + 1);
+        }
+        i += 1;
+    }
+    found
+}
+
+/// Every `*.rs` file under `dir`, recursively.
+fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn no_production_code_encodes_pending_content() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut sites = Vec::new();
+    let mut crate_dirs: Vec<_> = std::fs::read_dir(&crates)
+        .expect("the crates directory")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && !p.ends_with("knot-test-support"))
+        .collect();
+    crate_dirs.sort();
+    for dir in crate_dirs {
+        let mut files = Vec::new();
+        rust_files(&dir.join("src"), &mut files);
+        files.sort();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("a source file");
+            for line in encoder_calls(&source) {
+                let shown = file.strip_prefix(&crates).unwrap_or(&file);
+                sites.push(format!("{}:{line}", shown.display()));
+            }
+        }
+    }
+    assert!(
+        sites.is_empty(),
+        "production code calls yrs's state encoder, which writes pending \
+         blocks at shifted clocks; use knot_crdt::pending::encode_without_pending: {sites:#?}"
+    );
+}
+
+#[test]
+fn the_guard_skips_test_modules_of_any_visibility() {
+    let snippet = "\
+fn production() {}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    fn a() {
+        let _ = txn.encode_state_as_update_v1(&sv);
+    }
+}
+
+#[cfg(test)]
+
+mod tests {
+    fn b() {
+        let _ = txn.encode_state_as_update_v2(&sv);
+    }
+}
+
+fn after() {
+    // txn.encode_state_as_update_v1(&sv) in a comment
+    let _ = txn.encode_state_as_update_v1(&sv);
+}
+
+#[cfg(test)]
+fn helper() {
+    let _ = txn.encode_state_as_update_v2(&sv);
+}
+";
+    let lines: Vec<&str> = snippet.lines().collect();
+    let reported: Vec<&str> = encoder_calls(snippet)
+        .into_iter()
+        .map(|l| lines[l - 1].trim())
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            "let _ = txn.encode_state_as_update_v1(&sv);",
+            "let _ = txn.encode_state_as_update_v2(&sv);",
+        ],
+    );
+    assert_eq!(encoder_calls(snippet), vec![20, 25]);
+    assert!(opens_a_module("pub mod x {"));
+    assert!(opens_a_module("pub(super) mod x_1 {"));
+    assert!(!opens_a_module("mod x;"));
+    assert!(!opens_a_module("fn mod_x() {"));
+}
+
+/// knot-history's ports (`replay::may_be_shifted`, `replay::trusted_prefix`)
+/// agree with knot-crdt's on the fixtures: knot-history does not depend on
+/// knot-crdt, so it keeps its own copy.
+#[test]
+fn knot_historys_ports_agree_with_the_rooms_rules() {
+    let o = overlapping_skips();
+    let states = [
+        shifted_full(overlapping_doc().inner()),
+        shifted_full(doc_of(&[&o.t0, &o.t3]).inner()),
+        shifted_full(doc_of(&[&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3]).inner()),
+        shifted_state_that_parks_nothing(),
+        shifted_state_yrs_refuses(),
+        b"not an update".to_vec(),
+    ];
+    for (i, state) in states.iter().enumerate() {
+        assert_eq!(
+            knot_history::replay::may_be_shifted(state),
+            may_be_shifted(state),
+            "state {i}"
+        );
+        let ours = trusted_prefix(state).ok();
+        let theirs = knot_history::replay::trusted_prefix(state);
+        assert_eq!(ours.is_some(), theirs.is_some(), "state {i}");
+        if let (Some(a), Some(b)) = (ours, theirs) {
+            assert!(same_ids(&insertions(&a), &insertions(&b)), "state {i}");
+            let (da, db) = (doc_of(&[&a]), doc_of(&[&b]));
+            assert_eq!(text(&da), text(&db), "state {i}");
+        }
     }
 }

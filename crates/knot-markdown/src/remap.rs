@@ -352,9 +352,11 @@ struct HeldItems(HashMap<BranchID, Vec<(u32, Held)>>);
 impl HeldItems {
     /// Reads the items from the document's own state, decoded as yrs
     /// decodes an update, without integrating it
-    /// ([`knot_crdt::update_items::decode`]).
+    /// ([`knot_crdt::update_items::decode`]). The state leaves pending
+    /// content out ([`knot_crdt::pending::encode_without_pending`]): it is
+    /// never visible, and yrs's own encoder can write it at shifted clocks.
     fn read<T: ReadTxn>(txn: &T) -> Option<Self> {
-        let state = txn.encode_state_as_update_v1(&StateVector::default());
+        let state = knot_crdt::pending::encode_without_pending(txn, &StateVector::default());
         Self::from_state(txn, &state)
     }
 

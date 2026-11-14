@@ -17,7 +17,7 @@ mod interleave;
 mod log_fixtures;
 
 use fixtures::{Rng, cross_client_parked, overlapping_skips, para};
-use interleave::{held, pending_parts};
+use interleave::{held, pending_ids, pending_parts};
 use knot_crdt::nesting::MAX_NESTING;
 use knot_crdt::pending::{self, holds_any};
 use knot_crdt::{
@@ -1760,4 +1760,93 @@ async fn carried_legacy_pending_content_is_named_by_the_next_snapshot() {
         n + 2,
         "a second carry was written"
     );
+}
+
+/// Ruling 22: "Move to subpage" copies only placed content. The source
+/// page's pending update holds overlapping Skips, so yrs's own encoder
+/// would write its pending blocks at shifted clocks into the new page's
+/// state; the copy must name only blocks the source room holds, and park
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_to_subpage_copies_only_placed_content() {
+    use knot_crdt::move_blocks::{Commit, Link, Prepared, load};
+    use yrs::IndexedSequence;
+    let o = overlapping_skips();
+    let parked: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let scratch = doc_of(&parked);
+    assert_eq!(
+        pending::pending_update_v1(&scratch.inner().transact()),
+        pending::PendingV1::Shifted,
+        "fixture: the pending update holds overlapping Skips"
+    );
+    let phantoms = insertions(&shifted_state(&parked))
+        .diff(&held(scratch.inner()))
+        .diff(&pending_ids(scratch.inner()));
+    assert!(holds_any(&phantoms), "fixture: yrs's full state is shifted");
+
+    let (pool, doc) = new_page().await;
+    let store = Arc::new(PgUpdatesStore::new(pool.clone()));
+    let h = open_room(&pool, doc, store, LAZY).await;
+    let c = Client::join(&h, 7).await;
+    for u in parked {
+        c.send(&h, u.to_vec()).await;
+    }
+    until_rows(&pool, doc, 3).await;
+
+    // Anchors inside t0's paragraph, as the editor sends them.
+    let replica = doc_of(&[&o.t0]);
+    let anchor = |index: u32, assoc: yrs::Assoc| {
+        let frag = replica.inner().get_or_insert_xml_fragment("default");
+        let txn = replica.inner().transact();
+        fixtures::text_at(&frag, &txn, 0)
+            .expect("t0's paragraph")
+            .sticky_index(&txn, index, assoc)
+            .expect("an index inside \"base\"")
+            .encode_v1()
+    };
+    let (start, end) = (anchor(1, yrs::Assoc::After), anchor(3, yrs::Assoc::Before));
+    let slot: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
+    let commit: Commit = {
+        let slot = slot.clone();
+        Box::new(move |prepared: Prepared| {
+            *slot.lock().unwrap() = Some(prepared.child_state);
+            Box::pin(async {
+                Ok(Link {
+                    title: "T".into(),
+                    href: "knot://doc/x".into(),
+                    meta: serde_json::json!({}),
+                })
+            })
+        })
+    };
+    let (reply, rx) = oneshot::channel();
+    h.tx.send(Event::MoveBlocksOut {
+        start,
+        end,
+        by_user: None,
+        commit,
+        reply,
+    })
+    .await
+    .unwrap();
+    rx.await.unwrap().expect("the move");
+    let child = slot.lock().unwrap().take().expect("the commit ran");
+
+    let (room, _) = room_doc(&h).await;
+    let copied = insertions(&child);
+    assert!(
+        within(&copied, &held(room.inner())),
+        "the new page names blocks the source room lacks: {:?}",
+        copied.diff(&held(room.inner()))
+    );
+    assert!(!holds_any(&copied.intersect(&phantoms)));
+    assert!(
+        !pending::parks_when_applied(&child),
+        "the new page parks content"
+    );
+    let moved = load(&child).expect("the new page loads");
+    let frag = moved.get_or_insert_xml_fragment("default");
+    let page = yrs::GetString::get_string(&frag, &moved.transact());
+    assert!(page.contains("base"), "{page}");
+    shut_down(&h).await;
 }

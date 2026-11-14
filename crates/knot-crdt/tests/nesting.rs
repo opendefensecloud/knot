@@ -42,6 +42,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use yrs::block::{ClientID, ItemContent};
 use yrs::encoding::write::Write;
+use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{
     Doc, Options, ReadTxn, StateVector, Text, Transact, XmlElementPrelim, XmlElementRef,
@@ -1758,4 +1759,327 @@ fn the_reader_reads_the_updates_of_these_tests_as_yrs_does() {
         None,
         "a subtree DEEP types deep, and its deletion"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Drained pending types (Ruling 12): measured from the store, never from
+// yrs's encoding of a merged pending update
+// ---------------------------------------------------------------------------
+
+/// The transaction's own update, as a client sends it.
+fn txn_update(doc: &Doc, f: impl FnOnce(&mut yrs::TransactionMut)) -> Vec<u8> {
+    let mut txn = doc.transact_mut();
+    f(&mut txn);
+    txn.encode_update_v1()
+}
+
+/// The id of the item that holds the type `node`.
+fn item_id(node: &XmlElementRef) -> yrs::ID {
+    match AsRef::<yrs::branch::Branch>::as_ref(node).id() {
+        yrs::branch::BranchID::Nested(id) => id,
+        yrs::branch::BranchID::Root(_) => panic!("a nested type"),
+    }
+}
+
+/// `fixtures::overlapping_skips()`'s five transactions by client 1, whose
+/// `t3` also embeds an element in paragraph 0's text at index 5 (inside
+/// "base", so the embed's origins are t0's) and nests `MAX_NESTING + 1`
+/// elements inside it. Returns `[t0, t1, t2, t2b, t3]`, the embed's id, and
+/// client 1's content in order up to the embed (`partial`): the author's
+/// blocks below the embed's clock, as a writer can re-send them, holding no
+/// type of the chain.
+fn overlapping_skips_with_a_deep_embed() -> ([Vec<u8>; 5], yrs::ID, Vec<u8>) {
+    let c = Doc::with_client_id(1);
+    let frag = c.get_or_insert_xml_fragment("default");
+    let text0 = |txn: &yrs::TransactionMut| fixtures::text_at(&frag, txn, 0).expect("paragraph 0");
+    let t0 = txn_update(&c, |txn| {
+        let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
+        p.push_back(txn, XmlTextPrelim::new("base"));
+    });
+    let t1 = txn_update(&c, |txn| text0(txn).insert(txn, 4, "WWW"));
+    let t2 = txn_update(&c, |txn| text0(txn).insert(txn, 7, "pp"));
+    let t2b = txn_update(&c, |txn| text0(txn).insert(txn, 0, "zz"));
+    let mut embed = None;
+    let t3 = txn_update(&c, |txn| {
+        let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
+        p.push_back(txn, XmlTextPrelim::new("new"));
+        text0(txn).insert(txn, 7, "qq");
+        let e = text0(txn).insert_embed(txn, 5, XmlElementPrelim::empty("embed"));
+        embed = Some(item_id(&e));
+        chain(&e, txn, MAX_NESTING + 1);
+    });
+    let embed = embed.expect("the embed");
+    let ordered = Doc::with_options(Options {
+        skip_gc: true,
+        ..Options::default()
+    });
+    for u in [&t0, &t1, &t2, &t2b, &t3] {
+        ordered
+            .transact_mut()
+            .apply_update(yrs::Update::decode_v1(u).unwrap())
+            .unwrap();
+    }
+    let upto: StateVector = [(embed.client, embed.clock)].into_iter().collect();
+    let mut enc = EncoderV1::new();
+    ordered
+        .transact()
+        .encode_state_from_snapshot(&yrs::Snapshot::new(upto, yrs::IdSet::new()), &mut enc)
+        .unwrap();
+    ([t0, t1, t2, t2b, t3], embed, enc.to_vec())
+}
+
+/// Ruling 12: a deep type parked behind overlapping Skips is measured when
+/// it drains. yrs parks the embed (its origins are held) because "qq"
+/// before it in `t3` cannot integrate, and the doc's pending update then
+/// encodes `Shifted`. `t1` and `t2b` leave the content stuck in a live doc
+/// (yrs retries nothing: Task 1, Concern 2), so the drain comes from a
+/// re-send of the author's blocks up to the embed, which carries no type of
+/// the chain: only the doc's own blocks name it.
+#[test]
+fn a_deep_type_parked_behind_overlapping_skips_is_measured_when_it_drains() {
+    on_worker_stack(|| {
+        let ([t0, t1, t2, t2b, t3], embed, partial) = overlapping_skips_with_a_deep_embed();
+        assert!(
+            !inserted_type_ids(&partial).unwrap().contains(&embed),
+            "fixture: the drain carries no type of the chain"
+        );
+        let live = YrsEngine.new_doc();
+        for u in [&t0, &t2, &t3] {
+            let m = YrsEngine
+                .apply_update_measuring(&live, u, MAX_NESTING)
+                .expect("apply");
+            assert!(m.max_depth <= MAX_NESTING, "{}", m.max_depth);
+        }
+        assert_eq!(
+            knot_crdt::pending::pending_update_v1(&live.inner().transact()),
+            knot_crdt::pending::PendingV1::Shifted,
+            "fixture: the pending update holds overlapping Skips"
+        );
+        let claims = knot_crdt::pending::claims(&live).expect("fixture: content parks");
+        assert!(
+            claims.structs.contains(&embed),
+            "fixture: the embed is pending"
+        );
+        for u in [&t1, &t2b] {
+            let m = YrsEngine
+                .apply_update_measuring(&live, u, MAX_NESTING)
+                .expect("apply");
+            assert!(m.max_depth <= MAX_NESTING, "{}", m.max_depth);
+        }
+        let stuck = knot_crdt::pending::claims(&live).expect("fixture: still pending");
+        assert!(
+            stuck.structs.contains(&embed),
+            "fixture: the embed is stuck"
+        );
+        let m = YrsEngine
+            .apply_update_measuring(&live, &partial, MAX_NESTING)
+            .expect("apply");
+        assert!(
+            knot_crdt::pending::claims(&live).is_none(),
+            "fixture: the re-send drains the embed"
+        );
+        assert!(
+            m.max_depth > MAX_NESTING,
+            "the drained chain was not measured: {}",
+            m.max_depth
+        );
+    });
+}
+
+/// A page nested past the limit before the limit existed, with content
+/// parked behind overlapping Skips (`t0`, `t2`, `t3`): a room boots it
+/// unmeasured from its log (no snapshot), and a shallow edit, which drains
+/// nothing, is stored, and so is the next: the room neither refuses the
+/// sender nor evicts itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_deep_legacy_page_with_shifted_pending_content_still_takes_edits() {
+    let o = fixtures::overlapping_skips();
+    let deep = on_big_stack(|| chain_update(MAX_NESTING + 2));
+    let store = Stored::default();
+    store
+        .0
+        .lock()
+        .unwrap()
+        .extend([deep, o.t0.clone(), o.t2.clone(), o.t3.clone()]);
+    let doc_id = Uuid::new_v4();
+    let room = room_on(doc_id, &store).await;
+    let (conn, _rx, refused) = join(&room).await;
+    let edit = sentinel();
+    send(&room, conn, edit.clone()).await;
+    store.holds(&edit).await;
+    assert!(!refused.is_cancelled(), "the editor was refused");
+    let second = {
+        let doc = Doc::new();
+        let frag = doc.get_or_insert_xml_fragment("default");
+        {
+            let mut txn = doc.transact_mut();
+            let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new("again"));
+        }
+        state(&doc)
+    };
+    send(&room, conn, second.clone()).await;
+    store.holds(&second).await;
+    assert!(!refused.is_cancelled(), "the editor was refused");
+}
+
+/// Ruling 12: no measurement walks a drained block clock by clock. A few
+/// bytes park an item of `ContentDeleted` `1 << 31` clocks long behind a
+/// missing origin; the apply that brings the origin drains it and is
+/// measured in bounded time. (Main's code reads the pending update's
+/// encoding, which passes too: this guards the measurement against a
+/// per-clock design.)
+#[test]
+fn a_drained_long_deleted_item_is_measured_in_bounded_time() {
+    on_worker_stack(|| {
+        const LEN: u32 = 1 << 31;
+        let a = {
+            let mut enc = EncoderV1::new();
+            enc.write_var(1u32);
+            enc.write_var(1u32);
+            enc.write_client(ClientID::new(7));
+            enc.write_var(0u32);
+            enc.write_info(yrs::block::HAS_ORIGIN | yrs::block::BLOCK_ITEM_DELETED_REF_NUMBER);
+            enc.write_left_id(&yrs::ID::new(ClientID::new(8), 0));
+            ItemContent::Deleted(LEN).encode(&mut enc);
+            enc.write_var(0u32);
+            enc.to_vec()
+        };
+        let doc = YrsEngine.new_doc();
+        let m = YrsEngine
+            .apply_update_measuring(&doc, &a, MAX_NESTING)
+            .expect("A applies");
+        assert!(m.pending_changed, "fixture: A parks");
+        let claims = knot_crdt::pending::claims(&doc).expect("fixture: A parks");
+        let mut whole = yrs::IdSet::new();
+        whole.insert(yrs::ID::new(ClientID::new(7), 0), LEN);
+        assert!(
+            claims
+                .structs
+                .contains(&yrs::ID::new(ClientID::new(7), LEN - 1))
+                && !knot_crdt::pending::holds_any(&whole.diff(&claims.structs)),
+            "fixture: client 7's whole range is pending: {claims:?}"
+        );
+        let b = {
+            let d = Doc::with_client_id(8);
+            let frag = d.get_or_insert_xml_fragment("default");
+            frag.push_back(&mut d.transact_mut(), XmlElementPrelim::empty("paragraph"));
+            state(&d)
+        };
+        let started = std::time::Instant::now();
+        YrsEngine
+            .apply_update_measuring(&doc, &b, MAX_NESTING)
+            .expect("B applies");
+        let took = started.elapsed();
+        assert!(
+            knot_crdt::pending::claims(&doc).is_none(),
+            "B drains the item"
+        );
+        assert!(took < Duration::from_millis(200), "the apply took {took:?}");
+    });
+}
+
+/// Ruling 12's round-4 case: a chain nested past the limit parks at clocks
+/// above a gap of its own client that never fills (`A0` is never sent), and
+/// drains, past that gap, when its parent arrives (`Y`). The state vector
+/// stops at client 31's gap, so the measurement must encode every block of
+/// each client the apply inserted for, not the blocks above a lowered
+/// clock (`StateVector::set_min` would keep client 31's clock at 0 and
+/// write nothing for it).
+#[test]
+fn a_deep_type_drained_past_its_clients_own_gap_is_measured() {
+    on_worker_stack(|| {
+        let owner = Doc::with_client_id(32);
+        let owner_frag = owner.get_or_insert_xml_fragment("default");
+        owner_frag.push_back(
+            &mut owner.transact_mut(),
+            XmlElementPrelim::empty("paragraph"),
+        );
+        let y = state(&owner);
+        let writer = Doc::with_client_id(31);
+        writer
+            .transact_mut()
+            .apply_update(yrs::Update::decode_v1(&y).unwrap())
+            .unwrap();
+        let frag = writer.get_or_insert_xml_fragment("default");
+        {
+            let mut txn = writer.transact_mut();
+            let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new("abc"));
+        }
+        // A0 (31#0..5) is never sent.
+        let after_a0 = writer.transact().state_vector();
+        assert_eq!(after_a0.get(&ClientID::new(31)), 5, "fixture: A0's clocks");
+        let root = {
+            let mut txn = writer.transact_mut();
+            let Some(XmlOut::Element(parent)) = frag.get(&txn, 0) else {
+                panic!("Y's paragraph comes first");
+            };
+            let first = parent.push_back(&mut txn, XmlElementPrelim::empty("blockquote"));
+            chain(&first, &mut txn, MAX_NESTING);
+            item_id(&first)
+        };
+        let a1 = writer.transact().encode_diff_v1(&after_a0);
+
+        let doc = YrsEngine.new_doc();
+        let m = YrsEngine
+            .apply_update_measuring(&doc, &a1, MAX_NESTING)
+            .expect("A1 applies");
+        assert!(m.max_depth <= MAX_NESTING, "A1 parks: {}", m.max_depth);
+        let m = YrsEngine
+            .apply_update_measuring(&doc, &y, MAX_NESTING)
+            .expect("Y applies");
+        {
+            let txn = doc.inner().transact();
+            assert!(
+                knot_crdt::pending::claims(&doc).is_none(),
+                "fixture: the chain drained"
+            );
+            assert_eq!(
+                txn.state_vector().get(&ClientID::new(31)),
+                0,
+                "fixture: client 31's gap never filled"
+            );
+            let held = yrs::Update::decode_v1(&knot_crdt::pending::encode_without_pending(
+                &txn,
+                &StateVector::default(),
+            ))
+            .unwrap()
+            .insertions(true);
+            assert!(
+                held.contains(&root),
+                "fixture: the chain integrated past client 31's gap"
+            );
+        }
+        assert!(
+            m.max_depth > MAX_NESTING,
+            "the chain drained past its client's gap unmeasured: {}",
+            m.max_depth
+        );
+    });
+}
+
+/// A shallow edit on a page nested past the limit, with nothing pending,
+/// is measured at its own depth: the measurement never walks the page.
+#[test]
+fn a_shallow_edit_on_a_page_with_nothing_pending_is_not_measured_deep() {
+    let deep = on_big_stack(|| chain_update(MAX_NESTING + 2));
+    on_worker_stack(move || {
+        let edit = sentinel();
+        let own = YrsEngine
+            .apply_update_measuring(&YrsEngine.new_doc(), &edit, MAX_NESTING)
+            .expect("measure on an empty page")
+            .max_depth;
+        let doc = YrsEngine.new_doc();
+        YrsEngine.apply_update(&doc, &deep).expect("hydrate");
+        assert!(
+            nests_deeper_than(&doc, MAX_NESTING),
+            "fixture: the page is over the limit"
+        );
+        let measured = YrsEngine
+            .apply_update_measuring(&doc, &edit, MAX_NESTING)
+            .expect("measure the edit");
+        assert!(measured.changed);
+        assert_eq!(measured.max_depth, own);
+    });
 }

@@ -183,14 +183,22 @@ impl History {
     }
 
     /// The room's state as a snapshot: its blocks and delete set, without
-    /// its pending content. A room's own snapshot today is
+    /// its pending content, as every room writes it from the fix on
+    /// (`knot_crdt::pending::encode_without_pending`; its `pending_revs`
+    /// name the rows that parked the rest). Rooms before the fix wrote
     /// `encode_state_as_update_v1`, which merges in yrs 0.27.3's encoding of
     /// the pending update, and that encoding shifts the clocks of pending
     /// blocks once the pending update holds overlapping Skips (`replay`
     /// module docs): such a snapshot names blocks the room never had, which
     /// the gap check would report as gap content (seed 251 of
-    /// `snapshots_of_the_log_report_no_gap`). The generator models a room
-    /// that does not write that encoding.
+    /// `snapshots_of_the_log_report_no_gap`); the builder leaves such a
+    /// legacy snapshot unchecked (`SnapshotProbe::legacy`, Ruling 13).
+    ///
+    /// This models a fixed room that never reboots. A rebooted room's
+    /// snapshot can also hold, as placed blocks, stuck content a kept row
+    /// integrated at boot; knot-crdt's reboot property
+    /// (`tests/pending_state.rs`) feeds those snapshots to `run_pass` and
+    /// reports its counts there.
     pub fn room_snapshot(&self) -> Vec<u8> {
         let mut encoder = EncoderV1::new();
         self.room

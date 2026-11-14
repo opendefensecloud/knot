@@ -966,3 +966,71 @@ fn find_the_skip_underflow() {
     }
     panic!("no panic in 2000 seeds");
 }
+
+// ---------------------------------------------------------------------------
+// Bytes that may be shifted (Rulings 13 and 15; knot-crdt's
+// `pending::may_be_shifted` and `pending::trusted_prefix`, ported)
+// ---------------------------------------------------------------------------
+
+/// yrs's own full state of a doc that applied `updates` in order.
+fn yrs_full_state(updates: &[&[u8]]) -> Vec<u8> {
+    let doc = Doc::new();
+    for u in updates {
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(u).unwrap())
+            .unwrap();
+    }
+    doc.transact()
+        .encode_state_as_update_v1(&StateVector::default())
+}
+
+#[test]
+fn may_be_shifted_flags_the_states_that_name_blocks_past_a_gap() {
+    use knot_history::replay::may_be_shifted;
+    let o = fixtures::overlapping_skips();
+    assert!(may_be_shifted(&yrs_full_state(&[&o.t0, &o.t2, &o.t3])));
+    // Text past a gap with nothing pending: the same test (Task 1's
+    // fallback: names alone), since it cannot be told from shifted blocks.
+    assert!(may_be_shifted(&yrs_full_state(&[&o.t0, &o.t3])));
+    assert!(may_be_shifted(&fixtures::shifted_state_that_parks_nothing()));
+    assert!(!may_be_shifted(&yrs_full_state(&[
+        &o.t0, &o.t1, &o.t2, &o.t2b, &o.t3
+    ])));
+    assert!(!may_be_shifted(b"not an update"));
+}
+
+#[test]
+fn the_trusted_prefix_holds_no_phantom_and_parks_nothing() {
+    use knot_history::replay::trusted_prefix;
+    let o = fixtures::overlapping_skips();
+    let parked: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let mut r = Replayer::new(ReplayMode::Gc);
+    for u in parked {
+        r.apply(u);
+    }
+    let held = insertions_of(&r.encode_state());
+    let prefix = trusted_prefix(&yrs_full_state(&parked)).expect("the prefix");
+    assert!(
+        !insertions_of(&prefix)
+            .diff(&held)
+            .iter()
+            .any(|(_, r)| !r.is_empty()),
+        "the prefix names a phantom"
+    );
+    let fresh = Replayer::from_state(ReplayMode::Gc, &prefix).expect("the prefix applies");
+    assert!(!fresh.has_pending());
+    assert!(!knot_history::replay::may_be_shifted(&prefix));
+    let text = |state: &[u8]| {
+        let r = Replayer::from_state(ReplayMode::Gc, state).unwrap();
+        let txn = r.doc().transact();
+        txn.get_xml_fragment("default")
+            .map(|f| f.get_string(&txn))
+            .unwrap_or_default()
+    };
+    assert!(text(&prefix).contains("base"));
+    // A state yrs refuses part way still has one.
+    let refused = trusted_prefix(&fixtures::shifted_state_yrs_refuses()).expect("the prefix");
+    assert!(insertions_of(&refused).iter().any(|(_, r)| !r.is_empty()));
+    assert!(!knot_history::replay::may_be_shifted(&refused));
+    assert!(trusted_prefix(b"not an update").is_none());
+}

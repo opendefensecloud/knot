@@ -904,11 +904,13 @@ fn memory(growth: Growth) -> [f64; 2] {
             rev: built_rev,
             created_at: at(built_rev) + Duration::seconds(30),
             state_bytes: Some(late.clone()),
+            legacy: false,
         },
         SnapshotProbe {
             rev: union_rev,
             created_at: at(union_rev) + Duration::seconds(30),
             state_bytes: Some(union_state.clone()),
+            legacy: false,
         },
     ];
     let pass_input_bytes = checkpoint_state.len()
@@ -1126,6 +1128,7 @@ fn checkpoint_heavy(growth: Growth) -> [f64; 3] {
         rev: checkpoint_rev,
         created_at: at(checkpoint_rev) + Duration::seconds(30),
         state_bytes: Some(late.clone()),
+        legacy: false,
     }]);
     let b = measure(|| run_pass(input).expect("the pass"));
     let out = b.value;

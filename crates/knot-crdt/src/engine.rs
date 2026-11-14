@@ -204,34 +204,19 @@ impl Engine for YrsEngine {
     ) -> Result<ApplyMeasured, EngineError> {
         // The shared types this apply could integrate: the update's own, read
         // before yrs reads it (an update this reader refuses is not applied
-        // at all), and any already parked as pending — this update may be
-        // what they were waiting for, in which case they integrate now and
-        // must be measured.
+        // at all), and, when the apply changed the pending content, any that
+        // drained (below).
         let mut type_ids = crate::nesting::inserted_type_ids(update)
             .map_err(|e| EngineError::Decode(e.to_string()))?;
         let u = Update::decode_v1(update).map_err(|e| EngineError::Decode(e.to_string()))?;
         let mut txn = d.0.transact_mut();
         let pending_before = pending_fingerprint(&txn);
-        if let Some(pending) = txn.store().pending_update() {
-            // yrs encoded them, from updates that decoded.
-            type_ids.extend(
-                crate::nesting::inserted_type_ids(&pending.update.encode_v1()).unwrap_or_default(),
-            );
-        }
         // On an error, what yrs integrated before it stays in the doc, and
         // is measured below like the rest.
         let rejected = txn.apply_update(u).err().map(|e| e.to_string());
         let pending_changed = pending_fingerprint(&txn) != pending_before;
         let changed =
             !txn.insert_set().is_empty() || !txn.delete_set().is_empty() || pending_changed;
-        // Measure only the types THIS transaction actually integrated — the
-        // ones in its insert set. A full-state SyncStep2 re-send re-encodes
-        // every type the doc already has; those must not be re-measured, or
-        // reconnecting to a page already nested past the limit (a legacy
-        // page, the documented pre-existing limitation) would wrongly evict
-        // the room on every join. Content parked as pending that integrates
-        // now IS in the insert set, so it is still measured.
-        type_ids.retain(|id| txn.insert_set().contains(id));
         let inserted = if changed {
             txn.insert_set().clone()
         } else {
@@ -241,6 +226,37 @@ impl Engine for YrsEngine {
         // integrated, garbage-collected document, and the effective update
         // below is encoded from it.
         txn.commit();
+        if pending_changed {
+            // Parked content may have drained: its types are among the
+            // blocks of the clients this transaction inserted for. Read them
+            // from the doc's own blocks (Ruling 12), never from yrs's
+            // encoding of the merged pending update, which can write them at
+            // shifted ids. With those clients left out of `from`,
+            // `encode_diff_v1` writes every block they hold, from their first
+            // block, blocks past a gap included: a drain can integrate a
+            // block past its own client's gap, which moves no clock, so a
+            // lowered clock (`StateVector::set_min`) would miss it. The cost
+            // follows the bytes the doc holds for them, never clock lengths.
+            let inserted_for: std::collections::BTreeSet<_> =
+                txn.insert_set().iter().map(|(client, _)| *client).collect();
+            let from: StateVector = txn
+                .state_vector()
+                .iter()
+                .filter(|(client, _)| !inserted_for.contains(*client))
+                .map(|(client, clock)| (*client, *clock))
+                .collect();
+            type_ids.extend(
+                crate::nesting::inserted_type_ids(&txn.encode_diff_v1(&from)).unwrap_or_default(),
+            );
+        }
+        // Measure only the types THIS transaction actually integrated — the
+        // ones in its insert set. A full-state SyncStep2 re-send re-encodes
+        // every type the doc already has; those must not be re-measured, or
+        // reconnecting to a page already nested past the limit (a legacy
+        // page, the documented pre-existing limitation) would wrongly evict
+        // the room on every join. Content parked as pending that integrates
+        // now IS in the insert set, so it is still measured.
+        type_ids.retain(|id| txn.insert_set().contains(id));
         let max_depth = crate::nesting::deepest_inserted_type_depth(&txn, &type_ids, limit);
         let (persist, raw_fallback) = if !changed || rejected.is_some() {
             (Vec::new(), false)

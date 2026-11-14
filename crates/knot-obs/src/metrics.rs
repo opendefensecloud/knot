@@ -198,7 +198,7 @@ fn describe_history_metrics() {
     );
     describe_counter!(
         "knot_history_snapshots_unchecked_total",
-        "Room snapshots the history builder left out of its gap check, by reason (refused|corrupt|undecodable|panic|timeout|too_large|kept_gap)"
+        "Room snapshots the history builder left out of its gap check, by reason (refused|corrupt|undecodable|panic|timeout|too_large|kept_gap|pending)"
     );
     describe_counter!(
         "knot_history_build_failures_total",
