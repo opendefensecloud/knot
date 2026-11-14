@@ -70,6 +70,9 @@ type Opts = {
   body?: Body;
   contentType?: string;
   parser?: (data: unknown) => unknown;
+  /** Aborts the request (a superseded query, an unmounted view); `fetch`
+   *  then rejects with an `AbortError`. */
+  signal?: AbortSignal;
 };
 
 const UNSAFE = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -91,7 +94,9 @@ export async function apiFetch<T>(path: string, opts: Opts = {}): Promise<ApiRes
     const csrf = readCookie("csrf");
     if (csrf) headers["X-CSRF-Token"] = csrf;
   }
-  const res = await fetch(path, { method, credentials: "include", headers, body });
+  const init: RequestInit = { method, credentials: "include", headers, body };
+  if (opts.signal) init.signal = opts.signal;
+  const res = await fetch(path, init);
   const text = await res.text();
   let data: unknown = undefined;
   if (text.length > 0) {
@@ -104,4 +109,19 @@ export async function apiFetch<T>(path: string, opts: Opts = {}): Promise<ApiRes
   if (!res.ok) return { error: apiErrorFrom(res.status, data) };
   const parsed = opts.parser ? opts.parser(data) : data;
   return { ok: parsed as T };
+}
+
+/** Unwraps an ApiResult, throwing on error. The thrown value carries the
+ *  HTTP `status` (and `code`) from the API error so that
+ *  `queryClient`'s retry predicate — which keys off `"status" in error` —
+ *  can see it and correctly skip retries on 4xx responses. A bare
+ *  `new Error(message)` would defeat that predicate silently. */
+export function unwrapResult<T>(res: ApiResult<T>): T {
+  if ("error" in res) {
+    throw Object.assign(new Error(res.error.message), {
+      status: res.error.status,
+      code: res.error.code,
+    });
+  }
+  return res.ok;
 }

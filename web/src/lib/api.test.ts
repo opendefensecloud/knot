@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { ApiRequestError, apiFetch, fetchBlob, readApiError } from "./api";
+import { ApiRequestError, apiFetch, fetchBlob, readApiError, unwrapResult } from "./api";
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -52,6 +52,28 @@ describe("apiFetch", () => {
     const init = spy.mock.calls[0]?.[1];
     const headers = init?.headers as Record<string, string> | undefined;
     expect(headers?.["X-CSRF-Token"]).toBeUndefined();
+  });
+
+  it("passes the abort signal to fetch", async () => {
+    const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
+    );
+    const controller = new AbortController();
+    await apiFetch("/api/foo", { signal: controller.signal });
+    expect(spy.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
+  });
+
+  it("unwrapResult throws the status and code of an error result", () => {
+    const res = { error: { status: 503, code: "history.busy", message: "busy", details: {} } };
+    let thrown: unknown;
+    try {
+      unwrapResult(res);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).toMatchObject({ status: 503, code: "history.busy" });
+    expect(unwrapResult({ ok: 1 })).toBe(1);
   });
 });
 
