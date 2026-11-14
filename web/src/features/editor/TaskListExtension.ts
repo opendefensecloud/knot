@@ -33,8 +33,24 @@ export function checkedState(value: unknown): boolean | null {
   return null;
 }
 
-export const TaskListExtension = Extension.create({
+export interface TaskListOptions {
+  /**
+   * Checkbox clicks change nothing. Set by the history viewer
+   * (`createSchemaExtensions({viewer: true})`): ProseMirror runs
+   * `handleClickOn` from mousedown, which fires on a non-editable view too,
+   * so without it a click would tick a past version's task on screen, a
+   * state that never existed. Not tied to `view.editable`, because the live
+   * editor opens pages in view mode and its clicks stay as they are.
+   */
+  readOnly: boolean;
+}
+
+export const TaskListExtension = Extension.create<TaskListOptions>({
   name: "knotTaskList",
+
+  addOptions() {
+    return { readOnly: false };
+  },
 
   addGlobalAttributes() {
     return [
@@ -85,11 +101,13 @@ export const TaskListExtension = Extension.create({
   },
 
   addProseMirrorPlugins() {
+    const readOnly = this.options.readOnly;
     return [
       new Plugin({
         key: new PluginKey("knotTaskListClick"),
         props: {
           handleClickOn(view, _pos, node, nodePos, event) {
+            if (readOnly) return false;
             // Only handle clicks on list_item nodes that have the checked attr.
             if (node.type.name !== "list_item") return false;
             const state = checkedState(node.attrs.checked);

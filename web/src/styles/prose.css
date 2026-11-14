@@ -523,6 +523,35 @@
 }
 
 /* ---------------------------------------------------------------- */
+/* History diff — a past version's changes in the read-only viewer  */
+/* ---------------------------------------------------------------- */
+
+/* The decoration colours are the plain tokens (the e2e spec compares the
+   computed colours with them); the tint and the fade go elsewhere. */
+.ProseMirror .history-insert {
+  text-decoration: underline;
+  text-decoration-color: var(--color-history-added);
+  background: color-mix(in srgb, var(--color-history-added) 12%, transparent);
+}
+.ProseMirror .history-delete {
+  text-decoration: line-through;
+  text-decoration-color: var(--color-destructive);
+  opacity: 0.8;
+}
+
+/* A block the version added, removed or changed: a bar on its left. */
+.ProseMirror [data-history-change="added"] {
+  box-shadow: inset 3px 0 0 var(--color-history-added);
+}
+.ProseMirror [data-history-change="removed"] {
+  box-shadow: inset 3px 0 0 var(--color-destructive);
+  opacity: 0.7;
+}
+.ProseMirror [data-history-change="changed"] {
+  box-shadow: inset 3px 0 0 var(--color-accent);
+}
+
+/* ---------------------------------------------------------------- */
 /* Width modes — measure cap + per-block breakout                   */
 /*                                                                  */
 /* In fixed mode --knot-measure equals the content box, so every    */

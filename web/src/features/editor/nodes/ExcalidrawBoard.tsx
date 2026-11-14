@@ -10,12 +10,25 @@ import { ExcalidrawBoardView } from "./ExcalidrawBoardView";
  * NodeView fetches a cached SVG preview from `/api/boards/:id/svg`; clicking
  * opens the editor modal (mounted in T10).
  */
-export const ExcalidrawBoard = Node.create({
+export interface ExcalidrawBoardOptions {
+  /**
+   * The history viewer's board: no `Open` button, a preview that is not
+   * clickable, no editor modal. The node view opens the live, editable
+   * board whatever `editor.isEditable` says, so a read-only page needs
+   * this rather than the editable flag.
+   */
+  readOnly: boolean;
+}
+
+export const ExcalidrawBoard = Node.create<ExcalidrawBoardOptions>({
   name: "excalidraw_board",
   group: "block",
   atom: true,
   selectable: true,
   draggable: true,
+  addOptions() {
+    return { readOnly: false };
+  },
   addAttributes() {
     return {
       board_id: { default: "" },

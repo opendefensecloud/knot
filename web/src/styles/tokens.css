@@ -4,8 +4,10 @@
    overrides elsewhere keep selecting on [data-theme="dark"].
 
    Adding a skin: one block here, one entry in skins.ts. Keep body text
-   at 7:1 against bg and surface, muted text and destructive at 4.5:1,
-   accent at 3:1, and accent-fg at 4.5:1 on accent. */
+   at 7:1 against bg and surface, muted text, destructive and
+   history-added at 4.5:1, accent at 3:1, and accent-fg at 4.5:1 on
+   accent. history-added is the colour of text a page version added
+   (history viewer; destructive marks what it removed). */
 
 :root {
   --font-ui: 'Inter Variable', Inter, system-ui, sans-serif;
@@ -30,6 +32,7 @@
   --color-accent: #2563EB;
   --color-accent-fg: #FFFFFF;
   --color-destructive: #DC2626;
+  --color-history-added: #15803D;
 }
 
 /* Warm cream and ink, with a serif for the document body. */
@@ -43,6 +46,7 @@
   --color-accent: #9C4A2C;
   --color-accent-fg: #FFFFFF;
   --color-destructive: #B42318;
+  --color-history-added: #157A3A;
   --font-body: 'Source Serif 4 Variable', 'Source Serif 4', Georgia, 'Times New Roman', serif;
 }
 
@@ -58,6 +62,7 @@
   --color-accent: #1D6FB3;
   --color-accent-fg: #FFFFFF;
   --color-destructive: #BC2D1B;
+  --color-history-added: #15763A;
 }
 
 [data-skin="rose-pine-dawn"] {
@@ -70,6 +75,7 @@
   --color-accent: #286983;
   --color-accent-fg: #FFFFFF;
   --color-destructive: #A04A62;
+  --color-history-added: #15803D;
 }
 
 [data-skin="sage"] {
@@ -82,6 +88,7 @@
   --color-accent: #1F7A5C;
   --color-accent-fg: #FFFFFF;
   --color-destructive: #C0392B;
+  --color-history-added: #15803D;
   --radius-unit: 3px;
 }
 
@@ -95,6 +102,7 @@
   --color-accent: #0B3FC2;
   --color-accent-fg: #FFFFFF;
   --color-destructive: #B00020;
+  --color-history-added: #166534;
   --radius-unit: 0px;
 }
 
@@ -110,6 +118,7 @@
   --color-accent: #3B82F6;
   --color-accent-fg: #FFFFFF;
   --color-destructive: #F87171;
+  --color-history-added: #4ADE80;
 }
 
 [data-skin="nord"] {
@@ -122,6 +131,7 @@
   --color-accent: #88C0D0;
   --color-accent-fg: #2E3440;
   --color-destructive: #EC9AA1;
+  --color-history-added: #4ADE80;
 }
 
 [data-skin="gruvbox"] {
@@ -134,6 +144,7 @@
   --color-accent: #FE8019;
   --color-accent-fg: #1D2021;
   --color-destructive: #FF6B52;
+  --color-history-added: #4ADE80;
 }
 
 [data-skin="catppuccin-mocha"] {
@@ -146,6 +157,7 @@
   --color-accent: #CBA6F7;
   --color-accent-fg: #1E1E2E;
   --color-destructive: #F38BA8;
+  --color-history-added: #4ADE80;
 }
 
 [data-skin="everforest"] {
@@ -158,6 +170,7 @@
   --color-accent: #A7C080;
   --color-accent-fg: #232A2E;
   --color-destructive: #EC8B8D;
+  --color-history-added: #4ADE80;
 }
 
 [data-skin="dracula"] {
@@ -170,6 +183,7 @@
   --color-accent: #BD93F9;
   --color-accent-fg: #21222C;
   --color-destructive: #FF6E6E;
+  --color-history-added: #4ADE80;
 }
 
 /* True black, phosphor green, monospace for everything. */
@@ -183,6 +197,7 @@
   --color-accent: #5AF78E;
   --color-accent-fg: #000000;
   --color-destructive: #FF5C5C;
+  --color-history-added: #4ADE80;
   --font-ui: var(--font-mono);
   --font-body: var(--font-mono);
   /* A numbered list's gutter (prose.css). In a monospace font the ". "

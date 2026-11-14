@@ -1,0 +1,22 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`viewerContent > every rendered fixture case is viewable 1`] = `
+{
+  "editor/damaged": 16,
+  "editor/in-bullet": 11,
+  "editor/in-ordered": 11,
+  "editor/in-ordered-task": 11,
+  "editor/in-task": 11,
+  "editor/lists": 1,
+  "import/damaged": 16,
+  "import/in-bullet": 11,
+  "import/in-ordered": 11,
+  "import/in-ordered-task": 11,
+  "import/in-task": 11,
+  "import/lists": 1,
+  "random/1": 6,
+  "random/2": 1,
+  "random/3": 5,
+  "random/4": 5,
+}
+`;
