@@ -75,7 +75,7 @@ impl HistoryPermits {
             .await
             .expect("the compute semaphore is never closed");
         ComputeGuard {
-            _permit: permit,
+            permit: Some(permit),
             state: Arc::new(AtomicU8::new(RUNNING)),
             stalled: self.stalled.clone(),
             ended: Arc::new(Notify::new()),
@@ -119,7 +119,9 @@ impl HistoryPermits {
 /// state for the stalled gauge. Dropping it (when the thread ends) returns
 /// the permit and ends every [`StallWatch`] of it.
 pub struct ComputeGuard {
-    _permit: OwnedSemaphorePermit,
+    /// `Some` until `drop`, which returns it before it ends the watches,
+    /// so whoever wakes on [`StallWatch::ended`] sees the permit back.
+    permit: Option<OwnedSemaphorePermit>,
     state: Arc<AtomicU8>,
     stalled: Arc<AtomicI64>,
     ended: Arc<Notify>,
@@ -138,6 +140,8 @@ impl ComputeGuard {
 
 impl Drop for ComputeGuard {
     fn drop(&mut self) {
+        // Fields drop after this body: return the permit first.
+        drop(self.permit.take());
         if self.state.swap(ENDED, Ordering::SeqCst) == TIMED_OUT {
             self.stalled.fetch_sub(1, Ordering::SeqCst);
         }

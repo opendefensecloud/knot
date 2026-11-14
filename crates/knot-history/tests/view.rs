@@ -137,6 +137,26 @@ fn marked(v: &Value, s: &str, mark: &str) -> bool {
 
 /// Polls `f` every 10 ms on the test task until it holds, at most
 /// `within`.
+/// Polls `request` until its render thread has started (`renders` counts
+/// past its value at the call), then drops it. A fixed timeout instead
+/// drops the request before its render starts when the database load is
+/// slow (CI), and a test that needs a render in flight then sees none.
+/// Returns `Some` only if the request finished before its render started.
+async fn drop_once_rendering<T>(
+    request: impl std::future::Future<Output = T>,
+    renders: &Arc<AtomicUsize>,
+) -> Option<T> {
+    let before = count(renders);
+    tokio::select! {
+        r = request => Some(r),
+        _ = async {
+            while count(renders) <= before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } => None,
+    }
+}
+
 async fn wait_until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + within;
     while !f() {
@@ -999,17 +1019,15 @@ async fn a_dropped_view_request_cancels_its_render() {
     let db = db().await;
     let (doc, s, _) = open_session_page(&db).await;
     let permits = history_permits(1);
+    let renders = counter();
     let views = views_with(&db.pool, &permits, |l| {
         l.hooks.hold_render = Duration::from_secs(1);
+        l.hooks.renders = Some(renders.clone());
     });
     let rec = CountingRecorder::default();
     let _g = metrics::set_default_local_recorder(&rec);
-    let dropped = tokio::time::timeout(
-        Duration::from_millis(200),
-        views.view(anyone(), doc, s.id, false),
-    )
-    .await;
-    assert!(dropped.is_err(), "the request was dropped");
+    let dropped = drop_once_rendering(views.view(anyone(), doc, s.id, false), &renders).await;
+    assert!(dropped.is_none(), "the request was dropped");
     assert_eq!(permits.stalled(), 1);
     assert_eq!(stalled_gauge(&rec), Some(1.0));
     assert_eq!(
@@ -1044,12 +1062,8 @@ async fn a_dropped_render_that_outlives_the_timeout_is_not_replayed() {
     });
     let rec = CountingRecorder::default();
     let _g = metrics::set_default_local_recorder(&rec);
-    let dropped = tokio::time::timeout(
-        Duration::from_millis(100),
-        views.view(anyone(), doc, s.id, true),
-    )
-    .await;
-    assert!(dropped.is_err());
+    let dropped = drop_once_rendering(views.view(anyone(), doc, s.id, true), &renders).await;
+    assert!(dropped.is_none());
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(view_timeouts(&rec), 1, "the watcher recorded it");
     assert_eq!(permits.stalled(), 1);
@@ -1316,9 +1330,8 @@ async fn one_principal_renders_one_version_at_a_time() {
         l.hooks.renders = Some(renders.clone());
         l.permit_wait = Duration::from_secs(2);
     });
-    let dropped =
-        tokio::time::timeout(Duration::from_millis(100), views.view(a, doc, e2, false)).await;
-    assert!(dropped.is_err());
+    let dropped = drop_once_rendering(views.view(a, doc, e2, false), &renders).await;
+    assert!(dropped.is_none());
     let at_drop = Instant::now();
     let held = permits.available_compute();
     assert_eq!(held, 1, "the dropped render runs on");
@@ -1480,13 +1493,10 @@ async fn a_joined_caller_renders_after_the_first_is_dropped() {
     let rec = CountingRecorder::default();
     let _g = metrics::set_default_local_recorder(&rec);
     let (first, second) = tokio::join!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            views.view(anyone(), doc, s.id, false)
-        ),
+        drop_once_rendering(views.view(anyone(), doc, s.id, false), &renders),
         views.view(anyone(), doc, s.id, false),
     );
-    assert!(first.is_err(), "the first was dropped");
+    assert!(first.is_none(), "the first was dropped");
     assert!(second.is_ok(), "{:?}", second.err());
     assert_eq!(count(&renders), 2);
     assert_eq!(outcome(&rec, "rendered"), 1);
