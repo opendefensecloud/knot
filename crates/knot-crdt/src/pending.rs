@@ -144,7 +144,11 @@ pub fn delete_only_update(ds: &IdSet) -> Vec<u8> {
 /// outside that part.
 ///
 /// 1. Apply `state` to a scratch doc that keeps deleted content
-///    (`skip_gc`); a decode error is [`EngineError::Decode`].
+///    (`skip_gc`); a decode error is [`EngineError::Decode`]. yrs can
+///    refuse shifted bytes part way (a shifted block names a string item
+///    as its parent, `UpdateError::InvalidParent`), and then stops before
+///    the delete set: the scratch doc keeps the blocks yrs integrated
+///    before the refused one, and the delete set is applied alone.
 /// 2. Take its state vector without zero-clock entries (yrs's
 ///    `write_blocks_to` computes `clock - 1`). It stops at each client's
 ///    first gap, and holds no pending content.
