@@ -8,6 +8,19 @@
 //!   effective update, or the raw bytes when content is pending:
 //!   [`crate::engine::ApplyMeasured`]) is handed to the writer
 //!   ([`crate::writer`]) and only then fanned out, those same bytes.
+//! - **Pending content** (content yrs parked for a missing dependency)
+//!   travels as the original bytes of the log rows that parked it
+//!   ([`crate::pending::ParkedRows`], Ruling 4): every apply that changes
+//!   the doc's pending content records its row (own rows get their rev from
+//!   the writer's `Applied`), and the rows are trimmed to an oldest-first
+//!   cover of what stays pending. A joining connection gets the doc's state
+//!   without its pending content ([`JoinState::update`]) and those rows
+//!   ([`JoinState::pending`]); `ExportState` leaves pending content out too.
+//! - **Updates from outside** (inbound, `ApplyUpdate`, catch-up rows) are
+//!   pre-checked against the blocks the doc holds past a gap in their
+//!   client's clock ([`crate::pending::PastGap`], Ruling 25): one that would
+//!   meet yrs's skip underflow is neither applied, persisted nor fanned
+//!   out.
 //! - **Server-side edits** (`ApplyUpdate`, `ReplaceWithMarkdown`,
 //!   `PatchTaskChecked`, `ApplySuggestion`) are tagged with what made them
 //!   (`source`, `meta`), and the room waits until the writer has stored one
@@ -28,9 +41,14 @@
 //!   for the rest of its life once its doc holds content no row carries: an
 //!   update yrs rejected part-way, or a row that failed to apply at boot or
 //!   in catch-up. Each snapshot is stamped with the watermark, the content
-//!   epoch and the seq of the row at the watermark.
+//!   epoch and the seq of the row at the watermark. A snapshot holds no
+//!   pending content and names the rows that re-park it (`pending_revs`),
+//!   checked by replaying them over the snapshot as boot will
+//!   ([`crate::pending::check_reparks`]); when the check fails it is
+//!   withheld, and the pending content is persisted again as a row when it
+//!   has a faithful encoding (Ruling 9).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -39,6 +57,7 @@ use uuid::Uuid;
 use crate::bus::{Bus, Subscription};
 use crate::engine::{ApplyMeasured, DocHandle, Engine, EngineError};
 use crate::hydrate::{BootError, BootMode};
+use crate::pending::{ParkedRows, PastGap, PendingClaims, Refusal, RowToken};
 use crate::protocol::wrap_sync_update;
 use crate::tasks::patch_task_checked;
 use crate::writer::{Applied, PersistJob, WriterDone, WriterEvent, WriterLimits};
@@ -96,17 +115,31 @@ impl ConnHandle {
 /// was down ever reach the server (the web providers apply offline edits
 /// locally but do not queue them for sending). Both are read in the same
 /// actor turn, so they describe the same document state.
+///
+/// `update` holds no pending content (yrs 0.27.3's own encoding of it can
+/// name blocks the doc never had). `pending` carries it instead: the
+/// original bytes of the log rows that park it, sent to the client as sync
+/// Update frames after SyncStep2 and before SyncStep1 (Ruling 5), so the
+/// client holds the same pending content as the room and drains it when the
+/// dependency arrives. Empty when nothing is pending, for a re-join of a
+/// connection the room still holds, and for boards (Ruling 10).
 #[derive(Debug)]
 pub struct JoinState {
     pub update: Vec<u8>,
     pub state_vector: Vec<u8>,
+    pub pending: Vec<Vec<u8>>,
 }
 
 impl JoinState {
-    pub(crate) fn of(engine: &dyn Engine, doc: &DocHandle) -> Result<Self, EngineError> {
+    pub(crate) fn of(
+        engine: &dyn Engine,
+        doc: &DocHandle,
+        pending: Vec<Vec<u8>>,
+    ) -> Result<Self, EngineError> {
         Ok(Self {
             update: engine.encode_state_as_update(doc, None)?,
             state_vector: engine.encode_state_vector(doc)?,
+            pending,
         })
     }
 }
@@ -115,6 +148,15 @@ impl JoinState {
 pub enum Event {
     Inbound(InMsg),
     Join {
+        conn_id: ConnId,
+        handle: ConnHandle,
+        reply: oneshot::Sender<Result<JoinState, EngineError>>,
+    },
+    /// A re-join: the shim's answer to a client SyncStep1. Answered like
+    /// [`Event::Join`], except that `pending` holds the parked rows only when
+    /// the room no longer held the connection (it dropped it as a slow
+    /// consumer, so rows fanned out meanwhile did not reach it; Ruling 5).
+    Resync {
         conn_id: ConnId,
         handle: ConnHandle,
         reply: oneshot::Sender<Result<JoinState, EngineError>>,
@@ -240,11 +282,20 @@ pub enum Event {
     /// The room's log bookkeeping, for tests.
     #[cfg(test)]
     Probe(oneshot::Sender<Probe>),
+    /// The room forgets the rows that park its pending content, for tests
+    /// of a cover no known production path leaves incomplete.
+    #[cfg(test)]
+    ForgetParked,
+    /// Every later re-park check refuses the kept row at this rev (the
+    /// lowest such rev not yet excluded), for tests of a refusal no known
+    /// production path reaches.
+    #[cfg(test)]
+    FailCheck(i64),
 }
 
 /// What [`Event::Probe`] reports.
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
     pub applied_through_rev: i64,
     pub through_seq: i64,
@@ -253,6 +304,22 @@ pub struct Probe {
     pub in_flight: usize,
     pub unlogged: bool,
     pub content_epoch: i32,
+    /// Whether the room withholds its snapshots (Ruling 9).
+    pub withheld: bool,
+    /// The revs of the kept parked rows that have one (own rows in flight
+    /// have none yet).
+    pub parked_revs: Vec<i64>,
+}
+
+/// A withheld snapshot attempt (Ruling 9): what it left uncovered, why,
+/// and the pending ids and kept revs it saw. An attempt that sees the same
+/// pending ids and kept revs skips the check.
+#[derive(Debug, PartialEq)]
+struct Withheld {
+    missing: PendingClaims,
+    reason: &'static str,
+    claims: PendingClaims,
+    revs: Vec<i64>,
 }
 
 pub struct Room {
@@ -308,14 +375,29 @@ pub struct Room {
     /// sends a Fatal or closes its channel, and when a snapshot write finds
     /// the page's epoch changed or the page gone.
     evicted: bool,
-    /// The log rows that park the doc's pending content, from boot
-    /// (`Boot::parked`).
-    #[allow(dead_code)] // Task 4: recorded, pruned and named by snapshots.
-    parked: crate::pending::ParkedRows,
+    /// The log rows that park the doc's pending content (Ruling 4): from
+    /// boot (`Boot::parked`), then every apply that changes the pending
+    /// content records its row, and every record and snapshot attempt
+    /// trims them to their cover.
+    parked: ParkedRows,
+    /// One entry per job handed to the writer, in job order: the token of
+    /// the row `parked` recorded for it, if any. `on_applied` pops the front
+    /// and gives that row the job's rev.
+    in_flight_parked: VecDeque<Option<RowToken>>,
     /// Rows that carry pending content no log row holds (`Boot::carry`,
-    /// Ruling 19).
-    #[allow(dead_code)] // Task 4: persisted before the event loop.
+    /// Ruling 19), persisted before the event loop.
     carry: Vec<Vec<u8>>,
+    /// The current withholding of snapshots, if any (Ruling 9).
+    withheld: Option<Withheld>,
+    /// The pending ids the room last persisted again as rows (Ruling 9):
+    /// one re-park per set of pending ids.
+    reparked: Option<PendingClaims>,
+    /// The blocks the doc holds past a gap in their client's clock, which
+    /// updates from outside are pre-checked against (Ruling 25).
+    past_gap: PastGap,
+    /// Revs every re-park check refuses ([`Event::FailCheck`]).
+    #[cfg(test)]
+    fail_check: std::collections::BTreeSet<i64>,
 }
 
 pub struct RoomHandle {
@@ -523,7 +605,13 @@ impl Room {
             dirty_tx: deps.dirty_tx,
             evicted: false,
             parked: booted.parked,
+            in_flight_parked: VecDeque::new(),
             carry: booted.carry,
+            withheld: None,
+            reparked: None,
+            past_gap: booted.past_gap,
+            #[cfg(test)]
+            fail_check: std::collections::BTreeSet::new(),
         };
         tokio::spawn(room.run());
         RoomHandle {
@@ -540,6 +628,10 @@ impl Room {
         // room's token on the way out, so the shims close their sockets and
         // the registry stops handing out this room (see `RoomHandle`).
         let _ended = self.shutdown.clone().drop_guard();
+        // Pending content only the snapshot's own bytes held (Ruling 19): no
+        // connection is registered yet, so nothing is fanned out.
+        let carry = std::mem::take(&mut self.carry);
+        self.repark(carry, "legacy", false).await;
         let mut idle_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut catchup_tick = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
@@ -560,13 +652,16 @@ impl Room {
                 _ = idle_tick.tick() => {
                     let idle = self.snap_state.last_apply_at.elapsed();
                     if self.snap_state.updates_since_snapshot > 0 && idle >= self.policy.idle {
-                        self.snapshot().await;
+                        self.snapshot(false).await;
                     }
                 }
                 msg = self.rx.recv() => match msg {
                     Some(Event::Inbound(m)) => self.on_inbound(m).await,
                     Some(Event::Join { conn_id, handle, reply }) => {
-                        self.on_join(conn_id, handle, reply).await;
+                        self.on_join(conn_id, handle, reply, true).await;
+                    }
+                    Some(Event::Resync { conn_id, handle, reply }) => {
+                        self.on_join(conn_id, handle, reply, false).await;
                     }
                     Some(Event::Leave(c)) => {
                         self.conns.remove(&c);
@@ -671,7 +766,15 @@ impl Room {
                             in_flight: self.in_flight,
                             unlogged: self.unlogged,
                             content_epoch: self.content_epoch,
+                            withheld: self.withheld.is_some(),
+                            parked_revs: self.parked.revs_assigned(),
                         });
+                    }
+                    #[cfg(test)]
+                    Some(Event::ForgetParked) => self.parked = ParkedRows::default(),
+                    #[cfg(test)]
+                    Some(Event::FailCheck(rev)) => {
+                        self.fail_check.insert(rev);
                     }
                 },
                 Some(_rev) = self.bus_updates_rx.recv() => {
@@ -697,8 +800,9 @@ impl Room {
         // server-side edit it could not persist, a snapshot write that found the
         // epoch changed or the page gone): the live doc may hold content
         // storage lacks, and a snapshot of it would be the one thing that
-        // persisted it.
-        self.snapshot().await;
+        // persisted it. A re-park it needs is persisted but fanned out to
+        // no one: the connections are closing (Ruling 9).
+        self.snapshot(true).await;
     }
 
     /// `Event::ApplyUpdate`: apply, measure, persist what the apply changed
@@ -713,10 +817,18 @@ impl Room {
         meta: Option<serde_json::Value>,
     ) -> Result<i64, EngineError> {
         let limit = crate::nesting::MAX_NESTING;
+        // Before anything of it is applied (Ruling 25).
+        if self.past_gap.refuses(&update_bytes) {
+            self.underflow_refused("apply_update", None, None, true);
+            return Err(EngineError::Apply(
+                "the update would corrupt the page (skip underflow)".into(),
+            ));
+        }
         // `Err` here: it doesn't decode, so nothing of it was applied.
         let measured = self
             .engine
             .apply_update_measuring(&self.doc, &update_bytes, limit)?;
+        self.note_applied(&measured.inserted);
         // Checked first, as for an inbound update (`refuse_applied`): the
         // doc holds what the apply integrated, all of it or the part before
         // a rejection, and none of it may be persisted or fanned out. No
@@ -756,9 +868,10 @@ impl Room {
             return Err(EngineError::Apply("nothing to persist".into()));
         }
         metrics::counter!("knot_room_updates_total", "source" => "local").increment(1);
+        let token = self.record_parking(&measured);
         let framed = wrap_sync_update(&measured.persist);
         let seq = self
-            .persist_server_edit(measured.persist, by_user, source, meta)
+            .persist_server_edit(measured.persist, by_user, source, meta, token)
             .await
             .map_err(EngineError::Apply)?;
         if measured.raw_fallback {
@@ -817,7 +930,7 @@ impl Room {
         metrics::counter!("knot_room_updates_total", "source" => "restore").increment(1);
         let framed = wrap_sync_update(&effective);
         let seq = self
-            .persist_server_edit(effective, by_user, source, meta)
+            .persist_server_edit(effective, by_user, source, meta, None)
             .await?;
         self.fan_out(&framed, None);
         Ok(seq)
@@ -844,7 +957,13 @@ impl Room {
         metrics::counter!("knot_room_updates_total", "source" => "patch").increment(1);
         let framed = wrap_sync_update(&update);
         let seq = self
-            .persist_server_edit(update, by_user, knot_storage::UpdateSource::Task, None)
+            .persist_server_edit(
+                update,
+                by_user,
+                knot_storage::UpdateSource::Task,
+                None,
+                None,
+            )
             .await?;
         self.fan_out(&framed, None);
         Ok(seq)
@@ -899,6 +1018,7 @@ impl Room {
                 by_user,
                 knot_storage::UpdateSource::Suggestion,
                 Some(meta),
+                None,
             )
             .await
             .map_err(ApplySuggestionError::Persist)?;
@@ -951,6 +1071,7 @@ impl Room {
                 by_user,
                 knot_storage::UpdateSource::Edit,
                 Some(link.meta),
+                None,
             )
             .await
             .map_err(MoveBlocksError::Persist)?;
@@ -989,13 +1110,16 @@ impl Room {
     /// client, and no reconnect can push it back credited to someone else.
     /// The writer bounds the wait ([`WriterLimits`]). Returns the row's seq.
     /// When the edit is not stored the room is evicted: its doc holds an
-    /// edit no row carries.
+    /// edit no row carries. `token` is the row `parked` recorded for the
+    /// edit (`persist`): `None` for the room's own transactions, which park
+    /// nothing.
     async fn persist_server_edit(
         &mut self,
         bytes: Vec<u8>,
         by_user: Option<Uuid>,
         source: knot_storage::UpdateSource,
         meta: Option<serde_json::Value>,
+        token: Option<RowToken>,
     ) -> Result<i64, String> {
         let (persisted, stored) = oneshot::channel();
         let job = PersistJob {
@@ -1006,7 +1130,7 @@ impl Room {
             persisted: Some(persisted),
         };
         // `persist` evicts the room when the writer's channel is closed.
-        if !self.persist(job).await {
+        if !self.persist(job, token).await {
             return Err("persist channel closed".into());
         }
         let error = match stored.await {
@@ -1024,6 +1148,11 @@ impl Room {
     /// The writer appended one of this room's rows at `rev`.
     async fn on_applied(&mut self, Applied { seq, rev }: Applied) {
         self.in_flight = self.in_flight.saturating_sub(1);
+        // First, so that a snapshot this `Applied` allows reads every kept
+        // row's rev.
+        if let Some(Some(token)) = self.in_flight_parked.pop_front() {
+            self.parked.assign(token, rev);
+        }
         self.max_own_rev = self.max_own_rev.max(rev);
         self.last_applied_seq = self.last_applied_seq.max(seq);
         if rev == self.applied_through_rev + 1 {
@@ -1045,7 +1174,7 @@ impl Room {
             let _ = tx.try_send(self.doc_id);
         }
         if self.snap_state.updates_since_snapshot >= self.policy.every_n {
-            self.snapshot().await;
+            self.snapshot(false).await;
         }
     }
 
@@ -1053,10 +1182,13 @@ impl Room {
     /// means the writer gave up after a Fatal the room has not read yet: the
     /// room is evicted, and the caller neither fans the update out nor
     /// reports it persisted. Returns whether the job was handed over.
-    async fn persist(&mut self, job: PersistJob) -> bool {
+    /// `token` is the row `parked` recorded for the job (`None` when it
+    /// recorded none), which gets the job's rev at its `Applied`.
+    async fn persist(&mut self, job: PersistJob, token: Option<RowToken>) -> bool {
         match self.persist_tx.send(job).await {
             Ok(()) => {
                 self.in_flight += 1;
+                self.in_flight_parked.push_back(token);
                 true
             }
             Err(_) => {
@@ -1070,7 +1202,11 @@ impl Room {
     /// the bus may not have delivered yet, rows written past a gap), in rev
     /// order, as long as they are contiguous. A row that changes the doc is
     /// fanned out; one that fails to apply is passed (logged, counted, the
-    /// room becomes `unlogged`, not fanned out). Returns whether the doc is
+    /// room becomes `unlogged`, not fanned out). A row the skip-underflow
+    /// pre-check refuses (Ruling 25) is not applied: skipped when the doc
+    /// already holds every id it names, else passed like a row that fails
+    /// to apply. A row that changes the pending content is recorded in
+    /// `parked` with its rev. Returns whether the doc is
     /// now caught up with storage as of the read: `false` when the read
     /// failed, when it stopped at a rev gap, or when the log does not reach
     /// a rev the writer confirmed for this room.
@@ -1104,8 +1240,36 @@ impl Room {
                 );
                 return false;
             }
-            match self.engine.apply_update_changed(&self.doc, &u.update_bytes) {
-                Ok(true) => {
+            if self.past_gap.refuses(&u.update_bytes) {
+                let held = crate::pending::holds(&self.doc, &u.update_bytes);
+                self.underflow_refused("catch_up", None, Some(rev), held);
+                if !held {
+                    tracing::warn!(
+                        doc_id = %self.doc_id,
+                        rev,
+                        seq = u.seq,
+                        error = "the update would corrupt the page (skip underflow)",
+                        "a log row failed to apply in catch-up; passed, and the room writes no more snapshots"
+                    );
+                    metrics::counter!("knot_room_row_apply_errors_total", "phase" => "catch_up")
+                        .increment(1);
+                    self.unlogged = true;
+                }
+                self.applied_through_rev = rev;
+                self.through_seq = u.seq;
+                self.last_applied_seq = self.last_applied_seq.max(u.seq);
+                continue;
+            }
+            match self.engine.apply_row(&self.doc, &u.update_bytes) {
+                Ok(applied) if applied.changed => {
+                    self.note_applied(&applied.inserted);
+                    if applied.pending_changed {
+                        let claims = crate::pending::claims(&self.doc);
+                        if claims.is_some() {
+                            self.parked.record(Some(rev), u.update_bytes.clone());
+                        }
+                        let _ = self.parked.prune(claims.as_ref());
+                    }
                     metrics::counter!("knot_room_updates_total", "source" => "peer").increment(1);
                     self.fan_out(&wrap_sync_update(&u.update_bytes), None);
                     // Notify the server-side reindex worker so non-writing
@@ -1118,7 +1282,7 @@ impl Room {
                 }
                 // Already in the doc: an own row read back, or a row
                 // written twice after a lost acknowledgement.
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(
                         doc_id = %self.doc_id,
@@ -1181,23 +1345,32 @@ impl Room {
     }
 
     /// Write a snapshot stamped with the watermark, if the snapshot rule
-    /// holds. A write that finds the page's epoch changed evicts the room;
-    /// one that finds the page gone ends it quietly (nothing broke). Either
-    /// way no further snapshot is written.
-    async fn snapshot(&mut self) {
+    /// holds. It names the rows that re-park the doc's pending content
+    /// (`pending_revs`), once they pass the re-park check; otherwise it is
+    /// withheld ([`Room::snapshot_cover`]). A write that finds the page's
+    /// epoch changed evicts the room; one that finds the page gone ends it
+    /// quietly (nothing broke). Either way no further snapshot is written.
+    /// `final_flush` is the attempt after the event loop: a re-park it
+    /// needs is fanned out to no one.
+    async fn snapshot(&mut self, final_flush: bool) {
         if !self.may_snapshot() {
             return;
         }
-        // Until the room records the rows that park its pending content, a
-        // doc that holds pending content is not snapshotted: yrs's encoding
-        // of it may be shifted, and a snapshot without `pending_revs` would
-        // read as an older pod's at boot. With nothing pending, yrs's
-        // encoding is already pending-free (`merge_pending_v1` changes
-        // nothing), so the snapshot names no rows.
-        if crate::pending::claims(&self.doc).is_some() {
-            self.snap_state.updates_since_snapshot = 0;
-            return;
-        }
+        let pending_revs = match crate::pending::claims(&self.doc) {
+            None => {
+                let _ = self.parked.prune(None);
+                self.withheld = None;
+                self.reparked = None;
+                Vec::new()
+            }
+            Some(claims) => match self.snapshot_cover(claims, final_flush).await {
+                Some(revs) => revs,
+                None => {
+                    self.snap_state.updates_since_snapshot = 0;
+                    return;
+                }
+            },
+        };
         let stamp = knot_storage::SnapshotStamp {
             snapshot_seq: self.through_seq,
             snapshot_rev: Some(self.applied_through_rev),
@@ -1209,7 +1382,7 @@ impl Room {
             self.engine.as_ref(),
             &self.doc,
             self.snapshots.as_ref(),
-            Some(&[]),
+            Some(&pending_revs),
         )
         .await
         {
@@ -1244,11 +1417,210 @@ impl Room {
         }
     }
 
+    /// The kept rows' revs a snapshot of the doc's pending `claims` names,
+    /// or `None` when it is withheld (Ruling 9). An attempt that sees the
+    /// withholding's pending ids and kept revs again skips the check.
+    /// Otherwise it prunes the rows to their cover and replays them over the
+    /// snapshot's state as boot will ([`crate::pending::check_reparks`]); a
+    /// row the guards refuse is excluded and the rest checked again, until
+    /// the check passes or the cover leaves ids uncovered. Uncovered content
+    /// with a faithful encoding is persisted again as rows, once per set of
+    /// pending ids ([`Room::repark`]), and the snapshot is withheld until
+    /// their `Applied`; each distinct withholding warns and counts once.
+    async fn snapshot_cover(
+        &mut self,
+        claims: PendingClaims,
+        final_flush: bool,
+    ) -> Option<Vec<i64>> {
+        if self
+            .withheld
+            .as_ref()
+            .is_some_and(|w| w.claims == claims && w.revs == self.parked.revs())
+        {
+            return None;
+        }
+        let state = match self.engine.encode_state_as_update(&self.doc, None) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(doc_id = %self.doc_id, %error, "snapshot write failed");
+                return None;
+            }
+        };
+        let mut last_excluded: Option<i64> = None;
+        let missing = loop {
+            let refusal = match self.parked.prune(Some(&claims)) {
+                Err(uncovered) => Some(Refusal::Uncovered(uncovered.missing)),
+                Ok(()) => self.check_reparks(&state, &claims).err(),
+            };
+            match refusal {
+                // An excluded rev is never kept again, so this runs at most
+                // once per kept row.
+                Some(Refusal::Underflow(rev)) => {
+                    debug_assert!(!self.parked.is_excluded(rev), "rev {rev} refused twice");
+                    self.parked.exclude(rev);
+                    last_excluded = Some(rev);
+                }
+                Some(Refusal::Uncovered(missing)) => break Some(missing),
+                None => break None,
+            }
+        };
+        let Some(missing) = missing else {
+            self.withheld = None;
+            return Some(self.parked.revs());
+        };
+        let reason = if last_excluded.is_some() {
+            "underflow"
+        } else {
+            "uncovered"
+        };
+        let withheld = Withheld {
+            missing,
+            reason,
+            claims: claims.clone(),
+            revs: self.parked.revs(),
+        };
+        if self.reparked.as_ref() != Some(&claims)
+            && let Some(rows) = crate::pending::carry_rows(&self.doc)
+        {
+            self.repark(rows, reason, !final_flush).await;
+            self.reparked = Some(claims.clone());
+        }
+        if self.withheld.as_ref() != Some(&withheld) {
+            let reparked = self.reparked.as_ref() == Some(&claims);
+            match reason {
+                "underflow" => tracing::warn!(
+                    doc_id = %self.doc_id,
+                    rev = last_excluded,
+                    reparked,
+                    "a recorded row would not re-apply over the snapshot; snapshot withheld"
+                ),
+                _ => tracing::warn!(
+                    doc_id = %self.doc_id,
+                    reparked,
+                    "pending content that no recorded row carries; snapshot withheld"
+                ),
+            }
+            metrics::counter!("knot_room_snapshots_withheld_total", "reason" => reason)
+                .increment(1);
+            self.withheld = Some(withheld);
+        }
+        None
+    }
+
+    /// [`crate::pending::check_reparks`] of the kept rows over `state`.
+    fn check_reparks(&self, state: &[u8], claims: &PendingClaims) -> Result<(), Refusal> {
+        let rows = self.parked.checked_rows();
+        #[cfg(test)]
+        if let Some(&(rev, _)) = rows
+            .iter()
+            .find(|(rev, _)| self.fail_check.contains(rev) && !self.parked.is_excluded(*rev))
+        {
+            return Err(Refusal::Underflow(rev));
+        }
+        crate::pending::check_reparks(self.engine.as_ref(), state, &rows, claims)
+    }
+
+    /// Persists `rows` as rows without an author that carry the doc's
+    /// pending content again (`meta: {"repark": reason}`; Rulings 9 and
+    /// 19), recording each in `parked`, and with `fan_out` sends each to the
+    /// registered connections once its job is handed over (editors who
+    /// joined earlier may lack that content). Nothing for no rows.
+    async fn repark(&mut self, rows: Vec<Vec<u8>>, reason: &'static str, fan_out: bool) {
+        if rows.is_empty() {
+            return;
+        }
+        metrics::counter!("knot_room_pending_reparked_total", "reason" => reason)
+            .increment(rows.len() as u64);
+        tracing::info!(
+            doc_id = %self.doc_id,
+            rows = rows.len(),
+            reason,
+            "pending content persisted again as log rows"
+        );
+        for row in rows {
+            let token = self.parked.record(None, row.clone());
+            let frame = fan_out.then(|| wrap_sync_update(&row));
+            let job = PersistJob {
+                bytes: row,
+                by_user_id: None,
+                source: knot_storage::UpdateSource::Edit,
+                meta: Some(serde_json::json!({ "repark": reason })),
+                persisted: None,
+            };
+            if !self.persist(job, token).await {
+                return;
+            }
+            if let Some(frame) = frame {
+                self.fan_out(&frame, None);
+            }
+        }
+    }
+
+    /// Records the row an apply from outside persists when the apply
+    /// changed the doc's pending content and some stays pending (Ruling 4):
+    /// its token, which `persist` ties to the row's job. The rows are then
+    /// trimmed to their cover (to nothing once the content drained).
+    fn record_parking(&mut self, measured: &ApplyMeasured) -> Option<RowToken> {
+        if !measured.pending_changed {
+            return None;
+        }
+        let claims = crate::pending::claims(&self.doc);
+        let token = match claims {
+            Some(_) => {
+                debug_assert!(
+                    measured.raw_fallback,
+                    "a parking apply persists its raw update"
+                );
+                self.parked.record(None, measured.persist.clone())
+            }
+            None => None,
+        };
+        let _ = self.parked.prune(claims.as_ref());
+        token
+    }
+
+    /// Takes in what an apply from outside integrated, for the pre-check
+    /// (Ruling 25).
+    fn note_applied(&mut self, inserted: &yrs::IdSet) {
+        if crate::pending::holds_any(inserted) || crate::pending::holds_any(self.past_gap.ids()) {
+            self.past_gap.note(&self.doc, inserted);
+        }
+    }
+
+    /// Counts an update from outside the skip-underflow pre-check refused
+    /// (Ruling 25), and warns unless `warn` is off (a catch-up row the doc
+    /// does not hold is logged as a row that failed to apply instead).
+    fn underflow_refused(
+        &self,
+        source: &'static str,
+        conn: Option<ConnId>,
+        rev: Option<i64>,
+        warn: bool,
+    ) {
+        metrics::counter!("knot_room_updates_underflow_refused_total", "source" => source)
+            .increment(1);
+        if warn {
+            tracing::warn!(
+                doc_id = %self.doc_id,
+                source,
+                conn = conn.map(tracing::field::display),
+                rev,
+                "an update would corrupt the page (skip underflow); not applied"
+            );
+        }
+    }
+
+    /// `Event::Join` (`with_pending`) and `Event::Resync`: registers the
+    /// connection and replies with the doc's state. `pending` holds the
+    /// parked rows for a join, and for a re-join of a connection the room
+    /// no longer held (Ruling 5); a connection the room still holds got them
+    /// at its join and every row recorded since in its fan-out.
     async fn on_join(
         &mut self,
         conn_id: ConnId,
         handle: ConnHandle,
         reply: oneshot::Sender<Result<JoinState, EngineError>>,
+        with_pending: bool,
     ) {
         // A re-join (client SyncStep1) racing a revoke, or queued behind an
         // update the room refused, still carries the connection's cancelled
@@ -1258,8 +1630,14 @@ impl Room {
         if handle.revoked.is_cancelled() || handle.refused.is_cancelled() {
             return;
         }
-        self.conns.insert(conn_id, handle);
-        let _ = reply.send(JoinState::of(self.engine.as_ref(), &self.doc));
+        // Not held: a join, or a re-join of a connection `fan_out` dropped.
+        let unregistered = self.conns.insert(conn_id, handle).is_none();
+        let pending = if with_pending || unregistered {
+            self.parked.frames()
+        } else {
+            Vec::new()
+        };
+        let _ = reply.send(JoinState::of(self.engine.as_ref(), &self.doc, pending));
     }
 
     #[tracing::instrument(skip(self, m), fields(doc_id = %self.doc_id, bytes = m.bytes.len()))]
@@ -1290,15 +1668,24 @@ impl Room {
             self.refuse_sender(m.from);
             return;
         }
+        // Before anything of it is applied (Ruling 25). The sender stays:
+        // its frame may carry its own offline edits besides the resend, and
+        // a closed client would reconnect and send the same answer again.
+        if self.past_gap.refuses(&m.bytes) {
+            self.underflow_refused("inbound", Some(m.from), None, true);
+            return;
+        }
         // Apply, then run the authoritative nesting check on the real doc:
         // the prefilter predicts yrs and can be bypassed (an update that
         // hangs a short chain of new types off existing legal content nests
         // past the limit without its own structure being deep).
-        let measured = match self.engine.apply_update_measuring(
-            &self.doc,
-            &m.bytes,
-            crate::nesting::MAX_NESTING,
-        ) {
+        let result =
+            self.engine
+                .apply_update_measuring(&self.doc, &m.bytes, crate::nesting::MAX_NESTING);
+        if let Ok(applied) = &result {
+            self.note_applied(&applied.inserted);
+        }
+        let measured = match result {
             // Measured over what the apply integrated, also when yrs
             // rejected the rest of the update.
             Ok(applied) if applied.max_depth > crate::nesting::MAX_NESTING => {
@@ -1374,18 +1761,22 @@ impl Room {
         // the raw update when content is pending (`ApplyMeasured::persist`).
         // Persisted first, and fanned out only once the writer has it: an
         // edit the writer can no longer take reaches no one.
+        let token = self.record_parking(&measured);
         let framed = wrap_sync_update(&measured.persist);
         let handed_over = self
-            .persist(PersistJob {
-                bytes: measured.persist,
-                by_user_id: m.by_user,
-                source: knot_storage::UpdateSource::Edit,
-                meta: None,
-                // Inbound WS updates are fire-and-forget — the client
-                // already has the update locally, so we don't need to
-                // hold up acknowledgement on the durable insert.
-                persisted: None,
-            })
+            .persist(
+                PersistJob {
+                    bytes: measured.persist,
+                    by_user_id: m.by_user,
+                    source: knot_storage::UpdateSource::Edit,
+                    meta: None,
+                    // Inbound WS updates are fire-and-forget — the client
+                    // already has the update locally, so we don't need to
+                    // hold up acknowledgement on the durable insert.
+                    persisted: None,
+                },
+                token,
+            )
             .await;
         if !handed_over {
             return;
@@ -3429,6 +3820,8 @@ pub(crate) mod tests {
         written: std::sync::Mutex<Vec<(SnapshotStamp, Option<Vec<i64>>)>>,
         fail: std::sync::Mutex<Option<fn() -> knot_storage::SnapshotStoreError>>,
         collide: std::sync::atomic::AtomicBool,
+        /// What `latest` and `latest_trusted` serve (`None`: no snapshot).
+        serve: std::sync::Mutex<Option<knot_storage::DocSnapshot>>,
     }
 
     impl Stamps {
@@ -3453,6 +3846,12 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl knot_storage::SnapshotStore for Stamps {
+        async fn latest_trusted(
+            &self,
+            _: Uuid,
+        ) -> Result<Option<knot_storage::DocSnapshot>, knot_storage::SnapshotStoreError> {
+            Ok(self.serve.lock().unwrap().clone())
+        }
         async fn insert_stamped(
             &self,
             _: Uuid,
@@ -3474,7 +3873,7 @@ pub(crate) mod tests {
             &self,
             _: Uuid,
         ) -> Result<Option<knot_storage::DocSnapshot>, knot_storage::SnapshotStoreError> {
-            Ok(None)
+            Ok(self.serve.lock().unwrap().clone())
         }
         async fn gc(
             &self,
@@ -4033,9 +4432,13 @@ pub(crate) mod tests {
         let (parked, edit, client) = parked_block_and_the_edit_it_fails_on();
 
         send_edit(&h, crafted, parked).await;
-        // Until the room records the rows that park its pending content, it
-        // writes no snapshot while the crafted block is parked.
-        until("the parked block is stored", || !log.appended().is_empty()).await;
+        until("a snapshot naming the parked block's row", || {
+            snapshots
+                .pending_revs()
+                .iter()
+                .any(|revs| revs.as_ref().is_some_and(|r| !r.is_empty()))
+        })
+        .await;
         let written = snapshots.written().len();
         send_edit(&h, innocent, edit).await;
         until_probe(&h, "the room is unlogged", |p| p.unlogged).await;
@@ -4100,8 +4503,12 @@ pub(crate) mod tests {
         fn apply_update(&self, d: &DocHandle, update: &[u8]) -> Result<(), EngineError> {
             YrsEngine.apply_update(d, update)
         }
-        fn apply_update_changed(&self, d: &DocHandle, update: &[u8]) -> Result<bool, EngineError> {
-            YrsEngine.apply_update_changed(d, update)
+        fn apply_row(
+            &self,
+            d: &DocHandle,
+            update: &[u8],
+        ) -> Result<crate::engine::RowApplied, EngineError> {
+            YrsEngine.apply_row(d, update)
         }
         fn apply_update_measuring(
             &self,
@@ -4757,6 +5164,706 @@ pub(crate) mod tests {
         assert_eq!(exported_page(&h).await, before);
         assert!(!h.shutdown.is_cancelled(), "the room was evicted");
         assert!(log.appended().is_empty());
+        shut_down(&h).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending content: the rows that park it, snapshots that name them, the
+    // join handshake, and the skip-underflow pre-check (Rulings 4, 5, 9, 25).
+    // -----------------------------------------------------------------------
+
+    use crate::pending::{self as pend, PendingV1};
+    use crate::test_fixtures::{
+        cross_client_parked, cross_client_parked_tail, is_frame_of, overlapping_skips,
+        skip_underflow_case, skip_underflow_parts,
+    };
+
+    /// A snapshot attempt after every own row, none when idle.
+    const EVERY_ROW: crate::snapshot::SnapshotPolicy = crate::snapshot::SnapshotPolicy {
+        every_n: 1,
+        idle: std::time::Duration::from_secs(3600),
+    };
+
+    /// No snapshot attempt during the session: only the exit snapshot.
+    const RARE: crate::snapshot::SnapshotPolicy = crate::snapshot::SnapshotPolicy {
+        every_n: 100,
+        idle: std::time::Duration::from_secs(3600),
+    };
+
+    /// A room on `log` and `snapshots` without a writer: the test takes its
+    /// jobs and sends its writer events ([`Room::spawn_detached`]).
+    async fn detached(
+        log: &Arc<Log>,
+        snapshots: &Arc<Stamps>,
+        policy: crate::snapshot::SnapshotPolicy,
+    ) -> (
+        RoomHandle,
+        mpsc::Receiver<PersistJob>,
+        mpsc::UnboundedSender<WriterEvent>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let bus = Arc::new(MemBus::new());
+        let doc_id = Uuid::new_v4();
+        let sub = bus.subscribe(doc_id).await.unwrap();
+        Room::spawn_detached(
+            doc_id,
+            Arc::new(YrsEngine),
+            bus,
+            sub,
+            log.clone(),
+            snapshots.clone(),
+            policy,
+            None,
+        )
+        .await
+        .expect("the room boots")
+    }
+
+    /// Sends `bytes` from `conn` and returns the job the room hands over.
+    async fn handed_over(
+        h: &RoomHandle,
+        conn: ConnId,
+        bytes: Vec<u8>,
+        jobs: &mut mpsc::Receiver<PersistJob>,
+    ) -> PersistJob {
+        send_edit(h, conn, bytes).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), jobs.recv())
+            .await
+            .expect("no job was handed to the writer")
+            .expect("the room ended")
+    }
+
+    /// The writer stored the room's next job at `rev` (and seq `rev`).
+    fn acknowledge(events: &mpsc::UnboundedSender<WriterEvent>, rev: i64) {
+        events
+            .send(WriterEvent::Applied(Applied { seq: rev, rev }))
+            .unwrap();
+    }
+
+    /// Sends `bytes` from `conn` and waits until the room's watermark is at
+    /// `rev` with nothing in flight.
+    async fn acknowledged(h: &RoomHandle, conn: ConnId, bytes: Vec<u8>, rev: i64) -> Probe {
+        send_edit(h, conn, bytes).await;
+        until_probe(h, "the row is acknowledged", |p| {
+            p.applied_through_rev == rev && p.in_flight == 0
+        })
+        .await
+    }
+
+    /// A fresh doc that applied `updates` through the room's measured apply.
+    fn measured_doc(updates: &[&[u8]]) -> DocHandle {
+        let d = YrsEngine.new_doc();
+        for u in updates {
+            YrsEngine
+                .apply_update_measuring(&d, u, crate::nesting::MAX_NESTING)
+                .unwrap();
+        }
+        d
+    }
+
+    /// The room's state (`Event::ExportState`).
+    async fn export(h: &RoomHandle) -> Vec<u8> {
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::ExportState(tx)).await.unwrap();
+        rx.await.unwrap().unwrap().0
+    }
+
+    /// Joins with a handle of the test's own, returning the reply.
+    async fn join_with(
+        h: &RoomHandle,
+        conn_id: ConnId,
+        handle: ConnHandle,
+        resync: bool,
+    ) -> JoinState {
+        let (reply, rx) = oneshot::channel();
+        let event = if resync {
+            Event::Resync {
+                conn_id,
+                handle,
+                reply,
+            }
+        } else {
+            Event::Join {
+                conn_id,
+                handle,
+                reply,
+            }
+        };
+        h.tx.send(event).await.unwrap();
+        rx.await.unwrap().unwrap()
+    }
+
+    /// The jobs of re-park rows the log stored.
+    fn reparks(log: &Log) -> Vec<NewUpdate> {
+        log.appended()
+            .into_iter()
+            .filter(|n| n.meta.is_some())
+            .collect()
+    }
+
+    fn last_pending_revs(snapshots: &Stamps) -> Option<Vec<i64>> {
+        snapshots
+            .pending_revs()
+            .last()
+            .cloned()
+            .expect("a snapshot was written")
+    }
+
+    /// Ruling 4: own rows in flight get their revs from their own job, also
+    /// when a row recorded before them was pruned before its `Applied`.
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_parked_rows_get_their_own_revs() {
+        let o = overlapping_skips();
+        let (_, u2) = cross_client_parked();
+        let scratch = measured_doc(&[&o.t0, &o.t2, &o.t3]);
+        let before = pend::claims(&scratch);
+        let again = YrsEngine
+            .apply_update_measuring(&scratch, &o.t2, crate::nesting::MAX_NESTING)
+            .unwrap();
+        assert!(
+            again.pending_changed,
+            "fixture: a re-send of t2 is recorded"
+        );
+        assert_eq!(pend::claims(&scratch), before, "fixture: it adds no id");
+
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, mut jobs, events, _done) = detached(&log, &snapshots, RARE).await;
+        let (conn, _rx) = join(&h).await;
+        for (rev, u) in (1..).zip([&o.t0, &o.t2, &o.t3]) {
+            handed_over(&h, conn, u.clone(), &mut jobs).await;
+            acknowledge(&events, rev);
+        }
+        let p = until_probe(&h, "three rows", |p| p.applied_through_rev == 3).await;
+        assert_eq!(p.parked_revs, vec![2, 3]);
+
+        let resend = handed_over(&h, conn, o.t2.clone(), &mut jobs).await;
+        assert_eq!(resend.bytes, o.t2, "a parking apply persists raw");
+        handed_over(&h, conn, u2, &mut jobs).await;
+        assert_eq!(probe(&h).await.in_flight, 2);
+        acknowledge(&events, 4);
+        acknowledge(&events, 5);
+        until_probe(&h, "both acknowledged", |p| p.applied_through_rev == 5).await;
+        shut_down(&h).await;
+        assert_eq!(snapshots.pending_revs().last(), Some(&Some(vec![2, 3, 5])));
+    }
+
+    /// Ruling 4: a drain between a row's hand-over and its `Applied` drops
+    /// it; the snapshot names only the row still parking content.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_while_rows_are_in_flight_names_only_the_live_row() {
+        let (u1, u2) = cross_client_parked();
+        let o = overlapping_skips();
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, mut jobs, events, _done) = detached(&log, &snapshots, RARE).await;
+        let (conn, _rx) = join(&h).await;
+        for u in [u2, u1, o.t2.clone()] {
+            handed_over(&h, conn, u, &mut jobs).await;
+        }
+        assert_eq!(probe(&h).await.in_flight, 3);
+        for rev in 1..=3 {
+            acknowledge(&events, rev);
+        }
+        until_probe(&h, "all acknowledged", |p| p.applied_through_rev == 3).await;
+        shut_down(&h).await;
+        assert_eq!(snapshots.pending_revs().last(), Some(&Some(vec![3])));
+    }
+
+    /// The author's answer to a room's SyncStep1 once it reconnects: what
+    /// its doc (every one of `updates`) holds past the room's `sv`. It
+    /// brings the content the room's pending update waits on in order.
+    fn reconnect_answer(updates: &[&[u8]], sv: &yrs::StateVector) -> Vec<u8> {
+        use yrs::{ReadTxn, Transact, Update, updates::decoder::Decode};
+        let author = yrs::Doc::new();
+        for u in updates {
+            author
+                .transact_mut()
+                .apply_update(Update::decode_v1(u).unwrap())
+                .unwrap();
+        }
+        author.transact().encode_state_as_update_v1(sv)
+    }
+
+    fn state_vector(d: &DocHandle) -> yrs::StateVector {
+        use yrs::{ReadTxn, Transact};
+        d.inner().transact().state_vector()
+    }
+
+    /// Ruling 9: pending content no recorded row carries, whose encoding is
+    /// `Shifted`, withholds snapshots, warning and counting once, and
+    /// persists nothing; a drain ends the withholding.
+    #[tokio::test(start_paused = true)]
+    async fn uncovered_shifted_pending_content_withholds_snapshots_once() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let o = overlapping_skips();
+        {
+            let live = measured_doc(&[&o.t0, &o.t2, &o.t3]);
+            let txn = yrs::Transact::transact(live.inner());
+            assert!(
+                matches!(pend::pending_update_v1(&txn), PendingV1::Shifted),
+                "fixture: the pending update's encoding is shifted"
+            );
+        }
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, EVERY_ROW).await;
+        let (conn, _rx) = join(&h).await;
+        for (rev, u) in (1..).zip([&o.t0, &o.t2, &o.t3]) {
+            acknowledged(&h, conn, u.clone(), rev).await;
+        }
+        assert_eq!(last_pending_revs(&snapshots), Some(vec![2, 3]));
+
+        h.tx.send(Event::ForgetParked).await.unwrap();
+        let written = snapshots.written().len();
+        for i in 0..5 {
+            acknowledged(&h, conn, para(40 + i, "plain"), 4 + i as i64).await;
+        }
+        assert_eq!(snapshots.written().len(), written, "a snapshot was written");
+        assert_eq!(log.appended().len(), 8);
+        assert!(reparks(&log).is_empty(), "a re-park was persisted");
+        let withheld =
+            |reason| rec.counter("knot_room_snapshots_withheld_total", &[("reason", reason)]);
+        assert_eq!(withheld("uncovered"), 1);
+        assert_eq!(withheld("underflow"), 0);
+        assert!(probe(&h).await.withheld);
+
+        // The live room keeps "pp" and "qq" stuck after t1 and t2b (Ruling
+        // 11); the author's reconnect answer drains them.
+        acknowledged(&h, conn, o.t1.clone(), 9).await;
+        acknowledged(&h, conn, o.t2b.clone(), 10).await;
+        let sv = state_vector(&measured_doc(&[&o.t0, &o.t2, &o.t3, &o.t1, &o.t2b]));
+        let all: [&[u8]; 5] = [&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3];
+        acknowledged(&h, conn, reconnect_answer(&all, &sv), 11).await;
+        acknowledged(&h, conn, para(50, "after"), 12).await;
+        assert_eq!(last_pending_revs(&snapshots), Some(vec![]));
+        assert!(!probe(&h).await.withheld);
+        assert_eq!(withheld("uncovered"), 1);
+        shut_down(&h).await;
+    }
+
+    /// Ruling 9: pending content no recorded row carries, with a faithful
+    /// encoding, is persisted again as one author-less row, fanned out to
+    /// the connections, and named by the next snapshot; at shutdown it is
+    /// persisted but fanned out to no one.
+    #[tokio::test(start_paused = true)]
+    async fn uncovered_faithful_pending_content_is_parked_again() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let (_, u2) = cross_client_parked();
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, EVERY_ROW).await;
+        let (_early, mut early_rx) = join(&h).await;
+        let (conn, _rx) = join(&h).await;
+        acknowledged(&h, conn, u2.clone(), 1).await;
+        assert!(reparks(&log).is_empty(), "a clean boot carries nothing");
+        for reason in ["legacy", "uncovered", "underflow"] {
+            assert_eq!(
+                rec.counter("knot_room_pending_reparked_total", &[("reason", reason)]),
+                0
+            );
+        }
+
+        h.tx.send(Event::ForgetParked).await.unwrap();
+        drain(&mut early_rx);
+        send_edit(&h, conn, para(41, "one")).await;
+        until("the re-park row is stored", || log.appended().len() == 3).await;
+        let reparked = reparks(&log);
+        assert_eq!(reparked.len(), 1);
+        assert_eq!(reparked[0].by_user_id, None);
+        assert_eq!(
+            reparked[0].meta,
+            Some(serde_json::json!({ "repark": "uncovered" }))
+        );
+        assert_eq!(
+            rec.counter(
+                "knot_room_snapshots_withheld_total",
+                &[("reason", "uncovered")]
+            ),
+            1
+        );
+        assert_eq!(
+            rec.counter(
+                "knot_room_pending_reparked_total",
+                &[("reason", "uncovered")]
+            ),
+            1
+        );
+        assert!(
+            drain(&mut early_rx)
+                .iter()
+                .any(|f| is_frame_of(f, &reparked[0].bytes)),
+            "the re-park row was not fanned out"
+        );
+
+        until_probe(&h, "the re-park row is acknowledged", |p| {
+            p.applied_through_rev == 3 && p.in_flight == 0
+        })
+        .await;
+        acknowledged(&h, conn, para(42, "two"), 4).await;
+        assert_eq!(last_pending_revs(&snapshots), Some(vec![3]));
+        assert!(!probe(&h).await.withheld);
+        shut_down(&h).await;
+
+        // Shutdown before the next attempt: the final flush re-parks.
+        let snapshots = Arc::new(Stamps::default());
+        let (h, mut jobs, events, _done) = detached(&Log::new(), &snapshots, RARE).await;
+        let (conn, _rx) = join(&h).await;
+        handed_over(&h, conn, u2, &mut jobs).await;
+        acknowledge(&events, 1);
+        until_probe(&h, "acknowledged", |p| {
+            p.in_flight == 0 && p.applied_through_rev == 1
+        })
+        .await;
+        h.tx.send(Event::ForgetParked).await.unwrap();
+        let (_joined, mut joined_rx) = join(&h).await;
+        assert!(jobs.try_recv().is_err(), "a job before the shutdown");
+        shut_down(&h).await;
+        let job = jobs.recv().await.expect("the final flush re-parks");
+        assert_eq!(job.by_user_id, None);
+        assert_eq!(job.meta, Some(serde_json::json!({ "repark": "uncovered" })));
+        assert!(snapshots.written().is_empty(), "{:?}", snapshots.written());
+        assert!(
+            !drain(&mut joined_rx)
+                .iter()
+                .any(|f| is_frame_of(f, &job.bytes)),
+            "the final flush fanned the re-park row out"
+        );
+    }
+
+    /// Ruling 9: a kept row the re-park check refuses is excluded, and its
+    /// content is persisted again and named instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_row_that_fails_the_check_is_replaced_by_a_repark_row() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let (_, u2) = cross_client_parked();
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, EVERY_ROW).await;
+        let (conn, _rx) = join(&h).await;
+        acknowledged(&h, conn, u2, 1).await;
+        assert_eq!(last_pending_revs(&snapshots), Some(vec![1]));
+
+        h.tx.send(Event::FailCheck(1)).await.unwrap();
+        let written = snapshots.written().len();
+        send_edit(&h, conn, para(41, "one")).await;
+        until("the re-park row is stored", || log.appended().len() == 3).await;
+        let reparked = reparks(&log);
+        assert_eq!(reparked.len(), 1);
+        assert_eq!(
+            reparked[0].meta,
+            Some(serde_json::json!({ "repark": "underflow" }))
+        );
+        let withheld =
+            |reason| rec.counter("knot_room_snapshots_withheld_total", &[("reason", reason)]);
+        assert_eq!(withheld("underflow"), 1);
+        assert_eq!(withheld("uncovered"), 0);
+        assert_eq!(
+            rec.counter(
+                "knot_room_pending_reparked_total",
+                &[("reason", "underflow")]
+            ),
+            1
+        );
+        assert!(
+            snapshots.written()[written..]
+                .iter()
+                .all(|s| s.snapshot_rev != Some(2)),
+            "withheld at rev 2: {:?}",
+            snapshots.written()
+        );
+
+        until_probe(&h, "the re-park row is acknowledged", |p| {
+            p.applied_through_rev == 3 && p.in_flight == 0
+        })
+        .await;
+        let p = acknowledged(&h, conn, para(42, "two"), 4).await;
+        assert_eq!(last_pending_revs(&snapshots), Some(vec![3]));
+        assert_eq!(p.parked_revs, vec![3]);
+        assert!(!p.withheld);
+        assert_eq!(withheld("underflow"), 1);
+        shut_down(&h).await;
+    }
+
+    /// Ruling 9: two kept rows the check refuses are both excluded; the
+    /// second on the attempt after the re-park, which then passes.
+    #[tokio::test(start_paused = true)]
+    async fn two_kept_rows_that_fail_the_check_are_both_excluded() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let (_, u2, tail) = cross_client_parked_tail(1);
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, EVERY_ROW).await;
+        let (conn, _rx) = join(&h).await;
+        acknowledged(&h, conn, u2, 1).await;
+        assert_eq!(last_pending_revs(&snapshots), Some(vec![1]));
+        acknowledged(&h, conn, tail[0].clone(), 2).await;
+        assert_eq!(last_pending_revs(&snapshots), Some(vec![1, 2]));
+
+        h.tx.send(Event::FailCheck(1)).await.unwrap();
+        h.tx.send(Event::FailCheck(2)).await.unwrap();
+        send_edit(&h, conn, para(41, "one")).await;
+        until("the re-park row is stored", || log.appended().len() == 4).await;
+        let reparked = reparks(&log);
+        assert_eq!(reparked.len(), 1);
+        assert_eq!(
+            reparked[0].meta,
+            Some(serde_json::json!({ "repark": "underflow" }))
+        );
+        let p = until_probe(&h, "the re-park row is acknowledged", |p| {
+            p.applied_through_rev == 4 && p.in_flight == 0
+        })
+        .await;
+        assert_eq!(last_pending_revs(&snapshots), Some(vec![4]));
+        assert_eq!(p.parked_revs, vec![4]);
+        assert!(!p.withheld);
+        assert_eq!(
+            rec.counter(
+                "knot_room_snapshots_withheld_total",
+                &[("reason", "underflow")]
+            ),
+            1,
+            "one distinct withholding"
+        );
+        assert_eq!(reparks(&log).len(), 1);
+        shut_down(&h).await;
+    }
+
+    /// Ruling 5: a join gets the parked rows; a re-join of a connection the
+    /// room holds gets none, and one the room had dropped as a slow
+    /// consumer gets the cover's rows again.
+    #[tokio::test(start_paused = true)]
+    async fn a_resync_sends_pending_frames_only_to_a_connection_the_room_had_dropped() {
+        let (_, u2) = cross_client_parked();
+        let o = overlapping_skips();
+        let log = Log::new();
+        let (h, _bus, _) = room_on_log(&log, &Arc::new(Stamps::default()), RARE).await;
+        let (a, _a_rx) = join(&h).await;
+        acknowledged(&h, a, u2.clone(), 1).await;
+
+        let (c_tx, _c_rx) = mpsc::channel(64);
+        let c = Uuid::new_v4();
+        let joined = join_with(&h, c, ConnHandle::new(c_tx.clone()), false).await;
+        assert_eq!(joined.pending.len(), 1);
+        assert!(same_update(&joined.pending[0], &u2));
+        let resynced = join_with(&h, c, ConnHandle::new(c_tx), true).await;
+        assert!(resynced.pending.is_empty(), "{:?}", resynced.pending.len());
+
+        let (b_tx, _b_rx) = mpsc::channel(1);
+        let b = Uuid::new_v4();
+        assert_eq!(
+            join_with(&h, b, ConnHandle::new(b_tx.clone()), false)
+                .await
+                .pending
+                .len(),
+            1
+        );
+        acknowledged(&h, a, para(41, "one"), 2).await;
+        acknowledged(&h, a, para(42, "two"), 3).await;
+        acknowledged(&h, a, o.t2.clone(), 4).await;
+        let resynced = join_with(&h, b, ConnHandle::new(b_tx), true).await;
+        assert_eq!(resynced.pending.len(), 2);
+        assert!(same_update(&resynced.pending[0], &u2));
+        assert!(same_update(&resynced.pending[1], &o.t2));
+        shut_down(&h).await;
+    }
+
+    /// Task 3's `a_kept_row_that_integrates_stuck_content_at_boot_passes_the_guards`
+    /// store: S1 = `paras` at rev 2 naming rev 1, rows rev 1 = `t2_only`,
+    /// rev 2 = `paras`. Boot integrates T2 past the gap 2#0..2#2.
+    fn stuck_content_page(
+        snapshot: Vec<u8>,
+        pending_revs: Option<Vec<i64>>,
+    ) -> (Arc<Log>, Arc<Stamps>) {
+        let (paras, t2_only) = skip_underflow_parts();
+        let log = Log::new();
+        log.push(1, 1, t2_only);
+        log.push(2, 2, paras);
+        let snapshots = Arc::new(Stamps::default());
+        let sv = {
+            use yrs::updates::encoder::Encode;
+            state_vector(&measured_doc(&[&snapshot])).encode_v1()
+        };
+        *snapshots.serve.lock().unwrap() = Some(knot_storage::DocSnapshot {
+            doc_id: Uuid::nil(),
+            snapshot_seq: 2,
+            state_bytes: snapshot,
+            state_vector: sv,
+            created_at: sqlx::types::chrono::Utc::now(),
+            snapshot_rev: Some(2),
+            epoch: Some(0),
+            pending_revs,
+            older_writer: false,
+        });
+        (log, snapshots)
+    }
+
+    /// Asserts the booted page holds T2 past the gap (Ruling 25's state).
+    async fn assert_boot_holds_t2_past_the_gap(log: &Arc<Log>, snapshots: &Arc<Stamps>) {
+        let boot = crate::hydrate::boot(
+            &YrsEngine,
+            log.as_ref(),
+            snapshots.as_ref(),
+            Uuid::nil(),
+            BootMode::Room,
+        )
+        .await
+        .unwrap();
+        assert!(
+            pend::holds_any(boot.past_gap.ids()),
+            "precondition: boot holds T2 past the gap 2#0..2#2"
+        );
+        assert!(
+            pend::claims(&boot.doc).is_none(),
+            "precondition: T2 integrated"
+        );
+    }
+
+    /// Ruling 25: after a reboot that integrated stuck content past a gap,
+    /// the reconnecting author's resend (the GC record of its lost edit)
+    /// is refused by the pre-check, inbound and through `ApplyUpdate`.
+    async fn assert_a_resend_is_refused(log: Arc<Log>, snapshots: Arc<Stamps>) {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let (_, resend, _) = skip_underflow_case();
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let (tx, _rx) = mpsc::channel(64);
+        let handle = ConnHandle::new(tx);
+        let refused = handle.refused.clone();
+        let sender = Uuid::new_v4();
+        join_with(&h, sender, handle, false).await;
+        let (_peer, mut peer_rx) = join(&h).await;
+        let before = export(&h).await;
+
+        send_edit(&h, sender, resend.clone()).await;
+        let p = probe(&h).await;
+        assert!(!p.unlogged && p.in_flight == 0, "{p:?}");
+        assert_eq!(export(&h).await, before, "the doc changed");
+        assert!(log.appended().is_empty(), "the resend was persisted");
+        assert!(drain(&mut peer_rx).is_empty(), "the resend was fanned out");
+        assert!(!refused.is_cancelled(), "the sender was refused");
+        let refusals = |source| {
+            rec.counter(
+                "knot_room_updates_underflow_refused_total",
+                &[("source", source)],
+            )
+        };
+        assert_eq!(refusals("inbound"), 1);
+
+        // Its own edit (client 5, not client 2) still goes through.
+        let own = {
+            use yrs::{ReadTxn, Text, Transact, Update, updates::decoder::Decode};
+            let (paras, _) = skip_underflow_parts();
+            let c = yrs::Doc::with_client_id(5);
+            c.transact_mut()
+                .apply_update(Update::decode_v1(&paras).unwrap())
+                .unwrap();
+            let frag = c.get_or_insert_xml_fragment("default");
+            let sv = c.transact().state_vector();
+            {
+                let mut txn = c.transact_mut();
+                let text = crate::test_fixtures::text_at(&frag, &txn, 0).expect("a text");
+                text.insert(&mut txn, 0, "!");
+            }
+            c.transact().encode_diff_v1(&sv)
+        };
+        send_edit(&h, sender, own.clone()).await;
+        until("the own edit is stored", || log.appended().len() == 1).await;
+        assert!(same_update(&log.appended()[0].bytes, &own));
+        assert!(
+            drain(&mut peer_rx).iter().any(|f| is_frame_of(f, &own)),
+            "the own edit was not fanned out"
+        );
+
+        let (reply, rx) = oneshot::channel();
+        h.tx.send(Event::ApplyUpdate {
+            update_bytes: resend,
+            by_user: None,
+            source: knot_storage::UpdateSource::Edit,
+            meta: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(rx.await.unwrap(), Err(EngineError::Apply(_))));
+        assert_eq!(log.appended().len(), 1, "the resend was persisted");
+        assert_eq!(refusals("apply_update"), 1);
+        assert!(!h.shutdown.is_cancelled(), "the room was evicted");
+        shut_down(&h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resend_after_a_reboot_that_integrated_stuck_content_does_not_corrupt_the_room() {
+        let (paras, _) = skip_underflow_parts();
+        let (log, snapshots) = stuck_content_page(paras, Some(vec![1]));
+        assert_boot_holds_t2_past_the_gap(&log, &snapshots).await;
+        assert_a_resend_is_refused(log, snapshots).await;
+    }
+
+    /// Ruling 25's legacy variant: a legacy snapshot of yrs's full state of
+    /// the two rows boots `legacy` from its trusted prefix, replays both
+    /// rows and retries, and holds T2 past the gap.
+    #[tokio::test(start_paused = true)]
+    async fn a_resend_after_a_legacy_reboot_that_integrated_stuck_content_does_not_corrupt_the_room()
+     {
+        use yrs::{ReadTxn, Transact};
+        let (paras, t2_only) = skip_underflow_parts();
+        let full = measured_doc(&[&t2_only, &paras])
+            .inner()
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        assert!(
+            pend::may_be_shifted(&full),
+            "precondition: boot takes `legacy`"
+        );
+        let (log, snapshots) = stuck_content_page(full, None);
+        let boot = crate::hydrate::boot(
+            &YrsEngine,
+            log.as_ref(),
+            snapshots.as_ref(),
+            Uuid::nil(),
+            BootMode::Room,
+        )
+        .await
+        .unwrap();
+        assert_eq!(boot.fallback.as_ref().map(|f| f.reason), Some("legacy"));
+        assert_boot_holds_t2_past_the_gap(&log, &snapshots).await;
+        assert_a_resend_is_refused(log, snapshots).await;
+    }
+
+    /// Ruling 25: another replica's row that would underflow is passed in
+    /// catch-up, like a row that fails to apply, and not fanned out.
+    #[tokio::test(start_paused = true)]
+    async fn a_catch_up_row_that_would_underflow_is_passed_and_not_fanned_out() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let (paras, _) = skip_underflow_parts();
+        let (log, snapshots) = stuck_content_page(paras, Some(vec![1]));
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let (_peer, mut peer_rx) = join(&h).await;
+        let before = export(&h).await;
+
+        let (_, resend, _) = skip_underflow_case();
+        log.push(3, 3, resend);
+        let p = until_probe(&h, "caught up", |p| p.applied_through_rev == 3).await;
+        assert!(p.unlogged, "{p:?}");
+        assert_eq!(export(&h).await, before, "the doc changed");
+        assert_eq!(
+            rec.counter(
+                "knot_room_updates_underflow_refused_total",
+                &[("source", "catch_up")]
+            ),
+            1
+        );
+        assert_eq!(
+            rec.counter("knot_room_row_apply_errors_total", &[("phase", "catch_up")]),
+            1
+        );
+        assert!(drain(&mut peer_rx).is_empty(), "the row was fanned out");
         shut_down(&h).await;
     }
 }

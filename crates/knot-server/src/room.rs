@@ -23,9 +23,17 @@
 //! client the loop hears nothing from for the silence limit is let go
 //! (`rate_limit::Liveness`). With limits off, the loop behaves exactly as
 //! without them.
+//!
+//! The join handshake is sent by the socket writer (`ws_writer::run`),
+//! before any frame the room fans out: SyncStep2 with the room's state, then
+//! each log row that parks the page's pending content as a sync Update
+//! frame (`JoinState::pending`), then SyncStep1 (writers only). A re-join
+//! (the answer to a client SyncStep1, `Event::Resync`) sends SyncStep2 and,
+//! for a connection the room had dropped as a slow consumer, the parked rows.
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::StreamExt;
+use knot_crdt::protocol::wrap_sync_update;
 use knot_crdt::{ConnHandle, ConnId, Event, InMsg};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -98,8 +106,15 @@ pub async fn serve(
     if rooms.acl_epoch(doc_id) != acl_epoch_at_check {
         revoked.cancel();
     }
+    // The handshake (Ruling 5): the room's state without its pending
+    // content, then the rows that park that content, so the client holds it
+    // pending too and drains it when its dependency arrives, then
+    // SyncStep1. The writer sends it before any frame the room fans out,
+    // which it queues meanwhile.
+    let mut handshake = Vec::new();
     if !revoked.is_cancelled() {
-        let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
+        handshake.push(encode_sync_step2(&joined.update));
+        handshake.extend(joined.pending.iter().map(|row| wrap_sync_update(row)));
     }
     // Ask the client for what WE lack (standard y-protocol: both sides send
     // SyncStep1). The web provider applies edits made while its socket was
@@ -113,13 +128,8 @@ pub async fn serve(
     // upload, and their reply (at least the whole delete set) would only be
     // dropped below.
     if can_write && !revoked.is_cancelled() {
-        let _ = out_tx.send(encode_sync_step1(&joined.state_vector)).await;
+        handshake.push(encode_sync_step1(&joined.state_vector));
     }
-    // Server-side share of "open a doc, wait for content": includes the
-    // hydrate of a cold room (see knot_room_hydrate_seconds) and the wait for
-    // the room actor's reply.
-    metrics::histogram!("knot_collab_initial_sync_seconds")
-        .record(join_started.elapsed().as_secs_f64());
 
     let (sink, mut stream) = socket.split();
     // Cancelled by whichever half ends the session first, so the other one
@@ -135,6 +145,7 @@ pub async fn serve(
     // a revoked connection 4403 (both checked first).
     let writer = tokio::spawn(crate::ws_writer::run(
         sink,
+        handshake,
         out_rx,
         shutdown.clone(),
         revoked.clone(),
@@ -143,6 +154,11 @@ pub async fn serve(
         done.clone(),
         rate_limits.liveness.map(|liveness| liveness.ping_interval),
     ));
+    // Server-side share of "open a doc, wait for content": includes the
+    // hydrate of a cold room (see knot_room_hydrate_seconds) and the wait for
+    // the room actor's reply; the handshake is now the writer's to send.
+    metrics::histogram!("knot_collab_initial_sync_seconds")
+        .record(join_started.elapsed().as_secs_f64());
 
     let liveness = rate_limits.liveness;
     let mut throttle = ConnectionThrottle::new(rate_limits, user_id, CollabKind::Doc);
@@ -208,10 +224,14 @@ pub async fn serve(
                     // full-state encode in the room actor.
                     Ok(YSyncMessage::SyncStep1(_sv)) if throttle.admit_sync_step1() => {
                         // Reply with full state again — cheap, idempotent.
+                        // A re-join: the parked rows come back only when the
+                        // room had dropped this connection (Ruling 5). The
+                        // writer is running, so these sends wait but cannot
+                        // block for good.
                         let (rtx, rrx) = oneshot::channel();
                         let _ = handle
                             .tx
-                            .send(Event::Join {
+                            .send(Event::Resync {
                                 conn_id,
                                 handle: conn_handle(),
                                 reply: rtx,
@@ -219,6 +239,9 @@ pub async fn serve(
                             .await;
                         if let Ok(Ok(joined)) = rrx.await {
                             let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
+                            for row in &joined.pending {
+                                let _ = out_tx.send(wrap_sync_update(row)).await;
+                            }
                         }
                     }
                     Ok(YSyncMessage::SyncStep2(inner)) | Ok(YSyncMessage::Update(inner)) => {

@@ -17,7 +17,7 @@ mod interleave;
 mod log_fixtures;
 
 use fixtures::{Rng, cross_client_parked, overlapping_skips, para};
-use interleave::held;
+use interleave::{held, pending_parts};
 use knot_crdt::nesting::MAX_NESTING;
 use knot_crdt::pending::{self, holds_any};
 use knot_crdt::{
@@ -198,6 +198,50 @@ async fn legacy_snapshot(pool: &PgPool, doc: Uuid, seq: i64, state: &DocHandle) 
     .execute(pool)
     .await
     .unwrap();
+}
+
+/// The page's stamped snapshots, by rev: rev, state and `pending_revs`.
+async fn named_snapshots(pool: &PgPool, doc: Uuid) -> Vec<(i64, Vec<u8>, Option<Vec<i64>>)> {
+    sqlx::query_as(
+        "SELECT snapshot_rev, state_bytes, pending_revs FROM doc_snapshots
+         WHERE doc_id = $1 AND snapshot_rev IS NOT NULL ORDER BY snapshot_rev",
+    )
+    .bind(doc)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// A snapshot's state with the rows it names applied after it, in rev
+/// order: what boot re-parks.
+async fn snapshot_with_its_rows(pool: &PgPool, doc: Uuid, state: &[u8], revs: &[i64]) -> DocHandle {
+    let log = rows(pool, doc).await;
+    let mut updates: Vec<&[u8]> = vec![state];
+    for rev in revs {
+        let row = log
+            .iter()
+            .find(|r| r.rev == Some(*rev))
+            .unwrap_or_else(|| panic!("the log lacks rev {rev}"));
+        updates.push(&row.update_bytes);
+    }
+    doc_of(&updates)
+}
+
+/// Asserts `a` and `b` agree in text, state vector, delete set and pending
+/// claims.
+#[track_caller]
+fn assert_same_content(a: &DocHandle, b: &DocHandle, what: &str) {
+    assert_eq!(text(a), text(b), "{what}: text");
+    let state = |d: &DocHandle| {
+        let txn = d.inner().transact();
+        (txn.state_vector(), txn.snapshot().delete_set.encode_v1())
+    };
+    assert_eq!(state(a), state(b), "{what}: state vector and delete set");
+    assert_eq!(
+        pending::claims(a),
+        pending::claims(b),
+        "{what}: pending claims"
+    );
 }
 
 /// The page's stamped snapshots: rev, epoch and state, by rev.
@@ -571,32 +615,31 @@ async fn every_snapshot_equals_the_log_replayed_to_its_rev() {
         }
         settle(&pool, doc, &h).await;
 
-        let snapshots = stamped_snapshots(&pool, doc).await;
-        // One before the held-back update and at least one after it
-        // drained: until the room records the rows that park its pending
-        // content, it writes none while u2 waits.
+        let snapshots = named_snapshots(&pool, doc).await;
+        // Before the held-back update, while u2 waits (naming its row), and
+        // after it drained.
         assert!(
-            snapshots.len() >= 2,
+            snapshots.len() >= 3,
             "{mode:?}: {} snapshots",
             snapshots.len()
         );
         let mut with_pending = 0;
-        for (rev, _, state) in &snapshots {
-            let snapshot = doc_of(&[state]);
-            if pending(&snapshot).0.is_some() {
+        for (rev, state, revs) in &snapshots {
+            let what = format!("{mode:?}: snapshot at rev {rev}");
+            let revs = revs.as_ref().expect("a fixed snapshot names its rows");
+            if !revs.is_empty() {
                 with_pending += 1;
             }
-            assert_same_doc(
-                &snapshot,
+            assert_eq!(pending(&doc_of(&[state])), (None, None), "{what}");
+            assert_same_content(
+                &snapshot_with_its_rows(&pool, doc, state, revs).await,
                 &replay(&pool, doc, *rev).await,
-                &format!("{mode:?}: snapshot at rev {rev}"),
+                &what,
             );
         }
-        // Until the room records the rows that park its pending content,
-        // it writes no snapshot while content is pending.
-        assert_eq!(
-            with_pending, 0,
-            "{mode:?}: a snapshot was written while content was pending"
+        assert!(
+            with_pending > 0,
+            "{mode:?}: no snapshot was written while u2 waited"
         );
         assert!(!h.shutdown.is_cancelled(), "{mode:?}: the room was evicted");
 
@@ -1314,11 +1357,9 @@ async fn a_snapshot_an_older_pod_wrote_after_the_migration_boots_from_the_last_t
     shut_down(&h).await;
 }
 
-/// Review Focus 4: a pre-0.9.9 page whose parking row the old GC deleted;
-/// its legacy snapshot holds the only copy of the parked content, and boot
-/// carries it (Ruling 19).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_legacy_page_whose_parking_row_was_collected_keeps_its_pending_content() {
+/// A pre-0.9.9 page whose parking row (u2's) the old GC deleted: its
+/// legacy snapshot holds the only copy of the parked content.
+async fn legacy_page_whose_parking_row_was_collected() -> (PgPool, Uuid) {
     let (_, u2) = cross_client_parked();
     let (pool, doc) = legacy_page().await;
     let snapshot_seq: i64 =
@@ -1334,6 +1375,16 @@ async fn a_legacy_page_whose_parking_row_was_collected_keeps_its_pending_content
     assert!(pending::parks_when_applied(&bytes) && !pending::may_be_shifted(&bytes));
     legacy_snapshot(&pool, doc, snapshot_seq, &parked).await;
     finish_migrations(&pool).await;
+    (pool, doc)
+}
+
+/// Review Focus 4: a pre-0.9.9 page whose parking row the old GC deleted;
+/// its legacy snapshot holds the only copy of the parked content, and boot
+/// carries it (Ruling 19).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_page_whose_parking_row_was_collected_keeps_its_pending_content() {
+    let (_, u2) = cross_client_parked();
+    let (pool, doc) = legacy_page_whose_parking_row_was_collected().await;
 
     let boot = direct_boot(&pool, doc).await;
     assert_eq!(boot.fallback, None);
@@ -1417,4 +1468,296 @@ async fn a_page_whose_trusted_snapshot_an_older_gc_deleted_boots_from_the_whole_
     c.send(&h, u1).await;
     until_text(&h, "back held").await;
     shut_down(&h).await;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots that name the rows parking their pending content (Task 4)
+// ---------------------------------------------------------------------------
+
+/// The newest stamped snapshot's state and `pending_revs`.
+async fn newest_snapshot(pool: &PgPool, doc: Uuid) -> (Vec<u8>, Option<Vec<i64>>) {
+    let (_, state, revs) = named_snapshots(pool, doc)
+        .await
+        .pop()
+        .expect("a stamped snapshot");
+    (state, revs)
+}
+
+/// The insertions of `update`.
+fn insertions(update: &[u8]) -> yrs::IdSet {
+    Update::decode_v1(update).unwrap().insertions(true)
+}
+
+/// Ruling 3: the exit snapshot holds no pending content and names the rows
+/// that parked it; the next boot re-parks them and the content drains.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_leaves_pending_content_to_the_rows_that_parked_it() {
+    let o = overlapping_skips();
+    let (pool, doc) = new_page().await;
+    let store = Arc::new(PgUpdatesStore::new(pool.clone()));
+    let h = open_room(&pool, doc, store.clone(), LAZY).await;
+    let c = Client::join(&h, 7).await;
+    for u in [&o.t0, &o.t2, &o.t3] {
+        c.send(&h, u.clone()).await;
+    }
+    until_rows(&pool, doc, 3).await;
+    let live = live_of(&[&o.t0, &o.t2, &o.t3]);
+    let claims = pending::claims(&live).expect("fixture: t2 and t3 park");
+    shut_down(&h).await;
+
+    let (state, revs) = newest_snapshot(&pool, doc).await;
+    assert_eq!(pending(&doc_of(&[&state])), (None, None));
+    assert!(
+        !holds_any(&insertions(&state).intersect(&claims.structs)),
+        "the snapshot names pending ids"
+    );
+    assert_eq!(revs, Some(vec![2, 3]), "the rows of t2 and t3");
+
+    let h = open_room(&pool, doc, store, LAZY).await;
+    let c = Client::join(&h, 7).await;
+    c.send(&h, o.t1.clone()).await;
+    c.send(&h, o.t2b.clone()).await;
+    until_rows(&pool, doc, 5).await;
+    shut_down(&h).await;
+    // The live room keeps "pp" and "qq" stuck after t1 and t2b (Ruling 11,
+    // Task 1's Concern 2); the next boot re-parks and drains them.
+    let reboot = direct_boot(&pool, doc).await;
+    assert!(
+        pending::claims(&reboot.doc).is_none(),
+        "the content drained"
+    );
+    let in_order: [&[u8]; 5] = [&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3];
+    assert_eq!(text(&reboot.doc), text(&doc_of(&in_order)));
+}
+
+/// Review Focus 1: content parked for good, a page edited for long, and
+/// re-sends of the parking update that change the pending fingerprint
+/// without adding ids: snapshots keep being written, each naming the
+/// oldest rows that parked the content.
+#[tokio::test(flavor = "multi_thread")]
+async fn content_parked_for_good_keeps_snapshots_and_its_parking_rows() {
+    let o = overlapping_skips();
+    let parked: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let scratch = live_of(&parked);
+    let claims = pending::claims(&scratch).expect("fixture: t2 and t3 park");
+    let again = YrsEngine
+        .apply_update_measuring(&scratch, &o.t2, MAX_NESTING)
+        .unwrap();
+    assert!(
+        again.pending_changed,
+        "fixture: a re-send of t2 is recorded"
+    );
+    assert_eq!(
+        pending::claims(&scratch),
+        Some(claims.clone()),
+        "fixture: it adds no id"
+    );
+    // Only the first re-send changes the pending fingerprint: the later
+    // ones change nothing, and are neither persisted nor recorded.
+    for _ in 0..2 {
+        let later = YrsEngine
+            .apply_update_measuring(&scratch, &o.t2, MAX_NESTING)
+            .unwrap();
+        assert!(!later.changed, "fixture: a second re-send changes nothing");
+    }
+
+    let (pool, doc) = new_page().await;
+    let store = Arc::new(PgUpdatesStore::new(pool.clone()));
+    let policy = SnapshotPolicy {
+        every_n: 5,
+        idle: Duration::from_secs(3600),
+    };
+    let h = open_room(&pool, doc, store.clone(), policy).await;
+    let a = Client::join(&h, 1).await;
+    for u in parked {
+        a.send(&h, u.to_vec()).await;
+    }
+    until_rows(&pool, doc, 3).await;
+
+    // A joining editor holds the room's pending content, and no phantom.
+    let mut c = Client::join(&h, 3).await;
+    let allowed = insertions_of(&parked);
+    assert!(
+        within(&held(&c.doc), &allowed),
+        "the joined doc holds a phantom"
+    );
+    let (structs, deletes) = pending_parts(&c.doc);
+    let (live_structs, live_deletes) = pending_parts(scratch.inner());
+    assert!(
+        holds_any(&structs),
+        "the joined doc holds the pending content"
+    );
+    assert!(
+        within(&structs, &live_structs),
+        "pending structs the room lacks"
+    );
+    assert!(
+        within(&deletes, &live_deletes),
+        "pending deletes the room lacks"
+    );
+    let (exported, _) = room_doc(&h).await;
+    assert!(
+        within(&held(exported.inner()), &allowed),
+        "the export holds a phantom"
+    );
+    assert_eq!(
+        pending(&exported),
+        (None, None),
+        "the export holds pending content"
+    );
+
+    let mut rng = Rng::new(42);
+    let mut edits = Vec::new();
+    for i in 0..30 {
+        c.sync();
+        let edit = c.edit(&mut rng);
+        edits.push(edit.clone());
+        c.send(&h, edit).await;
+        if i % 10 == 5 {
+            a.send(&h, o.t2.clone()).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // t0, t2, t3, c's 30 edits and the first re-send.
+    until_rows(&pool, doc, 34).await;
+    shut_down(&h).await;
+    assert_eq!(row_count(&pool, doc).await, 34);
+
+    let snapshots = named_snapshots(&pool, doc).await;
+    assert!(snapshots.len() >= 4, "{} snapshots", snapshots.len());
+    for (rev, _, revs) in &snapshots {
+        assert_eq!(revs, &Some(vec![2, 3]), "the snapshot at rev {rev}");
+    }
+    let boot = direct_boot(&pool, doc).await;
+    assert_eq!(pending::claims(&boot.doc), Some(claims));
+
+    let h = open_room(&pool, doc, store, LAZY).await;
+    let b = Client::join(&h, 1).await;
+    b.send(&h, o.t1.clone()).await;
+    b.send(&h, o.t2b.clone()).await;
+    until_rows(&pool, doc, 36).await;
+    shut_down(&h).await;
+    // The live room keeps the content stuck (Ruling 11); the next boot
+    // drains it.
+    let reboot = direct_boot(&pool, doc).await;
+    assert!(
+        pending::claims(&reboot.doc).is_none(),
+        "the content drained"
+    );
+    let mut all: Vec<&[u8]> = vec![&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3];
+    all.extend(edits.iter().map(Vec::as_slice));
+    assert_eq!(text(&reboot.doc), text(&doc_of(&all)));
+}
+
+/// Ruling 5: a client that joined while content was pending holds it
+/// pending, from the join's rows, and drains it when the dependency is
+/// fanned out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_joined_while_content_was_pending_sees_it_drain() {
+    let (u1, u2) = cross_client_parked();
+    let (pool, doc) = new_page().await;
+    let h = open_room(
+        &pool,
+        doc,
+        Arc::new(PgUpdatesStore::new(pool.clone())),
+        LAZY,
+    )
+    .await;
+    let a = Client::join(&h, 1).await;
+    a.send(&h, u2.clone()).await;
+    until_rows(&pool, doc, 1).await;
+
+    let mut c = Client::join(&h, 3).await;
+    let (structs, _) = pending_parts(&c.doc);
+    assert!(within(&insertions(&u2), &structs), "c lacks u2 pending");
+
+    let b = Client::join(&h, 2).await;
+    b.send(&h, u1).await;
+    let page = until_text(&h, "back held").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        c.sync();
+        let frag = c.doc.get_or_insert_xml_fragment("default");
+        let mine = yrs::GetString::get_string(&frag, &c.doc.transact());
+        if mine.contains("back held") {
+            assert_eq!(mine, page);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "c never drained: {mine}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    shut_down(&h).await;
+}
+
+/// Ruling 5: a joining client that holds the dependency integrates the
+/// parked rows at once, and its own answer drains the room.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_that_holds_the_dependency_drains_on_join() {
+    let (u1, u2) = cross_client_parked();
+    let (pool, doc) = new_page().await;
+    let h = open_room(
+        &pool,
+        doc,
+        Arc::new(PgUpdatesStore::new(pool.clone())),
+        LAZY,
+    )
+    .await;
+    let a = Client::join(&h, 1).await;
+    a.send(&h, u2).await;
+    until_rows(&pool, doc, 1).await;
+
+    let d = Client::join_seeded(&h, 4, None, &[&u1]).await;
+    let mine = {
+        let frag = d.doc.get_or_insert_xml_fragment("default");
+        yrs::GetString::get_string(&frag, &d.doc.transact())
+    };
+    assert!(mine.contains("back held"), "{mine}");
+    d.send(&h, u1).await;
+    assert_eq!(until_text(&h, "back held").await, mine);
+    shut_down(&h).await;
+}
+
+/// Ruling 19: content only a legacy snapshot held is persisted once as an
+/// author-less row, which the next snapshot names; the next boot trusts
+/// that snapshot and carries nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn carried_legacy_pending_content_is_named_by_the_next_snapshot() {
+    let (u1, _) = cross_client_parked();
+    let (pool, doc) = legacy_page_whose_parking_row_was_collected().await;
+    let n = row_count(&pool, doc).await;
+    let store = Arc::new(PgUpdatesStore::new(pool.clone()));
+    let h = open_room(&pool, doc, store.clone(), LAZY).await;
+    until_rows(&pool, doc, n + 1).await;
+    shut_down(&h).await;
+
+    let carried: Vec<(i64, Option<Uuid>)> = sqlx::query_as(
+        "SELECT rev, by_user_id FROM doc_updates
+          WHERE doc_id = $1 AND meta->>'repark' = 'legacy'",
+    )
+    .bind(doc)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(carried.len(), 1, "{carried:?}");
+    let (rev, by_user) = carried[0];
+    assert_eq!(by_user, None);
+    let (_, revs) = newest_snapshot(&pool, doc).await;
+    assert_eq!(revs, Some(vec![rev]));
+
+    let boot = direct_boot(&pool, doc).await;
+    assert_eq!(boot.fallback, None);
+    assert!(boot.carry.is_empty(), "the next boot carries again");
+    let h = open_room(&pool, doc, store, LAZY).await;
+    let c = Client::join(&h, 7).await;
+    c.send(&h, u1).await;
+    until_text(&h, "back held").await;
+    shut_down(&h).await;
+    assert_eq!(
+        row_count(&pool, doc).await,
+        n + 2,
+        "a second carry was written"
+    );
 }

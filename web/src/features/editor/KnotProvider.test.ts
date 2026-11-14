@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 
-import { FakeSocket } from "../../test/fakeSocket";
+import { FakeSocket, syncMsg } from "../../test/fakeSocket";
 
+import pendingHandshake from "./__fixtures__/pendingHandshake.json";
 import { KnotProvider, type CommentChangeMsg } from "./KnotProvider";
 
 describe("KnotProvider", () => {
@@ -242,5 +243,168 @@ describe("KnotProvider close codes", () => {
     vi.advanceTimersByTime(31_000);
     expect(FakeSocket.all).toHaveLength(2);
     p.destroy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Parked rows in the join handshake
+// ---------------------------------------------------------------------------
+
+/**
+ * The yjs half of the server's join handshake on a page whose content waits
+ * for a missing update: SYNC_STEP_2 carries the room's state without its
+ * pending content, then each log row that parked that content arrives as a
+ * SYNC_UPDATE, then SYNC_STEP_1. The fixture comes from
+ * crates/knot-crdt/tests/web_handshake_fixture.rs, which builds it from the
+ * reproducers of yrs 0.27.3's pending-encoding defect: `state` is the
+ * room's pending-free state, `frames` the rows the room sends, and
+ * `dependency`/`dependencies` what drains them.
+ */
+describe("KnotProvider receives parked rows in the join handshake", () => {
+  type Case = {
+    state: string;
+    frames: string[];
+    dependency?: string;
+    dependencies?: string[];
+    all?: string[];
+  };
+  const cases = pendingHandshake as Record<"crossClient" | "overlapping" | "underflow", Case>;
+
+  const unhex = (s: string) =>
+    Uint8Array.from(s.match(/../g) ?? [], (b) => Number.parseInt(b, 16));
+  const dependencies = (c: Case) =>
+    (c.dependencies ?? (c.dependency ? [c.dependency] : [])).map(unhex);
+  // `toJSON` is the fragment's `toString()` (its XML), typed as a string.
+  const fragment = (d: Y.Doc): string => d.getXmlFragment("default").toJSON();
+
+  /** A doc that applied `updates` in order. */
+  function docOf(updates: Uint8Array[]): Y.Doc {
+    const d = new Y.Doc();
+    for (const u of updates) Y.applyUpdate(d, u);
+    return d;
+  }
+
+  /** The room's frames up to SYNC_STEP_1: the state, then the parked rows. */
+  function handshakeFrames(c: Case): Uint8Array[] {
+    return [syncMsg(1, unhex(c.state)), ...c.frames.map((f) => syncMsg(2, unhex(f)))];
+  }
+
+  function feed(p: KnotProvider, frames: Uint8Array[]) {
+    for (const f of frames) {
+      (p as unknown as { handleFrame(b: Uint8Array): void }).handleFrame(f);
+    }
+  }
+
+  /** Every id `c`'s state and frames name: struct ranges (Skips left out),
+   *  and those plus their delete sets. Per client, as clock sets. */
+  function namedIds(c: Case) {
+    const structs = new Map<number, Set<number>>();
+    const deletes = new Map<number, Set<number>>();
+    const add = (m: Map<number, Set<number>>, client: number, clock: number, len: number) => {
+      const s = m.get(client) ?? new Set<number>();
+      for (let i = clock; i < clock + len; i++) s.add(i);
+      m.set(client, s);
+    };
+    for (const u of [c.state, ...c.frames].map(unhex)) {
+      const { structs: ss, ds } = Y.decodeUpdate(u);
+      for (const s of ss) {
+        if (!(s instanceof Y.Item || s instanceof Y.GC)) continue;
+        add(structs, s.id.client, s.id.clock, s.length);
+        add(deletes, s.id.client, s.id.clock, s.length);
+      }
+      for (const [client, items] of ds.clients) {
+        for (const it of items) add(deletes, client, it.clock, it.len);
+      }
+    }
+    return { structs, deletes };
+  }
+
+  /** The ids `update` names that `allowed` lacks, as "client#clock". */
+  function strays(
+    update: Uint8Array,
+    allowed: { structs: Map<number, Set<number>>; deletes: Map<number, Set<number>> },
+  ): string[] {
+    const out: string[] = [];
+    const { structs, ds } = Y.decodeUpdate(update);
+    for (const s of structs) {
+      if (!(s instanceof Y.Item || s instanceof Y.GC)) continue;
+      for (let i = s.id.clock; i < s.id.clock + s.length; i++) {
+        if (!allowed.structs.get(s.id.client)?.has(i)) out.push(`struct ${s.id.client}#${i}`);
+      }
+    }
+    for (const [client, items] of ds.clients) {
+      for (const it of items) {
+        for (let i = it.clock; i < it.clock + it.len; i++) {
+          if (!allowed.deletes.get(client)?.has(i)) out.push(`delete ${client}#${i}`);
+        }
+      }
+    }
+    return out;
+  }
+
+  function drains(c: Case) {
+    const doc = new Y.Doc();
+    const p = new KnotProvider({ url: "ws://127.0.0.1:1/never", doc });
+    feed(p, handshakeFrames(c));
+    expect(doc.store.pendingStructs).not.toBeNull();
+
+    feed(p, dependencies(c).map((d) => syncMsg(2, d)));
+
+    expect(doc.store.pendingStructs).toBeNull();
+    const reference = docOf(c.all!.map(unhex));
+    expect(fragment(doc)).toBe(fragment(reference));
+    p.destroy();
+    return fragment(doc);
+  }
+
+  it("holds parked rows from the handshake and drains them when the dependency arrives", () => {
+    expect(drains(cases.crossClient)).toContain("back held");
+  });
+
+  it("drains rows parked behind overlapping skips", () => {
+    drains(cases.overlapping);
+  });
+
+  it("takes a GC row after a state that holds blocks past a gap", () => {
+    const p = new KnotProvider({ url: "ws://127.0.0.1:1/never", doc: new Y.Doc() });
+    expect(() => feed(p, handshakeFrames(cases.underflow))).not.toThrow();
+    p.destroy();
+  });
+
+  describe("answers the room's SyncStep1 with nothing it was not sent", () => {
+    beforeEach(() => {
+      FakeSocket.all = [];
+      vi.useFakeTimers();
+      vi.stubGlobal("WebSocket", FakeSocket);
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    });
+
+    for (const name of ["crossClient", "overlapping", "underflow"] as const) {
+      it(name, () => {
+        const c = cases[name];
+        const doc = new Y.Doc();
+        const p = new KnotProvider({ url: "ws://x/collab", doc });
+        const ws = FakeSocket.all.at(-1)!;
+        ws.open();
+        for (const f of handshakeFrames(c)) ws.deliver(f);
+        // The room's own state vector: it holds `state`, and parks the rest.
+        const model = docOf([unhex(c.state)]);
+        ws.serverAsks(model);
+
+        const replies = ws.edits();
+        expect(replies.length).toBeGreaterThan(0);
+        const allowed = namedIds(c);
+        for (const reply of replies) expect(strays(reply, allowed)).toEqual([]);
+
+        if (c.all) {
+          const room = docOf([unhex(c.state), ...dependencies(c), ...replies]);
+          expect(fragment(room)).toBe(fragment(docOf(c.all.map(unhex))));
+        }
+        p.destroy();
+      });
+    }
   });
 });

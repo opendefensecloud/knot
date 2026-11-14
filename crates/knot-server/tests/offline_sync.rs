@@ -19,6 +19,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "../../knot-crdt/tests/common/fixtures.rs"]
+mod fixtures;
+
 use futures_util::{SinkExt, StreamExt};
 use knot_auth::{Hasher, Throttle};
 use knot_server::protocol::{YSyncMessage, decode};
@@ -1076,4 +1079,120 @@ async fn board_update_that_does_not_decode_closes_only_its_sender() {
 
     b.disconnect().await;
     c.disconnect().await;
+}
+
+// ---------------------------------------------------------------------------
+// Pending content in the join handshake (Ruling 5)
+// ---------------------------------------------------------------------------
+
+/// The ids `updates` insert.
+fn insertions_of<'a>(updates: impl IntoIterator<Item = &'a Vec<u8>>) -> yrs::IdSet {
+    updates.into_iter().fold(yrs::IdSet::new(), |acc, u| {
+        acc.merge(&Update::decode_v1(u).unwrap().insertions(true))
+    })
+}
+
+/// Whether `doc` holds every id of `ids` as a pending struct.
+fn holds_pending(doc: &Doc, ids: &yrs::IdSet) -> bool {
+    let txn = doc.transact();
+    let pending = txn
+        .store()
+        .pending_update()
+        .map(|p| p.update.insertions(true))
+        .unwrap_or_default();
+    !knot_crdt::pending::holds_any(&ids.diff(&pending))
+}
+
+/// Waits until the page holds `n` rows.
+async fn until_rows(fx: &Fixture, n: i64) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM doc_updates WHERE doc_id = $1")
+            .bind(fx.doc_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        if count >= n {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the page never held {n} rows");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A joining editor receives the rows that park the room's pending content
+/// in its handshake, holds that content pending under its real ids, and
+/// drains it when the dependency is fanned out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joining_socket_receives_the_rows_that_hold_pending_content() {
+    let fx = fixture().await;
+    let path = format!("/collab/doc/{}", fx.doc_id);
+    let (u1, u2) = fixtures::cross_client_parked();
+    let mut first = Peer::new();
+    first.connect(&fx, &path).await;
+    assert!(first.pump_until(DEADLINE, |p| p.step2_received >= 1).await);
+    first.send_raw_update(&u2).await;
+    until_rows(&fx, 1).await;
+
+    let mut second = Peer::new();
+    second.connect(&fx, &path).await;
+    let parked = insertions_of([&u2]);
+    assert!(
+        second
+            .pump_until(HANDSHAKE_WAIT, |p| holds_pending(&p.doc, &parked))
+            .await,
+        "the joining socket does not hold u2 pending"
+    );
+
+    first.send_raw_update(&u1).await;
+    assert!(
+        second
+            .pump_until(DEADLINE, |p| p.doc_text().contains("back held"))
+            .await,
+        "the joined doc never drained: {}",
+        second.doc_text()
+    );
+}
+
+/// Review Focus 3 with the collab limits off: a join on a page with 301
+/// parked rows completes, holds every row pending, and drains.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_with_300_parked_rows_syncs_and_drains() {
+    let fx = fixture().await;
+    let path = format!("/collab/doc/{}", fx.doc_id);
+    let (u1, u2, tail) = fixtures::cross_client_parked_tail(300);
+    let mut first = Peer::new();
+    first.connect(&fx, &path).await;
+    assert!(first.pump_until(DEADLINE, |p| p.step2_received >= 1).await);
+    first.send_raw_update(&u2).await;
+    for row in &tail {
+        first.send_raw_update(row).await;
+    }
+    until_rows(&fx, 301).await;
+
+    let mut second = Peer::new();
+    second.connect(&fx, &path).await;
+    let parked = insertions_of(std::iter::once(&u2).chain(&tail));
+    assert!(
+        second
+            .pump_until(Duration::from_secs(5), |p| p.step2_received >= 1
+                && holds_pending(&p.doc, &parked))
+            .await,
+        "the join did not complete with every parked row"
+    );
+
+    first.send_raw_update(&u1).await;
+    let reference = Doc::new();
+    for u in std::iter::once(&u1).chain([&u2]).chain(&tail) {
+        reference
+            .transact_mut()
+            .apply_update(Update::decode_v1(u).unwrap())
+            .unwrap();
+    }
+    let want = doc_text(&reference);
+    assert!(
+        second.pump_until(DEADLINE, |p| p.doc_text() == want).await,
+        "the joined doc never drained: {}",
+        second.doc_text()
+    );
 }

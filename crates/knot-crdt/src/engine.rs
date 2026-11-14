@@ -3,7 +3,7 @@
 
 use thiserror::Error;
 use yrs::{
-    Doc, ReadTxn, StateVector, Transact, TransactionMut, Update,
+    Doc, IdSet, ReadTxn, StateVector, Transact, TransactionMut, Update,
     updates::{decoder::Decode, encoder::Encode},
 };
 
@@ -59,6 +59,23 @@ pub struct ApplyMeasured {
     /// deletes (it parked or drained content): the rows a room records for
     /// its pending content (`pending::ParkedRows`).
     pub pending_changed: bool,
+    /// The transaction's insert set: every block the apply integrated,
+    /// drained pending content included (empty when nothing changed). The
+    /// room keeps the blocks it holds past a gap current from it
+    /// (`pending::PastGap::note`, Ruling 25).
+    pub inserted: IdSet,
+}
+
+/// What [`Engine::apply_row`] reports for a log row that applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowApplied {
+    /// Whether the doc changed, as [`Engine::apply_update_changed`] reports.
+    pub changed: bool,
+    /// Whether the apply changed the doc's pending structs or pending
+    /// deletes, as [`ApplyMeasured::pending_changed`].
+    pub pending_changed: bool,
+    /// The transaction's insert set, as [`ApplyMeasured::inserted`].
+    pub inserted: IdSet,
 }
 
 pub struct DocHandle(pub(crate) Doc);
@@ -83,7 +100,13 @@ pub trait Engine: Send + Sync + 'static {
     /// sends back, which always includes its full delete set. Callers use it
     /// to skip persisting / fanning out such no-ops; anything that could not
     /// be integrated yet reports `true`, so it is never dropped.
-    fn apply_update_changed(&self, d: &DocHandle, update: &[u8]) -> Result<bool, EngineError>;
+    fn apply_update_changed(&self, d: &DocHandle, update: &[u8]) -> Result<bool, EngineError> {
+        Ok(self.apply_row(d, update)?.changed)
+    }
+    /// Apply a log row (a catch-up row) and report whether the doc changed
+    /// (as [`Engine::apply_update_changed`]), whether its pending content
+    /// changed, and what the apply integrated ([`RowApplied`]).
+    fn apply_row(&self, d: &DocHandle, update: &[u8]) -> Result<RowApplied, EngineError>;
     /// Apply `update` and, in the same transaction, measure how deep it
     /// nested the doc's shared types — the authoritative nesting check (see
     /// [`crate::nesting`]). Returns whether the doc changed (as
@@ -114,6 +137,10 @@ pub trait Engine: Send + Sync + 'static {
         update: &[u8],
         limit: usize,
     ) -> Result<ApplyMeasured, EngineError>;
+    /// The doc's blocks from `peer_sv` on (all of them without one) and its
+    /// whole delete set, without its pending content
+    /// ([`crate::pending::encode_without_pending`]): yrs 0.27.3's own
+    /// encoder can write pending blocks at shifted clocks (Ruling 2).
     fn encode_state_as_update(
         &self,
         d: &DocHandle,
@@ -138,7 +165,7 @@ impl Engine for YrsEngine {
         Ok(())
     }
 
-    fn apply_update_changed(&self, d: &DocHandle, update: &[u8]) -> Result<bool, EngineError> {
+    fn apply_row(&self, d: &DocHandle, update: &[u8]) -> Result<RowApplied, EngineError> {
         let u = Update::decode_v1(update).map_err(|e| EngineError::Apply(e.to_string()))?;
         let mut txn = d.0.transact_mut();
         let pending_before = pending_fingerprint(&txn);
@@ -154,9 +181,19 @@ impl Engine for YrsEngine {
         //   hold pending content indefinitely (and snapshots and every
         //   client's state re-send it), and re-delivering it changes nothing.
         //   Content that is newly parked does change it, and is never dropped.
-        Ok(!txn.insert_set().is_empty()
-            || !txn.delete_set().is_empty()
-            || pending_fingerprint(&txn) != pending_before)
+        let pending_changed = pending_fingerprint(&txn) != pending_before;
+        let changed =
+            !txn.insert_set().is_empty() || !txn.delete_set().is_empty() || pending_changed;
+        let inserted = if changed {
+            txn.insert_set().clone()
+        } else {
+            IdSet::default()
+        };
+        Ok(RowApplied {
+            changed,
+            pending_changed,
+            inserted,
+        })
     }
 
     fn apply_update_measuring(
@@ -195,6 +232,11 @@ impl Engine for YrsEngine {
         // the room on every join. Content parked as pending that integrates
         // now IS in the insert set, so it is still measured.
         type_ids.retain(|id| txn.insert_set().contains(id));
+        let inserted = if changed {
+            txn.insert_set().clone()
+        } else {
+            IdSet::default()
+        };
         // Commit now (rather than on drop) so the walk below reads the
         // integrated, garbage-collected document, and the effective update
         // below is encoded from it.
@@ -217,6 +259,7 @@ impl Engine for YrsEngine {
             persist,
             raw_fallback,
             pending_changed,
+            inserted,
         })
     }
 
@@ -232,7 +275,7 @@ impl Engine for YrsEngine {
             None => StateVector::default(),
         };
         let txn = d.0.transact();
-        Ok(txn.encode_state_as_update_v1(&sv))
+        Ok(crate::pending::encode_without_pending(&txn, &sv))
     }
 
     fn encode_state_vector(&self, d: &DocHandle) -> Result<Vec<u8>, EngineError> {

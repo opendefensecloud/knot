@@ -13,7 +13,8 @@ mod fixtures;
 #[path = "common/log_fixtures.rs"]
 mod log_fixtures;
 
-use fixtures::{Rng, random_edit};
+use fixtures::{Rng, cross_client_parked, random_edit};
+use knot_crdt::pending;
 use knot_crdt::{Bus, DocHandle, Event, MemBus, RoomHandle, Rooms, SnapshotPolicy, YrsEngine};
 use knot_storage::{
     DocSnapshot, DocUpdate, HistoryHead, NewUpdate, Persisted, PgSnapshotStore, PgUpdatesStore,
@@ -21,7 +22,7 @@ use knot_storage::{
     UpdatesStoreError,
 };
 use knot_test_support::old_sql::{OLD_INSERT_UPDATES_SQL, OLD_SNAPSHOT_UPSERT_SQL};
-use log_fixtures::{Client, assert_same_doc, doc_of, replay, row_count};
+use log_fixtures::{Client, assert_same_doc, doc_of, pending, replay, row_count, rows, text};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::oneshot;
@@ -433,21 +434,49 @@ impl OldPod {
     }
 }
 
-/// Every stamped snapshot of the page equals the log replayed to its rev.
+/// Every stamped snapshot of the page holds no pending content, and with
+/// the rows it names (`pending_revs`) applied after it equals the log
+/// replayed to its rev: text, state vector, delete set and pending claims.
 async fn assert_stamped_snapshots_replay(pool: &PgPool, doc: Uuid) {
-    let stamped: Vec<(i64, i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT snapshot_rev, snapshot_seq, state_bytes FROM doc_snapshots
+    /// A stamped snapshot: rev, seq, state and `pending_revs`.
+    type Stamped = (i64, i64, Vec<u8>, Option<Vec<i64>>);
+    let stamped: Vec<Stamped> = sqlx::query_as(
+        "SELECT snapshot_rev, snapshot_seq, state_bytes, pending_revs FROM doc_snapshots
           WHERE doc_id = $1 AND snapshot_rev IS NOT NULL ORDER BY snapshot_rev",
     )
     .bind(doc)
     .fetch_all(pool)
     .await
     .unwrap();
-    for (rev, seq, state) in &stamped {
-        assert_same_doc(
-            &doc_of(&[state]),
-            &replay(pool, doc, *rev).await,
-            &format!("the stamped snapshot at rev {rev} (seq {seq})"),
+    let log = rows(pool, doc).await;
+    for (rev, seq, state, revs) in &stamped {
+        let what = format!("the stamped snapshot at rev {rev} (seq {seq})");
+        assert_eq!(pending(&doc_of(&[state])), (None, None), "{what}");
+        // A 0.9.9 pod's upsert never lands on a stamped row, so every
+        // stamped row here is a fixed room's.
+        let revs = revs
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what} names no rows"));
+        let mut updates: Vec<&[u8]> = vec![state];
+        for named in revs {
+            let row = log
+                .iter()
+                .find(|r| r.rev == Some(*named))
+                .unwrap_or_else(|| panic!("{what}: the log lacks rev {named}"));
+            updates.push(&row.update_bytes);
+        }
+        let rebooted = doc_of(&updates);
+        let replayed = replay(pool, doc, *rev).await;
+        assert_eq!(text(&rebooted), text(&replayed), "{what}: text");
+        let state_of = |d: &DocHandle| {
+            let txn = d.inner().transact();
+            (txn.state_vector(), txn.snapshot().delete_set.encode_v1())
+        };
+        assert_eq!(state_of(&rebooted), state_of(&replayed), "{what}");
+        assert_eq!(
+            pending::claims(&rebooted),
+            pending::claims(&replayed),
+            "{what}: pending claims"
         );
     }
 }
@@ -589,5 +618,53 @@ async fn old_and_new_replicas_share_one_gapless_log() {
     }
     for rooms in [&rooms_a, &rooms_b, &rooms_c] {
         assert_eq!(rooms.drain_all(Duration::from_secs(30)).await, 0);
+    }
+}
+
+/// Ruling 4: a row that parks content on replica A is recorded by replica
+/// B when it catches up, and B's snapshot names it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_that_parks_on_one_replica_is_named_by_the_others_snapshot() {
+    let db = knot_test_support::fresh_db().await;
+    let (doc, users) = page_and_users(&db.pool, 1).await;
+    let bus = Arc::new(MemBus::new());
+    let (rooms_a, _) = replica(&pool_of(&db.url).await, &bus);
+    let (rooms_b, _) = replica(&pool_of(&db.url).await, &bus);
+    let a = rooms_a
+        .acquire(doc)
+        .await
+        .expect("replica A opens the page");
+    let b = rooms_b
+        .acquire(doc)
+        .await
+        .expect("replica B opens the page");
+
+    let (_, u2) = cross_client_parked();
+    let writer = Client::join_as(&a, 1, Some(users[0])).await;
+    writer.send(&a, u2).await;
+    quiesce(&db.pool, doc).await;
+    let rev: i64 = sqlx::query_scalar("SELECT rev FROM doc_updates WHERE doc_id = $1")
+        .bind(doc)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    caught_up_doc(&b, "replica B").await;
+    b.tx.send(Event::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), b.tx.closed())
+        .await
+        .expect("room B did not end");
+
+    let named: Option<Vec<i64>> = sqlx::query_scalar(
+        "SELECT pending_revs FROM doc_snapshots WHERE doc_id = $1
+          ORDER BY snapshot_rev DESC NULLS LAST, snapshot_seq DESC LIMIT 1",
+    )
+    .bind(doc)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(named, Some(vec![rev]), "B's snapshot names u2's row");
+    assert_stamped_snapshots_replay(&db.pool, doc).await;
+    for rooms in [&rooms_a, &rooms_b] {
+        rooms.drain_all(Duration::from_secs(30)).await;
     }
 }

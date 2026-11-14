@@ -48,8 +48,8 @@ mod mem_store;
 mod test_metrics;
 
 use fixtures::{
-    Rng, cross_client_parked, overlapping_skips, overlapping_skips_as, para,
-    shifted_state_that_parks_nothing, shifted_state_yrs_refuses, skip_underflow_case,
+    Rng, cross_client_parked, cross_client_parked_tail, overlapping_skips, overlapping_skips_as,
+    para, shifted_state_that_parks_nothing, shifted_state_yrs_refuses, skip_underflow_case,
     skip_underflow_parts,
 };
 use interleave::{
@@ -283,6 +283,27 @@ fn the_pending_free_state_names_only_held_blocks() {
     assert!(holds_pending(d.inner()), "fixture: t2 and t3's \"qq\" park");
     let found = pending_free_violations(d.inner());
     assert!(found.is_empty(), "{found:?}");
+}
+
+/// The reproducer through the production engine: the state every snapshot,
+/// SyncStep2 and `ExportState` is encoded with names no block the doc
+/// lacks, its pending content included.
+#[test]
+fn the_engines_state_names_no_block_the_doc_lacks() {
+    let o = overlapping_skips();
+    let d = YrsEngine.new_doc();
+    for u in [&o.t0, &o.t2, &o.t3] {
+        YrsEngine.apply_update(&d, u).expect("the update applies");
+    }
+    assert!(holds_pending(d.inner()), "fixture: t2 and t3's \"qq\" park");
+    let state = YrsEngine
+        .encode_state_as_update(&d, None)
+        .expect("the state encodes");
+    let named = insertions(&state).diff(&held(d.inner()));
+    assert!(
+        !holds_any(&named),
+        "the engine's state names blocks the doc lacks: {named:?}"
+    );
 }
 
 #[test]
@@ -2393,4 +2414,57 @@ async fn a_pending_free_snapshot_and_its_rows_reboot_the_room() {
 /// What a fixed room sends a pulling client: its pending-free state.
 fn fixed_pull(d: &DocHandle, sv: &StateVector) -> Vec<u8> {
     encode_without_pending(&d.inner().transact(), sv)
+}
+
+/// Ruling 4's k: a cover of 3,000 keystroke rows parked behind one lost
+/// update. Recording and pruning each row as the room does stays bounded,
+/// and one re-park check, which the room actor runs inline on every
+/// passing snapshot attempt, stays under 250 ms in a release build.
+#[test]
+fn a_cover_of_3000_keystroke_rows_stays_cheap() {
+    use std::time::{Duration, Instant};
+    let (_, u2, tail) = cross_client_parked_tail(3000);
+    let live = YrsEngine.new_doc();
+    let mut parked = pending::ParkedRows::default();
+    let started = Instant::now();
+    for (rev, row) in (1..).zip(std::iter::once(&u2).chain(&tail)) {
+        let measured = YrsEngine
+            .apply_update_measuring(&live, row, MAX_NESTING)
+            .expect("the row applies");
+        if measured.pending_changed {
+            let claims = pending::claims(&live);
+            if claims.is_some() {
+                parked.record(Some(rev), row.clone());
+            }
+            let _ = parked.prune(claims.as_ref());
+        }
+    }
+    let recording = started.elapsed();
+    let claims = pending::claims(&live).expect("every row parks");
+    let state = encode_without_pending(&live.inner().transact(), &StateVector::default());
+    let started = Instant::now();
+    let checked = pending::check_reparks(&YrsEngine, &state, &parked.checked_rows(), &claims);
+    let check = started.elapsed();
+    println!(
+        "k = {}: recording {recording:?}, one check {check:?} ({} build)",
+        parked.len(),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    assert_eq!(parked.len(), 3001);
+    assert!(checked.is_ok(), "{checked:?}");
+    assert!(
+        recording < Duration::from_secs(60),
+        "recording took {recording:?}"
+    );
+    assert!(check < Duration::from_secs(20), "the check took {check:?}");
+    if !cfg!(debug_assertions) {
+        assert!(
+            check < Duration::from_millis(250),
+            "the check took {check:?}"
+        );
+    }
 }

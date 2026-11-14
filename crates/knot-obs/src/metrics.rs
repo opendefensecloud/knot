@@ -96,6 +96,18 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         "knot_room_boot_fallbacks_total",
         "Page boots, by rooms and read-only loads alike, that did not boot from the page's latest snapshot as stored, or that had a row refused by the skip-underflow guards, by reason: legacy (a snapshot from before the pending-encoding fix whose bytes may hold shifted blocks, booted from its trusted prefix and the whole log), rollout (a snapshot an older pod wrote during the rollout, replaced by the newest trusted snapshot, or by the whole log when none survives), missing_row (a row the snapshot names is missing or fails to apply; the rows after the snapshot still load) or underflow (the guards refused a row). A rollout boot that found a trusted snapshot whose own rule held, and a missing_row boot, read only the rows after the snapshot; every other fallback replays the page's whole log. Counted once per boot that returns, never for one that fails"
     );
+    describe_counter!(
+        "knot_room_snapshots_withheld_total",
+        "Room snapshots not written because the log rows recorded for the page's pending content would not re-park it over the snapshot, by reason: uncovered (pending content that no recorded row carries) or underflow (a recorded row the skip-underflow guards refused, excluded from the snapshot's rows, and the rest left content uncovered). Counted once per room for each distinct withholding (same reason, same pending ids, same recorded rows); a written snapshot ends it. Before it withholds, the room persists the pending content again as log rows when it has a faithful encoding (knot_room_pending_reparked_total)"
+    );
+    describe_counter!(
+        "knot_room_pending_reparked_total",
+        "Log rows a room persisted, without an author, to carry the page's pending content again, by reason: legacy (content only a pre-fix snapshot held, written once at boot), uncovered or underflow (content the recorded rows did not re-park when a snapshot was due; see knot_room_snapshots_withheld_total)"
+    );
+    describe_counter!(
+        "knot_room_updates_underflow_refused_total",
+        "Updates a live room did not apply because they meet yrs's skip underflow over blocks the room holds past a gap in their client's clock (a reconnecting editor's resend after a restart integrated content its lost edit had left pending), by source: inbound (a socket's update; its sender stays connected), apply_update (a server-side update, answered with an error) or catch_up (another replica's log row; one the room does not already hold also counts on knot_room_row_apply_errors_total). Nothing of such an update is applied, persisted or fanned out"
+    );
     describe_histogram!(
         "knot_room_hydrate_seconds",
         Unit::Seconds,

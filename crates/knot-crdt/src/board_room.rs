@@ -300,7 +300,8 @@ impl BoardRoom {
             return;
         }
         self.conns.insert(conn_id, handle);
-        let _ = reply.send(JoinState::of(self.engine.as_ref(), &self.doc));
+        // Boards track no parked rows (Ruling 10).
+        let _ = reply.send(JoinState::of(self.engine.as_ref(), &self.doc, Vec::new()));
     }
 
     #[tracing::instrument(skip(self, m), fields(board_id = %self.board_id, bytes = m.bytes.len()))]
