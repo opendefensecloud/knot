@@ -1,6 +1,6 @@
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
-import { ChevronRight, FileText, Lock, MoreHorizontal, Plus } from "lucide-react";
+import { ChevronRight, FileText, Lock, MoreHorizontal, Plus, Star } from "lucide-react";
 import { useCallback, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
@@ -71,6 +71,13 @@ export type TreeState = {
   onDuplicate: (node: TreeNode) => void;
   /** The pages whose copy is being made. */
   copying: ReadonlySet<string>;
+  /** The user's favorites, from `useFavorites`. */
+  favorites: {
+    isFavorite: (id: string) => boolean;
+    /** The list has loaded: until then a star can't say what it is. */
+    ready: boolean;
+    toggle: (doc: { id: string; title: string; icon: string | null }) => void;
+  };
 };
 
 export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; tree: TreeState }) {
@@ -107,6 +114,11 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
   const expanded = !tree.collapsed.has(node.id);
   const copying = tree.copying.has(node.id);
   const descId = `tree-desc-${node.id}`;
+  // A template can't be a favorite: the server refuses it.
+  const canStar = !node.is_template;
+  const starred = tree.favorites.isFavorite(node.id);
+  const starLabel = starred ? "Remove from favorites" : "Add to favorites";
+  const toggleStar = () => tree.favorites.toggle({ id: node.id, title: node.title, icon: node.icon });
 
   async function onRename() {
     const next = window.prompt("Rename to:", node.title);
@@ -143,6 +155,10 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
   }
 
   const items: ContextMenuItem[] = [];
+  // For every role: it gives Viewers a row menu too.
+  if (canStar) {
+    items.push({ label: starLabel, testId: "ctx-favorite", disabled: !tree.favorites.ready, onSelect: toggleStar });
+  }
   if (canEdit) {
     items.push({ label: "Rename", testId: "ctx-rename", onSelect: () => void onRename() });
     // The copy goes next to the page, under a parent the user can't see when
@@ -288,6 +304,28 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
         <span id={descId} className="sr-only">
           {row && rowDescription(row, node.within_restricted)}
         </span>
+        {canStar && (
+          <IconButton
+            data-testid={`tree-star-${node.id}`}
+            label={starLabel}
+            size="sm"
+            active={starred}
+            disabled={!tree.favorites.ready}
+            // A starred row shows its star always; an unstarred one on
+            // hover, and when a keyboard user is on the row or the star.
+            className={`shrink-0 ${
+              starred
+                ? "opacity-100"
+                : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
+            }`}
+            onClick={(e) => {
+              e.preventDefault();
+              toggleStar();
+            }}
+          >
+            <Star size={14} aria-hidden fill={starred ? "currentColor" : "none"} />
+          </IconButton>
+        )}
         {canEdit && (
           <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5">
             <IconButton

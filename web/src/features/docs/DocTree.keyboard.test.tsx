@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 type Role = "owner" | "editor" | "viewer";
-type Page = { id: string; title: string; parent_id: string | null; sort_key: string };
+type Page = { id: string; title: string; parent_id: string | null; sort_key: string; is_template?: boolean };
 type MoveBody = { parent_id: string | null; before_id?: string; after_id?: string };
 
 /** Alpha; Beta > Beta one; Gamma. */
@@ -35,7 +35,7 @@ function doc(p: Page) {
     icon: null,
     created_by: "u1",
     archived: false,
-    is_template: false,
+    is_template: p.is_template ?? false,
     archived_at: null,
     archive_root_id: null,
   };
@@ -84,6 +84,8 @@ type MoveReply = {
 
 type ServerOpts = {
   role?: Role;
+  /** The pages listed. `PAGES` by default. */
+  pages?: Page[];
   /** Moves are answered once this resolves. */
   gate?: Promise<unknown>;
   /** Moves are refused with this error. */
@@ -97,8 +99,16 @@ type ServerOpts = {
   relistGate?: Promise<unknown>;
 };
 
-function server({ role = "editor", gate, refuse, replies, place = serverMove, relistGate }: ServerOpts = {}) {
-  let pages = PAGES;
+function server({
+  role = "editor",
+  pages: initial = PAGES,
+  gate,
+  refuse,
+  replies,
+  place = serverMove,
+  relistGate,
+}: ServerOpts = {}) {
+  let pages = initial;
   let listed = 0;
   let movesSeen = 0;
   return vi.fn((url: string, init?: RequestInit) => {
@@ -223,6 +233,7 @@ describe("DocTree — moves from the row menu", () => {
     await editorRows();
     const items = within(openMenu("beta")).getAllByRole("menuitem").map((b) => b.textContent);
     expect(items).toEqual([
+      "Add to favorites",
       "Rename",
       "Duplicate…",
       "Move up",
@@ -388,10 +399,13 @@ describe("DocTree — the row menu by keyboard", () => {
 });
 
 describe("DocTree — the browser's own menu", () => {
-  // Viewers have no row menu: a right-click on a page must still open the
-  // browser's (open in a new tab, copy the link).
+  // A viewer has no row menu items on a template (it can't be a favorite):
+  // a right-click on it must still open the browser's (open in a new tab,
+  // copy the link).
+  const TEMPLATE_BETA = PAGES.map((p) => (p.id === "beta" ? { ...p, is_template: true } : p));
+
   it("leaves the browser's menu on a page's link to a user with no row menu items", async () => {
-    renderTree(server({ role: "viewer" }));
+    renderTree(server({ role: "viewer", pages: TEMPLATE_BETA }));
     await screen.findByText("a@x.test");
     const link = screen.getByTestId("doc-row-beta");
 
@@ -402,7 +416,7 @@ describe("DocTree — the browser's own menu", () => {
   });
 
   it("leaves Shift+F10 and the ContextMenu key to the browser for a user with no row menu items", async () => {
-    renderTree(server({ role: "viewer" }));
+    renderTree(server({ role: "viewer", pages: TEMPLATE_BETA }));
     await screen.findByText("a@x.test");
     const link = screen.getByTestId("doc-row-beta");
 
