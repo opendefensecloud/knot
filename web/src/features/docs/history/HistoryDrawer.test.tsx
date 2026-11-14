@@ -97,13 +97,19 @@ describe("HistoryDrawer", () => {
       started_at: "2025-11-02T11:00:00Z",
       ended_at: "2025-11-02T12:00:00Z",
     });
-    api.entries.mockResolvedValue({ ok: page([restore, accepted, gap, first]) });
+    // A former member's session: the author is known, the key is not.
+    const former = entry(5, {
+      author: { key: null, name: null },
+      started_at: "2025-11-02T10:00:00Z",
+      ended_at: "2025-11-02T10:30:00Z",
+    });
+    api.entries.mockResolvedValue({ ok: page([restore, accepted, gap, first, former]) });
     renderDrawer();
 
     await screen.findByTestId("history-entry-1");
     expect(screen.getAllByTestId("history-day")).toHaveLength(2);
     const now = new Date();
-    for (const e of [restore, accepted, gap, first]) {
+    for (const e of [restore, accepted, gap, first, former]) {
       const row = screen.getByTestId(`history-entry-${e.id}`);
       expect(row).toHaveTextContent(entryLine(e, now));
       expect(row).toHaveAttribute("data-kind", e.kind);
@@ -114,6 +120,7 @@ describe("HistoryDrawer", () => {
     expect(screen.getAllByTestId("history-entry-note")).toHaveLength(1);
     expect(avatarOf(1)).toHaveStyle({ background: colorFor("u-bea") });
     expect(avatarOf(4).getAttribute("style")).toContain("var(--color-fg-muted)");
+    expect(avatarOf(5).getAttribute("style")).toContain("var(--color-fg-muted)");
     expect(screen.getByTestId("history-drawer")).not.toHaveTextContent("Former member");
     // Day headings first, then each day's entries newest first.
     const [day2, day1] = screen.getAllByTestId("history-day");
@@ -154,6 +161,58 @@ describe("HistoryDrawer", () => {
     expect(api.entries).toHaveBeenCalledWith("d1", "c1");
     expect(screen.getByTestId("history-entry-9")).toBeInTheDocument();
     expect(screen.queryByTestId("history-load-more")).toBeNull();
+  });
+
+  it("keeps focus in the dialog when the last page loads from Load more", async () => {
+    api.entries.mockImplementation((_doc: string, cursor: string | null) =>
+      Promise.resolve({ ok: cursor === null ? page([entry(9)], { next_cursor: "c1" }) : page([entry(4)]) }),
+    );
+    const { onClose } = renderDrawer();
+    const dialog = screen.getByRole("dialog", { name: "History" });
+
+    const loadMore = await screen.findByTestId("history-load-more");
+    loadMore.focus();
+    fireEvent.click(loadMore);
+    await screen.findByTestId("history-entry-4");
+    await waitFor(() => expect(screen.queryByTestId("history-load-more")).toBeNull());
+
+    // The button went away with focus on it: focus is on the last row now,
+    // inside the dialog, so its Tab trap and Escape still work.
+    expect(document.activeElement).toBe(screen.getByTestId("history-entry-4"));
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves focus alone when the last page loads while it is elsewhere", async () => {
+    api.entries.mockImplementation((_doc: string, cursor: string | null) =>
+      Promise.resolve({ ok: cursor === null ? page([entry(9)], { next_cursor: "c1" }) : page([entry(4)]) }),
+    );
+    renderDrawer();
+    fireEvent.click(await screen.findByTestId("history-load-more"));
+    await screen.findByTestId("history-entry-4");
+    await waitFor(() => expect(screen.queryByTestId("history-load-more")).toBeNull());
+    expect(document.activeElement).toBe(screen.getByTestId("history-close"));
+  });
+
+  it("re-labels the days after midnight even when a poll brings nothing new", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    vi.setSystemTime(new Date(2025, 10, 3, 23, 50));
+    const late = entry(1, {
+      started_at: new Date(2025, 10, 3, 23, 0).toISOString(),
+      ended_at: new Date(2025, 10, 3, 23, 30).toISOString(),
+    });
+    api.entries.mockResolvedValue({ ok: page([late]) });
+    renderDrawer();
+    expect(await screen.findByTestId("history-day")).toHaveTextContent(copy.today);
+
+    vi.setSystemTime(new Date(2025, 10, 4, 0, 10));
+    await act(async () => {
+      vi.advanceTimersByTime(15_000);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(api.entries).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId("history-day")).toHaveTextContent(copy.yesterday));
   });
 
   it("loads more when the end of the list scrolls into view", async () => {

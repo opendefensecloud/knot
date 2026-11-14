@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, type RefObject } from "react";
 
 import { Avatar } from "../../../components/ui/Avatar";
 import { Button } from "../../../components/ui/Button";
@@ -26,21 +26,47 @@ export function TimelineColumn({
   /** The column that scrolls; the end of the list is watched within it. */
   scrollRoot: RefObject<HTMLElement | null>;
 }) {
-  const { entries, first, isLoading, isError, hasData, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } =
-    history;
+  const {
+    entries,
+    first,
+    isLoading,
+    isError,
+    hasData,
+    dataUpdatedAt,
+    refetch,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = history;
 
-  // Wording builds date formatters per entry: once per poll's data, not on
-  // every selection or hover.
+  // Wording builds date formatters per entry: once per poll, not on every
+  // selection or hover. "Now" is when the data last arrived: a poll that
+  // brings nothing new keeps `entries` the same object but moves
+  // `dataUpdatedAt`, so `Today` and `Yesterday` follow the clock past
+  // midnight, at most one poll late.
   const items: Item[] = useMemo(() => {
     if (first === null) return [];
-    const now = new Date();
+    const now = new Date(dataUpdatedAt);
     return timelineRows(entries, {
       now,
       historySince: first.history_since,
       historyComplete: first.history_complete,
       exhausted: !hasNextPage,
     }).map((row) => (row.type === "entry" ? { ...row, line: entryLine(row.entry, now), note: entryNote(row.entry) } : row));
-  }, [entries, first, hasNextPage]);
+  }, [entries, first, hasNextPage, dataUpdatedAt]);
+
+  // `Load more` goes away with the last page. When it had focus, focus would
+  // fall to <body>, outside the dialog's Tab trap and Escape handler, so it
+  // moves to the last row, where the button was.
+  const refocus = useRef(false);
+  useEffect(() => {
+    if (!refocus.current) return;
+    refocus.current = false;
+    const root = scrollRoot.current;
+    const rows = root?.querySelectorAll<HTMLElement>("button[data-kind]");
+    const target = rows && rows.length > 0 ? rows[rows.length - 1]! : root?.closest<HTMLElement>('[role="dialog"]');
+    target?.focus();
+  });
 
   const sentinelRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -133,24 +159,61 @@ export function TimelineColumn({
       {hasNextPage && (
         <>
           <div ref={sentinelRef} data-testid="history-sentinel" aria-hidden className="h-px" />
-          <div className="px-3 py-3">
-            {/* Not `disabled` while a page loads: that would drop focus out
-                of the dialog, past its Tab trap and Escape handler. */}
-            <Button
-              type="button"
-              size="sm"
-              data-testid="history-load-more"
-              aria-busy={isFetchingNextPage || undefined}
-              onClick={() => {
-                if (!isFetchingNextPage) void fetchNextPage();
-              }}
-            >
-              {copy.loadMore}
-            </Button>
-          </div>
+          <LoadMore
+            busy={isFetchingNextPage}
+            onLoad={() => void fetchNextPage()}
+            onRemovedWithFocus={() => {
+              refocus.current = true;
+            }}
+          />
         </>
       )}
     </>
+  );
+}
+
+/**
+ * The `Load more` button. Not `disabled` while a page loads: that would drop
+ * focus out of the dialog, past its Tab trap and Escape handler. When it is
+ * removed while it has focus it says so, so the column can move focus.
+ */
+function LoadMore({
+  busy,
+  onLoad,
+  onRemovedWithFocus,
+}: {
+  busy: boolean;
+  onLoad: () => void;
+  onRemovedWithFocus: () => void;
+}) {
+  const ref = useRef<HTMLButtonElement>(null);
+  const removed = useRef(onRemovedWithFocus);
+  useLayoutEffect(() => {
+    removed.current = onRemovedWithFocus;
+  });
+  // A layout cleanup on unmount runs while the button is still in the
+  // document, so it can still tell whether it has focus.
+  useLayoutEffect(() => {
+    const button = ref.current;
+    return () => {
+      if (button !== null && document.activeElement === button) removed.current();
+    };
+  }, []);
+  return (
+    <div className="px-3 py-3">
+      <Button
+        ref={ref}
+        type="button"
+        size="sm"
+        data-testid="history-load-more"
+        aria-busy={busy || undefined}
+        onClick={() => {
+          if (!busy) onLoad();
+        }}
+      >
+        {copy.loadMore}
+      </Button>
+    </div>
   );
 }
 

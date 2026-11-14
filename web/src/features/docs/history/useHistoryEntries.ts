@@ -43,6 +43,9 @@ export function useHistoryEntries(docId: string) {
     isLoading: query.isLoading,
     isError: query.isError,
     hasData: query.data !== undefined,
+    /** When the last fetch succeeded, also when it brought nothing new
+     *  (structural sharing then keeps `entries` the same object). */
+    dataUpdatedAt: query.dataUpdatedAt,
     refetch: query.refetch,
     fetchNextPage: query.fetchNextPage,
     hasNextPage: query.hasNextPage,
