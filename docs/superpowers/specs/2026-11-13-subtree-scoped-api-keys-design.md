@@ -28,7 +28,7 @@ as `S10`.
 
 | # | Threat | Enforced by |
 |---|---|---|
-| **S10** | A subtree key reads or changes a page outside its subtree, or workspace-wide state (members, templates, export/import/archive, the user's notifications), or widens its own root. | The root is part of the ACL rule itself (`knot-docs`): a page whose ancestor chain doesn't contain the root resolves to no access, in `acl::resolve` and in `rule::compute_access`, so every doc-scoped route, listing, search and task query narrows without its own check. Workspace-wide routes are refused by `auth/scope.rs::SUBTREE_DENIED`; a test forces every `/api/*` route into `SUBTREE_DENIED` or `SUBTREE_OK`. Top-level destinations are refused in `require_editable_destination` and `duplicate.rs`. In the database, trigger `KB005` refuses a root from another workspace and any change of `root_doc_id` after insert; the foreign key is `ON DELETE CASCADE`, never `SET NULL`, which would silently widen the key to the whole workspace. |
+| **S10** | A subtree key reads or changes a page outside its subtree, or workspace-wide state (members, templates, export/import/archive, the user's notifications), or widens its own root. | The root is part of the ACL rule itself (`knot-docs`): a page whose ancestor chain doesn't contain the root resolves to no access, in `acl::resolve` and in `rule::compute_access`, so every doc-scoped route, listing, search and task query narrows without its own check (a page outside answers like one without access: `403 acl.no_grant`). Workspace-wide routes are refused by `auth/scope.rs::SUBTREE_DENIED`; a test forces every `/api/*` route into `SUBTREE_DENIED` or `SUBTREE_OK`. Top-level destinations are refused in `require_editable_destination`, `duplicate.rs` and restore. In the database, trigger `KB005` refuses a root from another workspace and any change of `root_doc_id` after insert; the foreign key is `ON DELETE CASCADE`, never `SET NULL`, which would silently widen the key to the whole workspace. |
 
 ## Data model
 
@@ -105,9 +105,10 @@ with a root and a destination `parent_id == None`, answers
 Everything else follows from the rule without its own code:
 
 - Creating, moving or duplicating under a parent outside the subtree:
-  `require_editable_parent` sees no access, `404 doc.not_found`.
+  `require_editable_parent` sees no access, `404 doc.not_found`. On `/api/docs/{id}…` routes the existing `require_doc_role` guard answers `403 acl.no_grant`, the same as for a nonexistent page.
 - Moving or duplicating the root itself: the destination is the root's
   parent, outside, so refused the same way.
+- Restoring a page whose parent is archived, missing or absent would land it at the top level: `403 api_key.subtree_denied` for a subtree key.
 - Deleting, archiving or restoring the root: allowed under the key's HTTP
   scopes; the root belongs to its subtree.
 - `GET /api/docs/{id}` of the root: the parent is already blanked when
@@ -136,12 +137,12 @@ doc), `GET /api/workspace` (id, slug, name, role, retention — needed by
 clients, no page content), `/api/version`, `/api/release-notes`, `GET
 /api/whats-new`, `/api/healthz`, `/api/readyz`.
 
-A test walks the built router and fails when an `/api/*` route is in neither
+A test walks the built router (also collecting `const … = "/api/…"` literals and ignoring code after a file's first column-0 `#[cfg(test)]`) and fails when an `/api/*` route is in neither
 table, so a new route must be classified before it ships. Both tables also
 get the row-count tests the existing tables have.
 
-Errors: a page outside the subtree is `404`, indistinguishable from a page
-the user can't see. A workspace-wide route or a top-level destination is
+Errors: a page outside the subtree answers exactly like a page the user can't see (`403 acl.no_grant` on `/api/docs/{id}…`, `404 doc.not_found` where a destination parent is checked).
+A workspace-wide route or a top-level destination is
 `403 api_key.subtree_denied`. `scope_mw` logs subtree refusals like scope
 refusals (`key_id`, method, route template).
 
@@ -169,14 +170,14 @@ refusals (`key_id`, method, route template).
 - **knot-storage:** migration applies; purging the root deletes the key;
   `KB005` refuses a foreign-workspace root and an update of `root_doc_id`.
 - **knot-server integration (`api_keys_integration.rs`):** with a subtree
-  key — read, write, create inside work; outside is `404`; top-level
+  key — read, write, create inside work; outside is `403 acl.no_grant`; top-level
   create/move/duplicate, moving or duplicating the root and every
   `SUBTREE_DENIED` route are `403 api_key.subtree_denied`; tree, search and
   tasks list only the subtree; minting with an unreadable root is `404`; a
   bot key with a root behaves the same. Plus the router-walk test.
 - **web:** Vitest — the create body carries `root_doc_id`; the chip renders
   both states. e2e `api-keys.spec.ts` — mint a subtree key, a page outside
-  answers `404`.
+  answers `403 acl.no_grant`.
 
 ## Documentation
 

@@ -8,6 +8,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Added
+
+- API keys can be limited to one page and its subpages (Settings → API keys → Pages). Such a key can't call workspace-wide endpoints.
+
 ## [0.9.12] - 2026-11-13
 
 A feature release: scoped API keys and bot accounts, rate limits and
