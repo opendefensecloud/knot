@@ -254,7 +254,8 @@ async fn emit_comment_notifications(
         let acl = acl.clone();
         async move {
             matches!(
-                acl.effective_role(n.workspace_id, doc_id, n.user_id).await,
+                acl.effective_role(n.workspace_id, doc_id, n.user_id, None)
+                    .await,
                 Ok(Some(_))
             )
         }

@@ -90,7 +90,10 @@ async fn filter_by_role(
     };
     let roles = futures::future::join_all(ids.iter().map(|&user_id| {
         let acl = acl.clone();
-        async move { acl.effective_role(workspace_id, doc_id, user_id).await }
+        async move {
+            acl.effective_role(workspace_id, doc_id, user_id, None)
+                .await
+        }
     }))
     .await;
     ids.into_iter()

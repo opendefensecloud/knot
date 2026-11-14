@@ -922,6 +922,7 @@ fn password_change_request(user_id: Uuid, content_type: &str, body: &str) -> Req
             user_id,
             workspace_id: Uuid::new_v4(),
             role: WorkspaceRole::Owner,
+            root_doc_id: None,
         });
     request
 }

@@ -182,7 +182,7 @@ pub(super) async fn visibility_covering_ids(
     let Some(acl) = state.acl.as_ref() else {
         return Err(internal());
     };
-    acl.visibility_covering(ctx.workspace_id, ctx.user_id, doc_ids)
+    acl.visibility_covering(ctx.workspace_id, ctx.user_id, ctx.root_doc_id, doc_ids)
         .await
         .map_err(|e| {
             tracing::error!(error=?e, "visibility");
@@ -241,7 +241,7 @@ async fn caller_doc_response(
         return Err(internal());
     };
     match acl
-        .effective_role(ctx.workspace_id, parent_id, ctx.user_id)
+        .effective_role(ctx.workspace_id, parent_id, ctx.user_id, ctx.root_doc_id)
         .await
     {
         Ok(Some(_)) => {}
@@ -438,7 +438,10 @@ async fn get_one(
         archive: ArchiveInfo,
     }
     // Cached by the middleware's lookup a moment ago.
-    let access = match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
+    let access = match acl
+        .access(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(Some(access)) => access,
         Ok(None) => return json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""),
         Err(e) => {
@@ -458,7 +461,7 @@ async fn get_one(
     let readable = |other_id: Uuid| {
         let acl = acl.clone();
         async move {
-            acl.effective_role(ctx.workspace_id, other_id, ctx.user_id)
+            acl.effective_role(ctx.workspace_id, other_id, ctx.user_id, ctx.root_doc_id)
                 .await
                 .map(|other_role| other_role.is_some())
         }
@@ -1403,6 +1406,7 @@ mod tests {
             user_id: bot,
             workspace_id: Uuid::new_v4(),
             role: WorkspaceRole::Editor,
+            root_doc_id: None,
         });
         req.extensions_mut()
             .insert(EffectiveDocRole(WorkspaceRole::Owner));

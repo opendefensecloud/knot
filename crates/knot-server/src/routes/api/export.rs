@@ -244,8 +244,10 @@ async fn export_response(
         {
             let state = state.clone();
             let user_id = auth_context.user_id;
+            let scope_root = auth_context.root_doc_id;
             async move {
-                let built = export::build(&state, user_id, doc_id, format, pictures).await;
+                let built =
+                    export::build(&state, user_id, scope_root, doc_id, format, pictures).await;
                 drop(permit);
                 built
             }

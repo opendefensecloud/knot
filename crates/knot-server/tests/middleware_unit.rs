@@ -43,6 +43,7 @@ async fn require_session_allows_when_auth_context_present() {
                     user_id: Uuid::new_v4(),
                     workspace_id: Uuid::new_v4(),
                     role: WorkspaceRole::Owner,
+                    root_doc_id: None,
                 });
                 next.run(req).await
             },
@@ -98,6 +99,7 @@ async fn csrf_authed_post_requires_matching_token() {
             user_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             role: WorkspaceRole::Owner,
+            root_doc_id: None,
         });
         async move { next.run(req).await }
     }

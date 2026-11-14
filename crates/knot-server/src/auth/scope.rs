@@ -404,6 +404,7 @@ mod tests {
                         user_id: Uuid::nil(),
                         workspace_id: Uuid::nil(),
                         role: WorkspaceRole::Editor,
+                        root_doc_id: None,
                     });
                     req.extensions_mut().insert(ApiPrincipal {
                         key_id: Uuid::nil(),
@@ -560,6 +561,7 @@ mod tests {
                         user_id: Uuid::nil(),
                         workspace_id: Uuid::nil(),
                         role: WorkspaceRole::Editor,
+                        root_doc_id: None,
                     });
                     next.run(req).await
                 },

@@ -249,10 +249,16 @@ async fn readable_root_titles(
     }
     let readable = readable_sources(
         &root_ids,
-        state
-            .acl
-            .as_ref()
-            .map(|acl| move |id| acl.access(auth_context.workspace_id, id, auth_context.user_id)),
+        state.acl.as_ref().map(|acl| {
+            move |id| {
+                acl.access(
+                    auth_context.workspace_id,
+                    id,
+                    auth_context.user_id,
+                    auth_context.root_doc_id,
+                )
+            }
+        }),
     )
     .await;
     let mut titles = HashMap::new();

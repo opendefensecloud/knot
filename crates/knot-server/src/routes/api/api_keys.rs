@@ -485,6 +485,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             role: WorkspaceRole::Owner,
+            root_doc_id: None,
         }
     }
 

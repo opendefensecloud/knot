@@ -98,10 +98,19 @@ pub async fn snapshot(state: &AppState, doc_id: Uuid) -> Result<DocHandle, Expor
 pub async fn resolve_assets(
     state: &AppState,
     user_id: Uuid,
+    scope_root: Option<Uuid>,
     doc: &ExportDoc,
     diagrams: HashMap<String, Vec<u8>>,
 ) -> Result<Assets, ExportFailure> {
-    resolve_assets_with_budget(state, user_id, doc, diagrams, IMAGE_BUDGET_BYTES).await
+    resolve_assets_with_budget(
+        state,
+        user_id,
+        scope_root,
+        doc,
+        diagrams,
+        IMAGE_BUDGET_BYTES,
+    )
+    .await
 }
 
 /// Everything the writers need from outside the page:
@@ -113,6 +122,7 @@ pub async fn resolve_assets(
 pub async fn resolve_assets_with_budget(
     state: &AppState,
     user_id: Uuid,
+    scope_root: Option<Uuid>,
     doc: &ExportDoc,
     mut diagrams: HashMap<String, Vec<u8>>,
     budget: i64,
@@ -121,7 +131,7 @@ pub async fn resolve_assets_with_budget(
 
     let mut spent = 0;
     for id in knot_export::blob_ids(doc) {
-        let image = resolve_image(state, user_id, &id, budget, &mut spent).await?;
+        let image = resolve_image(state, user_id, scope_root, &id, budget, &mut spent).await?;
         assets.images.insert(id, image);
     }
 
@@ -156,6 +166,7 @@ pub async fn resolve_assets_with_budget(
 async fn resolve_image(
     state: &AppState,
     user_id: Uuid,
+    scope_root: Option<Uuid>,
     id: &str,
     budget: i64,
     spent: &mut i64,
@@ -174,7 +185,7 @@ async fn resolve_image(
         return Ok(ImageAsset::Unavailable);
     };
     let role = acl
-        .effective_role(meta.workspace_id, meta.doc_id, user_id)
+        .effective_role(meta.workspace_id, meta.doc_id, user_id, scope_root)
         .await
         .map_err(store_err)?;
     if role.is_none() {
@@ -213,6 +224,7 @@ async fn resolve_image(
 pub async fn build(
     state: &AppState,
     user_id: Uuid,
+    scope_root: Option<Uuid>,
     doc_id: Uuid,
     format: Format,
     diagram_pngs: HashMap<String, Vec<u8>>,
@@ -221,7 +233,7 @@ pub async fn build(
     let walked = tokio::task::spawn_blocking(move || knot_export::walk(handle.inner()))
         .await
         .map_err(|e| ExportFailure::Write(format!("walk: {e}")))?;
-    let assets = resolve_assets(state, user_id, &walked.doc, diagram_pngs).await?;
+    let assets = resolve_assets(state, user_id, scope_root, &walked.doc, diagram_pngs).await?;
     let docs = state.docs.as_ref().ok_or_else(|| not_configured("docs"))?;
     let title = docs
         .get(doc_id)

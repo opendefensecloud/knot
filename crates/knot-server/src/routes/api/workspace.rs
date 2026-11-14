@@ -475,6 +475,7 @@ mod tests {
             user_id: Uuid::nil(),
             workspace_id: Uuid::nil(),
             role: WorkspaceRole::Owner,
+            root_doc_id: None,
         });
         req
     }

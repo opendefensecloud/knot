@@ -302,7 +302,7 @@ pub async fn run(
         .chain(live_subpages.iter().map(|row| row.id))
         .collect();
     let visibility = acl
-        .visibility_covering(ws, ctx.user_id, &listed_ids)
+        .visibility_covering(ws, ctx.user_id, ctx.root_doc_id, &listed_ids)
         .await
         .map_err(internal)?;
     let subpages = readable_subpages(live_subpages, &visibility);
@@ -536,7 +536,7 @@ async fn readable_access(
         .as_ref()
         .ok_or_else(|| internal("acl not configured"))?;
     Ok(acl
-        .access(ctx.workspace_id, doc_id, ctx.user_id)
+        .access(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
         .await
         .map_err(internal)?
         .filter(|access| access.can_read()))

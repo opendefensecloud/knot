@@ -27,7 +27,10 @@ pub async fn require_editable_parent(
     let Some(acl) = state.acl.as_ref() else {
         return Err(internal());
     };
-    let access = match acl.access(ctx.workspace_id, parent_id, ctx.user_id).await {
+    let access = match acl
+        .access(ctx.workspace_id, parent_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(Some(access)) if access.can_read() => access,
         Ok(_) => return Err(json_err(StatusCode::NOT_FOUND, "doc.not_found", "")),
         Err(e) => {
@@ -57,7 +60,7 @@ pub async fn require_readable_anchors(
     };
     for anchor_id in anchors.iter().flatten() {
         match acl
-            .effective_role(ctx.workspace_id, *anchor_id, ctx.user_id)
+            .effective_role(ctx.workspace_id, *anchor_id, ctx.user_id, ctx.root_doc_id)
             .await
         {
             Ok(Some(_)) => {}
