@@ -204,7 +204,7 @@ async fn lookup(
             user_id: key.user_id,
             workspace_id: key.workspace_id,
             role,
-            root_doc_id: None,
+            root_doc_id: key.root_doc_id,
         },
         ApiPrincipal {
             key_id,

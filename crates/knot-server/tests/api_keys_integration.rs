@@ -3567,3 +3567,177 @@ async fn a_key_stays_limited_by_its_users_role_and_page_acl() {
     let (st, body) = guards_bearer(&app, &key, "GET", &secret_uri, None).await;
     assert_eq!(st, StatusCode::OK, "{body}");
 }
+
+// ---------------------------------------------------------------------------
+// Subtree-scoped keys (S10)
+// ---------------------------------------------------------------------------
+
+/// A key limited to `root` with the given scopes.
+async fn subtree_key(app: &axum::Router, s: &Session, root: &str, scopes: &[&str]) -> String {
+    let (st, body) = send(
+        app,
+        s,
+        "POST",
+        "/api/auth/api-keys",
+        Some(serde_json::json!({"name": "subtree", "scopes": scopes, "root_doc_id": root})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    assert_eq!(body["root_doc_id"], root);
+    body["key"].as_str().unwrap().to_string()
+}
+
+/// A page under `parent`, created through the session.
+async fn child_doc(app: &axum::Router, s: &Session, parent: &str, title: &str) -> String {
+    let (st, body) = send(
+        app,
+        s,
+        "POST",
+        "/api/docs",
+        Some(serde_json::json!({ "title": title, "parent_id": parent })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    body["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_key_reaches_only_its_subtree() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let top = matrix_doc(&app, &s, "top").await;
+    let root = child_doc(&app, &s, &top, "root").await;
+    let child = child_doc(&app, &s, &root, "child").await;
+    let sibling = child_doc(&app, &s, &top, "sibling").await;
+    let key = subtree_key(&app, &s, &root, &["read", "create", "update"]).await;
+
+    for inside in [&root, &child] {
+        let (st, body) =
+            guards_bearer(&app, &key, "GET", &format!("/api/docs/{inside}"), None).await;
+        assert_eq!(st, StatusCode::OK, "{inside}: {body}");
+    }
+    for outside in [&top, &sibling] {
+        let (st, body) =
+            guards_bearer(&app, &key, "GET", &format!("/api/docs/{outside}"), None).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{outside}: {body}");
+    }
+    // The root's parent is outside: blanked, not leaked.
+    let (_, body) = guards_bearer(&app, &key, "GET", &format!("/api/docs/{root}"), None).await;
+    assert!(body["parent_id"].is_null(), "{body}");
+
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "PATCH",
+        &format!("/api/docs/{child}"),
+        Some(serde_json::json!({"title": "renamed"})),
+    )
+    .await;
+    assert!(st.is_success(), "{body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "PATCH",
+        &format!("/api/docs/{sibling}"),
+        Some(serde_json::json!({"title": "renamed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        "/api/docs",
+        Some(serde_json::json!({"title": "new", "parent_id": child})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        "/api/docs",
+        Some(serde_json::json!({"title": "new", "parent_id": sibling})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+
+    // The tree lists the subtree only.
+    let (st, body) = guards_bearer(&app, &key, "GET", "/api/docs", None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let listed: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        listed.contains(&root.as_str()) && listed.contains(&child.as_str()),
+        "{body}"
+    );
+    assert!(
+        !listed.contains(&top.as_str()) && !listed.contains(&sibling.as_str()),
+        "{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_key_mint_needs_a_readable_root_and_lists_it() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let root = matrix_doc(&app, &s, "Project X").await;
+
+    let (st, body) = send(
+        &app,
+        &s,
+        "POST",
+        "/api/auth/api-keys",
+        Some(serde_json::json!({"name": "k", "scopes": ["read"],
+                                "root_doc_id": uuid::Uuid::new_v4()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "doc.not_found");
+
+    subtree_key(&app, &s, &root, &["read"]).await;
+    let (st, body) = send(&app, &s, "GET", "/api/auth/api-keys", None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let listed = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["name"] == "subtree")
+        .unwrap();
+    assert_eq!(listed["root_doc_id"], root);
+    assert_eq!(listed["root_title"], "Project X");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_subtree_key_needs_a_root_the_bot_can_read() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let bot = invite_bot(&app, &s, &state, "bot@example.com").await;
+    let secret = matrix_doc(&app, &s, "secret").await;
+    restrict_doc(&app, &s, &secret).await;
+    let open = matrix_doc(&app, &s, "open").await;
+
+    let mint = |root: String| {
+        send(
+            &app,
+            &s,
+            "POST",
+            "/api/auth/api-keys",
+            Some(serde_json::json!({"name": "b", "scopes": ["read"],
+                                "user_id": bot, "root_doc_id": root})),
+        )
+    };
+    let (st, body) = mint(secret).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "doc.not_found");
+    let (st, body) = mint(open).await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+}

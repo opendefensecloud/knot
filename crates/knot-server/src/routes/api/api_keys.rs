@@ -1,5 +1,5 @@
 //! GET    /api/auth/api-keys            ?user_id=<uuid> (owner, bot target only)
-//! POST   /api/auth/api-keys            body: {name, scopes, expires_in_days?, user_id?}
+//! POST   /api/auth/api-keys            body: {name, scopes, expires_in_days?, user_id?, root_doc_id?}
 //! DELETE /api/auth/api-keys/{id}       ?user_id=<uuid> (owner, bot target only)
 //!
 //! Session principals only (S2): an API key can never mint, list or revoke
@@ -55,6 +55,9 @@ struct KeyResponse {
     expires_at: Option<DateTime<Utc>>,
     last_used_at: Option<DateTime<Utc>>,
     revoked_at: Option<DateTime<Utc>>,
+    /// The page the key is limited to, with its title when the viewer can read it.
+    root_doc_id: Option<Uuid>,
+    root_title: Option<String>,
 }
 
 impl From<ApiKey> for KeyResponse {
@@ -68,6 +71,8 @@ impl From<ApiKey> for KeyResponse {
             expires_at: k.expires_at,
             last_used_at: k.last_used_at,
             revoked_at: k.revoked_at,
+            root_doc_id: k.root_doc_id,
+            root_title: None,
         }
     }
 }
@@ -85,6 +90,8 @@ struct CreateRequest {
     expires_in_days: Option<i64>,
     #[serde(default)]
     user_id: Option<Uuid>,
+    #[serde(default)]
+    root_doc_id: Option<Uuid>,
 }
 
 /// The single authorization gate for key management. Returns the caller's
@@ -190,7 +197,21 @@ async fn list_keys(
     };
     match store.list_for_user(ctx.workspace_id, target.id).await {
         Ok(keys) => {
-            Json(keys.into_iter().map(KeyResponse::from).collect::<Vec<_>>()).into_response()
+            let mut out: Vec<KeyResponse> = keys.into_iter().map(KeyResponse::from).collect();
+            // A root's title shows only to a viewer who can read it.
+            if let (Some(acl), Some(docs)) = (state.acl.as_ref(), state.docs.as_ref()) {
+                for k in out.iter_mut() {
+                    let Some(root) = k.root_doc_id else { continue };
+                    let readable = matches!(
+                        acl.access(ctx.workspace_id, root, ctx.user_id, None).await,
+                        Ok(Some(a)) if a.can_read()
+                    );
+                    if readable {
+                        k.root_title = docs.get(root).await.ok().flatten().map(|d| d.title);
+                    }
+                }
+            }
+            Json(out).into_response()
         }
         Err(e) => {
             tracing::error!(error = ?e, "api key list");
@@ -207,6 +228,7 @@ struct CreatedResponse<'a> {
     name: String,
     scopes: Vec<String>,
     expires_at: Option<DateTime<Utc>>,
+    root_doc_id: Option<Uuid>,
 }
 
 #[tracing::instrument(skip_all, name = "api_keys.create")]
@@ -297,6 +319,24 @@ async fn create_key(State(state): State<AppState>, req: Request) -> Response {
         }
     };
 
+    // S10: the key's principal must read the root now. An id that does
+    // not exist and one it can't read answer alike, so the mint can't
+    // probe page ids. Losing access later simply leaves the key with
+    // nothing to reach: the rule is evaluated per request.
+    if let Some(root) = body.root_doc_id {
+        let Some(acl) = state.acl.as_ref() else {
+            return internal();
+        };
+        match acl.access(ctx.workspace_id, root, target.id, None).await {
+            Ok(Some(access)) if access.can_read() => {}
+            Ok(_) => return json_err(StatusCode::NOT_FOUND, "doc.not_found", ""),
+            Err(e) => {
+                tracing::error!(error = ?e, "api key root acl");
+                return internal();
+            }
+        }
+    }
+
     let Some(store) = state.api_keys.as_ref() else {
         return internal();
     };
@@ -312,7 +352,7 @@ async fn create_key(State(state): State<AppState>, req: Request) -> Response {
             created_by: ctx.user_id,
             expires_at,
             session_hash: Some(&session_hash),
-            root_doc_id: None,
+            root_doc_id: body.root_doc_id,
         })
         .await
     {
@@ -335,6 +375,10 @@ async fn create_key(State(state): State<AppState>, req: Request) -> Response {
         }
         // Lost the owner role, or the bot left, while the request ran.
         Err(ApiKeyStoreError::NotPermitted) => return foreign_forbidden(),
+        // A purge between the check above and the insert.
+        Err(ApiKeyStoreError::RootRejected) => {
+            return json_err(StatusCode::NOT_FOUND, "doc.not_found", "");
+        }
         Err(e) => {
             tracing::error!(error = ?e, "api key create");
             return internal();
@@ -368,6 +412,7 @@ async fn create_key(State(state): State<AppState>, req: Request) -> Response {
             name: key.name,
             scopes: key.scopes.names(),
             expires_at: key.expires_at,
+            root_doc_id: key.root_doc_id,
         }),
     )
         .into_response()
