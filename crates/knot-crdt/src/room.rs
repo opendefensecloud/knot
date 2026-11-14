@@ -1189,11 +1189,24 @@ impl Room {
             self.engine.as_ref(),
             &self.doc,
             self.snapshots.as_ref(),
+            None,
         )
         .await
         {
-            Ok(()) => {
+            Ok(true) => {
                 metrics::counter!("knot_room_snapshots_total").increment(1);
+                self.snap_state.last_snapshot_seq = self.through_seq;
+                self.snap_state.updates_since_snapshot = 0;
+            }
+            // A stamped snapshot already holds this seq (an older pod's at
+            // the same watermark; Ruling 6). Nothing newer exists at this
+            // watermark, so the counters reset as for a write.
+            Ok(false) => {
+                tracing::debug!(
+                    doc_id = %self.doc_id,
+                    snapshot_seq = stamp.snapshot_seq,
+                    "a snapshot at this seq already exists; not replaced"
+                );
                 self.snap_state.last_snapshot_seq = self.through_seq;
                 self.snap_state.updates_since_snapshot = 0;
             }
@@ -1593,8 +1606,9 @@ pub(crate) mod tests {
             _: knot_storage::SnapshotStamp,
             _: &[u8],
             _: &[u8],
-        ) -> Result<(), knot_storage::SnapshotStoreError> {
-            Ok(())
+            _: Option<&[i64]>,
+        ) -> Result<bool, knot_storage::SnapshotStoreError> {
+            Ok(true)
         }
         async fn latest(
             &self,
@@ -2979,10 +2993,11 @@ pub(crate) mod tests {
             _: knot_storage::SnapshotStamp,
             _: &[u8],
             _: &[u8],
-        ) -> Result<(), knot_storage::SnapshotStoreError> {
+            _: Option<&[i64]>,
+        ) -> Result<bool, knot_storage::SnapshotStoreError> {
             self.inserts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+            Ok(true)
         }
         async fn latest(
             &self,
@@ -3385,17 +3400,34 @@ pub(crate) mod tests {
         }
     }
 
-    /// Records the stamp of every snapshot written, and fails each write
-    /// with `fail` when set.
+    /// Records the stamp and the `pending_revs` of every snapshot write
+    /// attempted, and fails each write with `fail` when set. With `collide`
+    /// set, each write finds a stamped row at its seq: nothing is written
+    /// (`Ok(false)`), as when the trigger skips the upsert.
     #[derive(Default)]
     struct Stamps {
-        written: std::sync::Mutex<Vec<SnapshotStamp>>,
+        written: std::sync::Mutex<Vec<(SnapshotStamp, Option<Vec<i64>>)>>,
         fail: std::sync::Mutex<Option<fn() -> knot_storage::SnapshotStoreError>>,
+        collide: std::sync::atomic::AtomicBool,
     }
 
     impl Stamps {
         fn written(&self) -> Vec<SnapshotStamp> {
-            self.written.lock().unwrap().clone()
+            self.written
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(s, _)| *s)
+                .collect()
+        }
+
+        fn pending_revs(&self) -> Vec<Option<Vec<i64>>> {
+            self.written
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, p)| p.clone())
+                .collect()
         }
     }
 
@@ -3407,11 +3439,15 @@ pub(crate) mod tests {
             stamp: SnapshotStamp,
             _: &[u8],
             _: &[u8],
-        ) -> Result<(), knot_storage::SnapshotStoreError> {
-            self.written.lock().unwrap().push(stamp);
+            pending_revs: Option<&[i64]>,
+        ) -> Result<bool, knot_storage::SnapshotStoreError> {
+            self.written
+                .lock()
+                .unwrap()
+                .push((stamp, pending_revs.map(<[i64]>::to_vec)));
             match *self.fail.lock().unwrap() {
                 Some(fail) => Err(fail()),
-                None => Ok(()),
+                None => Ok(!self.collide.load(std::sync::atomic::Ordering::SeqCst)),
             }
         }
         async fn latest(
@@ -3733,6 +3769,47 @@ pub(crate) mod tests {
             .expect("the room's actor did not end");
         assert_eq!(snapshots.written().len(), 1, "an exit snapshot was written");
         assert_eq!(rec.counter("knot_room_evicted_total", &[]), 1);
+    }
+
+    /// Ruling 6's seq collision, room side: a snapshot write that finds a
+    /// stamped row at its seq writes nothing, is not counted, and resets the
+    /// snapshot counters as a write does (nothing newer exists at that
+    /// watermark). With `every_n: 2`, an attempt after edit 3 would show a
+    /// counter left unreset.
+    #[tokio::test(start_paused = true)]
+    async fn a_snapshot_write_that_collides_is_not_counted_and_resets_the_counters() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let log = Log::new();
+        let snapshots = Arc::new(Stamps::default());
+        snapshots
+            .collide
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let policy = crate::snapshot::SnapshotPolicy {
+            every_n: 2,
+            idle: std::time::Duration::from_secs(60),
+        };
+        let (h, _bus, _) = room_on_log(&log, &snapshots, policy).await;
+        let (sender, _rx) = join(&h).await;
+
+        for (rev, text) in (1..=4).zip(["one", "two", "three", "four"]) {
+            send_edit(&h, sender, para(10 + rev as u64, text)).await;
+            until_probe(&h, "the edit is acknowledged", |p| {
+                p.applied_through_rev == rev
+            })
+            .await;
+            let p = probe(&h).await;
+            assert_eq!(p.in_flight, 0, "{p:?}");
+        }
+        let written = snapshots.written();
+        assert_eq!(
+            written.iter().map(|s| s.snapshot_rev).collect::<Vec<_>>(),
+            vec![Some(2), Some(4)],
+            "attempts after edits 2 and 4 only"
+        );
+        assert_eq!(snapshots.pending_revs(), vec![None, None]);
+        assert_eq!(rec.counter("knot_room_snapshots_total", &[]), 0);
+        shut_down(&h).await;
     }
 
     /// A writer Fatal evicts the room before any snapshot.

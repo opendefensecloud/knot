@@ -8,13 +8,15 @@ use knot_test_support::old_sql::{OLD_INSERT_UPDATES_SQL, OLD_SNAPSHOT_UPSERT_SQL
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// A 0.9.10 snapshot write, stamped with the rev it holds the log up to and
-/// the content epoch it was taken at.
+/// A snapshot write of every release from 0.9.10 to 0.9.13, stamped with
+/// the rev it holds the log up to and the content epoch it was taken at. It
+/// names no `pending_revs`.
 const STAMPED_SNAPSHOT_INSERT_SQL: &str = "INSERT INTO doc_snapshots
              (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch)
              VALUES ($1, $2, $3, $4, $5, $6)";
 
-/// The shape of 0.9.10's stamped snapshot upsert (`PgSnapshotStore::insert_stamped`).
+/// The shape of the stamped snapshot upsert of every release from 0.9.10 to
+/// 0.9.13 (`PgSnapshotStore::insert_stamped`), which names no `pending_revs`.
 const STAMPED_SNAPSHOT_UPSERT_SQL: &str = "INSERT INTO doc_snapshots
              (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -3421,10 +3423,7 @@ async fn history_builder_migration_runs_under_live_0_9_10_traffic() {
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
     use std::time::{Duration, Instant};
 
-    use knot_storage::{
-        DocStore, PgDocStore, PgSnapshotStore, PgUpdatesStore, SnapshotStamp, SnapshotStore,
-        UpdatesStore,
-    };
+    use knot_storage::{DocStore, PgDocStore, PgUpdatesStore, UpdatesStore};
     use sqlx::Connection;
 
     let (url, pool) = bare_db(4).await;
@@ -3539,7 +3538,8 @@ async fn history_builder_migration_runs_under_live_0_9_10_traffic() {
             },
         ),
     ));
-    // (v) A stamped snapshot write on B.
+    // (v) A stamped snapshot write on B, as 0.9.10 writes it (the store's
+    // write now names `pending_revs`, which this schema lacks).
     loops.push((
         "snapshot",
         spawn_loop(
@@ -3547,15 +3547,17 @@ async fn history_builder_migration_runs_under_live_0_9_10_traffic() {
             stop.clone(),
             Duration::from_millis(50),
             move |pool, n| async move {
-                let stamp = SnapshotStamp {
-                    snapshot_seq: n as i64 + 1,
-                    snapshot_rev: Some(1),
-                    epoch: Some(0),
-                };
-                PgSnapshotStore::new(pool)
-                    .insert_stamped(b, stamp, b"b", b"sv")
-                    .await
-                    .map_err(|e| format!("snapshot: {e:?}"))
+                stamped_snapshot(
+                    &pool,
+                    STAMPED_SNAPSHOT_UPSERT_SQL,
+                    b,
+                    n as i64 + 1,
+                    b"b",
+                    1,
+                    0,
+                )
+                .await
+                .map_err(|e| format!("snapshot: {}", err_text(e)))
             },
         ),
     ));
@@ -4652,6 +4654,38 @@ fn api_keys_migrations_take_their_locks_through_the_helper() {
     }
 }
 
+/// The `pending_revs` migration takes its lock through `knot_lock_tables`,
+/// up front, inside sqlx's transaction, and changes only the catalog: no
+/// default (which would rewrite nothing but is not wanted), no lock taken
+/// around the helper, no trigger dropped.
+#[test]
+fn snapshot_pending_revs_migration_takes_its_lock_through_the_helper() {
+    let sql = include_str!("../../../migrations/20261114140000_snapshot_pending_revs.sql");
+    assert!(
+        sql.contains("SET LOCAL lock_timeout = '5s';"),
+        "lock_timeout went missing"
+    );
+    let helper = "SELECT knot_lock_tables('20261114140000_snapshot_pending_revs', \
+                  ARRAY['doc_snapshots']::regclass[], 'ACCESS EXCLUSIVE');";
+    let helper_at = sql.find(helper).expect("no helper call on doc_snapshots");
+    let alter_at = sql.find("ALTER TABLE").expect("no ALTER TABLE");
+    assert!(helper_at < alter_at, "the lock is taken after the ALTER");
+    assert!(
+        !sql.lines().any(|l| l.trim() == "-- no-transaction"),
+        "SET LOCAL does nothing outside sqlx's migration transaction"
+    );
+    let statements: Vec<&str> = sql
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect();
+    for forbidden in ["DROP TRIGGER", "LOCK TABLE", "DEFAULT"] {
+        assert!(
+            !statements.iter().any(|l| l.contains(forbidden)),
+            "{forbidden} in a statement"
+        );
+    }
+}
+
 /// The API-keys migrations run while the previous release serves: grant and
 /// member writes (whose foreign keys read `users`), edit saves and `users`
 /// reads/writes all keep working, nothing deadlocks, and the two CHECKs end
@@ -4822,6 +4856,328 @@ async fn api_keys_migrations_run_under_live_previous_release_traffic() {
     .await
     .unwrap();
     assert!(unvalidated.is_empty(), "left NOT VALID: {unvalidated:?}");
+
+    pool.close().await;
+    let mut probe = sqlx::PgConnection::connect(&url).await.unwrap();
+    let mut others: i64 = -1;
+    for _ in 0..50 {
+        sqlx::query("SELECT pg_stat_clear_snapshot()")
+            .execute(&mut probe)
+            .await
+            .unwrap();
+        others = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database() AND backend_type = 'client backend'
+                AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(&mut probe)
+        .await
+        .unwrap();
+        if others == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(others, 0, "every loop backend exited within 5 s");
+    sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(&mut probe)
+        .await
+        .unwrap();
+    let deadlocks: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&mut probe)
+    .await
+    .unwrap();
+    assert_eq!(deadlocks, deadlocks0, "no deadlock anywhere");
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots name their pending rows (20261114140000_snapshot_pending_revs)
+// ---------------------------------------------------------------------------
+
+/// The schema of 0.9.13, the release the `pending_revs` migration upgrades
+/// from.
+const V0_9_13_SCHEMA: i64 = 20261113120000;
+
+/// 0.9.13's `PgSnapshotStore::latest` SELECT, verbatim.
+const V0_9_13_LATEST_SQL: &str =
+    "SELECT doc_id, snapshot_seq, state_bytes, state_vector, created_at,
+                    snapshot_rev, epoch
+             FROM doc_snapshots WHERE doc_id = $1
+             ORDER BY snapshot_rev DESC NULLS LAST, snapshot_seq DESC LIMIT 1";
+
+/// 0.9.13's snapshot GC statement (`PgSnapshotStore::gc`), verbatim.
+const V0_9_13_GC_SQL: &str = "WITH recent AS (
+                 SELECT snapshot_seq FROM doc_snapshots
+                 WHERE doc_id = $1 ORDER BY snapshot_seq DESC LIMIT $2
+             ),
+             per_day AS (
+                 SELECT DISTINCT ON (date_trunc('day', created_at)) snapshot_seq
+                 FROM doc_snapshots
+                 WHERE doc_id = $1 AND created_at >= now() - ($3 || ' days')::interval
+                 ORDER BY date_trunc('day', created_at), created_at DESC
+             )
+             DELETE FROM doc_snapshots
+             WHERE doc_id = $1
+               AND snapshot_seq NOT IN (SELECT snapshot_seq FROM recent)
+               AND snapshot_seq NOT IN (SELECT snapshot_seq FROM per_day)";
+
+/// 0.9.13's history builder snapshot size query (`knot-history`
+/// `store.rs`), verbatim. Binds: the page, `snapshot_checked_rev`,
+/// `built_rev`, how many to fetch.
+const V0_9_13_BUILDER_SNAPSHOTS_SQL: &str =
+    "SELECT s.snapshot_rev, s.snapshot_seq, s.created_at, s.size,
+                coalesce((SELECT sum(octet_length(u.update_bytes)) FROM doc_updates u
+                           WHERE u.doc_id = $1 AND u.rev > $3 AND u.rev <= s.snapshot_rev),
+                         0)::bigint
+           FROM (SELECT DISTINCT ON (snapshot_rev)
+                        snapshot_rev, snapshot_seq, created_at,
+                        octet_length(state_bytes)::bigint AS size
+                   FROM doc_snapshots
+                  WHERE doc_id = $1 AND snapshot_rev > $2
+                    AND snapshot_rev <> ALL (
+                        SELECT unnest(skip_snapshots) FROM doc_history_state WHERE doc_id = $1)
+                  ORDER BY snapshot_rev, snapshot_seq DESC) s
+          ORDER BY s.snapshot_rev LIMIT $4";
+
+/// The `pending_revs` migration runs while 0.9.13 pods keep serving: their
+/// edit saves, snapshot writes, snapshot reads, snapshot GC and the history
+/// builder's snapshot reads all keep working and wait at most for the lock
+/// helper's short attempts; nothing deadlocks, `doc_snapshots` is not
+/// rewritten, and the stamped NULL rows 0.9.13 writes from the migration on
+/// read as an older writer's (Ruling 6), the ones before it do not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn snapshot_pending_revs_migration_runs_under_live_0_9_13_traffic() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::time::Duration;
+
+    use knot_storage::{PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore};
+    use sqlx::Connection;
+
+    let (url, pool) = bare_db(4).await;
+    migrate_up_to(&pool, V0_9_13_SCHEMA).await;
+    let (ws, user) = seed_ws_user(&pool).await;
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let p = new_page(&pool, ws, user).await;
+        PgUpdatesStore::new(pool.clone())
+            .append(p, 0, &edits(user, 3))
+            .await
+            .unwrap();
+        pages.push(p);
+    }
+    let (b, c, d) = (pages[1], pages[2], pages[3]);
+    // Something for the builder's query to read on D.
+    stamped_snapshot(&pool, STAMPED_SNAPSHOT_INSERT_SQL, d, 1, b"d", 3, 0)
+        .await
+        .unwrap();
+    let deadlocks0: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let relfilenode = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT relfilenode::bigint FROM pg_class WHERE oid = 'doc_snapshots'::regclass",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let relfilenode0 = relfilenode().await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut loops = Vec::new();
+    // (i) One back-to-back appender per page.
+    for &p in &pages {
+        loops.push((
+            "append",
+            spawn_loop(
+                loop_pool(&url).await,
+                stop.clone(),
+                Duration::ZERO,
+                move |pool, n| async move {
+                    PgUpdatesStore::new(pool)
+                        .append(p, 0, &edits(user, 1 + (n % 3) as usize))
+                        .await
+                        .map(drop)
+                        .map_err(|e| format!("append: {e:?}"))
+                },
+            ),
+        ));
+    }
+    // (ii) 0.9.13's stamped snapshot write on B, a new row each time.
+    loops.push((
+        "snapshot write",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(20),
+            move |pool, n| async move {
+                stamped_snapshot(
+                    &pool,
+                    STAMPED_SNAPSHOT_UPSERT_SQL,
+                    b,
+                    n as i64 + 1,
+                    b"b",
+                    1,
+                    0,
+                )
+                .await
+                .map_err(|e| format!("snapshot write: {}", err_text(e)))
+            },
+        ),
+    ));
+    // (iii) 0.9.13's boot read on B.
+    loops.push((
+        "latest",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(5),
+            move |pool, _| async move {
+                sqlx::query(V0_9_13_LATEST_SQL)
+                    .bind(b)
+                    .fetch_optional(&pool)
+                    .await
+                    .map(drop)
+                    .map_err(err_text)
+            },
+        ),
+    ));
+    // (iv) 0.9.13's snapshot write and hourly GC on C.
+    loops.push((
+        "gc",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(20),
+            move |pool, n| async move {
+                stamped_snapshot(
+                    &pool,
+                    STAMPED_SNAPSHOT_UPSERT_SQL,
+                    c,
+                    n as i64 + 1,
+                    b"c",
+                    1,
+                    0,
+                )
+                .await
+                .map_err(|e| format!("snapshot write: {}", err_text(e)))?;
+                sqlx::query(V0_9_13_GC_SQL)
+                    .bind(c)
+                    .bind(2i64)
+                    .bind(30i32)
+                    .execute(&pool)
+                    .await
+                    .map(drop)
+                    .map_err(|e| format!("gc: {}", err_text(e)))
+            },
+        ),
+    ));
+    // (v) 0.9.13's history builder reading snapshot sizes on D.
+    loops.push((
+        "builder",
+        spawn_loop(
+            loop_pool(&url).await,
+            stop.clone(),
+            Duration::from_millis(5),
+            move |pool, _| async move {
+                sqlx::query(V0_9_13_BUILDER_SNAPSHOTS_SQL)
+                    .bind(d)
+                    .bind(0i64)
+                    .bind(0i64)
+                    .bind(11i64)
+                    .fetch_all(&pool)
+                    .await
+                    .map(drop)
+                    .map_err(err_text)
+            },
+        ),
+    ));
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Panics (failing the test) when a migration fails.
+    let migrated = tokio::time::timeout(Duration::from_secs(30), migrate_all(&pool)).await;
+    let at_migration: Vec<u64> = loops.iter().map(|(_, l)| l.runs()).collect();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    stop.store(true, SeqCst);
+    let mut reports = Vec::new();
+    for ((name, l), before) in loops.into_iter().zip(at_migration) {
+        let longest = l.longest();
+        reports.push((name, before, longest, l.handle.await.unwrap()));
+    }
+
+    assert!(migrated.is_ok(), "migrator still running after 30 s");
+    for (name, before, longest, report) in &reports {
+        eprintln!("{name}: {} runs, longest {longest:?}", report.runs);
+        assert!(report.errors.is_empty(), "{name}: {:?}", report.errors);
+        assert!(
+            report.runs > *before,
+            "{name} made no progress after the migration"
+        );
+        assert!(
+            *longest < Duration::from_secs(5),
+            "{name} stalled for {longest:?}"
+        );
+    }
+
+    assert_eq!(
+        relfilenode().await,
+        relfilenode0,
+        "doc_snapshots was rewritten"
+    );
+    let default: Option<String> = sqlx::query_scalar(
+        "SELECT column_default::text FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'doc_snapshots'
+            AND column_name = 'pending_revs'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the pending_revs column");
+    assert_eq!(default, None, "pending_revs takes no default");
+
+    // Ruling 6: flagged by when the row was written, not by commit order.
+    let installed_on: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT installed_on FROM _sqlx_migrations WHERE version = 20261114140000",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let rows: Vec<(i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT snapshot_seq, created_at FROM doc_snapshots
+          WHERE doc_id = $1 AND snapshot_rev IS NOT NULL ORDER BY snapshot_seq",
+    )
+    .bind(b)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let store = PgSnapshotStore::new(pool.clone());
+    let (mut before, mut after) = (0, 0);
+    for (seq, created_at) in rows {
+        let snapshot = store.by_seq(b, seq).await.unwrap().unwrap();
+        let flagged = created_at >= installed_on;
+        assert_eq!(
+            snapshot.older_writer, flagged,
+            "seq {seq}, created {created_at}, migration installed {installed_on}"
+        );
+        assert_eq!(snapshot.pending_revs, None);
+        if flagged {
+            after += 1;
+        } else {
+            before += 1;
+        }
+    }
+    assert!(
+        before > 0 && after > 0,
+        "{before} rows before the migration, {after} after"
+    );
 
     pool.close().await;
     let mut probe = sqlx::PgConnection::connect(&url).await.unwrap();

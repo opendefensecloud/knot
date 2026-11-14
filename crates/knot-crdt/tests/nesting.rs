@@ -390,9 +390,10 @@ impl knot_storage::SnapshotStore for RecordingSnapshots {
         _: knot_storage::SnapshotStamp,
         state: &[u8],
         _: &[u8],
-    ) -> Result<(), knot_storage::SnapshotStoreError> {
+        _: Option<&[i64]>,
+    ) -> Result<bool, knot_storage::SnapshotStoreError> {
         self.written.lock().unwrap().push(state.to_vec());
-        Ok(())
+        Ok(true)
     }
     async fn latest(
         &self,

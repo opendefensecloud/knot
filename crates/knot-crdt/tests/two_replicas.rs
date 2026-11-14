@@ -214,15 +214,23 @@ impl SnapshotStore for Recording {
         stamp: SnapshotStamp,
         state_bytes: &[u8],
         state_vector: &[u8],
-    ) -> Result<(), SnapshotStoreError> {
+        pending_revs: Option<&[i64]>,
+    ) -> Result<bool, SnapshotStoreError> {
         let written = self
             .snapshots
-            .insert_stamped(doc_id, stamp, state_bytes, state_vector)
+            .insert_stamped(doc_id, stamp, state_bytes, state_vector, pending_revs)
             .await;
         self.keep_s("insert_stamped", written)
     }
     async fn latest(&self, doc_id: Uuid) -> Result<Option<DocSnapshot>, SnapshotStoreError> {
         self.keep_s("latest", self.snapshots.latest(doc_id).await)
+    }
+    async fn latest_trusted(
+        &self,
+        doc_id: Uuid,
+    ) -> Result<Option<DocSnapshot>, SnapshotStoreError> {
+        let trusted = self.snapshots.latest_trusted(doc_id).await;
+        self.keep_s("latest_trusted", trusted)
     }
     async fn gc(
         &self,
