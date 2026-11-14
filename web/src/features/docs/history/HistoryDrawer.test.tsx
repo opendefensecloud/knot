@@ -2,19 +2,26 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { colorFor } from "../../../components/ui/Avatar";
-import type { HistoryEntry, HistoryPage } from "../../../lib/validators";
+import type { HistoryEntry, HistoryPage, HistoryView } from "../../../lib/validators";
+import { useUi } from "../../../stores/ui";
 import { copy } from "./copy";
 import { HistoryDrawer } from "./HistoryDrawer";
 import { entryLine } from "./timeline";
 
-const api = vi.hoisted(() => ({ entries: vi.fn() }));
+const api = vi.hoisted(() => ({ entries: vi.fn(), view: vi.fn(), restoreEntry: vi.fn() }));
+const docs = vi.hoisted(() => ({ get: vi.fn() }));
 
 vi.mock("../../../lib/history.api", () => ({
-  historyApi: { entries: api.entries },
+  historyApi: { entries: api.entries, view: api.view, restoreEntry: api.restoreEntry },
 }));
+
+vi.mock("../docs.api", async (importOriginal) => {
+  const m = await importOriginal<typeof import("../docs.api")>();
+  return { ...m, docsApi: { ...m.docsApi, get: docs.get } };
+});
 
 function entry(id: number, over: Partial<HistoryEntry> = {}): HistoryEntry {
   return {
@@ -69,11 +76,45 @@ function before(a: Element, b: Element): boolean {
   return (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
 }
 
+function viewOk(): { ok: HistoryView } {
+  return {
+    ok: {
+      entry_id: 7,
+      kind: "session",
+      changes: true,
+      can_restore: true,
+      can_erase: false,
+      doc: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "one" }] }] },
+    },
+  };
+}
+
+/** `window.matchMedia` answering `matches` for every query: false is below
+ *  `md`, true is `md` and up. */
+function stubMatchMedia(matches: boolean) {
+  vi.stubGlobal("matchMedia", (q: string) => ({
+    matches,
+    media: q,
+    addEventListener() {},
+    removeEventListener() {},
+  }));
+}
+
+beforeEach(() => {
+  api.view.mockResolvedValue(viewOk());
+  docs.get.mockResolvedValue({ ok: { id: "d1", title: "Plan" } });
+});
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   api.entries.mockReset();
+  api.view.mockReset();
+  api.restoreEntry.mockReset();
+  docs.get.mockReset();
+  useUi.setState({ toasts: [] });
 });
 
 describe("HistoryDrawer", () => {
@@ -425,5 +466,46 @@ describe("HistoryDrawer", () => {
     fireEvent.click(row);
     expect(row).toHaveAttribute("aria-current", "true");
     expect(screen.getByTestId("history-entry-6")).not.toHaveAttribute("aria-current");
+  });
+
+  it("moves focus with the column on narrow screens", async () => {
+    api.entries.mockResolvedValue({ ok: page([entry(7), entry(6)]) });
+    stubMatchMedia(false);
+    renderDrawer();
+    const row = await screen.findByTestId("history-entry-7");
+    row.focus();
+    fireEvent.click(row);
+    const back = await screen.findByTestId("history-back");
+    expect(document.activeElement).toBe(back);
+    expect(screen.getByTestId("history-drawer").contains(document.activeElement)).toBe(true);
+
+    fireEvent.click(back);
+    expect(screen.queryByTestId("history-back")).toBeNull();
+    expect(screen.getByTestId("history-timeline").className).not.toContain("max-md:hidden");
+    expect(document.activeElement).toBe(screen.getByTestId("history-entry-7"));
+    cleanup();
+
+    // From md up both columns stay, and focus stays on the clicked entry.
+    stubMatchMedia(true);
+    renderDrawer();
+    const wide = await screen.findByTestId("history-entry-7");
+    wide.focus();
+    fireEvent.click(wide);
+    await screen.findByTestId("history-back");
+    expect(document.activeElement).toBe(screen.getByTestId("history-entry-7"));
+  });
+
+  it("closes after a successful restore", async () => {
+    api.entries.mockResolvedValue({ ok: page([entry(7, { open: true })]) });
+    api.restoreEntry.mockResolvedValue({ ok: undefined });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { onClose } = renderDrawer();
+    fireEvent.click(await screen.findByTestId("history-entry-7"));
+    const restore = await screen.findByTestId("history-restore");
+    await waitFor(() => expect(restore).toBeEnabled());
+    fireEvent.click(restore);
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    expect(api.restoreEntry).toHaveBeenCalledWith("d1", 7, "2025-11-03T12:00:00Z");
+    expect(useUi.getState().toasts.map((t) => t.text)).toEqual([copy.restored]);
   });
 });

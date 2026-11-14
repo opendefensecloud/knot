@@ -6,6 +6,7 @@ import type { HistoryEntry } from "../../../lib/validators";
 import { copy } from "./copy";
 import { TimelineColumn } from "./TimelineColumn";
 import { useHistoryEntries } from "./useHistoryEntries";
+import { VersionView } from "./VersionView";
 
 /** What Tab can reach. Hidden ones (the column not shown below `md`) are
  *  filtered out where the browser can tell. */
@@ -22,8 +23,9 @@ function tabbables(root: HTMLElement): HTMLElement[] {
  * The page's history: a modal panel from the right with the timeline of
  * editing sessions and, beside it (below `md`, instead of it), the version
  * of the selected entry. The backdrop, the close button and Escape close
- * it; focus starts on the close button, stays in the panel, and goes back
- * to what had it before the drawer opened.
+ * it, and so does a successful restore; focus starts on the close button,
+ * stays in the panel, and goes back to what had it before the drawer
+ * opened.
  */
 export function HistoryDrawer({
   docId,
@@ -46,6 +48,25 @@ export function HistoryDrawer({
   const panelRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
+
+  // Below `md` the drawer shows one column at a time and hides the one that
+  // held the control just activated, so focus would fall to <body>, outside
+  // the dialog. Selecting an entry focuses Back (`focusBack`); Back focuses
+  // the entry again once the timeline shows. From `md` up both columns stay
+  // and nothing moves. Without `matchMedia` (jsdom) it is wide.
+  const narrow =
+    entry !== null && typeof window.matchMedia === "function" && !window.matchMedia("(min-width: 768px)").matches;
+  const returnTo = useRef<number | null>(null);
+  function onBack() {
+    returnTo.current = selected?.id ?? null;
+    setSelected(null);
+  }
+  useEffect(() => {
+    if (selected !== null || returnTo.current === null) return;
+    const id = returnTo.current;
+    returnTo.current = null;
+    timelineRef.current?.querySelector<HTMLElement>(`[data-testid="history-entry-${id}"]`)?.focus();
+  }, [selected]);
 
   // Focus moves in on open and back to the opener (the History button) on
   // close, however the drawer closes.
@@ -121,32 +142,23 @@ export function HistoryDrawer({
             data-testid="history-version-pane"
             className={`flex-1 min-w-0 overflow-auto flex flex-col ${entry === null ? "max-md:hidden" : ""}`}
           >
-            <VersionSlot
-              docId={docId}
-              entry={entry}
-              showChanges={showChanges}
-              onShowChanges={setShowChanges}
-              canRestore={canRestore}
-              onBack={() => setSelected(null)}
-              onRestored={onClose}
-            />
+            {entry === null ? (
+              <p className="m-0 p-4 text-sm text-fg-muted">{copy.selectEntry}</p>
+            ) : (
+              <VersionView
+                docId={docId}
+                entry={entry}
+                showChanges={showChanges}
+                onShowChanges={setShowChanges}
+                canRestore={canRestore}
+                onBack={onBack}
+                onRestored={onClose}
+                focusBack={narrow}
+              />
+            )}
           </div>
         </div>
       </div>
     </>
   );
-}
-
-/** The version pane's content. Task 12 mounts `VersionView` here for the
- *  selected entry, with these props. */
-function VersionSlot(_props: {
-  docId: string;
-  entry: HistoryEntry | null;
-  showChanges: boolean;
-  onShowChanges: (on: boolean) => void;
-  canRestore: boolean;
-  onBack: () => void;
-  onRestored: () => void;
-}) {
-  return <p className="m-0 p-4 text-sm text-fg-muted">{copy.selectEntry}</p>;
 }
