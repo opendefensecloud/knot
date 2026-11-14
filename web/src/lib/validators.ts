@@ -308,6 +308,20 @@ const docAuditPageSchema = v.object({
 export type DocAuditPage = v.InferOutput<typeof docAuditPageSchema>;
 export const DocAuditPage = docAuditPageSchema;
 
+/**
+ * One of the user's favorite pages (GET /api/me/favorites), oldest star
+ * first. Only pages the user can read that are neither archived nor
+ * templates are listed.
+ */
+const favoriteSchema = v.object({
+  doc_id: v.string(),
+  title: v.string(),
+  icon: v.nullable(v.string()),
+  favorited_at: v.string(),
+});
+export type Favorite = v.InferOutput<typeof favoriteSchema>;
+export const Favorite = favoriteSchema;
+
 export function parse<T>(schema: v.GenericSchema<unknown, T>, data: unknown): T {
   return v.parse(schema, data);
 }

@@ -25,6 +25,7 @@ import { CommentSidebar } from "../comments/CommentSidebar";
 import { MarkdownView } from "../editor/MarkdownView";
 import type { KnotEditorHandle } from "../editor/readingCaret";
 import { ExportMenu } from "../export/ExportMenu";
+import { FAVORITES_KEY } from "../favorites/useFavorites";
 import { CopyLinkButton } from "./CopyLinkButton";
 import { archiveErrorText, purgeConfirmText, purgeErrorText } from "./archive";
 import { ArchivedBanner } from "./ArchivedBanner";
@@ -464,6 +465,9 @@ export default function DocPage() {
     await qc.invalidateQueries({ queryKey: ["doc"] });
     await qc.invalidateQueries({ queryKey: ["docs"] });
     await qc.invalidateQueries({ queryKey: ["archive"] });
+    // The favorites list leaves archived pages out: a restored one may be
+    // a favorite again.
+    await qc.invalidateQueries({ queryKey: FAVORITES_KEY });
   }
 
   async function restoreFromArchive() {

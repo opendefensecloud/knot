@@ -15,6 +15,7 @@ import { Button } from "../../components/ui/Button";
 import type { ArchiveEntry } from "../../lib/validators";
 import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
+import { FAVORITES_KEY } from "../favorites/useFavorites";
 
 import { archiveErrorText, daysUntil, purgeConfirmText, purgeErrorText } from "./archive";
 import { docsApi } from "./docs.api";
@@ -53,6 +54,9 @@ export default function ArchivePage() {
     await qc.invalidateQueries({ queryKey: ["archive"] });
     await qc.invalidateQueries({ queryKey: ["docs"] });
     await qc.invalidateQueries({ queryKey: ["doc"] });
+    // The favorites list leaves archived pages out: a restored one may be
+    // a favorite again.
+    await qc.invalidateQueries({ queryKey: FAVORITES_KEY });
   }
 
   async function restore(entry: ArchiveEntry) {

@@ -1,6 +1,6 @@
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
-import { ChevronRight, FileText, Lock, MoreHorizontal, Plus } from "lucide-react";
+import { ChevronRight, FileText, Lock, MoreHorizontal, Plus, Star } from "lucide-react";
 import { useCallback, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
@@ -9,6 +9,7 @@ import { ContextMenu, type ContextMenuItem } from "../../components/ContextMenu"
 import { IconButton } from "../../components/ui/IconButton";
 import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
+import { FAVORITES_KEY } from "../favorites/useFavorites";
 
 import { archiveConfirmText, archiveErrorText } from "./archive";
 import { docsApi } from "./docs.api";
@@ -71,6 +72,13 @@ export type TreeState = {
   onDuplicate: (node: TreeNode) => void;
   /** The pages whose copy is being made. */
   copying: ReadonlySet<string>;
+  /** The user's favorites, from `useFavorites`. */
+  favorites: {
+    isFavorite: (id: string) => boolean;
+    /** The list has loaded: until then a star can't say what it is. */
+    ready: boolean;
+    toggle: (doc: { id: string; title: string; icon: string | null }) => void;
+  };
 };
 
 export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; tree: TreeState }) {
@@ -107,6 +115,11 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
   const expanded = !tree.collapsed.has(node.id);
   const copying = tree.copying.has(node.id);
   const descId = `tree-desc-${node.id}`;
+  // A template can't be a favorite: the server refuses it.
+  const canStar = !node.is_template;
+  const starred = tree.favorites.isFavorite(node.id);
+  const starLabel = starred ? "Remove from favorites" : "Add to favorites";
+  const toggleStar = () => tree.favorites.toggle({ id: node.id, title: node.title, icon: node.icon });
 
   async function onRename() {
     const next = window.prompt("Rename to:", node.title);
@@ -140,9 +153,18 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
     notify("info", next ? "Saved as template" : "Removed from templates");
     await qc.invalidateQueries({ queryKey: ["docs"] });
     await qc.invalidateQueries({ queryKey: ["templates"] });
+    // The favorites list leaves templates out: a page that stops being one
+    // may be a favorite again.
+    await qc.invalidateQueries({ queryKey: FAVORITES_KEY });
   }
 
   const items: ContextMenuItem[] = [];
+  // For every role: it gives Viewers a row menu too. Only once favorites
+  // have loaded: until then (or if they fail to) a Viewer's menu would be
+  // one disabled item in place of the browser's own.
+  if (canStar && tree.favorites.ready) {
+    items.push({ label: starLabel, testId: "ctx-favorite", onSelect: toggleStar });
+  }
   if (canEdit) {
     items.push({ label: "Rename", testId: "ctx-rename", onSelect: () => void onRename() });
     // The copy goes next to the page, under a parent the user can't see when
@@ -288,6 +310,35 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
         <span id={descId} className="sr-only">
           {row && rowDescription(row, node.within_restricted)}
         </span>
+        {canStar && (
+          <IconButton
+            data-testid={`tree-star-${node.id}`}
+            // The label names the action and so already says the state; no
+            // aria-pressed, which would contradict it ("Remove…, pressed").
+            label={starLabel}
+            size="sm"
+            disabled={!tree.favorites.ready}
+            // A starred row shows its star always; an unstarred one on
+            // hover, when a keyboard user is on the row or the star, and
+            // always where there is no hover (an invisible star takes taps).
+            className={`shrink-0 ${
+              starred
+                ? "opacity-100"
+                : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+            }`}
+            onClick={(e) => {
+              e.preventDefault();
+              toggleStar();
+            }}
+          >
+            <Star
+              size={14}
+              aria-hidden
+              fill={starred ? "currentColor" : "none"}
+              className={starred ? "text-accent" : undefined}
+            />
+          </IconButton>
+        )}
         {canEdit && (
           <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5">
             <IconButton

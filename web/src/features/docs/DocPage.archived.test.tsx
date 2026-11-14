@@ -138,6 +138,29 @@ describe("DocPage — archived", () => {
     expect(editor).toHaveAttribute("data-edit-mode", "false");
   });
 
+  it("refetches favorites after restoring from the banner, which may bring a starred page back", async () => {
+    const base = server("editor", {
+      d1: [docBody("d1", "Runbook", "editor", archivedRoot), docBody("d1", "Runbook", "editor", null)],
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) => {
+        if (url === "/api/docs/d1/restore" && init?.method === "POST") {
+          return Promise.resolve(new Response(null, { status: 204 }));
+        }
+        return base(url);
+      }),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    renderDoc("d1", client);
+
+    const banner = await screen.findByTestId("archived-banner");
+    fireEvent.click(within(banner).getByRole("button", { name: "Restore" }));
+
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["favorites"] }));
+  });
+
   it("ignores ⌘E on an archived page", async () => {
     vi.stubGlobal("fetch", server("editor", { d1: [docBody("d1", "Runbook", "editor", archivedRoot)] }));
     renderDoc("d1");

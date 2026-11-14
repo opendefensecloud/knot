@@ -27,6 +27,8 @@ import { ApiRequestError, type ApiError } from "../../lib/api";
 import { LIMIT_TOAST_KEY, limitErrorText, notifyFailure } from "../../lib/limitErrors";
 
 import { SidebarVersion } from "../about/SidebarVersion";
+import { FavoritesSection } from "../favorites/FavoritesSection";
+import { useFavorites } from "../favorites/useFavorites";
 import { WorkspaceHeader } from "../workspace/WorkspaceHeader";
 import { workspaceApi } from "../workspace/workspace.api";
 import { docsApi } from "./docs.api";
@@ -194,6 +196,7 @@ export function DocTree() {
 
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const docs = useMemo(() => (list.data && "ok" in list.data ? list.data.ok : []), [list.data]);
+  const favorites = useFavorites();
   const tree = useMemo(() => buildTree(docs), [docs]);
   // The rows in on-screen order: the workspace's pages, then those shared
   // with the user ("Shared with you"), as one list for moves to plan in.
@@ -442,12 +445,15 @@ export function DocTree() {
     onMove: moveBy,
     onDuplicate: startDuplicate,
     copying,
+    favorites,
   };
   const dragged = draggingId === null ? undefined : rows.get(draggingId);
 
   return (
     <div data-testid="doc-tree" className="flex flex-col h-full">
       <WorkspaceHeader />
+      {/* Outside the tree's DndContext: favorites are links, not drag sources. */}
+      <FavoritesSection docs={list.data && "ok" in list.data ? list.data.ok : undefined} />
       <div className="px-3 pt-3 pb-1 flex items-center justify-between">
         <span className="text-[11px] font-semibold uppercase tracking-wider text-fg-muted">
           Documents
