@@ -312,6 +312,7 @@ async fn create_key(State(state): State<AppState>, req: Request) -> Response {
             created_by: ctx.user_id,
             expires_at,
             session_hash: Some(&session_hash),
+            root_doc_id: None,
         })
         .await
     {

@@ -280,6 +280,7 @@ mod tests {
                 created_by: fx.user,
                 expires_at: None,
                 session_hash: None,
+                root_doc_id: None,
             })
             .await
             .unwrap();

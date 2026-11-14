@@ -429,6 +429,7 @@ async fn guards_mint_all_scopes_key(state: &AppState, user_id: uuid::Uuid) -> St
             created_by: user_id,
             expires_at: None,
             session_hash: None,
+            root_doc_id: None,
         })
         .await
         .unwrap();
@@ -3151,6 +3152,7 @@ async fn owner_cannot_manage_the_keys_of_another_workspaces_bot() {
             created_by: other_owner,
             expires_at: None,
             session_hash: None,
+            root_doc_id: None,
         })
         .await
         .unwrap();

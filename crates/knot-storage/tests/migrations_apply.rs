@@ -3734,6 +3734,7 @@ async fn api_keys_table_has_expected_columns_and_constraints() {
             ("expires_at", "timestamp with time zone", "YES"),
             ("last_used_at", "timestamp with time zone", "YES"),
             ("revoked_at", "timestamp with time zone", "YES"),
+            ("root_doc_id", "uuid", "YES"),
         ],
         "api_keys columns drifted from the spec"
     );
@@ -3760,11 +3761,15 @@ async fn api_keys_table_has_expected_columns_and_constraints() {
     .unwrap()
     .into_iter()
     .collect();
-    let want: BTreeSet<(String, String)> =
-        [("created_by", "a"), ("user_id", "c"), ("workspace_id", "c")]
-            .into_iter()
-            .map(|(a, b)| (a.to_owned(), b.to_owned()))
-            .collect();
+    let want: BTreeSet<(String, String)> = [
+        ("created_by", "a"),
+        ("root_doc_id", "c"),
+        ("user_id", "c"),
+        ("workspace_id", "c"),
+    ]
+    .into_iter()
+    .map(|(a, b)| (a.to_owned(), b.to_owned()))
+    .collect();
     assert_eq!(fks, want, "api_keys foreign keys / ON DELETE rules drifted");
 
     let idx: Option<String> = sqlx::query_scalar(
@@ -4627,6 +4632,14 @@ fn api_keys_migrations_take_their_locks_through_the_helper() {
         (
             "api_keys_and_bots",
             include_str!("../../../migrations/20261112120002_api_keys_and_bots.sql"),
+        ),
+        (
+            "api_keys_root_doc",
+            include_str!("../../../migrations/20261114120000_api_keys_root_doc.sql"),
+        ),
+        (
+            "api_keys_root_doc_fk",
+            include_str!("../../../migrations/20261114120001_api_keys_root_doc_fk.sql"),
         ),
     ] {
         assert!(
