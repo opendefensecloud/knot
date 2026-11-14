@@ -3741,3 +3741,123 @@ async fn bot_subtree_key_needs_a_root_the_bot_can_read() {
     let (st, body) = mint(open).await;
     assert_eq!(st, StatusCode::CREATED, "{body}");
 }
+
+/// S10: every SUBTREE_DENIED path names a real route and refuses a subtree
+/// key with every scope, whatever the method.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_subtree_denied_route_refuses_a_subtree_key() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let root = matrix_doc(&app, &s, "root").await;
+    let key = subtree_key(&app, &s, &root, &ALL_SCOPES).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    for template in knot_server::auth::scope::SUBTREE_DENIED {
+        let uri = template.replace("{id}", &id);
+        for method in ["GET", "POST", "PATCH", "DELETE"] {
+            let body = (method != "GET").then(|| serde_json::json!({}));
+            let (st, body) = guards_bearer(&app, &key, method, &uri, body).await;
+            if st == StatusCode::METHOD_NOT_ALLOWED {
+                continue;
+            }
+            assert_eq!(st, StatusCode::FORBIDDEN, "{method} {template}: {body}");
+            assert!(
+                body["error"]["code"] == "api_key.subtree_denied"
+                    || body["error"]["code"] == "api_key.session_required",
+                "{method} {template}: {body}"
+            );
+        }
+    }
+    // An unscoped key still reaches them, as before.
+    let unscoped = matrix_key(&app, &s, &["read"]).await;
+    let (st, body) = guards_bearer(&app, &unscoped, "GET", "/api/workspace/templates", None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_key_cannot_reach_the_top_level_or_move_its_root() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let top = matrix_doc(&app, &s, "top").await;
+    let root = child_doc(&app, &s, &top, "root").await;
+    let child = child_doc(&app, &s, &root, "child").await;
+    let key = subtree_key(&app, &s, &root, &ALL_SCOPES).await;
+    let denied = |st: StatusCode, body: &serde_json::Value| {
+        st == StatusCode::FORBIDDEN && body["error"]["code"] == "api_key.subtree_denied"
+    };
+
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        "/api/docs",
+        Some(serde_json::json!({"title": "top-level"})),
+    )
+    .await;
+    assert!(denied(st, &body), "create at top level: {st} {body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{child}/move"),
+        Some(serde_json::json!({"parent_id": null})),
+    )
+    .await;
+    assert!(denied(st, &body), "move to top level: {st} {body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{root}/move"),
+        Some(serde_json::json!({"parent_id": top})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "move root under its parent: {body}"
+    );
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{root}/duplicate"),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "duplicate root next to itself: {body}"
+    );
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{child}/duplicate"),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert!(st.is_success(), "duplicate inside: {body}");
+
+    // A key rooted at a top-level page cannot copy it either.
+    let top_key = subtree_key(&app, &s, &top, &ALL_SCOPES).await;
+    let (st, body) = guards_bearer(
+        &app,
+        &top_key,
+        "POST",
+        &format!("/api/docs/{top}/duplicate"),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert!(denied(st, &body), "duplicate a top-level root: {st} {body}");
+
+    // Search stays inside too.
+    let (st, body) = guards_bearer(&app, &key, "GET", "/api/search?q=top", None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(
+        !body.to_string().contains(&top),
+        "search leaked the parent: {body}"
+    );
+}

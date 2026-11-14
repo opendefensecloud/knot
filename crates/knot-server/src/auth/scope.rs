@@ -12,6 +12,7 @@
 //! The required scope comes from the HTTP method, except for the routes in
 //! [`OVERRIDES`]: that table is the single auditable place for exceptions.
 //! Routes in [`SESSION_ONLY`] refuse every key, whatever its scopes.
+//! Routes in [`SUBTREE_DENIED`] refuse every key that has a scope root (S10).
 
 use axum::{
     Json,
@@ -25,6 +26,7 @@ use knot_storage::Scope;
 use serde_json::json;
 
 use super::api_key_loader::ApiPrincipal;
+use super::context::AuthContext;
 use crate::http_error::json_err;
 
 /// Routes no API key may call, keyed by the exact axum `MatchedPath`: they
@@ -53,6 +55,104 @@ pub const SESSION_ONLY: &[(Method, &str)] = &[
     (Method::DELETE, "/api/docs/{id}/grants/{principal}"),
     (Method::PUT, "/api/docs/{id}/restricted"),
 ];
+
+/// S10: routes a key with a scope root may not call, whatever the method:
+/// they are workspace-wide, or they change the user's own state. Keyed by
+/// the exact axum `MatchedPath`. Routes that filter through the doc ACL
+/// narrow on their own and are listed in [`SUBTREE_OK`].
+pub const SUBTREE_DENIED: &[&str] = &[
+    // Who is in the workspace is not page content.
+    "/api/workspace/members",
+    "/api/workspace/members/{id}",
+    // Workspace-wide by definition.
+    "/api/workspace/templates",
+    "/api/workspace/export",
+    "/api/workspace/import",
+    "/api/workspace/archive",
+    // The user's inbox: doc-less notifications pass the visibility filter,
+    // and marking read checks no ACL.
+    "/api/notifications",
+    "/api/notifications/unread_count",
+    "/api/notifications/read",
+    // Changes the user's own state.
+    "/api/whats-new/seen",
+];
+
+/// S10: routes open to a subtree key, each with why that is safe. Every
+/// `/api` route is in exactly one of the two tables (tested).
+pub const SUBTREE_OK: &[&str] = &[
+    // Resolved through the doc ACL (route layer or handler), which masks
+    // everything outside the root. Destinations are checked separately.
+    "/api/docs/{id}",
+    "/api/docs/{id}/purge",
+    "/api/docs/{id}/template",
+    "/api/docs/{id}/duplicate",
+    "/api/docs/{id}/move",
+    "/api/docs/{id}/markdown",
+    "/api/docs/from-template/{id}",
+    "/api/docs/{id}/grants",
+    "/api/docs/{id}/grants/{principal}",
+    "/api/docs/{id}/restricted",
+    "/api/docs/{id}/access",
+    "/api/docs/{id}/history",
+    "/api/docs/{id}/history/entries",
+    "/api/docs/{id}/history/{seq}/markdown",
+    "/api/docs/{id}/history/{seq}/restore",
+    "/api/docs/{id}/contributors",
+    "/api/docs/{id}/audit",
+    "/api/docs/{id}/short-link",
+    "/api/docs/{id}/export/diagrams",
+    "/api/docs/{id}/export/{format}",
+    "/api/docs/{doc_id}/export",
+    "/api/docs/{doc_id}/shares",
+    "/api/docs/{doc_id}/shares/{share_id}",
+    "/api/docs/{doc_id}/tasks/{item_index}",
+    // Comments and suggestions of a page: same doc ACL.
+    "/api/docs/{id}/comments",
+    "/api/docs/{id}/comments/{thread_id}/replies",
+    "/api/docs/{id}/comments/{thread_id}/resolve",
+    "/api/docs/{id}/comments/{thread_id}/unresolve",
+    "/api/docs/{id}/comments/{comment_id}/reactions",
+    "/api/docs/{id}/comments/{comment_id}/reactions/{emoji}",
+    "/api/docs/{id}/comments/{comment_id}",
+    "/api/docs/{id}/suggestions",
+    "/api/docs/{id}/suggestions/{suggestion_id}/accept",
+    "/api/docs/{id}/suggestions/{suggestion_id}/reject",
+    "/api/docs/{id}/suggestions/{suggestion_id}/withdraw",
+    "/api/docs/{id}/suggestions/{suggestion_id}/replies",
+    "/api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id}",
+    // Blobs, boards and short links resolve to their page's ACL.
+    "/api/docs/{doc_id}/blobs",
+    "/api/blobs/{id}",
+    "/api/docs/{doc_id}/boards",
+    "/api/boards/{id}",
+    "/api/boards/{id}/svg",
+    "/api/short-links/{code}",
+    // Filtered by Visibility or the doc ACL; every row has a doc.
+    "/api/docs",
+    "/api/search",
+    "/api/workspace/tasks",
+    // Workspace id, slug, name, role, retention: no page content.
+    "/api/workspace",
+    // Key management is SESSION_ONLY anyway; the handlers refuse keys.
+    "/api/auth/api-keys",
+    "/api/auth/api-keys/{id}",
+    // No page content.
+    "/api/version",
+    "/api/release-notes",
+    "/api/whats-new",
+    "/api/healthz",
+    "/api/readyz",
+];
+
+/// The answer to a subtree key on a workspace-wide route or destination.
+pub fn subtree_denied() -> Response {
+    json_err(
+        StatusCode::FORBIDDEN,
+        "api_key.subtree_denied",
+        "this API key is limited to one page and its subpages",
+    )
+}
 
 /// POST routes that are not creates, keyed by the exact axum `MatchedPath`.
 /// The ONLY place scope exceptions live.
@@ -161,6 +261,20 @@ pub async fn scope_mw(req: Request<Body>, next: Next) -> Response {
             "api_key.session_required",
             "this route needs a signed-in session, not an API key",
         );
+    }
+    let has_root = req
+        .extensions()
+        .get::<AuthContext>()
+        .is_some_and(|ctx| ctx.root_doc_id.is_some());
+    if has_root && matched.is_some_and(|m| SUBTREE_DENIED.contains(&m)) {
+        tracing::info!(
+            %key_id,
+            %method,
+            %route,
+            required = %"subtree",
+            "api key refused outside its subtree"
+        );
+        return subtree_denied();
     }
     // Without a MatchedPath (no route matched) the override table cannot
     // apply, so only the method default counts.
@@ -354,6 +468,56 @@ mod tests {
     fn every_override_row_is_covered_by_a_test_above() {
         // Guards against adding a row without its dedicated test.
         assert_eq!(OVERRIDES.len(), 14);
+    }
+
+    #[test]
+    fn subtree_tables_have_their_rows() {
+        assert_eq!(SUBTREE_DENIED.len(), 10);
+        assert!(SUBTREE_DENIED.iter().all(|p| !SUBTREE_OK.contains(p)));
+    }
+
+    /// S10: every `/api` route is classified for subtree keys. A new route
+    /// fails here until it is added to SUBTREE_DENIED or SUBTREE_OK.
+    #[test]
+    fn every_api_route_is_classified_for_subtree_keys() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut routes = Vec::new();
+        collect_route_paths(&src, &mut routes);
+        assert!(routes.len() > 40, "route scan found too little: {routes:?}");
+        let unclassified: Vec<_> = routes
+            .iter()
+            .filter(|p| !SUBTREE_DENIED.contains(&p.as_str()) && !SUBTREE_OK.contains(&p.as_str()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "classify for subtree keys: {unclassified:?}"
+        );
+    }
+
+    /// The first string argument of every `.route(` call under `dir`, when
+    /// it starts with `/api/`.
+    fn collect_route_paths(dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_route_paths(&path, out);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (at, _) in text.match_indices(".route(") {
+                let rest = text[at + ".route(".len()..].trim_start();
+                let Some(rest) = rest.strip_prefix('"') else {
+                    continue;
+                };
+                let literal = &rest[..rest.find('"').unwrap()];
+                if literal.starts_with("/api/") && !out.iter().any(|p| p == literal) {
+                    out.push(literal.to_string());
+                }
+            }
+        }
     }
 
     #[test]

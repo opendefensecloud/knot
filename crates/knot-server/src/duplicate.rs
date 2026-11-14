@@ -242,6 +242,12 @@ pub async fn check(
         Some(parent_id) => crate::restricted::require_editable_parent(state, ctx, parent_id)
             .await
             .map_err(DuplicateError::Destination)?,
+        // S10: a top-level page is outside every subtree.
+        None if ctx.root_doc_id.is_some() => {
+            return Err(DuplicateError::Destination(
+                crate::auth::scope::subtree_denied(),
+            ));
+        }
         None if ctx.role == WorkspaceRole::Viewer => return Err(DuplicateError::EditorRequired),
         None => {}
     }

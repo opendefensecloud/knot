@@ -313,6 +313,8 @@ async fn require_editable_destination(
 ) -> Result<(), Response> {
     match parent_id {
         Some(parent_id) => crate::restricted::require_editable_parent(state, ctx, parent_id).await,
+        // S10: a top-level page is outside every subtree.
+        None if ctx.root_doc_id.is_some() => Err(crate::auth::scope::subtree_denied()),
         None if ctx.role == WorkspaceRole::Viewer => {
             Err(json_err(StatusCode::FORBIDDEN, "acl.editor_required", ""))
         }
