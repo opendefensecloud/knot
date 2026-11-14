@@ -83,6 +83,32 @@ pub const VIEW_MEMORY_FACTOR: u64 = 360;
 /// `RESTORE_TIMEOUT` − 5 s.
 pub const PLAIN_MEMORY_FACTOR: u64 = 40;
 
+/// The memory factor of a view or restore of a baseline that may be
+/// shifted (M1.4 Task 8's measurement, workload 7's (h) and (i)): its
+/// bytes are cut to their trusted prefix first ([`state_input`]), which
+/// builds a skip-GC scratch doc and a fresh GC doc of its own before the
+/// render builds one. On workload 6's 4 MiB typing page with the knot-crdt
+/// fix's overlapping Skips merged into it as yrs encodes them (4.18 MiB),
+/// the view and the restore (the replay, `encode_state` and the Markdown
+/// round trip) each measured 43.40, against 39.1 for the same page's
+/// unshifted state; rounded up, 44. Only `baseline` entries pay it (the
+/// rollout entry and every window keep the plain cap):
+/// [`baseline_max_input_bytes`].
+pub const SHIFTED_MEMORY_FACTOR: u64 = 44;
+
+/// The largest baseline state a view or restore of a `baseline` entry may
+/// load, given the plain cap: `max_plain_input_bytes ×
+/// max(PLAIN_MEMORY_FACTOR, BUILD_MEMORY_FACTOR) /
+/// max(SHIFTED_MEMORY_FACTOR, BUILD_MEMORY_FACTOR)`, so cutting a shifted
+/// baseline to its prefix stays within the builder's memory rule. 3.81 MiB
+/// at the default 4 MiB replay cap.
+pub fn baseline_max_input_bytes(max_plain_input_bytes: i64) -> i64 {
+    let cap = i128::from(max_plain_input_bytes)
+        * i128::from(PLAIN_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR))
+        / i128::from(SHIFTED_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR));
+    i64::try_from(cap).unwrap_or(i64::MAX)
+}
+
 /// The largest replay input a view may load (the diff cap with `changes`,
 /// the plain cap without): `replay_max_bytes × BUILD_MEMORY_FACTOR /
 /// max(F, BUILD_MEMORY_FACTOR)` with F = [`VIEW_MEMORY_FACTOR`] or
@@ -105,7 +131,8 @@ pub fn view_max_input_bytes(replay_max_bytes: u64, changes: bool) -> i64 {
 // add an allocation.
 #[allow(clippy::large_enum_variant)]
 pub enum ViewInput {
-    /// A baseline's state, rendered as it is.
+    /// A baseline's state, rendered from [`state_input`] (its trusted
+    /// prefix when it may be shifted).
     State(Vec<u8>),
     /// An entry's window: the checkpoint at or before its start, the rows
     /// through its end.
@@ -197,7 +224,8 @@ impl StageCell {
 }
 
 /// Renders `input`, publishing its stage through `stage`. A
-/// [`ViewInput::State`] renders plain (`changes` is ignored). A
+/// [`ViewInput::State`] renders plain from [`state_input`] (`changes` is
+/// ignored). A
 /// [`ViewInput::Window`] is replayed with its own `progress`; with
 /// `changes` (the entry's insert and delete sets) the diff step
 /// ([`entry_diff`], then [`pm_json_diff`]) runs under `catch_unwind`, and
@@ -214,6 +242,7 @@ pub fn render_staged(
     stage.set(RenderStage::Replay);
     let window = match input {
         ViewInput::State(bytes) => {
+            let bytes = owned_state_input(bytes)?;
             let r = Replayer::from_state(ReplayMode::KeepDeleted, &bytes)
                 .map_err(|e| RenderError::State(e.to_string()))?;
             stage.set(RenderStage::Plain);
@@ -258,6 +287,36 @@ pub fn render_staged(
             ))
         }
     }
+}
+
+/// The state a baseline is viewed and restored from: when the bytes
+/// [`may_be_shifted`](crate::replay::may_be_shifted) (a baseline a room
+/// wrote before the knot-crdt fix), their
+/// [`trusted_prefix`](crate::replay::trusted_prefix), else the bytes as
+/// they are. Runs on the replay thread, in stage [`RenderStage::Replay`];
+/// it returns bytes only, so every doc the two checks build is dropped
+/// before the render builds its own.
+pub fn state_input(bytes: &[u8]) -> Result<Vec<u8>, RenderError> {
+    Ok(shifted_prefix(bytes)?.unwrap_or_else(|| bytes.to_vec()))
+}
+
+/// [`state_input`] for a caller that owns the bytes: they come back as
+/// they are, not copied, when they cannot be shifted (a copy of a 4 MiB
+/// state would add 1 to the plain view's memory factor), and are dropped
+/// once the prefix replaces them.
+fn owned_state_input(bytes: Vec<u8>) -> Result<Vec<u8>, RenderError> {
+    Ok(shifted_prefix(&bytes)?.unwrap_or(bytes))
+}
+
+/// The trusted prefix of `bytes` when they may be shifted; `None` when
+/// they cannot be.
+fn shifted_prefix(bytes: &[u8]) -> Result<Option<Vec<u8>>, RenderError> {
+    if !crate::replay::may_be_shifted(bytes) {
+        return Ok(None);
+    }
+    crate::replay::trusted_prefix(bytes)
+        .map(Some)
+        .ok_or_else(|| RenderError::State("the baseline's trusted prefix does not decode".into()))
 }
 
 fn plain(h: &yrs::Doc, diff_error: Option<String>) -> Rendered {
@@ -325,7 +384,8 @@ pub fn merge_gap_at_end(kind: EntryKind, meta: &Value, end_rev: i64) -> bool {
 pub struct ViewLimits {
     /// A `changes=1` view tries the diff only up to this input.
     pub max_changes_input_bytes: i64,
-    /// Every view and restore answers `TooLarge` above this input.
+    /// Every view and restore answers `TooLarge` above this input (a
+    /// `baseline` entry above [`baseline_max_input_bytes`] of it).
     pub max_plain_input_bytes: i64,
     pub permit_wait: Duration,
     pub timeout: Duration,
@@ -853,6 +913,7 @@ impl Views {
                 move |input| {
                     let replayer = match input {
                         ViewInput::State(bytes) => {
+                            let bytes = owned_state_input(bytes).map_err(|e| e.to_string())?;
                             Replayer::from_state(ReplayMode::KeepDeleted, &bytes)
                                 .map_err(|e| format!("the state does not apply: {e}"))?
                         }
@@ -888,15 +949,25 @@ impl Views {
         Ok(entry)
     }
 
-    /// The entry's replay input size, within the plain cap.
+    /// The entry's replay input size, within its cap.
     async fn input_bytes(&self, entry: &ViewEntry) -> Result<i64, ViewError> {
         match store::view_input_bytes(&self.pool, entry)
             .await
             .map_err(store_error)?
         {
             None => Err(ViewError::NotFound),
-            Some(n) if n > self.limits.max_plain_input_bytes => Err(ViewError::TooLarge),
+            Some(n) if n > self.max_input_bytes(entry) => Err(ViewError::TooLarge),
             Some(n) => Ok(n),
+        }
+    }
+
+    /// The plain cap, or for a baseline's state (cut to its trusted prefix
+    /// when it may be shifted) the lower [`baseline_max_input_bytes`].
+    fn max_input_bytes(&self, entry: &ViewEntry) -> i64 {
+        if entry.kind == EntryKind::Baseline && entry.baseline_id.is_some() {
+            baseline_max_input_bytes(self.limits.max_plain_input_bytes)
+        } else {
+            self.limits.max_plain_input_bytes
         }
     }
 
@@ -958,7 +1029,7 @@ impl Views {
             &self.pool,
             entry.doc_id,
             entry.id,
-            self.limits.max_plain_input_bytes,
+            self.max_input_bytes(entry),
         )
         .await
         .map_err(store_error)?
@@ -1086,9 +1157,20 @@ mod tests {
         assert!(plain <= i64::try_from(cap).unwrap());
         assert!(diff <= i64::try_from(cap).unwrap());
         // `workers × F × cap` stays what the builder's F allows.
-        for (f, c) in [(VIEW_MEMORY_FACTOR, diff), (PLAIN_MEMORY_FACTOR, plain)] {
+        let baseline = baseline_max_input_bytes(plain);
+        assert_eq!(baseline, 3_813_003, "4 MiB × 40 / 44");
+        assert!(baseline <= plain);
+        for (f, c) in [
+            (VIEW_MEMORY_FACTOR, diff),
+            (PLAIN_MEMORY_FACTOR, plain),
+            (SHIFTED_MEMORY_FACTOR, baseline),
+        ] {
             assert!(u64::try_from(c).unwrap() * f.max(BUILD_MEMORY_FACTOR) <= cap * 40);
         }
+        assert_eq!(
+            i128::from(baseline_max_input_bytes(i64::MAX)),
+            i128::from(i64::MAX) * 40 / 44
+        );
         // A cap too large for the arithmetic saturates instead of wrapping.
         assert_eq!(view_max_input_bytes(u64::MAX, false), i64::MAX);
         assert!(view_max_input_bytes(u64::MAX, true) > 0);

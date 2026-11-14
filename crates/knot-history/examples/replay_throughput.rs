@@ -48,7 +48,9 @@
 //!    a page whose every other word is bold. Each view's span includes the
 //!    JSON's serialization. They set `view::VIEW_MEMORY_FACTOR` and
 //!    `view::PLAIN_MEMORY_FACTOR`, and time the Show changes views on a
-//!    page of the diff cap's size.
+//!    page of the diff cap's size. Then (M1.4, Task 8) a baseline that may
+//!    be shifted, near 4 MiB: (h) its view and (i) its restore, each
+//!    through `view::state_input`, summarized apart from the others.
 //!
 //! The cap rule: the largest power of two at most min(the slower of
 //! workloads 1-2 × 2 s, (512 MiB − 256 MiB) ÷ (1 worker × F)), at most
@@ -69,7 +71,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use knot_crdt::{Engine, YrsEngine};
 use knot_history::view::{
     BUILD_MEMORY_FACTOR, PLAIN_MEMORY_FACTOR, RenderHooks, VIEW_MEMORY_FACTOR, ViewInput, render,
-    view_max_input_bytes,
+    state_input, view_max_input_bytes,
 };
 use knot_history::{
     CHECKPOINT_FLOOR_BYTES, CheckpointKind, CheckpointWrite, Claims, EntryDraft, EntryKind,
@@ -1581,6 +1583,108 @@ fn view_factors() {
         } else {
             "does not hold"
         },
+    );
+    shifted_baseline();
+}
+
+/// (h) A view and (i) a restore of a baseline that may be shifted (M1.4,
+/// Task 8), kept out of [`view_factors`]' maxima: workload 6's typing page
+/// grown to 4 MiB, plus `fixtures::overlapping_skips_as`'s `t0`, `t2` and
+/// `t3` by a client of its own (`t1` and `t2b` withheld), so its pending
+/// update holds overlapping Skips, encoded as yrs encodes a full state
+/// (`encode_state_as_update_v1`, which merges the pending update in at a
+/// shifted clock): what a room wrote before the knot-crdt fix. Both cut it
+/// to its trusted prefix through `view::state_input` before they replay.
+fn shifted_baseline() {
+    let page = GrownPage::new(Growth::Typing, 4 * MIB);
+    let o = fixtures::overlapping_skips_as(0x7e57_0001);
+    let doc = Doc::new();
+    for u in [&page.checkpoint_state, &o.t0, &o.t2, &o.t3] {
+        apply(&doc, u);
+    }
+    drop(page);
+    let state = doc
+        .transact()
+        .encode_state_as_update_v1(&StateVector::default());
+    drop(doc);
+    assert!(
+        knot_history::replay::may_be_shifted(&state),
+        "the baseline may be shifted"
+    );
+    let bytes = state.len();
+    assert!(
+        bytes.abs_diff(4 * MIB) * 20 <= 4 * MIB,
+        "{bytes} bytes is not within 5 % of 4 MiB"
+    );
+
+    let input = state.clone();
+    let h = measure(|| {
+        let rendered =
+            render(ViewInput::State(input), None, RenderHooks::default()).expect("the render");
+        let json = serde_json::to_vec(&rendered.doc).expect("the JSON");
+        (rendered, json)
+    });
+    let h_json = h.value.1.len();
+    drop(h.value);
+    let h = ViewRun {
+        name: "(h) shifted baseline view",
+        input: bytes,
+        peak: h.peak,
+        secs: h.secs,
+    };
+    let input = state.clone();
+    let i = measure(|| {
+        // As `Views::restore_input` does: the prefix replaces the bytes.
+        let prefix = state_input(&input).expect("the prefix");
+        drop(input);
+        let state = Replayer::from_state(ReplayMode::KeepDeleted, &prefix)
+            .expect("the prefix applies")
+            .encode_state();
+        drop(prefix);
+        let engine = YrsEngine;
+        let doc = engine.new_doc();
+        engine
+            .apply_update(&doc, &state)
+            .expect("the state applies");
+        let markdown = to_markdown::serialise(&engine, &doc).expect("the Markdown");
+        let (_, update) = from_markdown::parse(&markdown).expect("the update");
+        (state, doc, markdown, update)
+    });
+    let (i_markdown, i_update) = (i.value.2.len(), i.value.3.len());
+    drop(i.value);
+    let i = ViewRun {
+        name: "(i) shifted baseline restore",
+        input: bytes,
+        peak: i.peak,
+        secs: i.secs,
+    };
+    drop(state);
+
+    println!(
+        "== 7. a shifted baseline's view and restore: {}, {:.2} MiB",
+        Growth::Typing.name(),
+        mib(bytes)
+    );
+    println!(
+        "  (h): JSON {:.2} MiB; (i) restore: Markdown {:.2} MiB, update {:.2} MiB",
+        mib(h_json),
+        mib(i_markdown),
+        mib(i_update)
+    );
+    for r in [&h, &i] {
+        println!(
+            "  {}: input {:.2} MiB, peak heap above start {:.2} MiB, F = (input + peak) / input {:.2}, {:.3} s",
+            r.name,
+            mib(r.input),
+            mib(r.peak),
+            r.factor(),
+            r.secs,
+        );
+    }
+    let f = h.factor().max(i.factor());
+    println!(
+        "  largest shifted-baseline F at 4 MiB {f:.2}, rounded up {}; PLAIN_MEMORY_FACTOR {PLAIN_MEMORY_FACTOR}",
+        f.ceil()
     );
 }
 

@@ -14,14 +14,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::db::{
-    Db, Entry, build_clean, db, limits, page_with_rows, state_of, typed, visible, with_paragraph,
+    Db, Entry, build_clean, db, insertions, limits, page_with_rows, state_of, typed, visible,
+    with_paragraph,
 };
 use common::metrics::CountingRecorder;
 use common::{Client, History, author};
 use knot_history::canonical::visible_content;
 use knot_history::{
     BUILDER_VERSION, EntryKind, HistoryPermits, ReplayMode, Replayer, VIEW_PERMIT_WAIT, ViewError,
-    ViewLimits, Views, history_permits, list_entries, merge_gap_at_end, pm_json,
+    ViewLimits, Views, history_permits, list_entries, merge_gap_at_end, pm_json, state_input,
 };
 use knot_storage::UpdateSource;
 use serde_json::{Value, json};
@@ -1573,4 +1574,382 @@ async fn restore_input_is_bounded_like_a_plain_view() {
     assert_eq!(count(&renders), before + 1);
     assert_eq!(outcome(&rec, "rendered"), 1);
     assert_eq!(views_counted(&rec), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Baselines that may be shifted, and pages lifted from version 1 (Task 8)
+// ---------------------------------------------------------------------------
+
+/// yrs's own full state of a doc that applied `updates` in order: what
+/// every room and every baseline held before the knot-crdt fix, shifted
+/// when the doc's pending update holds overlapping Skips.
+fn yrs_full_state(updates: &[&[u8]]) -> Vec<u8> {
+    use yrs::ReadTxn;
+    let doc = Doc::new();
+    for u in updates {
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(u).unwrap())
+            .unwrap();
+    }
+    doc.transact()
+        .encode_state_as_update_v1(&yrs::StateVector::default())
+}
+
+/// Whether every id of `a` is in `b`.
+fn within(a: &yrs::IdSet, b: &yrs::IdSet) -> bool {
+    !a.diff(b).iter().any(|(_, r)| !r.is_empty())
+}
+
+fn insertions_of_all(updates: &[&[u8]]) -> yrs::IdSet {
+    updates
+        .iter()
+        .fold(yrs::IdSet::new(), |acc, u| acc.merge(&insertions(u)))
+}
+
+/// pm_json of a fresh doc that applied `state`.
+fn applied(state: &[u8]) -> Value {
+    let d = Doc::new();
+    d.transact_mut()
+        .apply_update(Update::decode_v1(state).expect("the state decodes"))
+        .expect("the state applies");
+    pm_json(&d)
+}
+
+/// A legacy page (created a day before `history_since`) whose baseline is
+/// `baseline` and whose legacy rows are `rows`, an hour before
+/// `history_since`, a minute apart.
+async fn legacy_page_with_baseline(db: &Db, baseline: &[u8], rows: &[&[u8]]) -> Uuid {
+    let doc = db.page().await;
+    db.exec(
+        "UPDATE documents SET created_at = history_since - interval '1 day' WHERE id = $1",
+        doc,
+    )
+    .await;
+    let since = db.history_since(doc).await;
+    sqlx::query(
+        "INSERT INTO doc_history_baselines (doc_id, snapshot_seq, state_bytes, state_vector, created_at)
+         VALUES ($1, 3, $2, '\\x00', $3)",
+    )
+    .bind(doc)
+    .bind(baseline)
+    .bind(since - chrono::Duration::hours(2))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    for (i, u) in rows.iter().enumerate() {
+        db.insert_row(
+            doc,
+            None,
+            u,
+            None,
+            since - chrono::Duration::minutes(60 - i as i64),
+        )
+        .await;
+    }
+    doc
+}
+
+/// [`legacy_page_with_baseline`] as the knot-crdt fix's builder tests
+/// build it: the baseline is yrs's shifted full state after the fixture's
+/// `t0`, `t2` and `t3`, which are its legacy rows; returns the page, the
+/// baseline and the fixture.
+async fn page_with_a_shifted_baseline(
+    db: &Db,
+) -> (Uuid, Vec<u8>, common::fixtures::OverlappingSkips) {
+    let o = common::fixtures::overlapping_skips();
+    let parked: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let baseline = yrs_full_state(&parked);
+    let doc = legacy_page_with_baseline(db, &baseline, &parked).await;
+    (doc, baseline, o)
+}
+
+/// A transaction of client 3 on a doc holding `before`: `text` typed at
+/// `index` of paragraph 0. Unlike the builder test's helper, each edit
+/// continues client 3's clock (pass its earlier edits in `before`), so
+/// the second one is a real row, not a repeat of the first one's ids.
+fn edit_by_client_3(before: &[&[u8]], index: u32, text: &str) -> Vec<u8> {
+    let c = Doc::with_client_id(3);
+    for u in before {
+        c.transact_mut()
+            .apply_update(Update::decode_v1(u).unwrap())
+            .unwrap();
+    }
+    let frag = c.get_or_insert_xml_fragment("default");
+    let mut txn = c.transact_mut();
+    common::fixtures::text_at(&frag, &txn, 0)
+        .expect("paragraph 0")
+        .insert(&mut txn, index, text);
+    txn.encode_update_v1()
+}
+
+#[test]
+fn state_input_cuts_a_shifted_state_to_its_prefix() {
+    use knot_history::replay::{may_be_shifted, trusted_prefix};
+    let o = common::fixtures::overlapping_skips();
+    let shifted = yrs_full_state(&[&o.t0, &o.t2, &o.t3]);
+    assert!(
+        may_be_shifted(&shifted),
+        "fixture: the state may be shifted"
+    );
+    assert_eq!(
+        state_input(&shifted).unwrap(),
+        trusted_prefix(&shifted).unwrap()
+    );
+
+    let whole = yrs_full_state(&[&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3]);
+    assert!(!may_be_shifted(&whole));
+    assert_eq!(state_input(&whole).unwrap(), whole);
+    let (typed, _) = with_paragraph(5, &state_of([]), "plain");
+    assert_eq!(state_input(&typed).unwrap(), typed);
+}
+
+/// The plan's baseline (the fix's overlapping-Skips state) renders and
+/// restores the same from its raw bytes as from its prefix: a fresh doc
+/// parks every block past the gap, and the restore's encoding leaves
+/// pending content out. So the test also takes the fix's shifted state
+/// that parks nothing, whose raw bytes show the phantoms as text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_baseline_that_may_be_shifted_views_and_restores_from_its_prefix() {
+    use knot_history::replay::{may_be_shifted, trusted_prefix};
+    let db = db().await;
+    let (overlapping, overlapping_baseline, _) = page_with_a_shifted_baseline(&db).await;
+    let parks_nothing = common::fixtures::shifted_state_that_parks_nothing();
+    let row = common::fixtures::para(9, "legacy row");
+    let phantoms = legacy_page_with_baseline(&db, &parks_nothing, &[&row]).await;
+    assert_ne!(
+        replayed(&parks_nothing, &[]),
+        replayed(&trusted_prefix(&parks_nothing).unwrap(), &[]),
+        "fixture: the raw bytes show what the prefix leaves out"
+    );
+    let views = views_with(&db.pool, &history_permits(1), |_| {});
+
+    for (doc, baseline) in [
+        (overlapping, overlapping_baseline),
+        (phantoms, parks_nothing),
+    ] {
+        assert!(
+            may_be_shifted(&baseline),
+            "fixture: the baseline may be shifted"
+        );
+        let prefix = trusted_prefix(&baseline).expect("the prefix");
+        build_clean(&db.builder(limits()), doc).await;
+        let entry = db
+            .entries(doc)
+            .await
+            .into_iter()
+            .find(|e| e.kind == "baseline" && e.baseline_id.is_some())
+            .expect("the baseline's entry");
+
+        let v = views.view(anyone(), doc, entry.id, false).await.unwrap();
+        assert_eq!(json_of(&v), replayed(&prefix, &[]));
+        let r = views
+            .restore_input(anyone(), doc, entry.id, |bytes| Ok(bytes.to_vec()))
+            .await
+            .expect("the restore input");
+        let held = insertions(&r.value);
+        assert!(
+            within(&held, &insertions(&prefix)),
+            "the restore names {:?}",
+            held.diff(&insertions(&prefix))
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_lifted_from_version_1_views_no_phantom() {
+    use knot_history::replay::trusted_prefix;
+    let db = db().await;
+    let b = db.builder(limits());
+    let (doc, baseline, o) = page_with_a_shifted_baseline(&db).await;
+    let e4 = edit_by_client_3(&[&o.t0], 2, "four");
+    let e5 = edit_by_client_3(&[&o.t0, &e4], 1, "five");
+    assert_eq!(db.append(doc, 2, &e4).await, 4);
+    assert_eq!(db.append(doc, 2, &e5).await, 5);
+    let g = common::fixtures::para(9, "gap text");
+    let rows: [&[u8]; 5] = [&o.t0, &o.t2, &o.t3, &e4, &e5];
+    // A fixed room's snapshot at rev 5: the rows plus G.
+    let room: Vec<&[u8]> = rows.iter().copied().chain([g.as_slice()]).collect();
+    db.snapshot(doc, 5, &state_of(room)).await;
+    build_clean(&b, doc).await;
+
+    // What 0.9.14 wrote at rev 4: the baseline's raw bytes, rows 1-4 and G.
+    let v1_gap = {
+        let mut r = Replayer::new(ReplayMode::Gc);
+        r.merge_state(&baseline);
+        for u in &rows[..4] {
+            r.apply(u);
+        }
+        r.merge_state(&g);
+        r.encode_state()
+    };
+    let sv = Replayer::from_state(ReplayMode::Gc, &v1_gap)
+        .expect("the state applies")
+        .state_vector();
+    sqlx::query(
+        "INSERT INTO doc_history_checkpoints
+             (doc_id, rev, kind, state_bytes, state_vector, pending_revs, created_at)
+         VALUES ($1, 4, 'gap', $2, $3, '{}', now() - interval '1 day')
+         ON CONFLICT (doc_id, rev) DO UPDATE
+            SET kind = 'gap', state_bytes = EXCLUDED.state_bytes,
+                state_vector = EXCLUDED.state_vector, pending_revs = '{}',
+                created_at = EXCLUDED.created_at",
+    )
+    .bind(doc)
+    .bind(&v1_gap)
+    .bind(sv)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.exec(
+        "UPDATE doc_history_state SET builder_version = 1, rebuilds = 2 WHERE doc_id = $1",
+        doc,
+    )
+    .await;
+
+    // Version 1's entries: refused until the rebuild.
+    let views = views_with(&db.pool, &history_permits(1), |_| {});
+    let before = db.entries(doc).await;
+    assert!(!before.is_empty());
+    for e in &before {
+        assert!(
+            matches!(
+                views.view(anyone(), doc, e.id, false).await,
+                Err(ViewError::Rebuilding)
+            ),
+            "{e:?}"
+        );
+        assert!(
+            matches!(
+                views
+                    .restore_input(anyone(), doc, e.id, |b| Ok(b.len()))
+                    .await,
+                Err(ViewError::Rebuilding)
+            ),
+            "{e:?}"
+        );
+    }
+
+    build_clean(&b, doc).await;
+    assert_eq!(db.state(doc).await.builder_version, BUILDER_VERSION);
+    let entries = db.entries(doc).await;
+    assert!(
+        entries.iter().any(|e| e.kind == "session"
+            && e.start_rev.is_some_and(|s| s <= 4)
+            && e.end_rev.is_some_and(|e| e >= 5)),
+        "no session covers rows 4-5: {entries:#?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.kind == "gap" && e.end_rev == Some(5)),
+        "no gap entry at rev 5: {entries:#?}"
+    );
+
+    let allowed = insertions_of_all(&rows)
+        .merge(&insertions(&trusted_prefix(&baseline).expect("the prefix")))
+        .merge(&insertions(&g));
+    for e in &entries {
+        let r = views
+            .restore_input(anyone(), doc, e.id, |bytes| Ok(bytes.to_vec()))
+            .await
+            .unwrap_or_else(|err| panic!("{e:?}: {err:?}"));
+        let held = insertions(&r.value);
+        assert!(
+            within(&held, &allowed),
+            "the {} entry {:?}..{:?} restores {:?}",
+            e.kind,
+            e.start_rev,
+            e.end_rev,
+            held.diff(&allowed)
+        );
+        let v = views.view(anyone(), doc, e.id, false).await.unwrap();
+        assert_eq!(json_of(&v), applied(&r.value), "{e:?}");
+    }
+}
+
+/// The replay input of a session's window, as the views sum it: the
+/// latest checkpoint at or before `start_rev − 1`, the gap checkpoints
+/// after it and the rows (and its pending rows) through `end_rev`.
+async fn window_bytes(db: &Db, doc: Uuid, e: &Entry) -> i64 {
+    sqlx::query_scalar(
+        "WITH cp AS (
+             SELECT rev, octet_length(state_bytes)::bigint AS size, pending_revs
+               FROM doc_history_checkpoints WHERE doc_id = $1 AND rev <= $2 - 1
+              ORDER BY rev DESC LIMIT 1)
+         SELECT (cp.size
+                 + coalesce((SELECT sum(octet_length(c.state_bytes)) FROM doc_history_checkpoints c
+                              WHERE c.doc_id = $1 AND c.kind = 'gap'
+                                AND c.rev > cp.rev AND c.rev <= $3), 0)
+                 + coalesce((SELECT sum(octet_length(u.update_bytes)) FROM doc_updates u
+                              WHERE u.doc_id = $1
+                                AND ((u.rev > cp.rev AND u.rev <= $3) OR u.rev = ANY(cp.pending_revs))),
+                            0))::bigint
+           FROM cp",
+    )
+    .bind(doc)
+    .bind(e.start_rev.expect("a window"))
+    .bind(e.end_rev.expect("a window"))
+    .fetch_one(&db.pool)
+    .await
+    .expect("the window's size")
+}
+
+/// A baseline's state is cut to its trusted prefix before it is replayed,
+/// which costs more than a plain replay (`SHIFTED_MEMORY_FACTOR`), so a
+/// baseline gets a lower cap than the plain one; a window does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_baseline_over_the_shifted_cap_is_too_large() {
+    use knot_history::baseline_max_input_bytes;
+    let db = db().await;
+    let (doc, ids, _) = page_with_baselines(&db).await;
+    let baseline = db
+        .entries(doc)
+        .await
+        .into_iter()
+        .find(|e| e.baseline_id == Some(ids[1]))
+        .expect("the newer baseline's entry");
+    let b: i64 = sqlx::query_scalar(
+        "SELECT octet_length(state_bytes)::bigint FROM doc_history_baselines WHERE id = $1",
+    )
+    .bind(ids[1])
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let (other, s, _) = open_session_page(&db).await;
+    let w = window_bytes(&db, other, &s).await;
+    let permits = history_permits(1);
+    let len = |b: &[u8]| Ok(b.len());
+
+    // At a plain cap equal to its own size: between the two caps.
+    assert!(baseline_max_input_bytes(b) < b);
+    let at = views_with(&db.pool, &permits, |l| l.max_plain_input_bytes = b);
+    assert!(matches!(
+        at.view(anyone(), doc, baseline.id, false).await,
+        Err(ViewError::TooLarge)
+    ));
+    assert!(matches!(
+        at.restore_input(anyone(), doc, baseline.id, len).await,
+        Err(ViewError::TooLarge)
+    ));
+    // A window of the same size, relative to its cap, renders.
+    assert!(baseline_max_input_bytes(w) < w);
+    let at = views_with(&db.pool, &permits, |l| l.max_plain_input_bytes = w);
+    at.view(anyone(), other, s.id, false)
+        .await
+        .expect("the window renders");
+    at.restore_input(anyone(), other, s.id, len)
+        .await
+        .expect("the window restores");
+    // The baseline, once the plain cap leaves room for the shifted one.
+    let room = (b * 44 + 39) / 40;
+    assert!(baseline_max_input_bytes(room) >= b);
+    let above = views_with(&db.pool, &permits, |l| l.max_plain_input_bytes = room);
+    above
+        .view(anyone(), doc, baseline.id, false)
+        .await
+        .expect("the baseline renders");
+    above
+        .restore_input(anyone(), doc, baseline.id, len)
+        .await
+        .expect("the baseline restores");
 }

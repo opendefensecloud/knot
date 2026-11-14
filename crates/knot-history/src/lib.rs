@@ -90,9 +90,9 @@ pub use sizes::{
 };
 pub use view::{
     BUILD_MEMORY_FACTOR, PLAIN_MEMORY_FACTOR, PRINCIPAL_RENDERS, RESTORE_TIMEOUT, RenderError,
-    RenderHooks, RenderStage, Rendered, RenderedView, Restorable, StageCell, VIEW_CACHE_BYTES,
-    VIEW_CACHE_TTL, VIEW_MEMORY_FACTOR, VIEW_PERMIT_WAIT, VIEW_TIMEOUT, ViewError, ViewHooks,
-    ViewInput, ViewLimits, Views, merge_gap_at_end, render, render_staged, shows_changes,
-    view_max_input_bytes,
+    RenderHooks, RenderStage, Rendered, RenderedView, Restorable, SHIFTED_MEMORY_FACTOR, StageCell,
+    VIEW_CACHE_BYTES, VIEW_CACHE_TTL, VIEW_MEMORY_FACTOR, VIEW_PERMIT_WAIT, VIEW_TIMEOUT,
+    ViewError, ViewHooks, ViewInput, ViewLimits, Views, baseline_max_input_bytes, merge_gap_at_end,
+    render, render_staged, shows_changes, state_input, view_max_input_bytes,
 };
 pub use words::{WordCounts, count_words, entry_word_counts};

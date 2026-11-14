@@ -191,7 +191,7 @@ async fn run_server(cfg: Config) {
                     )
                     .with_dirty_tx(dirty_tx),
                 );
-                knot_crdt::spawn_gc(pool.clone(), snapshots);
+                knot_crdt::spawn_gc(pool.clone(), snapshots, knot_history::BUILDER_VERSION);
                 (
                     Some(bus),
                     Some(rooms),
