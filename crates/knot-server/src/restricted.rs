@@ -135,7 +135,7 @@ pub async fn ensure_creator_can_edit(
         })
         .collect();
     let can_write = |path: &[AclNode]| {
-        rule::access_along_path(path, &creator_grants, workspace_role)
+        rule::access_along_path(path, &creator_grants, workspace_role, None)
             .is_some_and(|access| access.can_write())
     };
     // An empty chain: the doc is gone already.

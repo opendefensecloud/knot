@@ -49,8 +49,9 @@ impl Visibility {
         nodes: &[AclNode],
         grants: &[PrincipalGrant],
         workspace_role: Option<WorkspaceRole>,
+        scope_root: Option<Uuid>,
     ) -> Self {
-        let access_by_doc = rule::compute_access(nodes, grants, workspace_role);
+        let access_by_doc = rule::compute_access(nodes, grants, workspace_role, scope_root);
         let hidden_ids = nodes
             .iter()
             .map(|node| node.id)
@@ -286,6 +287,7 @@ impl AclCache {
             &nodes,
             &principal_grants,
             workspace_role,
+            None,
         )))
     }
 

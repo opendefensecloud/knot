@@ -126,6 +126,7 @@ pub async fn resolve(
         &path,
         &principal_grants,
         workspace_role,
+        None,
     ))
 }
 
