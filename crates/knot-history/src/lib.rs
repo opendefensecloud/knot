@@ -17,8 +17,9 @@
 //! - [`mod@pm_json`]: a page as y-tiptap's ProseMirror JSON, what the history
 //!   viewer shows (M1.4), and an entry's "Show changes" render on its diff.
 //! - [`view`]: a past version rendered for the viewer (M1.4), plain or
-//!   with the entry's own changes, and the input caps that keep it within
-//!   the builder's memory rule.
+//!   with the entry's own changes, the input caps that keep it within the
+//!   builder's memory rule, and the `Views` service that loads, bounds,
+//!   renders and caches versions and loads a restore's state.
 //! - [`pass`]: one builder pass as pure compute (attribution, gap check,
 //!   checkpoints), and the window replay every other reader uses.
 //! - [`permits`]: the process's compute permits, shared by the builder and
@@ -86,5 +87,12 @@ pub use sessions::{
 };
 pub use sizes::{
     HISTORY_TABLES, SIZE_LOCK_KEY, SIZE_SAMPLE_EVERY, sample_table_sizes, spawn_size_sampler,
+};
+pub use view::{
+    BUILD_MEMORY_FACTOR, PLAIN_MEMORY_FACTOR, PRINCIPAL_RENDERS, RESTORE_TIMEOUT, RenderError,
+    RenderHooks, RenderStage, Rendered, RenderedView, Restorable, StageCell, VIEW_CACHE_BYTES,
+    VIEW_CACHE_TTL, VIEW_MEMORY_FACTOR, VIEW_PERMIT_WAIT, VIEW_TIMEOUT, ViewError, ViewHooks,
+    ViewInput, ViewLimits, Views, merge_gap_at_end, render, render_staged, shows_changes,
+    view_max_input_bytes,
 };
 pub use words::{WordCounts, count_words, entry_word_counts};

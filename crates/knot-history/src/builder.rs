@@ -35,7 +35,7 @@ use crate::permits::{ComputeGuard, HistoryPermits};
 use crate::replay::{ReplayError, ReplayMode};
 use crate::store::{
     self, Claim, FailureAction, GenesisLoaded, PassLimits, PassLoad, PassLoaded, PassWrite,
-    Recorded, WordsLoaded, Write,
+    Recorded, WindowLoaded, Write,
 };
 use crate::words::{WordCounts, entry_word_counts};
 
@@ -1256,11 +1256,17 @@ impl Run<'_> {
             )
             .await
             {
-                Ok(WordsLoaded::Load(l)) => l,
-                Ok(WordsLoaded::TooLarge) => {
+                Ok(WindowLoaded::Load(l)) => l,
+                Ok(WindowLoaded::TooLarge) => {
                     self.b.forget_words_wait(doc_id);
                     words_skipped("too_large");
                     continue;
+                }
+                // `load_words_inputs` answers a missing checkpoint as the
+                // error below; the arm only keeps the match exhaustive.
+                Ok(WindowLoaded::NoCheckpoint) => {
+                    let e = format!("no checkpoint at or before rev {}", entry.start_rev - 1);
+                    return Err(self.fail(Failure::plain(format!("words read: {e}"))).await);
                 }
                 Err(e) => return Err(self.fail(Failure::plain(format!("words read: {e}"))).await),
             };

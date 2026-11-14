@@ -26,8 +26,13 @@ use yrs::updates::encoder::Encode;
 use crate::builder::{BUILDER_VERSION, MAX_CRASHES, MAX_FAILURES, MAX_REBUILDS, MAX_TIMEOUTS};
 use crate::claims::{Claims, ClaimsError};
 use crate::genesis::{BaselineInput, GenesisOutput};
-use crate::pass::{CheckpointKind, CheckpointWrite, KeptGap, PassOutput, SnapshotProbe};
+use crate::pass::{
+    CheckpointKind, CheckpointWrite, KeptGap, PassOutput, Progress, ReplayHooks, SnapshotProbe,
+    WindowInput,
+};
+use crate::replay::ReplayMode;
 use crate::sessions::{EntryDraft, EntryKind, SEAL_MARGIN, SESSION_GAP};
+use crate::view::{ViewInput, merge_gap_at_end};
 use crate::words::WordCounts;
 
 type Tx = Transaction<'static, Postgres>;
@@ -1613,8 +1618,8 @@ pub(crate) async fn take_words_entry(
     Ok(Write::Done)
 }
 
-/// A word count's replay input.
-pub(crate) struct WordsLoad {
+/// A window's replay input: a word count's, or a view's.
+pub(crate) struct WindowLoad {
     pub checkpoint_state: Vec<u8>,
     pub reapply: Vec<DocUpdate>,
     pub rows: Vec<DocUpdate>,
@@ -1623,28 +1628,45 @@ pub(crate) struct WordsLoad {
     pub bytes: i64,
 }
 
-pub(crate) enum WordsLoaded {
+pub(crate) enum WindowLoaded {
     TooLarge,
-    Load(WordsLoad),
+    /// No checkpoint at or before `start_rev − 1` (a rebuild removed it).
+    NoCheckpoint,
+    Load(WindowLoad),
 }
 
-/// The replay input of the session `start_rev..=end_rev`'s word count: the
-/// latest checkpoint at or before `start_rev − 1`, the gap checkpoints
-/// after it through `end_rev`, its reapply rows and the rows through
-/// `end_rev`; sizes checked in SQL first.
+/// The replay input of the session `start_rev..=end_rev`'s word count (see
+/// [`load_window_inputs`]), in a read transaction of its own.
 pub(crate) async fn load_words_inputs(
     pool: &PgPool,
     doc_id: Uuid,
     start_rev: i64,
     end_rev: i64,
     cap: i64,
-) -> Result<WordsLoaded> {
+) -> Result<WindowLoaded> {
     let mut tx = begin_read(pool).await?;
-    let skip_revs: Vec<i64> =
-        sqlx::query_scalar("SELECT skip_revs FROM doc_history_state WHERE doc_id = $1")
-            .bind(doc_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let loaded = load_window_inputs(&mut tx, doc_id, start_rev, end_rev, cap).await?;
+    tx.commit().await?;
+    match loaded {
+        WindowLoaded::NoCheckpoint => Err(StoreError::Invalid(format!(
+            "no checkpoint at or before rev {}",
+            start_rev - 1
+        ))),
+        other => Ok(other),
+    }
+}
+
+/// The checkpoint a window `start_rev..=end_rev` starts from (the latest
+/// at or before `start_rev − 1`), its `pending_revs`, and the bytes the
+/// window's replay loads: the checkpoint, the gap checkpoints after it
+/// through `end_rev`, the reapply rows and the rows through `end_rev`.
+/// `None`: no such checkpoint.
+async fn window_size(
+    conn: &mut PgConnection,
+    doc_id: Uuid,
+    start_rev: i64,
+    end_rev: i64,
+) -> Result<Option<(i64, Vec<i64>, i64)>> {
     let cp: Option<(i64, i64, Vec<i64>)> = sqlx::query_as(
         "SELECT rev, octet_length(state_bytes)::bigint, pending_revs
            FROM doc_history_checkpoints WHERE doc_id = $1 AND rev <= $2
@@ -1652,13 +1674,10 @@ pub(crate) async fn load_words_inputs(
     )
     .bind(doc_id)
     .bind(start_rev - 1)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
     let Some((cp_rev, cp_size, pending_revs)) = cp else {
-        return Err(StoreError::Invalid(format!(
-            "no checkpoint at or before rev {}",
-            start_rev - 1
-        )));
+        return Ok(None);
     };
     let (gaps_size, rows_size): (i64, i64) = sqlx::query_as(
         "SELECT coalesce((SELECT sum(octet_length(state_bytes)) FROM doc_history_checkpoints
@@ -1671,18 +1690,45 @@ pub(crate) async fn load_words_inputs(
     .bind(cp_rev)
     .bind(end_rev)
     .bind(&pending_revs)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
-    let bytes = cp_size + gaps_size + rows_size;
+    Ok(Some((
+        cp_rev,
+        pending_revs,
+        cp_size + gaps_size + rows_size,
+    )))
+}
+
+/// The replay input of the window `start_rev..=end_rev`: the latest
+/// checkpoint at or before `start_rev − 1`, the gap checkpoints after it
+/// through `end_rev`, its reapply rows and the rows through `end_rev`;
+/// sizes checked in SQL first. Reads in the caller's transaction and
+/// never commits it.
+async fn load_window_inputs(
+    tx: &mut Tx,
+    doc_id: Uuid,
+    start_rev: i64,
+    end_rev: i64,
+    cap: i64,
+) -> Result<WindowLoaded> {
+    let skip_revs: Vec<i64> =
+        sqlx::query_scalar("SELECT skip_revs FROM doc_history_state WHERE doc_id = $1")
+            .bind(doc_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let Some((cp_rev, pending_revs, bytes)) = window_size(tx, doc_id, start_rev, end_rev).await?
+    else {
+        return Ok(WindowLoaded::NoCheckpoint);
+    };
     if bytes > cap {
-        return Ok(WordsLoaded::TooLarge);
+        return Ok(WindowLoaded::TooLarge);
     }
     let checkpoint_state: Vec<u8> = sqlx::query_scalar(
         "SELECT state_bytes FROM doc_history_checkpoints WHERE doc_id = $1 AND rev = $2",
     )
     .bind(doc_id)
     .bind(cp_rev)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     let gap_states: Vec<(i64, Vec<u8>)> = sqlx::query_as(
         "SELECT rev, state_bytes FROM doc_history_checkpoints
@@ -1691,14 +1737,13 @@ pub(crate) async fn load_words_inputs(
     .bind(doc_id)
     .bind(cp_rev)
     .bind(end_rev)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
-    let reapply = rows_at(&mut tx, doc_id, &pending_revs).await?;
-    let rows = rows_in_range(&mut tx, doc_id, cp_rev, Some(end_rev), i64::MAX, i64::MAX)
+    let reapply = rows_at(tx, doc_id, &pending_revs).await?;
+    let rows = rows_in_range(tx, doc_id, cp_rev, Some(end_rev), i64::MAX, i64::MAX)
         .await
         .map_err(updates_error)?;
-    tx.commit().await?;
-    Ok(WordsLoaded::Load(WordsLoad {
+    Ok(WindowLoaded::Load(WindowLoad {
         checkpoint_state,
         reapply,
         rows,
@@ -1706,6 +1751,400 @@ pub(crate) async fn load_words_inputs(
         skip_revs: skip_revs.into_iter().collect(),
         bytes,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Views (M1.4)
+// ---------------------------------------------------------------------------
+
+/// What a view needs of an entry before it loads anything: its cache key's
+/// inputs and the rules that answer without a replay.
+#[derive(Debug, Clone)]
+pub(crate) struct ViewEntry {
+    /// The request's page, never read back from a row.
+    pub doc_id: Uuid,
+    pub id: i64,
+    pub kind: EntryKind,
+    pub start_rev: Option<i64>,
+    pub end_rev: Option<i64>,
+    pub baseline_id: Option<i64>,
+    pub meta: Value,
+    pub ended_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub sealed: bool,
+    pub words_pending: bool,
+    pub words_added: Option<i32>,
+    /// A builder holds the page's lease.
+    pub leased: bool,
+    /// `doc_history_heads.content_epoch`, 0 without a heads row.
+    pub content_epoch: i32,
+    /// A baseline entry whose baseline is in `skip_baselines`.
+    pub skipped: bool,
+    /// The page's history was built by an older builder version.
+    pub stale: bool,
+}
+
+impl ViewEntry {
+    /// A sealed session whose word count the builder attempted and left
+    /// NULL while no builder holds the page (Rulings on skipping the diff,
+    /// (b): a count in progress is taken under a live lease).
+    pub fn count_failed(&self) -> bool {
+        self.kind == EntryKind::Session
+            && self.sealed
+            && !self.words_pending
+            && self.words_added.is_none()
+            && !self.leased
+    }
+}
+
+type ViewEntryCols = (
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Value,
+    DateTime<Utc>,
+    DateTime<Utc>,
+    bool,
+    bool,
+    Option<i32>,
+    bool,
+    i32,
+    bool,
+    bool,
+);
+
+/// The entry `$1` of page `$2`, with its page's lease, epoch, skipped
+/// baselines and builder version (`$3` = [`BUILDER_VERSION`]).
+const VIEW_ENTRY: &str = "SELECT e.kind, e.start_rev, e.end_rev, e.baseline_id, e.meta,
+            e.ended_at, e.updated_at, e.sealed, e.words_pending, e.words_added,
+            coalesce(s.claimed_until > now(), false),
+            coalesce(h.content_epoch, 0),
+            coalesce(e.baseline_id = ANY(s.skip_baselines), false),
+            coalesce(s.builder_version < $3, false)
+       FROM doc_history_entries e
+       LEFT JOIN doc_history_state s ON s.doc_id = $2
+       LEFT JOIN doc_history_heads h ON h.doc_id = $2
+      WHERE e.id = $1 AND e.doc_id = $2";
+
+/// [`VIEW_ENTRY`] with the entry's id sets.
+const VIEW_ENTRY_SETS: &str = "SELECT e.kind, e.start_rev, e.end_rev, e.baseline_id, e.meta,
+            e.ended_at, e.updated_at, e.sealed, e.words_pending, e.words_added,
+            coalesce(s.claimed_until > now(), false),
+            coalesce(h.content_epoch, 0),
+            coalesce(e.baseline_id = ANY(s.skip_baselines), false),
+            coalesce(s.builder_version < $3, false),
+            e.ins_ids, e.del_ids
+       FROM doc_history_entries e
+       LEFT JOIN doc_history_state s ON s.doc_id = $2
+       LEFT JOIN doc_history_heads h ON h.doc_id = $2
+      WHERE e.id = $1 AND e.doc_id = $2";
+
+fn view_entry(doc_id: Uuid, id: i64, c: ViewEntryCols) -> Result<ViewEntry> {
+    Ok(ViewEntry {
+        doc_id,
+        id,
+        kind: c
+            .0
+            .parse()
+            .map_err(|e: crate::sessions::UnknownEntryKind| StoreError::Invalid(e.to_string()))?,
+        start_rev: c.1,
+        end_rev: c.2,
+        baseline_id: c.3,
+        meta: c.4,
+        ended_at: c.5,
+        updated_at: c.6,
+        sealed: c.7,
+        words_pending: c.8,
+        words_added: c.9,
+        leased: c.10,
+        content_epoch: c.11,
+        skipped: c.12,
+        stale: c.13,
+    })
+}
+
+/// Entry `entry_id` of page `doc_id`; `None` when the page has no such
+/// entry.
+pub(crate) async fn load_view_entry(
+    pool: &PgPool,
+    doc_id: Uuid,
+    entry_id: i64,
+) -> Result<Option<ViewEntry>> {
+    let row: Option<ViewEntryCols> = sqlx::query_as(VIEW_ENTRY)
+        .bind(entry_id)
+        .bind(doc_id)
+        .bind(BUILDER_VERSION)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|c| view_entry(doc_id, entry_id, c)).transpose()
+}
+
+/// What an entry's view replays: a baseline's state, the page's genesis
+/// checkpoint (the rollout entry) or a window.
+enum ViewSource {
+    Baseline(i64),
+    Genesis,
+    Window { start_rev: i64, end_rev: i64 },
+}
+
+fn view_source(e: &ViewEntry) -> Result<ViewSource> {
+    match (e.kind, e.baseline_id, e.start_rev, e.end_rev) {
+        (EntryKind::Baseline, Some(id), _, _) => Ok(ViewSource::Baseline(id)),
+        (EntryKind::Baseline, None, _, _) => Ok(ViewSource::Genesis),
+        (_, _, Some(start_rev), Some(end_rev)) => Ok(ViewSource::Window { start_rev, end_rev }),
+        _ => Err(StoreError::Invalid(format!("entry {} has no revs", e.id))),
+    }
+}
+
+/// The genesis checkpoint's size with its `pending_revs` rows, and those
+/// revs; `None` without a genesis checkpoint.
+async fn genesis_size(conn: &mut PgConnection, doc_id: Uuid) -> Result<Option<(i64, Vec<i64>)>> {
+    let row: Option<(Vec<i64>, i64)> = sqlx::query_as(
+        "SELECT c.pending_revs,
+                (octet_length(c.state_bytes)
+                 + coalesce((SELECT sum(octet_length(u.update_bytes)) FROM doc_updates u
+                              WHERE u.doc_id = $1 AND u.rev = ANY(c.pending_revs)), 0))::bigint
+           FROM doc_history_checkpoints c WHERE c.doc_id = $1 AND c.kind = 'genesis'",
+    )
+    .bind(doc_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|(pending, size)| (size, pending)))
+}
+
+/// The `octet_length` sum of the entry's replay input, before any bytes
+/// are read; `None` when what it replays is gone (a rebuild removed it).
+pub(crate) async fn view_input_bytes(pool: &PgPool, e: &ViewEntry) -> Result<Option<i64>> {
+    let mut conn = pool.acquire().await?;
+    match view_source(e)? {
+        ViewSource::Baseline(id) => Ok(sqlx::query_scalar(
+            "SELECT octet_length(state_bytes)::bigint FROM doc_history_baselines
+              WHERE id = $1 AND doc_id = $2",
+        )
+        .bind(id)
+        .bind(e.doc_id)
+        .fetch_optional(&mut *conn)
+        .await?),
+        ViewSource::Genesis => Ok(genesis_size(&mut conn, e.doc_id)
+            .await?
+            .map(|(size, _)| size)),
+        ViewSource::Window { start_rev, end_rev } => {
+            Ok(window_size(&mut conn, e.doc_id, start_rev, end_rev)
+                .await?
+                .map(|(_, _, size)| size))
+        }
+    }
+}
+
+/// What [`load_view_input`] loaded.
+// One per render, moved into the replay thread; a box would only add an
+// allocation (as `ViewInput`).
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ViewLoaded {
+    /// The entry, or what it replays, is gone.
+    NotFound,
+    /// The page's history is an older builder version's now.
+    Stale,
+    /// Over the cap.
+    TooLarge,
+    /// The entry's baseline is in `skip_baselines` now.
+    Skipped,
+    Load {
+        input: ViewInput,
+        ins: IdSet,
+        del: IdSet,
+        /// The entry as read in the load's transaction.
+        entry: ViewEntry,
+    },
+}
+
+/// What a state load found.
+enum StateLoaded<T> {
+    Missing,
+    TooLarge,
+    Load(T),
+}
+
+/// A baseline's state, its size checked in SQL first.
+async fn load_baseline_state(
+    tx: &mut Tx,
+    doc_id: Uuid,
+    baseline_id: i64,
+    cap: i64,
+) -> Result<StateLoaded<Vec<u8>>> {
+    let size: Option<i64> = sqlx::query_scalar(
+        "SELECT octet_length(state_bytes)::bigint FROM doc_history_baselines
+          WHERE id = $1 AND doc_id = $2",
+    )
+    .bind(baseline_id)
+    .bind(doc_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match size {
+        None => return Ok(StateLoaded::Missing),
+        Some(size) if size > cap => return Ok(StateLoaded::TooLarge),
+        Some(_) => {}
+    }
+    let state: Vec<u8> = sqlx::query_scalar(
+        "SELECT state_bytes FROM doc_history_baselines WHERE id = $1 AND doc_id = $2",
+    )
+    .bind(baseline_id)
+    .bind(doc_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(StateLoaded::Load(state))
+}
+
+/// The genesis checkpoint's state, its `pending_revs` rows and its rev,
+/// the size of both checked in SQL first.
+async fn load_genesis_state(
+    tx: &mut Tx,
+    doc_id: Uuid,
+    cap: i64,
+) -> Result<StateLoaded<(Vec<u8>, Vec<DocUpdate>, i64)>> {
+    let Some((size, pending_revs)) = genesis_size(tx, doc_id).await? else {
+        return Ok(StateLoaded::Missing);
+    };
+    if size > cap {
+        return Ok(StateLoaded::TooLarge);
+    }
+    let (rev, state): (i64, Vec<u8>) = sqlx::query_as(
+        "SELECT rev, state_bytes FROM doc_history_checkpoints
+          WHERE doc_id = $1 AND kind = 'genesis'",
+    )
+    .bind(doc_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let reapply = rows_at(tx, doc_id, &pending_revs).await?;
+    Ok(StateLoaded::Load((state, reapply, rev)))
+}
+
+/// Entry `entry_id`'s replay input, in one read transaction committed
+/// before it returns: the entry read again (a page lifted to an older
+/// builder version since is [`ViewLoaded::Stale`], a baseline skipped
+/// since is [`ViewLoaded::Skipped`]), then its baseline's state, the
+/// genesis checkpoint with its pending rows (the rollout entry), or its
+/// window, each size checked against `cap` before any bytes are read.
+/// Whatever a rebuild removed since is [`ViewLoaded::NotFound`].
+pub(crate) async fn load_view_input(
+    pool: &PgPool,
+    doc_id: Uuid,
+    entry_id: i64,
+    cap: i64,
+) -> Result<ViewLoaded> {
+    type Cols = (
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Value,
+        DateTime<Utc>,
+        DateTime<Utc>,
+        bool,
+        bool,
+        Option<i32>,
+        bool,
+        i32,
+        bool,
+        bool,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    );
+    let mut tx = begin_read(pool).await?;
+    let row: Option<Cols> = sqlx::query_as(VIEW_ENTRY_SETS)
+        .bind(entry_id)
+        .bind(doc_id)
+        .bind(BUILDER_VERSION)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(c) = row else {
+        tx.commit().await?;
+        return Ok(ViewLoaded::NotFound);
+    };
+    let (ins, del) = (id_set(c.14.as_deref())?, id_set(c.15.as_deref())?);
+    let entry = view_entry(
+        doc_id,
+        entry_id,
+        (
+            c.0, c.1, c.2, c.3, c.4, c.5, c.6, c.7, c.8, c.9, c.10, c.11, c.12, c.13,
+        ),
+    )?;
+    if entry.stale {
+        tx.commit().await?;
+        return Ok(ViewLoaded::Stale);
+    }
+    if entry.skipped {
+        tx.commit().await?;
+        return Ok(ViewLoaded::Skipped);
+    }
+    let input = match view_source(&entry)? {
+        ViewSource::Baseline(id) => match load_baseline_state(&mut tx, doc_id, id, cap).await? {
+            StateLoaded::Missing => None,
+            StateLoaded::TooLarge => {
+                tx.commit().await?;
+                return Ok(ViewLoaded::TooLarge);
+            }
+            StateLoaded::Load(state) => Some(ViewInput::State(state)),
+        },
+        ViewSource::Genesis => match load_genesis_state(&mut tx, doc_id, cap).await? {
+            StateLoaded::Missing => None,
+            StateLoaded::TooLarge => {
+                tx.commit().await?;
+                return Ok(ViewLoaded::TooLarge);
+            }
+            StateLoaded::Load((checkpoint_state, reapply, rev)) => {
+                let skip_revs: Vec<i64> =
+                    sqlx::query_scalar("SELECT skip_revs FROM doc_history_state WHERE doc_id = $1")
+                        .bind(doc_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                Some(ViewInput::Window(WindowInput {
+                    mode: ReplayMode::KeepDeleted,
+                    checkpoint_state,
+                    reapply,
+                    rows: Vec::new(),
+                    gap_states: Vec::new(),
+                    skip_revs: skip_revs.into_iter().collect(),
+                    end_rev: rev,
+                    merge_gap_at_end: false,
+                    progress: Progress::default(),
+                    hooks: ReplayHooks::default(),
+                }))
+            }
+        },
+        ViewSource::Window { start_rev, end_rev } => {
+            match load_window_inputs(&mut tx, doc_id, start_rev, end_rev, cap).await? {
+                WindowLoaded::NoCheckpoint => None,
+                WindowLoaded::TooLarge => {
+                    tx.commit().await?;
+                    return Ok(ViewLoaded::TooLarge);
+                }
+                WindowLoaded::Load(l) => Some(ViewInput::Window(WindowInput {
+                    mode: ReplayMode::KeepDeleted,
+                    checkpoint_state: l.checkpoint_state,
+                    reapply: l.reapply,
+                    rows: l.rows,
+                    gap_states: l.gap_states,
+                    skip_revs: l.skip_revs,
+                    end_rev,
+                    merge_gap_at_end: merge_gap_at_end(entry.kind, &entry.meta, end_rev),
+                    progress: Progress::default(),
+                    hooks: ReplayHooks::default(),
+                })),
+            }
+        }
+    };
+    tx.commit().await?;
+    Ok(match input {
+        None => ViewLoaded::NotFound,
+        Some(input) => ViewLoaded::Load {
+            input,
+            ins,
+            del,
+            entry,
+        },
+    })
 }
 
 /// Stores an entry's word counts, under the lease.

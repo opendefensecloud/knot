@@ -145,7 +145,7 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     Ok(())
 }
 
-/// Page history (M1.2's log and M1.3's builder).
+/// Page history (M1.2's log, M1.3's builder and M1.4's views).
 fn describe_history_metrics() {
     describe_gauge!(
         "knot_history_table_bytes",
@@ -162,7 +162,7 @@ fn describe_history_metrics() {
     );
     describe_gauge!(
         "knot_history_replay_threads_stalled",
-        "Replay threads of this replica that timed out and still run, each holding a worker until it ends"
+        "Replay threads of this replica, the builder's and the history views', that timed out or whose view request was dropped and still run, each holding a worker until it ends"
     );
     describe_counter!(
         "knot_history_rows_built_total",
@@ -190,7 +190,7 @@ fn describe_history_metrics() {
     );
     describe_counter!(
         "knot_history_replay_timeouts_total",
-        "History replays that ran past their timeout, by phase (genesis|build|words)"
+        "History replays that ran past their timeout, by phase (genesis|build|words|view); view counts history views and restores, also those whose request was dropped before the timeout"
     );
     describe_counter!(
         "knot_history_pages_given_up_total",
@@ -208,6 +208,15 @@ fn describe_history_metrics() {
         "knot_history_replay_seconds",
         Unit::Seconds,
         "Compute time of one history replay, by phase (genesis|build|words)"
+    );
+    describe_counter!(
+        "knot_history_views_total",
+        "History version views, by outcome: cached (served from the view cache, or joined another request's render), rendered, diff_failed (rendered, but without changes because the diff step failed or panicked), no_changes (a Show changes request answered with the plain version without trying the diff: over the diff cap, the builder's word count failed, or an earlier diff of it timed out; cached or rendered), not_found, rebuilding (the page's history is an older builder's, until its rebuild), too_large, busy (no render slot or replay permit within the wait), failed (render, replay, panic, skipped baseline, earlier timeout, store error), timeout"
+    );
+    describe_histogram!(
+        "knot_history_view_seconds",
+        Unit::Seconds,
+        "Time from a history view's replay permit to its rendered body, on a cache miss"
     );
 }
 
@@ -280,26 +289,50 @@ mod tests {
         assert_eq!(normalize_addr("127.0.0.1:9090").unwrap(), "127.0.0.1:9090");
     }
 
-    /// Keeps every description: (name, kind, unit).
+    /// One description: (name, kind, unit, description).
+    type Described = (String, &'static str, Option<Unit>, String);
+
+    /// Keeps every description.
     #[derive(Default)]
-    struct Descriptions(Mutex<Vec<(String, &'static str, Option<Unit>)>>);
+    struct Descriptions(Mutex<Vec<Described>>);
 
     impl Descriptions {
-        fn push(&self, name: KeyName, kind: &'static str, unit: Option<Unit>) {
+        fn push(&self, name: KeyName, kind: &'static str, unit: Option<Unit>, text: SharedString) {
             let name = name.as_str().to_owned();
-            self.0.lock().unwrap().push((name, kind, unit));
+            let text = text.into_owned();
+            self.0.lock().unwrap().push((name, kind, unit, text));
+        }
+
+        /// The unit `name` was described with.
+        fn unit(&self, name: &str) -> Option<Unit> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(n, ..)| n == name)
+                .and_then(|(_, _, u, _)| *u)
+        }
+
+        /// The description `name` was described with.
+        fn description(&self, name: &str) -> Option<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(n, ..)| n == name)
+                .map(|(.., d)| d.clone())
         }
     }
 
     impl Recorder for Descriptions {
-        fn describe_counter(&self, name: KeyName, unit: Option<Unit>, _: SharedString) {
-            self.push(name, "counter", unit);
+        fn describe_counter(&self, name: KeyName, unit: Option<Unit>, text: SharedString) {
+            self.push(name, "counter", unit, text);
         }
-        fn describe_gauge(&self, name: KeyName, unit: Option<Unit>, _: SharedString) {
-            self.push(name, "gauge", unit);
+        fn describe_gauge(&self, name: KeyName, unit: Option<Unit>, text: SharedString) {
+            self.push(name, "gauge", unit, text);
         }
-        fn describe_histogram(&self, name: KeyName, unit: Option<Unit>, _: SharedString) {
-            self.push(name, "histogram", unit);
+        fn describe_histogram(&self, name: KeyName, unit: Option<Unit>, text: SharedString) {
+            self.push(name, "histogram", unit, text);
         }
         fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
             Counter::noop()
@@ -321,7 +354,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|(n, k, _)| (n.clone(), *k))
+            .map(|(n, k, ..)| (n.clone(), *k))
             .collect();
         got.sort();
         let mut want = vec![
@@ -340,21 +373,41 @@ mod tests {
             ("knot_history_words_skipped_total", "counter"),
             ("knot_history_legacy_mismatch_total", "counter"),
             ("knot_history_replay_seconds", "histogram"),
+            ("knot_history_views_total", "counter"),
+            ("knot_history_view_seconds", "histogram"),
         ];
         want.sort();
         let want: Vec<(String, &str)> = want.into_iter().map(|(n, k)| (n.to_owned(), k)).collect();
         assert_eq!(got, want);
 
-        let unit = |name: &str| {
-            rec.0
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|(n, _, _)| n == name)
-                .and_then(|(_, _, u)| *u)
-        };
-        assert_eq!(unit("knot_history_table_bytes"), Some(Unit::Bytes));
-        assert_eq!(unit("knot_history_replay_seconds"), Some(Unit::Seconds));
+        assert_eq!(rec.unit("knot_history_table_bytes"), Some(Unit::Bytes));
+        assert_eq!(rec.unit("knot_history_replay_seconds"), Some(Unit::Seconds));
+        assert_eq!(rec.unit("knot_history_view_seconds"), Some(Unit::Seconds));
+
+        // Every outcome the views record, named where operators read them.
+        let views = rec
+            .description("knot_history_views_total")
+            .expect("described");
+        for outcome in [
+            "cached",
+            "rendered",
+            "diff_failed",
+            "no_changes",
+            "not_found",
+            "rebuilding",
+            "too_large",
+            "busy",
+            "failed",
+            "timeout",
+        ] {
+            assert!(views.contains(outcome), "{outcome} missing: {views}");
+        }
+        let timeouts = rec
+            .description("knot_history_replay_timeouts_total")
+            .expect("described");
+        for phase in ["genesis", "build", "words", "view"] {
+            assert!(timeouts.contains(phase), "{phase} missing: {timeouts}");
+        }
     }
 
     #[test]
@@ -366,7 +419,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|(n, k, _)| (n.clone(), *k))
+            .map(|(n, k, ..)| (n.clone(), *k))
             .collect();
         got.sort();
         let mut want = vec![
@@ -381,14 +434,10 @@ mod tests {
         let want: Vec<(String, &str)> = want.into_iter().map(|(n, k)| (n.to_owned(), k)).collect();
         assert_eq!(got, want);
 
-        let unit = rec
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(n, _, _)| n == "knot_collab_throttle_wait_seconds")
-            .and_then(|(_, _, u)| *u);
-        assert_eq!(unit, Some(Unit::Seconds));
+        assert_eq!(
+            rec.unit("knot_collab_throttle_wait_seconds"),
+            Some(Unit::Seconds)
+        );
     }
 
     #[test]
@@ -400,7 +449,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|(n, k, _)| (n.clone(), *k))
+            .map(|(n, k, ..)| (n.clone(), *k))
             .collect();
         assert_eq!(
             got,
