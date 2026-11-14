@@ -9,6 +9,7 @@ import { ContextMenu, type ContextMenuItem } from "../../components/ContextMenu"
 import { IconButton } from "../../components/ui/IconButton";
 import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
+import { FAVORITES_KEY } from "../favorites/useFavorites";
 
 import { archiveConfirmText, archiveErrorText } from "./archive";
 import { docsApi } from "./docs.api";
@@ -152,12 +153,17 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
     notify("info", next ? "Saved as template" : "Removed from templates");
     await qc.invalidateQueries({ queryKey: ["docs"] });
     await qc.invalidateQueries({ queryKey: ["templates"] });
+    // The favorites list leaves templates out: a page that stops being one
+    // may be a favorite again.
+    await qc.invalidateQueries({ queryKey: FAVORITES_KEY });
   }
 
   const items: ContextMenuItem[] = [];
-  // For every role: it gives Viewers a row menu too.
-  if (canStar) {
-    items.push({ label: starLabel, testId: "ctx-favorite", disabled: !tree.favorites.ready, onSelect: toggleStar });
+  // For every role: it gives Viewers a row menu too. Only once favorites
+  // have loaded: until then (or if they fail to) a Viewer's menu would be
+  // one disabled item in place of the browser's own.
+  if (canStar && tree.favorites.ready) {
+    items.push({ label: starLabel, testId: "ctx-favorite", onSelect: toggleStar });
   }
   if (canEdit) {
     items.push({ label: "Rename", testId: "ctx-rename", onSelect: () => void onRename() });
@@ -307,23 +313,30 @@ export function TreeRow({ node, depth, tree }: { node: TreeNode; depth: number; 
         {canStar && (
           <IconButton
             data-testid={`tree-star-${node.id}`}
+            // The label names the action and so already says the state; no
+            // aria-pressed, which would contradict it ("Remove…, pressed").
             label={starLabel}
             size="sm"
-            active={starred}
             disabled={!tree.favorites.ready}
             // A starred row shows its star always; an unstarred one on
-            // hover, and when a keyboard user is on the row or the star.
+            // hover, when a keyboard user is on the row or the star, and
+            // always where there is no hover (an invisible star takes taps).
             className={`shrink-0 ${
               starred
                 ? "opacity-100"
-                : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
+                : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
             }`}
             onClick={(e) => {
               e.preventDefault();
               toggleStar();
             }}
           >
-            <Star size={14} aria-hidden fill={starred ? "currentColor" : "none"} />
+            <Star
+              size={14}
+              aria-hidden
+              fill={starred ? "currentColor" : "none"}
+              className={starred ? "text-accent" : undefined}
+            />
           </IconButton>
         )}
         {canEdit && (

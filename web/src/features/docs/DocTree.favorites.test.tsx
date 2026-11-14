@@ -48,10 +48,10 @@ function fav(id: string, title = id): Favorite {
 
 const DOCS = [doc("alpha", "Alpha", null), doc("beta", "Beta", null), doc("tpl", "Template", null, true)];
 
-type Opts = { role?: Role; favorites?: Favorite[]; favoritesGate?: Promise<unknown> };
+type Opts = { role?: Role; favorites?: Favorite[]; favoritesGate?: Promise<unknown>; favoritesStatus?: number };
 
 /** The session, workspace and docs list, plus a fake `/api/me/favorites`. */
-function server({ role = "viewer", favorites = [], favoritesGate }: Opts = {}) {
+function server({ role = "viewer", favorites = [], favoritesGate, favoritesStatus }: Opts = {}) {
   let list = [...favorites];
   return vi.fn((url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
@@ -63,7 +63,13 @@ function server({ role = "viewer", favorites = [], favoritesGate }: Opts = {}) {
     }
     if (url === "/api/docs") return json(DOCS);
     if (url === "/api/me/favorites" && method === "GET") {
+      if (favoritesStatus !== undefined) {
+        return json({ error: { code: "internal", message: "", details: {} } }, favoritesStatus);
+      }
       return (favoritesGate ?? Promise.resolve()).then(() => json(list));
+    }
+    if (/^\/api\/docs\/[^/]+\/template$/.test(url) && method === "POST") {
+      return Promise.resolve(new Response(null, { status: 204 }));
     }
     const m = /^\/api\/me\/favorites\/([^/]+)$/.exec(url);
     if (m && method === "PUT") {
@@ -106,7 +112,9 @@ describe("DocTree — favorites", () => {
     await screen.findByText("a@x.test");
     const star = await starReady("alpha");
     expect(star).toHaveAccessibleName("Add to favorites");
-    expect(star).toHaveAttribute("aria-pressed", "false");
+    // The label says what a press does; a pressed state on top would
+    // contradict it ("Remove from favorites, pressed").
+    expect(star).not.toHaveAttribute("aria-pressed");
     expect(screen.queryByRole("button", { name: "More" })).toBeNull();
 
     fireEvent.contextMenu(screen.getByTestId("doc-row-alpha"));
@@ -141,8 +149,8 @@ describe("DocTree — favorites", () => {
 
     expect(await screen.findByTestId("fav-row-beta")).toBeInTheDocument();
     expect(screen.getByTestId("fav-link-beta")).toHaveTextContent("Beta");
-    expect(star).toHaveAttribute("aria-pressed", "true");
     expect(star).toHaveAccessibleName("Remove from favorites");
+    expect(star).not.toHaveAttribute("aria-pressed");
     await waitFor(() =>
       expect(fetchMock.mock.calls.some(([u, i]) => u === "/api/me/favorites/beta" && i?.method === "PUT")).toBe(true),
     );
@@ -159,7 +167,7 @@ describe("DocTree — favorites", () => {
     fireEvent.click(item);
 
     await waitFor(() => expect(screen.queryByTestId("fav-row-alpha")).toBeNull());
-    expect(screen.getByTestId("tree-star-alpha")).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTestId("tree-star-alpha")).toHaveAccessibleName("Add to favorites");
   });
 
   it("star button is revealed on keyboard focus", async () => {
@@ -185,8 +193,69 @@ describe("DocTree — favorites", () => {
 
     const star = await screen.findByTestId("tree-star-alpha");
     expect(star).toBeDisabled();
+    // A Viewer's only item would be a disabled one: the browser's own menu
+    // opens instead.
+    const opened = fireEvent.contextMenu(screen.getByTestId("doc-row-alpha"));
+    expect(opened).toBe(true);
+    expect(screen.queryByTestId("context-menu")).toBeNull();
+  });
+
+  it("an editor's row menu leaves the favorites item out while favorites load", async () => {
+    const gate = new Promise<unknown>(() => {});
+    renderTree(server({ role: "editor", favoritesGate: gate }));
+    await screen.findByText("a@x.test");
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "More" }).length).toBeGreaterThan(0));
+
     fireEvent.contextMenu(screen.getByTestId("doc-row-alpha"));
-    expect(screen.getByTestId("ctx-favorite")).toBeDisabled();
+    expect(screen.getByTestId("ctx-rename")).toBeInTheDocument();
+    expect(screen.queryByTestId("ctx-favorite")).toBeNull();
+  });
+
+  it("a viewer keeps the browser's menu when favorites fail to load", async () => {
+    renderTree(server({ role: "viewer", favoritesStatus: 500 }));
+    await screen.findByText("a@x.test");
+    const star = await screen.findByTestId("tree-star-alpha");
+    expect(star).toBeDisabled();
+
+    const link = screen.getByTestId("doc-row-alpha");
+    expect(fireEvent.contextMenu(link)).toBe(true);
+    expect(fireEvent.keyDown(link, { key: "F10", shiftKey: true })).toBe(true);
+    expect(screen.queryByTestId("context-menu")).toBeNull();
+  });
+
+  it("star stays visible where there is no hover, so a tap never hits it unseen", async () => {
+    renderTree(server({ role: "viewer" }));
+    await screen.findByText("a@x.test");
+    const star = await starReady("alpha");
+    expect(star.className.split(/\s+/)).toContain("[@media(hover:none)]:opacity-100");
+  });
+
+  it("unstarring the only favorite by keyboard moves focus to its tree row", async () => {
+    renderTree(server({ role: "viewer", favorites: [fav("beta", "Beta")] }));
+    await screen.findByText("a@x.test");
+    const btn = await screen.findByTestId("fav-unstar-beta");
+    await waitFor(() => expect(screen.getByTestId("tree-star-beta")).not.toBeDisabled());
+
+    btn.focus();
+    fireEvent.click(btn);
+    await waitFor(() => expect(screen.queryByTestId("favorites")).toBeNull());
+    expect(document.activeElement).toBe(screen.getByTestId("doc-row-beta"));
+  });
+
+  it("removing a page from templates refetches favorites", async () => {
+    const fetchMock = server({ role: "owner" });
+    renderTree(fetchMock);
+    await screen.findByText("a@x.test");
+    await starReady("alpha");
+    const favGets = () =>
+      fetchMock.mock.calls.filter(([u, i]) => u === "/api/me/favorites" && (i?.method ?? "GET") === "GET").length;
+    const before = favGets();
+
+    fireEvent.contextMenu(screen.getByTestId("doc-row-tpl"));
+    fireEvent.click(screen.getByTestId("ctx-template"));
+
+    // The server may list a starred page again once it is not a template.
+    await waitFor(() => expect(favGets()).toBeGreaterThan(before));
   });
 
   it("offers no star on a template, which can't be a favorite", async () => {

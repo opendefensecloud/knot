@@ -232,4 +232,43 @@ describe("FavoritesSection", () => {
     expect(btn.className).toContain("group-focus-within:opacity-100");
     expect(btn.className).toContain("focus-visible:opacity-100");
   });
+
+  it("unstar button stays visible where there is no hover, so a tap never hits it unseen", async () => {
+    vi.stubGlobal("fetch", server([fav("a")]).fetch);
+    renderSection([doc("a", "Alpha")]);
+
+    const btn = await screen.findByTestId("fav-unstar-a");
+    expect(btn.className.split(/\s+/)).toContain("[@media(hover:none)]:opacity-100");
+  });
+
+  it("unstarring by keyboard moves focus to the next favorite", async () => {
+    vi.stubGlobal("fetch", server([fav("a"), fav("b"), fav("c")]).fetch);
+    renderSection([doc("a", "Alpha"), doc("b", "Beta"), doc("c", "Gamma")]);
+
+    const btn = await screen.findByTestId("fav-unstar-b");
+    btn.focus();
+    fireEvent.click(btn);
+    await waitFor(() => expect(screen.queryByTestId("fav-row-b")).toBeNull());
+    expect(document.activeElement).toBe(screen.getByTestId("fav-link-c"));
+  });
+
+  it("unstarring the last favorite by keyboard moves focus to the one before it", async () => {
+    vi.stubGlobal("fetch", server([fav("a"), fav("b")]).fetch);
+    renderSection([doc("a", "Alpha"), doc("b", "Beta")]);
+
+    const btn = await screen.findByTestId("fav-unstar-b");
+    btn.focus();
+    fireEvent.click(btn);
+    await waitFor(() => expect(screen.queryByTestId("fav-row-b")).toBeNull());
+    expect(document.activeElement).toBe(screen.getByTestId("fav-link-a"));
+  });
+
+  it("unstarring by mouse leaves focus alone", async () => {
+    vi.stubGlobal("fetch", server([fav("a"), fav("b")]).fetch);
+    renderSection([doc("a", "Alpha"), doc("b", "Beta")]);
+
+    fireEvent.click(await screen.findByTestId("fav-unstar-a"));
+    await waitFor(() => expect(screen.queryByTestId("fav-row-a")).toBeNull());
+    expect(document.activeElement).toBe(document.body);
+  });
 });

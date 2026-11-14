@@ -288,3 +288,35 @@ async fn concurrent_adds_get_distinct_sort_keys() {
         w.store.remove(w.alice, w.ws, w.d2).await.unwrap();
     }
 }
+
+/// The cascade from `documents` deletes `WHERE doc_id = ?` once per purged
+/// page; without an index leading with `doc_id` each one scans the table.
+#[tokio::test(flavor = "multi_thread")]
+async fn doc_id_has_a_leading_index_for_the_purge_cascade() {
+    let w = setup().await;
+    let defs: Vec<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes \
+         WHERE schemaname = current_schema() AND tablename = 'user_favorites'",
+    )
+    .fetch_all(&w.pool)
+    .await
+    .unwrap();
+    assert!(
+        defs.iter()
+            .any(|d| d.contains("(doc_id)") || d.contains("(doc_id,")),
+        "no index on user_favorites leads with doc_id: {defs:?}"
+    );
+}
+
+/// `add` runs inside an axum handler that is dropped when the client
+/// disconnects; a raw `pool.begin()` can then strand an open transaction on
+/// a pooled connection (see `knot_storage::begin`). Pin the safe helper.
+#[test]
+fn add_opens_its_transaction_with_the_cancellation_safe_begin() {
+    let src = include_str!("../src/favorites.rs");
+    assert!(
+        !src.contains(".begin()"),
+        "favorites.rs must use crate::begin, not pool.begin()"
+    );
+    assert!(src.contains("crate::begin(&self.pool)"));
+}

@@ -86,6 +86,8 @@ CREATE TABLE user_favorites (
 );
 CREATE INDEX user_favorites_user_ws_sort
     ON user_favorites (user_id, workspace_id, sort_key COLLATE "C");
+-- The documents cascade deletes WHERE doc_id = ? once per purged page.
+CREATE INDEX user_favorites_doc ON user_favorites (doc_id);
 ```
 
 - FKs to `documents`/`users` take their locks through `knot_lock_tables`
@@ -141,17 +143,23 @@ LimitReached` (append, idempotent, cap enforced in the same transaction);
     `knot.favoritesCollapsed` (try/catch, like `knot.sidebarWidth`).
   - Hidden entirely when the user has no visible favorites.
   - Rows: page icon + title link to `/doc/{id}`, selected style when open,
-    and an unstar button (filled star) on hover/focus.
+    and an unstar button (filled star) on hover/focus (always shown on
+    devices without hover). Unstarring by keyboard moves focus to the
+    next favorite, else the previous one, else the page's tree row.
   - Titles/icons come from joining favorite ids (in favorites order) with
     the `["docs"]` query data, so renames, archives and access changes
     show up whenever the tree refreshes; ids not in the docs list are
     skipped. Before `["docs"]` loads, the API's own titles are used.
 - **TreeRow star**: a star `IconButton` (`lucide-react` `Star`) for every
-  role. Outline, shown on hover/focus-within for unstarred rows; filled,
-  accent, always visible for starred rows. `aria-pressed`, label
-  "Add to favorites" / "Remove from favorites".
+  role. Outline, shown on hover/focus-within (and always on devices
+  without hover) for unstarred rows; filled, accent, always visible for
+  starred rows. Label "Add to favorites" / "Remove from favorites", no
+  `aria-pressed` (the label already names the action).
 - **Context menu**: "Add to favorites" / "Remove from favorites" item
-  (`ctx-favorite`) for every role, which also gives Viewers a row menu.
+  (`ctx-favorite`) for every role once favorites have loaded, which also
+  gives Viewers a row menu; before that it is left out.
+- Restoring a page or removing it from templates refetches
+  `["favorites"]`.
 - Test ids: `favorites` (section), `favorites-toggle`, `fav-row-{id}`,
   `fav-link-{id}`, `fav-unstar-{id}`, `tree-star-{id}`, `ctx-favorite`.
   No reuse of `doc-row-*`, `tree-row-*`, `tree-desc-*`.

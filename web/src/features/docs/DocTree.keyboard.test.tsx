@@ -232,8 +232,9 @@ describe("DocTree — moves from the row menu", () => {
     renderTree(server());
     await editorRows();
     const items = within(openMenu("beta")).getAllByRole("menuitem").map((b) => b.textContent);
+    // This server has no favorites, so the menu leaves "Add to favorites"
+    // out; DocTree.favorites.test.tsx pins that it comes first.
     expect(items).toEqual([
-      "Add to favorites",
       "Rename",
       "Duplicate…",
       "Move up",

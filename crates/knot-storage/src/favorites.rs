@@ -104,7 +104,7 @@ impl FavoriteStore for PgFavoriteStore {
     }
 
     async fn add(&self, user_id: Uuid, workspace_id: Uuid, doc_id: Uuid) -> Result<AddOutcome> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin(&self.pool).await?;
         // One writer per (user, workspace) list at a time: two concurrent
         // stars would otherwise read the same last key (and append the same
         // one), or both pass the cap check.

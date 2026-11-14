@@ -28,3 +28,6 @@ CREATE TABLE user_favorites (
 );
 CREATE INDEX user_favorites_user_ws_sort
     ON user_favorites (user_id, workspace_id, sort_key COLLATE "C");
+-- The documents FK cascade deletes `WHERE doc_id = ?` once per purged page;
+-- without this, each of those scans the table inside the purge transaction.
+CREATE INDEX user_favorites_doc ON user_favorites (doc_id);

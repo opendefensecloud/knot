@@ -1,5 +1,5 @@
 import { ChevronRight, FileText, Star } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 
 import { IconButton } from "../../components/ui/IconButton";
@@ -40,6 +40,28 @@ function openDocId(pathname: string): string | undefined {
 
 type Entry = { id: string; title: string; icon: string | null };
 
+/** Where focus goes when the focused unstar button's row is about to go:
+ *  the next favorite, else the one before it, else (the section goes too)
+ *  the page's own row in the tree, else the tree's first row. */
+function focusAfterUnstar(section: HTMLElement | null, entries: Entry[], id: string): HTMLElement | null {
+  const i = entries.findIndex((e) => e.id === id);
+  const neighbour = entries[i + 1] ?? entries[i - 1];
+  const link = (sel: string) => section?.querySelector<HTMLElement>(sel) ?? null;
+  if (neighbour) return link(`[data-testid="fav-link-${neighbour.id}"]`);
+  const tree = section?.closest<HTMLElement>('[data-testid="doc-tree"]') ?? null;
+  return (
+    tree?.querySelector<HTMLElement>(`[data-testid="doc-row-${id}"]`) ??
+    tree?.querySelector<HTMLElement>('[data-testid^="doc-row-"]') ??
+    null
+  );
+}
+
+/** Classes for a button shown only on hover or keyboard focus. Where there
+ *  is no hover (touch), it shows always: an invisible button still takes
+ *  taps. */
+const REVEAL_ON_HOVER =
+  "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100";
+
 /**
  * The user's favorite pages, above the sidebar's "Documents" header.
  *
@@ -57,6 +79,7 @@ export function FavoritesSection({ docs }: { docs: Doc[] | undefined }) {
   const { pathname } = useLocation();
   const openId = openDocId(pathname);
   const [collapsed, setCollapsed] = useState(readCollapsed);
+  const sectionRef = useRef<HTMLElement | null>(null);
 
   const entries = useMemo<Entry[]>(() => {
     if (!favorites) return [];
@@ -80,7 +103,7 @@ export function FavoritesSection({ docs }: { docs: Doc[] | undefined }) {
   }
 
   return (
-    <section data-testid="favorites" aria-labelledby="favorites-heading">
+    <section ref={sectionRef} data-testid="favorites" aria-labelledby="favorites-heading">
       <div className="px-3 pt-3 pb-1 flex items-center justify-between">
         <h3 id="favorites-heading" className="m-0 text-[11px] font-semibold uppercase tracking-wider text-fg-muted">
           Favorites
@@ -125,9 +148,14 @@ export function FavoritesSection({ docs }: { docs: Doc[] | undefined }) {
                   data-testid={`fav-unstar-${e.id}`}
                   label="Remove from favorites"
                   size="sm"
-                  className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
+                  className={REVEAL_ON_HOVER}
                   onClick={(ev) => {
                     ev.preventDefault();
+                    // The row goes at once: a keyboard user's focus would
+                    // drop to <body> with it. Move it first.
+                    if (document.activeElement === ev.currentTarget) {
+                      focusAfterUnstar(sectionRef.current, entries, e.id)?.focus();
+                    }
                     favs.toggle(e);
                   }}
                 >
