@@ -8,6 +8,56 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Upgrading
+- Upgrade from 0.9.13. One database migration runs on upgrade:
+  `20261114120000_user_favorites` creates the empty `user_favorites`
+  table, for favorites. Its foreign keys need a `SHARE ROW EXCLUSIVE`
+  lock on `documents`, `users` and `workspaces`, which it takes through
+  `knot_lock_tables`, in attempts that each wait at most 100 ms; once it
+  has them it creates the table and commits at once. Page writes
+  (creating, renaming, moving, archiving or purging pages, among others)
+  and changes to members and workspaces pause for those moments; page
+  loads go on. It gives up after 45 s instead of queueing writes behind a
+  long transaction; if it gives up, re-run the upgrade once that
+  transaction has finished. Pass `helm upgrade --timeout` of at least
+  3 minutes plus your rollout time. 0.9.13 pods that restart after it
+  commits crash-loop until new pods replace them, since they don't start
+  on a database with a migration they don't know.
+- Rolling back to 0.9.13 needs no database restore: run
+  `DROP TABLE user_favorites;` and
+  `DELETE FROM _sqlx_migrations WHERE version = 20261114120000;` in one
+  transaction, then roll back. Everyone's favorites are lost.
+
+### Added
+- Favorites: star the pages you use most and they stay one click away. A
+  star shows on a page in the sidebar when you point at it or reach it
+  with the keyboard, and the page's menu has "Add to favorites"; both are
+  there for everyone, Viewers included. Starred pages are listed in a
+  Favorites section at the top of the sidebar, above Documents, in the
+  order you starred them; click a star again, there or in the tree, to
+  remove one. The section can be collapsed and is hidden while you have
+  none. Favorites are yours alone and follow you to every browser:
+  nobody else sees them, and starring is not recorded in the page's audit
+  log. A page you can no longer open (its access changed, or it was
+  archived) leaves your list and comes back when you can open it again;
+  purging a page removes it for good. Templates can't be starred. You can
+  have up to 200 favorites in a workspace, counting those hidden from you.
+- `GET /api/me/favorites` lists your favorites in the workspace, oldest
+  star first, as `[{doc_id, title, icon, favorited_at}]`, leaving out
+  pages you can't read, archived pages and templates. API keys need the
+  `read` scope.
+- `PUT /api/me/favorites/{doc_id}` stars a page you can read → 204;
+  starring it again changes nothing. A page you can't read answers
+  `403 acl.no_grant`, like an unknown one; an archived page
+  `409 doc.archived` (`404 doc.not_found` for a Viewer); a template
+  `422 favorite.not_a_page`; the 201st favorite
+  `409 favorite.limit_reached` with `details.limit`. API keys need the
+  `update` scope.
+- `DELETE /api/me/favorites/{doc_id}` removes your star → 204, also when
+  there was none. It checks no access, so a page that was archived or
+  hidden from you can still be unstarred. API keys need the `delete`
+  scope.
+
 ## [0.9.13] - 2026-11-13
 
 A feature release: a per-page audit log that records every file export,
