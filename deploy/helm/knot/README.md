@@ -597,6 +597,14 @@ If the upgrade halts, `SELECT version FROM _sqlx_migrations WHERE version = 2026
 
 From this release every file export adds one `audit_events` row per exported page, and exports fail closed: see **Audit log** in [Operational notes](#operational-notes), and alert on `knot_audit_write_failures_total` before you upgrade.
 
+### Upgrading from 0.9.13
+
+Upgrade to 0.9.14 from 0.9.13; coming from an older release, upgrade to 0.9.13 first (see [Upgrading from 0.9.12](#upgrading-from-0912)). The `pre-upgrade` Job applies one migration, while 0.9.13 pods keep serving: `20261114120000_user_favorites` creates the empty `user_favorites` table for favorites, with two indexes, and copies or rewrites nothing.
+
+Its foreign keys need a `SHARE ROW EXCLUSIVE` lock on `documents`, `users` and `workspaces`. It takes them through `knot_lock_tables`, in attempts 0.5 s apart that each wait at most 100 ms, then creates the table and commits at once. Page writes (creating, renaming, moving, archiving or purging pages, among others) and changes to members and workspaces pause for those moments; edit saves, sign-ins and page loads go on. It gives up after 45 s rather than queueing writes behind a long transaction, so don't upgrade while `pg_dump` or another long transaction runs on the database. Pass `helm upgrade --timeout` of at least 3 minutes plus the time your rollout usually takes, as for 0.9.13.
+
+If the upgrade halts, `SELECT version FROM _sqlx_migrations WHERE version = 20261114120000` tells whether the migration committed. No row: nothing was applied and 0.9.13 keeps working; re-run the upgrade once the long transaction has finished. One row: re-run the upgrade now, since 0.9.13 pods that restart crash-loop on a database with a migration they don't know. Rolling back to 0.9.13 needs no database restore: in one transaction run `DROP TABLE user_favorites;` and `DELETE FROM _sqlx_migrations WHERE version = 20261114120000;`, then roll back. Everyone's favorites are lost.
+
 ## Operational notes
 
 - **Healthchecks** — readiness `/api/readyz`, liveness `/api/healthz`. Disable with `probes.enabled=false` if you want to debug a wedged pod.

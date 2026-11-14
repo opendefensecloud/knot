@@ -8,6 +8,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-11-14
+
+A feature release: favorites. Star the pages you use most and they are
+listed at the top of the sidebar. One small database migration runs on
+upgrade; read Upgrading first.
+
 ### Upgrading
 - Upgrade from 0.9.13. One database migration runs on upgrade:
   `20261114120000_user_favorites` creates the empty `user_favorites`
@@ -1709,7 +1715,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.13...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.14...HEAD
+[0.9.14]: https://github.com/opendefensecloud/knot/compare/v0.9.13...v0.9.14
 [0.9.13]: https://github.com/opendefensecloud/knot/compare/v0.9.12...v0.9.13
 [0.9.12]: https://github.com/opendefensecloud/knot/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/opendefensecloud/knot/compare/v0.9.10...v0.9.11
