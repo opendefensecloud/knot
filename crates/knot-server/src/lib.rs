@@ -54,6 +54,8 @@ pub mod static_files;
 pub(crate) mod suggestion_notifications;
 pub mod suggestions_sweep;
 mod ws_writer;
+#[doc(hidden)]
+pub use ws_writer::handshake_frames_queued;
 
 use auth::SessionDeps;
 

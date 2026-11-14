@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::underflow::skip_underflow_case;
+use common::fixtures::skip_underflow_case;
 use knot_history::{IsolateError, ReplayMode, Replayer, RowOutcome, run_isolated};
 use yrs::types::Attrs;
 use yrs::updates::decoder::Decode;
@@ -232,29 +232,6 @@ fn a_checkpoint_leaves_pending_content_to_the_rows_that_parked_it() {
     assert_eq!(state_vector_of(&again), state_vector_of(&r));
 }
 
-/// Client 1's transactions on one paragraph: "base" (t0), "WWW" after it
-/// (t1, withheld), "pp" after the "WWW" (t2, parks on t1), "zz" before
-/// "base" (t2b, withheld), then a new paragraph and "qq" inside the "WWW"
-/// (t3: the paragraph integrates past the gap t2b leaves, "qq" parks on
-/// t1).
-fn overlapping_skips_case() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let c = Doc::with_client_id(1);
-    let frag = c.get_or_insert_xml_fragment("default");
-    let t0 = txn_update(&c, |txn| {
-        let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
-        p.push_back(txn, XmlTextPrelim::new("base"));
-    });
-    let _t1 = txn_update(&c, |txn| text_of(&frag, txn, 0).insert(txn, 4, "WWW"));
-    let t2 = txn_update(&c, |txn| text_of(&frag, txn, 0).insert(txn, 7, "pp"));
-    let _t2b = txn_update(&c, |txn| text_of(&frag, txn, 0).insert(txn, 0, "zz"));
-    let t3 = txn_update(&c, |txn| {
-        let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
-        p.push_back(txn, XmlTextPrelim::new("new"));
-        text_of(&frag, txn, 0).insert(txn, 7, "qq");
-    });
-    (t0, t2, t3)
-}
-
 /// Why checkpoints leave pending content out: yrs 0.27.3 merges t3's
 /// parked remainder into the pending update without splitting its Skips,
 /// so the pending update holds overlapping Skips, and its v1 encoding (which
@@ -262,7 +239,7 @@ fn overlapping_skips_case() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 /// shifted clock: the full state names blocks the doc never had.
 #[test]
 fn a_pending_update_with_overlapping_skips_stays_out_of_the_checkpoint() {
-    let (t0, t2, t3) = overlapping_skips_case();
+    let fixtures::OverlappingSkips { t0, t2, t3, .. } = fixtures::overlapping_skips();
     let mut r = Replayer::new(ReplayMode::Gc);
     for u in [&t0, &t2, &t3] {
         applied(&mut r, u);
@@ -988,4 +965,72 @@ fn find_the_skip_underflow() {
         }
     }
     panic!("no panic in 2000 seeds");
+}
+
+// ---------------------------------------------------------------------------
+// Bytes that may be shifted (Rulings 13 and 15; knot-crdt's
+// `pending::may_be_shifted` and `pending::trusted_prefix`, ported)
+// ---------------------------------------------------------------------------
+
+/// yrs's own full state of a doc that applied `updates` in order.
+fn yrs_full_state(updates: &[&[u8]]) -> Vec<u8> {
+    let doc = Doc::new();
+    for u in updates {
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(u).unwrap())
+            .unwrap();
+    }
+    doc.transact()
+        .encode_state_as_update_v1(&StateVector::default())
+}
+
+#[test]
+fn may_be_shifted_flags_the_states_that_name_blocks_past_a_gap() {
+    use knot_history::replay::may_be_shifted;
+    let o = fixtures::overlapping_skips();
+    assert!(may_be_shifted(&yrs_full_state(&[&o.t0, &o.t2, &o.t3])));
+    // Text past a gap with nothing pending: the same test (Task 1's
+    // fallback: names alone), since it cannot be told from shifted blocks.
+    assert!(may_be_shifted(&yrs_full_state(&[&o.t0, &o.t3])));
+    assert!(may_be_shifted(&fixtures::shifted_state_that_parks_nothing()));
+    assert!(!may_be_shifted(&yrs_full_state(&[
+        &o.t0, &o.t1, &o.t2, &o.t2b, &o.t3
+    ])));
+    assert!(!may_be_shifted(b"not an update"));
+}
+
+#[test]
+fn the_trusted_prefix_holds_no_phantom_and_parks_nothing() {
+    use knot_history::replay::trusted_prefix;
+    let o = fixtures::overlapping_skips();
+    let parked: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let mut r = Replayer::new(ReplayMode::Gc);
+    for u in parked {
+        r.apply(u);
+    }
+    let held = insertions_of(&r.encode_state());
+    let prefix = trusted_prefix(&yrs_full_state(&parked)).expect("the prefix");
+    assert!(
+        !insertions_of(&prefix)
+            .diff(&held)
+            .iter()
+            .any(|(_, r)| !r.is_empty()),
+        "the prefix names a phantom"
+    );
+    let fresh = Replayer::from_state(ReplayMode::Gc, &prefix).expect("the prefix applies");
+    assert!(!fresh.has_pending());
+    assert!(!knot_history::replay::may_be_shifted(&prefix));
+    let text = |state: &[u8]| {
+        let r = Replayer::from_state(ReplayMode::Gc, state).unwrap();
+        let txn = r.doc().transact();
+        txn.get_xml_fragment("default")
+            .map(|f| f.get_string(&txn))
+            .unwrap_or_default()
+    };
+    assert!(text(&prefix).contains("base"));
+    // A state yrs refuses part way still has one.
+    let refused = trusted_prefix(&fixtures::shifted_state_yrs_refuses()).expect("the prefix");
+    assert!(insertions_of(&refused).iter().any(|(_, r)| !r.is_empty()));
+    assert!(!knot_history::replay::may_be_shifted(&refused));
+    assert!(trusted_prefix(b"not an update").is_none());
 }

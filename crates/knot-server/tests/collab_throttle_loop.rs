@@ -182,8 +182,9 @@ impl SnapshotStore for MemoryLogs {
         _stamp: SnapshotStamp,
         _state_bytes: &[u8],
         _state_vector: &[u8],
-    ) -> Result<(), SnapshotStoreError> {
-        Ok(())
+        _pending_revs: Option<&[i64]>,
+    ) -> Result<bool, SnapshotStoreError> {
+        Ok(true)
     }
 
     async fn latest(&self, _doc_id: Uuid) -> Result<Option<DocSnapshot>, SnapshotStoreError> {

@@ -221,6 +221,24 @@ pub trait UpdatesStore: Send + Sync + 'static {
         from: RowsAfter,
     ) -> Result<Vec<DocUpdate>, UpdatesStoreError>;
 
+    /// The page's rows at `revs`, in rev order. A rev the page has no row
+    /// at is left out. The default filters `rows_after(All)`; the Postgres
+    /// store reads only those rows.
+    async fn rows_at(
+        &self,
+        doc_id: Uuid,
+        revs: &[i64],
+    ) -> Result<Vec<DocUpdate>, UpdatesStoreError> {
+        let mut rows: Vec<DocUpdate> = self
+            .rows_after(doc_id, RowsAfter::All)
+            .await?
+            .into_iter()
+            .filter(|r| r.rev.is_some_and(|rev| revs.contains(&rev)))
+            .collect();
+        rows.sort_by_key(|r| r.rev);
+        Ok(rows)
+    }
+
     /// The page's heads row; all zero when it has none.
     async fn head(&self, doc_id: Uuid) -> Result<HistoryHead, UpdatesStoreError>;
 
@@ -638,6 +656,22 @@ impl UpdatesStore for PgUpdatesStore {
                 .await?
             }
         };
+        rows.into_iter().map(doc_update).collect()
+    }
+
+    async fn rows_at(
+        &self,
+        doc_id: Uuid,
+        revs: &[i64],
+    ) -> Result<Vec<DocUpdate>, UpdatesStoreError> {
+        let rows: Vec<UpdateRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {UPDATE_COLS} FROM doc_updates
+              WHERE doc_id = $1 AND rev = ANY($2) ORDER BY rev"
+        )))
+        .bind(doc_id)
+        .bind(revs)
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter().map(doc_update).collect()
     }
 
