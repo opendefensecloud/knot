@@ -1411,7 +1411,7 @@ async fn a_flagged_snapshot_boots_from_the_newest_trusted_one_and_keeps_its_text
         vec![RowsRead::After(RowsAfter::Rev(1)), RowsRead::At(vec![1])]
     );
 
-    // 0.9.13's GC deleted S1: the whole log over S2.
+    // 0.9.14's GC deleted S1: the whole log over S2.
     let store = rows();
     let boot = room_boot(&store).await;
     assert_eq!(fell_back(&boot), Some(("rollout", true, 0, true)));
@@ -1539,7 +1539,7 @@ async fn a_flagged_unshifted_snapshot_with_uncovered_pending_content_carries_it(
     assert!(read_only.carry.is_empty());
 }
 
-/// The rows and the flagged snapshot of a 0.9.13 room open across the
+/// The rows and the flagged snapshot of a 0.9.14 room open across the
 /// migration on a page whose pending update holds overlapping Skips.
 fn shifted_rollout_page() -> (MemStore, DocHandle, Vec<Vec<u8>>, Vec<u8>) {
     let o = overlapping_skips();

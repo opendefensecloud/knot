@@ -46,7 +46,7 @@ fn state_of(updates: &[&[u8]]) -> String {
 fn fixture() -> Value {
     let (u1, u2) = cross_client_parked();
     let o = overlapping_skips();
-    let (underflow_state, underflow_row, _) = skip_underflow_case();
+    let (underflow_state, underflow_row, underflow_author) = skip_underflow_case();
     json!({
         "crossClient": {
             "state": state_of(&[&u2]),
@@ -63,6 +63,9 @@ fn fixture() -> Value {
         "underflow": {
             "state": state_of(&[&underflow_state]),
             "frames": hexes(&[&underflow_row]),
+            // Client 2's full state: the page the row's author holds, which
+            // the joiner's doc must show once it took the row.
+            "expected": hex(&underflow_author),
         },
     })
 }

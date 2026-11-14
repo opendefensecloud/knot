@@ -672,7 +672,7 @@ pub(crate) async fn reset_for_rebuild(pool: &PgPool, doc_id: Uuid, me: Uuid) -> 
 /// `skip_snapshots`, in the caller's transaction (Ruling 14); returns
 /// whether it did.
 ///
-/// Version 1 (0.9.12 and 0.9.13) started genesis from a baseline's raw
+/// Version 1 (0.9.12 to 0.9.14) started genesis from a baseline's raw
 /// bytes, and a gap checkpoint is the whole replay state at its rev, so
 /// every gap checkpoint version 1 wrote can hold the phantoms of a shifted
 /// baseline, and one derived from a shifted room snapshot holds that
@@ -1775,6 +1775,12 @@ pub(crate) async fn write_words(
 /// whatever their dirty flag, unless claimed or backing off, after every
 /// dirty page (Ruling 14's version lift): the rebuild a `BUILDER_VERSION`
 /// bump asks for then runs at this loop's pace, not the sweep's.
+///
+/// Two arms, each limited, so the dirty arm keeps its partial index
+/// (`doc_history_heads_dirty_idx`) and the lift arm scans only
+/// `doc_history_state`, which matches nothing once the lift is done: one
+/// statement that ORs them joins every head to its state row on every
+/// tick. A page both arms return counts once, in the dirty order.
 pub(crate) async fn dirty_candidates(
     pool: &PgPool,
     exclude: &[Uuid],
@@ -1783,23 +1789,34 @@ pub(crate) async fn dirty_candidates(
     max_lag_revs: i64,
 ) -> Result<Vec<Uuid>> {
     Ok(sqlx::query_scalar(
-        "SELECT h.doc_id FROM doc_history_heads h
-           LEFT JOIN doc_history_state s USING (doc_id)
-          WHERE NOT h.doc_id = ANY($2)
-            AND ((h.dirty
-                  AND (s.doc_id IS NULL
-                       OR ((s.retry_after IS NULL OR s.retry_after <= now())
-                           AND (s.claimed_until IS NULL OR s.claimed_until < now())
-                           AND s.builder_version <= $1))
-                  AND (h.last_write_at < now() - make_interval(secs => $4)
-                       OR h.head_rev - coalesce(s.built_rev, 0) >= $5))
-                 OR (s.builder_version < $1
-                     AND (s.genesis_rev IS NOT NULL OR s.retry_after = 'infinity')
-                     AND (s.retry_after IS NULL OR s.retry_after <= now()
-                          OR s.retry_after = 'infinity')
-                     AND (s.claimed_until IS NULL OR s.claimed_until < now())))
-          ORDER BY h.dirty DESC, h.last_write_at
-          LIMIT $3",
+        "SELECT doc_id FROM (
+           (SELECT h.doc_id, h.dirty, h.last_write_at FROM doc_history_heads h
+              LEFT JOIN doc_history_state s USING (doc_id)
+             WHERE h.dirty
+               AND NOT h.doc_id = ANY($2)
+               AND (s.doc_id IS NULL
+                    OR ((s.retry_after IS NULL OR s.retry_after <= now())
+                        AND (s.claimed_until IS NULL OR s.claimed_until < now())
+                        AND s.builder_version <= $1))
+               AND (h.last_write_at < now() - make_interval(secs => $4)
+                    OR h.head_rev - coalesce(s.built_rev, 0) >= $5)
+             ORDER BY h.last_write_at
+             LIMIT $3)
+           UNION ALL
+           (SELECT h.doc_id, h.dirty, h.last_write_at FROM doc_history_state s
+              JOIN doc_history_heads h USING (doc_id)
+             WHERE s.builder_version < $1
+               AND NOT s.doc_id = ANY($2)
+               AND (s.genesis_rev IS NOT NULL OR s.retry_after = 'infinity')
+               AND (s.retry_after IS NULL OR s.retry_after <= now()
+                    OR s.retry_after = 'infinity')
+               AND (s.claimed_until IS NULL OR s.claimed_until < now())
+             ORDER BY h.dirty DESC, h.last_write_at
+             LIMIT $3)
+         ) c
+         GROUP BY doc_id
+         ORDER BY bool_or(dirty) DESC, min(last_write_at)
+         LIMIT $3",
     )
     .bind(BUILDER_VERSION)
     .bind(exclude)

@@ -267,6 +267,7 @@ describe("KnotProvider receives parked rows in the join handshake", () => {
     dependency?: string;
     dependencies?: string[];
     all?: string[];
+    expected?: string;
   };
   const cases = pendingHandshake as Record<"crossClient" | "overlapping" | "underflow", Case>;
 
@@ -366,8 +367,15 @@ describe("KnotProvider receives parked rows in the join handshake", () => {
   });
 
   it("takes a GC row after a state that holds blocks past a gap", () => {
-    const p = new KnotProvider({ url: "ws://127.0.0.1:1/never", doc: new Y.Doc() });
-    expect(() => feed(p, handshakeFrames(cases.underflow))).not.toThrow();
+    const c = cases.underflow;
+    const doc = new Y.Doc();
+    const p = new KnotProvider({ url: "ws://127.0.0.1:1/never", doc });
+    expect(() => feed(p, handshakeFrames(c))).not.toThrow();
+    // The page the row's author holds, with nothing left pending.
+    expect(doc.store.pendingStructs).toBeNull();
+    expect(doc.store.pendingDs).toBeNull();
+    expect(fragment(doc)).toBe(fragment(docOf([unhex(c.expected!)])));
+    expect(fragment(doc)).toContain("keep");
     p.destroy();
   });
 

@@ -3299,7 +3299,7 @@ async fn a_page_built_by_version_1_is_rebuilt_from_the_baselines_trusted_prefix(
     db.snapshot(doc, 5, &state_of(room)).await;
     build_clean(&b, doc).await;
 
-    // What 0.9.13 wrote at rev 4: the baseline's raw bytes, rows 1-4 and G.
+    // What 0.9.14 wrote at rev 4: the baseline's raw bytes, rows 1-4 and G.
     let v1_gap = {
         let mut r = knot_history::Replayer::new(knot_history::ReplayMode::Gc);
         r.merge_state(&baseline);

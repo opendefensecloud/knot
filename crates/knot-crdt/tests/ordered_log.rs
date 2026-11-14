@@ -44,10 +44,10 @@ use yrs::{
 /// holds rows and snapshots as 0.9.9 wrote them (no rev, no heads row).
 const HISTORY_LOG_COLUMNS: i64 = 20261107120000;
 
-/// The schema of 0.9.13, the release before `pending_revs`.
-const V0_9_13_SCHEMA: i64 = 20261113120000;
+/// The schema of 0.9.14, the release before `pending_revs`.
+const V0_9_14_SCHEMA: i64 = 20261114120000;
 
-/// A snapshot write of every release from 0.9.10 to 0.9.13, stamped with
+/// A snapshot write of every release from 0.9.10 to 0.9.14, stamped with
 /// the rev it holds the log up to and the content epoch it was taken at. It
 /// names no `pending_revs` (`knot-storage/tests/migrations_apply.rs`).
 const STAMPED_SNAPSHOT_INSERT_SQL: &str = "INSERT INTO doc_snapshots
@@ -55,7 +55,7 @@ const STAMPED_SNAPSHOT_INSERT_SQL: &str = "INSERT INTO doc_snapshots
              VALUES ($1, $2, $3, $4, $5, $6)";
 
 /// The shape of the stamped snapshot upsert of every release from 0.9.10 to
-/// 0.9.13 (`PgSnapshotStore::insert_stamped`), which names no `pending_revs`.
+/// 0.9.14 (`PgSnapshotStore::insert_stamped`), which names no `pending_revs`.
 const STAMPED_SNAPSHOT_UPSERT_SQL: &str = "INSERT INTO doc_snapshots
              (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -66,9 +66,9 @@ const STAMPED_SNAPSHOT_UPSERT_SQL: &str = "INSERT INTO doc_snapshots
                  snapshot_rev = EXCLUDED.snapshot_rev,
                  epoch = EXCLUDED.epoch";
 
-/// 0.9.10's to 0.9.13's snapshot GC (`gc(doc, 5, 30)`), which keeps no
+/// 0.9.10's to 0.9.14's snapshot GC (`gc(doc, 5, 30)`), which keeps no
 /// trusted row (`knot-storage/tests/snapshots.rs`).
-const V0_9_13_GC_SQL: &str = "WITH recent AS (
+const V0_9_14_GC_SQL: &str = "WITH recent AS (
                  SELECT snapshot_seq FROM doc_snapshots
                  WHERE doc_id = $1 ORDER BY snapshot_seq DESC LIMIT $2
              ),
@@ -154,16 +154,16 @@ async fn legacy_page() -> (PgPool, Uuid) {
     (pool, doc)
 }
 
-/// A database migrated up to 0.9.13's schema, with one page; the test
-/// writes what 0.9.13 pods wrote, then calls [`finish_migrations`].
-async fn v0_9_13_page() -> (PgPool, Uuid) {
+/// A database migrated up to 0.9.14's schema, with one page; the test
+/// writes what 0.9.14 pods wrote, then calls [`finish_migrations`].
+async fn v0_9_14_page() -> (PgPool, Uuid) {
     let url = knot_test_support::fresh_db_url().await;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)
         .await
         .unwrap();
-    migrator_up_to(V0_9_13_SCHEMA).run(&pool).await.unwrap();
+    migrator_up_to(V0_9_14_SCHEMA).run(&pool).await.unwrap();
     let doc = page(&pool).await;
     (pool, doc)
 }
@@ -1090,7 +1090,7 @@ async fn append_rows(pool: &PgPool, doc: Uuid, rows: &[&[u8]]) -> Vec<Persisted>
     out
 }
 
-/// A stamped snapshot without `pending_revs`, as 0.9.13 pods wrote it, at
+/// A stamped snapshot without `pending_revs`, as 0.9.14 pods wrote it, at
 /// the seq of the row at its rev, through `sql` (the insert or the upsert).
 async fn older_pods_snapshot(
     pool: &PgPool,
@@ -1116,7 +1116,7 @@ async fn older_pods_snapshot(
         .unwrap();
 }
 
-/// yrs's own full state of a doc that applied `updates`: what 0.9.13 rooms
+/// yrs's own full state of a doc that applied `updates`: what 0.9.14 rooms
 /// wrote, shifted when their pending update holds overlapping Skips.
 fn shifted_state(updates: &[&[u8]]) -> Vec<u8> {
     doc_of(updates)
@@ -1196,13 +1196,13 @@ async fn until_text(h: &RoomHandle, word: &str) -> String {
     }
 }
 
-/// Review Focus 4: a 0.9.13 room wrote a snapshot whose pending update held
+/// Review Focus 4: a 0.9.14 room wrote a snapshot whose pending update held
 /// overlapping Skips; boot drops its phantoms (rule 3, `legacy`) and the
 /// content drains when its dependency arrives.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_older_pods_snapshot_with_shifted_pending_content_boots_without_phantoms() {
     let o = overlapping_skips();
-    let (pool, doc) = v0_9_13_page().await;
+    let (pool, doc) = v0_9_14_page().await;
     let rows: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
     let at = append_rows(&pool, doc, &rows).await;
     older_pods_snapshot(
@@ -1243,14 +1243,14 @@ async fn an_older_pods_snapshot_with_shifted_pending_content_boots_without_phant
     assert_eq!(text(&reboot.doc), text(&doc_of(&all)));
 }
 
-/// Review Focus 2: a 0.9.13 room open across the migration on a page whose
+/// Review Focus 2: a 0.9.14 room open across the migration on a page whose
 /// pending update holds overlapping Skips: its pre-migration snapshot (the
 /// trusted one) and its flagged one both hold shifted bytes.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_0_9_13_room_open_across_the_migration_on_a_shifted_page_boots_from_the_prefix_and_drains()
+async fn a_0_9_14_room_open_across_the_migration_on_a_shifted_page_boots_from_the_prefix_and_drains()
  {
     let o = overlapping_skips();
-    let (pool, doc) = v0_9_13_page().await;
+    let (pool, doc) = v0_9_14_page().await;
     let first: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
     let at = append_rows(&pool, doc, &first).await;
     older_pods_snapshot(
@@ -1305,7 +1305,7 @@ async fn a_0_9_13_room_open_across_the_migration_on_a_shifted_page_boots_from_th
     assert_eq!(text(&reboot.doc), text(&doc_of(&all)));
 }
 
-/// Review Focus 2: a 0.9.13 room booted from a fixed snapshot (it ignores
+/// Review Focus 2: a 0.9.14 room booted from a fixed snapshot (it ignores
 /// `pending_revs`), so its own snapshot lacks the parked content; boot
 /// takes the last trusted snapshot and re-parks it.
 #[tokio::test(flavor = "multi_thread")]
@@ -1393,7 +1393,7 @@ async fn a_legacy_page_whose_parking_row_was_collected_keeps_its_pending_content
     assert!(!boot.carry.is_empty());
 }
 
-/// Ruling 6: 0.9.13's GC can delete the trusted snapshot during a long
+/// Ruling 6: 0.9.14's GC can delete the trusted snapshot during a long
 /// rollout; boot then replays the whole log over the flagged row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_page_whose_trusted_snapshot_an_older_gc_deleted_boots_from_the_whole_log() {
@@ -1443,7 +1443,7 @@ async fn a_page_whose_trusted_snapshot_an_older_gc_deleted_boots_from_the_whole_
         "no newer trusted row"
     );
 
-    sqlx::query(V0_9_13_GC_SQL)
+    sqlx::query(V0_9_14_GC_SQL)
         .bind(doc)
         .bind(5i64)
         .bind(30i32)

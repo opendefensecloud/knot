@@ -8,6 +8,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+A fix for pages that lost an edit: snapshots, the first sync and exports
+no longer hold text at the wrong place. One database migration runs on
+upgrade, and every page's history is rebuilt once; read Upgrading first.
+
 ### Upgrading
 - Upgrade from 0.9.14. One database migration runs on upgrade:
   `20261114140000_snapshot_pending_revs` adds a column to
@@ -104,6 +108,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   stayed hidden after the missing edit arrived (as it could before this
   release) usually shows once the page is next loaded into a new editing
   session. (#TBD)
+
+## [0.9.14] - 2026-11-14
+
+A feature release: favorites. Star the pages you use most and they are
+listed at the top of the sidebar. One small database migration runs on
+upgrade; read Upgrading first.
 
 ### Upgrading
 - Upgrade from 0.9.13. One database migration runs on upgrade:
@@ -1806,7 +1816,8 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.13...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.14...HEAD
+[0.9.14]: https://github.com/opendefensecloud/knot/compare/v0.9.13...v0.9.14
 [0.9.13]: https://github.com/opendefensecloud/knot/compare/v0.9.12...v0.9.13
 [0.9.12]: https://github.com/opendefensecloud/knot/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/opendefensecloud/knot/compare/v0.9.10...v0.9.11

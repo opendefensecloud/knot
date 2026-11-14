@@ -15,7 +15,10 @@
 //!   the writer's `Applied`), and the rows are trimmed to an oldest-first
 //!   cover of what stays pending. A joining connection gets the doc's state
 //!   without its pending content ([`JoinState::update`]) and those rows
-//!   ([`JoinState::pending`]); `ExportState` leaves pending content out too.
+//!   ([`JoinState::pending`]); a read-only one gets only the pending
+//!   content itself ([`JoinState::pending_for_readers`]), since a row can
+//!   also carry text deleted since. `ExportState` leaves pending content
+//!   out too.
 //! - **Updates from outside** (inbound, `ApplyUpdate`, catch-up rows) are
 //!   pre-checked against the blocks the doc holds past a gap in their
 //!   client's clock ([`crate::pending::PastGap`], Ruling 25): one that would
@@ -123,11 +126,23 @@ impl ConnHandle {
 /// client holds the same pending content as the room and drains it when the
 /// dependency arrives. Empty when nothing is pending, for a re-join of a
 /// connection the room still holds, and for boards (Ruling 10).
+///
+/// `pending_for_readers` is what a read-only connection gets instead: a
+/// parked row is the whole update that parked content, so it can also
+/// carry content that integrated and was deleted since, a past state a
+/// Viewer must not reach (design spec: "Viewers see only the current
+/// page"). It holds only the doc's pending content: its pending structs as
+/// their faithful v1 encoding and its pending deletes as a delete-only
+/// update ([`crate::pending::carry_rows`]). Empty when nothing is pending,
+/// when `pending` is empty for a re-join, and when the pending structs'
+/// encoding is shifted: such a reader then shows the content that drains
+/// only after it reloads.
 #[derive(Debug)]
 pub struct JoinState {
     pub update: Vec<u8>,
     pub state_vector: Vec<u8>,
     pub pending: Vec<Vec<u8>>,
+    pub pending_for_readers: Vec<Vec<u8>>,
 }
 
 impl JoinState {
@@ -135,11 +150,13 @@ impl JoinState {
         engine: &dyn Engine,
         doc: &DocHandle,
         pending: Vec<Vec<u8>>,
+        pending_for_readers: Vec<Vec<u8>>,
     ) -> Result<Self, EngineError> {
         Ok(Self {
             update: engine.encode_state_as_update(doc, None)?,
             state_vector: engine.encode_state_vector(doc)?,
             pending,
+            pending_for_readers,
         })
     }
 }
@@ -1287,6 +1304,11 @@ impl Room {
                 // written twice after a lost acknowledgement.
                 Ok(_) => {}
                 Err(error) => {
+                    // yrs keeps what it integrated before the block it
+                    // rejected, which can hold blocks past a gap: take the
+                    // guard's set from the doc again, since the error
+                    // carries no insert set (Ruling 25).
+                    self.past_gap = PastGap::of(&self.doc);
                     tracing::warn!(
                         doc_id = %self.doc_id,
                         rev,
@@ -1457,7 +1479,13 @@ impl Room {
             };
             match refusal {
                 // An excluded rev is never kept again, so this runs at most
-                // once per kept row.
+                // once per kept row. It also leaves the join handshake: a
+                // writer that joins later lacks the content it parks
+                // (unless a re-park row carries it), so it shows that
+                // content, once its dependency arrives, only after a reload.
+                // Readers get the pending content itself
+                // (`JoinState::pending_for_readers`). No production path is
+                // known to reach a refusal here (only the tests' `FailCheck`).
                 Some(Refusal::Underflow(rev)) => {
                     debug_assert!(!self.parked.is_excluded(rev), "rev {rev} refused twice");
                     self.parked.exclude(rev);
@@ -1635,12 +1663,20 @@ impl Room {
         }
         // Not held: a join, or a re-join of a connection `fan_out` dropped.
         let unregistered = self.conns.insert(conn_id, handle).is_none();
-        let pending = if with_pending || unregistered {
-            self.parked.frames()
+        let (pending, pending_for_readers) = if with_pending || unregistered {
+            (
+                self.parked.frames(),
+                crate::pending::carry_rows(&self.doc).unwrap_or_default(),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        let _ = reply.send(JoinState::of(self.engine.as_ref(), &self.doc, pending));
+        let _ = reply.send(JoinState::of(
+            self.engine.as_ref(),
+            &self.doc,
+            pending,
+            pending_for_readers,
+        ));
     }
 
     #[tracing::instrument(skip(self, m), fields(doc_id = %self.doc_id, bytes = m.bytes.len()))]
@@ -5675,6 +5711,74 @@ pub(crate) mod tests {
         shut_down(&h).await;
     }
 
+    /// Final review round 1: a parked row is the whole update that parked
+    /// content, so it can also carry text that integrated and was deleted
+    /// since. A reader's join gets the pending content alone
+    /// (`pending_for_readers`), which holds none of that text and still
+    /// drains to the live page once the dependency arrives.
+    #[tokio::test(start_paused = true)]
+    async fn a_readers_join_gets_the_pending_content_without_text_deleted_since() {
+        use yrs::{GetString, ReadTxn, Transact, Update, XmlFragment, updates::decoder::Decode};
+        let (u1, u2) = cross_client_parked();
+        let secret = para(50, "secretXYZ");
+        // An editor's reconnect SyncStep2: a new paragraph, and an insert
+        // into a lost update's paragraph.
+        let mixed = yrs::merge_updates_v1([secret.as_slice(), u2.as_slice()]).unwrap();
+        let removal = {
+            let d = yrs::Doc::with_client_id(51);
+            d.transact_mut()
+                .apply_update(Update::decode_v1(&secret).unwrap())
+                .unwrap();
+            let sv = d.transact().state_vector();
+            let frag = d.get_or_insert_xml_fragment("default");
+            frag.remove_range(&mut d.transact_mut(), 0, 1);
+            d.transact().encode_state_as_update_v1(&sv)
+        };
+        let log = Log::new();
+        let (h, _bus, _) = room_on_log(&log, &Arc::new(Stamps::default()), RARE).await;
+        let (a, _a_rx) = join(&h).await;
+        acknowledged(&h, a, mixed, 1).await;
+        acknowledged(&h, a, removal.clone(), 2).await;
+
+        let holds_secret = |bytes: &[u8]| bytes.windows(9).any(|w| w == b"secretXYZ");
+        let (tx, _rx) = mpsc::channel(64);
+        let joined = join_with(&h, Uuid::new_v4(), ConnHandle::new(tx), false).await;
+        assert!(
+            joined.pending.iter().any(|row| holds_secret(row)),
+            "precondition: the kept row carries the deleted paragraph"
+        );
+        assert!(
+            !holds_secret(&joined.update),
+            "the state holds deleted text"
+        );
+        assert!(!joined.pending_for_readers.is_empty());
+        assert!(
+            !joined
+                .pending_for_readers
+                .iter()
+                .any(|row| holds_secret(row)),
+            "a reader is sent text deleted since"
+        );
+
+        // The reader's doc drains to the page once u1 arrives.
+        let page = |updates: &[&[u8]]| {
+            let d = yrs::Doc::new();
+            for u in updates {
+                let _ = d.transact_mut().apply_update(Update::decode_v1(u).unwrap());
+            }
+            let frag = d.get_or_insert_xml_fragment("default");
+            let txn = d.transact();
+            frag.get_string(&txn)
+        };
+        let mut reader: Vec<&[u8]> = vec![&joined.update];
+        reader.extend(joined.pending_for_readers.iter().map(Vec::as_slice));
+        reader.push(&u1);
+        let reference = page(&[&secret, &u2, &removal, &u1]);
+        assert!(reference.contains("back held"), "{reference}");
+        assert_eq!(page(&reader), reference);
+        shut_down(&h).await;
+    }
+
     /// Task 3's `a_kept_row_that_integrates_stuck_content_at_boot_passes_the_guards`
     /// store: S1 = `paras` at rev 2 naming rev 1, rows rev 1 = `t2_only`,
     /// rev 2 = `paras`. Boot integrates T2 past the gap 2#0..2#2.
@@ -5836,6 +5940,54 @@ pub(crate) mod tests {
         assert_eq!(boot.fallback.as_ref().map(|f| f.reason), Some("legacy"));
         assert_boot_holds_t2_past_the_gap(&log, &snapshots).await;
         assert_a_resend_is_refused(log, snapshots).await;
+    }
+
+    /// Final review round 1: a catch-up row that yrs rejects part way after
+    /// it integrated blocks past a gap leaves the guard current, so a later
+    /// resend that meets the skip underflow over those blocks is refused.
+    #[tokio::test(start_paused = true)]
+    async fn a_catch_up_row_rejected_part_way_keeps_the_underflow_guard_current() {
+        use crate::test_fixtures::parked_block_and_the_edit_it_fails_on;
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let (paras, t2_only) = skip_underflow_parts();
+        let (parked, edit, _) = parked_block_and_the_edit_it_fails_on();
+        // yrs integrates the edit and T2 (past the gap 2#0..2#2), then
+        // fails retrying the parked string.
+        let failing = yrs::merge_updates_v1([edit.as_slice(), t2_only.as_slice()]).unwrap();
+        let log = Log::new();
+        log.push(1, 1, paras);
+        let snapshots = Arc::new(Stamps::default());
+        let (h, bus, doc_id) = room_on_log(&log, &snapshots, RARE).await;
+        let (tx, _rx) = mpsc::channel(64);
+        let sender = Uuid::new_v4();
+        join_with(&h, sender, ConnHandle::new(tx), false).await;
+        probe(&h).await;
+
+        log.push(2, 2, parked);
+        log.push(3, 3, failing);
+        bus.publish(doc_id, 3).await.unwrap();
+        let p = until_probe(&h, "caught up to rev 3", |p| p.applied_through_rev == 3).await;
+        assert!(p.unlogged, "{p:?}");
+        assert_eq!(
+            rec.counter("knot_room_row_apply_errors_total", &[("phase", "catch_up")]),
+            1,
+            "precondition: the row failed to apply"
+        );
+
+        let (_, resend, _) = skip_underflow_case();
+        send_edit(&h, sender, resend).await;
+        probe(&h).await;
+        assert_eq!(
+            rec.counter(
+                "knot_room_updates_underflow_refused_total",
+                &[("source", "inbound")]
+            ),
+            1,
+            "the resend was not refused"
+        );
+        assert!(!h.shutdown.is_cancelled(), "the room was evicted");
+        shut_down(&h).await;
     }
 
     /// Ruling 25: another replica's row that would underflow is passed in

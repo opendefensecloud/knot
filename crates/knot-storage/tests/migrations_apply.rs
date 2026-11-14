@@ -8,7 +8,7 @@ use knot_test_support::old_sql::{OLD_INSERT_UPDATES_SQL, OLD_SNAPSHOT_UPSERT_SQL
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// A snapshot write of every release from 0.9.10 to 0.9.13, stamped with
+/// A snapshot write of every release from 0.9.10 to 0.9.14, stamped with
 /// the rev it holds the log up to and the content epoch it was taken at. It
 /// names no `pending_revs`.
 const STAMPED_SNAPSHOT_INSERT_SQL: &str = "INSERT INTO doc_snapshots
@@ -16,7 +16,7 @@ const STAMPED_SNAPSHOT_INSERT_SQL: &str = "INSERT INTO doc_snapshots
              VALUES ($1, $2, $3, $4, $5, $6)";
 
 /// The shape of the stamped snapshot upsert of every release from 0.9.10 to
-/// 0.9.13 (`PgSnapshotStore::insert_stamped`), which names no `pending_revs`.
+/// 0.9.14 (`PgSnapshotStore::insert_stamped`), which names no `pending_revs`.
 const STAMPED_SNAPSHOT_UPSERT_SQL: &str = "INSERT INTO doc_snapshots
              (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -4896,19 +4896,19 @@ async fn api_keys_migrations_run_under_live_previous_release_traffic() {
 // Snapshots name their pending rows (20261114140000_snapshot_pending_revs)
 // ---------------------------------------------------------------------------
 
-/// The schema of 0.9.13, the release the `pending_revs` migration upgrades
+/// The schema of 0.9.14, the release the `pending_revs` migration upgrades
 /// from.
-const V0_9_13_SCHEMA: i64 = 20261113120000;
+const V0_9_14_SCHEMA: i64 = 20261114120000;
 
-/// 0.9.13's `PgSnapshotStore::latest` SELECT, verbatim.
-const V0_9_13_LATEST_SQL: &str =
+/// 0.9.14's `PgSnapshotStore::latest` SELECT, verbatim.
+const V0_9_14_LATEST_SQL: &str =
     "SELECT doc_id, snapshot_seq, state_bytes, state_vector, created_at,
                     snapshot_rev, epoch
              FROM doc_snapshots WHERE doc_id = $1
              ORDER BY snapshot_rev DESC NULLS LAST, snapshot_seq DESC LIMIT 1";
 
-/// 0.9.13's snapshot GC statement (`PgSnapshotStore::gc`), verbatim.
-const V0_9_13_GC_SQL: &str = "WITH recent AS (
+/// 0.9.14's snapshot GC statement (`PgSnapshotStore::gc`), verbatim.
+const V0_9_14_GC_SQL: &str = "WITH recent AS (
                  SELECT snapshot_seq FROM doc_snapshots
                  WHERE doc_id = $1 ORDER BY snapshot_seq DESC LIMIT $2
              ),
@@ -4923,10 +4923,10 @@ const V0_9_13_GC_SQL: &str = "WITH recent AS (
                AND snapshot_seq NOT IN (SELECT snapshot_seq FROM recent)
                AND snapshot_seq NOT IN (SELECT snapshot_seq FROM per_day)";
 
-/// 0.9.13's history builder snapshot size query (`knot-history`
+/// 0.9.14's history builder snapshot size query (`knot-history`
 /// `store.rs`), verbatim. Binds: the page, `snapshot_checked_rev`,
 /// `built_rev`, how many to fetch.
-const V0_9_13_BUILDER_SNAPSHOTS_SQL: &str =
+const V0_9_14_BUILDER_SNAPSHOTS_SQL: &str =
     "SELECT s.snapshot_rev, s.snapshot_seq, s.created_at, s.size,
                 coalesce((SELECT sum(octet_length(u.update_bytes)) FROM doc_updates u
                            WHERE u.doc_id = $1 AND u.rev > $3 AND u.rev <= s.snapshot_rev),
@@ -4941,14 +4941,14 @@ const V0_9_13_BUILDER_SNAPSHOTS_SQL: &str =
                   ORDER BY snapshot_rev, snapshot_seq DESC) s
           ORDER BY s.snapshot_rev LIMIT $4";
 
-/// The `pending_revs` migration runs while 0.9.13 pods keep serving: their
+/// The `pending_revs` migration runs while 0.9.14 pods keep serving: their
 /// edit saves, snapshot writes, snapshot reads, snapshot GC and the history
 /// builder's snapshot reads all keep working and wait at most for the lock
 /// helper's short attempts; nothing deadlocks, `doc_snapshots` is not
-/// rewritten, and the stamped NULL rows 0.9.13 writes from the migration on
+/// rewritten, and the stamped NULL rows 0.9.14 writes from the migration on
 /// read as an older writer's (Ruling 6), the ones before it do not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn snapshot_pending_revs_migration_runs_under_live_0_9_13_traffic() {
+async fn snapshot_pending_revs_migration_runs_under_live_0_9_14_traffic() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
     use std::time::Duration;
@@ -4957,7 +4957,7 @@ async fn snapshot_pending_revs_migration_runs_under_live_0_9_13_traffic() {
     use sqlx::Connection;
 
     let (url, pool) = bare_db(4).await;
-    migrate_up_to(&pool, V0_9_13_SCHEMA).await;
+    migrate_up_to(&pool, V0_9_14_SCHEMA).await;
     let (ws, user) = seed_ws_user(&pool).await;
     let mut pages = Vec::new();
     for _ in 0..4 {
@@ -5012,7 +5012,7 @@ async fn snapshot_pending_revs_migration_runs_under_live_0_9_13_traffic() {
             ),
         ));
     }
-    // (ii) 0.9.13's stamped snapshot write on B, a new row each time.
+    // (ii) 0.9.14's stamped snapshot write on B, a new row each time.
     loops.push((
         "snapshot write",
         spawn_loop(
@@ -5034,7 +5034,7 @@ async fn snapshot_pending_revs_migration_runs_under_live_0_9_13_traffic() {
             },
         ),
     ));
-    // (iii) 0.9.13's boot read on B.
+    // (iii) 0.9.14's boot read on B.
     loops.push((
         "latest",
         spawn_loop(
@@ -5042,7 +5042,7 @@ async fn snapshot_pending_revs_migration_runs_under_live_0_9_13_traffic() {
             stop.clone(),
             Duration::from_millis(5),
             move |pool, _| async move {
-                sqlx::query(V0_9_13_LATEST_SQL)
+                sqlx::query(V0_9_14_LATEST_SQL)
                     .bind(b)
                     .fetch_optional(&pool)
                     .await
@@ -5051,7 +5051,7 @@ async fn snapshot_pending_revs_migration_runs_under_live_0_9_13_traffic() {
             },
         ),
     ));
-    // (iv) 0.9.13's snapshot write and hourly GC on C.
+    // (iv) 0.9.14's snapshot write and hourly GC on C.
     loops.push((
         "gc",
         spawn_loop(
@@ -5070,7 +5070,7 @@ async fn snapshot_pending_revs_migration_runs_under_live_0_9_13_traffic() {
                 )
                 .await
                 .map_err(|e| format!("snapshot write: {}", err_text(e)))?;
-                sqlx::query(V0_9_13_GC_SQL)
+                sqlx::query(V0_9_14_GC_SQL)
                     .bind(c)
                     .bind(2i64)
                     .bind(30i32)
@@ -5081,7 +5081,7 @@ async fn snapshot_pending_revs_migration_runs_under_live_0_9_13_traffic() {
             },
         ),
     ));
-    // (v) 0.9.13's history builder reading snapshot sizes on D.
+    // (v) 0.9.14's history builder reading snapshot sizes on D.
     loops.push((
         "builder",
         spawn_loop(
@@ -5089,7 +5089,7 @@ async fn snapshot_pending_revs_migration_runs_under_live_0_9_13_traffic() {
             stop.clone(),
             Duration::from_millis(5),
             move |pool, _| async move {
-                sqlx::query(V0_9_13_BUILDER_SNAPSHOTS_SQL)
+                sqlx::query(V0_9_14_BUILDER_SNAPSHOTS_SQL)
                     .bind(d)
                     .bind(0i64)
                     .bind(0i64)

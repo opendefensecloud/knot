@@ -199,9 +199,9 @@ async fn snapshot_of_a_purged_page_is_doc_gone() {
 // (`doc_snapshots.pending_revs`, `older_writer`, `latest_trusted`)
 // ---------------------------------------------------------------------------
 
-/// 0.9.13's snapshot GC statement (`PgSnapshotStore::gc` up to 0.9.13),
+/// 0.9.14's snapshot GC statement (`PgSnapshotStore::gc` up to 0.9.14),
 /// verbatim: it knows nothing of trusted snapshots.
-const V0_9_13_GC_SQL: &str = "WITH recent AS (
+const V0_9_14_GC_SQL: &str = "WITH recent AS (
                  SELECT snapshot_seq FROM doc_snapshots
                  WHERE doc_id = $1 ORDER BY snapshot_seq DESC LIMIT $2
              ),
@@ -216,14 +216,14 @@ const V0_9_13_GC_SQL: &str = "WITH recent AS (
                AND snapshot_seq NOT IN (SELECT snapshot_seq FROM recent)
                AND snapshot_seq NOT IN (SELECT snapshot_seq FROM per_day)";
 
-/// A 0.9.10 to 0.9.13 snapshot write (`migrations_apply.rs`), which names
+/// A 0.9.10 to 0.9.14 snapshot write (`migrations_apply.rs`), which names
 /// no `pending_revs`.
 const STAMPED_SNAPSHOT_INSERT_SQL: &str = "INSERT INTO doc_snapshots
              (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch)
              VALUES ($1, $2, $3, $4, $5, $6)";
 
-/// The snapshot schema of 0.9.13, the release before `pending_revs`.
-const V0_9_13_SCHEMA: i64 = 20261113120000;
+/// The snapshot schema of 0.9.14, the release before `pending_revs`.
+const V0_9_14_SCHEMA: i64 = 20261114120000;
 
 /// A stamped row written through raw SQL a day before the migration:
 /// `(doc, seq, bytes, rev)`, epoch 0, `pending_revs` NULL.
@@ -360,7 +360,7 @@ async fn rows_at_returns_the_named_revs_in_order() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stamped_write_at_a_taken_seq_reports_it_was_skipped() {
     let (s, doc) = setup().await;
-    // A 0.9.13 pod's write.
+    // A 0.9.14 pod's write.
     assert!(
         s.insert_stamped(doc, stamp(4, 2, 0), b"first", b"sv1", None)
             .await
@@ -407,7 +407,7 @@ async fn a_stamped_write_at_a_taken_seq_reports_it_was_skipped() {
 }
 
 /// Ruling 6: GC keeps the page's newest trusted snapshot beside its newest
-/// five and one per day; 0.9.13's statement does not.
+/// five and one per day; 0.9.14's statement does not.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_keeps_the_trusted_snapshot() {
     let (s, pool, doc) = setup_with_pool().await;
@@ -431,7 +431,7 @@ async fn gc_keeps_the_trusted_snapshot() {
     let trusted = s.latest_trusted(doc).await.unwrap().unwrap();
     assert_eq!(trusted.snapshot_rev, Some(1));
 
-    let deleted = sqlx::query(V0_9_13_GC_SQL)
+    let deleted = sqlx::query(V0_9_14_GC_SQL)
         .bind(doc)
         .bind(5i64)
         .bind(30i32)
@@ -439,18 +439,18 @@ async fn gc_keeps_the_trusted_snapshot() {
         .await
         .unwrap()
         .rows_affected();
-    assert_eq!(deleted, 1, "0.9.13's GC deletes the trusted row");
+    assert_eq!(deleted, 1, "0.9.14's GC deletes the trusted row");
     assert_eq!(s.latest_trusted(doc).await.unwrap(), None);
 }
 
 /// A database that never ran the `pending_revs` migration (`knot-server
-/// export-check` on a staging copy of 0.9.13): `latest` still reads it, and
+/// export-check` on a staging copy of 0.9.14): `latest` still reads it, and
 /// nothing on it is trusted over the latest snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn latest_reads_a_database_without_pending_revs() {
     use knot_test_support::migrate::{bare_db, migrate_up_to};
     let (_url, pool) = bare_db(2).await;
-    migrate_up_to(&pool, V0_9_13_SCHEMA).await;
+    migrate_up_to(&pool, V0_9_14_SCHEMA).await;
     let doc: uuid::Uuid = sqlx::query_scalar(
         "WITH w AS (INSERT INTO workspaces (slug, name) VALUES ('w', 'W') RETURNING id),
               u AS (INSERT INTO users (email, display_name) VALUES ('a@x.test', 'A')

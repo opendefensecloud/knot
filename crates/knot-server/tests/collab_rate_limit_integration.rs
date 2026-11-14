@@ -1049,6 +1049,10 @@ async fn a_joiner_whose_handshake_is_slow_keeps_its_place_while_others_type() {
     let (_, u2) = fixtures::cross_client_parked();
     seed_rows(&fx, [&big, &u2]).await;
 
+    // A process-wide counter: this holds under nextest (`make test.rust`),
+    // which runs each test in its own process. Under plain `cargo test`,
+    // other tests' joins in the same binary can raise it too, so run this
+    // test alone there (`-- --test-threads=1` or by its name).
     let queued_before = knot_server::handshake_frames_queued();
     let mut reader_ws = dial(&fx, &fx.doc_path(), &fx.reader)
         .await

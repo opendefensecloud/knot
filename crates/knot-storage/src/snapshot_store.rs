@@ -324,7 +324,7 @@ impl SnapshotStore for PgSnapshotStore {
         let row = match row {
             // 42703: no `pending_revs` column, the schema predates the
             // pending-encoding fix (`knot-server export-check` on a staging
-            // copy of 0.9.13): no snapshot names its pending rows, and none
+            // copy of 0.9.14): no snapshot names its pending rows, and none
             // is an older writer's.
             Err(e) if undefined_column(&e) => self.latest_before_pending_revs(doc_id).await?,
             row => row?,
