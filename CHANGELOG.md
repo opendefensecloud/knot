@@ -102,7 +102,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   hold only placed content. The waiting content stays in the edit log,
   and joining editors receive it as it was sent. Waiting content that
   stayed hidden after the missing edit arrived (as it could before this
-  release) shows once a pod opens the page again. (#TBD)
+  release) usually shows once the page is next loaded into a new editing
+  session. (#TBD)
 
 ### Upgrading
 - Upgrade from 0.9.13. One database migration runs on upgrade:
