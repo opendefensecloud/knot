@@ -23,9 +23,18 @@
 //! client the loop hears nothing from for the silence limit is let go
 //! (`rate_limit::Liveness`). With limits off, the loop behaves exactly as
 //! without them.
+//!
+//! The join handshake is sent by the socket writer (`ws_writer::run`),
+//! before any frame the room fans out: SyncStep2 with the room's state, then
+//! each log row that parks the page's pending content as a sync Update
+//! frame (`JoinState::pending`; a Viewer gets the pending content alone,
+//! `JoinState::pending_for_readers`), then SyncStep1 (writers only). A re-join
+//! (the answer to a client SyncStep1, `Event::Resync`) sends SyncStep2 and,
+//! for a connection the room had dropped as a slow consumer, the parked rows.
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::StreamExt;
+use knot_crdt::protocol::wrap_sync_update;
 use knot_crdt::{ConnHandle, ConnId, Event, InMsg};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -98,8 +107,21 @@ pub async fn serve(
     if rooms.acl_epoch(doc_id) != acl_epoch_at_check {
         revoked.cancel();
     }
+    // The handshake (Ruling 5): the room's state without its pending
+    // content, then the rows that park that content, so the client holds it
+    // pending too and drains it when its dependency arrives, then
+    // SyncStep1. The writer sends it before any frame the room fans out,
+    // which it queues meanwhile. A Viewer gets the pending content alone
+    // instead of the rows (`pending_frames`): a row can also carry text
+    // deleted since, a past state Viewers must not reach.
+    let mut handshake = Vec::new();
     if !revoked.is_cancelled() {
-        let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
+        handshake.push(encode_sync_step2(&joined.update));
+        handshake.extend(
+            pending_frames(&joined, can_write)
+                .iter()
+                .map(|row| wrap_sync_update(row)),
+        );
     }
     // Ask the client for what WE lack (standard y-protocol: both sides send
     // SyncStep1). The web provider applies edits made while its socket was
@@ -113,13 +135,8 @@ pub async fn serve(
     // upload, and their reply (at least the whole delete set) would only be
     // dropped below.
     if can_write && !revoked.is_cancelled() {
-        let _ = out_tx.send(encode_sync_step1(&joined.state_vector)).await;
+        handshake.push(encode_sync_step1(&joined.state_vector));
     }
-    // Server-side share of "open a doc, wait for content": includes the
-    // hydrate of a cold room (see knot_room_hydrate_seconds) and the wait for
-    // the room actor's reply.
-    metrics::histogram!("knot_collab_initial_sync_seconds")
-        .record(join_started.elapsed().as_secs_f64());
 
     let (sink, mut stream) = socket.split();
     // Cancelled by whichever half ends the session first, so the other one
@@ -135,6 +152,7 @@ pub async fn serve(
     // a revoked connection 4403 (both checked first).
     let writer = tokio::spawn(crate::ws_writer::run(
         sink,
+        handshake,
         out_rx,
         shutdown.clone(),
         revoked.clone(),
@@ -143,6 +161,11 @@ pub async fn serve(
         done.clone(),
         rate_limits.liveness.map(|liveness| liveness.ping_interval),
     ));
+    // Server-side share of "open a doc, wait for content": includes the
+    // hydrate of a cold room (see knot_room_hydrate_seconds) and the wait for
+    // the room actor's reply; the handshake is now the writer's to send.
+    metrics::histogram!("knot_collab_initial_sync_seconds")
+        .record(join_started.elapsed().as_secs_f64());
 
     let liveness = rate_limits.liveness;
     let mut throttle = ConnectionThrottle::new(rate_limits, user_id, CollabKind::Doc);
@@ -208,17 +231,51 @@ pub async fn serve(
                     // full-state encode in the room actor.
                     Ok(YSyncMessage::SyncStep1(_sv)) if throttle.admit_sync_step1() => {
                         // Reply with full state again — cheap, idempotent.
+                        // A re-join: the parked rows come back only when the
+                        // room had dropped this connection (Ruling 5). The
+                        // writer drains the queue while the client reads;
+                        // one that stopped reading leaves the writer, and so
+                        // these sends, waiting. They therefore stop at any
+                        // end of the session, as the read below does, and
+                        // the session ends when they cannot finish within
+                        // the silence limit (a client that vanished keeps no
+                        // socket and no per-user slot past it).
                         let (rtx, rrx) = oneshot::channel();
                         let _ = handle
                             .tx
-                            .send(Event::Join {
+                            .send(Event::Resync {
                                 conn_id,
                                 handle: conn_handle(),
                                 reply: rtx,
                             })
                             .await;
                         if let Ok(Ok(joined)) = rrx.await {
-                            let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
+                            let frames = std::iter::once(encode_sync_step2(&joined.update)).chain(
+                                pending_frames(&joined, can_write)
+                                    .iter()
+                                    .map(|row| wrap_sync_update(row)),
+                            );
+                            let resent = async {
+                                for frame in frames {
+                                    if out_tx.send(frame).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            };
+                            let finished = tokio::select! {
+                                biased;
+                                _ = shutdown.cancelled() => false,
+                                _ = done.cancelled() => false,
+                                _ = revoked.cancelled() => false,
+                                _ = sleep_until_due(silence_deadline(liveness, heard_from_client_at)) => {
+                                    tracing::debug!(user = %user_id, "collab client took no re-join frames for the silence limit; ending the session");
+                                    false
+                                }
+                                () = resent => true,
+                            };
+                            if !finished {
+                                break;
+                            }
                         }
                     }
                     Ok(YSyncMessage::SyncStep2(inner)) | Ok(YSyncMessage::Update(inner)) => {
@@ -278,4 +335,15 @@ pub async fn serve(
     done.cancel();
     let _ = handle.tx.send(Event::Leave(conn_id)).await;
     let _ = writer.await;
+}
+
+/// The pending frames of the handshake for this connection: the rows that
+/// park the pending content for a writer, the pending content alone for a
+/// Viewer (`JoinState::pending_for_readers`).
+fn pending_frames(joined: &knot_crdt::JoinState, can_write: bool) -> &[Vec<u8>] {
+    if can_write {
+        &joined.pending
+    } else {
+        &joined.pending_for_readers
+    }
 }

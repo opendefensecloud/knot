@@ -59,7 +59,7 @@ settled during the design and the user has not weighed in.
 | Data protection: removing a person from history | **(user)** Exact times stay. An **admin function** replaces a person's name in **all** history with "Former member". **(design call)** Instance admins only (`crates/knot-server/src/admin.rs`), for one user at a time, across all workspaces. It is irreversible and covers timeline entries, contributor credit (`doc_contributors`, byline) and the restore, erase and accept wording. It does not change comments or suggestions they wrote, and it does not remove their content. History must therefore reference authors in a way that can be rewritten in one place. |
 | Access to the past follows current access | **(design call, from the brainstorm)** History is gated by the page's **current** access. Someone who gets access later, or a page moved out of a restricted area, exposes the page's whole past. Erase is the remedy for anything that must not be seen. No access history is stored. |
 | Backups | **(design call)** Covered by "What an erase does not reach". |
-| Existing pages (before rollout) | **(design call)** Their early history is already gone, because the current GC deletes it. Whatever survives at rollout (the remaining snapshots) appears at the bottom of the timeline as "Earlier versions (author unknown)", each viewable and restorable, under a line "Complete history starts `<rollout date>`". New pages have complete history from creation. |
+| Existing pages (before rollout) | **(design call)** Their early history is already gone, because the current GC deletes it. Whatever survives at rollout (the remaining snapshots) appears at the bottom of the timeline as "Earlier versions (author unknown)", each viewable and restorable, under a line "Complete history starts `<rollout date>`". New pages have complete history from creation. Since the room-snapshot-pending fix, an old snapshot that may hold misplaced text is viewed and restored from its trusted prefix, so text that only it held past a lost edit is not shown ([that plan](../plans/2026-11-08-room-snapshot-pending.md), Rulings 7 and 20). |
 | Title changes | **(user)** Not tracked in v1. The timeline covers page content only. Past versions show the **current** title, restore leaves the title alone, and erase does not touch titles. |
 | Moves, icon, restriction changes | **(design call)** Not in the timeline in v1. |
 
@@ -199,6 +199,13 @@ references are as of `7e1de9d`.
 - **Hydration does not read old rows.** Rooms boot from the latest snapshot
   plus newer rows (`crates/knot-crdt/src/room.rs:234-260`), so keeping old
   rows does not slow live editing. Only storage and history reads pay.
+  Since the room-snapshot-pending fix, a room also reads the rows at or
+  below its snapshot's rev that the snapshot's `pending_revs` names, and
+  replays the whole log on the `legacy` and `underflow` fallbacks and on a
+  `rollout` boot that finds no trusted snapshot, on every open of an idle
+  page until its next edit
+  ([that plan](../plans/2026-11-08-room-snapshot-pending.md), Rulings 3,
+  6, 7 and 8).
 - **Purge cascades.** Purging an archived page deletes its history, which is
   correct and stays so.
 - **Erase rewrites history the CRDT has already shared.** Clients and other

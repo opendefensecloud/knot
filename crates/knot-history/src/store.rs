@@ -667,15 +667,19 @@ pub(crate) async fn release_unfinished(
 }
 
 /// Starts a rebuild (Rulings): deletes the page's entries except `erase`
-/// ones and its genesis and periodic checkpoints (gap checkpoints are
-/// source data and stay), resets the state row's build columns
-/// (`skip_revs`, `skip_baselines` and `skip_snapshots` stay) and marks the
-/// page dirty.
+/// ones and its genesis and periodic checkpoints, resets the state row's
+/// build columns (`skip_revs`, `skip_baselines` and `skip_snapshots` stay)
+/// and marks the page dirty. Gap checkpoints are source data and stay,
+/// except a version-1 page's: this first drops those once, and clears that
+/// page's `skip_snapshots` ([`drop_version_1_gaps`], Ruling 14).
 pub(crate) async fn reset_for_rebuild(pool: &PgPool, doc_id: Uuid, me: Uuid) -> Result<Write> {
     let (mut tx, _, _) = match begin_leased(pool, doc_id, me).await? {
         Ok(t) => t,
         Err(w) => return Ok(w),
     };
+    if drop_version_1_gaps(&mut tx, doc_id, true).await? {
+        tracing::debug!(%doc_id, "history rebuild: version 1's gap checkpoints dropped");
+    }
     sqlx::query("DELETE FROM doc_history_entries WHERE doc_id = $1 AND kind <> 'erase'")
         .bind(doc_id)
         .execute(&mut *tx)
@@ -702,6 +706,60 @@ pub(crate) async fn reset_for_rebuild(pool: &PgPool, doc_id: Uuid, me: Uuid) -> 
         .await?;
     tx.commit().await?;
     Ok(Write::Done)
+}
+
+/// Drops the gap checkpoints of a page that version 1 built, and clears its
+/// `skip_snapshots`, in the caller's transaction (Ruling 14); returns
+/// whether it did.
+///
+/// Version 1 (0.9.12 to 0.9.14) started genesis from a baseline's raw
+/// bytes, and a gap checkpoint is the whole replay state at its rev, so
+/// every gap checkpoint version 1 wrote can hold the phantoms of a shifted
+/// baseline, and one derived from a shifted room snapshot holds that
+/// snapshot's phantoms as gap content. The version-2 passes find real gap
+/// content again from the snapshots still kept, those version 1 failed to
+/// probe (`skip_snapshots`) included; `skip_revs` and `skip_baselines`
+/// stay, as they name rows and baselines that failed to apply whatever the
+/// builder.
+///
+/// The page is version 1's when its `builder_version` is 1 (a version-2
+/// builder writes 2 at genesis and at a give-up), or, when
+/// `genesis_checkpoint_counts`, when its genesis checkpoint was written
+/// before the migration `20261114140000` committed (a page at version 0
+/// whose genesis version 1 wrote). Never from a gap checkpoint's own
+/// `created_at`, which is its source snapshot's. A later rebuild of a
+/// version-2 page (a rejected starting checkpoint, or a later
+/// `BUILDER_VERSION`) drops nothing: its gap checkpoints are source data.
+pub(crate) async fn drop_version_1_gaps(
+    tx: &mut PgConnection,
+    doc_id: Uuid,
+    genesis_checkpoint_counts: bool,
+) -> Result<bool> {
+    let version_1: bool = sqlx::query_scalar(
+        "SELECT coalesce((SELECT builder_version = 1 FROM doc_history_state WHERE doc_id = $1),
+                         false)
+             OR ($2 AND EXISTS (
+                     SELECT 1 FROM doc_history_checkpoints g
+                      WHERE g.doc_id = $1 AND g.kind = 'genesis'
+                        AND g.created_at < (SELECT m.installed_on FROM _sqlx_migrations m
+                                             WHERE m.version = 20261114140000)))",
+    )
+    .bind(doc_id)
+    .bind(genesis_checkpoint_counts)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !version_1 {
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM doc_history_checkpoints WHERE doc_id = $1 AND kind = 'gap'")
+        .bind(doc_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE doc_history_state SET skip_snapshots = '{}' WHERE doc_id = $1")
+        .bind(doc_id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -837,6 +895,11 @@ pub(crate) async fn write_genesis(
     };
     if genesis_rev.is_some() {
         return Ok(Write::LeaseLost);
+    }
+    // A page version 1 gave up at genesis is lifted without a reset, so it
+    // drops its gap checkpoints here (Ruling 14).
+    if drop_version_1_gaps(&mut tx, doc_id, false).await? {
+        tracing::debug!(%doc_id, "history genesis: version 1's gap checkpoints dropped");
     }
     // What a give-up at genesis listed: genesis lists them again.
     sqlx::query(
@@ -1014,7 +1077,7 @@ pub(crate) struct PassLimits {
     pub max_snapshots: i64,
 }
 
-type SnapshotSize = (i64, i64, DateTime<Utc>, i64, i64);
+type SnapshotSize = (i64, i64, DateTime<Utc>, i64, i64, bool);
 type KeptSize = (i64, DateTime<Utc>, i64, i64);
 
 /// A pass's inputs (step 6), in one read transaction, sizes first.
@@ -1084,10 +1147,12 @@ pub(crate) async fn load_pass_inputs(
         "SELECT s.snapshot_rev, s.snapshot_seq, s.created_at, s.size,
                 coalesce((SELECT sum(octet_length(u.update_bytes)) FROM doc_updates u
                            WHERE u.doc_id = $1 AND u.rev > $3 AND u.rev <= s.snapshot_rev),
-                         0)::bigint
+                         0)::bigint,
+                s.legacy
            FROM (SELECT DISTINCT ON (snapshot_rev)
                         snapshot_rev, snapshot_seq, created_at,
-                        octet_length(state_bytes)::bigint AS size
+                        octet_length(state_bytes)::bigint AS size,
+                        pending_revs IS NULL AS legacy
                    FROM doc_snapshots
                   WHERE doc_id = $1 AND snapshot_rev > $2
                     AND snapshot_rev <> ALL (
@@ -1178,7 +1243,7 @@ pub(crate) async fn load_pass_inputs(
     taken_snapshots.extend(w.oversized.iter().copied());
     taken_snapshots.sort_unstable();
     for i in taken_snapshots {
-        let (rev, seq, created_at, ..) = snapshot_sizes[i];
+        let (rev, seq, created_at, _, _, legacy) = snapshot_sizes[i];
         if rev > last {
             continue;
         }
@@ -1199,6 +1264,7 @@ pub(crate) async fn load_pass_inputs(
             rev,
             created_at,
             state_bytes,
+            legacy,
         });
     }
     let mut kept_gaps = Vec::new();
@@ -2178,7 +2244,17 @@ pub(crate) async fn write_words(
 // Candidates and gauges
 // ---------------------------------------------------------------------------
 
-/// Dirty pages to build, oldest write first, debounced (Rulings).
+/// Dirty pages to build, oldest write first, debounced (Rulings). Pages an
+/// older builder built (or gave up after genesis) are candidates too,
+/// whatever their dirty flag, unless claimed or backing off, after every
+/// dirty page (Ruling 14's version lift): the rebuild a `BUILDER_VERSION`
+/// bump asks for then runs at this loop's pace, not the sweep's.
+///
+/// Two arms, each limited, so the dirty arm keeps its partial index
+/// (`doc_history_heads_dirty_idx`) and the lift arm scans only
+/// `doc_history_state`, which matches nothing once the lift is done: one
+/// statement that ORs them joins every head to its state row on every
+/// tick. A page both arms return counts once, in the dirty order.
 pub(crate) async fn dirty_candidates(
     pool: &PgPool,
     exclude: &[Uuid],
@@ -2187,17 +2263,34 @@ pub(crate) async fn dirty_candidates(
     max_lag_revs: i64,
 ) -> Result<Vec<Uuid>> {
     Ok(sqlx::query_scalar(
-        "SELECT h.doc_id FROM doc_history_heads h
-           LEFT JOIN doc_history_state s USING (doc_id)
-          WHERE h.dirty AND NOT h.doc_id = ANY($2)
-            AND (s.doc_id IS NULL
-                 OR ((s.retry_after IS NULL OR s.retry_after <= now())
-                     AND (s.claimed_until IS NULL OR s.claimed_until < now())
-                     AND s.builder_version <= $1))
-            AND (h.last_write_at < now() - make_interval(secs => $4)
-                 OR h.head_rev - coalesce(s.built_rev, 0) >= $5)
-          ORDER BY h.last_write_at
-          LIMIT $3",
+        "SELECT doc_id FROM (
+           (SELECT h.doc_id, h.dirty, h.last_write_at FROM doc_history_heads h
+              LEFT JOIN doc_history_state s USING (doc_id)
+             WHERE h.dirty
+               AND NOT h.doc_id = ANY($2)
+               AND (s.doc_id IS NULL
+                    OR ((s.retry_after IS NULL OR s.retry_after <= now())
+                        AND (s.claimed_until IS NULL OR s.claimed_until < now())
+                        AND s.builder_version <= $1))
+               AND (h.last_write_at < now() - make_interval(secs => $4)
+                    OR h.head_rev - coalesce(s.built_rev, 0) >= $5)
+             ORDER BY h.last_write_at
+             LIMIT $3)
+           UNION ALL
+           (SELECT h.doc_id, h.dirty, h.last_write_at FROM doc_history_state s
+              JOIN doc_history_heads h USING (doc_id)
+             WHERE s.builder_version < $1
+               AND NOT s.doc_id = ANY($2)
+               AND (s.genesis_rev IS NOT NULL OR s.retry_after = 'infinity')
+               AND (s.retry_after IS NULL OR s.retry_after <= now()
+                    OR s.retry_after = 'infinity')
+               AND (s.claimed_until IS NULL OR s.claimed_until < now())
+             ORDER BY h.dirty DESC, h.last_write_at
+             LIMIT $3)
+         ) c
+         GROUP BY doc_id
+         ORDER BY bool_or(dirty) DESC, min(last_write_at)
+         LIMIT $3",
     )
     .bind(BUILDER_VERSION)
     .bind(exclude)

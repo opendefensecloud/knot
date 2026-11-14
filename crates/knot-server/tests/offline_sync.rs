@@ -19,6 +19,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "../../knot-crdt/tests/common/fixtures.rs"]
+mod fixtures;
+
 use futures_util::{SinkExt, StreamExt};
 use knot_auth::{Hasher, Throttle};
 use knot_server::protocol::{YSyncMessage, decode};
@@ -59,6 +62,8 @@ struct Fixture {
     addr: std::net::SocketAddr,
     /// `sid=…; csrf=…` for the workspace owner.
     cookie: String,
+    /// `sid=…; csrf=…` for a workspace Viewer.
+    viewer_cookie: String,
     pool: knot_storage::Pool,
     user_id: Uuid,
     doc_id: Uuid,
@@ -130,28 +135,51 @@ async fn fixture() -> Fixture {
         .await
         .unwrap();
 
-    let r = router_with_state(s.clone())
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/auth/login")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({"email": email, "password": password}).to_string(),
-                ))
-                .unwrap(),
-        )
+    let viewer_email = "viewer@sync.test";
+    let viewer = s
+        .users
+        .as_ref()
+        .unwrap()
+        .create_local(viewer_email, "V", &hash)
         .await
         .unwrap();
-    let cookie = r
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string())
-        .filter(|kv| kv.starts_with("sid=") || kv.starts_with("csrf="))
-        .collect::<Vec<_>>()
-        .join("; ");
-    assert!(cookie.contains("sid="), "login set no session cookie");
+    s.workspaces
+        .as_ref()
+        .unwrap()
+        .add_member(ws.id, viewer.id, WorkspaceRole::Viewer)
+        .await
+        .unwrap();
+
+    let login = |email: &'static str| {
+        let s = s.clone();
+        async move {
+            let r = router_with_state(s)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/auth/login")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"email": email, "password": password}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let cookie = r
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string())
+                .filter(|kv| kv.starts_with("sid=") || kv.starts_with("csrf="))
+                .collect::<Vec<_>>()
+                .join("; ");
+            assert!(cookie.contains("sid="), "login set no session cookie");
+            cookie
+        }
+    };
+    let cookie = login(email).await;
+    let viewer_cookie = login(viewer_email).await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -163,6 +191,7 @@ async fn fixture() -> Fixture {
     Fixture {
         addr,
         cookie,
+        viewer_cookie,
         pool,
         user_id: u.id,
         doc_id: doc.id,
@@ -197,6 +226,8 @@ struct Peer {
     step2_received: usize,
     /// SYNC_UPDATE frames applied — i.e. fan-out from other connections.
     updates_received: usize,
+    /// The payloads of those frames, in order.
+    update_payloads: Vec<Vec<u8>>,
 }
 
 impl Peer {
@@ -207,6 +238,7 @@ impl Peer {
             step1_answered: 0,
             step2_received: 0,
             updates_received: 0,
+            update_payloads: Vec::new(),
         }
     }
 
@@ -214,12 +246,17 @@ impl Peer {
     /// vector. (The provider also sends its awareness state; awareness is
     /// irrelevant to document sync and is left out.)
     async fn connect(&mut self, fx: &Fixture, path: &str) {
+        self.connect_as(fx, path, &fx.cookie).await;
+    }
+
+    /// [`Peer::connect`] with the session `cookie`.
+    async fn connect_as(&mut self, fx: &Fixture, path: &str, cookie: &str) {
         let mut req = format!("ws://{}{path}", fx.addr)
             .into_client_request()
             .unwrap();
         req.headers_mut().insert(
             "cookie",
-            tungstenite::http::HeaderValue::from_str(&fx.cookie).unwrap(),
+            tungstenite::http::HeaderValue::from_str(cookie).unwrap(),
         );
         let (mut ws, _) = tokio_tungstenite::connect_async(req)
             .await
@@ -317,6 +354,7 @@ impl Peer {
             Ok(YSyncMessage::Update(u)) => {
                 self.apply(&u);
                 self.updates_received += 1;
+                self.update_payloads.push(u);
             }
             _ => {}
         }
@@ -1076,4 +1114,195 @@ async fn board_update_that_does_not_decode_closes_only_its_sender() {
 
     b.disconnect().await;
     c.disconnect().await;
+}
+
+// ---------------------------------------------------------------------------
+// Pending content in the join handshake (Ruling 5)
+// ---------------------------------------------------------------------------
+
+/// The ids `updates` insert.
+fn insertions_of<'a>(updates: impl IntoIterator<Item = &'a Vec<u8>>) -> yrs::IdSet {
+    updates.into_iter().fold(yrs::IdSet::new(), |acc, u| {
+        acc.merge(&Update::decode_v1(u).unwrap().insertions(true))
+    })
+}
+
+/// Whether `doc` holds every id of `ids` as a pending struct.
+fn holds_pending(doc: &Doc, ids: &yrs::IdSet) -> bool {
+    let txn = doc.transact();
+    let pending = txn
+        .store()
+        .pending_update()
+        .map(|p| p.update.insertions(true))
+        .unwrap_or_default();
+    !knot_crdt::pending::holds_any(&ids.diff(&pending))
+}
+
+/// Waits until the page holds `n` rows.
+async fn until_rows(fx: &Fixture, n: i64) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM doc_updates WHERE doc_id = $1")
+            .bind(fx.doc_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        if count >= n {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the page never held {n} rows");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A joining editor receives the rows that park the room's pending content
+/// in its handshake, holds that content pending under its real ids, and
+/// drains it when the dependency is fanned out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joining_socket_receives_the_rows_that_hold_pending_content() {
+    let fx = fixture().await;
+    let path = format!("/collab/doc/{}", fx.doc_id);
+    let (u1, u2) = fixtures::cross_client_parked();
+    let mut first = Peer::new();
+    first.connect(&fx, &path).await;
+    assert!(first.pump_until(DEADLINE, |p| p.step2_received >= 1).await);
+    first.send_raw_update(&u2).await;
+    until_rows(&fx, 1).await;
+
+    let mut second = Peer::new();
+    second.connect(&fx, &path).await;
+    let parked = insertions_of([&u2]);
+    assert!(
+        second
+            .pump_until(HANDSHAKE_WAIT, |p| holds_pending(&p.doc, &parked))
+            .await,
+        "the joining socket does not hold u2 pending"
+    );
+
+    first.send_raw_update(&u1).await;
+    assert!(
+        second
+            .pump_until(DEADLINE, |p| p.doc_text().contains("back held"))
+            .await,
+        "the joined doc never drained: {}",
+        second.doc_text()
+    );
+}
+
+/// Final review round 1: a Viewer's handshake carries the pending content
+/// alone, never the row that parked it, since a row can also carry text
+/// deleted since (a past state, which Viewers must not reach). The Viewer
+/// still holds the content pending and drains it when the dependency is
+/// fanned out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_viewers_handshake_holds_no_text_deleted_since() {
+    let fx = fixture().await;
+    let path = format!("/collab/doc/{}", fx.doc_id);
+    let (u1, u2) = fixtures::cross_client_parked();
+    let mut editor = Peer::new();
+    editor.connect(&fx, &path).await;
+    assert!(editor.pump_until(DEADLINE, |p| p.step2_received >= 1).await);
+    // An editor's reconnect answer: a new paragraph, and an insert into a
+    // lost update's paragraph, in one update.
+    let secret = {
+        let d = Doc::with_client_id(50);
+        let frag = d.get_or_insert_xml_fragment("default");
+        {
+            let mut txn = d.transact_mut();
+            let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new("secretXYZ"));
+        }
+        d.transact()
+            .encode_state_as_update_v1(&StateVector::default())
+    };
+    let mixed = yrs::merge_updates_v1([secret.as_slice(), u2.as_slice()]).unwrap();
+    editor.apply(&mixed);
+    editor.send_raw_update(&mixed).await;
+    until_rows(&fx, 1).await;
+    editor
+        .edit(|roots, txn| roots.frag.remove_range(txn, 0, 1))
+        .await;
+    until_rows(&fx, 2).await;
+
+    let holds_secret = |bytes: &[u8]| bytes.windows(9).any(|w| w == b"secretXYZ");
+    let mut viewer = Peer::new();
+    viewer.connect_as(&fx, &path, &fx.viewer_cookie).await;
+    let parked = insertions_of([&u2]);
+    assert!(
+        viewer
+            .pump_until(HANDSHAKE_WAIT, |p| p.step2_received >= 1
+                && holds_pending(&p.doc, &parked))
+            .await,
+        "the Viewer does not hold u2 pending"
+    );
+    assert!(
+        !viewer.update_payloads.iter().any(|u| holds_secret(u)),
+        "the Viewer was sent text deleted since"
+    );
+
+    // An editor joining now still gets the row (Ruling 5).
+    let mut second = Peer::new();
+    second.connect(&fx, &path).await;
+    assert!(
+        second
+            .pump_until(HANDSHAKE_WAIT, |p| holds_pending(&p.doc, &parked))
+            .await
+    );
+    assert!(
+        second.update_payloads.iter().any(|u| holds_secret(u)),
+        "precondition: the kept row carries the deleted paragraph"
+    );
+
+    editor.send_raw_update(&u1).await;
+    assert!(
+        viewer
+            .pump_until(DEADLINE, |p| p.doc_text().contains("back held"))
+            .await,
+        "the Viewer's doc never drained: {}",
+        viewer.doc_text()
+    );
+    assert!(!viewer.doc_text().contains("secretXYZ"));
+}
+
+/// Review Focus 3 with the collab limits off: a join on a page with 301
+/// parked rows completes, holds every row pending, and drains.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_with_300_parked_rows_syncs_and_drains() {
+    let fx = fixture().await;
+    let path = format!("/collab/doc/{}", fx.doc_id);
+    let (u1, u2, tail) = fixtures::cross_client_parked_tail(300);
+    let mut first = Peer::new();
+    first.connect(&fx, &path).await;
+    assert!(first.pump_until(DEADLINE, |p| p.step2_received >= 1).await);
+    first.send_raw_update(&u2).await;
+    for row in &tail {
+        first.send_raw_update(row).await;
+    }
+    until_rows(&fx, 301).await;
+
+    let mut second = Peer::new();
+    second.connect(&fx, &path).await;
+    let parked = insertions_of(std::iter::once(&u2).chain(&tail));
+    assert!(
+        second
+            .pump_until(Duration::from_secs(5), |p| p.step2_received >= 1
+                && holds_pending(&p.doc, &parked))
+            .await,
+        "the join did not complete with every parked row"
+    );
+
+    first.send_raw_update(&u1).await;
+    let reference = Doc::new();
+    for u in std::iter::once(&u1).chain([&u2]).chain(&tail) {
+        reference
+            .transact_mut()
+            .apply_update(Update::decode_v1(u).unwrap())
+            .unwrap();
+    }
+    let want = doc_text(&reference);
+    assert!(
+        second.pump_until(DEADLINE, |p| p.doc_text() == want).await,
+        "the joined doc never drained: {}",
+        second.doc_text()
+    );
 }

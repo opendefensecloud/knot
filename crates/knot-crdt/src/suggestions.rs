@@ -151,7 +151,10 @@ pub fn resolve_range<T: ReadTxn>(
         ..Default::default()
     });
     replica.get_or_insert_xml_fragment(FRAGMENT);
-    let state = txn.encode_state_as_update_v1(&StateVector::default());
+    // Without the doc's pending content: yrs's own encoder can write it at
+    // shifted clocks (Ruling 2), and pending content is never visible, so
+    // no anchor can point into it.
+    let state = crate::pending::encode_without_pending(txn, &StateVector::default());
     // The live doc's own state should always load; if it doesn't, refuse
     // rather than resolve against a partial replica.
     let update = Update::decode_v1(&state).map_err(|_| ApplySuggestionError::AnchorLost)?;

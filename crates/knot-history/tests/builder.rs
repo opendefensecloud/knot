@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use common::db::{
     Db, Entry, base_of, build_clean, build_until, db, filler, genesis, genesis_then_rows, holding,
-    is_built, keys, limits, limits_with, oversized_snapshot_page, page_with_gaps, page_with_rows,
-    state_of, typed, visible, with_paragraph,
+    insertions, is_built, keys, limits, limits_with, oversized_snapshot_page, page_with_gaps,
+    page_with_rows, state_of, typed, visible, with_paragraph,
 };
-use common::underflow::skip_underflow_case;
+use common::fixtures::skip_underflow_case;
 use common::{Client, History, author};
 use knot_history::builder::{DEBOUNCE_MAX_LAG_REVS, MAX_FAILURES, MAX_REBUILDS};
 use knot_history::{BUILDER_VERSION, PassResult, history_permits};
@@ -2867,7 +2867,10 @@ async fn a_newer_builder_version_is_left_alone_and_an_older_one_rebuilt() {
     assert_eq!(of_kind(&before, "gap").len(), 1);
 
     db.exec(
-        "UPDATE doc_history_state SET builder_version = 2 WHERE doc_id = $1",
+        &format!(
+            "UPDATE doc_history_state SET builder_version = {} WHERE doc_id = $1",
+            BUILDER_VERSION + 1
+        ),
         doc,
     )
     .await;
@@ -2941,7 +2944,10 @@ async fn the_sweep_seals_idle_sessions_on_clean_pages() {
     )
     .await;
     db.exec(
-        "UPDATE doc_history_state SET builder_version = 2 WHERE doc_id = $1",
+        &format!(
+            "UPDATE doc_history_state SET builder_version = {} WHERE doc_id = $1",
+            BUILDER_VERSION + 1
+        ),
         newer,
     )
     .await;
@@ -2984,6 +2990,73 @@ async fn ticks_visit_seeded_pages_oldest_first() {
     )
     .await;
     assert_eq!(b.dirty_candidates().await, vec![docs[0], docs[2], docs[1]]);
+}
+
+/// Ruling 14's version lift: a clean page an older builder built is a
+/// dirty candidate (unless claimed or backing off), after every dirty page,
+/// so the rebuild runs at the dirty loop's pace, not the sweep's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clean_page_an_older_builder_built_is_a_dirty_candidate() {
+    let db = db().await;
+    let b = db.builder(limits());
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let doc = db.page().await;
+        let mut h = History::new(1);
+        let u = typed(&mut h, 0, "one");
+        db.append(doc, 0, &u).await;
+        build_clean(&b, doc).await;
+        assert!(!db.head(doc).await.1, "fixture: built clean");
+        db.exec(
+            "UPDATE doc_history_heads SET last_write_at = now() - interval '3 hours'
+              WHERE doc_id = $1",
+            doc,
+        )
+        .await;
+        pages.push(doc);
+    }
+    let (older, given_up, backing_off, current) = (pages[0], pages[1], pages[2], pages[3]);
+    let older_version = BUILDER_VERSION - 1;
+    for (doc, extra) in [
+        (older, ""),
+        (given_up, ", retry_after = 'infinity'"),
+        (backing_off, ", retry_after = now() + interval '1 hour'"),
+    ] {
+        db.exec(
+            &format!(
+                "UPDATE doc_history_state SET builder_version = {older_version}{extra}
+                  WHERE doc_id = $1"
+            ),
+            doc,
+        )
+        .await;
+    }
+    let edited = db.page().await;
+    let mut h = History::new(1);
+    let u = typed(&mut h, 0, "one");
+    db.append(edited, 0, &u).await;
+    db.exec(
+        "UPDATE doc_history_heads SET last_write_at = now() - interval '2 hours'
+          WHERE doc_id = $1",
+        edited,
+    )
+    .await;
+
+    let candidates = b.dirty_candidates().await;
+    assert!(
+        candidates.contains(&older) && candidates.contains(&given_up),
+        "{candidates:?}"
+    );
+    assert!(!candidates.contains(&backing_off) && !candidates.contains(&current));
+    assert_eq!(candidates.first(), Some(&edited), "dirty pages first");
+
+    b.tick().await;
+    for doc in [older, given_up] {
+        let s = db.state(doc).await;
+        assert_eq!(s.builder_version, BUILDER_VERSION);
+        assert!(s.genesis_rev.is_some());
+    }
+    assert!(!db.state(given_up).await.given_up);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3586,4 +3659,483 @@ async fn an_expired_words_wait_on_an_idle_sealed_page_marks_it_dirty() {
             "shutdown {shutdown}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pages version 1 built (Ruling 14)
+// ---------------------------------------------------------------------------
+
+/// yrs's own full state of a doc that applied `updates` in order: what
+/// every room and every baseline held before the fix, shifted when the
+/// doc's pending update holds overlapping Skips.
+fn yrs_full_state(updates: &[&[u8]]) -> Vec<u8> {
+    use yrs::ReadTxn;
+    let doc = yrs::Doc::new();
+    for u in updates {
+        doc.transact_mut()
+            .apply_update(yrs::Update::decode_v1(u).unwrap())
+            .unwrap();
+    }
+    doc.transact()
+        .encode_state_as_update_v1(&yrs::StateVector::default())
+}
+
+fn insertions_of_all(updates: &[&[u8]]) -> yrs::IdSet {
+    updates
+        .iter()
+        .fold(yrs::IdSet::new(), |acc, u| acc.merge(&insertions(u)))
+}
+
+/// Whether `a` holds any id.
+fn holds_ids(a: &yrs::IdSet) -> bool {
+    a.iter().any(|(_, r)| !r.is_empty())
+}
+
+/// Whether every id of `a` is in `b`.
+fn within(a: &yrs::IdSet, b: &yrs::IdSet) -> bool {
+    !holds_ids(&a.diff(b))
+}
+
+/// When the migration `20261114140000_snapshot_pending_revs` committed.
+async fn installed_on(db: &Db) -> chrono::DateTime<Utc> {
+    sqlx::query_scalar("SELECT installed_on FROM _sqlx_migrations WHERE version = 20261114140000")
+        .fetch_one(&db.pool)
+        .await
+        .expect("installed_on")
+}
+
+/// A `gap` checkpoint at `rev` holding `state`, written a day ago, as
+/// version 1 left it.
+async fn version_1_gap_checkpoint(db: &Db, doc: Uuid, rev: i64, state: &[u8]) {
+    let sv = knot_history::Replayer::from_state(knot_history::ReplayMode::Gc, state)
+        .expect("the state applies")
+        .state_vector();
+    sqlx::query(
+        "INSERT INTO doc_history_checkpoints
+             (doc_id, rev, kind, state_bytes, state_vector, pending_revs, created_at)
+         VALUES ($1, $2, 'gap', $3, $4, '{}', now() - interval '1 day')
+         ON CONFLICT (doc_id, rev) DO UPDATE
+            SET kind = 'gap', state_bytes = EXCLUDED.state_bytes,
+                state_vector = EXCLUDED.state_vector, pending_revs = '{}',
+                created_at = EXCLUDED.created_at",
+    )
+    .bind(doc)
+    .bind(rev)
+    .bind(state)
+    .bind(sv)
+    .execute(&db.pool)
+    .await
+    .expect("gap checkpoint");
+}
+
+/// The page's text at its head, replayed from its newest checkpoint.
+async fn head_xml(db: &Db, doc: Uuid) -> String {
+    use knot_history::{
+        Progress, ReplayHooks, ReplayMode, WindowInput, canonical::visible_content, replay_window,
+    };
+    use knot_storage::{RowsAfter, UpdatesStore};
+    let (cp_rev, state, pending): (i64, Vec<u8>, Vec<i64>) = sqlx::query_as(
+        "SELECT rev, state_bytes, pending_revs FROM doc_history_checkpoints
+          WHERE doc_id = $1 ORDER BY rev DESC LIMIT 1",
+    )
+    .bind(doc)
+    .fetch_one(&db.pool)
+    .await
+    .expect("a checkpoint");
+    let rows = db
+        .updates
+        .rows_after(doc, RowsAfter::All)
+        .await
+        .expect("rows");
+    let head = rows.last().and_then(|r| r.rev).unwrap_or(cp_rev);
+    let w = replay_window(WindowInput {
+        mode: ReplayMode::Gc,
+        checkpoint_state: state,
+        reapply: rows
+            .iter()
+            .filter(|r| r.rev.is_some_and(|rev| pending.contains(&rev)))
+            .cloned()
+            .collect(),
+        rows: rows
+            .iter()
+            .filter(|r| r.rev.is_some_and(|rev| rev > cp_rev))
+            .cloned()
+            .collect(),
+        gap_states: Vec::new(),
+        skip_revs: db.state(doc).await.skip_revs.into_iter().collect(),
+        end_rev: head,
+        merge_gap_at_end: true,
+        progress: Progress::default(),
+        hooks: ReplayHooks::default(),
+    })
+    .expect("the head replays");
+    visible_content(w.doc()).to_string()
+}
+
+/// What a doc that applied `updates` in order shows.
+fn xml_in_order(updates: &[&[u8]]) -> String {
+    let r = {
+        let mut r = knot_history::Replayer::new(knot_history::ReplayMode::Gc);
+        for u in updates {
+            r.apply(u);
+        }
+        r
+    };
+    knot_history::canonical::visible_content(r.doc()).to_string()
+}
+
+/// Every checkpoint's and every entry's ids lie within `allowed`.
+async fn names_only(db: &Db, doc: Uuid, allowed: &yrs::IdSet) {
+    for c in db.checkpoints(doc).await {
+        let held = insertions(&c.state_bytes);
+        assert!(
+            within(&held, allowed),
+            "the {} checkpoint at rev {} names {:?}",
+            c.kind,
+            c.rev,
+            held.diff(allowed)
+        );
+    }
+    for e in db.entries(doc).await {
+        assert!(
+            within(&e.inserted(), allowed),
+            "the {} entry {:?}..{:?} names {:?}",
+            e.kind,
+            e.start_rev,
+            e.end_rev,
+            e.inserted().diff(allowed)
+        );
+    }
+}
+
+/// A transaction of client 3 on a doc holding `t0`: `text` typed at
+/// `index` of paragraph 0.
+fn edit_by_client_3(t0: &[u8], index: u32, text: &str) -> Vec<u8> {
+    let c = yrs::Doc::with_client_id(3);
+    c.transact_mut()
+        .apply_update(yrs::Update::decode_v1(t0).unwrap())
+        .unwrap();
+    let frag = c.get_or_insert_xml_fragment("default");
+    let mut txn = c.transact_mut();
+    common::fixtures::text_at(&frag, &txn, 0)
+        .expect("paragraph 0")
+        .insert(&mut txn, index, text);
+    txn.encode_update_v1()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_built_by_version_1_is_rebuilt_from_the_baselines_trusted_prefix() {
+    let db = db().await;
+    let b = db.builder(limits());
+    let doc = db.page().await;
+    db.exec(
+        "UPDATE documents SET created_at = history_since - interval '1 day' WHERE id = $1",
+        doc,
+    )
+    .await;
+    let since = db.history_since(doc).await;
+    let o = common::fixtures::overlapping_skips();
+    let parked: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let baseline = yrs_full_state(&parked);
+    sqlx::query(
+        "INSERT INTO doc_history_baselines (doc_id, snapshot_seq, state_bytes, state_vector, created_at)
+         VALUES ($1, 3, $2, '\\x00', $3)",
+    )
+    .bind(doc)
+    .bind(&baseline)
+    .bind(since - chrono::Duration::hours(2))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    for (i, u) in parked.iter().enumerate() {
+        db.insert_row(doc, None, u, None, since - minutes(60 - i as i64))
+            .await;
+    }
+    let e4 = edit_by_client_3(&o.t0, 2, "four");
+    let e5 = edit_by_client_3(&o.t0, 1, "five");
+    assert_eq!(db.append(doc, 2, &e4).await, 4);
+    assert_eq!(db.append(doc, 2, &e5).await, 5);
+    let g = common::fixtures::para(9, "gap text");
+    let rows: [&[u8]; 5] = [&o.t0, &o.t2, &o.t3, &e4, &e5];
+    let allowed = insertions_of_all(&rows).merge(&insertions(&g));
+    // A fixed room's snapshot at rev 5: the rows, without the baseline's
+    // phantoms, plus G.
+    let room: Vec<&[u8]> = rows.iter().copied().chain([g.as_slice()]).collect();
+    db.snapshot(doc, 5, &state_of(room)).await;
+    build_clean(&b, doc).await;
+
+    // What 0.9.14 wrote at rev 4: the baseline's raw bytes, rows 1-4 and G.
+    let v1_gap = {
+        let mut r = knot_history::Replayer::new(knot_history::ReplayMode::Gc);
+        r.merge_state(&baseline);
+        for u in &rows[..4] {
+            r.apply(u);
+        }
+        r.merge_state(&g);
+        r.encode_state()
+    };
+    // The ids the baseline names past its trusted prefix: its shifted
+    // blocks, and the blocks it held past a gap.
+    let phantoms = insertions(&baseline).diff(&insertions(
+        &knot_history::replay::trusted_prefix(&baseline).expect("the prefix"),
+    ));
+    assert!(
+        holds_ids(&insertions(&v1_gap).intersect(&phantoms)),
+        "fixture: version 1's gap checkpoint meets the baseline's phantom ids"
+    );
+    version_1_gap_checkpoint(&db, doc, 4, &v1_gap).await;
+    db.exec(
+        "UPDATE doc_history_state SET builder_version = 1, rebuilds = 2 WHERE doc_id = $1",
+        doc,
+    )
+    .await;
+
+    let rebuilt = b.build_page(doc).await;
+    assert!(matches!(rebuilt, PassResult::Genesis { .. }), "{rebuilt:?}");
+    assert_eq!(BUILDER_VERSION, 2);
+    let s = db.state(doc).await;
+    assert_eq!((s.builder_version, s.rebuilds), (BUILDER_VERSION, 0));
+    build_clean(&b, doc).await;
+    assert!(
+        !db.checkpoints(doc)
+            .await
+            .iter()
+            .any(|c| c.rev == 4 && c.kind == "gap"),
+        "version 1's gap checkpoint survived"
+    );
+    names_only(&db, doc, &allowed).await;
+    let entries = db.entries(doc).await;
+    let gaps = of_kind(&entries, "gap");
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0].end_rev, Some(5));
+    assert!(within(&gaps[0].inserted(), &insertions(&g)));
+
+    db.append(doc, 0, &o.t1).await;
+    db.append(doc, 0, &o.t2b).await;
+    build_clean(&b, doc).await;
+    names_only(
+        &db,
+        doc,
+        &allowed.merge(&insertions_of_all(&[&o.t1, &o.t2b])),
+    )
+    .await;
+    assert_eq!(
+        head_xml(&db, doc).await,
+        xml_in_order(&[&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3, &e4, &e5, &g])
+    );
+}
+
+/// Ruling 14, the shifted-snapshot case. The snapshot is yrs's full state
+/// after `t0`, `t2` and `t3`: its shifted "qq" waits on `t1`, so version 1
+/// took it in as gap content when it probed the snapshot late, at a rev
+/// past `t1` (`Pass::gap` at `built_rev`): the union's fresh doc parks it,
+/// and the replay's state brings `t1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_checkpoint_derived_from_a_shifted_snapshot_is_dropped_by_the_rebuild() {
+    let db = db().await;
+    let b = db.builder(limits());
+    let doc = db.page().await;
+    let o = common::fixtures::overlapping_skips();
+    let parked: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let rows: [&[u8]; 4] = [&o.t0, &o.t2, &o.t3, &o.t1];
+    for u in rows {
+        db.append(doc, 0, u).await;
+    }
+    let shifted = yrs_full_state(&parked);
+    db.legacy_snapshot(doc, 3, &shifted).await;
+    build_clean(&b, doc).await;
+    let real = insertions_of_all(&rows);
+
+    // What version 1 left: the replay of the rows, which then took the
+    // snapshot in, phantoms and all, as gap content.
+    let v1_gap = {
+        let mut r = knot_history::Replayer::new(knot_history::ReplayMode::Gc);
+        for u in rows {
+            r.apply(u);
+        }
+        r.union(&shifted);
+        r.encode_state()
+    };
+    let phantoms = insertions(&v1_gap).diff(&real);
+    assert!(holds_ids(&phantoms), "fixture: the union took phantoms in");
+    version_1_gap_checkpoint(&db, doc, 4, &v1_gap).await;
+    sqlx::query(
+        "INSERT INTO doc_history_entries
+             (doc_id, kind, started_at, ended_at, start_rev, end_rev, sealed, ins_ids)
+         VALUES ($1, 'gap', now() - interval '1 day', now() - interval '1 day', 4, 4, true, $2)",
+    )
+    .bind(doc)
+    .bind(yrs::updates::encoder::Encode::encode_v1(&phantoms))
+    .execute(&db.pool)
+    .await
+    .expect("gap entry");
+    db.exec(
+        "UPDATE doc_history_state SET builder_version = 1 WHERE doc_id = $1",
+        doc,
+    )
+    .await;
+
+    let rebuilt = b.build_page(doc).await;
+    assert!(matches!(rebuilt, PassResult::Genesis { .. }), "{rebuilt:?}");
+    build_clean(&b, doc).await;
+    assert!(
+        !db.checkpoints(doc).await.iter().any(|c| c.kind == "gap"),
+        "a gap checkpoint survived"
+    );
+    assert!(of_kind(&db.entries(doc).await, "gap").is_empty());
+    names_only(&db, doc, &real).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_checkpoint_version_2_derived_from_an_old_snapshot_survives_a_rebuild() {
+    let db = db().await;
+    let b = db.builder(limits());
+    let doc = db.page().await;
+    let mut h = History::new(1);
+    for text in ["one", "two"] {
+        let u = typed(&mut h, 0, text);
+        db.append(doc, 0, &u).await;
+    }
+    let (s, g) = with_paragraph(9, &db.state_at(doc, 2).await, "gap para");
+    db.snapshot_at(doc, 2, &s, Utc::now() - chrono::Duration::days(30))
+        .await;
+    let installed = installed_on(&db).await;
+    let written: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT created_at FROM doc_snapshots WHERE doc_id = $1")
+            .bind(doc)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(
+        written < installed,
+        "fixture: the snapshot predates the fix"
+    );
+    build_clean(&b, doc).await;
+    let gap_at = |cps: &[common::db::Checkpoint]| {
+        cps.iter()
+            .find(|c| c.kind == "gap" && c.rev == 2)
+            .map(|c| c.created_at)
+    };
+    let cps = db.checkpoints(doc).await;
+    assert_eq!(
+        gap_at(&cps),
+        Some(written),
+        "a gap checkpoint dated by its snapshot"
+    );
+    let genesis_cp = cps.iter().find(|c| c.kind == "genesis").expect("genesis");
+    assert!(genesis_cp.created_at >= installed);
+
+    // A rejected starting checkpoint's rebuild, after the snapshot was
+    // thinned.
+    db.exec(
+        "UPDATE doc_history_state SET builder_version = 0 WHERE doc_id = $1",
+        doc,
+    )
+    .await;
+    db.exec("DELETE FROM doc_snapshots WHERE doc_id = $1", doc)
+        .await;
+    let rebuilt = b.build_page(doc).await;
+    assert!(matches!(rebuilt, PassResult::Genesis { .. }), "{rebuilt:?}");
+    build_clean(&b, doc).await;
+    assert_eq!(gap_at(&db.checkpoints(doc).await), Some(written));
+    let entries = db.entries(doc).await;
+    let gaps = of_kind(&entries, "gap");
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0].end_rev, Some(2));
+    assert!(within(&gaps[0].inserted(), &insertions(&g)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_0_page_whose_genesis_predates_the_migration_drops_its_version_1_gap_checkpoints()
+{
+    let db = db().await;
+    let b = db.builder(limits());
+    let doc = db.page().await;
+    let mut h = History::new(1);
+    let mut rows = Vec::new();
+    for text in ["one", "two"] {
+        let u = typed(&mut h, 0, text);
+        db.append(doc, 0, &u).await;
+        rows.push(u);
+    }
+    build_clean(&b, doc).await;
+    db.exec(
+        "UPDATE doc_history_checkpoints
+            SET created_at = (SELECT installed_on FROM _sqlx_migrations
+                               WHERE version = 20261114140000) - interval '1 day'
+          WHERE doc_id = $1 AND kind = 'genesis'",
+        doc,
+    )
+    .await;
+    let v1 = common::fixtures::para(9, "v1 gap");
+    let v1_gap = {
+        let mut r = knot_history::Replayer::new(knot_history::ReplayMode::Gc);
+        r.apply(&rows[0]);
+        r.merge_state(&v1);
+        r.encode_state()
+    };
+    version_1_gap_checkpoint(&db, doc, 1, &v1_gap).await;
+    db.exec(
+        "UPDATE doc_history_state SET builder_version = 0 WHERE doc_id = $1",
+        doc,
+    )
+    .await;
+
+    let rebuilt = b.build_page(doc).await;
+    assert!(matches!(rebuilt, PassResult::Genesis { .. }), "{rebuilt:?}");
+    build_clean(&b, doc).await;
+    let gone = insertions(&v1);
+    for c in db.checkpoints(doc).await {
+        assert!(
+            !holds_ids(&insertions(&c.state_bytes).intersect(&gone)),
+            "the {} checkpoint at rev {} holds \"v1 gap\"",
+            c.kind,
+            c.rev
+        );
+    }
+    for e in db.entries(doc).await {
+        assert!(!holds_ids(&e.inserted().intersect(&gone)), "{e:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_version_1_failed_to_probe_is_probed_by_version_2() {
+    let db = db().await;
+    let b = db.builder(limits());
+    let doc = db.page().await;
+    let mut h = History::new(1);
+    for text in ["one", "two", "three"] {
+        let u = typed(&mut h, 0, text);
+        db.append(doc, 0, &u).await;
+    }
+    let (s, g) = with_paragraph(9, &db.state_at(doc, 2).await, "gap para");
+    db.snapshot(doc, 2, &s).await;
+    // As version 1 left it after a failed probe: built, the snapshot
+    // skipped.
+    assert_eq!(b.build_page(doc).await, genesis(0));
+    db.exec(
+        "UPDATE doc_history_state SET skip_snapshots = '{2}' WHERE doc_id = $1",
+        doc,
+    )
+    .await;
+    build_clean(&b, doc).await;
+    assert!(
+        of_kind(&db.entries(doc).await, "gap").is_empty(),
+        "fixture: the snapshot was skipped"
+    );
+    db.exec(
+        "UPDATE doc_history_state SET builder_version = 1 WHERE doc_id = $1",
+        doc,
+    )
+    .await;
+
+    let rebuilt = b.build_page(doc).await;
+    assert!(matches!(rebuilt, PassResult::Genesis { .. }), "{rebuilt:?}");
+    build_clean(&b, doc).await;
+    assert!(db.state(doc).await.skip_snapshots.is_empty());
+    let entries = db.entries(doc).await;
+    let gaps = of_kind(&entries, "gap");
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0].end_rev, Some(2));
+    assert!(within(&gaps[0].inserted(), &insertions(&g)));
 }

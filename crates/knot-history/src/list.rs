@@ -164,15 +164,21 @@ pub async fn list_entries(
 ) -> Result<Option<HistoryPage>, sqlx::Error> {
     // Never decodes `retry_after` (Global Constraints: 'infinity' panics
     // chrono); a page with neither a heads nor a state row is not catching
-    // up.
+    // up. A page below `BUILDER_VERSION`, given up or not, lists as
+    // catching up (not unavailable) until a builder of this version has
+    // rebuilt or given it up (Ruling 14): its entries are an older
+    // builder's, whose ids change at the rebuild.
     let status: Option<(DateTime<Utc>, bool, bool, bool)> = sqlx::query_as(
         "SELECT d.history_since,
                 d.created_at >= d.history_since AS history_complete,
-                coalesce(s.retry_after = 'infinity', false) AS unavailable,
-                (NOT coalesce(s.retry_after = 'infinity', false)
-                 AND ((s.doc_id IS NULL AND coalesce(h.dirty, false))
-                      OR (s.doc_id IS NOT NULL AND s.genesis_rev IS NULL)
-                      OR coalesce(s.built_rev, 0) < coalesce(h.head_rev, 0) - $2)) AS catching_up
+                coalesce(s.retry_after = 'infinity', false)
+                  AND NOT coalesce(s.builder_version < $3, false) AS unavailable,
+                ((s.doc_id IS NOT NULL AND s.builder_version < $3)
+                 OR (NOT coalesce(s.retry_after = 'infinity', false)
+                     AND ((s.doc_id IS NULL AND coalesce(h.dirty, false))
+                          OR (s.doc_id IS NOT NULL AND s.genesis_rev IS NULL)
+                          OR coalesce(s.built_rev, 0) < coalesce(h.head_rev, 0) - $2)))
+                  AS catching_up
            FROM documents d
            LEFT JOIN doc_history_state s ON s.doc_id = d.id
            LEFT JOIN doc_history_heads h ON h.doc_id = d.id
@@ -180,6 +186,7 @@ pub async fn list_entries(
     )
     .bind(doc_id)
     .bind(CATCHING_UP_REVS)
+    .bind(crate::builder::BUILDER_VERSION)
     .fetch_optional(pool)
     .await?;
     let Some((history_since, history_complete, unavailable, catching_up)) = status else {

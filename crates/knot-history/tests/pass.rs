@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use common::underflow::skip_underflow_case;
+use common::fixtures::skip_underflow_case;
 use common::{Client, History, at, author};
 use knot_history::canonical::visible_content;
 use knot_history::{
@@ -142,11 +142,13 @@ fn extra_paragraph_by(client: u64, state: &[u8], text: &str) -> Vec<u8> {
     })
 }
 
+/// A fixed room's snapshot (`pending_revs` not NULL).
 fn snapshot(rev: i64, created_at: DateTime<Utc>, state: Vec<u8>) -> SnapshotProbe {
     SnapshotProbe {
         rev,
         created_at,
         state_bytes: Some(state),
+        legacy: false,
     }
 }
 
@@ -827,6 +829,7 @@ fn an_oversized_snapshot_is_left_unchecked() {
         rev: 2,
         created_at: at(2),
         state_bytes: None,
+        legacy: false,
     };
     let mut inp = input(empty_state(), h.rows());
     inp.snapshots = vec![too_large.clone()];
@@ -2345,4 +2348,192 @@ fn checkpoint_state_vectors_are_encoded_in_client_order() {
         let decoded = Replayer::from_state(ReplayMode::Gc, &cp.state_bytes).unwrap();
         assert_eq!(decoded.state_vector(), cp.state_vector);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots and baselines that may be shifted (Rulings 13 and 15)
+// ---------------------------------------------------------------------------
+
+/// The rows `updates`, by A, a minute apart from rev 1.
+fn rows_of(updates: &[&[u8]]) -> Vec<DocUpdate> {
+    let mut h = History::new(0);
+    for (i, u) in updates.iter().enumerate() {
+        h.edit_at(0, u.to_vec(), at(i as i64));
+    }
+    h.rows().to_vec()
+}
+
+/// yrs's own full state of a doc that applied `updates` in order: what
+/// every room wrote before the fix, shifted when the doc's pending update
+/// holds overlapping Skips.
+fn yrs_full_state(updates: &[&[u8]]) -> Vec<u8> {
+    let doc = Doc::new();
+    for u in updates {
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(u).unwrap())
+            .unwrap();
+    }
+    doc.transact()
+        .encode_state_as_update_v1(&StateVector::default())
+}
+
+/// The insertions of every update in `updates`.
+fn insertions_of_all(updates: &[&[u8]]) -> IdSet {
+    updates
+        .iter()
+        .fold(IdSet::new(), |acc, u| acc.merge(&insertions_of(u)))
+}
+
+fn probe(rev: i64, legacy: bool, state: Vec<u8>) -> SnapshotProbe {
+    SnapshotProbe {
+        rev,
+        created_at: at(rev),
+        state_bytes: Some(state),
+        legacy,
+    }
+}
+
+/// The text of what `updates` give applied in order.
+fn text_in_order(updates: &[&[u8]]) -> String {
+    let doc = Doc::new();
+    for u in updates {
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(u).unwrap())
+            .unwrap();
+    }
+    xml_of(&doc)
+}
+
+#[test]
+fn a_legacy_snapshot_that_may_be_shifted_is_left_unchecked() {
+    let o = common::fixtures::overlapping_skips();
+    let parked: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let rows = rows_of(&parked);
+    let mut inp = input(empty_state(), &rows);
+    inp.snapshots = vec![probe(3, true, yrs_full_state(&parked))];
+    let out = pass(inp);
+    assert_eq!(out.stats.snapshots_unchecked.get("pending"), Some(&1));
+    assert!(of_kind(&out.entries, EntryKind::Gap).is_empty());
+    assert_eq!(out.stats.gaps, 0);
+}
+
+#[test]
+fn a_legacy_snapshot_with_nothing_pending_is_probed() {
+    let o = common::fixtures::overlapping_skips();
+    let in_order: [&[u8]; 5] = [&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3];
+    let rows = rows_of(&in_order);
+    let mut inp = input(empty_state(), &rows);
+    inp.snapshots = vec![probe(5, true, yrs_full_state(&in_order))];
+    let out = pass(inp);
+    assert!(
+        out.stats.snapshots_unchecked.is_empty(),
+        "{:?}",
+        out.stats.snapshots_unchecked
+    );
+    assert!(of_kind(&out.entries, EntryKind::Gap).is_empty());
+    assert_eq!(out.snapshot_checked_rev, 5);
+}
+
+#[test]
+fn a_snapshot_with_pending_revs_is_probed() {
+    let o = common::fixtures::overlapping_skips();
+    let parked: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let rows = rows_of(&parked);
+    // The pending-free state, through yrs's encoder form (which skips
+    // `merge_pending_v1`), as a fixed room writes it.
+    let pending_free = {
+        let doc = Doc::new();
+        for u in parked {
+            doc.transact_mut()
+                .apply_update(Update::decode_v1(u).unwrap())
+                .unwrap();
+        }
+        let mut encoder = yrs::updates::encoder::EncoderV1::new();
+        doc.transact()
+            .encode_state_as_update(&StateVector::default(), &mut encoder);
+        yrs::updates::encoder::Encoder::to_vec(encoder)
+    };
+    let mut inp = input(empty_state(), &rows);
+    inp.snapshots = vec![probe(3, false, pending_free)];
+    let out = pass(inp);
+    assert!(
+        out.stats.snapshots_unchecked.is_empty(),
+        "{:?}",
+        out.stats.snapshots_unchecked
+    );
+    assert!(of_kind(&out.entries, EntryKind::Gap).is_empty());
+    assert_eq!(out.snapshot_checked_rev, 3);
+}
+
+#[test]
+fn genesis_starts_from_the_trusted_prefix_of_a_baseline_that_may_be_shifted() {
+    let o = common::fixtures::overlapping_skips();
+    let parked: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let mut h = History::new(0);
+    for (i, u) in parked.iter().enumerate() {
+        h.edit_at(0, u.to_vec(), at(-200 + i as i64));
+    }
+    let mut inp = genesis_input(3, h.rows());
+    inp.baselines = vec![BaselineInput {
+        id: 1,
+        snapshot_seq: 3,
+        state_bytes: Some(yrs_full_state(&parked)),
+        created_at: at(-150),
+    }];
+    let g = build_genesis(inp).expect("genesis");
+    let held = insertions_of(&g.checkpoint.state_bytes);
+    let real = insertions_of_all(&parked);
+    assert!(
+        contains(&real, &held),
+        "the genesis state names a phantom: {:?}",
+        held.diff(&real)
+    );
+
+    h.edit_at(0, o.t1.clone(), at(0));
+    h.edit_at(0, o.t2b.clone(), at(1));
+    let mut inp = input(g.checkpoint.state_bytes.clone(), &h.rows()[3..]);
+    inp.checkpoint_rev = 3;
+    inp.genesis_rev = 3;
+    inp.built_rev = 3;
+    inp.snapshot_checked_rev = 3;
+    inp.claims = g.claims.clone();
+    inp.reapply = reapply_of(&g.checkpoint, h.rows());
+    let out = pass(inp);
+    assert_eq!(out.built_rev, 5);
+    let head = window(&g.checkpoint, h.rows(), 5, &[], &BTreeSet::new());
+    let in_order: [&[u8]; 5] = [&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3];
+    assert_eq!(
+        xml_of(head.doc()),
+        text_in_order(&in_order),
+        "a later real block was trimmed as already held"
+    );
+}
+
+#[test]
+fn genesis_starts_from_a_baseline_with_nothing_pending_as_it_is() {
+    let o = common::fixtures::overlapping_skips();
+    let in_order: [&[u8]; 5] = [&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3];
+    let mut h = History::new(0);
+    for (i, u) in in_order.iter().enumerate() {
+        h.edit_at(0, u.to_vec(), at(-200 + i as i64));
+    }
+    let baseline = yrs_full_state(&in_order);
+    let mut inp = genesis_input(5, h.rows());
+    inp.baselines = vec![BaselineInput {
+        id: 1,
+        snapshot_seq: 5,
+        state_bytes: Some(baseline.clone()),
+        created_at: at(-150),
+    }];
+    let g = build_genesis(inp).expect("genesis");
+    let of = |state: &[u8]| {
+        let r = Replayer::from_state(ReplayMode::Gc, state).unwrap();
+        let txn = r.doc().transact();
+        (
+            txn.state_vector(),
+            txn.snapshot().delete_set,
+            xml_of(r.doc()),
+        )
+    };
+    assert_eq!(of(&g.checkpoint.state_bytes), of(&baseline));
 }

@@ -41,7 +41,14 @@ use crate::words::{WordCounts, entry_word_counts};
 
 /// The builder's version: a page built by an older one is rebuilt, a page
 /// built by a newer one is left alone.
-pub const BUILDER_VERSION: i32 = 1;
+///
+/// 2 rebuilds every page that 0.9.12 to 0.9.14 built (Ruling 14): their
+/// genesis started from a baseline's raw bytes, which yrs's shifted
+/// encoding of pending content can fill with phantoms, so genesis now
+/// starts from a baseline's trusted prefix, and the rebuild drops the gap
+/// checkpoints version 1 derived (`store::drop_version_1_gaps`). A later
+/// PR that changes what the builder writes bumps it again.
+pub const BUILDER_VERSION: i32 = 2;
 /// How often the builder looks for dirty pages.
 pub const TICK: Duration = Duration::from_secs(2);
 /// Passes a loop keeps queued at once (they wait for a builder slot).
@@ -1007,6 +1014,13 @@ impl Run<'_> {
             };
             return match store::write_genesis(&self.b.pool, self.doc_id, self.b.id, &out).await {
                 Ok(Write::Done) => {
+                    if let Some(baseline_id) = out.from_prefix {
+                        tracing::info!(
+                            doc_id = %self.doc_id,
+                            baseline_id,
+                            "the baseline may hold misplaced text; genesis starts from its trusted prefix"
+                        );
+                    }
                     record_stats(&out.stats);
                     PassResult::Genesis {
                         genesis_rev: out.checkpoint.rev,

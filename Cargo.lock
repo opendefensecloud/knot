@@ -2024,6 +2024,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures-util",
+ "knot-history",
  "knot-storage",
  "knot-test-support",
  "metrics",

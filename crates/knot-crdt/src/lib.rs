@@ -8,6 +8,7 @@ pub mod gc;
 pub mod hydrate;
 pub mod move_blocks;
 pub mod nesting;
+pub mod pending;
 pub mod presence;
 pub mod protocol;
 pub mod registry;

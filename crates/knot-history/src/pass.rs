@@ -111,6 +111,12 @@ pub struct SnapshotProbe {
     /// `None`: too large to probe even alone (Rulings); the pass leaves it
     /// unchecked (`too_large`) when it reaches its rev.
     pub state_bytes: Option<Vec<u8>>,
+    /// Written before the fix, or by an older pod during the rollout
+    /// (`doc_snapshots.pending_revs IS NULL`): its bytes may hold yrs
+    /// 0.27.3's shifted encoding of pending content. The pass leaves such a
+    /// snapshot unchecked (`pending`) when its bytes may be shifted
+    /// ([`crate::replay::may_be_shifted`], Ruling 13).
+    pub legacy: bool,
 }
 
 /// A gap checkpoint above `built_rev` that a rebuild kept (Rulings, gap
@@ -798,6 +804,12 @@ impl Pass<'_> {
             self.unchecked("too_large");
             return Ok(());
         };
+        // Its phantoms, misplaced blocks at ids the log never had, would
+        // read as gap content (Ruling 13).
+        if snapshot.legacy && crate::replay::may_be_shifted(bytes) {
+            self.unchecked("pending");
+            return Ok(());
+        }
         if self.progress.is_cancelled() {
             return Err(ReplayError::Cancelled);
         }
