@@ -2,7 +2,6 @@
 
 pub mod db;
 pub mod metrics;
-pub mod underflow;
 
 #[path = "../../../knot-crdt/tests/common/fixtures.rs"]
 pub mod fixtures;

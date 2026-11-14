@@ -418,8 +418,9 @@ impl Replayer {
     /// starts after clock 0 only where a Skip of the doc ends, which is
     /// where a range of `past_gap` starts. So: some GC block of the update
     /// starts before the start of a `past_gap` range of its client and ends
-    /// after it. `tests/common/underflow.rs` holds the reproducer: a GC
-    /// block 2#0..2#3 over the doc's Skip 2#0..2#2 and its held 2#2.
+    /// after it. knot-crdt's `tests/common/fixtures.rs` holds the reproducer
+    /// (`skip_underflow_case`): a GC block 2#0..2#3 over the doc's Skip
+    /// 2#0..2#2 and its held 2#2.
     ///
     /// yrs does not expose an update's blocks; a decoded update's items are
     /// never marked deleted (yrs marks them on integration), so its GC

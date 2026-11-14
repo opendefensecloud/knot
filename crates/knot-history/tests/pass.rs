@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use common::underflow::skip_underflow_case;
+use common::fixtures::skip_underflow_case;
 use common::{Client, History, at, author};
 use knot_history::canonical::visible_content;
 use knot_history::{

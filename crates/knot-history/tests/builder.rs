@@ -13,7 +13,7 @@ use common::db::{
     is_built, keys, limits, limits_with, oversized_snapshot_page, page_with_gaps, page_with_rows,
     state_of, typed, visible, with_paragraph,
 };
-use common::underflow::skip_underflow_case;
+use common::fixtures::skip_underflow_case;
 use common::{Client, History, author};
 use knot_history::builder::{DEBOUNCE_MAX_LAG_REVS, MAX_FAILURES, MAX_REBUILDS};
 use knot_history::{BUILDER_VERSION, PassResult, history_permits};

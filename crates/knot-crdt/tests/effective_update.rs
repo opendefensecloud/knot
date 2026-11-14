@@ -20,174 +20,26 @@
 //! that replays only the persisted bytes always hold the same state, pending
 //! content included.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+#[path = "common/fixtures.rs"]
+mod fixtures;
+#[path = "common/interleave.rs"]
+mod interleave;
 
+use fixtures::Rng;
+use interleave::{Client, delete_before_insert, deliveries, has_gaps};
 use knot_crdt::nesting::MAX_NESTING;
 use knot_crdt::{ApplyMeasured, DocHandle, Engine, YrsEngine};
 use yrs::types::Attrs;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{
-    Any, Doc, GetString, ID, IdSet, ReadTxn, StateVector, Subscription, Text, Transact, Update,
-    XmlElementPrelim, XmlFragment, XmlFragmentRef, XmlOut, XmlTextPrelim, XmlTextRef,
+    Any, GetString, ReadTxn, StateVector, Text, Transact, Update, XmlElementPrelim, XmlFragment,
+    XmlTextPrelim,
 };
 
 /// Seeds the property runs, and steps per seed.
 const SEEDS: u64 = 300;
 const STEPS: usize = 60;
-
-/// A seeded xorshift64: the histories are reproducible from the seed alone.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        // Spread small seeds over the state and keep it non-zero.
-        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    /// Uniform in `0..n` (`n > 0`).
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    /// True with probability `pct` percent.
-    fn chance(&mut self, pct: u64) -> bool {
-        self.next() % 100 < pct
-    }
-
-    fn word(&mut self) -> String {
-        let len = 1 + self.below(6);
-        (0..len)
-            .map(|_| char::from(b'a' + self.below(26) as u8))
-            .collect()
-    }
-}
-
-/// One editor: a yrs doc with its own client id, the updates of its own
-/// transactions that it has not delivered yet, and the updates it holds back
-/// to deliver late.
-struct Client {
-    doc: Doc,
-    frag: XmlFragmentRef,
-    /// Each local transaction's own update (`observe_update_v1`), in order,
-    /// since the client's last delivery.
-    undelivered: Arc<Mutex<Vec<Vec<u8>>>>,
-    /// Off while the client applies what it pulls from the server, so only
-    /// its own transactions are recorded.
-    recording: Arc<AtomicBool>,
-    held: Vec<Vec<u8>>,
-    _sub: Subscription,
-}
-
-impl Client {
-    fn new(id: u64) -> Self {
-        let doc = Doc::with_client_id(id);
-        let frag = doc.get_or_insert_xml_fragment("default");
-        let undelivered = Arc::new(Mutex::new(Vec::new()));
-        let recording = Arc::new(AtomicBool::new(true));
-        let sub = {
-            let undelivered = undelivered.clone();
-            let recording = recording.clone();
-            doc.observe_update_v1(move |_, e| {
-                if recording.load(Ordering::SeqCst) {
-                    undelivered.lock().unwrap().push(e.update.clone());
-                }
-            })
-            .expect("observe_update_v1")
-        };
-        Client {
-            doc,
-            frag,
-            undelivered,
-            recording,
-            held: Vec::new(),
-            _sub: sub,
-        }
-    }
-
-    fn take_undelivered(&self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut *self.undelivered.lock().unwrap())
-    }
-
-    /// Apply what the server holds that this client lacks, as a client does
-    /// on sync, without recording it as the client's own.
-    fn pull(&self, server: &DocHandle) {
-        let sv = self.doc.transact().state_vector();
-        let diff = server.inner().transact().encode_state_as_update_v1(&sv);
-        self.recording.store(false, Ordering::SeqCst);
-        self.doc
-            .transact_mut()
-            .apply_update(Update::decode_v1(&diff).expect("decode pull"))
-            .expect("apply pull");
-        self.recording.store(true, Ordering::SeqCst);
-    }
-
-    /// The text of the paragraph at `i`, if it is a paragraph with one.
-    fn text_of(&self, txn: &impl ReadTxn, i: u32) -> Option<XmlTextRef> {
-        let Some(XmlOut::Element(p)) = self.frag.get(txn, i) else {
-            return None;
-        };
-        match p.get(txn, 0) {
-            Some(XmlOut::Text(t)) => Some(t),
-            _ => None,
-        }
-    }
-
-    /// One local edit, in its own transaction: insert a paragraph, insert or
-    /// delete text inside one, format a range, or remove a paragraph.
-    fn edit(&self, rng: &mut Rng) {
-        let mut txn = self.doc.transact_mut();
-        let paragraphs = self.frag.len(&txn);
-        if paragraphs == 0 || rng.chance(25) {
-            let at = rng.below(paragraphs as usize + 1) as u32;
-            let p = self
-                .frag
-                .insert(&mut txn, at, XmlElementPrelim::empty("paragraph"));
-            p.push_back(&mut txn, XmlTextPrelim::new(rng.word()));
-            return;
-        }
-        let i = rng.below(paragraphs as usize) as u32;
-        let Some(text) = self.text_of(&txn, i) else {
-            self.frag.remove_range(&mut txn, i, 1);
-            return;
-        };
-        let len = text.len(&txn);
-        match rng.below(10) {
-            0..=3 => {
-                let at = rng.below(len as usize + 1) as u32;
-                text.insert(&mut txn, at, &rng.word());
-            }
-            4..=6 if len > 0 => {
-                let at = rng.below(len as usize) as u32;
-                let n = 1 + rng.below((len - at) as usize) as u32;
-                text.remove_range(&mut txn, at, n);
-            }
-            7..=8 if len > 0 => {
-                let at = rng.below(len as usize) as u32;
-                let n = 1 + rng.below((len - at) as usize) as u32;
-                let mark = ["bold", "italic", "code"][rng.below(3)];
-                let value = if rng.chance(70) {
-                    Any::Bool(true)
-                } else {
-                    Any::Null
-                };
-                let attrs: Attrs = [(mark.into(), value)].into_iter().collect();
-                text.format(&mut txn, at, n, attrs);
-            }
-            _ => self.frag.remove_range(&mut txn, i, 1),
-        }
-    }
-}
 
 /// The three server-side docs: `raw` applies every delivered byte string,
 /// `live` (the room's doc) applies it measured, and `log` applies only what
@@ -281,39 +133,6 @@ impl Server {
     }
 }
 
-/// Whether `d` holds blocks past a gap in their client's clock. yrs 0.27
-/// integrates a block whose own dependencies it has even when earlier
-/// blocks of its client are missing, behind a Skip, and its state vector
-/// stops at the gap. Such a doc's state diff from that clock re-sends the
-/// blocks past the gap, and yrs 0.27 panics applying a block that runs from
-/// inside a gap into blocks the doc already holds (`block_store.rs:318`),
-/// whether the doc is a client pulling from the server or the server taking
-/// a client's reconnect resend. The generator does neither while the server
-/// holds a gap: that panic is yrs's, on the raw update as much as on the
-/// effective one, so it says nothing about the property.
-fn has_gaps(d: &DocHandle) -> bool {
-    let txn = d.inner().transact();
-    let sv = txn.state_vector();
-    // Blocks past the state vector, less the pending structs, which the
-    // full state also re-encodes but which are not in the block store.
-    let full = txn.encode_state_as_update_v1(&StateVector::default());
-    let held = Update::decode_v1(&full)
-        .expect("decode full state")
-        .insertions(true);
-    let mut past = IdSet::new();
-    for (client, ranges) in held.iter() {
-        let clock = sv.get(client);
-        for r in ranges.iter().filter(|r| r.end > clock) {
-            let start = r.start.max(clock);
-            past.insert(ID::new(*client, start), r.end - start);
-        }
-    }
-    if let Some(p) = txn.store().pending_update() {
-        past.diff_with(&p.update.insertions(true));
-    }
-    past.iter().any(|(_, ranges)| !ranges.is_empty())
-}
-
 /// Fails, naming the seed, unless `a` and `b` hold the same state: state
 /// vector, delete set, the fragment's content, and the same pending structs
 /// and pending deletes (not only whether either is set).
@@ -338,75 +157,11 @@ fn assert_same_state(a: &DocHandle, b: &DocHandle, seed: u64) {
     assert_eq!(pd_a, pd_b, "seed {seed}: pending deletes differ");
 }
 
-/// The fixed delete-before-insert step: `c` creates a paragraph with text
-/// (U1), deletes part of that text (U2), and delivers U2 alone first. U2's
-/// update carries only a delete set over items the server lacks, so the
-/// server parks a pending delete set and no structs. U1 is held back and
-/// arrives later.
-fn delete_before_insert(c: &mut Client, server: &Server, seed: u64, counts: &mut Counts) {
-    {
-        let mut txn = c.doc.transact_mut();
-        let at = c.frag.len(&txn);
-        let p = c
-            .frag
-            .insert(&mut txn, at, XmlElementPrelim::empty("paragraph"));
-        p.push_back(&mut txn, XmlTextPrelim::new("abcdef"));
-    }
-    {
-        let mut txn = c.doc.transact_mut();
-        let at = c.frag.len(&txn) - 1;
-        let text = c.text_of(&txn, at).expect("the paragraph just made");
-        text.remove_range(&mut txn, 1, 3);
-    }
-    let mut own = c.undelivered.lock().unwrap();
-    let u2 = own.pop().expect("U2 recorded");
-    let u1 = own.pop().expect("U1 recorded");
-    drop(own);
-    let before = counts.parked_deletes_only;
-    server.deliver(&u2, seed, counts);
-    assert_eq!(
-        counts.parked_deletes_only,
-        before + 1,
-        "seed {seed}: U2 alone should park a delete set and no structs"
-    );
-    c.held.push(u1);
-}
-
-/// One delivery from `c`, chosen at random: its incremental update since
-/// its last delivery (merged, or each transaction's own update in turn,
-/// possibly holding one transaction or the whole increment back), a
-/// reconnect resend against the server's state vector, or one of its
-/// held-back updates, late.
-fn deliveries(c: &mut Client, server: &Server, rng: &mut Rng) -> Vec<Vec<u8>> {
-    let pick = rng.below(100);
-    if pick < 20 && !c.held.is_empty() {
-        let i = rng.below(c.held.len());
-        return vec![c.held.remove(i)];
-    }
-    if pick < 45 && !has_gaps(&server.live) {
-        // Reconnect: SyncStep2 against the server's state vector carries
-        // everything the server lacks plus the client's whole delete set.
-        c.take_undelivered();
-        let sv = server.live.inner().transact().state_vector();
-        return vec![c.doc.transact().encode_state_as_update_v1(&sv)];
-    }
-    let mut own = c.take_undelivered();
-    if own.is_empty() {
-        return Vec::new();
-    }
-    if own.len() > 1 && rng.chance(20) {
-        let i = rng.below(own.len());
-        c.held.push(own.remove(i));
-    }
-    if rng.chance(50) {
-        return own;
-    }
-    let merged = yrs::merge_updates_v1(&own).expect("merge own updates");
-    if rng.chance(10) {
-        c.held.push(merged);
-        return Vec::new();
-    }
-    vec![merged]
+/// yrs's own state encoding, pending content merged in: what rooms sent
+/// clients before the fix, and what this property's histories were
+/// generated with.
+fn shifted(d: &DocHandle, sv: &StateVector) -> Vec<u8> {
+    d.inner().transact().encode_state_as_update_v1(sv)
 }
 
 #[test]
@@ -421,16 +176,25 @@ fn effective_update_applies_like_the_raw_update() {
             // Someone edits, sometimes after pulling what the server has.
             let editor = rng.below(clients.len());
             if rng.chance(40) && !has_gaps(&server.live) {
-                clients[editor].pull(&server.live);
+                clients[editor].pull(&server.live, shifted);
             }
             for _ in 0..1 + rng.below(3) {
                 clients[editor].edit(&mut rng);
             }
             let c = rng.below(clients.len());
             if step == fixed_step {
-                delete_before_insert(&mut clients[c], &server, seed, &mut counts);
+                // U2 alone parks a delete set and no structs; U1 is held back
+                // and arrives later.
+                let u2 = delete_before_insert(&mut clients[c]);
+                let before = counts.parked_deletes_only;
+                server.deliver(&u2, seed, &mut counts);
+                assert_eq!(
+                    counts.parked_deletes_only,
+                    before + 1,
+                    "seed {seed}: U2 alone should park a delete set and no structs"
+                );
             } else {
-                for bytes in deliveries(&mut clients[c], &server, &mut rng) {
+                for bytes in deliveries(&mut clients[c], &server.live, &mut rng) {
                     server.deliver(&bytes, seed, &mut counts);
                 }
             }

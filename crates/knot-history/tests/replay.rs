@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::underflow::skip_underflow_case;
+use common::fixtures::skip_underflow_case;
 use knot_history::{IsolateError, ReplayMode, Replayer, RowOutcome, run_isolated};
 use yrs::types::Attrs;
 use yrs::updates::decoder::Decode;
@@ -232,29 +232,6 @@ fn a_checkpoint_leaves_pending_content_to_the_rows_that_parked_it() {
     assert_eq!(state_vector_of(&again), state_vector_of(&r));
 }
 
-/// Client 1's transactions on one paragraph: "base" (t0), "WWW" after it
-/// (t1, withheld), "pp" after the "WWW" (t2, parks on t1), "zz" before
-/// "base" (t2b, withheld), then a new paragraph and "qq" inside the "WWW"
-/// (t3: the paragraph integrates past the gap t2b leaves, "qq" parks on
-/// t1).
-fn overlapping_skips_case() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let c = Doc::with_client_id(1);
-    let frag = c.get_or_insert_xml_fragment("default");
-    let t0 = txn_update(&c, |txn| {
-        let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
-        p.push_back(txn, XmlTextPrelim::new("base"));
-    });
-    let _t1 = txn_update(&c, |txn| text_of(&frag, txn, 0).insert(txn, 4, "WWW"));
-    let t2 = txn_update(&c, |txn| text_of(&frag, txn, 0).insert(txn, 7, "pp"));
-    let _t2b = txn_update(&c, |txn| text_of(&frag, txn, 0).insert(txn, 0, "zz"));
-    let t3 = txn_update(&c, |txn| {
-        let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
-        p.push_back(txn, XmlTextPrelim::new("new"));
-        text_of(&frag, txn, 0).insert(txn, 7, "qq");
-    });
-    (t0, t2, t3)
-}
-
 /// Why checkpoints leave pending content out: yrs 0.27.3 merges t3's
 /// parked remainder into the pending update without splitting its Skips,
 /// so the pending update holds overlapping Skips, and its v1 encoding (which
@@ -262,7 +239,7 @@ fn overlapping_skips_case() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 /// shifted clock: the full state names blocks the doc never had.
 #[test]
 fn a_pending_update_with_overlapping_skips_stays_out_of_the_checkpoint() {
-    let (t0, t2, t3) = overlapping_skips_case();
+    let fixtures::OverlappingSkips { t0, t2, t3, .. } = fixtures::overlapping_skips();
     let mut r = Replayer::new(ReplayMode::Gc);
     for u in [&t0, &t2, &t3] {
         applied(&mut r, u);

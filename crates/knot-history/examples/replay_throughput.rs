@@ -46,8 +46,8 @@
 //! plan is gone, since at F > 32 its 8 MiB floor does not fit even one
 //! worker in the chart's 512 Mi limit.
 
-#[path = "../tests/common/underflow.rs"]
-mod underflow;
+#[path = "../../knot-crdt/tests/common/fixtures.rs"]
+mod fixtures;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{BTreeMap, BTreeSet};
@@ -835,7 +835,7 @@ impl Growth {
 
 /// Peak heap factors of (a) a pass and (b) a word count.
 fn memory(growth: Growth) -> [f64; 2] {
-    let (doc_state, refused_row, refused_room) = underflow::skip_underflow_case();
+    let (doc_state, refused_row, refused_room) = fixtures::skip_underflow_case();
     let mut ed = Editors::new(4);
     let mut log = Log::default();
     let mut i = 0;
