@@ -28,6 +28,7 @@ knot-storage = { path = "../knot-storage" }
 [dev-dependencies]
 sqlx.workspace = true
 knot-test-support = { path = "../knot-test-support" }
+knot-history = { path = "../knot-history" }
 async-trait.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

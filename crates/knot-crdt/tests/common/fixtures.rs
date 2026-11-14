@@ -368,6 +368,23 @@ pub fn skip_underflow_case() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     )
 }
 
+/// [`skip_underflow_case`]'s doc state in two parts: `paras`, client 1's
+/// paragraphs alone (its `encode_diff_v1` against `{2: 3}`), and `t2_only`,
+/// client 2's T2 alone (against client 1's full clock), which over `paras`
+/// integrates past the gap 2#0..2#2.
+pub fn skip_underflow_parts() -> (Vec<u8>, Vec<u8>) {
+    let (state, _, _) = skip_underflow_case();
+    let doc = Doc::new();
+    doc.transact_mut()
+        .apply_update(Update::decode_v1(&state).expect("the state decodes"))
+        .expect("the state applies");
+    let txn = doc.transact();
+    let paras = txn.encode_diff_v1(&[(ClientID::new(2), 3)].into_iter().collect());
+    let client_1 = txn.state_vector().get(&ClientID::new(1));
+    let t2_only = txn.encode_diff_v1(&[(ClientID::new(1), client_1)].into_iter().collect());
+    (paras, t2_only)
+}
+
 /// yrs 0.27.3's full state (`encode_state_as_update_v1`) of a live doc
 /// that the interleaving generator built (`tests/pending_state.rs`'s
 /// property, seed 209, step 44, three clients), whose pending update holds

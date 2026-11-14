@@ -25,31 +25,52 @@
 //! Content is compared once yrs retried both docs' pending content
 //! (`settle`): which content yrs leaves stuck depends on the order updates
 //! arrived in.
+//!
+//! Boot (`knot_crdt::boot`, on the in-memory stores of
+//! `common/mem_store.rs`) re-parks pending content from the rows a
+//! snapshot names, decides which snapshots it trusts, carries legacy
+//! pending content no row holds, and applies every row through the
+//! skip-underflow guards. The reboot property checks that a room rebooted
+//! from its pending-free snapshot and the rows it names holds what the live
+//! room held (Ruling 17), through several boot generations, and that the
+//! history builder finds no gap in what such rooms wrote.
 
 #[path = "common/fixtures.rs"]
 mod fixtures;
 #[path = "common/interleave.rs"]
 mod interleave;
+#[path = "common/log_fixtures.rs"]
+mod log_fixtures;
+#[path = "common/mem_store.rs"]
+mod mem_store;
+#[allow(dead_code)]
+#[path = "../src/test_metrics.rs"]
+mod test_metrics;
 
 use fixtures::{
-    Rng, cross_client_parked, overlapping_skips, shifted_state_that_parks_nothing,
-    shifted_state_yrs_refuses,
+    Rng, cross_client_parked, overlapping_skips, overlapping_skips_as, para,
+    shifted_state_that_parks_nothing, shifted_state_yrs_refuses, skip_underflow_case,
+    skip_underflow_parts,
 };
 use interleave::{
-    Client, delete_before_insert, deliveries, has_gaps, held, holds_blocks_past_a_gap, pending_ids,
+    Client, delete_before_insert, deliveries, has_gaps, held, holds_blocks_past_a_gap,
+    join_violations, pending_ids, reboot_violations,
 };
 use knot_crdt::nesting::MAX_NESTING;
 use knot_crdt::pending::{
-    PendingV1, delete_only_update, encode_without_pending, holds_any, may_be_shifted,
+    self, PendingV1, delete_only_update, encode_without_pending, holds_any, may_be_shifted,
     names_blocks_past_a_gap, parks_when_applied, pending_update_v1, trusted_prefix,
 };
-use knot_crdt::{DocHandle, Engine, YrsEngine};
+use knot_crdt::{Boot, BootError, BootMode, DocHandle, Engine, YrsEngine};
+use knot_storage::RowsAfter;
+use log_fixtures::{assert_same_doc, text};
+use mem_store::{MemStore, RowsRead, snapshot};
 use yrs::block::ClientID;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{
-    Doc, GetString, ID, IdSet, ReadTxn, StateVector, Transact, Update, WriteTxn, XmlElementPrelim,
-    XmlFragment, XmlTextPrelim,
+    Doc, GetString, ID, IdSet, ReadTxn, StateVector, Text, Transact, Update, WriteTxn,
+    XmlElementPrelim, XmlFragment, XmlTextPrelim,
 };
 
 /// Seeds the property runs, and steps per seed.
@@ -909,4 +930,1467 @@ fn the_overlapping_skips_fixture_drains_in_order_or_on_a_forced_retry() {
         assert!(!holds_pending(late.inner()));
         assert!(same_content(in_order.inner(), late.inner()));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+/// Boots the in-memory page in `mode`.
+async fn boot_in(store: &MemStore, mode: BootMode) -> Result<Boot, BootError> {
+    knot_crdt::boot(&YrsEngine, store, store, uuid::Uuid::nil(), mode).await
+}
+
+/// A room-mode boot of the in-memory page.
+async fn room_boot(store: &MemStore) -> Boot {
+    boot_in(store, BootMode::Room)
+        .await
+        .expect("the room boots")
+}
+
+/// The update of one transaction `f` runs on `doc`.
+fn own_update(doc: &Doc, f: impl FnOnce(&mut yrs::TransactionMut)) -> Vec<u8> {
+    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sub = {
+        let out = out.clone();
+        doc.observe_update_v1(move |_, e| *out.lock().unwrap() = e.update.clone())
+            .expect("observe_update_v1")
+    };
+    f(&mut doc.transact_mut());
+    drop(sub);
+    let update = std::mem::take(&mut *out.lock().unwrap());
+    assert!(!update.is_empty(), "the transaction changed something");
+    update
+}
+
+/// A doc of `client` that applied `updates`.
+fn client_doc(client: u64, updates: &[&[u8]]) -> Doc {
+    let doc = Doc::with_client_id(client);
+    for u in updates {
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(u).expect("decodes"))
+            .expect("applies");
+    }
+    doc
+}
+
+/// An edit by `client`, on a doc that applied `updates`: `word` at index 2
+/// of the first paragraph's text ("ba|se").
+fn edit_inside_base(client: u64, updates: &[&[u8]], word: &str) -> Vec<u8> {
+    let doc = client_doc(client, updates);
+    let frag = doc.get_or_insert_xml_fragment("default");
+    own_update(&doc, |txn| {
+        let text = fixtures::text_at(&frag, txn, 0).expect("a first paragraph");
+        text.insert(txn, 2, word);
+    })
+}
+
+/// A paragraph `word` by `doc` (appended), in its own transaction.
+fn paragraph_by(doc: &Doc, word: &str) -> Vec<u8> {
+    let frag = doc.get_or_insert_xml_fragment("default");
+    own_update(doc, |txn| {
+        let p = frag.push_back(txn, XmlElementPrelim::empty("paragraph"));
+        p.push_back(txn, XmlTextPrelim::new(word));
+    })
+}
+
+/// A doc that applied `updates` through the room's measured apply.
+fn live_of(updates: &[&[u8]]) -> DocHandle {
+    let live = YrsEngine.new_doc();
+    for u in updates {
+        YrsEngine
+            .apply_update_measuring(&live, u, MAX_NESTING)
+            .expect("the measured apply");
+    }
+    live
+}
+
+/// The insertions of every update in `updates`.
+fn insertions_of(updates: &[&[u8]]) -> IdSet {
+    updates
+        .iter()
+        .fold(IdSet::new(), |acc, u| acc.merge(&insertions(u)))
+}
+
+/// The reason, `whole_log`, `refused` and `dropped == 0 && dropped_past_gap
+/// == 0` of a boot's fallback.
+fn fell_back(boot: &Boot) -> Option<(&'static str, bool, u64, bool)> {
+    boot.fallback.as_ref().map(|f| {
+        (
+            f.reason,
+            f.whole_log,
+            f.refused,
+            f.dropped == 0 && f.dropped_past_gap == 0,
+        )
+    })
+}
+
+/// The overlapping-Skips rows `t0`, `t2` and `t3` at revs 1-3, and the
+/// pending-free snapshot of a doc that applied them, at rev 3, naming revs
+/// 2 and 3.
+fn reparking_page() -> (MemStore, DocHandle) {
+    let o = overlapping_skips();
+    let store = MemStore::new();
+    for (rev, row) in [(1, &o.t0), (2, &o.t2), (3, &o.t3)] {
+        store.push_row(rev, row.clone());
+    }
+    let live = live_of(&[&o.t0, &o.t2, &o.t3]);
+    store.push_snapshot(snapshot(
+        Some(3),
+        3,
+        pending_free(live.inner()),
+        Some(vec![2, 3]),
+        false,
+    ));
+    (store, live)
+}
+
+#[tokio::test]
+async fn boot_reapplies_the_pending_rows_after_the_snapshot() {
+    let (store, live) = reparking_page();
+    let boot = room_boot(&store).await;
+    assert!(pending::claims(&live).is_some(), "fixture: pp and qq park");
+    assert_eq!(pending::claims(&boot.doc), pending::claims(&live));
+    assert_eq!(boot.parked.revs(), vec![2, 3]);
+    assert_eq!(
+        store.reads(),
+        vec![RowsRead::After(RowsAfter::Rev(3)), RowsRead::At(vec![2, 3])]
+    );
+    assert_eq!(boot.fallback, None);
+    assert!(!boot.unlogged);
+    assert!(boot.carry.is_empty());
+}
+
+#[tokio::test]
+async fn read_only_boot_loads_what_a_room_boot_loads() {
+    let (store, _) = reparking_page();
+    let room = room_boot(&store).await;
+    let read_only = boot_in(&store, BootMode::ReadOnly).await.expect("loads");
+    assert_same_doc(&read_only.doc, &room.doc, "read-only vs room");
+    assert!(read_only.parked.is_empty(), "only rooms derive parked rows");
+}
+
+/// The underflow shape at boot: the snapshot holds T2 past a gap and names
+/// the resend, whose GC block runs into T2.
+#[tokio::test]
+async fn boot_refuses_a_pending_row_that_would_underflow() {
+    let (state, resend, _) = skip_underflow_case();
+    assert!(!parks_when_applied(&state), "fixture: .0 parks nothing");
+    let store = MemStore::new();
+    store.push_row(1, resend.clone());
+    store.push_row(2, state.clone());
+    store.push_snapshot(snapshot(Some(2), 2, state.clone(), Some(vec![1]), false));
+
+    let recorder = test_metrics::CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let boot = room_boot(&store).await;
+    assert_eq!(fell_back(&boot), Some(("underflow", true, 0, true)));
+    assert!(
+        boot.unlogged,
+        "the resend is a failed row, not a skipped one"
+    );
+    let fresh = doc_of(&[&state]);
+    assert_same_doc(&boot.doc, &fresh, "the doc is .0");
+    assert!(matches!(
+        boot_in(&store, BootMode::ReadOnly).await,
+        Err(BootError::Apply(_))
+    ));
+    assert_eq!(
+        recorder.counter("knot_room_boot_fallbacks_total", &[("reason", "underflow")]),
+        1,
+        "the room boot counts; the read-only boot, which fails, does not"
+    );
+}
+
+/// Rule 3's `All` path (an unstamped legacy snapshot), which replayed
+/// unguarded before the fix: `seq 1 <= snapshot_seq` does not mean the
+/// snapshot holds row 1.
+#[tokio::test]
+async fn an_unstamped_snapshot_that_lacks_a_lower_row_does_not_skip_it() {
+    let (state, resend, _) = skip_underflow_case();
+    let (paras, t2_only) = skip_underflow_parts();
+    assert!(!may_be_shifted(&paras), "fixture: paras boot by rule 3");
+    let store = MemStore::new();
+    store.push_row(1, t2_only.clone());
+    store.push_row(2, resend.clone());
+    store.push_snapshot(snapshot(None, 2, paras.clone(), None, false));
+    let boot = room_boot(&store).await;
+    assert_eq!(fell_back(&boot), Some(("underflow", true, 0, true)));
+    assert!(boot.unlogged);
+    assert_eq!(text(&boot.doc), text(&doc_of(&[&state])));
+    assert!(matches!(
+        boot_in(&store, BootMode::ReadOnly).await,
+        Err(BootError::Apply(_))
+    ));
+
+    // The brief's own fixture: an unstamped snapshot of .0, which names a
+    // block past a gap, so `may_be_shifted` (Task 1) sends it to its
+    // trusted prefix and the whole log, where the resend applies before
+    // T2 and nothing is refused.
+    let store = MemStore::new();
+    store.push_row(1, resend);
+    store.push_row(2, state.clone());
+    store.push_snapshot(snapshot(None, 2, state, None, false));
+    let boot = room_boot(&store).await;
+    assert_eq!(boot.fallback.as_ref().map(|f| f.reason), Some("legacy"));
+    assert!(!boot.unlogged);
+}
+
+#[tokio::test]
+async fn a_refused_row_over_a_prefix_base_is_not_skipped() {
+    let o = overlapping_skips_as(5);
+    let (state, resend, _) = skip_underflow_case();
+    let store = MemStore::new();
+    let rows: [&[u8]; 5] = [&o.t0, &o.t2, &o.t3, &state, &resend];
+    for (rev, row) in (1..).zip(rows) {
+        store.push_row(rev, row.to_vec());
+    }
+    let first_four = doc_of(&rows[..4]);
+    let bytes = shifted_full(first_four.inner());
+    assert!(may_be_shifted(&bytes));
+    store.push_snapshot(snapshot(Some(5), 5, bytes, None, false));
+    let boot = room_boot(&store).await;
+    let f = boot.fallback.clone().expect("a fallback");
+    assert_eq!((f.reason, f.whole_log, f.refused), ("legacy", true, 0));
+    assert!(boot.unlogged);
+    assert!(within(&held(boot.doc.inner()), &insertions_of(&rows[..4])));
+}
+
+#[tokio::test]
+async fn a_refused_row_over_a_flagged_base_is_not_skipped() {
+    let (state, resend, _) = skip_underflow_case();
+    let store = MemStore::new();
+    store.push_row(1, state.clone());
+    store.push_row(2, resend);
+    store.push_snapshot(snapshot(Some(2), 2, state, None, true));
+    let boot = room_boot(&store).await;
+    let f = boot.fallback.clone().expect("a fallback");
+    assert_eq!((f.reason, f.whole_log, f.refused), ("rollout", true, 0));
+    assert!(boot.unlogged);
+}
+
+#[tokio::test]
+async fn a_page_without_a_snapshot_replays_its_log_through_the_guards() {
+    let (state, resend, _) = skip_underflow_case();
+    let store = MemStore::new();
+    store.push_row(1, state);
+    store.push_row(2, resend);
+    let boot = room_boot(&store).await;
+    let f = boot.fallback.clone().expect("a fallback");
+    assert_eq!((f.reason, f.whole_log, f.refused), ("underflow", true, 0));
+    assert!(boot.unlogged);
+
+    let (store, _) = reparking_page();
+    let store = {
+        let rows = store.rows();
+        let fresh = MemStore::new();
+        for r in rows {
+            fresh.push_row(r.rev.unwrap(), r.update_bytes);
+        }
+        fresh
+    };
+    let boot = room_boot(&store).await;
+    assert_eq!(boot.fallback, None);
+    assert!(!boot.unlogged);
+    assert_eq!(store.reads(), vec![RowsRead::After(RowsAfter::All)]);
+}
+
+/// Ruling 8's order: the kept rows after the rows after the snapshot. The
+/// snapshot holds `paras` and names `t2_only`; the row after it is the GC
+/// resend `.1`. Applied first, the kept row would integrate T2 past the gap
+/// 2#0..2#2 and the resend would then meet the underflow; applied last, it
+/// is trimmed by the resend's GC block.
+///
+/// The brief's live model (T2 still pending after `paras`) is not reachable
+/// with these bytes: T2 parks with `missing = {1: 0}`, and `paras` moves
+/// client 1's clock past 0, so yrs retries and T2 drains. The test pins the
+/// boot order on the store alone, and the counterfactual order on a guarded
+/// doc.
+#[tokio::test]
+async fn a_kept_row_is_applied_after_the_rows_after_the_snapshot() {
+    let (paras, t2_only) = skip_underflow_parts();
+    let (state, resend, _) = skip_underflow_case();
+    let live = live_of(&[&t2_only, &paras]);
+    assert!(
+        pending::claims(&live).is_none(),
+        "T2 drains live when paras arrives (the brief's live model is unreachable)"
+    );
+    assert_same_doc(&live, &doc_of(&[&state]), "the live doc holds .0");
+
+    let mut kept_first = pending::GuardedDoc::new(doc_of(&[&paras]));
+    assert_eq!(kept_first.apply(&t2_only), Ok(()));
+    assert_eq!(
+        kept_first.apply(&resend),
+        Err(pending::Refused::Underflow),
+        "kept rows first meet the underflow"
+    );
+
+    let store = MemStore::new();
+    store.push_row(1, t2_only.clone());
+    store.push_row(2, paras.clone());
+    store.push_row(3, resend.clone());
+    store.push_snapshot(snapshot(Some(2), 2, paras.clone(), Some(vec![1]), false));
+    let boot = room_boot(&store).await;
+    assert_eq!(boot.fallback, None);
+    assert!(!boot.unlogged);
+    assert_eq!(
+        store.reads(),
+        vec![RowsRead::After(RowsAfter::Rev(2)), RowsRead::At(vec![1])]
+    );
+    let reference = doc_of(&[&paras, &resend, &t2_only]);
+    assert_same_doc(&boot.doc, &reference, "the snapshot, row 3, then row 1");
+    let again = room_boot(&store).await;
+    assert_same_doc(&again.doc, &boot.doc, "a second boot");
+    assert!(!again.unlogged);
+    let read_only = boot_in(&store, BootMode::ReadOnly).await.expect("loads");
+    assert_eq!(text(&read_only.doc), text(&boot.doc));
+}
+
+#[tokio::test]
+async fn a_row_after_the_snapshot_that_the_guards_refuse_falls_back() {
+    let (state, resend, _) = skip_underflow_case();
+    let store = MemStore::new();
+    store.push_row(1, state.clone());
+    store.push_row(2, resend);
+    store.push_snapshot(snapshot(Some(1), 1, state, Some(vec![]), false));
+    let boot = room_boot(&store).await;
+    let f = boot.fallback.clone().expect("a fallback");
+    assert_eq!((f.reason, f.whole_log, f.refused), ("underflow", true, 0));
+    assert!(boot.unlogged);
+}
+
+/// Ruling 8's `missing_row`: a pre-0.9.9 page's GC took the row that parked
+/// t3's "qq", and a row was deleted by hand.
+#[tokio::test]
+async fn a_named_row_the_log_lacks_is_skipped_and_the_rows_after_the_snapshot_load() {
+    let o = overlapping_skips();
+    let edit = edit_inside_base(3, &[&o.t0], "EDIT");
+    let after = para(4, "after");
+    let store = MemStore::new();
+    store.push_row(2, edit.clone());
+    store.push_row(3, after);
+    let base = doc_of(&[&o.t0, &o.t3, &edit]);
+    store.push_snapshot(snapshot(
+        Some(2),
+        2,
+        pending_free(base.inner()),
+        Some(vec![1]),
+        false,
+    ));
+    let boot = room_boot(&store).await;
+    assert_eq!(fell_back(&boot), Some(("missing_row", false, 0, true)));
+    assert_eq!(
+        store.reads(),
+        vec![RowsRead::After(RowsAfter::Rev(2)), RowsRead::At(vec![1])]
+    );
+    assert_eq!(boot.through_rev, 3);
+    let page = text(&boot.doc);
+    for word in ["ba", "new", "EDIT", "after"] {
+        assert!(page.contains(word), "{word}: {page}");
+    }
+    let read_only = boot_in(&store, BootMode::ReadOnly).await.expect("loads");
+    assert_eq!(text(&read_only.doc), page);
+}
+
+/// Task 1 Step 6: `may_be_shifted` flags every state that names a block
+/// past a gap, real text past a lost edit included, so this legacy snapshot
+/// boots from its trusted prefix and, with no row carrying t3, loses "new"
+/// (the plan's `..._and_nothing_pending_keeps_it`, whose expectation that
+/// fallback changed).
+#[tokio::test]
+async fn a_legacy_snapshot_with_text_past_a_gap_and_nothing_pending_boots_from_its_prefix() {
+    let o = overlapping_skips();
+    let gapped = doc_of(&[&o.t0, &o.t3]);
+    let state = pending_free(gapped.inner());
+    assert!(!parks_when_applied(&state), "fixture: nothing pending");
+    let store = MemStore::new();
+    store.push_snapshot(snapshot(None, 1, state, None, false));
+    let boot = room_boot(&store).await;
+    let f = boot.fallback.clone().expect("a fallback");
+    assert_eq!((f.reason, f.whole_log), ("legacy", true));
+    assert_eq!(f.dropped, 0);
+    assert!(f.dropped_past_gap > 0, "\"new\" is past the gap");
+    let page = text(&boot.doc);
+    assert!(page.contains("base") && !page.contains("new"), "{page}");
+}
+
+#[tokio::test]
+async fn an_untrusted_snapshot_past_a_gap_reports_what_it_dropped() {
+    let o = overlapping_skips();
+    let store = MemStore::new();
+    let shifted = shifted_full(doc_of(&[&o.t0, &o.t2, &o.t3]).inner());
+    store.push_snapshot(snapshot(Some(3), 3, shifted, None, false));
+    let boot = room_boot(&store).await;
+    let f = boot.fallback.clone().expect("a fallback");
+    assert_eq!((f.reason, f.whole_log), ("legacy", true));
+    assert_eq!(f.dropped, 0);
+    assert!(f.dropped_past_gap > 0);
+    assert!(within(
+        &held(boot.doc.inner()),
+        &insertions_of(&[&o.t0, &o.t2, &o.t3])
+    ));
+    assert!(text(&boot.doc).contains("base"));
+}
+
+/// Ruling 7's round-4 ruling: bytes that park content but name no block
+/// past a gap boot from the rows after them.
+#[tokio::test]
+async fn a_stamped_legacy_snapshot_that_parks_without_shift_reads_only_the_rows_after_it() {
+    let (state, resend, _) = skip_underflow_case();
+    let (_, u2) = cross_client_parked();
+    let store = MemStore::new();
+    store.push_row(1, state);
+    store.push_row(2, resend);
+    store.push_row(3, u2.clone());
+    store.push_row(4, para(4, "four"));
+    let bytes = shifted_full(doc_of(&[&u2, &para(3, "three")]).inner());
+    assert!(parks_when_applied(&bytes) && !may_be_shifted(&bytes));
+    store.push_snapshot(snapshot(Some(3), 3, bytes, None, false));
+    let boot = room_boot(&store).await;
+    assert_eq!(boot.fallback, None);
+    assert!(!boot.unlogged);
+    assert_eq!(store.reads(), vec![RowsRead::After(RowsAfter::Rev(3))]);
+    let claims = pending::claims(&boot.doc).expect("u2 pending");
+    assert!(same_ids(&claims.structs, &insertions(&u2)));
+    assert!(text(&boot.doc).contains("four"));
+    assert!(!boot.carry.is_empty(), "no applied row covers u2");
+    let read_only = boot_in(&store, BootMode::ReadOnly).await.expect("loads");
+    assert_eq!(text(&read_only.doc), text(&boot.doc));
+}
+
+/// Ruling 6: an older pod's snapshot is replaced by the newest trusted one.
+#[tokio::test]
+async fn a_flagged_snapshot_boots_from_the_newest_trusted_one_and_keeps_its_text() {
+    let o = overlapping_skips();
+    let s1_doc = doc_of(&[&o.t0, &o.t3]);
+    let s1 = pending_free(s1_doc.inner());
+    let edit = edit_inside_base(3, &[&s1], "EDIT");
+    let s2 = pending_free(doc_of(&[&s1, &edit]).inner());
+    let rows = || {
+        let store = MemStore::new();
+        store.push_row(1, o.t3.clone());
+        store.push_row(2, edit.clone());
+        store.push_snapshot(snapshot(Some(2), 2, s2.clone(), None, true));
+        store
+    };
+    let reference = doc_of(&[&o.t0, &o.t3, &edit]);
+
+    let store = rows();
+    store.push_snapshot(snapshot(Some(1), 1, s1.clone(), Some(vec![1]), false));
+    let boot = room_boot(&store).await;
+    let f = boot.fallback.clone().expect("rollout");
+    assert_eq!((f.reason, f.whole_log), ("rollout", false));
+    let page = text(&boot.doc);
+    for word in ["ba", "se", "new", "EDIT"] {
+        assert!(page.contains(word), "{word}: {page}");
+    }
+    assert_eq!(pending::claims(&boot.doc), pending::claims(&reference));
+    assert_eq!(
+        store.reads(),
+        vec![RowsRead::After(RowsAfter::Rev(1)), RowsRead::At(vec![1])]
+    );
+
+    // 0.9.13's GC deleted S1: the whole log over S2.
+    let store = rows();
+    let boot = room_boot(&store).await;
+    assert_eq!(fell_back(&boot), Some(("rollout", true, 0, true)));
+    let page = text(&boot.doc);
+    for word in ["ba", "se", "new", "EDIT"] {
+        assert!(page.contains(word), "{word}: {page}");
+    }
+    assert_eq!(
+        pending::claims(&boot.doc),
+        pending::claims(&reference),
+        "\"qq\" pending again, from row 1"
+    );
+}
+
+/// A client-3 doc's paragraph "one" and an edit inside it, as rows 1 and 2.
+fn one_and_its_edit() -> (Vec<u8>, Vec<u8>) {
+    let doc = Doc::with_client_id(3);
+    let one = paragraph_by(&doc, "one");
+    let frag = doc.get_or_insert_xml_fragment("default");
+    let edit = own_update(&doc, |txn| {
+        let text = fixtures::text_at(&frag, txn, 0).expect("the paragraph");
+        text.insert(txn, 1, "EDIT");
+    });
+    (one, edit)
+}
+
+#[tokio::test]
+async fn a_flagged_snapshot_over_a_pre_migration_snapshot_boots_from_it() {
+    let (one, edit) = one_and_its_edit();
+    let store = MemStore::new();
+    store.push_row(1, one.clone());
+    store.push_row(2, edit.clone());
+    store.push_snapshot(snapshot(
+        Some(1),
+        1,
+        shifted_full(doc_of(&[&one]).inner()),
+        None,
+        false,
+    ));
+    store.push_snapshot(snapshot(
+        Some(2),
+        2,
+        shifted_full(doc_of(&[&one, &edit]).inner()),
+        None,
+        true,
+    ));
+    let boot = room_boot(&store).await;
+    let f = boot.fallback.clone().expect("rollout");
+    assert_eq!((f.reason, f.whole_log), ("rollout", false));
+    assert_eq!(store.reads(), vec![RowsRead::After(RowsAfter::Rev(1))]);
+    assert!(boot.parked.is_empty() && boot.carry.is_empty());
+    assert_eq!(text(&boot.doc), text(&doc_of(&[&one, &edit])));
+}
+
+#[tokio::test]
+async fn a_flagged_snapshot_over_a_pre_migration_snapshot_with_pending_content_carries_it() {
+    let (_, u2) = cross_client_parked();
+    let (one, edit) = one_and_its_edit();
+    let store = MemStore::new();
+    store.push_row(1, one.clone());
+    store.push_row(2, edit.clone());
+    let t = shifted_full(doc_of(&[&u2, &one]).inner());
+    assert!(parks_when_applied(&t) && !may_be_shifted(&t));
+    store.push_snapshot(snapshot(Some(1), 1, t, None, false));
+    store.push_snapshot(snapshot(
+        Some(2),
+        2,
+        shifted_full(doc_of(&[&one, &edit]).inner()),
+        None,
+        true,
+    ));
+    let boot = room_boot(&store).await;
+    assert_eq!(fell_back(&boot), Some(("rollout", false, 0, true)));
+    assert_eq!(store.reads(), vec![RowsRead::After(RowsAfter::Rev(1))]);
+    assert!(!boot.carry.is_empty());
+    let claims = pending::claims(&boot.doc).expect("u2 pending");
+    assert!(same_ids(&claims.structs, &insertions(&u2)));
+    assert_eq!(text(&boot.doc), text(&doc_of(&[&one, &edit])));
+}
+
+#[tokio::test]
+async fn a_flagged_snapshot_falls_back_from_the_trusted_bytes() {
+    let o = overlapping_skips();
+    let edit = edit_inside_base(3, &[&o.t0], "EDIT");
+    let three = para(4, "three");
+    let store = MemStore::new();
+    store.push_row(2, edit.clone());
+    store.push_row(3, three.clone());
+    let t = pending_free(doc_of(&[&o.t0, &edit]).inner());
+    store.push_snapshot(snapshot(Some(2), 2, t.clone(), Some(vec![1]), false));
+    let f_state = shifted_full(doc_of(&[&t, &three, &para(7, "only flagged")]).inner());
+    store.push_snapshot(snapshot(Some(3), 3, f_state, None, true));
+    let boot = room_boot(&store).await;
+    let f = boot.fallback.clone().expect("rollout");
+    assert_eq!((f.reason, f.whole_log), ("rollout", false));
+    assert_eq!(
+        store.reads(),
+        vec![RowsRead::After(RowsAfter::Rev(2)), RowsRead::At(vec![1])]
+    );
+    let page = text(&boot.doc);
+    for word in ["ba", "EDIT", "three"] {
+        assert!(page.contains(word), "{word}: {page}");
+    }
+    assert!(!page.contains("only flagged"), "{page}");
+}
+
+/// Ruling 19: rule 2 with no trusted row, then rule 4 over the flagged
+/// row's own bytes.
+#[tokio::test]
+async fn a_flagged_unshifted_snapshot_with_uncovered_pending_content_carries_it() {
+    let (_, u2) = cross_client_parked();
+    let one = para(3, "one");
+    let store = MemStore::new();
+    store.push_row(1, one.clone());
+    let f_state = shifted_full(doc_of(&[&u2, &one]).inner());
+    assert!(parks_when_applied(&f_state) && !may_be_shifted(&f_state));
+    store.push_snapshot(snapshot(Some(1), 1, f_state, None, true));
+    let boot = room_boot(&store).await;
+    assert_eq!(fell_back(&boot), Some(("rollout", true, 0, true)));
+    assert!(!boot.carry.is_empty());
+    let claims = pending::claims(&boot.doc).expect("u2 pending");
+    assert!(same_ids(&claims.structs, &insertions(&u2)));
+    let read_only = boot_in(&store, BootMode::ReadOnly).await.expect("loads");
+    assert_same_doc(&read_only.doc, &boot.doc, "read-only vs room");
+    assert!(read_only.carry.is_empty());
+}
+
+/// The rows and the flagged snapshot of a 0.9.13 room open across the
+/// migration on a page whose pending update holds overlapping Skips.
+fn shifted_rollout_page() -> (MemStore, DocHandle, Vec<Vec<u8>>, Vec<u8>) {
+    let o = overlapping_skips();
+    let edit = edit_inside_base(3, &[&o.t0], "EDIT");
+    let rows = vec![o.t0.clone(), o.t2.clone(), o.t3.clone(), edit];
+    let store = MemStore::new();
+    for (rev, row) in (1..).zip(&rows) {
+        store.push_row(rev, row.clone());
+    }
+    let refs: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+    let live = live_of(&refs);
+    store.push_snapshot(snapshot(Some(4), 4, shifted_full(live.inner()), None, true));
+    let t = shifted_full(doc_of(&refs[..3]).inner());
+    assert!(may_be_shifted(&t), "fixture: T may be shifted");
+    (store, live, rows, t)
+}
+
+async fn assert_boots_from_a_prefix(store: &MemStore, live: &DocHandle, rows: &[Vec<u8>]) {
+    let boot = room_boot(store).await;
+    let f = boot.fallback.clone().expect("rollout");
+    assert_eq!((f.reason, f.whole_log, f.refused), ("rollout", true, 0));
+    assert_eq!(store.reads(), vec![RowsRead::After(RowsAfter::All)]);
+    let refs: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+    assert!(
+        within(&held(boot.doc.inner()), &insertions_of(&refs)),
+        "a phantom"
+    );
+    assert!(boot.carry.is_empty(), "a prefix base never carries");
+    assert_eq!(pending::claims(&boot.doc), pending::claims(live));
+    let page = text(&boot.doc);
+    assert!(page.contains("ba") && page.contains("EDIT"), "{page}");
+    assert_eq!(boot.through_rev, 4);
+    let read_only = boot_in(store, BootMode::ReadOnly).await.expect("loads");
+    assert_eq!(text(&read_only.doc), page);
+}
+
+#[tokio::test]
+async fn a_flagged_snapshot_over_a_shifted_pre_migration_snapshot_boots_from_its_prefix() {
+    let (store, live, rows, t) = shifted_rollout_page();
+    store.push_snapshot(snapshot(Some(3), 3, t, None, false));
+    assert_boots_from_a_prefix(&store, &live, &rows).await;
+}
+
+#[tokio::test]
+async fn a_shifted_flagged_snapshot_without_a_trusted_one_boots_from_its_prefix() {
+    let (store, live, rows, _) = shifted_rollout_page();
+    assert_boots_from_a_prefix(&store, &live, &rows).await;
+}
+
+/// One user per author in the history checks.
+fn user(n: u128) -> uuid::Uuid {
+    uuid::Uuid::from_u128(n)
+}
+
+/// `knot_history::run_pass` over `rows` (`(rev, bytes, author)`, a minute
+/// apart) and one probe per `(rev, state)` snapshot, from an empty page's
+/// genesis at rev 0 (`knot-history/tests/pass.rs::input`).
+fn history_pass(
+    rows: &[(i64, Vec<u8>, Option<uuid::Uuid>)],
+    snapshots: &[(i64, Vec<u8>)],
+) -> knot_history::PassOutput {
+    let minute = |n: i64| {
+        let mut row = knot_storage::DocUpdate {
+            seq: 0,
+            doc_id: uuid::Uuid::nil(),
+            update_bytes: Vec::new(),
+            by_user_id: None,
+            created_at: Default::default(),
+            rev: None,
+            source: None,
+            meta: None,
+            epoch: None,
+        };
+        row.created_at += std::time::Duration::from_secs(60 * n.max(0) as u64);
+        row.created_at
+    };
+    let rows: Vec<knot_storage::DocUpdate> = rows
+        .iter()
+        .map(|(rev, bytes, by)| knot_storage::DocUpdate {
+            seq: *rev,
+            doc_id: uuid::Uuid::nil(),
+            update_bytes: bytes.clone(),
+            by_user_id: *by,
+            created_at: minute(*rev),
+            rev: Some(*rev),
+            source: Some(knot_storage::UpdateSource::Edit),
+            meta: None,
+            epoch: Some(0),
+        })
+        .collect();
+    let snapshots = snapshots
+        .iter()
+        .map(|(rev, state)| knot_history::SnapshotProbe {
+            rev: *rev,
+            created_at: minute(*rev),
+            state_bytes: Some(state.clone()),
+        })
+        .collect();
+    let last = rows.last().map_or(0, |r| r.rev.unwrap_or(0));
+    knot_history::run_pass(knot_history::PassInput {
+        checkpoint_rev: 0,
+        checkpoint_state: knot_history::Replayer::new(knot_history::ReplayMode::Gc).encode_state(),
+        reapply: Vec::new(),
+        replay: Vec::new(),
+        genesis_rev: 0,
+        built_rev: 0,
+        rows,
+        rows_exhausted: true,
+        open: Vec::new(),
+        claims: knot_history::Claims::default(),
+        kept_gaps: Vec::new(),
+        snapshots,
+        snapshot_checked_rev: 0,
+        skip_revs: std::collections::BTreeSet::new(),
+        progress: knot_history::Progress::default(),
+        now: minute(last + 24 * 60),
+        rows_budget: None,
+        checkpoint_floor: 256,
+        hooks: knot_history::ReplayHooks::default(),
+    })
+    .expect("the pass")
+}
+
+/// Whether a pass found gap content: a gap fed, a gap entry, or a snapshot
+/// left unchecked.
+fn builder_gaps(out: &knot_history::PassOutput) -> Vec<String> {
+    let mut found = Vec::new();
+    if out.stats.gaps > 0 {
+        found.push(format!("{} gap(s) fed", out.stats.gaps));
+    }
+    if out
+        .entries
+        .iter()
+        .any(|e| e.kind == knot_history::EntryKind::Gap)
+    {
+        found.push("a gap entry".into());
+    }
+    if !out.stats.snapshots_unchecked.is_empty() {
+        found.push(format!(
+            "snapshots unchecked: {:?}",
+            out.stats.snapshots_unchecked
+        ));
+    }
+    found
+}
+
+/// Rulings 11 and 17: content a live room keeps stuck (yrs 0.27.3 does not
+/// retry the overlapping-Skips pending update when `t1` and `t2b` arrive
+/// late) integrates at boot, when the kept rows re-apply over a snapshot
+/// that holds their dependencies; the guards pass it, it stays inside the
+/// reboot bound, and the builder credits it to the row that parked it.
+///
+/// The brief built this from `skip_underflow_parts` (T2 parked, then
+/// `paras`), but T2 drains live there (see
+/// `a_kept_row_is_applied_after_the_rows_after_the_snapshot`); Task 1's
+/// overlapping-Skips fixture is the deterministic stuck shape.
+#[tokio::test]
+async fn a_kept_row_that_integrates_stuck_content_at_boot_passes_the_guards() {
+    let o = overlapping_skips();
+    let (a, b) = (Some(user(1)), Some(user(2)));
+    let mut rows: Vec<(i64, Vec<u8>, Option<uuid::Uuid>)> = vec![
+        (1, o.t0.clone(), b),
+        (2, o.t2.clone(), a),
+        (3, o.t3.clone(), a),
+        (4, o.t1.clone(), b),
+        (5, o.t2b.clone(), b),
+    ];
+    let refs: Vec<&[u8]> = rows.iter().map(|(_, r, _)| r.as_slice()).collect();
+    let live = live_of(&refs);
+    let pp = insertions(&o.t2);
+    let claims = pending::claims(&live).expect("fixture: pp and qq stay stuck live");
+    assert!(within(&pp, &claims.structs), "fixture: pp is stuck");
+    let s1 = pending_free(live.inner());
+    let fresh = doc_of(&[&s1, &o.t2, &o.t3]);
+    assert!(
+        !holds_pending(fresh.inner()) && within(&pp, &held(fresh.inner())),
+        "fixture: a fresh doc integrates the kept rows"
+    );
+    assert_eq!(
+        pending::check_reparks(&YrsEngine, &s1, &[(2, &o.t2), (3, &o.t3)], &claims),
+        Ok(())
+    );
+
+    let store = MemStore::new();
+    for (rev, bytes, _) in &rows {
+        store.push_row(*rev, bytes.clone());
+    }
+    store.push_snapshot(snapshot(Some(5), 5, s1.clone(), Some(vec![2, 3]), false));
+    let boot = room_boot(&store).await;
+    assert_eq!(boot.fallback, None);
+    let violations = reboot_violations(boot.doc.inner(), live.inner());
+    assert!(violations.is_empty(), "{violations:#?}");
+    assert!(
+        pending::claims(&boot.doc).is_none(),
+        "nothing pending at boot"
+    );
+    assert!(within(&pp, &held(boot.doc.inner())));
+
+    let later = para(3, "later");
+    YrsEngine.apply_update(&boot.doc, &later).unwrap();
+    let s2 = pending_free(boot.doc.inner());
+    rows.push((6, later, b));
+    let out = history_pass(&rows, &[(5, s1), (6, s2)]);
+    let gaps = builder_gaps(&out);
+    assert!(gaps.is_empty(), "{gaps:?}");
+    assert!(
+        out.entries
+            .iter()
+            .any(|e| e.author == a && holds_any(&e.inserted.intersect(&pp))),
+        "pp is credited to its author: {:#?}",
+        out.entries
+    );
+}
+
+/// Ruling 8's closing retry: a row after the snapshot (R') waits on a kept
+/// row's content, which integrates only when the kept rows apply last.
+#[tokio::test]
+async fn a_row_after_the_snapshot_that_waits_on_a_kept_row_drains_at_boot() {
+    let o = overlapping_skips();
+    let all = client_doc(9, &[&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3]);
+    let frag = all.get_or_insert_xml_fragment("default");
+    let r_prime = own_update(&all, |txn| {
+        let text = fixtures::text_at(&frag, txn, 0).expect("the first paragraph");
+        // "zzbaseWqqWWpp": between t2's two p's.
+        text.insert(txn, 12, "R");
+    });
+    let rows: Vec<Vec<u8>> = vec![
+        o.t0.clone(),
+        o.t2.clone(),
+        o.t3.clone(),
+        r_prime.clone(),
+        o.t1.clone(),
+        o.t2b.clone(),
+    ];
+    let live = YrsEngine.new_doc();
+    let mut snapshot_state = None;
+    for (rev, row) in (1..).zip(&rows) {
+        YrsEngine
+            .apply_update_measuring(&live, row, MAX_NESTING)
+            .expect("the measured apply");
+        if rev == 3 {
+            snapshot_state = Some(pending_free(live.inner()));
+        }
+        if rev == 4 {
+            let claims = pending::claims(&live).expect("R' parks");
+            assert!(
+                within(&insertions(&r_prime), &claims.structs),
+                "fixture: R' parks on the live doc"
+            );
+        }
+    }
+    // The brief expected the live doc to drain here. yrs 0.27.3 keeps the
+    // overlapping-Skips content stuck when `t1` and `t2b` arrive late
+    // (Task 1, Concern 2), and R' with it: the live room shows them only
+    // after a reboot (Ruling 11). Its settled copy (yrs's retry forced, as
+    // boot's closing retry forces it) is the content the reboot must show.
+    let stuck = pending::claims(&live).expect("pp, qq and R' stay stuck live");
+    assert!(within(&insertions(&r_prime), &stuck.structs));
+    let settled = doc_of(&[&pending_free(live.inner())]);
+    for row in &rows {
+        YrsEngine.apply_update(&settled, row).unwrap();
+    }
+    settle(settled.inner());
+    assert!(
+        pending::claims(&settled).is_none(),
+        "fixture: the settled live doc holds nothing pending"
+    );
+    let store = MemStore::new();
+    for (rev, row) in (1..).zip(&rows) {
+        store.push_row(rev, row.clone());
+    }
+    store.push_snapshot(snapshot(
+        Some(3),
+        3,
+        snapshot_state.unwrap(),
+        Some(vec![2, 3]),
+        false,
+    ));
+    let boot = room_boot(&store).await;
+    assert_eq!(boot.fallback, None);
+    assert_eq!(
+        store.reads(),
+        vec![RowsRead::After(RowsAfter::Rev(3)), RowsRead::At(vec![2, 3])]
+    );
+    assert!(pending::claims(&boot.doc).is_none());
+    let violations = reboot_violations(boot.doc.inner(), live.inner());
+    assert!(violations.is_empty(), "{violations:#?}");
+    assert_eq!(text(&boot.doc), text(&settled));
+    let read_only = boot_in(&store, BootMode::ReadOnly).await.expect("loads");
+    assert_eq!(text(&read_only.doc), text(&settled));
+}
+
+/// Rule 4 over a stamped base steps over a missing rev at or below the
+/// stamp (Ruling 8).
+#[tokio::test]
+async fn a_whole_log_fallback_over_a_stamped_snapshot_steps_over_a_missing_rev_below_it() {
+    let (state, resend, _) = skip_underflow_case();
+    assert!(!parks_when_applied(&state));
+    let store = MemStore::new();
+    store.push_row(2, resend);
+    store.push_row(3, state.clone());
+    store.push_row(4, para(3, "four"));
+    store.push_row(5, para(4, "five"));
+    store.push_snapshot(snapshot(Some(3), 3, state, Some(vec![2]), false));
+    let boot = room_boot(&store).await;
+    let f = boot.fallback.clone().expect("a fallback");
+    assert_eq!((f.reason, f.whole_log), ("underflow", true));
+    assert!(boot.unlogged);
+    assert_eq!(boot.through_rev, 5);
+    let page = text(&boot.doc);
+    assert!(page.contains("four") && page.contains("five"), "{page}");
+    assert!(matches!(
+        boot_in(&store, BootMode::ReadOnly).await,
+        Err(BootError::Apply(_))
+    ));
+}
+
+/// Ruling 8's per-client post-check on a whole-log boot (rule 0): 5,000
+/// rows that each name a client holding blocks past a gap, over a doc of
+/// 100,000 blocks.
+#[tokio::test]
+async fn a_whole_log_boot_of_5000_past_gap_rows_stays_bounded() {
+    let bulk = {
+        let doc = Doc::with_client_id(40);
+        let frag = doc.get_or_insert_xml_fragment("default");
+        let mut txn = doc.transact_mut();
+        let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+        let text = p.push_back(&mut txn, XmlTextPrelim::new(""));
+        for _ in 0..100_000 {
+            text.insert(&mut txn, 0, "b");
+        }
+        drop(txn);
+        doc.transact()
+            .encode_state_as_update_v1(&StateVector::default())
+    };
+    assert!(bulk.len() > 500_000, "fixture: {} bytes", bulk.len());
+    eprintln!("bulk: {} bytes", bulk.len());
+    let o = overlapping_skips();
+    let typist = client_doc(1, &[&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3]);
+    let frag = typist.get_or_insert_xml_fragment("default");
+    let typed: Vec<Vec<u8>> = (0..5_000)
+        .map(|i| {
+            own_update(&typist, |txn| {
+                let text = fixtures::text_at(&frag, txn, 1).expect("t3's paragraph");
+                let end = text.len(txn);
+                text.insert(txn, end, if i % 2 == 0 { "x" } else { "y" });
+            })
+        })
+        .collect();
+
+    let mut rows: Vec<&[u8]> = vec![&bulk, &o.t0, &o.t3];
+    rows.extend(typed.iter().map(Vec::as_slice));
+    let live = YrsEngine.new_doc();
+    let mut typed_ids = IdSet::new();
+    for (i, row) in rows.iter().enumerate() {
+        YrsEngine
+            .apply_update_measuring(&live, row, MAX_NESTING)
+            .expect("the measured apply");
+        if i >= 3 {
+            let ins = insertions(row);
+            assert!(holds_any(&ins), "fixture: typed row {i} inserts");
+            typed_ids.merge_with(ins);
+        }
+    }
+    // Held once all are applied: a block integrates once and stays (one
+    // encode of the doc instead of one per row).
+    assert!(
+        within(&typed_ids, &held(live.inner())),
+        "fixture: the typed rows integrate past client 1's gap"
+    );
+    eprintln!("fixture built");
+    let store = MemStore::new();
+    for (rev, row) in (1..).zip(&rows) {
+        store.push_row(rev, row.to_vec());
+    }
+    let started = std::time::Instant::now();
+    let boot = room_boot(&store).await;
+    let took = started.elapsed();
+    eprintln!("whole-log boot of {} rows: {took:?}", rows.len());
+    assert_eq!(boot.fallback, None);
+    assert!(!boot.unlogged);
+    let page = text(&boot.doc);
+    assert_eq!(page.matches(['x', 'y']).count(), 5_000);
+    assert!(took < std::time::Duration::from_secs(60), "{took:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The reboot property
+// ---------------------------------------------------------------------------
+
+/// Seeds the reboot property runs, and steps per seed.
+const REBOOT_SEEDS: u64 = 200;
+const REBOOT_STEPS: usize = 60;
+
+/// How often a relation was violated, and the first seed, step and message.
+type Violations = (usize, Option<(u64, usize, String)>);
+
+/// What the reboot property found.
+#[derive(Default)]
+struct RebootTally {
+    /// Per relation.
+    violations: std::collections::BTreeMap<&'static str, Violations>,
+    snapshots: usize,
+    snapshot_boots: usize,
+    after_rows_boots: usize,
+    after_rows_with_pending_revs: usize,
+    retry_changed: usize,
+    first_retry_changed: Option<(u64, usize)>,
+    generations: usize,
+    deepest: u32,
+    stuck_integrated: usize,
+    first_stuck: Option<(u64, usize)>,
+    probes: usize,
+    probes_by_booted: usize,
+    probes_by_stuck: usize,
+    joins: usize,
+    join_frames_refused: usize,
+    final_refused: usize,
+    settled_seeds: usize,
+    builder_runs: usize,
+}
+
+impl RebootTally {
+    fn violate(&mut self, what: &'static str, seed: u64, step: usize, message: String) {
+        let entry = self.violations.entry(what).or_default();
+        entry.0 += 1;
+        entry.1.get_or_insert((seed, step, message));
+    }
+}
+
+/// The live room: its doc, the rows that park its pending content, how many
+/// boots it descends from, and whether one of them integrated stuck content.
+struct Model {
+    live: DocHandle,
+    parked: pending::ParkedRows,
+    generation: u32,
+    stuck: bool,
+}
+
+/// A written snapshot, for later boots and the builder's probes.
+struct Written {
+    rev: i64,
+    state: Vec<u8>,
+    revs: Vec<i64>,
+    booted: bool,
+    stuck: bool,
+}
+
+/// One seed of the reboot property.
+struct Run<'t> {
+    seed: u64,
+    step: usize,
+    rng: Rng,
+    store: MemStore,
+    next_rev: i64,
+    authors: std::collections::BTreeMap<i64, Option<uuid::Uuid>>,
+    model: Model,
+    /// Own rows handed to the writer and not acknowledged: their tokens,
+    /// bytes and authors.
+    queue: std::collections::VecDeque<(Option<pending::RowToken>, Vec<u8>, Option<uuid::Uuid>)>,
+    joined: Vec<pending::GuardedDoc>,
+    written: Vec<Written>,
+    t: &'t mut RebootTally,
+}
+
+impl Run<'_> {
+    fn violate(&mut self, what: &'static str, message: String) {
+        self.t.violate(what, self.seed, self.step, message);
+    }
+
+    /// A delivery from a client: the live room applies it, and a changed
+    /// apply is a row, the room's own (handed to the writer) or another
+    /// replica's (its rev known at once). Joined docs get the row.
+    fn deliver(&mut self, bytes: &[u8], author: Option<uuid::Uuid>) {
+        let m = YrsEngine
+            .apply_update_measuring(&self.model.live, bytes, MAX_NESTING)
+            .unwrap_or_else(|e| panic!("seed {}: measured apply: {e}", self.seed));
+        if let Some(error) = m.rejected {
+            self.violate("rejected", error);
+            return;
+        }
+        if m.persist.is_empty() {
+            return;
+        }
+        for joined in &mut self.joined {
+            if joined.apply(&m.persist).is_err() {
+                self.t.join_frames_refused += 1;
+            }
+        }
+        let claims = pending::claims(&self.model.live);
+        let records = m.pending_changed && claims.is_some();
+        if self.rng.chance(70) {
+            let token = if records {
+                self.model.parked.record(None, m.persist.clone())
+            } else {
+                None
+            };
+            self.queue.push_back((token, m.persist, author));
+        } else {
+            let rev = self.push_row(m.persist.clone(), author);
+            if records {
+                self.model.parked.record(Some(rev), m.persist);
+            }
+        }
+        if m.pending_changed {
+            let _ = self.model.parked.prune(claims.as_ref());
+        }
+    }
+
+    fn push_row(&mut self, bytes: Vec<u8>, author: Option<uuid::Uuid>) -> i64 {
+        let rev = self.next_rev;
+        self.next_rev += 1;
+        self.store.push_row(rev, bytes);
+        self.authors.insert(rev, author);
+        rev
+    }
+
+    /// The writer acknowledges up to `n` queued rows, in order.
+    fn ack(&mut self, n: usize) {
+        for _ in 0..n {
+            let Some((token, bytes, author)) = self.queue.pop_front() else {
+                return;
+            };
+            let rev = self.push_row(bytes, author);
+            if let Some(token) = token {
+                self.model.parked.assign(token, rev);
+            }
+        }
+    }
+
+    fn last_rev(&self) -> i64 {
+        self.next_rev - 1
+    }
+
+    /// A snapshot with the queue empty: the cover and the re-park check
+    /// must hold, and a boot from it must reboot the live room.
+    async fn snapshot(&mut self) {
+        let claims = pending::claims(&self.model.live);
+        if let Err(uncovered) = self.model.parked.prune(claims.as_ref()) {
+            self.violate("cover", format!("{uncovered:?}"));
+            return;
+        }
+        let state = pending_free(self.model.live.inner());
+        if let Some(claims) = &claims {
+            let rows = self.model.parked.checked_rows();
+            if let Err(refusal) = pending::check_reparks(&YrsEngine, &state, &rows, claims) {
+                self.violate("re-park check", format!("{refusal:?}"));
+                return;
+            }
+        }
+        let rev = self.last_rev();
+        let revs = self.model.parked.revs();
+        self.store.push_snapshot(snapshot(
+            Some(rev),
+            rev,
+            state.clone(),
+            Some(revs.clone()),
+            false,
+        ));
+        self.written.push(Written {
+            rev,
+            state,
+            revs,
+            booted: self.model.generation > 0,
+            stuck: self.model.stuck,
+        });
+        self.t.snapshots += 1;
+        self.t.snapshot_boots += 1;
+        let boot = room_boot(&self.store).await;
+        self.check_boot(boot, "snapshot boot");
+    }
+
+    /// A boot from the latest snapshot and the rows after it, as a room
+    /// that died without its exit snapshot.
+    async fn boot_after_rows(&mut self) {
+        let latest = self.written.last().expect("a snapshot");
+        self.t.after_rows_boots += 1;
+        if !latest.revs.is_empty() {
+            self.t.after_rows_with_pending_revs += 1;
+        }
+        // Boot's own order, to see what its close changed.
+        let mut replay = pending::GuardedDoc::new(doc_of(&[&latest.state]));
+        let rows = self.store.rows();
+        let mut applied: Vec<&knot_storage::DocUpdate> = Vec::new();
+        for row in rows.iter().filter(|r| r.rev.unwrap() > latest.rev) {
+            if replay.apply(&row.update_bytes).is_ok() {
+                applied.push(row);
+            }
+        }
+        for row in rows
+            .iter()
+            .filter(|r| latest.revs.contains(&r.rev.unwrap()))
+        {
+            if replay.apply(&row.update_bytes).is_ok() {
+                applied.push(row);
+            }
+        }
+        applied.sort_by_key(|r| r.rev);
+        let before = pending::claims(replay.doc());
+        let _ = replay.close(applied.iter().map(|r| r.update_bytes.as_slice()));
+        if pending::claims(replay.doc()) != before {
+            self.t.retry_changed += 1;
+            self.t
+                .first_retry_changed
+                .get_or_insert((self.seed, self.step));
+        }
+        let boot = room_boot(&self.store).await;
+        self.check_boot(boot, "boot after rows");
+    }
+
+    /// `fallback` is `None` and the boot reboots the live doc (Ruling 17);
+    /// half the time the booted room becomes the live model.
+    fn check_boot(&mut self, boot: Boot, what: &'static str) {
+        if let Some(f) = &boot.fallback {
+            self.violate("fallback", format!("{what}: {f:?}"));
+        }
+        if boot.unlogged {
+            self.violate("unlogged", what.to_string());
+        }
+        for v in reboot_violations(boot.doc.inner(), self.model.live.inner()) {
+            self.violate("reboot", format!("{what}: {v}"));
+        }
+        let (ps_boot, _) = pending_parts(boot.doc.inner());
+        let (ps_live, _) = pending_parts(self.model.live.inner());
+        let integrated = within(&ps_boot, &ps_live) && !within(&ps_live, &ps_boot);
+        if integrated {
+            self.t.stuck_integrated += 1;
+            self.t.first_stuck.get_or_insert((self.seed, self.step));
+        }
+        if self.rng.chance(50) {
+            let generation = self.model.generation + 1;
+            self.model = Model {
+                live: boot.doc,
+                parked: boot.parked,
+                generation,
+                stuck: self.model.stuck || integrated,
+            };
+            self.t.generations += 1;
+            self.t.deepest = self.t.deepest.max(generation);
+        }
+    }
+
+    /// A client joins: the pending-free state, then the kept rows' frames.
+    fn join(&mut self) {
+        let mut joined =
+            pending::GuardedDoc::new(doc_of(&[&pending_free(self.model.live.inner())]));
+        for frame in self.model.parked.frames() {
+            if joined.apply(&frame).is_err() {
+                self.t.join_frames_refused += 1;
+            }
+        }
+        self.joined.push(joined);
+        self.t.joins += 1;
+    }
+
+    fn check_joined(&mut self) {
+        let found: Vec<String> = self
+            .joined
+            .iter()
+            .flat_map(|j| join_violations(j.doc().inner(), self.model.live.inner()))
+            .collect();
+        for v in found {
+            self.violate("join bound", v);
+        }
+    }
+}
+
+/// The user a generator client's rows are credited to.
+fn author_of(client: usize) -> Option<uuid::Uuid> {
+    Some(user(100 + client as u128))
+}
+
+/// Ruling 17's reboot equality and join bound, through room generations:
+/// a live room model (deliveries from the interleaving generator, its own
+/// rows through a modelled writer queue, other replicas' rows with their
+/// revs at once) writes pending-free snapshots that name its kept rows,
+/// and every boot from them, or from them and the rows after, reboots it.
+#[tokio::test]
+async fn a_pending_free_snapshot_and_its_rows_reboot_the_room() {
+    let mut t = RebootTally::default();
+    for seed in 1..=REBOOT_SEEDS {
+        let mut rng = Rng::new(seed);
+        let mut clients: Vec<Client> = (1..=3).map(Client::new).collect();
+        let fixed_step = rng.below(REBOOT_STEPS);
+        let mut run = Run {
+            seed,
+            step: 0,
+            rng: Rng::new(seed ^ 0x5eed),
+            store: MemStore::new(),
+            next_rev: 1,
+            authors: Default::default(),
+            model: Model {
+                live: YrsEngine.new_doc(),
+                parked: pending::ParkedRows::default(),
+                generation: 0,
+                stuck: false,
+            },
+            queue: Default::default(),
+            joined: Vec::new(),
+            written: Vec::new(),
+            t: &mut t,
+        };
+        for step in 0..REBOOT_STEPS {
+            run.step = step;
+            let editor = rng.below(clients.len());
+            if rng.chance(40) && !has_gaps(&run.model.live) {
+                clients[editor].pull(&run.model.live, fixed_pull);
+            }
+            for _ in 0..1 + rng.below(3) {
+                clients[editor].edit(&mut rng);
+            }
+            let c = rng.below(clients.len());
+            let batch = if step == fixed_step {
+                vec![delete_before_insert(&mut clients[c])]
+            } else {
+                deliveries(&mut clients[c], &run.model.live, &mut rng)
+            };
+            for bytes in batch {
+                run.deliver(&bytes, author_of(c));
+            }
+            let acks = run.rng.below(4);
+            run.ack(acks);
+            if run.queue.is_empty() && run.last_rev() > 0 {
+                if run.rng.chance(15) {
+                    run.snapshot().await;
+                } else if run.rng.chance(10)
+                    && run.written.last().is_some_and(|w| w.rev < run.last_rev())
+                {
+                    run.boot_after_rows().await;
+                }
+            }
+            if run.rng.chance(10) {
+                run.join();
+            }
+            run.check_joined();
+        }
+
+        // The final phase: the queue drains, the latest snapshot boots, and
+        // it and the live room get the same final deliveries.
+        run.step = REBOOT_STEPS;
+        run.ack(usize::MAX);
+        let mut fin = pending::GuardedDoc::new(room_boot(&run.store).await.doc);
+        let feed = |run: &mut Run, fin: &mut pending::GuardedDoc, bytes: &[u8], c: usize| {
+            run.deliver(bytes, author_of(c));
+            if fin.apply(bytes).is_err() {
+                run.t.final_refused += 1;
+            }
+        };
+        for (i, c) in clients.iter_mut().enumerate() {
+            let own = c.take_undelivered();
+            if !own.is_empty() {
+                c.held
+                    .push(yrs::merge_updates_v1(&own).expect("merge own updates"));
+            }
+            while !c.held.is_empty() {
+                let at = rng.below(c.held.len());
+                let bytes = c.held.remove(at);
+                feed(&mut run, &mut fin, &bytes, i);
+            }
+        }
+        if !has_gaps(&run.model.live) && !holds_blocks_past_a_gap(fin.doc().inner()) {
+            for (i, c) in clients.iter_mut().enumerate() {
+                c.take_undelivered();
+                let sv = run.model.live.inner().transact().state_vector();
+                let resend = c.doc.transact().encode_state_as_update_v1(&sv);
+                feed(&mut run, &mut fin, &resend, i);
+            }
+            for (i, c) in clients.iter_mut().enumerate() {
+                {
+                    let mut txn = c.doc.transact_mut();
+                    let at = c.frag.len(&txn);
+                    let p = c
+                        .frag
+                        .insert(&mut txn, at, XmlElementPrelim::empty("paragraph"));
+                    p.push_back(&mut txn, XmlTextPrelim::new(rng.word()));
+                }
+                for bytes in c.take_undelivered() {
+                    feed(&mut run, &mut fin, &bytes, i);
+                }
+            }
+            let live = run.model.live.inner();
+            settle(live);
+            settle(fin.doc().inner());
+            let booted_differs = !same_content(live, fin.doc().inner());
+            let differ = run
+                .joined
+                .iter()
+                .filter(|j| {
+                    settle(j.doc().inner());
+                    !same_content(live, j.doc().inner())
+                })
+                .count();
+            if booted_differs {
+                run.violate("final equality", "the booted room".into());
+            }
+            if differ > 0 {
+                run.violate("final equality", format!("{differ} joined doc(s)"));
+            }
+            run.t.settled_seeds += 1;
+        }
+        run.ack(usize::MAX);
+
+        // The builder over the log and the fixed snapshots.
+        let rows: Vec<(i64, Vec<u8>, Option<uuid::Uuid>)> = run
+            .store
+            .rows()
+            .into_iter()
+            .map(|r| {
+                let rev = r.rev.unwrap();
+                (rev, r.update_bytes, run.authors[&rev])
+            })
+            .collect();
+        let mut probes: std::collections::BTreeMap<i64, Vec<u8>> = Default::default();
+        for w in &run.written {
+            probes.insert(w.rev, w.state.clone());
+        }
+        run.t.probes += probes.len();
+        for rev in probes.keys() {
+            let w = run.written.iter().rev().find(|w| w.rev == *rev).unwrap();
+            run.t.probes_by_booted += usize::from(w.booted);
+            run.t.probes_by_stuck += usize::from(w.stuck);
+        }
+        if !rows.is_empty() {
+            let probes: Vec<(i64, Vec<u8>)> = probes.into_iter().collect();
+            let out = history_pass(&rows, &probes);
+            run.t.builder_runs += 1;
+            for gap in builder_gaps(&out) {
+                run.violate("builder", gap);
+            }
+        }
+    }
+
+    eprintln!(
+        "snapshots {}, snapshot boots {}, boots after rows {} ({} with pending_revs, closing \
+         retry changed {} {:?})",
+        t.snapshots,
+        t.snapshot_boots,
+        t.after_rows_boots,
+        t.after_rows_with_pending_revs,
+        t.retry_changed,
+        t.first_retry_changed
+    );
+    eprintln!(
+        "generations {}, deepest {}; boots that integrated stuck content {} (first {:?})",
+        t.generations, t.deepest, t.stuck_integrated, t.first_stuck
+    );
+    eprintln!(
+        "probes {}, written by a booted room {}, by a room whose boot integrated stuck \
+         content {}; builder runs {}",
+        t.probes, t.probes_by_booted, t.probes_by_stuck, t.builder_runs
+    );
+    eprintln!(
+        "joins {}, frames a joined doc's guards refused {}, final deliveries the booted \
+         room refused {}, settled seeds {}",
+        t.joins, t.join_frames_refused, t.final_refused, t.settled_seeds
+    );
+    for (what, (n, first)) in &t.violations {
+        eprintln!("violations of {what}: {n}, first {first:?}");
+    }
+    assert!(
+        t.violations.is_empty(),
+        "violations: {:?}",
+        t.violations.keys()
+    );
+    assert!(t.deepest >= 3, "no seed reached generation 3");
+    assert!(
+        t.after_rows_with_pending_revs > 0,
+        "no boot after appended rows had a non-empty pending_revs"
+    );
+}
+
+/// What a fixed room sends a pulling client: its pending-free state.
+fn fixed_pull(d: &DocHandle, sv: &StateVector) -> Vec<u8> {
+    encode_without_pending(&d.inner().transact(), sv)
 }

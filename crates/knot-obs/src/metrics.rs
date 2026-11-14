@@ -92,6 +92,10 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         "Rooms that evicted themselves after applying an inbound update that nested the document's types past knot_crdt::nesting::MAX_NESTING (the authoritative post-apply check), whether yrs applied all of the update or rejected the rest. The update was neither persisted nor fanned out, every connection of the room was closed (the sender with 4422, every other one with 1012) so its client reconnects, and the next join reloads the page from storage"
     );
     describe_counter!("knot_room_snapshots_total", "Snapshots written to storage");
+    describe_counter!(
+        "knot_room_boot_fallbacks_total",
+        "Page boots, by rooms and read-only loads alike, that did not boot from the page's latest snapshot as stored, or that had a row refused by the skip-underflow guards, by reason: legacy (a snapshot from before the pending-encoding fix whose bytes may hold shifted blocks, booted from its trusted prefix and the whole log), rollout (a snapshot an older pod wrote during the rollout, replaced by the newest trusted snapshot, or by the whole log when none survives), missing_row (a row the snapshot names is missing or fails to apply; the rows after the snapshot still load) or underflow (the guards refused a row). A rollout boot that found a trusted snapshot whose own rule held, and a missing_row boot, read only the rows after the snapshot; every other fallback replays the page's whole log. Counted once per boot that returns, never for one that fails"
+    );
     describe_histogram!(
         "knot_room_hydrate_seconds",
         Unit::Seconds,

@@ -11,17 +11,22 @@ use std::time::Duration;
 
 #[path = "common/fixtures.rs"]
 mod fixtures;
+#[path = "common/interleave.rs"]
+mod interleave;
 #[path = "common/log_fixtures.rs"]
 mod log_fixtures;
 
-use fixtures::{Rng, para};
+use fixtures::{Rng, cross_client_parked, overlapping_skips, para};
+use interleave::held;
 use knot_crdt::nesting::MAX_NESTING;
+use knot_crdt::pending::{self, holds_any};
 use knot_crdt::{
-    BootMode, Bus, DocHandle, Engine, Event, MemBus, Room, RoomHandle, SnapshotPolicy, YrsEngine,
+    Boot, BootMode, Bus, DocHandle, Engine, Event, MemBus, Room, RoomHandle, SnapshotPolicy,
+    YrsEngine,
 };
 use knot_storage::{
     DocUpdate, HistoryHead, NewUpdate, Persisted, PgSnapshotStore, PgUpdatesStore, RowsAfter,
-    UpdatesStore, UpdatesStoreError,
+    SnapshotStamp, SnapshotStore, UpdateSource, UpdatesStore, UpdatesStoreError,
 };
 use log_fixtures::{
     Client, assert_same_doc, difference, doc_of, pending, replay, row_count, rows, text,
@@ -38,6 +43,45 @@ use yrs::{
 /// The migration that adds the log columns: a database migrated up to it
 /// holds rows and snapshots as 0.9.9 wrote them (no rev, no heads row).
 const HISTORY_LOG_COLUMNS: i64 = 20261107120000;
+
+/// The schema of 0.9.13, the release before `pending_revs`.
+const V0_9_13_SCHEMA: i64 = 20261113120000;
+
+/// A snapshot write of every release from 0.9.10 to 0.9.13, stamped with
+/// the rev it holds the log up to and the content epoch it was taken at. It
+/// names no `pending_revs` (`knot-storage/tests/migrations_apply.rs`).
+const STAMPED_SNAPSHOT_INSERT_SQL: &str = "INSERT INTO doc_snapshots
+             (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch)
+             VALUES ($1, $2, $3, $4, $5, $6)";
+
+/// The shape of the stamped snapshot upsert of every release from 0.9.10 to
+/// 0.9.13 (`PgSnapshotStore::insert_stamped`), which names no `pending_revs`.
+const STAMPED_SNAPSHOT_UPSERT_SQL: &str = "INSERT INTO doc_snapshots
+             (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (doc_id, snapshot_seq) DO UPDATE
+             SET state_bytes = EXCLUDED.state_bytes,
+                 state_vector = EXCLUDED.state_vector,
+                 created_at = now(),
+                 snapshot_rev = EXCLUDED.snapshot_rev,
+                 epoch = EXCLUDED.epoch";
+
+/// 0.9.10's to 0.9.13's snapshot GC (`gc(doc, 5, 30)`), which keeps no
+/// trusted row (`knot-storage/tests/snapshots.rs`).
+const V0_9_13_GC_SQL: &str = "WITH recent AS (
+                 SELECT snapshot_seq FROM doc_snapshots
+                 WHERE doc_id = $1 ORDER BY snapshot_seq DESC LIMIT $2
+             ),
+             per_day AS (
+                 SELECT DISTINCT ON (date_trunc('day', created_at)) snapshot_seq
+                 FROM doc_snapshots
+                 WHERE doc_id = $1 AND created_at >= now() - ($3 || ' days')::interval
+                 ORDER BY date_trunc('day', created_at), created_at DESC
+             )
+             DELETE FROM doc_snapshots
+             WHERE doc_id = $1
+               AND snapshot_seq NOT IN (SELECT snapshot_seq FROM recent)
+               AND snapshot_seq NOT IN (SELECT snapshot_seq FROM per_day)";
 
 // ---------------------------------------------------------------------------
 // The database
@@ -106,6 +150,20 @@ async fn legacy_page() -> (PgPool, Uuid) {
         .run(&pool)
         .await
         .unwrap();
+    let doc = page(&pool).await;
+    (pool, doc)
+}
+
+/// A database migrated up to 0.9.13's schema, with one page; the test
+/// writes what 0.9.13 pods wrote, then calls [`finish_migrations`].
+async fn v0_9_13_page() -> (PgPool, Uuid) {
+    let url = knot_test_support::fresh_db_url().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&url)
+        .await
+        .unwrap();
+    migrator_up_to(V0_9_13_SCHEMA).run(&pool).await.unwrap();
     let doc = page(&pool).await;
     (pool, doc)
 }
@@ -429,9 +487,9 @@ async fn flush_failures_lose_nothing() {
     }
 }
 
-/// Every stamped snapshot equals the log replayed to its rev, also while
-/// the room holds pending content, around failed flushes and a reconnect
-/// resend; a reboot equals the whole log replayed.
+/// Every stamped snapshot equals the log replayed to its rev, around failed
+/// flushes, held-back content and a reconnect resend, and none holds
+/// pending content; a reboot equals the whole log replayed.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_snapshot_equals_the_log_replayed_to_its_rev() {
     for mode in [Mode::FailBefore, Mode::LostAck] {
@@ -514,8 +572,11 @@ async fn every_snapshot_equals_the_log_replayed_to_its_rev() {
         settle(&pool, doc, &h).await;
 
         let snapshots = stamped_snapshots(&pool, doc).await;
+        // One before the held-back update and at least one after it
+        // drained: until the room records the rows that park its pending
+        // content, it writes none while u2 waits.
         assert!(
-            snapshots.len() >= 3,
+            snapshots.len() >= 2,
             "{mode:?}: {} snapshots",
             snapshots.len()
         );
@@ -531,9 +592,11 @@ async fn every_snapshot_equals_the_log_replayed_to_its_rev() {
                 &format!("{mode:?}: snapshot at rev {rev}"),
             );
         }
-        assert!(
-            with_pending > 0,
-            "{mode:?}: no snapshot was written while content was pending"
+        // Until the room records the rows that park its pending content,
+        // it writes no snapshot while content is pending.
+        assert_eq!(
+            with_pending, 0,
+            "{mode:?}: a snapshot was written while content was pending"
         );
         assert!(!h.shutdown.is_cancelled(), "{mode:?}: the room was evicted");
 
@@ -960,5 +1023,398 @@ async fn reconnect_resend_persists_only_new_content() {
         &replay(&pool, doc, i64::MAX).await,
         "the log replayed",
     );
+    shut_down(&h).await;
+}
+
+// ---------------------------------------------------------------------------
+// Pending content across reboots and the rolling upgrade
+// ---------------------------------------------------------------------------
+
+/// Appends `rows` as edits at epoch 0, one flush each; returns where each
+/// landed.
+async fn append_rows(pool: &PgPool, doc: Uuid, rows: &[&[u8]]) -> Vec<Persisted> {
+    let store = PgUpdatesStore::new(pool.clone());
+    let mut out = Vec::new();
+    for bytes in rows {
+        let row = NewUpdate {
+            by_user_id: None,
+            bytes: bytes.to_vec(),
+            source: UpdateSource::Edit,
+            meta: None,
+        };
+        out.extend(store.append(doc, 0, &[row]).await.unwrap());
+    }
+    out
+}
+
+/// A stamped snapshot without `pending_revs`, as 0.9.13 pods wrote it, at
+/// the seq of the row at its rev, through `sql` (the insert or the upsert).
+async fn older_pods_snapshot(
+    pool: &PgPool,
+    doc: Uuid,
+    sql: &'static str,
+    at: Persisted,
+    state: &[u8],
+) {
+    let sv = doc_of(&[state])
+        .inner()
+        .transact()
+        .state_vector()
+        .encode_v1();
+    sqlx::query(sql)
+        .bind(doc)
+        .bind(at.seq)
+        .bind(state)
+        .bind(sv)
+        .bind(at.rev)
+        .bind(0i32)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// yrs's own full state of a doc that applied `updates`: what 0.9.13 rooms
+/// wrote, shifted when their pending update holds overlapping Skips.
+fn shifted_state(updates: &[&[u8]]) -> Vec<u8> {
+    doc_of(updates)
+        .inner()
+        .transact()
+        .encode_state_as_update_v1(&StateVector::default())
+}
+
+fn pending_free(d: &DocHandle) -> Vec<u8> {
+    pending::encode_without_pending(&d.inner().transact(), &StateVector::default())
+}
+
+/// A room-mode boot of the page, which writes nothing: the pending state a
+/// room starts with.
+async fn direct_boot(pool: &PgPool, doc: Uuid) -> Boot {
+    knot_crdt::boot(
+        &YrsEngine,
+        &PgUpdatesStore::new(pool.clone()),
+        &PgSnapshotStore::new(pool.clone()),
+        doc,
+        BootMode::Room,
+    )
+    .await
+    .unwrap()
+}
+
+fn insertions_of(updates: &[&[u8]]) -> yrs::IdSet {
+    updates.iter().fold(yrs::IdSet::new(), |acc, u| {
+        acc.merge(&Update::decode_v1(u).unwrap().insertions(true))
+    })
+}
+
+fn within(a: &yrs::IdSet, b: &yrs::IdSet) -> bool {
+    !holds_any(&a.diff(b))
+}
+
+/// A doc that applied `updates` through the room's measured apply.
+fn live_of(updates: &[&[u8]]) -> DocHandle {
+    let live = YrsEngine.new_doc();
+    for u in updates {
+        YrsEngine
+            .apply_update_measuring(&live, u, MAX_NESTING)
+            .unwrap();
+    }
+    live
+}
+
+/// An edit by client 3 inside "base" (`overlapping_skips().t0`'s text).
+fn edit_inside_base(t0: &[u8]) -> Vec<u8> {
+    let c = Doc::with_client_id(3);
+    c.transact_mut()
+        .apply_update(Update::decode_v1(t0).unwrap())
+        .unwrap();
+    let frag = c.get_or_insert_xml_fragment("default");
+    let sv = c.transact().state_vector();
+    {
+        let mut txn = c.transact_mut();
+        let text = fixtures::text_at(&frag, &txn, 0).unwrap();
+        text.insert(&mut txn, 2, "EDIT");
+    }
+    c.transact().encode_diff_v1(&sv)
+}
+
+/// Waits until the room's text holds `word`.
+async fn until_text(h: &RoomHandle, word: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let page = text(&room_doc(h).await.0);
+        if page.contains(word) {
+            return page;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the room never showed {word:?}: {page}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Review Focus 4: a 0.9.13 room wrote a snapshot whose pending update held
+/// overlapping Skips; boot drops its phantoms (rule 3, `legacy`) and the
+/// content drains when its dependency arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_pods_snapshot_with_shifted_pending_content_boots_without_phantoms() {
+    let o = overlapping_skips();
+    let (pool, doc) = v0_9_13_page().await;
+    let rows: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let at = append_rows(&pool, doc, &rows).await;
+    older_pods_snapshot(
+        &pool,
+        doc,
+        STAMPED_SNAPSHOT_INSERT_SQL,
+        at[2],
+        &shifted_state(&rows),
+    )
+    .await;
+    finish_migrations(&pool).await;
+
+    let boot = direct_boot(&pool, doc).await;
+    assert_eq!(boot.fallback.as_ref().map(|f| f.reason), Some("legacy"));
+    assert!(
+        within(&held(boot.doc.inner()), &insertions_of(&rows)),
+        "a phantom"
+    );
+
+    let h = open_room(
+        &pool,
+        doc,
+        Arc::new(PgUpdatesStore::new(pool.clone())),
+        LAZY,
+    )
+    .await;
+    let c = Client::join(&h, 7).await;
+    c.send(&h, o.t1.clone()).await;
+    c.send(&h, o.t2b.clone()).await;
+    until_rows(&pool, doc, 5).await;
+    shut_down(&h).await;
+    let all: [&[u8]; 5] = [&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3];
+    let reboot = direct_boot(&pool, doc).await;
+    assert!(
+        pending::claims(&reboot.doc).is_none(),
+        "the content drained"
+    );
+    assert_eq!(text(&reboot.doc), text(&doc_of(&all)));
+}
+
+/// Review Focus 2: a 0.9.13 room open across the migration on a page whose
+/// pending update holds overlapping Skips: its pre-migration snapshot (the
+/// trusted one) and its flagged one both hold shifted bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_0_9_13_room_open_across_the_migration_on_a_shifted_page_boots_from_the_prefix_and_drains()
+ {
+    let o = overlapping_skips();
+    let (pool, doc) = v0_9_13_page().await;
+    let first: [&[u8]; 3] = [&o.t0, &o.t2, &o.t3];
+    let at = append_rows(&pool, doc, &first).await;
+    older_pods_snapshot(
+        &pool,
+        doc,
+        STAMPED_SNAPSHOT_INSERT_SQL,
+        at[2],
+        &shifted_state(&first),
+    )
+    .await;
+    finish_migrations(&pool).await;
+    let edit = edit_inside_base(&o.t0);
+    let four: [&[u8]; 4] = [&o.t0, &o.t2, &o.t3, &edit];
+    let at4 = append_rows(&pool, doc, &[&edit]).await;
+    older_pods_snapshot(
+        &pool,
+        doc,
+        STAMPED_SNAPSHOT_UPSERT_SQL,
+        at4[0],
+        &shifted_state(&four),
+    )
+    .await;
+
+    let boot = direct_boot(&pool, doc).await;
+    let f = boot.fallback.clone().expect("rollout");
+    assert_eq!((f.reason, f.whole_log), ("rollout", true));
+    assert!(
+        within(&held(boot.doc.inner()), &insertions_of(&four)),
+        "a phantom"
+    );
+    assert!(boot.carry.is_empty());
+    assert_eq!(pending::claims(&boot.doc), pending::claims(&live_of(&four)));
+
+    let h = open_room(
+        &pool,
+        doc,
+        Arc::new(PgUpdatesStore::new(pool.clone())),
+        LAZY,
+    )
+    .await;
+    let c = Client::join(&h, 7).await;
+    c.send(&h, o.t1.clone()).await;
+    c.send(&h, o.t2b.clone()).await;
+    until_rows(&pool, doc, 6).await;
+    shut_down(&h).await;
+    let all: [&[u8]; 6] = [&o.t0, &o.t1, &o.t2, &o.t2b, &o.t3, &edit];
+    let reboot = direct_boot(&pool, doc).await;
+    assert!(
+        pending::claims(&reboot.doc).is_none(),
+        "the content drained"
+    );
+    assert_eq!(text(&reboot.doc), text(&doc_of(&all)));
+}
+
+/// Review Focus 2: a 0.9.13 room booted from a fixed snapshot (it ignores
+/// `pending_revs`), so its own snapshot lacks the parked content; boot
+/// takes the last trusted snapshot and re-parks it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_an_older_pod_wrote_after_the_migration_boots_from_the_last_trusted_one() {
+    let (u1, u2) = cross_client_parked();
+    let edit = para(3, "own paragraph");
+    let (pool, doc) = new_page().await;
+    let at = append_rows(&pool, doc, &[&u2, &edit]).await;
+    let after_row_1 = doc_of(&[&u2]);
+    let written = PgSnapshotStore::new(pool.clone())
+        .insert_stamped(
+            doc,
+            SnapshotStamp {
+                snapshot_seq: at[0].seq,
+                snapshot_rev: Some(at[0].rev),
+                epoch: Some(0),
+            },
+            &pending_free(&after_row_1),
+            &after_row_1.inner().transact().state_vector().encode_v1(),
+            Some(&[at[0].rev]),
+        )
+        .await
+        .unwrap();
+    assert!(written);
+    older_pods_snapshot(&pool, doc, STAMPED_SNAPSHOT_UPSERT_SQL, at[1], &edit).await;
+
+    let latest = PgSnapshotStore::new(pool.clone())
+        .latest(doc)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(latest.older_writer);
+    let boot = direct_boot(&pool, doc).await;
+    let f = boot.fallback.clone().expect("rollout");
+    assert_eq!((f.reason, f.whole_log), ("rollout", false));
+    let claims = pending::claims(&boot.doc).expect("u2 pending");
+    assert!(within(&insertions_of(&[&u2]), &claims.structs));
+
+    let h = open_room(
+        &pool,
+        doc,
+        Arc::new(PgUpdatesStore::new(pool.clone())),
+        LAZY,
+    )
+    .await;
+    let c = Client::join(&h, 7).await;
+    c.send(&h, u1).await;
+    until_text(&h, "back held").await;
+    shut_down(&h).await;
+}
+
+/// Review Focus 4: a pre-0.9.9 page whose parking row the old GC deleted;
+/// its legacy snapshot holds the only copy of the parked content, and boot
+/// carries it (Ruling 19).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_page_whose_parking_row_was_collected_keeps_its_pending_content() {
+    let (_, u2) = cross_client_parked();
+    let (pool, doc) = legacy_page().await;
+    let snapshot_seq: i64 =
+        sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('doc_updates', 'seq'))")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let parked = doc_of(&[&u2]);
+    let bytes = parked
+        .inner()
+        .transact()
+        .encode_state_as_update_v1(&StateVector::default());
+    assert!(pending::parks_when_applied(&bytes) && !pending::may_be_shifted(&bytes));
+    legacy_snapshot(&pool, doc, snapshot_seq, &parked).await;
+    finish_migrations(&pool).await;
+
+    let boot = direct_boot(&pool, doc).await;
+    assert_eq!(boot.fallback, None);
+    let claims = pending::claims(&boot.doc).expect("u2 pending");
+    assert!(within(&insertions_of(&[&u2]), &claims.structs));
+    assert!(!boot.carry.is_empty());
+}
+
+/// Ruling 6: 0.9.13's GC can delete the trusted snapshot during a long
+/// rollout; boot then replays the whole log over the flagged row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_whose_trusted_snapshot_an_older_gc_deleted_boots_from_the_whole_log() {
+    let (u1, u2) = cross_client_parked();
+    let (pool, doc) = new_page().await;
+    let edits: Vec<Vec<u8>> = (0..6).map(|i| para(30 + i, &format!("edit {i}"))).collect();
+    let mut rows: Vec<&[u8]> = vec![&u2];
+    rows.extend(edits.iter().map(Vec::as_slice));
+    let at = append_rows(&pool, doc, &rows).await;
+    let snapshots = PgSnapshotStore::new(pool.clone());
+    let after_row_1 = doc_of(&[&u2]);
+    snapshots
+        .insert_stamped(
+            doc,
+            SnapshotStamp {
+                snapshot_seq: at[0].seq,
+                snapshot_rev: Some(at[0].rev),
+                epoch: Some(0),
+            },
+            &pending_free(&after_row_1),
+            &after_row_1.inner().transact().state_vector().encode_v1(),
+            Some(&[at[0].rev]),
+        )
+        .await
+        .unwrap();
+    for i in 1..rows.len() {
+        let state = pending_free(&doc_of(&rows[1..=i]));
+        older_pods_snapshot(&pool, doc, STAMPED_SNAPSHOT_UPSERT_SQL, at[i], &state).await;
+    }
+    snapshots.gc(doc, 5, 30).await.unwrap();
+    let boot = direct_boot(&pool, doc).await;
+    let f = boot.fallback.clone().expect("rollout");
+    assert_eq!((f.reason, f.whole_log), ("rollout", false));
+
+    let h = open_room(
+        &pool,
+        doc,
+        Arc::new(PgUpdatesStore::new(pool.clone())),
+        LAZY,
+    )
+    .await;
+    shut_down(&h).await;
+    let trusted = snapshots.latest_trusted(doc).await.unwrap().unwrap();
+    assert_eq!(
+        trusted.snapshot_rev,
+        Some(at[0].rev),
+        "no newer trusted row"
+    );
+
+    sqlx::query(V0_9_13_GC_SQL)
+        .bind(doc)
+        .bind(5i64)
+        .bind(30i32)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(snapshots.latest_trusted(doc).await.unwrap(), None);
+    let boot = direct_boot(&pool, doc).await;
+    let f = boot.fallback.clone().expect("rollout");
+    assert_eq!((f.reason, f.whole_log), ("rollout", true));
+    let claims = pending::claims(&boot.doc).expect("u2 pending");
+    assert!(within(&insertions_of(&[&u2]), &claims.structs));
+
+    let h = open_room(
+        &pool,
+        doc,
+        Arc::new(PgUpdatesStore::new(pool.clone())),
+        LAZY,
+    )
+    .await;
+    let c = Client::join(&h, 7).await;
+    c.send(&h, u1).await;
+    until_text(&h, "back held").await;
     shut_down(&h).await;
 }

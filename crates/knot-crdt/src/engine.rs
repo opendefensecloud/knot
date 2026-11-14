@@ -55,6 +55,10 @@ pub struct ApplyMeasured {
     pub persist: Vec<u8>,
     /// Whether `persist` is the raw update (see `persist`).
     pub raw_fallback: bool,
+    /// Whether the apply changed the doc's pending structs or pending
+    /// deletes (it parked or drained content): the rows a room records for
+    /// its pending content (`pending::ParkedRows`).
+    pub pending_changed: bool,
 }
 
 pub struct DocHandle(pub(crate) Doc);
@@ -212,6 +216,7 @@ impl Engine for YrsEngine {
             rejected,
             persist,
             raw_fallback,
+            pending_changed,
         })
     }
 

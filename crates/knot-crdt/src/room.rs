@@ -308,6 +308,14 @@ pub struct Room {
     /// sends a Fatal or closes its channel, and when a snapshot write finds
     /// the page's epoch changed or the page gone.
     evicted: bool,
+    /// The log rows that park the doc's pending content, from boot
+    /// (`Boot::parked`).
+    #[allow(dead_code)] // Task 4: recorded, pruned and named by snapshots.
+    parked: crate::pending::ParkedRows,
+    /// Rows that carry pending content no log row holds (`Boot::carry`,
+    /// Ruling 19).
+    #[allow(dead_code)] // Task 4: persisted before the event loop.
+    carry: Vec<Vec<u8>>,
 }
 
 pub struct RoomHandle {
@@ -514,6 +522,8 @@ impl Room {
             snap_state,
             dirty_tx: deps.dirty_tx,
             evicted: false,
+            parked: booted.parked,
+            carry: booted.carry,
         };
         tokio::spawn(room.run());
         RoomHandle {
@@ -1178,6 +1188,16 @@ impl Room {
         if !self.may_snapshot() {
             return;
         }
+        // Until the room records the rows that park its pending content, a
+        // doc that holds pending content is not snapshotted: yrs's encoding
+        // of it may be shifted, and a snapshot without `pending_revs` would
+        // read as an older pod's at boot. With nothing pending, yrs's
+        // encoding is already pending-free (`merge_pending_v1` changes
+        // nothing), so the snapshot names no rows.
+        if crate::pending::claims(&self.doc).is_some() {
+            self.snap_state.updates_since_snapshot = 0;
+            return;
+        }
         let stamp = knot_storage::SnapshotStamp {
             snapshot_seq: self.through_seq,
             snapshot_rev: Some(self.applied_through_rev),
@@ -1189,7 +1209,7 @@ impl Room {
             self.engine.as_ref(),
             &self.doc,
             self.snapshots.as_ref(),
-            None,
+            Some(&[]),
         )
         .await
         {
@@ -3807,7 +3827,8 @@ pub(crate) mod tests {
             vec![Some(2), Some(4)],
             "attempts after edits 2 and 4 only"
         );
-        assert_eq!(snapshots.pending_revs(), vec![None, None]);
+        // Nothing pending: the snapshot names no rows.
+        assert_eq!(snapshots.pending_revs(), vec![Some(vec![]), Some(vec![])]);
         assert_eq!(rec.counter("knot_room_snapshots_total", &[]), 0);
         shut_down(&h).await;
     }
@@ -4012,10 +4033,9 @@ pub(crate) mod tests {
         let (parked, edit, client) = parked_block_and_the_edit_it_fails_on();
 
         send_edit(&h, crafted, parked).await;
-        until("a snapshot of the parked block", || {
-            !snapshots.written().is_empty()
-        })
-        .await;
+        // Until the room records the rows that park its pending content, it
+        // writes no snapshot while the crafted block is parked.
+        until("the parked block is stored", || !log.appended().is_empty()).await;
         let written = snapshots.written().len();
         send_edit(&h, innocent, edit).await;
         until_probe(&h, "the room is unlogged", |p| p.unlogged).await;

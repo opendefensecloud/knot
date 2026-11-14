@@ -287,3 +287,154 @@ pub fn holds_blocks_past_a_gap(d: &Doc) -> bool {
     let sv = d.transact().state_vector();
     holds_any(&at_or_above(&held(d), &sv))
 }
+
+/// `d`'s pending structs and pending deletes, apart.
+pub fn pending_parts(d: &Doc) -> (IdSet, IdSet) {
+    let txn = d.transact();
+    let store = txn.store();
+    (
+        store
+            .pending_update()
+            .map(|p| p.update.insertions(true))
+            .unwrap_or_default(),
+        store.pending_ds().cloned().unwrap_or_default(),
+    )
+}
+
+/// `d`'s pending structs net of the blocks it holds, and its pending
+/// deletes. yrs can keep a block in its pending update after the block
+/// integrated (it drops such a stale entry only at a later retry of the
+/// pending update), so the raw pending structs can name held blocks, which
+/// are not pending content.
+pub fn pending_content(d: &Doc) -> (IdSet, IdSet) {
+    let (structs, deletes) = pending_parts(d);
+    (structs.diff(&held(d)), deletes)
+}
+
+/// `d`'s delete set.
+pub fn deleted(d: &Doc) -> IdSet {
+    d.transact().snapshot().delete_set
+}
+
+/// Whether every id of `a` is in `b` (set semantics).
+fn within(a: &IdSet, b: &IdSet) -> bool {
+    !holds_any(&a.diff(b))
+}
+
+/// Ruling 17's reboot relations between a rebooted doc and the doc it
+/// reboots (`reference`), up to yrs's retry path dependence, one line per
+/// violated relation, structs and deletes apart. Pending structs are each
+/// doc's pending content ([`pending_content`]: stale entries of held blocks
+/// left out):
+/// 1. its state vector is at least the reference's;
+/// 2. its pending structs are within the reference's, and so are its
+///    pending deletes;
+/// 3. the reference's pending structs are held or pending in it, and the
+///    reference's pending deletes deleted or pending in it;
+/// 4. it holds nothing the reference lacks except stuck content a kept row
+///    integrated: its held blocks are within the reference's held blocks
+///    and pending structs, and its delete set within the reference's delete
+///    set, pending deletes and pending structs (the phantom check). A
+///    pending struct is in the delete set once integrated when its parent
+///    was deleted meanwhile (yrs deletes an item it integrates into a
+///    deleted parent), with no delete row naming it.
+pub fn reboot_violations(rebooted: &Doc, reference: &Doc) -> Vec<String> {
+    let mut out = Vec::new();
+    let (sv_b, sv_r) = (
+        rebooted.transact().state_vector(),
+        reference.transact().state_vector(),
+    );
+    if sv_r.iter().any(|(client, clock)| sv_b.get(client) < *clock) {
+        out.push(format!(
+            "1: the state vector is below the reference's: {sv_b:?} / {sv_r:?}"
+        ));
+    }
+    let (ps_b, pd_b) = pending_content(rebooted);
+    let (ps_r, pd_r) = pending_content(reference);
+    let (held_b, held_r) = (held(rebooted), held(reference));
+    let (ds_b, ds_r) = (deleted(rebooted), deleted(reference));
+    if !within(&ps_b, &ps_r) {
+        out.push(format!(
+            "2: pending structs the reference lacks: {:?}",
+            ps_b.diff(&ps_r)
+        ));
+    }
+    if !within(&pd_b, &pd_r) {
+        out.push(format!(
+            "2: pending deletes the reference lacks: {:?}",
+            pd_b.diff(&pd_r)
+        ));
+    }
+    if !within(&ps_r, &held_b.merge(&ps_b)) {
+        out.push(format!(
+            "3: the reference's pending structs neither held nor pending: {:?}",
+            ps_r.diff(&held_b.merge(&ps_b))
+        ));
+    }
+    if !within(&pd_r, &ds_b.merge(&pd_b)) {
+        out.push(format!(
+            "3: the reference's pending deletes neither deleted nor pending: {:?}",
+            pd_r.diff(&ds_b.merge(&pd_b))
+        ));
+    }
+    if !within(&held_b, &held_r.merge(&ps_r)) {
+        out.push(format!(
+            "4: held blocks the reference neither holds nor has pending: {:?}",
+            held_b.diff(&held_r.merge(&ps_r))
+        ));
+    }
+    let deletes_r = ds_r.merge(&pd_r).merge(&ps_r);
+    if !within(&ds_b, &deletes_r) {
+        out.push(format!(
+            "4: deletes the reference neither has nor has pending: {:?}",
+            ds_b.diff(&deletes_r)
+        ));
+    }
+    out
+}
+
+/// Panics with [`reboot_violations`] and `what` when there are any.
+#[track_caller]
+pub fn assert_reboots(rebooted: &Doc, reference: &Doc, what: &str) {
+    let violations = reboot_violations(rebooted, reference);
+    assert!(violations.is_empty(), "{what}: {violations:#?}");
+}
+
+/// Ruling 17's join bound: a joined doc's held blocks, delete set and
+/// pending content are within the live doc's held blocks and pending
+/// structs (structs) or its delete set and pending deletes (deletes). Its
+/// delete set may also hold live pending structs it integrated into a
+/// deleted parent (see [`reboot_violations`], relation 4).
+pub fn join_violations(joined: &Doc, live: &Doc) -> Vec<String> {
+    let mut out = Vec::new();
+    let (ps_l, pd_l) = pending_parts(live);
+    let structs = held(live).merge(&ps_l);
+    let deletes = deleted(live).merge(&pd_l);
+    let integrated_deletes = deletes.merge(&ps_l);
+    let (ps_j, pd_j) = pending_parts(joined);
+    if !within(&held(joined), &structs) {
+        out.push(format!(
+            "held blocks the live doc neither holds nor has pending: {:?}",
+            held(joined).diff(&structs)
+        ));
+    }
+    if !within(&deleted(joined), &integrated_deletes) {
+        out.push(format!(
+            "deletes the live doc neither has nor has pending: {:?}",
+            deleted(joined).diff(&integrated_deletes)
+        ));
+    }
+    if !within(&ps_j, &structs) {
+        out.push(format!(
+            "pending structs the live doc neither holds nor has pending: {:?}",
+            ps_j.diff(&structs)
+        ));
+    }
+    if !within(&pd_j, &deletes) {
+        out.push(format!(
+            "pending deletes the live doc neither has nor has pending: {:?}",
+            pd_j.diff(&deletes)
+        ));
+    }
+    out
+}
