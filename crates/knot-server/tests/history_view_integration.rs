@@ -1,7 +1,8 @@
 //! `GET /api/docs/{id}/history/entries/{eid}/view` (page history M1.4):
 //! who may view a past version of a page, the response it answers (a
 //! rendered ProseMirror doc in a per-request envelope), how `?changes=`
-//! is read, and how each `ViewError` reaches the client. Entries are
+//! is read, and how each `ViewError` reaches the client; and
+//! `POST …/entries/{eid}/restore`, the interim Markdown restore. Entries are
 //! built by the real builder (`Builder::build_page`) from rows the stores
 //! wrote; a test that changes the views' limits or hooks swaps
 //! `AppState::history_views` and builds a new router from that state.
@@ -1043,4 +1044,657 @@ async fn a_colleague_opening_the_same_version_is_not_blocked() {
     // The owner waits on no one else's slot.
     let body = colleague.ok();
     assert_eq!(body["entry_id"], json!(e2));
+}
+
+// ---------------------------------------------------------------------------
+// Restore (the interim Markdown restore, until M2)
+// ---------------------------------------------------------------------------
+
+fn restore_uri(doc: Uuid, eid: impl std::fmt::Display, query: &str) -> String {
+    format!("/api/docs/{doc}/history/entries/{eid}/restore{query}")
+}
+
+/// `POST …/history/entries/{eid}/restore{query}` through `app` as `session`.
+async fn restore_on(
+    app: &Router,
+    session: Option<&Session>,
+    doc: Uuid,
+    eid: impl std::fmt::Display,
+    query: &str,
+) -> Answer {
+    send_on(app, session, "POST", &restore_uri(doc, eid, query), None).await
+}
+
+/// [`restore_on`] through the fixture's router.
+async fn restore(
+    fx: &Fixture,
+    session: Option<&Session>,
+    doc: Uuid,
+    eid: impl std::fmt::Display,
+    query: &str,
+) -> Answer {
+    restore_on(&fx.app, session, doc, eid, query).await
+}
+
+/// A 204 with no body.
+#[track_caller]
+fn restored(a: &Answer) {
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+}
+
+/// The page's live content as Markdown, read by the owner.
+async fn markdown(fx: &Fixture, doc: Uuid) -> String {
+    let a = send(
+        fx,
+        Some(&fx.owner.session),
+        "GET",
+        &format!("/api/docs/{doc}/markdown"),
+        None,
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    a.body
+}
+
+/// `POST /api/docs/{doc}/markdown?mode=replace` as the owner.
+async fn import_replace(fx: &Fixture, doc: Uuid, md: &str) {
+    let r = fx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/docs/{doc}/markdown?mode=replace"))
+                .header("cookie", &fx.owner.session.cookie)
+                .header("x-csrf-token", &fx.owner.session.csrf)
+                .header("content-type", "text/markdown")
+                .body(Body::from(md.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let a = answer(r).await;
+    assert!(a.status.is_success(), "import: {} {}", a.status, a.body);
+}
+
+/// The first page of `doc`'s history entries, as the owner reads it.
+async fn entries(fx: &Fixture, doc: Uuid) -> Vec<Value> {
+    let body = send(
+        fx,
+        Some(&fx.owner.session),
+        "GET",
+        &format!("/api/docs/{doc}/history/entries"),
+        None,
+    )
+    .await
+    .ok();
+    body["entries"].as_array().unwrap().clone()
+}
+
+/// The listed entry `id` of `doc`.
+async fn listed(fx: &Fixture, doc: Uuid, id: i64) -> Value {
+    entries(fx, doc)
+        .await
+        .into_iter()
+        .find(|e| e["id"] == json!(id))
+        .unwrap_or_else(|| panic!("entry {id} not listed"))
+}
+
+/// A listed `ended_at`, as an instant.
+fn instant(v: &Value) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(v.as_str().unwrap())
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+/// `at` as a query value: a literal `+` would be read as a space.
+fn query_value(at: &str) -> String {
+    at.replace('+', "%2B")
+}
+
+/// The `meta` of `doc`'s newest `restore` row, as the room stored it.
+async fn stored_restore_meta(fx: &Fixture, doc: Uuid) -> Value {
+    sqlx::query_scalar(
+        "SELECT meta FROM doc_updates WHERE doc_id = $1 AND source = 'restore'
+          ORDER BY rev DESC LIMIT 1",
+    )
+    .bind(doc)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap()
+}
+
+/// The Markdown a full Y state reads as.
+fn markdown_of_state(state: &[u8]) -> String {
+    use knot_crdt::Engine;
+    let engine = knot_crdt::YrsEngine;
+    let doc = engine.new_doc();
+    engine.apply_update(&doc, state).unwrap();
+    knot_markdown::to_markdown::serialise(&engine, &doc).unwrap()
+}
+
+async fn baseline_state(fx: &Fixture, baseline_id: i64) -> Vec<u8> {
+    sqlx::query_scalar("SELECT state_bytes FROM doc_history_baselines WHERE id = $1")
+        .bind(baseline_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap()
+}
+
+/// A built page where the editor typed a paragraph (one session) and the
+/// owner then replaced the content with `# other` by an import, which
+/// seals it; returns the page and the session's id.
+async fn replaced_page(fx: &Fixture) -> (Uuid, i64) {
+    let doc = page(fx, "Replaced").await;
+    let t = Typist::new(20);
+    append(
+        fx,
+        doc,
+        fx.editor.id,
+        vec![t.para(&format!("first version: {TYPED}"))],
+    )
+    .await;
+    import_replace(fx, doc, "# other\n").await;
+    build(fx, doc).await;
+    let sid = session_of(fx, doc, fx.editor.id).await;
+    let md = markdown(fx, doc).await;
+    assert!(
+        md.contains("other") && !md.contains("first version"),
+        "{md}"
+    );
+    (doc, sid)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restoring_a_session_brings_back_its_text() {
+    let fx = fixture().await;
+    let (doc, sid) = replaced_page(&fx).await;
+    restored(&restore(&fx, Some(&fx.editor.session), doc, sid, "").await);
+    let md = markdown(&fx, doc).await;
+    assert!(md.contains("first version"), "{md}");
+    assert!(!md.contains("other"), "{md}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_is_listed_as_restored_to_its_target() {
+    let fx = fixture().await;
+    let (doc, sid) = replaced_page(&fx).await;
+    let session = listed(&fx, doc, sid).await;
+    let ended_at = instant(&session["ended_at"]);
+    let end_rev: i64 = sqlx::query_scalar("SELECT end_rev FROM doc_history_entries WHERE id = $1")
+        .bind(sid)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+
+    restored(&restore(&fx, Some(&fx.editor.session), doc, sid, "").await);
+    build(&fx, doc).await;
+    let newest = entries(&fx, doc).await[0].clone();
+    assert_eq!(newest["kind"], "restore", "{newest}");
+    assert_eq!(newest["meta"]["target_entry_id"], json!(sid), "{newest}");
+    assert_eq!(instant(&newest["meta"]["target_ended_at"]), ended_at);
+    // The list sends no target_rev; the stored row has it.
+    let stored = stored_restore_meta(&fx, doc).await;
+    assert_eq!(stored["target_rev"], json!(end_rev), "{stored}");
+    assert_eq!(stored["target_entry_id"], json!(sid), "{stored}");
+
+    // The same instant with another offset spelling, percent-encoded.
+    let plus = ended_at.to_rfc3339();
+    assert!(plus.ends_with("+00:00"), "{plus}");
+    let a = restore(
+        &fx,
+        Some(&fx.editor.session),
+        doc,
+        sid,
+        &format!("?ended_at={}", query_value(&plus)),
+    )
+    .await;
+    restored(&a);
+    let stored = stored_restore_meta(&fx, doc).await;
+    assert_eq!(instant(&stored["target_ended_at"]), ended_at, "{stored}");
+
+    // A literal "+" reaches the handler as a space.
+    restore(
+        &fx,
+        Some(&fx.editor.session),
+        doc,
+        sid,
+        &format!("?ended_at={plus}"),
+    )
+    .await
+    .error(StatusCode::BAD_REQUEST, "history.bad_request");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn viewers_cannot_restore_and_archived_pages_refuse() {
+    let fx = fixture().await;
+    let (doc, sid) = replaced_page(&fx).await;
+    restore(&fx, Some(&fx.viewer.session), doc, sid, "")
+        .await
+        .error(StatusCode::FORBIDDEN, "acl.editor_required");
+    restore(&fx, None, doc, sid, "")
+        .await
+        .error(StatusCode::UNAUTHORIZED, "auth.session_required");
+
+    let a = send(
+        &fx,
+        Some(&fx.owner.session),
+        "DELETE",
+        &format!("/api/docs/{doc}"),
+        None,
+    )
+    .await;
+    assert!(a.status.is_success(), "archive: {} {}", a.status, a.body);
+    for m in [&fx.owner, &fx.editor] {
+        restore(&fx, Some(&m.session), doc, sid, "")
+            .await
+            .error(StatusCode::CONFLICT, "doc.archived");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restoring_a_baseline_entry_works() {
+    let fx = fixture().await;
+    let (doc, eid, baseline_id) = legacy_page(&fx).await;
+    let expected = markdown_of_state(&baseline_state(&fx, baseline_id).await);
+    assert!(expected.contains("before the rollout"), "{expected}");
+    // The live rows lack the baseline's own content (the fixture's legacy
+    // row builds on it), so the page reads otherwise before the restore.
+    assert_ne!(markdown(&fx, doc).await, expected);
+
+    restored(&restore(&fx, Some(&fx.editor.session), doc, eid, "").await);
+    assert_eq!(markdown(&fx, doc).await, expected);
+    let stored = stored_restore_meta(&fx, doc).await;
+    assert_eq!(stored["target_rev"], Value::Null, "{stored}");
+    assert_eq!(stored["target_entry_id"], json!(eid), "{stored}");
+
+    // The rollout entry: the page as the rollout found it, at genesis.
+    let (rollout, genesis_rev): (i64, i64) = sqlx::query_as(
+        "SELECT e.id, s.genesis_rev FROM doc_history_entries e
+           JOIN doc_history_state s ON s.doc_id = e.doc_id
+          WHERE e.doc_id = $1 AND e.kind = 'baseline' AND e.baseline_id IS NULL",
+    )
+    .bind(doc)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    restored(&restore(&fx, Some(&fx.editor.session), doc, rollout, "").await);
+    let stored = stored_restore_meta(&fx, doc).await;
+    assert_eq!(stored["target_rev"], json!(genesis_rev), "{stored}");
+    let md = markdown(&fx, doc).await;
+    assert!(
+        md.contains("before the rollout") && md.contains("legacy row"),
+        "{md}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restoring_over_the_cap_is_a_409() {
+    let fx = fixture().await;
+    let (doc, sid) = replaced_page(&fx).await;
+    let before = markdown(&fx, doc).await;
+    let editor = Some(&fx.editor.session);
+
+    let app = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.max_plain_input_bytes = 64;
+    });
+    restore_on(&app, editor, doc, sid, "")
+        .await
+        .error(StatusCode::CONFLICT, "history.too_large");
+    assert_eq!(markdown(&fx, doc).await, before);
+
+    // A restore uses the plain cap, never the diff cap.
+    let app = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.max_changes_input_bytes = 64;
+    });
+    restored(&restore_on(&app, editor, doc, sid, "").await);
+    assert!(markdown(&fx, doc).await.contains("first version"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restoring_a_skipped_baseline_is_a_500() {
+    let fx = fixture().await;
+    let (doc, eid, baseline_id) = legacy_page(&fx).await;
+    sqlx::query("UPDATE doc_history_state SET skip_baselines = ARRAY[$2] WHERE doc_id = $1")
+        .bind(doc)
+        .bind(baseline_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    let before = markdown(&fx, doc).await;
+    let renders = counter();
+    let app = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.hooks.renders = Some(renders.clone());
+    });
+    restore_on(&app, Some(&fx.owner.session), doc, eid, "")
+        .await
+        .error(StatusCode::INTERNAL_SERVER_ERROR, "history.view_failed");
+    assert_eq!(count(&renders), 0);
+    assert_eq!(markdown(&fx, doc).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_restore_is_a_503() {
+    let fx = fixture().await;
+    let (doc, sid) = replaced_page(&fx).await;
+    let before = markdown(&fx, doc).await;
+    let app = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.permit_wait = Duration::from_millis(200);
+    });
+    let held = fx.state.history_permits.compute().await;
+    restore_on(&app, Some(&fx.editor.session), doc, sid, "")
+        .await
+        .busy();
+    drop(held);
+    assert_eq!(markdown(&fx, doc).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restricted_page_refuses_restore_without_a_grant() {
+    let fx = fixture().await;
+    let (doc, sid) = replaced_page(&fx).await;
+    let a = send(
+        &fx,
+        Some(&fx.owner.session),
+        "PUT",
+        &format!("/api/docs/{doc}/restricted"),
+        Some(json!({"restricted": true})),
+    )
+    .await;
+    assert!(a.status.is_success(), "restrict: {} {}", a.status, a.body);
+    let before = markdown(&fx, doc).await;
+
+    let renders = counter();
+    let app = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.hooks.renders = Some(renders.clone());
+    });
+    restore_on(&app, Some(&fx.editor.session), doc, sid, "")
+        .await
+        .error(StatusCode::FORBIDDEN, "acl.no_grant");
+    assert_eq!(count(&renders), 0);
+    assert_eq!(markdown(&fx, doc).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restoring_an_entry_of_another_page_is_a_404() {
+    let fx = fixture().await;
+    let (a, _) = replaced_page(&fx).await;
+    let (_, of_b) = edited_page(&fx).await;
+    let before = markdown(&fx, a).await;
+    restore(&fx, Some(&fx.owner.session), a, of_b, "")
+        .await
+        .error(StatusCode::NOT_FOUND, "history.not_found");
+    assert_eq!(markdown(&fx, a).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_of_a_moved_entry_is_a_409() {
+    let fx = fixture().await;
+    let editor = Some(&fx.editor.session);
+
+    // The version the reader saw is the entry's: restored.
+    let (doc, sid) = replaced_page(&fx).await;
+    let seen = listed(&fx, doc, sid).await["ended_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let a = restore(
+        &fx,
+        editor,
+        doc,
+        sid,
+        &format!("?ended_at={}", query_value(&seen)),
+    )
+    .await;
+    restored(&a);
+    assert!(markdown(&fx, doc).await.contains("first version"));
+
+    // An open session that grew after the reader saw it.
+    let doc = page(&fx, "Growing").await;
+    let t = Typist::new(30);
+    append(&fx, doc, fx.editor.id, vec![t.para("one")]).await;
+    build(&fx, doc).await;
+    let sid = session_of(&fx, doc, fx.editor.id).await;
+    let open = listed(&fx, doc, sid).await;
+    assert_eq!(open["open"], json!(true), "{open}");
+    let t1 = open["ended_at"].as_str().unwrap().to_string();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    append(&fx, doc, fx.editor.id, vec![t.para("two")]).await;
+    build(&fx, doc).await;
+    let grown = listed(&fx, doc, sid).await;
+    assert_ne!(instant(&grown["ended_at"]), instant(&json!(t1)), "{grown}");
+
+    let before = markdown(&fx, doc).await;
+    let t1q = query_value(&t1);
+    restore(&fx, editor, doc, sid, &format!("?ended_at={t1q}"))
+        .await
+        .error(StatusCode::CONFLICT, "history.moved");
+    for query in [
+        "?ended_at=garbage".to_string(),
+        "?ended_at=".to_string(),
+        format!("?ended_at={t1q}&ended_at={t1q}"),
+    ] {
+        restore(&fx, editor, doc, sid, &query)
+            .await
+            .error(StatusCode::BAD_REQUEST, "history.bad_request");
+    }
+    restore(&fx, editor, doc, "abc", "")
+        .await
+        .error(StatusCode::BAD_REQUEST, "history.bad_request");
+    assert_eq!(markdown(&fx, doc).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_given_up_at_genesis_restores_only_its_baselines() {
+    let fx = fixture().await;
+    let tiny = || {
+        builder(
+            &fx,
+            BuildLimits {
+                max_input_bytes: 1,
+                ..limits()
+            },
+        )
+    };
+    let given_up_at_genesis = |doc: Uuid| {
+        let fx = &fx;
+        async move {
+            let ok: bool = sqlx::query_scalar(
+                "SELECT retry_after = 'infinity' AND genesis_rev IS NULL AND builder_version = $2
+                   FROM doc_history_state WHERE doc_id = $1",
+            )
+            .bind(doc)
+            .bind(BUILDER_VERSION)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+            assert!(ok, "{doc} is not given up at genesis");
+        }
+    };
+
+    // A legacy page with one baseline and later typing.
+    let doc = page(&fx, "Given up").await;
+    exec(
+        &fx,
+        "UPDATE documents SET history_since = now() - interval '1 day',
+                              created_at = now() - interval '2 days'
+          WHERE id = $1",
+        doc,
+    )
+    .await;
+    let since = history_since(&fx, doc).await;
+    let t = Typist::new(60);
+    t.para("before the rollout");
+    let baseline_id: i64 = sqlx::query_scalar(
+        "INSERT INTO doc_history_baselines (doc_id, snapshot_seq, state_bytes, state_vector, created_at)
+         VALUES ($1, 1, $2, '\\x00', $3)
+         RETURNING id",
+    )
+    .bind(doc)
+    .bind(t.state())
+    .bind(since - chrono::Duration::hours(10))
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    append(&fx, doc, fx.editor.id, vec![t.para("later typing")]).await;
+    assert_eq!(tiny().build_page(doc).await, PassResult::Failed);
+    given_up_at_genesis(doc).await;
+
+    let listed = entries(&fx, doc).await;
+    assert_eq!(listed.len(), 1, "{listed:#?}");
+    assert_eq!(listed[0]["kind"], "baseline");
+    let eid = listed[0]["id"].as_i64().unwrap();
+    let baseline_entry: i64 = sqlx::query_scalar(
+        "SELECT id FROM doc_history_entries WHERE doc_id = $1 AND baseline_id = $2",
+    )
+    .bind(doc)
+    .bind(baseline_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(eid, baseline_entry);
+    let v = view(&fx, Some(&fx.owner.session), doc, eid, "").await.ok();
+    assert!(has_text(&v["doc"], "before the rollout"), "{}", v["doc"]);
+    assert!(!has_text(&v["doc"], "later typing"), "{}", v["doc"]);
+    let expected = markdown_of_state(&baseline_state(&fx, baseline_id).await);
+    assert_ne!(markdown(&fx, doc).await, expected);
+    restored(&restore(&fx, Some(&fx.editor.session), doc, eid, "").await);
+    assert_eq!(markdown(&fx, doc).await, expected);
+
+    // A page without a baseline, given up after its empty genesis: no
+    // entry; the seq restore is the operator's workaround.
+    let doc = page(&fx, "No entries").await;
+    let t = Typist::new(70);
+    append(&fx, doc, fx.editor.id, vec![t.para("one")]).await;
+    let snapshot = t.state();
+    let mut failed = false;
+    for _ in 0..5 {
+        match tiny().build_page(doc).await {
+            PassResult::Failed => {
+                failed = true;
+                break;
+            }
+            PassResult::Genesis { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(failed, "never given up");
+    let given_up: bool = sqlx::query_scalar(
+        "SELECT retry_after = 'infinity' FROM doc_history_state WHERE doc_id = $1",
+    )
+    .bind(doc)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert!(given_up);
+    assert_eq!(entries(&fx, doc).await, Vec::<Value>::new());
+
+    let sv = {
+        use yrs::updates::decoder::Decode;
+        use yrs::updates::encoder::Encode;
+        let update = yrs::Update::decode_v1(&snapshot).unwrap();
+        update.state_vector().encode_v1()
+    };
+    PgSnapshotStore::new(fx.pool.clone())
+        .insert(doc, 1, &snapshot, &sv)
+        .await
+        .unwrap();
+    append(&fx, doc, fx.editor.id, vec![t.para("two")]).await;
+    let a = send(
+        &fx,
+        Some(&fx.editor.session),
+        "POST",
+        &format!("/api/docs/{doc}/history/1/restore"),
+        None,
+    )
+    .await;
+    restored(&a);
+    let md = markdown(&fx, doc).await;
+    assert!(md.contains("one") && !md.contains("two"), "{md}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_of_a_page_an_older_builder_built_is_a_409() {
+    let fx = fixture().await;
+    let (doc, sid) = replaced_page(&fx).await;
+    sqlx::query("UPDATE doc_history_state SET builder_version = $2 WHERE doc_id = $1")
+        .bind(doc)
+        .bind(BUILDER_VERSION - 1)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    let before = markdown(&fx, doc).await;
+    let renders = counter();
+    let app = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.hooks.renders = Some(renders.clone());
+    });
+    restore_on(&app, Some(&fx.owner.session), doc, sid, "")
+        .await
+        .error(StatusCode::CONFLICT, "history.rebuilding");
+    assert_eq!(count(&renders), 0);
+    assert_eq!(markdown(&fx, doc).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_needs_the_update_scope() {
+    let fx = fixture().await;
+    let (doc, sid) = replaced_page(&fx).await;
+    let before = markdown(&fx, doc).await;
+    let key = |scopes: Vec<&'static str>| {
+        let fx = &fx;
+        async move {
+            let a = send(
+                fx,
+                Some(&fx.owner.session),
+                "POST",
+                "/api/auth/api-keys",
+                Some(json!({"name": "h", "scopes": scopes})),
+            )
+            .await;
+            assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+            a.json()["key"].as_str().unwrap().to_string()
+        }
+    };
+    // No cookie and no CSRF header: a key alone.
+    let with_key = |key: String| {
+        let app = fx.app.clone();
+        async move {
+            answer(
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(restore_uri(doc, sid, ""))
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await
+        }
+    };
+
+    let a = with_key(key(vec!["read"]).await).await;
+    a.error(StatusCode::FORBIDDEN, "api_key.scope_denied");
+    assert_eq!(
+        a.json()["error"]["details"]["scope"],
+        "update",
+        "{}",
+        a.body
+    );
+    assert_eq!(markdown(&fx, doc).await, before);
+
+    restored(&with_key(key(vec!["update"]).await).await);
+    assert!(markdown(&fx, doc).await.contains("first version"));
+    build(&fx, doc).await;
+    let author: Option<Uuid> = sqlx::query_scalar(
+        "SELECT author_id FROM doc_history_entries
+          WHERE doc_id = $1 AND kind = 'restore' ORDER BY id DESC LIMIT 1",
+    )
+    .bind(doc)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(author, Some(fx.owner.id));
 }

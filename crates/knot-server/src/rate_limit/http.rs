@@ -524,6 +524,24 @@ mod tests {
         }
     }
 
+    /// A history entry's restore is a page write like the Markdown
+    /// import: `classify`'s default for a mutating `/api` route, with no
+    /// `NAMED_ROUTES` row; its view is not limited (Rulings).
+    #[test]
+    fn history_entry_restores_are_writes() {
+        assert_eq!(
+            classify(
+                &Method::POST,
+                "/api/docs/{id}/history/entries/{eid}/restore"
+            ),
+            Some(HttpBucket::Write)
+        );
+        assert_eq!(
+            classify(&Method::GET, "/api/docs/{id}/history/entries/{eid}/view"),
+            None
+        );
+    }
+
     #[test]
     fn every_bucket_has_its_own_slot() {
         for (position, bucket) in HttpBucket::ALL.iter().enumerate() {
@@ -631,11 +649,18 @@ mod tests {
     async fn the_history_entry_templates_are_real_routes() {
         let app = probe_router();
         let doc = "0193e0c0-0000-7000-8000-000000000001";
-        for (method_name, uri, template) in [(
-            "GET",
-            format!("/api/docs/{doc}/history/entries/1/view"),
-            "/api/docs/{id}/history/entries/{eid}/view",
-        )] {
+        for (method_name, uri, template) in [
+            (
+                "GET",
+                format!("/api/docs/{doc}/history/entries/1/view"),
+                "/api/docs/{id}/history/entries/{eid}/view",
+            ),
+            (
+                "POST",
+                format!("/api/docs/{doc}/history/entries/1/restore"),
+                "/api/docs/{id}/history/entries/{eid}/restore",
+            ),
+        ] {
             assert_eq!(
                 matched_template(&app, method_name, &uri).await.as_deref(),
                 Some(template),

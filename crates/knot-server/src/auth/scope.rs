@@ -65,6 +65,11 @@ pub const OVERRIDES: &[(Method, &str, Scope)] = &[
         "/api/docs/{id}/history/{seq}/restore",
         Scope::Update,
     ),
+    (
+        Method::POST,
+        "/api/docs/{id}/history/entries/{eid}/restore",
+        Scope::Update,
+    ),
     (Method::POST, "/api/docs/{id}/template", Scope::Update),
     (
         Method::POST,
@@ -338,6 +343,16 @@ mod tests {
         assert!(!session_only(&Method::HEAD, p));
     }
 
+    /// A history entry's restore replaces the page's content, as the seq
+    /// restore and the Markdown import do: `update` through its
+    /// `OVERRIDES` row, open to keys (Rulings).
+    #[test]
+    fn the_history_entry_restore_requires_update() {
+        let p = "/api/docs/{id}/history/entries/{eid}/restore";
+        assert_eq!(up(p), Scope::Update);
+        assert!(!session_only(&Method::POST, p));
+    }
+
     /// axum answers HEAD with the GET handler, so a GET row covers HEAD too.
     #[test]
     fn head_on_a_session_only_get_route_is_session_only() {
@@ -374,7 +389,7 @@ mod tests {
     #[test]
     fn every_override_row_is_covered_by_a_test_above() {
         // Guards against adding a row without its dedicated test.
-        assert_eq!(OVERRIDES.len(), 14);
+        assert_eq!(OVERRIDES.len(), 15);
     }
 
     #[test]

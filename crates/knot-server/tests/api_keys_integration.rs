@@ -2422,6 +2422,7 @@ async fn every_scope_override_matches_a_real_route() {
             .replace("{thread_id}", &id)
             .replace("{suggestion_id}", &id)
             .replace("{seq}", "1")
+            .replace("{eid}", "1")
             .replace("{format}", "docx");
         assert!(!uri.contains('{'), "unsubstituted parameter in {template}");
         let (st, body) = guards_bearer(&app, &key, method.as_str(), &uri, None).await;
@@ -2430,6 +2431,39 @@ async fn every_scope_override_matches_a_real_route() {
             "{method} {template} with only `{}`: {st} {body}",
             scope.as_str()
         );
+    }
+}
+
+/// Bots view and restore history entries under their page role, as
+/// people do (Rulings): a bot Editor's key with `read` and `update`
+/// reaches both handlers, which answer for the missing entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_editor_reaches_history_views_and_restores() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let bot = invite_bot(&app, &s, &state, "history-bot@example.com").await;
+    let (st, minted) = send(
+        &app,
+        &s,
+        "POST",
+        "/api/auth/api-keys",
+        Some(serde_json::json!({
+            "name": "ci", "scopes": ["read", "update"], "user_id": bot,
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{minted}");
+    let key = minted["key"].as_str().unwrap().to_string();
+    let doc = matrix_doc(&app, &s, "page").await;
+
+    for (method, uri) in [
+        ("GET", format!("/api/docs/{doc}/history/entries/1/view")),
+        ("POST", format!("/api/docs/{doc}/history/entries/1/restore")),
+    ] {
+        let (st, body) = guards_bearer(&app, &key, method, &uri, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{method} {uri}: {body}");
+        assert_eq!(body["error"]["code"], "history.not_found", "{body}");
     }
 }
 
