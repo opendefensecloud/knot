@@ -534,6 +534,58 @@ mod tests {
         assert!(compute_access(&[root, child], &[], Some(Owner), Some(root.id)).is_empty());
     }
 
+    /// A restricted page above the root: only the user's inheriting grant on
+    /// it opens the subtree (with that role); the page itself and its other
+    /// children stay masked. Without the grant the restriction closes the
+    /// subtree.
+    #[test]
+    fn scope_root_below_a_restricted_page_needs_that_pages_grant() {
+        let locked = node(id(1), None, true);
+        let root = node(id(2), Some(locked.id), false);
+        let child = node(id(3), Some(root.id), false);
+        let sibling = node(id(4), Some(locked.id), false);
+        let nodes = [locked, root, child, sibling];
+        let scope = Some(root.id);
+        let grants = [grant(locked.id, Editor, true)];
+
+        let batched = compute_access(&nodes, &grants, Some(Viewer), scope);
+        assert_eq!(batched.len(), 2);
+        assert_eq!(batched[&root.id].role, Editor);
+        assert_eq!(batched[&child.id].role, Editor);
+        for (path, expected) in [
+            (&[locked][..], None),
+            (&[locked, sibling], None),
+            (&[locked, root], Some(Editor)),
+            (&[locked, root, child], Some(Editor)),
+        ] {
+            let along = access_along_path(path, &grants, Some(Viewer), scope).map(|a| a.role);
+            assert_eq!(along, expected, "{path:?}");
+        }
+
+        assert!(compute_access(&nodes, &[], Some(Owner), scope).is_empty());
+        for path in [&[locked, root][..], &[locked, root, child]] {
+            assert_eq!(access_along_path(path, &[], Some(Owner), scope), None);
+        }
+    }
+
+    /// A parent cycle through the root fails closed, key or no key. A path
+    /// cannot express a cycle, so the chain of a cyclic page is empty.
+    #[test]
+    fn parent_cycle_through_the_scope_root_fails_closed() {
+        let root = node(id(1), Some(id(2)), false);
+        let other = node(id(2), Some(id(1)), false);
+        let child = node(id(3), Some(root.id), false);
+        let grants = [grant(root.id, Owner, true)];
+
+        assert!(
+            compute_access(&[root, other, child], &grants, Some(Owner), Some(root.id)).is_empty()
+        );
+        assert_eq!(
+            access_along_path(&[], &grants, Some(Owner), Some(root.id)),
+            None
+        );
+    }
+
     /// A root that is not in the tree at all (deleted, foreign) reaches nothing.
     #[test]
     fn unknown_scope_root_reaches_nothing() {

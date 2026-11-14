@@ -90,7 +90,7 @@ pub async fn resolve(
     // of one workspace read/write access to documents in every other workspace
     // by UUID. The chain query filters every step by `workspace_id`, so a
     // missing or foreign doc yields an empty chain and no access. The cache
-    // key is (workspace_id, doc_id, user_id), so a `None` cached for a
+    // key is (workspace_id, doc_id, user_id, scope_root), so a `None` cached for a
     // foreign workspace never shadows the doc's real workspace.
     let principal = format!("user:{user_id}");
     let (chain, principal_grants) = grants

@@ -375,7 +375,9 @@ async fn create_key(State(state): State<AppState>, req: Request) -> Response {
         }
         // Lost the owner role, or the bot left, while the request ran.
         Err(ApiKeyStoreError::NotPermitted) => return foreign_forbidden(),
-        // A purge between the check above and the insert.
+        // A purge between the check above and the insert: one that committed
+        // before it trips the trigger (KB005), one still in flight the
+        // foreign key (23503). Both end as 404.
         Err(ApiKeyStoreError::RootRejected) => {
             return json_err(StatusCode::NOT_FOUND, "doc.not_found", "");
         }

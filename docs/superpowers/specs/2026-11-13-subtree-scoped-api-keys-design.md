@@ -128,7 +128,7 @@ root with `403 api_key.subtree_denied`:
 | `GET /api/notifications`, `GET /api/notifications/unread_count`, `POST /api/notifications/read` | the user's inbox; doc-less notifications pass the visibility filter, and `read` checks no ACL at all |
 | `POST /api/whats-new/seen` | changes the user's state |
 
-`SUBTREE_OK` lists the rest, each with a one-line reason: every
+`SUBTREE_OK` (rows of method and route template) lists the rest, each with a one-line reason: every
 `/api/docs/{id}/…`, `/api/blobs/{id}`, `/api/boards/{id}…` and
 `/api/short-links/{code}` route (resolved through the doc ACL), `GET
 /api/docs` (tree, filtered by `Visibility`), `GET /api/search` and `GET
@@ -178,6 +178,26 @@ refusals (`key_id`, method, route template).
 - **web:** Vitest — the create body carries `root_doc_id`; the chip renders
   both states. e2e `api-keys.spec.ts` — mint a subtree key, a page outside
   answers `403 acl.no_grant`.
+
+## Accepted limits
+
+- **Restore race.** The restore refusal checks the parent before
+  `docs.restore`, without a lock. If the parent is archived concurrently the
+  page can still land at the top level; accepted: the key then loses the page,
+  nothing leaks.
+- **Purging the root** deletes the key (FK cascade) without an
+  `api-key.revoke-cascade` audit row, and it disappears from the "revoked in
+  the last 30 days" listing.
+- **`GET /api/docs/{id}/access`** inside the subtree lists inheriting grants
+  that sit on ancestors above the root (principal, role, inherit; the source
+  page is not named), and `within_restricted` / `/access` may reveal that a
+  page above the root is restricted. Accepted: those grants govern the pages
+  inside.
+- **`SUBTREE_OK` is keyed by method** (`(Method, &str)`), so a method added to
+  an open route later stays closed to subtree keys until listed. The
+  integration test `subtree_ok_rows_match_the_real_router_methods` pins it:
+  every unlisted method on a listed path must answer 405, every listed one
+  must not.
 
 ## Documentation
 

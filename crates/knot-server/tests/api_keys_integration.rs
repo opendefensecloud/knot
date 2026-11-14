@@ -3774,6 +3774,78 @@ async fn every_subtree_denied_route_refuses_a_subtree_key() {
     assert_eq!(st, StatusCode::OK, "{body}");
 }
 
+/// S10: `SUBTREE_OK` is keyed by method, and the real router is the source of
+/// truth. For every path in the table and each of GET/POST/PUT/PATCH/DELETE:
+/// a method without a row has no handler (405), so nothing new can appear
+/// unnoticed; a method with a row is a real route (not 405, which also
+/// catches stale rows).
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_ok_rows_match_the_real_router_methods() {
+    use axum::http::Method;
+    use knot_server::auth::scope::SUBTREE_OK;
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let root = matrix_doc(&app, &s, "root").await;
+    let key = subtree_key(&app, &s, &root, &ALL_SCOPES).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut paths: Vec<&str> = SUBTREE_OK.iter().map(|(_, p)| *p).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    for template in paths {
+        let uri_for = |inner: &str| {
+            template
+                .replace("{id}", inner)
+                .replace("{doc_id}", inner)
+                .replace("{principal}", &format!("user:{id}"))
+                .replace("{seq}", "1")
+                .replace("{item_index}", "0")
+                .replace("{format}", "md")
+                .replace("{emoji}", "x")
+                .replace("{code}", "abc")
+                .replace("{thread_id}", &id)
+                .replace("{comment_id}", &id)
+                .replace("{share_id}", &id)
+                .replace("{suggestion_id}", &id)
+                .replace("{reply_id}", &id)
+        };
+        assert!(
+            !uri_for(&id).contains('{'),
+            "unsubstituted parameter in {template}"
+        );
+        for method in [
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            // A fresh page each time: archive, purge and restore would
+            // otherwise change what the next request meets.
+            let inner = child_doc(&app, &s, &root, "inner").await;
+            let uri = uri_for(&inner);
+            let listed = SUBTREE_OK
+                .iter()
+                .any(|(m, p)| *m == method && *p == template);
+            let body = (method != Method::GET).then(|| serde_json::json!({}));
+            let (st, body) = guards_bearer(&app, &key, method.as_str(), &uri, body).await;
+            if listed {
+                assert_ne!(
+                    st,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "stale SUBTREE_OK row {method} {template}: {body}"
+                );
+            } else {
+                assert_eq!(
+                    st,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {template} has a handler but no SUBTREE_OK row: {body}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn subtree_key_cannot_reach_the_top_level_or_move_its_root() {
     let state = state_with_owner("owner@example.com", "ownerpass1").await;

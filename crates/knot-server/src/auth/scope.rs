@@ -79,72 +79,117 @@ pub const SUBTREE_DENIED: &[&str] = &[
 ];
 
 /// S10: routes open to a subtree key, each with why that is safe. Every
-/// `/api` route is in exactly one of the two tables (tested).
-pub const SUBTREE_OK: &[&str] = &[
+/// `/api` route path is in SUBTREE_DENIED or has a row here (tested). Rows
+/// carry the method: a method added to a route later stays closed to subtree
+/// keys until listed (an integration test pins this against the real router).
+pub const SUBTREE_OK: &[(Method, &str)] = &[
     // Resolved through the doc ACL (route layer or handler), which masks
     // everything outside the root. Destinations are checked separately.
-    "/api/docs/{id}",
-    "/api/docs/{id}/purge",
+    (Method::GET, "/api/docs/{id}"),
+    (Method::PATCH, "/api/docs/{id}"),
+    (Method::DELETE, "/api/docs/{id}"),
+    (Method::POST, "/api/docs/{id}/purge"),
     // The handler refuses a restore that would land at the top level.
-    "/api/docs/{id}/restore",
-    "/api/docs/{id}/template",
-    "/api/docs/{id}/duplicate",
-    "/api/docs/{id}/move",
-    "/api/docs/{id}/markdown",
-    "/api/docs/from-template/{id}",
-    "/api/docs/{id}/grants",
-    "/api/docs/{id}/grants/{principal}",
-    "/api/docs/{id}/restricted",
-    "/api/docs/{id}/access",
-    "/api/docs/{id}/history",
-    "/api/docs/{id}/history/entries",
-    "/api/docs/{id}/history/{seq}/markdown",
-    "/api/docs/{id}/history/{seq}/restore",
-    "/api/docs/{id}/contributors",
-    "/api/docs/{id}/audit",
-    "/api/docs/{id}/short-link",
-    "/api/docs/{id}/export/diagrams",
-    "/api/docs/{id}/export/{format}",
-    "/api/docs/{doc_id}/export",
-    "/api/docs/{doc_id}/shares",
-    "/api/docs/{doc_id}/shares/{share_id}",
-    "/api/docs/{doc_id}/tasks/{item_index}",
+    (Method::POST, "/api/docs/{id}/restore"),
+    (Method::POST, "/api/docs/{id}/template"),
+    (Method::POST, "/api/docs/{id}/duplicate"),
+    (Method::POST, "/api/docs/{id}/move"),
+    (Method::GET, "/api/docs/{id}/markdown"),
+    (Method::POST, "/api/docs/{id}/markdown"),
+    (Method::POST, "/api/docs/from-template/{id}"),
+    (Method::GET, "/api/docs/{id}/grants"),
+    (Method::PUT, "/api/docs/{id}/grants/{principal}"),
+    (Method::DELETE, "/api/docs/{id}/grants/{principal}"),
+    (Method::PUT, "/api/docs/{id}/restricted"),
+    (Method::GET, "/api/docs/{id}/access"),
+    (Method::GET, "/api/docs/{id}/history"),
+    (Method::GET, "/api/docs/{id}/history/entries"),
+    (Method::GET, "/api/docs/{id}/history/{seq}/markdown"),
+    (Method::POST, "/api/docs/{id}/history/{seq}/restore"),
+    (Method::GET, "/api/docs/{id}/contributors"),
+    (Method::GET, "/api/docs/{id}/audit"),
+    (Method::GET, "/api/docs/{id}/short-link"),
+    (Method::POST, "/api/docs/{id}/short-link"),
+    (Method::GET, "/api/docs/{id}/export/diagrams"),
+    (Method::POST, "/api/docs/{id}/export/{format}"),
+    (Method::GET, "/api/docs/{doc_id}/export"),
+    (Method::GET, "/api/docs/{doc_id}/shares"),
+    (Method::POST, "/api/docs/{doc_id}/shares"),
+    (Method::DELETE, "/api/docs/{doc_id}/shares/{share_id}"),
+    (Method::PATCH, "/api/docs/{doc_id}/tasks/{item_index}"),
     // Comments and suggestions of a page: same doc ACL.
-    "/api/docs/{id}/comments",
-    "/api/docs/{id}/comments/{thread_id}/replies",
-    "/api/docs/{id}/comments/{thread_id}/resolve",
-    "/api/docs/{id}/comments/{thread_id}/unresolve",
-    "/api/docs/{id}/comments/{comment_id}/reactions",
-    "/api/docs/{id}/comments/{comment_id}/reactions/{emoji}",
-    "/api/docs/{id}/comments/{comment_id}",
-    "/api/docs/{id}/suggestions",
-    "/api/docs/{id}/suggestions/{suggestion_id}/accept",
-    "/api/docs/{id}/suggestions/{suggestion_id}/reject",
-    "/api/docs/{id}/suggestions/{suggestion_id}/withdraw",
-    "/api/docs/{id}/suggestions/{suggestion_id}/replies",
-    "/api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id}",
+    (Method::GET, "/api/docs/{id}/comments"),
+    (Method::POST, "/api/docs/{id}/comments"),
+    (Method::POST, "/api/docs/{id}/comments/{thread_id}/replies"),
+    (Method::POST, "/api/docs/{id}/comments/{thread_id}/resolve"),
+    (
+        Method::POST,
+        "/api/docs/{id}/comments/{thread_id}/unresolve",
+    ),
+    (
+        Method::POST,
+        "/api/docs/{id}/comments/{comment_id}/reactions",
+    ),
+    (
+        Method::DELETE,
+        "/api/docs/{id}/comments/{comment_id}/reactions/{emoji}",
+    ),
+    (Method::PATCH, "/api/docs/{id}/comments/{comment_id}"),
+    (Method::DELETE, "/api/docs/{id}/comments/{comment_id}"),
+    (Method::GET, "/api/docs/{id}/suggestions"),
+    (Method::POST, "/api/docs/{id}/suggestions"),
+    (
+        Method::POST,
+        "/api/docs/{id}/suggestions/{suggestion_id}/accept",
+    ),
+    (
+        Method::POST,
+        "/api/docs/{id}/suggestions/{suggestion_id}/reject",
+    ),
+    (
+        Method::POST,
+        "/api/docs/{id}/suggestions/{suggestion_id}/withdraw",
+    ),
+    (
+        Method::POST,
+        "/api/docs/{id}/suggestions/{suggestion_id}/replies",
+    ),
+    (
+        Method::PATCH,
+        "/api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id}",
+    ),
+    (
+        Method::DELETE,
+        "/api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id}",
+    ),
     // Blobs, boards and short links resolve to their page's ACL.
-    "/api/docs/{doc_id}/blobs",
-    "/api/blobs/{id}",
-    "/api/docs/{doc_id}/boards",
-    "/api/boards/{id}",
-    "/api/boards/{id}/svg",
-    "/api/short-links/{code}",
+    (Method::POST, "/api/docs/{doc_id}/blobs"),
+    (Method::GET, "/api/blobs/{id}"),
+    (Method::DELETE, "/api/blobs/{id}"),
+    (Method::GET, "/api/docs/{doc_id}/boards"),
+    (Method::POST, "/api/docs/{doc_id}/boards"),
+    (Method::DELETE, "/api/boards/{id}"),
+    (Method::GET, "/api/boards/{id}/svg"),
+    (Method::PUT, "/api/boards/{id}/svg"),
+    (Method::GET, "/api/short-links/{code}"),
     // Filtered by Visibility or the doc ACL; every row has a doc.
-    "/api/docs",
-    "/api/search",
-    "/api/workspace/tasks",
+    (Method::GET, "/api/docs"),
+    (Method::POST, "/api/docs"),
+    (Method::GET, "/api/search"),
+    (Method::GET, "/api/workspace/tasks"),
     // Workspace id, slug, name, role, retention: no page content.
-    "/api/workspace",
+    (Method::GET, "/api/workspace"),
     // Key management is SESSION_ONLY anyway; the handlers refuse keys.
-    "/api/auth/api-keys",
-    "/api/auth/api-keys/{id}",
-    // No page content.
-    "/api/version",
-    "/api/release-notes",
-    "/api/whats-new",
-    "/api/healthz",
-    "/api/readyz",
+    (Method::GET, "/api/auth/api-keys"),
+    (Method::POST, "/api/auth/api-keys"),
+    (Method::DELETE, "/api/auth/api-keys/{id}"),
+    // No page content. GET /api/whats-new initialises the user's
+    // `last_seen_version` once (harmless); POST /api/whats-new/seen is denied.
+    (Method::GET, "/api/version"),
+    (Method::GET, "/api/release-notes"),
+    (Method::GET, "/api/whats-new"),
+    (Method::GET, "/api/healthz"),
+    (Method::GET, "/api/readyz"),
 ];
 
 /// The answer to a subtree key on a workspace-wide route or destination.
@@ -475,7 +520,11 @@ mod tests {
     #[test]
     fn subtree_tables_have_their_rows() {
         assert_eq!(SUBTREE_DENIED.len(), 10);
-        assert!(SUBTREE_DENIED.iter().all(|p| !SUBTREE_OK.contains(p)));
+        assert!(
+            SUBTREE_DENIED
+                .iter()
+                .all(|p| SUBTREE_OK.iter().all(|(_, o)| o != p))
+        );
     }
 
     /// S10: every `/api` route is classified for subtree keys. A new route
@@ -492,7 +541,9 @@ mod tests {
         }
         let unclassified: Vec<_> = routes
             .iter()
-            .filter(|p| !SUBTREE_DENIED.contains(&p.as_str()) && !SUBTREE_OK.contains(&p.as_str()))
+            .filter(|p| {
+                !SUBTREE_DENIED.contains(&p.as_str()) && !SUBTREE_OK.iter().any(|(_, o)| o == p)
+            })
             .collect();
         assert!(
             unclassified.is_empty(),

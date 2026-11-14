@@ -15,6 +15,8 @@ const SSO_TTL_ERRCODE: &str = "KB003";
 
 /// SQLSTATE raised by the `api_keys_root_doc_guard` trigger.
 const ROOT_ERRCODE: &str = "KB005";
+const FK_ERRCODE: &str = "23503";
+const ROOT_FK: &str = "api_keys_root_doc_id_fkey";
 
 /// Most live (not revoked, not expired) keys one user may hold. Minting
 /// more answers [`ApiKeyStoreError::LimitReached`].
@@ -270,6 +272,11 @@ fn map_insert_err(e: sqlx::Error) -> ApiKeyStoreError {
         match db.code().as_deref() {
             Some(SSO_TTL_ERRCODE) => return ApiKeyStoreError::TtlRejected,
             Some(ROOT_ERRCODE) => return ApiKeyStoreError::RootRejected,
+            // A purge of the root still in flight: the trigger saw the page,
+            // the FK did not. Other FKs (user, workspace) stay errors.
+            Some(FK_ERRCODE) if db.constraint() == Some(ROOT_FK) => {
+                return ApiKeyStoreError::RootRejected;
+            }
             _ => {}
         }
     }
