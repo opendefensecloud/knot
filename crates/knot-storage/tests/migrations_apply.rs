@@ -86,6 +86,7 @@ async fn migrations_apply_cleanly() {
         "share_tokens",
         "suggestion_replies",
         "suggestions",
+        "user_favorites",
         "users",
         "workspace_members",
         "workspaces",

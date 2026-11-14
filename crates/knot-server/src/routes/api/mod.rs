@@ -14,6 +14,7 @@ pub mod contributors;
 pub mod docs;
 pub mod export;
 pub mod export_import;
+pub mod favorites;
 pub mod grants;
 pub mod history;
 pub mod markdown;
@@ -42,6 +43,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(boards::router())
         .merge(tasks::router())
         .merge(notifications::router())
+        .merge(favorites::router())
         .merge(export_import::router())
         .merge(whats_new::router())
         // Last layer is outermost: require_session -> scope -> csrf ->

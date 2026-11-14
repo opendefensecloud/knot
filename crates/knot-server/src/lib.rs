@@ -84,6 +84,8 @@ pub struct AppState {
     pub board_rooms: Option<Arc<knot_crdt::BoardRooms>>,
     pub tasks: Option<Arc<dyn knot_storage::TaskStore>>,
     pub notifications: Option<Arc<dyn NotificationStore>>,
+    /// The pages each user starred.
+    pub favorites: Option<Arc<dyn knot_storage::FavoriteStore>>,
     pub contributors: Option<Arc<dyn knot_storage::ContributorStore>>,
     pub hasher: Arc<Hasher>,
     pub throttle: Arc<Throttle>,
@@ -157,6 +159,7 @@ impl AppState {
             board_rooms: None,
             tasks: None,
             notifications: None,
+            favorites: None,
             contributors: None,
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
@@ -216,6 +219,8 @@ impl AppState {
             Arc::new(knot_storage::PgTaskStore::new(pool.clone()));
         let notifications: Arc<dyn NotificationStore> =
             Arc::new(PgNotificationStore::new(pool.clone()));
+        let favorites: Arc<dyn knot_storage::FavoriteStore> =
+            Arc::new(knot_storage::PgFavoriteStore::new(pool.clone()));
         let contributors: Arc<dyn knot_storage::ContributorStore> =
             Arc::new(knot_storage::PgContributorStore::new(pool.clone()));
         Self {
@@ -242,6 +247,7 @@ impl AppState {
             board_rooms: None,
             tasks: Some(tasks),
             notifications: Some(notifications),
+            favorites: Some(favorites),
             contributors: Some(contributors),
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
