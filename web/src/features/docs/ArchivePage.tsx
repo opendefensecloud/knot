@@ -13,6 +13,7 @@ import { Link } from "react-router-dom";
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { Button } from "../../components/ui/Button";
 import type { ArchiveEntry } from "../../lib/validators";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 
 import { archiveErrorText, daysUntil, purgeConfirmText, purgeErrorText } from "./archive";
@@ -59,8 +60,9 @@ export default function ArchivePage() {
     const r = await docsApi.restore(entry.id);
     setBusyId(null);
     if ("error" in r) {
-      notify(
-        "error",
+      notifyFailure(
+        notify,
+        r.error,
         r.error.code === "doc.restore_restricted_parent_archived"
           ? archiveErrorText(r.error.code)
           : `Couldn't restore "${entry.title}"`,
@@ -77,7 +79,7 @@ export default function ArchivePage() {
     const r = await docsApi.purge(entry.id);
     setBusyId(null);
     if ("error" in r) {
-      notify("error", purgeErrorText(r.error.code, `Couldn't delete "${entry.title}"`));
+      notifyFailure(notify, r.error, purgeErrorText(r.error.code, `Couldn't delete "${entry.title}"`));
       return;
     }
     notify("info", `Deleted "${entry.title}" permanently`);

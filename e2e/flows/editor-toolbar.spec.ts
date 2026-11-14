@@ -78,10 +78,13 @@ test("toolbar buttons reflect what the caret is inside", async ({ page }) => {
   await bold.click();
   await expect(bold).toHaveAttribute("aria-pressed", "true");
 
-  // The table row/column controls are gated on isActive("table") and no spec
-  // touches them. Absent in a paragraph, present once the caret is in a table
-  // — which only holds if the toolbar re-reads isActive as the caret moves.
-  await expect(page.getByTestId("toolbar-table-add-row")).toHaveCount(0);
+  // The table button is gated on isActive("table"): Insert table in a
+  // paragraph, the table menu once the caret is in a table — which only
+  // holds if the toolbar re-reads isActive as the caret moves.
+  await expect(page.getByTestId("toolbar-table-menu")).toHaveCount(0);
   await page.getByTestId("toolbar-table").click();
+  await expect(page.getByTestId("toolbar-table-menu")).toBeVisible();
+  await expect(page.getByTestId("toolbar-table")).toHaveCount(0);
+  await page.getByTestId("toolbar-table-menu").click();
   await expect(page.getByTestId("toolbar-table-add-row")).toBeVisible();
 });

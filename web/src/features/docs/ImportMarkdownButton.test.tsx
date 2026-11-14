@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { useUi } from "../../stores/ui";
 import { ImportMarkdownButton } from "./ImportMarkdownButton";
 
 const importMarkdown = vi.fn<(...a: unknown[]) => unknown>();
@@ -102,3 +103,19 @@ describe("ImportMarkdownButton", () => {
   });
 });
 
+
+describe("ImportMarkdownButton when a limit refuses the import", () => {
+  it("says to slow down instead of 'Import failed.'", async () => {
+    importMarkdown.mockResolvedValue({
+      error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 6 }, status: 429 },
+    });
+    useUi.setState({ toasts: [] });
+    renderButton();
+    pick();
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([
+        { kind: "warn", text: "You're doing that too fast. Try again in 6 s.", key: "limit" },
+      ]),
+    );
+  });
+});

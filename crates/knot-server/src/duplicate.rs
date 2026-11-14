@@ -47,6 +47,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::AuthContext;
+use crate::quota::{QuotaCheckError, QuotaRefusal};
 use crate::routes::api::markdown::{current_snapshot, refresh_markdown_from};
 
 /// Pages one duplicate may copy, the top page included.
@@ -70,7 +71,8 @@ pub enum DuplicateError {
     NotFound,
     /// The user can't put a page under the source's parent, where the copy
     /// goes: the answer of `restricted::require_editable_parent` (404, 403
-    /// or 409), passed on as it is.
+    /// or 409), or a bot's `403 bot.restricted_forbidden`, passed on as it
+    /// is.
     #[error("the source's parent refuses the copy")]
     Destination(Response),
     #[error("the page is a template")]
@@ -80,6 +82,10 @@ pub enum DuplicateError {
     /// Over [`MAX_DUPLICATE_PAGES`] or [`MAX_DUPLICATE_BLOB_BYTES`].
     #[error("too large")]
     TooLarge,
+    /// The copy's pages or file bytes are over a quota. Already counted and
+    /// audited ([`crate::quota::record_refusal`]).
+    #[error("over the {} quota ({})", .0.quota, .0.scope)]
+    QuotaExceeded(QuotaRefusal),
     /// While it was copied, the page was moved or archived, or a file it
     /// shows was purged or is missing from the store. Trying again can
     /// succeed once the page is back or the file is fixed.
@@ -95,6 +101,23 @@ pub enum DuplicateError {
 
 fn internal(e: impl std::fmt::Display) -> DuplicateError {
     DuplicateError::Internal(e.to_string())
+}
+
+/// `outcome` of a quota check as the duplicate's answer: a refusal is
+/// counted and audited here, where it happens.
+async fn quota_refused(
+    state: &AppState,
+    ctx: &AuthContext,
+    outcome: Result<(), QuotaCheckError>,
+) -> Result<(), DuplicateError> {
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(QuotaCheckError::Exceeded(refusal)) => {
+            crate::quota::record_refusal(state, ctx, &refusal).await;
+            Err(DuplicateError::QuotaExceeded(refusal))
+        }
+        Err(QuotaCheckError::Internal(error)) => Err(internal(format!("quota count: {error}"))),
+    }
 }
 
 /// One page of the copy while it is prepared.
@@ -222,6 +245,17 @@ pub async fn check(
         None if ctx.role == WorkspaceRole::Viewer => return Err(DuplicateError::EditorRequired),
         None => {}
     }
+    // Policy: a bot adds no page inside a restricted subtree. And the copy of a
+    // restricted page gives the user an owner grant, which a bot can never
+    // hold.
+    if let Some(response) =
+        crate::bots::deny_bot_restricted_destination(state, ctx, source.parent_id).await
+    {
+        return Err(DuplicateError::Destination(response));
+    }
+    if source.restricted {
+        deny_bot_restricted_copy(state, ctx).await?;
+    }
     if source.is_template {
         return Err(DuplicateError::IsTemplate);
     }
@@ -272,6 +306,9 @@ pub async fn run(
         .await
         .map_err(internal)?;
     let subpages = readable_subpages(live_subpages, &visibility);
+    if subpages.iter().any(|row| row.restricted) {
+        deny_bot_restricted_copy(&state, &ctx).await?;
+    }
     // The restriction boundary the copy goes into, as its parent's.
     let destination_root = source
         .parent_id
@@ -280,6 +317,9 @@ pub async fn run(
     if 1 + subpages.len() > MAX_DUPLICATE_PAGES {
         return Err(DuplicateError::TooLarge);
     }
+    // The copy's pages are `created_by` the user, so they count for them.
+    let quota_outcome = crate::quota::check_pages(&state, &ctx, 1 + subpages.len() as u64).await;
+    quota_refused(&state, &ctx, quota_outcome).await?;
 
     let page_ids: HashMap<Uuid, Uuid> = std::iter::once(source_id)
         .chain(subpages.iter().map(|row| row.id))
@@ -336,6 +376,10 @@ pub async fn run(
     if bytes > MAX_DUPLICATE_BLOB_BYTES {
         return Err(DuplicateError::TooLarge);
     }
+    // So do the copied files, before any object is copied.
+    let quota_outcome =
+        crate::quota::check_blob_bytes(&state, &ctx, u64::try_from(bytes).unwrap_or(0)).await;
+    quota_refused(&state, &ctx, quota_outcome).await?;
 
     // Objects outside the database: recorded first, so that a copy whose
     // answer was lost is still cleaned up (P16).
@@ -445,6 +489,21 @@ pub async fn run(
         top: outcome.top,
         refresh,
     })
+}
+
+/// `403 bot.restricted_forbidden` when `ctx`'s user is a bot: the copy of a
+/// restricted page carries an owner grant for the user.
+async fn deny_bot_restricted_copy(
+    state: &AppState,
+    ctx: &AuthContext,
+) -> Result<(), DuplicateError> {
+    match crate::bots::is_bot(state, ctx.user_id).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(DuplicateError::Destination(
+            crate::bots::restricted_forbidden(ctx, "duplicate restricted page"),
+        )),
+        Err(response) => Err(DuplicateError::Destination(response)),
+    }
 }
 
 /// The live subpages, from `live_subtree`, that the user can read, in their

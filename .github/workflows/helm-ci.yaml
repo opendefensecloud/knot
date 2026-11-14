@@ -32,6 +32,14 @@ jobs:
         # and silently ignores check-version-increment.
         run: ct lint --config ct.yaml --target-branch main --chart-dirs deploy/helm
 
+      - name: Chart render checks
+        # Renders the chart with several value sets and asserts the ConfigMap:
+        # no number in exponent notation (a large value without `| int64`
+        # renders as 1.073741824e+10, which the server refuses at startup),
+        # trustedProxies as a list or a string, and the schema refusing values
+        # the server would refuse.
+        run: deploy/helm/check-render.sh
+
       # NOTE: `ct install` (deploy-to-kind smoke test) is intentionally omitted:
       # the chart's default image is not published yet, so an install hits
       # ImagePullBackOff. Restore it once the release pipeline publishes an

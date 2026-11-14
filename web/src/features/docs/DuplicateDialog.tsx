@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 
 import { Button } from "../../components/ui/Button";
+import { limitErrorText, type LimitErrorInput } from "../../lib/limitErrors";
 
 /** Shown when a duplicate fails for any reason other than its size. */
 const DUPLICATE_FAILED = "Couldn't duplicate this page.";
@@ -14,8 +15,10 @@ const DUPLICATE_TOO_LARGE = "This page is too large to duplicate (over 200 pages
 const DUPLICATE_BUSY = "Too many copies are being made right now. Try again in a moment.";
 
 /** What to tell the user when a duplicate failed with this error, or with
- *  no answer at all. */
-export function duplicateErrorText(error?: { status: number; code: string }): string {
+ *  no answer at all. A rate limit or quota says so in its own words. */
+export function duplicateErrorText(error?: LimitErrorInput): string {
+  const limitText = error ? limitErrorText(error) : null;
+  if (limitText !== null) return limitText;
   if (error?.status === 413) return DUPLICATE_TOO_LARGE;
   if (error?.code === "doc.duplicate_busy") return DUPLICATE_BUSY;
   return DUPLICATE_FAILED;

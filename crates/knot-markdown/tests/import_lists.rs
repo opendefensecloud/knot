@@ -204,3 +204,84 @@ fn rule_inside_item_or_quote_stays_in_its_container() {
         assert_eq!(normalised(doc.inner()), want, "{md:?}");
     }
 }
+
+/// A nested list imports nested and exports in the canonical form, whatever
+/// the source indented it with. #78 ("they are all on top level") had every
+/// content path checked; none flattened, and this keeps it that way.
+#[test]
+fn nested_list_imports_nested_and_exports_canonically() {
+    let three_levels = concat!(
+        "<bullet_list>\n",
+        "  <list_item>\n",
+        "    <paragraph>\n",
+        "      \"a\"\n",
+        "    <bullet_list>\n",
+        "      <list_item>\n",
+        "        <paragraph>\n",
+        "          \"b\"\n",
+        "        <bullet_list>\n",
+        "          <list_item>\n",
+        "            <paragraph>\n",
+        "              \"c\"\n",
+        "  <list_item>\n",
+        "    <paragraph>\n",
+        "      \"d\"\n",
+    );
+    for md in [
+        "- a\n  - b\n    - c\n- d\n",
+        "- a\n    - b\n        - c\n- d\n",
+        "- a\n\t- b\n\t\t- c\n- d\n",
+    ] {
+        let doc = import(md);
+        assert_eq!(normalised(doc.inner()), three_levels, "{md:?}");
+        assert_eq!(export(&doc), "- a\n  - b\n    - c\n- d\n", "{md:?}");
+    }
+}
+
+/// Bullet and ordered lists nest in each other, and a nested item is
+/// indented by the width of its parent's marker.
+#[test]
+fn mixed_nested_lists_import_nested_and_export_canonically() {
+    for (md, want_tree) in [
+        (
+            "1. a\n   - b\n2. c\n",
+            concat!(
+                "<ordered_list start=\"1\">\n",
+                "  <list_item>\n",
+                "    <paragraph>\n",
+                "      \"a\"\n",
+                "    <bullet_list>\n",
+                "      <list_item>\n",
+                "        <paragraph>\n",
+                "          \"b\"\n",
+                "  <list_item>\n",
+                "    <paragraph>\n",
+                "      \"c\"\n",
+            ),
+        ),
+        (
+            "- a\n  1. b\n  2. c\n- d\n",
+            concat!(
+                "<bullet_list>\n",
+                "  <list_item>\n",
+                "    <paragraph>\n",
+                "      \"a\"\n",
+                "    <ordered_list start=\"1\">\n",
+                "      <list_item>\n",
+                "        <paragraph>\n",
+                "          \"b\"\n",
+                "      <list_item>\n",
+                "        <paragraph>\n",
+                "          \"c\"\n",
+                "  <list_item>\n",
+                "    <paragraph>\n",
+                "      \"d\"\n",
+            ),
+        ),
+    ] {
+        let doc = import(md);
+        assert_eq!(normalised(doc.inner()), want_tree, "{md:?}");
+        // Both are already canonical, so they come back unchanged.
+        assert_eq!(export(&doc), md, "{md:?}");
+    }
+}

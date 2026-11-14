@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { ConnStatus } from "../../components/StatusDot";
+import type { ApiError } from "../../lib/api";
+import { LIMIT_TOAST_KEY, limitErrorText, type Notify } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
+import { AUDIT_UNAVAILABLE_TEXT, isAuditUnavailable } from "./auditRefusal";
 import { exportApi } from "./export.api";
 import { exportFileName, fallbackMessage, saveBlob } from "./exportFile";
 import { renderDiagrams } from "./renderDiagrams";
@@ -12,11 +15,14 @@ export type ExportDeps = {
   exportFileName: typeof exportFileName;
   fallbackMessage: typeof fallbackMessage;
   saveBlob: typeof saveBlob;
-  notify: (kind: "info" | "warn" | "error", text: string) => void;
+  notify: Notify;
 };
 
 const SYNC_WAIT_MS = 5000;
 const SYNC_POLL_MS = 100;
+/** Failures worth one more try without the diagram pictures (a smaller,
+ *  quicker request). Never a 503: neither a busy server nor an export the
+ *  audit log couldn't record gets better without pictures. */
 const RETRY_STATUSES = new Set([413, 408, 0]);
 
 export function useExport(opts: {
@@ -67,7 +73,7 @@ export function useExport(opts: {
 
         const list = await d.exportApi.diagrams(docId);
         if ("error" in list) {
-          fail(d, list.error.code);
+          fail(d, list.error);
           return;
         }
         const parts = await d.renderDiagrams(list.ok.diagrams, list.ok.limits);
@@ -77,14 +83,14 @@ export function useExport(opts: {
           res = await d.exportApi.file(docId, format, new Map());
         }
         if ("error" in res) {
-          fail(d, res.error.code);
+          fail(d, res.error);
           return;
         }
         d.saveBlob(res.ok.blob, d.exportFileName(title, format));
         const msg = d.fallbackMessage(res.ok.fallbacks, unsynced);
         if (msg !== null) d.notify("warn", msg);
       } catch {
-        fail(d, "");
+        fail(d);
       } finally {
         busyRef.current = false;
         setExporting(false);
@@ -96,7 +102,10 @@ export function useExport(opts: {
   return { exporting, run };
 }
 
-function fail(d: ExportDeps, code: string): void {
-  if (code === "export.busy") d.notify("warn", "Export is busy, try again in a moment.");
+function fail(d: ExportDeps, error?: ApiError): void {
+  const limitText = error ? limitErrorText(error) : null;
+  if (limitText !== null) d.notify("warn", limitText, { key: LIMIT_TOAST_KEY });
+  else if (error?.code === "export.busy") d.notify("warn", "Export is busy, try again in a moment.");
+  else if (isAuditUnavailable(error)) d.notify("error", AUDIT_UNAVAILABLE_TEXT);
   else d.notify("error", "Couldn't export this page. Try again, or export as Markdown.");
 }

@@ -15,8 +15,12 @@ image:
   pullSecrets: []
 
 # Horizontally scalable: document and board collaboration fans out across pods
-# via Postgres LISTEN/NOTIFY, so replicaCount can be raised. (Login throttling is
-# still per-process, so brute-force protection weakens as replicas increase.)
+# via Postgres LISTEN/NOTIFY, so replicaCount can be raised. Login throttling and
+# the rate limits (rateLimit below) are per-process: a user or client spread over
+# N replicas gets up to N times each limit, so brute-force protection weakens as
+# replicas increase; divide the rate limits with rateLimit.scale if that matters
+# (the scale doesn't change the login failure throttle). Quotas are counted in
+# Postgres and hold across replicas.
 replicaCount: 1
 
 # Required: Postgres connection URL.
@@ -95,6 +99,11 @@ alerting:
   ticketSeverity: warning
   errorBudgetTarget: 0.995
   latencyP95Target: 0.25
+  # KnotRateLimitedSustained (ticket severity) fires when one bucket refuses
+  # more than this many requests per second (all replicas together, 15 min
+  # average) for 30 minutes. Normal use doesn't reach a limit, so a sustained
+  # rate means a script or a misbehaving client.
+  rateLimitedPerSecond: 1
 
 tracing:
   enabled: false
@@ -150,6 +159,50 @@ history:
   workers: 1
   replayMaxBytes: 4194304
   cpuShare: 0.5
+
+# Rate limits (README "Rate limits and quotas"). Every limit is an in-memory
+# token bucket per user (sign-in and public share links: per client IP), per
+# replica. The per-bucket numbers are built in and sized well above normal use;
+# scale multiplies all of them (above 0, at most 100; 0.5 halves them, 2
+# doubles them). enabled: false turns off every HTTP and collab WebSocket rate
+# limit (not quotas, not the import caps). collabMaxSockets is how many collab
+# WebSockets one user may hold open on one replica (at least 1; every open page
+# or board tab holds one). Set a fractional scale here or with
+# --set-json rateLimit.scale=0.5: --set passes "0.5" as a string, which the
+# schema refuses.
+rateLimit:
+  enabled: true
+  scale: 1
+  collabMaxSockets: 64
+
+# Reverse proxies whose X-Forwarded-For knot believes: a list of IPs or CIDRs
+# (or one comma-separated string). List ONLY your ingress controller's pod or
+# node addresses, and when you list a pod CIDR, restrict
+# networkPolicy.ingressFrom to the ingress controller, or any pod in that range
+# can choose its client IP. 0.0.0.0/0, ::/0 and any other /0 are refused at
+# render time; knot refuses to start, with an error naming
+# KNOT_TRUSTED_PROXIES, on a malformed entry or one with host bits after the
+# prefix (10.0.0.5/8: write 10.0.0.0/8, or the bare address). Empty: the TCP
+# peer is the client; behind a proxy that sends X-Forwarded-For the per-IP
+# limits (sign-in, public share links) are then skipped rather than shared by
+# every client, counted in
+# knot_client_ip_unresolved_total{reason="no_trusted_proxies"}. Behind an L4
+# balancer that adds no X-Forwarded-For, every client shares one sign-in
+# bucket: see the README, "Client IP behind a proxy".
+trustedProxies: []
+
+# Optional quotas, 0 = off. Pages count every page (archived ones and templates
+# included) until it is purged; file bytes count uploaded attachments and
+# copies, not board previews. Per user counts what that user created or
+# uploaded. A workspace quota without a per-user one lets one account use it
+# all. Checked before each create, upload, duplicate and import; best effort
+# under concurrency (concurrent creates can overshoot by what runs at once).
+# Each is at most 9007199254740991 (2^53 - 1, as Helm reads numbers as floats).
+quotas:
+  pagesPerUser: 0
+  pagesPerWorkspace: 0
+  blobBytesPerUser: 0
+  blobBytesPerWorkspace: 0
 
 resources:
   requests:

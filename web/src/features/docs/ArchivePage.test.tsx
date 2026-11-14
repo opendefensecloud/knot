@@ -196,3 +196,31 @@ describe("ArchivePage", () => {
     expect(await screen.findByText("Nothing in the archive.")).toBeInTheDocument();
   });
 });
+
+describe("ArchivePage when a limit refuses a restore", () => {
+  it("says to slow down instead of the generic error", async () => {
+    useUi.setState({ toasts: [] });
+    const base = server("editor", [folderEntry]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) => {
+        if (url === "/api/docs/folder/restore" && init?.method === "POST") {
+          return json(
+            { error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 2 } } },
+            429,
+          );
+        }
+        return base(url, init);
+      }),
+    );
+    renderPage();
+    const row = await screen.findByTestId("archive-row-folder");
+    await waitFor(() => expect(within(row).getByRole("button", { name: "Restore" })).toBeEnabled());
+    fireEvent.click(within(row).getByRole("button", { name: "Restore" }));
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([
+        { kind: "warn", text: "You're doing that too fast. Try again in 2 s.", key: "limit" },
+      ]),
+    );
+  });
+});

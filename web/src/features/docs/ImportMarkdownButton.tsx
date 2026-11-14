@@ -4,6 +4,7 @@ import { useRef, useState } from "react";
 
 import { IconButton } from "../../components/ui/IconButton";
 import { historyApi } from "../../lib/history.api";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 
 import { docsApi } from "./docs.api";
@@ -71,7 +72,7 @@ export function ImportMarkdownButton({
     const r = await docsApi.importMarkdown(docId, markdown, "replace");
     setBusy(false);
     if ("error" in r) {
-      notify("error", messageFor(r.error.code));
+      notifyFailure(notify, r.error, messageFor(r.error.code));
       return;
     }
     // The content needs no refetch: the room actor fans the replace out over

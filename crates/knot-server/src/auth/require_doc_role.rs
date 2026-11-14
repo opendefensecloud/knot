@@ -101,3 +101,25 @@ pub fn require_viewer(req: &Request<Body>) -> Option<Response> {
     }
     None
 }
+
+/// Require the caller to be at least Editor (not Viewer-only).
+/// Expects `EffectiveDocRole` already set by `require_doc_role_mw`:
+/// 401 `auth.session_required` without a session, 403 `acl.no_grant`
+/// without a role on the doc, 403 `acl.editor_required` for a viewer. The
+/// effective role on the doc decides, never the workspace role.
+pub fn require_editor(req: &Request<Body>) -> Option<Response> {
+    if req.extensions().get::<AuthContext>().is_none() {
+        return Some(json_err(
+            StatusCode::UNAUTHORIZED,
+            "auth.session_required",
+            "",
+        ));
+    }
+    match req.extensions().get::<EffectiveDocRole>().copied() {
+        None => Some(json_err(StatusCode::FORBIDDEN, "acl.no_grant", "")),
+        Some(role) if role.0 == WorkspaceRole::Viewer => {
+            Some(json_err(StatusCode::FORBIDDEN, "acl.editor_required", ""))
+        }
+        Some(_) => None,
+    }
+}

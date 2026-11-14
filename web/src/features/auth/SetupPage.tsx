@@ -3,6 +3,7 @@ import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { authApi } from "../../auth/session.api";
+import { limitErrorText } from "../../lib/limitErrors";
 
 export default function SetupPage() {
   const [email, setEmail] = useState("");
@@ -21,11 +22,12 @@ export default function SetupPage() {
     setBusy(false);
     if ("error" in r) {
       setError(
-        r.error.code === "auth.setup_closed"
-          ? "Setup is already complete. Try signing in."
-          : r.error.code === "auth.weak_password"
-            ? "Password must be at least 8 characters."
-            : "Setup failed.",
+        limitErrorText(r.error)
+          ?? (r.error.code === "auth.setup_closed"
+            ? "Setup is already complete. Try signing in."
+            : r.error.code === "auth.weak_password"
+              ? "Password must be at least 8 characters."
+              : "Setup failed."),
       );
       return;
     }

@@ -68,7 +68,12 @@ jobs:
           POSTGRES_DB: knot
         ports:
           - 5432:5432
+        # Docker's default 64 MB /dev/shm runs out once the suite has created
+        # several hundred t_<uuid> databases (Postgres's shared stats grow with
+        # every table, in segments up to 32 MB), and tests then fail with
+        # "could not resize shared memory segment". Same as deploy/compose/dev.yml.
         options: >-
+          --shm-size 1g
           --health-cmd "pg_isready -U knot"
           --health-interval 5s
           --health-timeout 5s

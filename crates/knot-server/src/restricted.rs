@@ -90,6 +90,9 @@ pub async fn require_readable_anchors(
 /// and their workspace role (at the top level, the role is the parent).
 /// When the parent is no longer editable, the page stays where it was made
 /// without the grant, as if it had been made just before the change.
+///
+/// A bot creator gets `editor` instead: a bot is never an owner (S4,
+/// trigger KB002), and editing is all it needs here.
 pub async fn ensure_creator_can_edit(
     state: &AppState,
     workspace_id: Uuid,
@@ -153,12 +156,17 @@ pub async fn ensure_creator_can_edit(
     if !can_edit_parent {
         return Ok(());
     }
+    let role = if crate::bots::is_bot(state, creator).await? {
+        WorkspaceRole::Editor
+    } else {
+        WorkspaceRole::Owner
+    };
     match grants
         .put(
             workspace_id,
             doc_id,
             &format!("user:{creator}"),
-            WorkspaceRole::Owner,
+            role,
             true,
             creator,
         )

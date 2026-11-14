@@ -452,3 +452,61 @@ async fn last_owner_guard_only_on_restricted_docs() {
         Err(knot_storage::GrantStoreError::LastOwner)
     ));
 }
+
+/// The `doc.grant` audit row says who got which access, for the page
+/// audit log.
+#[tokio::test(flavor = "multi_thread")]
+async fn grant_rows_carry_principal_role_and_inherit() {
+    let (docs, grants, ws, user, pool) = setup_with_pool().await;
+    let d = docs.create(ws, None, "X", "m", user).await.unwrap();
+    let principal = format!("user:{}", user);
+    grants
+        .put(ws, d.id, &principal, WorkspaceRole::Editor, false, user)
+        .await
+        .unwrap();
+    let rows: Vec<(String, Option<Uuid>, serde_json::Value)> = sqlx::query_as(
+        "SELECT action, actor_id, data FROM audit_events
+          WHERE target_id = $1 AND action = 'doc.grant'",
+    )
+    .bind(d.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "doc.grant".to_string(),
+            Some(user),
+            serde_json::json!({"principal": principal, "role": "editor", "inherit": false}),
+        )]
+    );
+}
+
+/// The `doc.grant.delete` audit row names the principal whose access went.
+#[tokio::test(flavor = "multi_thread")]
+async fn grant_delete_rows_carry_principal() {
+    let (docs, grants, ws, user, pool) = setup_with_pool().await;
+    let d = docs.create(ws, None, "X", "m", user).await.unwrap();
+    let principal = format!("user:{}", user);
+    grants
+        .put(ws, d.id, &principal, WorkspaceRole::Viewer, true, user)
+        .await
+        .unwrap();
+    grants.delete(ws, d.id, &principal, user).await.unwrap();
+    let rows: Vec<(String, Option<Uuid>, serde_json::Value)> = sqlx::query_as(
+        "SELECT action, actor_id, data FROM audit_events
+          WHERE target_id = $1 AND action = 'doc.grant.delete'",
+    )
+    .bind(d.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "doc.grant.delete".to_string(),
+            Some(user),
+            serde_json::json!({"principal": principal}),
+        )]
+    );
+}

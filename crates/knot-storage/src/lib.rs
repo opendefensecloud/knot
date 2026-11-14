@@ -1,5 +1,6 @@
 //! Storage layer for knot — Postgres pool + storage traits.
 
+pub mod api_key_store;
 pub mod audit;
 pub mod blobs;
 pub mod boards;
@@ -11,12 +12,15 @@ pub mod grant_store;
 pub mod invalidations;
 pub mod lexorank;
 pub mod markdown_cache;
+pub mod move_to_subpage;
 pub mod notifications;
 pub mod placement;
 pub mod pool;
+pub mod quota;
 pub mod search;
 pub mod session_store;
 pub mod share_tokens;
+pub mod short_links;
 pub mod snapshot_store;
 pub mod suggestions;
 pub mod tasks;
@@ -26,6 +30,9 @@ pub mod updates_store;
 pub mod user_store;
 pub mod workspace_store;
 
+pub use api_key_store::{
+    ApiKey, ApiKeyStore, ApiKeyStoreError, NewApiKey, PgApiKeyStore, Scope, ScopeError, Scopes,
+};
 pub use blobs::{BlobMeta, BlobMetadata, BlobStore, BlobStoreError, PgBytesStore, S3Store};
 pub use boards::{Board, BoardStore, BoardStoreError, PgBoardStore};
 pub use comments::{Comment, CommentStore, CommentStoreError, PgCommentStore, Reaction};
@@ -47,6 +54,10 @@ pub use pool::{Pool, PoolError, begin, connect};
 pub use search::{PgSearchStore, SearchHit, SearchStore, SearchStoreError};
 pub use session_store::{PgSessionStore, Session, SessionStore, SessionStoreError};
 pub use share_tokens::{PgShareTokenStore, ShareStoreError, ShareToken, ShareTokenStore};
+pub use short_links::{
+    PgShortLinkStore, SHORT_CODE_LEN, ShortLink, ShortLinkStore, ShortLinkStoreError,
+    is_short_code, new_short_code,
+};
 pub use snapshot_store::{
     DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStamp, SnapshotStore, SnapshotStoreError,
 };

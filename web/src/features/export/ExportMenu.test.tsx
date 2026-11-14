@@ -1,18 +1,29 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const hook = vi.hoisted(() => ({ exporting: false, run: vi.fn() }));
 vi.mock("./useExport", () => ({
   useExport: () => ({ exporting: hook.exporting, run: hook.run }),
 }));
+const saved = vi.hoisted(() => ({ saveBlob: vi.fn() }));
+vi.mock("./exportFile", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./exportFile")>()),
+  saveBlob: saved.saveBlob,
+}));
 
+import { useUi } from "../../stores/ui";
 import { ExportMenu } from "./ExportMenu";
 
 beforeEach(() => {
   hook.exporting = false;
   hook.run.mockReset();
+  saved.saveBlob.mockReset();
+  useUi.setState({ toasts: [] });
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 function mount(isTemplate = false) {
   render(
@@ -35,7 +46,8 @@ describe("ExportMenu", () => {
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("menu")).toBeInTheDocument();
     expect(screen.getAllByRole("menuitem")).toHaveLength(4);
-    expect(screen.getByRole("separator")).toBeInTheDocument();
+    // One between the file formats and the Markdown zips, one above the audit note.
+    expect(screen.getAllByRole("separator")).toHaveLength(2);
     expect(screen.getByTestId("export-docx")).toHaveTextContent("Word document");
     expect(screen.getByTestId("export-docx")).toHaveTextContent(
       ".docx · opens in Word, LibreOffice, Google Docs",
@@ -46,11 +58,30 @@ describe("ExportMenu", () => {
     expect(screen.getByTestId("export-md-subtree")).toHaveTextContent("Markdown with subpages (zip)");
   });
 
+  it("tells the exporter that exports are recorded, below the last item", () => {
+    mount();
+    open();
+    const note = screen.getByTestId("export-audit-note");
+    expect(note).toHaveTextContent("Exports are recorded in the page's audit log.");
+    expect(screen.getByRole("menu").lastElementChild).toBe(note);
+    // Not a menu item: arrow keys never land on it...
+    expect(screen.getAllByRole("menuitem")).not.toContain(note);
+    // ...so the menu carries it as its description, read when it opens.
+    expect(screen.getByRole("menu")).toHaveAccessibleDescription("Exports are recorded in the page's audit log.");
+  });
+
+  it("keeps the audit note on template pages", () => {
+    mount(true);
+    open();
+    expect(screen.getByTestId("export-audit-note")).toBeInTheDocument();
+  });
+
   it("hides the Markdown items on template pages", () => {
     mount(true);
     open();
     expect(screen.getAllByRole("menuitem")).toHaveLength(2);
-    expect(screen.queryByRole("separator")).toBeNull();
+    // Only the one above the audit note.
+    expect(screen.getAllByRole("separator")).toHaveLength(1);
     expect(screen.queryByTestId("export-md")).toBeNull();
     expect(screen.queryByTestId("export-md-subtree")).toBeNull();
   });
@@ -140,23 +171,71 @@ describe("ExportMenu", () => {
     expect(hook.run).toHaveBeenCalledWith("odt");
   });
 
-  it("downloads Markdown zips with and without subpages", () => {
-    const hrefs: string[] = [];
-    const click = vi
-      .spyOn(HTMLAnchorElement.prototype, "click")
-      .mockImplementation(function (this: HTMLAnchorElement) {
-        hrefs.push(`${this.getAttribute("href")}|${this.download}`);
-      });
+  it("downloads Markdown zips with and without subpages", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(new Response("zip", { status: 200, headers: { "Content-Type": "application/zip" } })),
+    );
     mount();
     open();
     fireEvent.click(screen.getByTestId("export-md"));
     expect(screen.queryByRole("menu")).toBeNull();
+    await waitFor(() => expect(saved.saveBlob).toHaveBeenCalledTimes(1));
     open();
     fireEvent.click(screen.getByTestId("export-md-subtree"));
-    expect(hrefs).toEqual([
-      "/api/docs/d1/export?descendants=false|Runbook.zip",
-      "/api/docs/d1/export?descendants=true|Runbook.zip",
+    await waitFor(() => expect(saved.saveBlob).toHaveBeenCalledTimes(2));
+    expect(fetchSpy.mock.calls.map((call) => call[0])).toEqual([
+      "/api/docs/d1/export?descendants=false",
+      "/api/docs/d1/export?descendants=true",
     ]);
-    click.mockRestore();
+    expect(saved.saveBlob.mock.calls.map((call): unknown => call[1])).toEqual(["Runbook.zip", "Runbook.zip"]);
+    expect(useUi.getState().toasts).toEqual([]);
+  });
+
+  it("says when a Markdown zip is refused for going too fast", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 9 } } }),
+        { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "9" } },
+      ),
+    );
+    mount();
+    open();
+    fireEvent.click(screen.getByTestId("export-md"));
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([
+        { kind: "warn", text: "You're doing that too fast. Try again in 9 s.", key: "limit" },
+      ]),
+    );
+    expect(saved.saveBlob).not.toHaveBeenCalled();
+  });
+
+  it("says when a Markdown zip is blocked because the audit log couldn't record it", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: { code: "audit.unavailable", message: "the export couldn't be recorded in the audit log", details: {} },
+        }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    mount();
+    open();
+    fireEvent.click(screen.getByTestId("export-md-subtree"));
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([
+        { kind: "error", text: "Export blocked: it couldn't be recorded in the audit log. Try again later." },
+      ]),
+    );
+    expect(saved.saveBlob).not.toHaveBeenCalled();
+  });
+
+  it("says when a Markdown zip fails for another reason", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", { status: 500 }));
+    mount();
+    open();
+    fireEvent.click(screen.getByTestId("export-md-subtree"));
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([{ kind: "error", text: "Couldn't export this page." }]),
+    );
   });
 });

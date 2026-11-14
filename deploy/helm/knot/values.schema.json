@@ -118,7 +118,8 @@
         "pageSeverity": { "type": "string" },
         "ticketSeverity": { "type": "string" },
         "errorBudgetTarget": { "type": "number", "minimum": 0, "maximum": 1 },
-        "latencyP95Target": { "type": "number", "minimum": 0 }
+        "latencyP95Target": { "type": "number", "minimum": 0 },
+        "rateLimitedPerSecond": { "type": "number", "exclusiveMinimum": 0 }
       }
     },
     "tracing": {
@@ -147,6 +148,41 @@
         "workers": { "type": "integer", "minimum": 0 },
         "replayMaxBytes": { "type": "integer", "minimum": 1048576 },
         "cpuShare": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+      }
+    },
+    "rateLimit": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "scale": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
+        "collabMaxSockets": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+      }
+    },
+    "trustedProxies": {
+      "description": "IPs or CIDRs whose X-Forwarded-For is trusted, as a list or one comma-separated string. Only IP and CIDR characters are allowed, and a prefix length of 0 (0.0.0.0/0, ::/0, /00) is refused; knot checks the rest at startup (malformed entries, host bits after the prefix, IPv4-mapped networks).",
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^\\s*[0-9A-Fa-f:.]+(/[0-9]+)?\\s*$",
+            "not": { "pattern": "/\\s*0+\\s*$" }
+          }
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9A-Fa-f:.,/\\s]*$",
+          "not": { "pattern": "/\\s*0+\\s*(,|$)" }
+        }
+      ]
+    },
+    "quotas": {
+      "type": "object",
+      "properties": {
+        "pagesPerUser": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "pagesPerWorkspace": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "blobBytesPerUser": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "blobBytesPerWorkspace": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
       }
     }
   }

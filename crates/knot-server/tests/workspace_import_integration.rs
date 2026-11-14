@@ -760,3 +760,318 @@ async fn subtree_export_prunes_restricted_child() {
     );
     assert_eq!(manifest_entry(&zip, "Public chapter")["restricted"], false);
 }
+
+// ---------------------------------------------------------------------------
+// Import caps
+// ---------------------------------------------------------------------------
+
+/// Most pages one import may create (`MAX_IMPORT_PAGES` in the handler).
+const MAX_IMPORT_PAGES: usize = 10_000;
+
+/// Most attachment and board SVG bytes one import may write.
+const MAX_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Most page Markdown bytes one import may write.
+const MAX_IMPORT_MARKDOWN_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A zip of `manifest` as `index.json` plus `entries`, deflated.
+fn zip_of(manifest: &Value, entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("index.json", options).unwrap();
+    zip.write_all(manifest.to_string().as_bytes()).unwrap();
+    for (name, bytes) in entries {
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+/// A manifest page entry: a fresh id at the top level, titled `title`, with
+/// its body at `docs/<title>.md`.
+fn page_entry(title: &str) -> (Uuid, Value) {
+    let id = Uuid::new_v4();
+    let entry = json!({
+        "id": id.to_string(),
+        "parent_id": null,
+        "title": title,
+        "sort_key": "m",
+        "path": format!("docs/{title}.md"),
+    });
+    (id, entry)
+}
+
+/// A manifest attachment entry of the page `doc_id`, its bytes at `path`.
+/// The `byte_size` it claims is 0: the caps must not believe it.
+fn attachment_entry(doc_id: Uuid, path: &str) -> Value {
+    json!({
+        "id": Uuid::new_v4().to_string(),
+        "doc_id": doc_id.to_string(),
+        "content_type": "application/octet-stream",
+        "original_name": null,
+        "byte_size": 0,
+        "path": path,
+    })
+}
+
+/// A version-2 manifest of `docs`, `attachments` and `boards`.
+fn manifest(docs: Vec<Value>, attachments: Vec<Value>, boards: Vec<Value>) -> Value {
+    json!({
+        "knot_export_version": "2",
+        "docs": docs,
+        "attachments": attachments,
+        "boards": boards,
+    })
+}
+
+/// `zip` with the uncompressed size of `entry_name` rewritten to
+/// `declared_size` in its local header and in the central directory alike:
+/// a consistent archive whose entry holds more than it says.
+fn with_declared_size(zip: &[u8], entry_name: &str, declared_size: u32) -> Vec<u8> {
+    const LOCAL_HEADER: &[u8] = b"PK\x03\x04";
+    const CENTRAL_HEADER: &[u8] = b"PK\x01\x02";
+    let mut patched = zip.to_vec();
+    let name = entry_name.as_bytes();
+    let name_at =
+        |bytes: &[u8], offset: usize| bytes.get(offset..offset + name.len()) == Some(name);
+    let mut patched_headers = 0;
+    for offset in 0..patched.len().saturating_sub(4) {
+        let size_offset = match &patched[offset..offset + 4] {
+            signature if signature == LOCAL_HEADER && name_at(&patched, offset + 30) => 22,
+            signature if signature == CENTRAL_HEADER && name_at(&patched, offset + 46) => 24,
+            _ => continue,
+        };
+        patched[offset + size_offset..offset + size_offset + 4]
+            .copy_from_slice(&declared_size.to_le_bytes());
+        patched_headers += 1;
+    }
+    assert_eq!(
+        patched_headers, 2,
+        "local and central header of {entry_name}"
+    );
+    patched
+}
+
+/// A 1×1 PNG (as in `blobs_integration.rs`).
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0xDA, 0x63, 0x60, 0x60, 0x00, 0x00,
+    0x00, 0x00, 0x04, 0x00, 0x01, 0x5C, 0x5B, 0x66, 0xE3, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+    0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+impl World {
+    /// `POST /api/workspace/import` of `zip` at the top level, as the owner.
+    async fn import_raw(&self, zip: Vec<u8>) -> (StatusCode, Value) {
+        self.send("POST", "/api/workspace/import", "application/zip", zip)
+            .await
+    }
+
+    /// How many pages, attachments and boards the workspace holds, archived
+    /// or not.
+    async fn stored_counts(&self) -> (i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT count(*) FROM documents WHERE workspace_id = $1),
+                    (SELECT count(*) FROM blobs WHERE workspace_id = $1),
+                    (SELECT count(*) FROM boards b JOIN documents d ON d.id = b.doc_id
+                      WHERE d.workspace_id = $1)",
+        )
+        .bind(self.workspace)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// Uploads `bytes` as a PNG attachment of `doc_id`, asserting 201.
+    async fn upload_png(&self, doc_id: Uuid, bytes: &[u8]) {
+        const BOUNDARY: &str = "----ImportTestBoundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"dot.png\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: image/png\r\n\r\n");
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        let (status, response) = self
+            .send(
+                "POST",
+                &format!("/api/docs/{doc_id}/blobs"),
+                &format!("multipart/form-data; boundary={BOUNDARY}"),
+                body,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "upload: {response}");
+    }
+}
+
+/// One page more than an import may create is refused whole, with 413
+/// `import.too_large`, before any page is created. The manifest alone is
+/// enough: the pages need no bodies.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_over_the_page_cap_is_refused_and_creates_nothing() {
+    let w = world().await;
+    w.create("Home").await;
+    let before = w.stored_counts().await;
+    let docs: Vec<Value> = (0..=MAX_IMPORT_PAGES)
+        .map(|index| page_entry(&format!("page-{index}")).1)
+        .collect();
+
+    let (status, body) = w
+        .import_raw(zip_of(&manifest(docs, vec![], vec![]), &[]))
+        .await;
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "import.too_large", "{body}");
+    assert_eq!(
+        body["error"]["details"]["pages"],
+        json!(MAX_IMPORT_PAGES + 1)
+    );
+    assert_eq!(
+        body["error"]["details"]["max_pages"],
+        json!(MAX_IMPORT_PAGES)
+    );
+    assert_eq!(w.stored_counts().await, before, "nothing written");
+}
+
+/// A tiny zip whose one compressible entry is named by enough attachments
+/// to write more than the byte cap is refused: each reference counts its
+/// entry's declared size again, whatever the manifest's `byte_size` says.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_naming_one_entry_past_the_byte_cap_is_refused_and_writes_nothing() {
+    let w = world().await;
+    w.create("Home").await;
+    let before = w.stored_counts().await;
+    let one_mebibyte = vec![0u8; 1024 * 1024];
+    let references = (MAX_IMPORT_BYTES / one_mebibyte.len() as u64) as usize + 1;
+    let (page_id, page) = page_entry("Zeros");
+    let attachments: Vec<Value> = (0..references)
+        .map(|_| attachment_entry(page_id, "attachments/zeros.bin"))
+        .collect();
+    let zip = zip_of(
+        &manifest(vec![page], attachments, vec![]),
+        &[("attachments/zeros.bin", &one_mebibyte)],
+    );
+    assert!(zip.len() < 1024 * 1024, "the request itself is small");
+
+    let (status, body) = w.import_raw(zip).await;
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "import.too_large", "{body}");
+    assert_eq!(
+        body["error"]["details"]["bytes"],
+        json!(references as u64 * 1024 * 1024)
+    );
+    assert_eq!(
+        body["error"]["details"]["max_bytes"],
+        json!(MAX_IMPORT_BYTES)
+    );
+    assert_eq!(w.stored_counts().await, before, "nothing written");
+}
+
+/// A tiny zip whose one compressible Markdown entry is named by enough
+/// pages to write more than the Markdown cap is refused: each page reads
+/// and stores its entry again, so each counts its declared size.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_naming_one_markdown_entry_past_the_markdown_cap_is_refused_and_writes_nothing() {
+    let w = world().await;
+    w.create("Home").await;
+    let before = w.stored_counts().await;
+    let large_markdown = vec![b'x'; 16 * 1024 * 1024];
+    let page_count = (MAX_IMPORT_MARKDOWN_BYTES / large_markdown.len() as u64) as usize + 1;
+    let docs: Vec<Value> = (0..page_count)
+        .map(|index| {
+            let (_, mut entry) = page_entry(&format!("page-{index}"));
+            entry["path"] = json!("docs/shared.md");
+            entry
+        })
+        .collect();
+    let zip = zip_of(
+        &manifest(docs, vec![], vec![]),
+        &[("docs/shared.md", &large_markdown)],
+    );
+    assert!(zip.len() < 1024 * 1024, "the request itself is small");
+
+    let (status, body) = w.import_raw(zip).await;
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "import.too_large", "{body}");
+    assert_eq!(
+        body["error"]["details"]["markdown_bytes"],
+        json!(page_count as u64 * large_markdown.len() as u64)
+    );
+    assert_eq!(
+        body["error"]["details"]["max_markdown_bytes"],
+        json!(MAX_IMPORT_MARKDOWN_BYTES)
+    );
+    assert_eq!(w.stored_counts().await, before, "nothing written");
+}
+
+/// An attachment whose entry holds more than it declares is skipped, as an
+/// unreadable entry is; the rest of the import lands. The bytes written
+/// never exceed the declared bytes the caps checked.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_skips_an_attachment_larger_than_declared() {
+    let w = world().await;
+    let (page_id, page) = page_entry("Pictures");
+    let honest = vec![3u8; 100];
+    let zip = zip_of(
+        &manifest(
+            vec![page],
+            vec![
+                attachment_entry(page_id, "attachments/honest.bin"),
+                attachment_entry(page_id, "attachments/liar.bin"),
+            ],
+            vec![],
+        ),
+        &[
+            ("docs/Pictures.md", b"# Pictures\n"),
+            ("attachments/honest.bin", &honest),
+            ("attachments/liar.bin", &[9u8; 64 * 1024]),
+        ],
+    );
+    let zip = with_declared_size(&zip, "attachments/liar.bin", 16);
+
+    let (status, body) = w.import_raw(zip).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["imported_docs"], json!(1), "{body}");
+    assert_eq!(body["imported_attachments"], json!(1), "{body}");
+    let stored_sizes: Vec<i64> =
+        sqlx::query_scalar("SELECT byte_size FROM blobs WHERE workspace_id = $1")
+            .bind(w.workspace)
+            .fetch_all(&w.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_sizes, [honest.len() as i64]);
+}
+
+/// An ordinary export with an attachment imports as before: the caps
+/// don't get in the way of a real archive.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_import_round_trip_with_an_attachment_is_unchanged() {
+    let w = world().await;
+    let handbook = w.create("Handbook").await;
+    w.create_as(&w.owner, "Chapter", Some(handbook)).await;
+    w.upload_png(handbook, TINY_PNG).await;
+    let zip = w.export_as(&w.owner, "/api/workspace/export").await;
+
+    let (status, body) = w.import_raw(zip).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["imported_docs"], json!(2), "{body}");
+    assert_eq!(body["imported_attachments"], json!(1), "{body}");
+    assert_eq!(
+        w.outline(None).await,
+        ["Handbook", "  Chapter", "Handbook", "  Chapter"]
+    );
+    let stored_sizes: Vec<i64> =
+        sqlx::query_scalar("SELECT byte_size FROM blobs WHERE workspace_id = $1")
+            .bind(w.workspace)
+            .fetch_all(&w.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_sizes, [TINY_PNG.len() as i64; 2]);
+}

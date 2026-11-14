@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { useEffect } from "react";
+import { useLayoutEffect } from "react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -67,7 +67,7 @@ function deferred() {
 
 /** How the server answers a duplicate: an error, a failed request, or (by
  *  default) a copy with the id "copy" right after the source. */
-type Reply = { status: number; code: string } | "network";
+type Reply = { status: number; code: string; details?: Record<string, unknown> } | "network";
 
 type ServerOpts = {
   role?: Role;
@@ -111,7 +111,7 @@ function server({ role = "editor", reply, gate, gates, copyIds = [], relistGate,
         const copy = { id, title: `${src.title} (copy)`, parent_id: src.parent_id, sort_key: `${src.sort_key}m` };
         if (!reply || stored) pages = [...pages, copy];
         if (reply === "network") throw new TypeError("Failed to fetch");
-        if (reply) return response({ error: { code: reply.code, message: reply.code, details: {} } }, reply.status);
+        if (reply) return response({ error: { code: reply.code, message: reply.code, details: reply.details ?? {} } }, reply.status);
         return response(doc(copy), 201);
       });
     }
@@ -134,10 +134,12 @@ function lists(fetchMock: FetchMock): number {
     .length;
 }
 
-/** Reports each path the app arrives at. */
+/** Reports each path the app arrives at. A layout effect reports it in the
+ *  commit that renders it; a passive effect could still be pending when a
+ *  waitFor on the text below returns. */
 function Location({ onPath }: { onPath: (path: string) => void }) {
   const { pathname } = useLocation();
-  useEffect(() => onPath(pathname), [pathname, onPath]);
+  useLayoutEffect(() => onPath(pathname), [pathname, onPath]);
   return <output data-testid="location">{pathname}</output>;
 }
 
@@ -547,5 +549,46 @@ describe("when Duplicate fails", () => {
     gate.resolve();
 
     expect(await screen.findByTestId("toast-error")).toHaveTextContent(TOO_LARGE);
+  });
+});
+
+describe("when a limit refuses a Duplicate", () => {
+  const LIMITS: [string, Reply, string][] = [
+    [
+      "a 429",
+      { status: 429, code: "rate.limited", details: { retry_after_secs: 7 } },
+      "You're doing that too fast. Try again in 7 s.",
+    ],
+    [
+      "a page quota",
+      { status: 403, code: "quota.exceeded", details: { quota: "pages", scope: "workspace", limit: 100 } },
+      "This workspace has reached its page limit.",
+    ],
+    [
+      "a file quota",
+      { status: 403, code: "quota.exceeded", details: { quota: "blob_bytes", scope: "user", limit: 100 } },
+      "You've reached your file storage limit.",
+    ],
+  ];
+
+  it.each(LIMITS)("%s shows the limit in the open dialog", async (_what, reply, text) => {
+    renderTree(server({ reply }));
+    await editorRows();
+
+    chooseDuplicate("plan");
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Duplicate" }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(text);
+  });
+
+  it.each(LIMITS)("%s without a dialog shows the limit as a warning", async (_what, reply, text) => {
+    renderTree(server({ reply }));
+    await editorRows();
+
+    chooseDuplicate("notes");
+
+    expect(await screen.findByTestId("toast-warn")).toHaveTextContent(text);
+    expect(screen.queryByTestId("toast-error")).toBeNull();
   });
 });

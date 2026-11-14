@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { apiFetch } from "./api";
+import { ApiRequestError, apiFetch, fetchBlob, readApiError } from "./api";
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -52,5 +52,85 @@ describe("apiFetch", () => {
     const init = spy.mock.calls[0]?.[1];
     const headers = init?.headers as Record<string, string> | undefined;
     expect(headers?.["X-CSRF-Token"]).toBeUndefined();
+  });
+});
+
+describe("a 429 rate.limited answer", () => {
+  function tooFast() {
+    return new Response(
+      JSON.stringify({ error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 7 } } }),
+      { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "7" } },
+    );
+  }
+
+  it("keeps its code, status and retry_after_secs through apiFetch", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(tooFast());
+    const r = await apiFetch("/api/docs", { method: "POST", body: {} });
+    if (!("error" in r)) throw new Error("expected error");
+    expect(r.error).toEqual({
+      code: "rate.limited",
+      message: "too many requests",
+      details: { retry_after_secs: 7 },
+      status: 429,
+    });
+  });
+
+  it("is read from a raw response by readApiError", async () => {
+    expect(await readApiError(tooFast())).toEqual({
+      code: "rate.limited",
+      message: "too many requests",
+      details: { retry_after_secs: 7 },
+      status: 429,
+    });
+  });
+});
+
+describe("readApiError", () => {
+  it("falls back to http_error for a body that isn't the envelope", async () => {
+    const error = await readApiError(new Response("<html>bad gateway</html>", { status: 502 }));
+    expect(error).toEqual({ code: "http_error", message: "HTTP 502", details: {}, status: 502 });
+  });
+});
+
+describe("fetchBlob", () => {
+  it("returns the body as a blob, with the session cookie", async () => {
+    const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("zip-bytes", { status: 200, headers: { "Content-Type": "application/zip" } }),
+    );
+    const r = await fetchBlob("/api/workspace/export");
+    if (!("ok" in r)) throw new Error("expected ok");
+    expect(await r.ok.text()).toBe("zip-bytes");
+    expect(spy.mock.calls[0]?.[0]).toBe("/api/workspace/export");
+    expect(spy.mock.calls[0]?.[1]).toMatchObject({ credentials: "include" });
+  });
+
+  it("returns the error envelope of a refused download", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 4 } } }),
+        { status: 429, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const r = await fetchBlob("/api/workspace/export");
+    if (!("error" in r)) throw new Error("expected error");
+    expect(r.error.code).toBe("rate.limited");
+    expect(r.error.details).toEqual({ retry_after_secs: 4 });
+  });
+
+  it("reports a failed request as a network error", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("offline"));
+    const r = await fetchBlob("/api/workspace/export");
+    if (!("error" in r)) throw new Error("expected error");
+    expect(r.error).toMatchObject({ code: "network", status: 0 });
+  });
+});
+
+describe("ApiRequestError", () => {
+  it("carries the error and names its code as the message", () => {
+    const apiError = { code: "rate.limited", message: "too many requests", details: {}, status: 429 };
+    const thrown = new ApiRequestError(apiError);
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown.message).toBe("rate.limited");
+    expect(thrown.apiError).toBe(apiError);
   });
 });

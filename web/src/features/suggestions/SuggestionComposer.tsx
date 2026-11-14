@@ -3,6 +3,7 @@ import type React from "react";
 import { useState } from "react";
 
 import { suggestionsApi, type NewSuggestionBody, type SuggestionKind } from "../../lib/suggestions.api";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi, type PendingSuggestion } from "../../stores/ui";
 
 /** The server's limits, in characters (see the suggestions migration). */
@@ -63,7 +64,7 @@ function ComposerForm({ docId, pending }: { docId: string; pending: PendingSugge
   const create = useMutation({
     mutationFn: (body: NewSuggestionBody) => suggestionsApi.create(docId, body),
     onSuccess: async (r) => {
-      if ("error" in r) { notify("error", createErrorMessage(r.error.code)); return; }
+      if ("error" in r) { notifyFailure(notify, r.error, createErrorMessage(r.error.code)); return; }
       clearPendingSuggestion();
       await qc.invalidateQueries({ queryKey: ["suggestions", docId] });
     },

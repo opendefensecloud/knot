@@ -19,6 +19,19 @@ export type Toast = {
   id: number;
   kind: "info" | "warn" | "error";
   text: string;
+  /** Dedupe key: a later toast with the same key replaces this one. */
+  key?: string;
+  /** How long it stays up, when not the renderer's default. */
+  durationMs?: number;
+};
+
+export type NotifyOptions = {
+  /** A toast already showing with this key is replaced in place, and its
+   *  timer starts again, instead of a second one stacking up. */
+  key?: string;
+  /** Keep the toast up this long instead of the default four seconds, for
+   *  a notice that stays true for a known time (the upload pause). */
+  durationMs?: number;
 };
 
 export type PendingAnchor = {
@@ -75,7 +88,7 @@ type UiState = {
   sidebarOpen: boolean;
   toggleSidebar: () => void;
   toasts: Toast[];
-  notify: (kind: Toast["kind"], text: string) => void;
+  notify: (kind: Toast["kind"], text: string, opts?: NotifyOptions) => void;
   dismiss: (id: number) => void;
   paletteOpen: boolean;
   openPalette: () => void;
@@ -288,8 +301,22 @@ export const useUi = create<UiState>((set, get) => ({
   sidebarOpen: true,
   toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
   toasts: [],
-  notify: (kind, text) =>
-    set((s) => ({ toasts: [...s.toasts, { id: nextId++, kind, text }] })),
+  notify: (kind, text, opts) =>
+    set((s) => {
+      const key = opts?.key;
+      const durationMs = opts?.durationMs;
+      // A new id even when replacing: the renderer's timer is per id.
+      const toast: Toast = {
+        id: nextId++,
+        kind,
+        text,
+        ...(key === undefined ? {} : { key }),
+        ...(durationMs === undefined ? {} : { durationMs }),
+      };
+      const replaced = key === undefined ? -1 : s.toasts.findIndex((t) => t.key === key);
+      if (replaced < 0) return { toasts: [...s.toasts, toast] };
+      return { toasts: s.toasts.map((t, index) => (index === replaced ? toast : t)) };
+    }),
   dismiss: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
   paletteOpen: false,
   openPalette: () => set({ paletteOpen: true }),

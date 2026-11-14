@@ -3,6 +3,8 @@ import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent
 
 import type { ConnStatus } from "../../components/StatusDot";
 import { IconButton } from "../../components/ui/IconButton";
+import { useUi } from "../../stores/ui";
+import { downloadFile } from "./downloadFile";
 import { useExport } from "./useExport";
 
 type Props = {
@@ -24,7 +26,10 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
   const buttonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
+  const auditNoteId = useId();
   const { exporting, run } = useExport({ docId, title, status, pendingBytes });
+  const notify = useUi((s) => s.notify);
+  const [downloadingZip, setDownloadingZip] = useState(false);
 
   const enabledItems = () =>
     Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]:not(:disabled)') ?? []);
@@ -89,11 +94,18 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
     action();
   }
 
-  function downloadZip(descendants: boolean) {
-    const a = document.createElement("a");
-    a.href = `/api/docs/${docId}/export?descendants=${descendants ? "true" : "false"}`;
-    a.download = `${title || "doc"}.zip`;
-    a.click();
+  async function downloadZip(descendants: boolean) {
+    setDownloadingZip(true);
+    try {
+      await downloadFile({
+        path: `/api/docs/${docId}/export?descendants=${descendants ? "true" : "false"}`,
+        fileName: `${title || "doc"}.zip`,
+        notify,
+        failureText: "Couldn't export this page.",
+      });
+    } finally {
+      setDownloadingZip(false);
+    }
   }
 
   return (
@@ -107,7 +119,7 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
         aria-controls={open ? menuId : undefined}
         onClick={() => setOpen((v) => !v)}
       >
-        {exporting ? (
+        {exporting || downloadingZip ? (
           <LoaderCircle size={16} className="animate-spin" aria-hidden />
         ) : (
           <Download size={16} aria-hidden />
@@ -119,6 +131,7 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
           id={menuId}
           role="menu"
           aria-label="Export"
+          aria-describedby={auditNoteId}
           onKeyDown={onMenuKeyDown}
           className="absolute right-0 top-full z-30 mt-1 w-72 max-w-[calc(100vw-2rem)] rounded-md border border-border bg-surface shadow-lg py-1"
         >
@@ -151,7 +164,8 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
                 type="button"
                 role="menuitem"
                 data-testid="export-md"
-                onClick={() => choose(() => downloadZip(false))}
+                disabled={downloadingZip}
+                onClick={() => choose(() => void downloadZip(false))}
                 className={ITEM_CLS}
               >
                 <span>Markdown (zip)</span>
@@ -160,13 +174,20 @@ export function ExportMenu({ docId, title, isTemplate, status, pendingBytes }: P
                 type="button"
                 role="menuitem"
                 data-testid="export-md-subtree"
-                onClick={() => choose(() => downloadZip(true))}
+                disabled={downloadingZip}
+                onClick={() => choose(() => void downloadZip(true))}
                 className={ITEM_CLS}
               >
                 <span>Markdown with subpages (zip)</span>
               </button>
             </>
           )}
+          {/* Viewers can export too: say who will see it. Focus never lands
+              on the note, so it is the menu's description for screen readers. */}
+          <div role="separator" className="my-1 border-t border-border" />
+          <p id={auditNoteId} role="none" data-testid="export-audit-note" className="m-0 px-3 py-1.5 text-[11px] text-fg-muted">
+            Exports are recorded in the page&apos;s audit log.
+          </p>
         </div>
       )}
     </div>

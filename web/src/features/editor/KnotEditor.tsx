@@ -29,6 +29,7 @@ import { SCOPE_TOOLTIP, suggestionScope, type SuggestionScope } from "../suggest
 import { isEditModeShortcut } from "../docs/editMode";
 import { stickyCoverBottom } from "../docs/readingAnchor";
 import { workspaceApi } from "../workspace/workspace.api";
+import { docsApi } from "../docs/docs.api";
 import { SELECTION_FLOAT_WIDTH, computeAddCommentPos } from "./addCommentPos";
 import { createExtensions } from "./extensions";
 import {
@@ -48,6 +49,7 @@ import { KnotProvider, type CommentChangeMsg, type ProviderStatus } from "./Knot
 import { looksLikeMarkdown, markdownToHtml } from "./markdownPaste";
 import { type KnotEditorHandle, placeCaretAtReadingLine, revealCaretBelowBand } from "./readingCaret";
 import { useReadableDocIds } from "./readableDocIds";
+import { abortableWait, uploadFiles } from "./uploadFiles";
 
 type Pair = { doc: Y.Doc; provider: KnotProvider };
 
@@ -274,33 +276,49 @@ function EditorBody({
     return () => { provider.off("comments", onComments); };
   }, [pair, docId, qc]);
 
+  // Drops still uploading. This body stays mounted when DocPage moves to a
+  // cached doc, so `editorRef` then points at that doc's editor: a drop is
+  // aborted when the doc or its connection changes, or on unmount, before
+  // it can upload to the old doc or insert into the new one. A layout
+  // effect, so the abort lands in the same commit as the switch.
+  const runningUploads = useRef(new Set<AbortController>());
+  useLayoutEffect(() => {
+    const uploadsForThisDoc = runningUploads.current;
+    return () => {
+      for (const uploadAbort of uploadsForThisDoc) uploadAbort.abort();
+      uploadsForThisDoc.clear();
+    };
+  }, [docId, pair]);
+
   const uploadAndInsert = useCallback(async (files: File[]) => {
-    for (const f of files) {
-      const r = await blobsApi.upload(docId, f);
-      if ("error" in r) {
-        notify(
-          "error",
-          r.error.code === "blob.too_large" ? "File too large (10 MB cap)."
-            : r.error.code === "blob.blocked_type" ? "File type not allowed."
-            : r.error.code === "acl.no_grant" ? "You don't have permission to upload here."
-            : "Upload failed.",
-        );
-        continue;
-      }
-      const blob = r.ok;
-      if (isImageType(blob.content_type)) {
-        editorRef.current?.chain().focus().setImage({ src: blob.url }).run();
-      } else {
-        editorRef.current?.chain().focus().insertContent({
-          type: "attachment",
-          attrs: {
-            url: blob.url,
-            name: blob.original_name ?? f.name,
-            size: blob.byte_size,
-            contentType: blob.content_type,
-          },
-        }).run();
-      }
+    const uploadAbort = new AbortController();
+    runningUploads.current.add(uploadAbort);
+    try {
+      await uploadFiles(files, {
+        upload: (file) => blobsApi.upload(docId, file),
+        insert: (blob, file) => {
+          const currentEditor = editorRef.current;
+          if (!currentEditor || currentEditor.isDestroyed) return;
+          if (isImageType(blob.content_type)) {
+            currentEditor.chain().focus().setImage({ src: blob.url }).run();
+          } else {
+            currentEditor.chain().focus().insertContent({
+              type: "attachment",
+              attrs: {
+                url: blob.url,
+                name: blob.original_name ?? file.name,
+                size: blob.byte_size,
+                contentType: blob.content_type,
+              },
+            }).run();
+          }
+        },
+        notify,
+        wait: (ms) => abortableWait(ms, uploadAbort.signal),
+        signal: uploadAbort.signal,
+      });
+    } finally {
+      runningUploads.current.delete(uploadAbort);
     }
   }, [docId, notify]);
 
@@ -337,10 +355,13 @@ function EditorBody({
       editorProps: {
         handleDOMEvents: {
           keydown: (_view, event) => {
-            // ⌘E toggles edit mode (DocPage listens on window).
-            // @tiptap/extension-code binds the same chord to toggleCode;
-            // returning true skips ProseMirror's keymaps, and the event
-            // still bubbles to the window listener.
+            // Mod+E (⌘E on a Mac, Ctrl+E elsewhere) toggles edit mode
+            // (DocPage listens on window). @tiptap/extension-code binds the
+            // same chord, `Mod-e`, to toggleCode; returning true skips
+            // ProseMirror's keymaps, and the event still bubbles to the
+            // window listener. isEditModeShortcut reads Mod the way
+            // prosemirror-keymap does, so a Mac's Ctrl+E is not caught here
+            // and reaches Tiptap's end-of-line binding.
             if (isEditModeShortcut(event)) return true;
             if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v") {
               plainPasteRef.current = event.shiftKey;
@@ -355,7 +376,7 @@ function EditorBody({
           void uploadAndInsert(files);
           return true;
         },
-        handlePaste(_view, event) {
+        handlePaste(view, event) {
           const clipboard = (event as ClipboardEvent).clipboardData;
           const files = Array.from(clipboard?.files ?? []);
           if (files.length > 0) {
@@ -377,7 +398,18 @@ function EditorBody({
           const text = clipboard?.getData("text/plain") ?? "";
           if (!looksLikeMarkdown(text)) return false;
           event.preventDefault();
-          ed.chain().focus().insertContent(markdownToHtml(text)).run();
+          const html = markdownToHtml(text);
+          // A table pasted into a table goes through ProseMirror's own paste,
+          // where prosemirror-tables fills the cells from the caret's on
+          // instead of nesting a table in the cell, which GFM can't hold.
+          // That paste comes back here without clipboard data and falls
+          // through. The pasted header row lands on the caret's row, so it
+          // stays a header only when that row is one.
+          if (ed.isActive("table") && html.includes("<table")) {
+            view.pasteHTML(ed.isActive("table_header") ? html : html.replace(/<(\/?)th\b/g, "<$1td"));
+          } else {
+            ed.chain().focus().insertContent(html).run();
+          }
           notify("info", "Pasted as Markdown");
           return true;
         },
@@ -571,6 +603,32 @@ function EditorBody({
     setAddCommentPos(null);
   }
 
+  /** Moves the top-level blocks the selection touches into a new subpage;
+   *  the server leaves a link in their place and moves their discussion. */
+  async function handleMoveToSubpage() {
+    if (!editor || !selectionRange) return;
+    const { from, to } = selectionRange;
+    const firstBlock = editor.state.doc.resolve(from).node(1).textContent.trim();
+    const title = window.prompt(
+      "Move the selected blocks to a new subpage titled:",
+      firstBlock.slice(0, 120) || "Untitled",
+    );
+    if (title === null) return;
+    const { start, end } = encodeAnchorRange(editor, pair.doc, from, to);
+    if (!start || !end) {
+      notify("error", "Couldn't move this selection.");
+      return;
+    }
+    setAddCommentPos(null);
+    const r = await docsApi.moveToSubpage(docId, { start, end, title });
+    if ("error" in r) {
+      notify("error", "Couldn't move this selection to a subpage.");
+      return;
+    }
+    await qc.invalidateQueries({ queryKey: ["docs"] });
+    notify("info", `Moved to "${r.ok.title}".`);
+  }
+
   /** Opens the suggestion composer for the current selection (a replace) or
    *  caret (an insertion). Read fresh: the selection is what will be sent. */
   function startSuggestion() {
@@ -635,6 +693,16 @@ function EditorBody({
             >
               Suggest change
             </button>
+            {canEdit && (
+              <button
+                type="button"
+                data-testid="move-to-subpage-float"
+                onClick={() => { void handleMoveToSubpage(); }}
+                className="bg-surface text-fg border border-border rounded px-2 py-0.5 text-[12px] font-medium cursor-pointer shadow-md hover:bg-muted transition-colors"
+              >
+                Move to subpage
+              </button>
+            )}
           </div>
         )}
         <EditorContent editor={editor} />

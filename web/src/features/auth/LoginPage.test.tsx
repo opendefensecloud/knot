@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, cleanup } from "@testing-library/react";
+import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -61,5 +61,21 @@ describe("LoginPage conditional options", () => {
     await waitFor(() => {
       expect(screen.queryByTestId("login-setup")).toBeNull();
     });
+  });
+});
+
+describe("LoginPage when sign-in is rate limited", () => {
+  it("says how long to wait instead of 'Login failed'", async () => {
+    mockConfig({ setup_available: false, oidc_enabled: false, password_login_enabled: true });
+    vi.spyOn(authApi, "login").mockResolvedValue({
+      error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 12 }, status: 429 },
+    });
+    renderLogin();
+    fireEvent.change(await screen.findByTestId("login-email"), { target: { value: "anna@example.org" } });
+    fireEvent.change(screen.getByTestId("login-password"), { target: { value: "password1" } });
+    fireEvent.click(screen.getByTestId("login-submit"));
+    expect(await screen.findByTestId("login-error")).toHaveTextContent(
+      "You're doing that too fast. Try again in 12 s.",
+    );
   });
 });

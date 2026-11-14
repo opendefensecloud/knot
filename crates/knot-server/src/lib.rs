@@ -20,6 +20,8 @@ use knot_storage::{
 };
 use uuid::Uuid;
 
+use crate::rate_limit::CollabKind;
+
 /// Max inbound collab/board WS message. CRDT updates and board ops are far
 /// smaller; this bounds memory amplification from a malicious frame.
 const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -28,6 +30,8 @@ pub mod admin;
 pub mod archive;
 pub mod auth;
 pub mod board_room_shim;
+pub mod bots;
+pub mod client_ip;
 pub mod comments_listener;
 pub mod duplicate;
 pub mod export;
@@ -35,8 +39,11 @@ pub mod export_check;
 pub mod history_stats;
 pub mod http_error;
 pub mod metrics;
+pub mod move_to_subpage;
 pub mod notifications_sweep;
 pub mod protocol;
+pub mod quota;
+pub mod rate_limit;
 pub mod reindex;
 pub mod release_notes;
 pub mod restricted;
@@ -56,12 +63,15 @@ pub struct AppState {
     pub users: Option<Arc<dyn UserStore>>,
     pub workspaces: Option<Arc<dyn WorkspaceStore>>,
     pub sessions: Option<Arc<dyn SessionStore>>,
+    /// Scoped bearer credentials; `None` keeps the server cookie-only.
+    pub api_keys: Option<Arc<dyn knot_storage::ApiKeyStore>>,
     pub docs: Option<Arc<dyn DocStore>>,
     pub grants: Option<Arc<dyn GrantStore>>,
     pub acl: Option<Arc<AclCache>>,
     pub markdown_cache: Option<Arc<dyn MarkdownCacheStore>>,
     pub search: Option<Arc<dyn SearchStore>>,
     pub shares: Option<Arc<dyn ShareTokenStore>>,
+    pub short_links: Option<Arc<dyn knot_storage::ShortLinkStore>>,
     pub comments: Option<Arc<dyn CommentStore>>,
     /// Change suggestions and their reply threads.
     pub suggestions: Option<Arc<dyn SuggestionStore>>,
@@ -100,6 +110,25 @@ pub struct AppState {
     pub duplicate_permits: Arc<tokio::sync::Semaphore>,
     /// How long a duplicate waits for a permit before it is refused as busy.
     pub duplicate_busy_wait: std::time::Duration,
+    /// The HTTP and collab rate limits. Built from `config` in
+    /// [`router_with_state`]; the constructors leave them off.
+    pub rate_limits: Arc<rate_limit::RateLimits>,
+    /// The proxies whose `X-Forwarded-For` is believed. Built from `config`
+    /// in [`router_with_state`].
+    pub trusted_proxies: Arc<client_ip::TrustedProxies>,
+    /// Which quota refusals get an audit row: one per user, quota and scope
+    /// per `quota::AUDIT_WINDOW`.
+    pub quota_audit: Arc<quota::QuotaAuditThrottle>,
+}
+
+/// The config the `AppState` constructors start with: the defaults with rate
+/// limits off, so tests run unlimited unless they set a config. `main`
+/// replaces it with the operator's.
+fn constructor_config() -> Arc<Config> {
+    Arc::new(Config {
+        rate_limit_enabled: false,
+        ..Default::default()
+    })
 }
 
 impl AppState {
@@ -109,12 +138,14 @@ impl AppState {
             users: None,
             workspaces: None,
             sessions: None,
+            api_keys: None,
             docs: None,
             grants: None,
             acl: None,
             markdown_cache: None,
             search: None,
             shares: None,
+            short_links: None,
             comments: None,
             suggestions: None,
             blob_store: None,
@@ -134,7 +165,7 @@ impl AppState {
             cookie_secure: true,
             oidc_enabled: false,
             oidc: None,
-            config: Arc::new(Config::default()),
+            config: constructor_config(),
             build_version: env!("KNOT_BUILD_VERSION"),
             shutdown: tokio_util::sync::CancellationToken::new(),
             export_permits: Arc::new(tokio::sync::Semaphore::new(export::MAX_CONCURRENT_EXPORTS)),
@@ -143,6 +174,9 @@ impl AppState {
                 duplicate::MAX_CONCURRENT_DUPLICATES,
             )),
             duplicate_busy_wait: duplicate::BUSY_WAIT,
+            rate_limits: Arc::new(rate_limit::RateLimits::disabled()),
+            trusted_proxies: Arc::new(client_ip::TrustedProxies::default()),
+            quota_audit: Arc::new(quota::QuotaAuditThrottle::new()),
         }
     }
 
@@ -155,6 +189,8 @@ impl AppState {
         let users: Arc<dyn UserStore> = Arc::new(PgUserStore::new(pool.clone()));
         let workspaces: Arc<dyn WorkspaceStore> = Arc::new(PgWorkspaceStore::new(pool.clone()));
         let sessions: Arc<dyn SessionStore> = Arc::new(PgSessionStore::new(pool.clone()));
+        let api_keys: Arc<dyn knot_storage::ApiKeyStore> =
+            Arc::new(knot_storage::PgApiKeyStore::new(pool.clone()));
         let docs: Arc<dyn DocStore> = Arc::new(PgDocStore::new(pool.clone()));
         let grants: Arc<dyn GrantStore> = Arc::new(PgGrantStore::new(pool.clone()));
         let acl = Arc::new(AclCache::new(
@@ -166,6 +202,8 @@ impl AppState {
             Arc::new(PgMarkdownCache::new(pool.clone()));
         let search: Arc<dyn SearchStore> = Arc::new(PgSearchStore::new(pool.clone()));
         let shares: Arc<dyn ShareTokenStore> = Arc::new(PgShareTokenStore::new(pool.clone()));
+        let short_links: Arc<dyn knot_storage::ShortLinkStore> =
+            Arc::new(knot_storage::PgShortLinkStore::new(pool.clone()));
         let comments: Arc<dyn CommentStore> = Arc::new(PgCommentStore::new(pool.clone()));
         let suggestions: Arc<dyn SuggestionStore> = Arc::new(PgSuggestionStore::new(pool.clone()));
         let blob_store: Arc<dyn BlobStore> = Arc::new(PgBytesStore::new(pool.clone()));
@@ -185,12 +223,14 @@ impl AppState {
             users: Some(users),
             workspaces: Some(workspaces),
             sessions: Some(sessions),
+            api_keys: Some(api_keys),
             docs: Some(docs),
             grants: Some(grants),
             acl: Some(acl),
             markdown_cache: Some(markdown_cache),
             search: Some(search),
             shares: Some(shares),
+            short_links: Some(short_links),
             comments: Some(comments),
             suggestions: Some(suggestions),
             blob_store: Some(blob_store),
@@ -210,7 +250,7 @@ impl AppState {
             cookie_secure: true,
             oidc_enabled: false,
             oidc: None,
-            config: Arc::new(Config::default()),
+            config: constructor_config(),
             build_version: env!("KNOT_BUILD_VERSION"),
             shutdown: tokio_util::sync::CancellationToken::new(),
             export_permits: Arc::new(tokio::sync::Semaphore::new(export::MAX_CONCURRENT_EXPORTS)),
@@ -219,6 +259,9 @@ impl AppState {
                 duplicate::MAX_CONCURRENT_DUPLICATES,
             )),
             duplicate_busy_wait: duplicate::BUSY_WAIT,
+            rate_limits: Arc::new(rate_limit::RateLimits::disabled()),
+            trusted_proxies: Arc::new(client_ip::TrustedProxies::default()),
+            quota_audit: Arc::new(quota::QuotaAuditThrottle::new()),
         }
     }
 
@@ -226,6 +269,7 @@ impl AppState {
         Some(SessionDeps {
             sessions: self.sessions.clone()?,
             workspaces: self.workspaces.clone()?,
+            api_keys: self.api_keys.clone(),
             session_key: self.session_key.clone(),
         })
     }
@@ -236,7 +280,11 @@ pub fn router() -> Router {
     router_with_state(AppState::in_memory())
 }
 
-pub fn router_with_state(state: AppState) -> Router {
+pub fn router_with_state(mut state: AppState) -> Router {
+    // Before any clone of `state`: every layer and handler sees these.
+    state.rate_limits = Arc::new(rate_limit::RateLimits::from_config(&state.config));
+    state.trusted_proxies = Arc::new(client_ip::TrustedProxies::from_config(&state.config));
+
     let web_dist = std::env::var("KNOT_WEB_DIST").unwrap_or_else(|_| "/web/dist".into());
 
     // WS routes: NO timeout / body-limit (long-lived, streamed).
@@ -244,11 +292,16 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/collab/doc/{doc_id}", get(collab_upgrade))
         .route("/collab/board/{board_id}", get(collab_board_upgrade));
 
+    // The per-client-IP buckets of the anonymous routes (`/auth/*`, `/p/*`);
+    // the `/api` buckets are layered in `routes::api::router`.
+    let anonymous_rate_limit =
+        axum::middleware::from_fn_with_state(state.clone(), rate_limit::http::anonymous_mw);
+
     // Everything else: request timeout + body-size limit.
     let api_and_pages = Router::new()
         .merge(routes::health::router())
-        .merge(routes::auth::router())
-        .merge(routes::public::router())
+        .merge(routes::auth::router().layer(anonymous_rate_limit.clone()))
+        .merge(routes::public::router().layer(anonymous_rate_limit))
         .merge(routes::api::router(state.clone()))
         .merge(static_files::router(&web_dist))
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
@@ -339,6 +392,28 @@ pub fn collab_write_access(
     }
 }
 
+/// The collab limits' admission of an upgrade by `ctx`'s user to `target_id`
+/// (spec "Collab WebSocket"): the open-socket cap per user, then the upgrade
+/// bucket per user and target. A refusal is a 429 `rate.limited` with
+/// `Retry-After`, which the browser sees as a failed upgrade (close 1006)
+/// and both providers back off from; no new close code.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is the ready axum Response, returned unboxed like the async handlers do"
+)]
+fn admit_collab_socket(
+    state: &AppState,
+    ctx: &crate::auth::AuthContext,
+    kind: CollabKind,
+    target_id: Uuid,
+) -> Result<rate_limit::collab::SocketGuard, axum::response::Response> {
+    state
+        .rate_limits
+        .collab
+        .open_socket(ctx.user_id, kind, target_id, tokio::time::Instant::now())
+        .map_err(|wait| crate::http_error::rate_limited(rate_limit::retry_after_secs(wait)))
+}
+
 #[tracing::instrument(skip_all, name = "collab.upgrade", fields(doc_id = %doc_id))]
 async fn collab_upgrade(
     Path(doc_id): Path<Uuid>,
@@ -352,6 +427,11 @@ async fn collab_upgrade(
             "auth.session_required",
         )
             .into_response();
+    };
+    // Before the access check, so a refused upgrade costs no ACL lookup.
+    let socket_guard = match admit_collab_socket(&state, &ctx, CollabKind::Doc, doc_id) {
+        Ok(socket_guard) => socket_guard,
+        Err(refusal) => return refusal,
     };
     let acl = match state.acl.as_ref() {
         Some(a) => a.clone(),
@@ -378,10 +458,13 @@ async fn collab_upgrade(
         }
     };
     let shutdown = state.shutdown.clone();
+    let rate_limits = state.rate_limits.clone();
     let ws = ws
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
+        // Holds the socket's place under the per-user cap for the session.
+        let _socket_guard = socket_guard;
         crate::room::serve(
             rooms,
             doc_id,
@@ -390,6 +473,7 @@ async fn collab_upgrade(
             can_write,
             acl_epoch_at_check,
             shutdown,
+            rate_limits,
         )
         .await;
     })
@@ -409,6 +493,11 @@ async fn collab_board_upgrade(
             "auth.session_required",
         )
             .into_response();
+    };
+    // Before the board lookup and the access check, as in `collab_upgrade`.
+    let socket_guard = match admit_collab_socket(&state, &ctx, CollabKind::Board, board_id) {
+        Ok(socket_guard) => socket_guard,
+        Err(refusal) => return refusal,
     };
     let Some(boards) = state.boards.as_ref().cloned() else {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
@@ -444,17 +533,21 @@ async fn collab_board_upgrade(
     }
     let doc_id = board.doc_id;
     let shutdown = state.shutdown.clone();
+    let rate_limits = state.rate_limits.clone();
     let ws = ws
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
+        let _socket_guard = socket_guard;
         crate::board_room_shim::serve(
             board_rooms,
             board_id,
             doc_id,
+            ctx.user_id,
             acl_epoch_at_check,
             socket,
             shutdown,
+            rate_limits,
         )
         .await;
     })

@@ -347,3 +347,24 @@ describe("SuggestionCard", () => {
     expect(screen.queryByTestId("suggestion-reply-input-s1")).toBeNull();
   });
 });
+
+describe("SuggestionCard when a limit refuses a decision", () => {
+  const TOO_FAST = {
+    error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 2 }, status: 429 },
+  };
+  const TOO_FAST_TOAST = { kind: "warn", text: "You're doing that too fast. Try again in 2 s.", key: "limit" };
+
+  it("says to slow down when an accept is refused", async () => {
+    api.accept.mockResolvedValue(TOO_FAST);
+    renderCard(suggestion(), { live: { state: "same", currentText: "charlie", from: 3 } });
+    fireEvent.click(screen.getByTestId("suggestion-accept-s1"));
+    await waitFor(() => expect(useUi.getState().toasts).toMatchObject([TOO_FAST_TOAST]));
+  });
+
+  it("says to slow down when a reject is refused", async () => {
+    api.reject.mockResolvedValue(TOO_FAST);
+    renderCard(suggestion(), { live: { state: "same", currentText: "charlie", from: 3 } });
+    fireEvent.click(screen.getByTestId("suggestion-reject-s1"));
+    await waitFor(() => expect(useUi.getState().toasts).toMatchObject([TOO_FAST_TOAST]));
+  });
+});

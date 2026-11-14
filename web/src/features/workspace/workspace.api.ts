@@ -19,11 +19,14 @@ export const workspaceApi = {
     role: "owner" | "editor" | "viewer",
     password?: string,
     displayName?: string,
+    kind?: "human" | "bot",
   ) {
     const body: Record<string, unknown> = { email, role };
     if (password) body.password = password;
     const name = displayName?.trim();
     if (name) body.display_name = name;
+    // Human is the server default; only a bot invite carries the field.
+    if (kind === "bot") body.kind = "bot";
     return apiFetch<void>("/api/workspace/members", { method: "POST", body });
   },
   setRole(userId: string, role: "owner" | "editor" | "viewer") {

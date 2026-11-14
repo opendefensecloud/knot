@@ -1,20 +1,43 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { useLayoutEffect, type MutableRefObject, type ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SessionProvider } from "../../auth/SessionContext";
 import { useUi } from "../../stores/ui";
+import { restorePlatform, stubPlatform } from "../../test/platform";
+import type { KnotEditorHandle } from "../editor/readingCaret";
+
+// What DocPage may ask of the editor, as spies: where the caret lands is the
+// editor's business (readingCaret.test.ts); whether DocPage asks is its own.
+const editorHandle = vi.hoisted(() => ({
+  placeCaretAtReadingLine: vi.fn(),
+  revealCaretBelowBand: vi.fn(),
+}));
 
 // The real editor needs a WebSocket. The stand-in shows what DocPage gave it,
-// including the controls it hands over for the end of the toolbar.
+// including the controls it hands over for the end of the toolbar, and has a
+// focusable .ProseMirror so a test can put focus "in the text".
 vi.mock("../editor/KnotEditor", () => ({
-  KnotEditor: (props: { editMode: boolean; toolbarTrailing?: ReactNode }) => (
-    <div data-testid="editor" data-edit-mode={String(props.editMode)}>
-      {props.toolbarTrailing && <div data-testid="mock-trailing">{props.toolbarTrailing}</div>}
-    </div>
-  ),
+  KnotEditor: (props: {
+    editMode: boolean;
+    toolbarTrailing?: ReactNode;
+    handleRef?: MutableRefObject<KnotEditorHandle | null>;
+  }) => {
+    const { handleRef } = props;
+    useLayoutEffect(() => {
+      if (!handleRef) return;
+      handleRef.current = editorHandle;
+      return () => { handleRef.current = null; };
+    }, [handleRef]);
+    return (
+      <div data-testid="editor" data-edit-mode={String(props.editMode)}>
+        <div data-testid="mock-prose" className="ProseMirror" tabIndex={0} />
+        {props.toolbarTrailing && <div data-testid="mock-trailing">{props.toolbarTrailing}</div>}
+      </div>
+    );
+  },
 }));
 
 import DocPage from "./DocPage";
@@ -22,6 +45,8 @@ import DocPage from "./DocPage";
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.clearAllMocks();
+  restorePlatform();
   window.sessionStorage.clear();
   useUi.setState({ commentSidebarOpen: false });
 });
@@ -201,14 +226,146 @@ describe("DocPage — doc dock", () => {
     expect(screen.getByTestId("edit-mode-announcer")).toHaveTextContent("Viewing");
   });
 
-  it("ignores a held-down ⌘E, without handing it to the browser", async () => {
+  it("ignores a held-down Ctrl+E, without handing it to the browser", async () => {
     vi.stubGlobal("fetch", server("editor"));
     renderDoc();
     await screen.findByTestId("editor");
 
     // fireEvent returns false once a handler called preventDefault.
-    expect(fireEvent.keyDown(window, { key: "e", metaKey: true, repeat: true })).toBe(false);
+    expect(fireEvent.keyDown(window, { key: "e", ctrlKey: true, repeat: true })).toBe(false);
     expect(screen.getByTestId("editor")).toHaveAttribute("data-edit-mode", "false");
+  });
+
+  it("toggles with ⌘E on a Mac, and leaves Ctrl+E (end of line) to the editor", async () => {
+    stubPlatform("MacIntel");
+    vi.stubGlobal("fetch", server("editor"));
+    renderDoc();
+    const editor = await screen.findByTestId("editor");
+
+    fireEvent.keyDown(window, { key: "e", metaKey: true });
+    expect(editor).toHaveAttribute("data-edit-mode", "true");
+    expect(screen.getByTestId("toggle-edit-mode")).toHaveAttribute("aria-label", "Stop editing (⌘E)");
+    expect(screen.getByTestId("toggle-edit-mode")).toHaveAttribute("aria-keyshortcuts", "Meta+E");
+
+    // Not claimed: no preventDefault, and still editing.
+    expect(fireEvent.keyDown(screen.getByTestId("mock-prose"), { key: "e", ctrlKey: true })).toBe(true);
+    expect(editor).toHaveAttribute("data-edit-mode", "true");
+  });
+
+  it("leaves Meta+E to the system outside Apple platforms", async () => {
+    stubPlatform("Linux x86_64");
+    vi.stubGlobal("fetch", server("editor"));
+    renderDoc();
+    const editor = await screen.findByTestId("editor");
+
+    expect(fireEvent.keyDown(window, { key: "e", metaKey: true })).toBe(true);
+    expect(editor).toHaveAttribute("data-edit-mode", "false");
+    expect(screen.getByTestId("toggle-edit-mode")).toHaveAttribute("aria-label", "Edit (Ctrl+E)");
+    expect(screen.getByTestId("toggle-edit-mode")).toHaveAttribute("aria-keyshortcuts", "Control+E");
+  });
+
+  it("entering edit mode at the top puts the caret in the text", async () => {
+    stubObserver();
+    vi.stubGlobal("fetch", server("editor"));
+    renderDoc();
+    await screen.findByTestId("editor");
+
+    // From nowhere in particular (focus on <body>), by keyboard.
+    fireEvent.keyDown(window, { key: "e", ctrlKey: true });
+    expect(screen.getByTestId("editor")).toHaveAttribute("data-edit-mode", "true");
+    expect(editorHandle.placeCaretAtReadingLine).toHaveBeenCalledOnce();
+
+    // Leaving never places a caret.
+    fireEvent.keyDown(window, { key: "e", ctrlKey: true });
+    expect(screen.getByTestId("editor")).toHaveAttribute("data-edit-mode", "false");
+    expect(editorHandle.placeCaretAtReadingLine).toHaveBeenCalledOnce();
+
+    // From the header's Edit button.
+    const toggle = screen.getByTestId("toggle-edit-mode");
+    toggle.focus();
+    fireEvent.click(toggle);
+    expect(screen.getByTestId("editor")).toHaveAttribute("data-edit-mode", "true");
+    expect(editorHandle.placeCaretAtReadingLine).toHaveBeenCalledTimes(2);
+
+    // At the top there is no band over the text to clear.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(editorHandle.revealCaretBelowBand).not.toHaveBeenCalled();
+  });
+
+  it("entering edit mode mid-document clears the band over the caret, even with no reading position held", async () => {
+    // jsdom has no layout, so DocPage finds no reading anchor here: the case
+    // where a page is condensed but the anchor could not be captured. The
+    // band is there all the same, and the caret just placed can sit under it
+    // once the toolbar grows.
+    const observer = stubObserver();
+    vi.stubGlobal("fetch", server("editor"));
+    renderDoc();
+    await screen.findByTestId("editor");
+    observer.scrollPast();
+
+    fireEvent.click(within(screen.getByTestId("doc-dock")).getByTestId("dock-toggle-edit-mode"));
+    expect(editorHandle.placeCaretAtReadingLine).toHaveBeenCalledOnce();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(editorHandle.revealCaretBelowBand).toHaveBeenCalledOnce();
+  });
+
+  it("entering edit mode from the title keeps focus in the title", async () => {
+    vi.stubGlobal("fetch", server("editor"));
+    renderDoc();
+    await screen.findByTestId("editor");
+    const title = screen.getByTestId("doc-title");
+    title.focus();
+
+    fireEvent.keyDown(title, { key: "e", ctrlKey: true });
+    expect(screen.getByTestId("editor")).toHaveAttribute("data-edit-mode", "true");
+    expect(editorHandle.placeCaretAtReadingLine).not.toHaveBeenCalled();
+    expect(title).toHaveFocus();
+  });
+
+  it("entering edit mode from a link outside the page, such as the tree, puts the caret in the text", async () => {
+    // Opening a page from the tree leaves focus on the row's link; the
+    // shortcut from there must still land in the text.
+    vi.stubGlobal("fetch", server("editor"));
+    renderDoc();
+    await screen.findByTestId("editor");
+    const treeLink = document.body.appendChild(document.createElement("a"));
+    treeLink.href = "/doc/d2";
+    treeLink.textContent = "Another page";
+    treeLink.focus();
+
+    fireEvent.keyDown(treeLink, { key: "e", ctrlKey: true });
+    expect(screen.getByTestId("editor")).toHaveAttribute("data-edit-mode", "true");
+    expect(editorHandle.placeCaretAtReadingLine).toHaveBeenCalledOnce();
+    treeLink.remove();
+  });
+
+  it("entering edit mode from inside a dialog keeps focus in the dialog", async () => {
+    vi.stubGlobal("fetch", server("editor"));
+    renderDoc();
+    await screen.findByTestId("editor");
+    const dialog = document.body.appendChild(document.createElement("div"));
+    dialog.setAttribute("role", "dialog");
+    const dialogButton = dialog.appendChild(document.createElement("button"));
+    dialogButton.focus();
+
+    fireEvent.keyDown(dialogButton, { key: "e", ctrlKey: true });
+    expect(screen.getByTestId("editor")).toHaveAttribute("data-edit-mode", "true");
+    expect(editorHandle.placeCaretAtReadingLine).not.toHaveBeenCalled();
+    expect(dialogButton).toHaveFocus();
+    dialog.remove();
+  });
+
+  it("leaving edit mode from the text hands focus to the Edit toggle", async () => {
+    vi.stubGlobal("fetch", server("editor"));
+    renderDoc();
+    await screen.findByTestId("editor");
+    fireEvent.click(screen.getByTestId("toggle-edit-mode"));
+    const prose = screen.getByTestId("mock-prose");
+    prose.focus();
+
+    fireEvent.keyDown(prose, { key: "e", ctrlKey: true });
+    expect(screen.getByTestId("editor")).toHaveAttribute("data-edit-mode", "false");
+    expect(screen.getByTestId("toggle-edit-mode")).toHaveFocus();
   });
 
   it("leaves ⌘E to the browser for viewers", async () => {

@@ -71,6 +71,24 @@
 }
 .ProseMirror ol {
   list-style: decimal outside;
+  /* The markers hang in this padding, whose base (--knot-ol-gutter, the
+     bullet list's 1.4em unless a skin's font needs more) fits one digit.
+     From item 10 on ("10.", or "104." in a list that starts at 95) each
+     digit past the first needs one more digit's width, or the marker runs
+     past the editor host's left edge and its clip cuts the leading digit
+     off (#95). The digit count comes from OrderedListMarkerGutter as an
+     inline style on the lists that need more than one digit, which beats
+     the 1 set here. Setting it here rather than relying on the var()
+     fallback matters: custom properties inherit, so a short list nested
+     in a long one would otherwise take the long list's count and shift
+     right when the outer list reached item 10. */
+  --knot-ol-digits: 1;
+  padding-left: calc(var(--knot-ol-gutter, 1.4em) + (var(--knot-ol-digits, 1) - 1) * 1ch);
+}
+/* Equal-width digits, so every digit is the `1ch` the gutter above adds
+   for it, in each of the theme fonts. */
+.ProseMirror ol > li::marker {
+  font-variant-numeric: tabular-nums;
 }
 .ProseMirror ul ul {
   list-style: circle outside;

@@ -68,9 +68,10 @@ test("mobile: the document header fits the viewport", async ({ page }) => {
   await page.waitForURL(/\/doc\/.+/);
   await expect(page.getByTestId("doc-page")).toBeVisible();
 
-  // The header action row carries nine controls. Without wrapping it forces
-  // an intrinsic 412px into a 327px content box, pushing the last two
-  // buttons off-screen and giving <main> a horizontal scrollbar.
+  // The header action row carries eleven controls for the page's owner, the
+  // audit log link among them. Without wrapping it is far wider than the
+  // 327px content box, pushing the last buttons off-screen and giving <main>
+  // a horizontal scrollbar.
   const overflow = await page.evaluate(() => {
     const m = document.querySelector("main")!;
     return m.scrollWidth - m.clientWidth;
@@ -78,7 +79,14 @@ test("mobile: the document header fits the viewport", async ({ page }) => {
   expect(overflow).toBeLessThanOrEqual(1);
 
   // Every control must be reachable, not merely non-overflowing.
-  for (const id of ["toggle-edit-mode", "toggle-markdown", "doc-export", "toggle-template", "open-comments"]) {
+  for (const id of [
+    "toggle-edit-mode",
+    "open-audit",
+    "toggle-markdown",
+    "doc-export",
+    "toggle-template",
+    "open-comments",
+  ]) {
     await expect(page.getByTestId(id)).toBeInViewport();
   }
 
@@ -94,4 +102,39 @@ test("mobile: the document header fits the viewport", async ({ page }) => {
   }
   await page.keyboard.press("Escape");
   await expect(page.getByRole("menu")).toHaveCount(0);
+});
+
+test("mobile: the audit log fits the viewport", async ({ page }) => {
+  await signIn(page);
+  const csrf = (await page.context().cookies()).find((cookie) => cookie.name === "csrf");
+  if (!csrf) throw new Error("csrf cookie not found");
+  const created = await page.request.post("/api/docs", {
+    headers: { "X-CSRF-Token": csrf.value },
+    data: { title: "A page with a rather long title to see how the audit log wraps it" },
+  });
+  expect(created.status()).toBe(201);
+  const docId = ((await created.json()) as { id: string }).id;
+  // One recorded export, so the stats, the exporters list and an event row
+  // all render.
+  const exported = await page.request.get(`/api/docs/${docId}/export`);
+  expect(exported.status()).toBe(200);
+
+  await page.goto(`/doc/${docId}/audit`);
+  await expect(page.getByTestId("doc-audit-page")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByTestId("audit-exporters")).toBeVisible({ timeout: 10_000 });
+  await expect(page.locator("[data-testid='audit-event'][data-action='doc.export']")).toHaveCount(1);
+  await expect(page.getByTestId("audit-scope-note")).toBeVisible();
+
+  const overflow = await page.evaluate(() => {
+    const m = document.querySelector("main")!;
+    return Math.max(
+      m.scrollWidth - m.clientWidth,
+      document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+  });
+  expect(overflow).toBeLessThanOrEqual(1);
+  // The tiles go two to a row, so both of the first row sit on screen.
+  for (const id of ["audit-stat-exports", "audit-stat-people"]) {
+    await expect(page.getByTestId(id)).toBeInViewport({ ratio: 1 });
+  }
 });

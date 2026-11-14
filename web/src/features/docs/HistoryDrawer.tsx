@@ -5,6 +5,7 @@ import { useState } from "react";
 import { IconButton } from "../../components/ui/IconButton";
 import { Button } from "../../components/ui/Button";
 import { historyApi, type SnapshotMeta } from "../../lib/history.api";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 
 export function HistoryDrawer({ docId, onClose }: { docId: string; onClose: () => void }) {
@@ -26,7 +27,7 @@ export function HistoryDrawer({ docId, onClose }: { docId: string; onClose: () =
   const restore = useMutation({
     mutationFn: async (seq: number) => historyApi.restore(docId, seq),
     onSuccess: async (r) => {
-      if ("error" in r) { notify("error", "Restore failed"); return; }
+      if ("error" in r) { notifyFailure(notify, r.error, "Restore failed"); return; }
       notify("info", "Restored — your editor will refresh shortly.");
       await qc.invalidateQueries({ queryKey: ["doc", docId] });
       // The restore is credited to the restorer; show them in the byline now.

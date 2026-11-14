@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { Doc, DocAccessInfo, DocWithRole, parse } from "./validators";
+import { AuditAuthor, Doc, DocAccessInfo, DocWithRole, Member, parse } from "./validators";
 
 /** A sidebar row as servers before restricted documents sent it. */
 const LEGACY_DOC = {
@@ -42,6 +42,25 @@ describe("Doc", () => {
   });
 });
 
+describe("Member", () => {
+  const LEGACY_MEMBER = { user_id: "u1", email: "a@example.org", display_name: "A", role: "editor" };
+
+  // Catches the kind being made required: older servers send none.
+  it("treats a member without a kind as human", () => {
+    expect(parse(Member, LEGACY_MEMBER).kind).toBe("human");
+  });
+
+  it("keeps a bot's kind", () => {
+    expect(parse(Member, { ...LEGACY_MEMBER, kind: "bot" }).kind).toBe("bot");
+  });
+
+  // Catches v.fallback coming back: it turned an unknown kind into human, and
+  // the members page then offered Owner on that row.
+  it("rejects a kind it doesn't know instead of calling it human", () => {
+    expect(() => parse(Member, { ...LEGACY_MEMBER, kind: "robot" })).toThrow('received "robot"');
+  });
+});
+
 describe("DocWithRole", () => {
   it("defaults the restriction fields", () => {
     const doc = parse(DocWithRole, { ...LEGACY_DOC, effective_role: "owner" });
@@ -65,5 +84,18 @@ describe("DocAccessInfo", () => {
     };
 
     expect(parse(DocAccessInfo, body)).toEqual(body);
+  });
+});
+
+describe("AuditAuthor", () => {
+  it("reads a person without the bot mark as no bot, and keeps a bot's", () => {
+    expect(parse(AuditAuthor, { key: "u1", name: "Ada", former: false })).toEqual({
+      key: "u1",
+      name: "Ada",
+      former: false,
+      bot: false,
+    });
+    expect(parse(AuditAuthor, { key: "u2", name: "CI bot", former: false, bot: true }).bot).toBe(true);
+    expect(parse(AuditAuthor, { key: "u3", name: "Odd", former: false, bot: "yes" }).bot).toBe(false);
   });
 });

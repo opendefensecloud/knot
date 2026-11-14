@@ -10,6 +10,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::invalidations;
+use crate::user_store::UserKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
@@ -26,6 +27,7 @@ pub struct Member {
     pub display_name: String,
     pub role: WorkspaceRole,
     pub added_at: DateTime<Utc>,
+    pub kind: UserKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +61,8 @@ pub enum WorkspaceStoreError {
     Sqlx(#[from] sqlx::Error),
     #[error("invalid role: {0}")]
     InvalidRole(String),
+    #[error("invalid user kind: {0}")]
+    InvalidKind(String),
 }
 
 #[async_trait]
@@ -181,8 +185,8 @@ impl WorkspaceStore for PgWorkspaceStore {
     }
 
     async fn list_members(&self, workspace_id: Uuid) -> Result<Vec<Member>, WorkspaceStoreError> {
-        let rows = sqlx::query_as::<_, (Uuid, String, String, String, DateTime<Utc>)>(
-            "SELECT wm.user_id, u.email::text, u.display_name, wm.role, wm.added_at
+        let rows = sqlx::query_as::<_, (Uuid, String, String, String, DateTime<Utc>, String)>(
+            "SELECT wm.user_id, u.email::text, u.display_name, wm.role, wm.added_at, u.kind
              FROM workspace_members wm
              JOIN users u ON u.id = wm.user_id
              WHERE wm.workspace_id = $1
@@ -192,7 +196,7 @@ impl WorkspaceStore for PgWorkspaceStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(uid, email, name, role, added)| {
+            .map(|(uid, email, name, role, added, kind)| {
                 Ok(Member {
                     user_id: uid,
                     email,
@@ -200,6 +204,8 @@ impl WorkspaceStore for PgWorkspaceStore {
                     role: WorkspaceRole::parse(&role)
                         .ok_or_else(|| WorkspaceStoreError::InvalidRole(role))?,
                     added_at: added,
+                    kind: UserKind::parse(&kind)
+                        .ok_or_else(|| WorkspaceStoreError::InvalidKind(kind))?,
                 })
             })
             .collect()

@@ -1,14 +1,21 @@
 //! Loads the session named by the `sid` cookie and attaches an
 //! `AuthContext` to request extensions. No `sid` cookie → no extension,
 //! no error: downstream handlers decide whether the route requires auth.
+//!
+//! On `/api/*` a `Bearer` API key is tried first (see `api_key_loader`);
+//! when one is presented it either authenticates the request or the request
+//! is refused, never falling back to the cookie.
 
 use std::sync::Arc;
 
 use axum::{body::Body, extract::Request, middleware::Next, response::Response};
 use knot_auth::SessionToken;
-use knot_storage::{SessionStore, WorkspaceStore};
+use knot_storage::{ApiKeyStore, SessionStore, WorkspaceStore};
 
-use super::context::AuthContext;
+use super::{
+    api_key_loader,
+    context::{AuthContext, SessionHash},
+};
 
 pub use crate::auth::cookies::SID_COOKIE;
 
@@ -16,6 +23,8 @@ pub use crate::auth::cookies::SID_COOKIE;
 pub struct SessionDeps {
     pub sessions: Arc<dyn SessionStore>,
     pub workspaces: Arc<dyn WorkspaceStore>,
+    /// `None` keeps the server cookie-only (tests with partial state).
+    pub api_keys: Option<Arc<dyn ApiKeyStore>>,
     pub session_key: Vec<u8>,
 }
 
@@ -24,6 +33,15 @@ pub async fn session_loader_mw(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    match api_key_loader::authenticate(&deps, &req).await {
+        Err(resp) => return resp,
+        Ok(Some((ctx, principal))) => {
+            req.extensions_mut().insert(ctx);
+            req.extensions_mut().insert(principal);
+            return next.run(req).await;
+        }
+        Ok(None) => {}
+    }
     if let Some(token) = crate::auth::cookies::find_cookie(&req, SID_COOKIE)
         && let Ok(decoded) = SessionToken::decode(&token)
     {
@@ -39,6 +57,7 @@ pub async fn session_loader_mw(
                 workspace_id: s.workspace_id,
                 role,
             });
+            req.extensions_mut().insert(SessionHash(id.clone()));
             // Fire-and-forget touch (using the hashed id).
             let sessions = deps.sessions.clone();
             tokio::spawn(async move {

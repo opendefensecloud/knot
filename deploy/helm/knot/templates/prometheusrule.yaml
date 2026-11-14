@@ -51,4 +51,15 @@ spec:
           annotations:
             summary: "knot p95 latency above target"
             description: "P95 request latency has been above {{ .Values.alerting.latencyP95Target }}s for 30 minutes."
+    - name: knot.limits
+      rules:
+        - alert: KnotRateLimitedSustained
+          expr: |
+            sum by (bucket) (rate(knot_rate_limited_total[15m])) > {{ .Values.alerting.rateLimitedPerSecond }}
+          for: 30m
+          labels:
+            severity: {{ .Values.alerting.ticketSeverity | quote }}
+          annotations:
+            summary: "knot is refusing requests on a rate limit"
+            description: "The {{ "{{" }} $labels.bucket {{ "}}" }} rate limit has refused requests at more than {{ .Values.alerting.rateLimitedPerSecond }}/s (15-minute average, all replicas together) for 30 minutes. Normal use doesn't reach the limits: look for a script or a misbehaving client in the server log (a line when a user or client starts being limited), not for a limit to raise."
 {{- end -}}

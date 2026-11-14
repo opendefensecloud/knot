@@ -8,16 +8,159 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+## [0.9.13] - 2026-11-13
+
+A feature release: a per-page audit log that records every file export,
+and moving a selection to a new subpage with its comments. One database
+migration runs on upgrade, and exports now fail closed when they can't be
+recorded; read Upgrading first.
+
 ### Upgrading
-- Upgrade from 0.9.10, and don't skip 0.9.10 on the way from 0.9.9:
-  this release builds on the numbered edit log that 0.9.10 starts. One
-  database migration runs on upgrade, `20261108120000_history_builder`,
-  which creates three empty tables. Its lock attempts pause page writes
-  (creating, moving, archiving or purging pages, among others) and user
-  updates for at most 100 ms each; once it has its locks it commits at
-  once. Edit saves and page loads go on. 0.9.10 pods that restart after
-  the migration commits crash-loop until new pods replace them; rolling
-  back needs a database restore. (#83)
+- Upgrade from 0.9.12. One database migration runs on upgrade:
+  `20261113120000_audit_doc_index` builds one index on `audit_events`,
+  for the page audit log. While it builds it holds a `SHARE` lock on the
+  table, so every write that adds an audit row waits: creating, renaming,
+  moving, archiving, restoring, duplicating and purging pages (the archive
+  retention job's purge too), marking and unmarking templates, restricting
+  pages and changing their access, member invites, role changes and
+  removals, password changes, and creating and revoking API keys, whether
+  made in the app or with an API key, and quota refusals when quotas are
+  on. Edits, sign-ins and page loads go on.
+  Exports wait too, and one that waits more than 5 s is refused with
+  `503 audit.unavailable` (see below). The migration takes its lock
+  through `knot_lock_tables`, in bounded attempts, and gives up after 45 s
+  instead of queueing those writes behind a long transaction; if it gives
+  up, re-run the upgrade once that transaction has finished. Pass
+  `helm upgrade --timeout` of at least 3 minutes plus your rollout time.
+  The table is small unless your instance wrote many audit rows; the chart
+  README says how to build the index ahead of time on a large
+  `audit_events`. 0.9.12 pods that restart after it commits crash-loop
+  until new pods replace them, and rolling back to 0.9.12 needs a database
+  restore.
+- `audit_events` now grows by one row per exported page: a Word or
+  OpenDocument export writes one, a Markdown zip one per page in it, so a
+  workspace export writes one per page. There is still no retention.
+- Exports now depend on the audit log: a file export is sent only once its
+  audit rows are written, and is refused with `503 audit.unavailable` when
+  they can't be (fail closed). An `audit_events` outage, or a database that
+  refuses inserts into it, blocks every Word, OpenDocument and Markdown zip
+  export until it is fixed, those made with API keys included. An insert
+  that hangs (a lock on `audit_events`, a lost synchronous standby) is
+  given up on after 5 s and refused the same way. Alert on
+  `knot_audit_write_failures_total`.
+
+### Added
+- Each page has an audit log for its editors and owners, under "Audit
+  log" in the page header and the sidebar's menu: who exported the page
+  (Word, OpenDocument, Markdown zip, also as part of a subpage or
+  workspace export), when and how, and who changed its access or the
+  page, with export stats on top. Bots are marked "(bot)", and an export
+  made with an API key says so. Viewers can't open it; the export menu
+  tells everyone that exports are recorded. Exports made before this
+  release were not recorded, and reading the page, the Markdown view,
+  attachment downloads and public link views are not recorded.
+- `GET /api/docs/{id}/audit?category=&cursor=&limit=` lists a page's
+  audit events, newest first, and on the first page its export stats.
+  Editor+ on the page, also when it is archived. API keys need the `read`
+  scope, and the key's user (a bot's included) needs Editor+ on the page.
+  A bot is shown with `"bot": true`.
+- File exports are recorded in `audit_events` as `doc.export`, one row
+  per page the file contains, with the person who exported it, before the
+  file is sent. An export made with an API key names the key's user, and
+  its rows also keep the key's id (`data.api_key_id`) for operators; the
+  audit log shows only `details.via_api_key: true`, never the key. An
+  export that can't be recorded is refused with `503 audit.unavailable`
+  and no file, and the app says "Export blocked: it couldn't be recorded
+  in the audit log. Try again later." Failed, refused and `HEAD` requests
+  are not recorded.
+- Metric `knot_audit_write_failures_total{action}`: failed audit writes,
+  one per failed insert however many rows it held (an export insert given
+  up on after 5 s included). For `doc.export` each is one refused export,
+  however many pages it covered; for member invites, role changes that
+  don't demote an owner, API key creation and revocation and quota
+  refusals the request went on without its row. Member removals, owner
+  demotions and password changes also get an `api-key.revoke-cascade` row
+  from a database trigger in their own transaction, so while
+  `audit_events` refuses inserts they fail, uncounted. Normal use keeps it
+  at 0; the chart README says why it is worth an alert.
+- "Move to subpage" in the selection toolbar, for editors in edit mode
+  (#92): the top-level blocks a selection touches move to a new child
+  page, under the title you confirm, and a link to it takes their place.
+  Comment threads (with their replies, reactions and resolved state) and
+  suggestions that sit entirely inside the moved blocks move with them,
+  and their notifications now point to the new page; ones that cross the
+  edge of the selection stay on the page. It counts against the page
+  quota like any new page, and Ctrl+Z can't undo it. The new page's audit
+  log records it as `doc.move_to_subpage`. API:
+  `POST /api/docs/{id}/move-to-subpage`.
+
+### Changed
+- `doc.grant` audit rows now carry the principal, role and inherit flag,
+  and `doc.grant.delete` rows the principal. Older rows have neither and
+  show as "changed access" or "removed access" in the page audit log.
+
+### Fixed
+- Numbered lists no longer cut off the first digit of their markers from
+  item 10 on ("10." showed as ".0.", #95). The gutter now grows with each
+  list's widest number, counting its start number, so "104." in a list
+  that starts at 95 fits too. In the terminal skin even "1." to "9." were
+  clipped; they fit now as well.
+
+## [0.9.12] - 2026-11-13
+
+A feature release: scoped API keys and bot accounts, rate limits and
+optional quotas, short links to pages, and page history built in the
+background (the timeline view follows in a later release). Five database
+migrations run on upgrade; read Upgrading first.
+
+### Upgrading
+- Upgrade from 0.9.10 or 0.9.11, and don't skip 0.9.10 on the way from
+  0.9.9: this release builds on the numbered edit log that 0.9.10 starts.
+  0.9.10 and 0.9.11 pods that restart after the first migration commits
+  crash-loop until new pods replace them; rolling back needs a database
+  restore.
+- Five database migrations run on upgrade, in this order:
+  `20261108120000_history_builder`, `20261109120000_doc_short_links`,
+  `20261112120000_quota_indexes`, `20261112120001_api_keys_users_kind` and
+  `20261112120002_api_keys_and_bots`. Each commits on its own; if the
+  Job halts between them, re-run the upgrade (see the Helm chart README).
+  Each takes its table locks through `knot_lock_tables`, in short bounded
+  attempts that never wait for one table while holding another, and gives
+  up after 45 seconds instead of holding up page writes or sign-ins; if it
+  gives up, re-run the upgrade once the long transaction it names has
+  finished.
+  With five migrations that each wait up to 45 s for their locks, pass
+  `helm upgrade --timeout` of at least 7 minutes plus your rollout time;
+  the chart README explains the budget and how to tell which migrations
+  committed.
+- `20261108120000_history_builder` creates three empty tables. Its lock
+  attempts pause page writes (creating, moving, archiving or purging
+  pages, among others) and user updates for at most 100 ms each; once it
+  has its locks it commits at once. Edit saves and page loads go on. (#83)
+- `20261109120000_doc_short_links` adds the `doc_short_links` table. It
+  needs a short lock on `documents` and `users` for its foreign keys and
+  gives up after 45 s instead of holding up page writes or sign-ins; if it
+  gives up, re-run the upgrade once the long transaction on `documents` or
+  `users` has finished.
+- `20261112120000_quota_indexes` adds two indexes, on `documents` and on
+  `blobs`, for the quotas. While they build it holds a `SHARE` lock on
+  both: page writes (creating, renaming, moving or archiving pages, among
+  others) and file uploads wait; page loads go on. It takes its locks in
+  bounded attempts and gives up after 45 s instead of queueing writes
+  behind a long transaction; if it gives up, re-run the upgrade once that
+  transaction has finished. Both tables are small, since file contents
+  live in `blob_bytes`, which it doesn't read. (#88)
+- The API-keys migrations are additive. `20261112120001_api_keys_users_kind`
+  adds `users.kind` and two unvalidated checks: it holds an exclusive lock
+  on `users` for an instant, so sign-ins and edit saves pause briefly,
+  and scans nothing. `20261112120002_api_keys_and_bots` validates the
+  checks without blocking anyone, then holds a share lock on `users`,
+  `workspaces`, `workspace_members` and `document_grants` while it creates
+  the `api_keys` table and its triggers: writes to those tables wait,
+  reads, edit saves and page loads go on. (#81)
+- Rotating `KNOT_SESSION_KEY` now invalidates every API key as well as
+  every session: keys are stored as an HMAC under that key. After a
+  rotation, every user and bot needs new keys. (#81)
 - After the upgrade, every page's history is built once in the
   background, pages edited longest ago first. Expect extra CPU and
   database reads for a while (about one read of `doc_updates`), and
@@ -42,8 +185,46 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   replay would read more than `history.replayMaxBytes`. The chart
   README says how to find such pages and re-enable them. (#83)
 - The old snapshot thinning is unchanged. (#83)
+- Writes are now rate limited per user, and sign-in and share links per
+  client address; the limits are on by default and far above normal use.
+  API clients and scripts that write in bulk can get
+  `429 rate.limited` with a `Retry-After` header and should wait and
+  retry. `rateLimit.enabled: false` turns every rate limit off. (#88)
+- Behind an ingress, set `trustedProxies` to the ingress controller's
+  addresses, and only those: any address listed can name any client IP.
+  Until you do, the per-IP sign-in and share-link limits are skipped for
+  requests that carry `X-Forwarded-For` (counted in
+  `knot_client_ip_unresolved_total{reason="no_trusted_proxies"}`), and
+  failed logins from all clients still count together, as before. knot
+  refuses to start on an entry it can't use (malformed, a `/0`, or host
+  bits after the prefix such as `10.0.0.5/8`), with an error naming
+  `KNOT_TRUSTED_PROXIES`. Behind an L4 balancer that adds no
+  `X-Forwarded-For`, all clients share one sign-in bucket; the chart
+  README says how to keep the client address. Clients behind one NAT or
+  egress proxy share its address and so one sign-in bucket (30 a minute)
+  too; OIDC sign-in isn't limited, and `rateLimit.scale` raises every
+  bucket. (#88)
+- The rate limits, the login throttle and the collab socket cap are kept
+  in each replica's memory, so a user spread over N replicas gets up to N
+  times each limit. Divide with `rateLimit.scale` (for example `0.5` with
+  two replicas), set in a values file or with `--set-json`: `--set`
+  passes a string, which the chart's schema refuses. The scale doesn't
+  change the login throttle or the socket cap. Quotas are counted in
+  Postgres and hold across replicas. (#88)
+- Keep the idle and read timeouts of every proxy in front of knot above
+  one minute: a collab socket the server is slowing down may otherwise be
+  closed by the proxy and reconnect. Nothing is lost, but the editor shows
+  the reconnect. (#88)
 
 ### Added
+- Short links to pages. "Copy link" in the page header copies
+  `https://<host>/<code>`, a 7-character code that stays the same when the
+  page is renamed, moved or archived. Every reader of the page can copy it.
+  The link names the page and grants nothing: opening it needs a session
+  and read access, after sign-in (SSO included) if needed, and a link to a
+  page the reader can't see looks the same as an unknown one. On an
+  archived page the button copies the page's existing short link, or its
+  long link if it never had one.
 - knot now builds every page's history in the background: who edited,
   when, and how much, per editing session, back to the page's creation
   (or to the 0.9.9 upgrade for older pages). The History drawer is
@@ -66,10 +247,201 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   The Helm chart README says which are worth an alert. (#83)
 - `knot-server history-stats` also reports checkpoint sizes and the
   number of history entries. (#83)
+- Create scoped API keys under Settings, or with
+  `POST /api/auth/api-keys` from a logged-in session, and call `/api/*`
+  with `Authorization: Bearer knot_…`. The key is shown exactly once.
+- Give each key any mix of four scopes: `read`, `create`, `update` and
+  `delete`. A request the key's scopes don't cover gets
+  `403 api_key.scope_denied`.
+- Pick a key's lifetime: at least 30 days, or no expiry. Keys of
+  single-sign-on users, and bot keys they mint, expire within 90 days.
+- See your keys and when each was last used, and revoke any live one. A
+  bot's keys also show who created each. The list shows live keys and those
+  revoked or expired in the last 30 days.
+- Each user or bot holds at most 50 live keys; creating another answers
+  `409 api_key.limit_reached` until one is revoked or expires.
+- Workspace owners can add bot accounts (Members, or
+  `POST /api/workspace/members` with `"kind":"bot"`) as editor or viewer
+  for scripts and AI agents, and manage the bots' keys. A bot has no
+  password and no SSO login; it signs in only with its API keys, which may
+  never expire when the owner minting them has a password. The member list
+  shows each member's kind.
+
+- Rate limits on writes, per user: a request over its limit gets
+  `429 Too Many Requests` with `Retry-After` and the error code
+  `rate.limited`, and the web app says "You're doing that too fast. Try
+  again in N s." in place of its generic error. Most writes allow 120 a
+  minute; duplicates, imports and password changes share a tighter
+  bucket (10 a minute), and exports, uploads and board previews have
+  their own. Sign-in allows 30 a minute and share links 600 a minute per
+  client address. Reads, health checks and static files aren't limited.
+  The chart README lists every bucket. (#88)
+- Backpressure on the page and board WebSockets: when one user sends more
+  than their budget, the server reads that user's next message later
+  instead of refusing it, so no edit is lost; typing and drawing stay far
+  below the budget. Presence updates past 120 a second are coalesced to
+  the latest, and a repeated request for the full page state on one
+  socket is ignored. A user may hold 64 collab sockets per replica and
+  connect to one page or board 20 times, then 20 times a minute; past
+  either, the connect gets 429 and the editor backs off and retries. (#88)
+- Optional quotas, off by default: pages and uploaded file bytes, per
+  user and per workspace. A write that would go past one is refused with
+  `403 quota.exceeded`, and the web app says which limit was reached.
+  Archived pages, templates and files count until purged, and duplicated
+  pages count for the user who duplicated them. A refusal is audited as
+  `quota.exceeded` at most once per user, quota and scope every
+  10 minutes. Quotas are best effort: requests running at the same time
+  can overshoot by what runs at once. Set a per-user quota along with a
+  workspace one, or one account can use all of it. (#88)
+- `trustedProxies` (`KNOT_TRUSTED_PROXIES`): the proxies whose
+  `X-Forwarded-For` knot believes, read from the right. The resolved
+  client address feeds the per-IP limits, the login and password failure
+  throttles and the IP stored on a password sign-in's session. IPv6
+  clients are grouped per `/64`. (#88)
+- Chart values `rateLimit.enabled`, `rateLimit.scale`,
+  `rateLimit.collabMaxSockets`, `trustedProxies`, `quotas.pagesPerUser`,
+  `quotas.pagesPerWorkspace`, `quotas.blobBytesPerUser`,
+  `quotas.blobBytesPerWorkspace` and `alerting.rateLimitedPerSecond`
+  (`KNOT_RATE_LIMIT_ENABLED`, `KNOT_RATE_LIMIT_SCALE`,
+  `KNOT_RATE_LIMIT_COLLAB_MAX_SOCKETS`, `KNOT_TRUSTED_PROXIES`,
+  `KNOT_QUOTA_PAGES_PER_USER`, `KNOT_QUOTA_PAGES_PER_WORKSPACE`,
+  `KNOT_QUOTA_BLOB_BYTES_PER_USER`, `KNOT_QUOTA_BLOB_BYTES_PER_WORKSPACE`).
+  The schema refuses a quota above 2^53 − 1, a `/0` proxy and characters
+  outside IPs and CIDRs. (#88)
+- Metrics `knot_rate_limited_total{bucket}`,
+  `knot_collab_throttled_total{kind,action}`,
+  `knot_collab_throttle_wait_seconds`,
+  `knot_quota_exceeded_total{quota,scope}`,
+  `knot_client_ip_unresolved_total{reason}` and
+  `knot_client_ip_malformed_forwarded_total`; the alert
+  `KnotRateLimitedSustained` (ticket severity) in the chart's
+  PrometheusRule; and a "Limits" row in the Grafana dashboard. Normal use
+  keeps them at 0. (#88)
 
 ### Changed
 - `GET /api/docs/{id}/contributors` adds `former` to each person
   (always `false` for now). (#83)
+- A workspace import may create at most 10 000 pages, write at most
+  256 MiB of page Markdown and 512 MiB of files and board images and hold
+  at most 20 000 file and board references. These caps are always on and checked before anything
+  is written; a larger import is refused with `413 import.too_large`, and
+  the web app names the caps. Split larger archives. (#88)
+- Dropping many files at once pauses on a rate limit: the editor shows
+  "Uploads paused — continuing in N s…" for a wait over 2 s, retries the
+  file once, and on a quota stops with one message saying how many files
+  weren't uploaded. (#88)
+- Workspace and page zip exports download through the app, so a refused
+  export shows a message instead of a failed browser download. (#88)
+
+### Fixed
+- With `trustedProxies` set, five failed logins from one client no longer
+  block password sign-in for everyone behind the same ingress: the login
+  and password failure throttles key on the client's own address. (#88)
+- An import whose manifest names one large file many times can no longer
+  write gigabytes: each reference counts toward the 512 MiB cap, and an
+  entry larger than it declares is skipped. (#88)
+- The login throttle no longer grows without bound: idle keys are
+  removed, it holds at most 100 000, and email keys are cut at
+  320 bytes. (#88)
+
+### Security
+- API keys are stored only as an HMAC-SHA256 under `KNOT_SESSION_KEY`; the
+  plaintext never reaches the database, logs, traces or the audit log.
+- A key works only on `/api/*`. It can't open the live editor websocket,
+  change the password, log out, create, list or revoke keys, invite,
+  re-role or remove members, create or list public share links, or change
+  a page's grants or restriction, or move a page into or out of a
+  restricted subtree (`403 api_key.session_required`, whatever its scopes),
+  so a leaked key can't take over the account or the workspace, raise its
+  own scopes, or leave behind a public link or page access that outlives
+  it. Reading a page's grants and access still works with `read`.
+- A broken key (`Authorization: Bearer knot_…`, also with the scheme
+  doubled or the key quoted, or a bare `Bearer`) is always
+  `401 api_key.invalid`, never served from the session cookie. A
+  Bearer token that isn't a knot key, such as the JWT an auth proxy in
+  front of knot forwards, is ignored as before, so the cookie session and
+  the health checks keep working behind such a proxy.
+- Requests refused by a key's scopes and writes made with a key are logged
+  with the key's id, the method and the route, never the key itself, so an
+  incident can be narrowed to one key.
+- Creating a key re-checks, in the same database transaction, that the
+  session asking for it still exists and that its user is still a member
+  (and still an owner, for a bot's key). A key requested just before a
+  password change, a removal or a demotion is refused instead of
+  outliving it. A password change now sets the new hash and ends every
+  session in one transaction.
+- Keys of single-sign-on users, and bot keys they mint, are capped at 90
+  days, by the server and by a database check.
+- Any change of a user's password hash (in the app, or a direct database
+  update) revokes all of that user's keys, and the bot keys that user
+  minted, so a stolen session can't leave a bot key behind before the
+  owner resets the password (a database trigger). Removing a member
+  revokes their keys, so re-inviting them brings none back, and
+  revokes the bot keys they minted; an owner who loses the owner role
+  loses the bot keys they minted too (database triggers). Each of these
+  writes an `api-key.revoke-cascade` audit event naming the cause and the
+  keys, and the app warns before a password change, a removal or an owner's
+  demotion.
+- A bot can't sign in through single sign-on, even when an identity
+  provider account has its email, and a user's kind (human or bot) never
+  changes (a database trigger).
+- A bot can never own the workspace or a page: the server refuses with
+  `422 bot.owner_forbidden`, and database triggers refuse it on every
+  other path. Bots also can't restrict pages (`403
+  api_key.session_required`: no key may), create or import pages
+  inside a restricted subtree, import restricted pages or duplicate a
+  restricted page (`403 bot.restricted_forbidden`). Where a person would
+  get an owner grant on a page they create, a bot gets an editor grant.
+- A page grant for `user:<id>` is stored under the canonical id whatever
+  UUID spelling the request used (upper case, without hyphens, braced,
+  `urn:uuid:`), and removed by any of them, so one person never holds
+  several rows that member removal would miss.
+- ammonia 4.1.9 fixes RUSTSEC-2026-0533 (mutation XSS through MathML
+  and SVG integration points). knot was not affected: both of its
+  sanitizers, for the public share page and for release notes, use
+  ammonia's default tags, which allow none of the raw-text tags the
+  attack needs.
+
+## [0.9.11] - 2026-11-12
+
+A fix release: nested lists, tables, keyboard shortcuts, the page
+scrollbar and SSO links.
+
+### Upgrading
+- No database migrations. Upgrade from 0.9.10 in place, and roll back to
+  0.9.10 without a restore. Coming from 0.9.9, upgrade to 0.9.10 first.
+
+### Added
+- **Indent** and **Outdent** buttons in the editor toolbar while the
+  caret is in a list, for touch screens without a Tab key. Inside a list
+  they take the place of the two diagram buttons. (#78)
+
+### Changed
+- The edit-mode shortcut is ⌘E on macOS and stays Ctrl+E elsewhere, so on
+  a Mac Ctrl+E and Ctrl+A move to the end and start of the line again
+  while editing. (#86)
+
+### Fixed
+- Typing `  - ` or `  1. ` at the start of a list item nests it, whether
+  you indent by 2 or 4 spaces, and the same indent on the next line stays
+  a sibling. (#78)
+- Lists pasted from Word for the web keep their nesting. (#78)
+- Delete at the end of a list item whose nested list has sublists of its
+  own works; it did nothing. (#78)
+- Starting to edit from the top of a page puts the caret in the text, so
+  End and Home no longer scroll the page; on a Mac they now move within
+  the line. (#86)
+- Long pages no longer show a third scrollbar that scrolled the sidebar
+  and the page together. (#87)
+- Clicking into a table no longer makes the page jump: the row and column
+  actions moved into a **Table** menu in place of **Insert table**. (#77)
+- Inside a table cell, Tab and Shift+Tab indent list items and code lines
+  instead of jumping to the next cell. (#77)
+- Tables can no longer end up inside tables, and a table at the end of a
+  page no longer traps the cursor. (#77)
+- Signing in with SSO from a link to a page, comment or suggestion opens
+  that link instead of the start page. Password sign-in keeps comment and
+  suggestion links too. (#84)
 
 ## [0.9.10] - 2026-11-08
 
@@ -1287,7 +1659,10 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.10...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.13...HEAD
+[0.9.13]: https://github.com/opendefensecloud/knot/compare/v0.9.12...v0.9.13
+[0.9.12]: https://github.com/opendefensecloud/knot/compare/v0.9.11...v0.9.12
+[0.9.11]: https://github.com/opendefensecloud/knot/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/opendefensecloud/knot/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/opendefensecloud/knot/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/opendefensecloud/knot/compare/v0.9.7...v0.9.8

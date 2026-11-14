@@ -11,6 +11,7 @@ import {
   type SuggestionStatus,
   type SuggestionWithReplies,
 } from "../../lib/suggestions.api";
+import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 import { CommentComposer } from "../comments/CommentComposer";
 import type { SuggestionLive } from "./liveState";
@@ -153,7 +154,7 @@ export const SuggestionCard = memo(function SuggestionCard({
             // The refetch tells the story: decided by someone else.
             break;
           default:
-            notify("error", "Couldn't accept suggestion");
+            notifyFailure(notify, r.error, "Couldn't accept suggestion");
         }
       }
       await invalidate();
@@ -164,7 +165,7 @@ export const SuggestionCard = memo(function SuggestionCard({
     mutationFn: () => suggestionsApi.reject(docId, s.id),
     onSuccess: async (r) => {
       if ("error" in r && r.error.code !== "suggestion.not_pending") {
-        notify("error", "Couldn't reject suggestion");
+        notifyFailure(notify, r.error, "Couldn't reject suggestion");
       }
       await invalidate();
     },
@@ -174,7 +175,7 @@ export const SuggestionCard = memo(function SuggestionCard({
     mutationFn: () => suggestionsApi.withdraw(docId, s.id),
     onSuccess: async (r) => {
       if ("error" in r && r.error.code !== "suggestion.not_pending") {
-        notify("error", "Couldn't withdraw suggestion");
+        notifyFailure(notify, r.error, "Couldn't withdraw suggestion");
       }
       await invalidate();
     },
@@ -184,7 +185,7 @@ export const SuggestionCard = memo(function SuggestionCard({
     mutationFn: (v: { body: string; mentions: string[] }) =>
       suggestionsApi.reply(docId, s.id, v.body, v.mentions),
     onSuccess: async (r) => {
-      if ("error" in r) { notify("error", "Couldn't post reply"); return; }
+      if ("error" in r) { notifyFailure(notify, r.error, "Couldn't post reply"); return; }
       await invalidate();
     },
   });

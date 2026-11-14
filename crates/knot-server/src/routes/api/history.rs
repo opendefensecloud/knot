@@ -22,27 +22,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::{AuthContext, EffectiveDocRole};
+use crate::auth::{AuthContext, require_editor};
 use crate::http_error::json_err;
-
-/// Require the caller to be at least Editor (not Viewer-only).
-/// Expects `EffectiveDocRole` already set by `require_doc_role_mw`.
-fn require_editor(req: &Request) -> Option<Response> {
-    if req.extensions().get::<AuthContext>().is_none() {
-        return Some(json_err(
-            StatusCode::UNAUTHORIZED,
-            "auth.session_required",
-            "",
-        ));
-    }
-    match req.extensions().get::<EffectiveDocRole>().copied() {
-        None => Some(json_err(StatusCode::FORBIDDEN, "acl.no_grant", "")),
-        Some(role) if role.0 == knot_storage::WorkspaceRole::Viewer => {
-            Some(json_err(StatusCode::FORBIDDEN, "acl.editor_required", ""))
-        }
-        Some(_) => None,
-    }
-}
 
 pub async fn list(
     State(state): State<AppState>,

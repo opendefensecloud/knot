@@ -93,6 +93,11 @@ lint: ## cargo clippy + cargo fmt --check + tsc --noEmit
 	$(CARGO) fmt --all -- --check
 	cd web && $(PNPM) tsc --noEmit
 
+.PHONY: helm.check
+helm.check: ## helm lint + render the chart with test values (numbers must not render as 1e+09)
+	helm lint deploy/helm/knot -f deploy/helm/knot/ci/ct-values.yaml
+	deploy/helm/check-render.sh
+
 .PHONY: fmt
 fmt: ## cargo fmt + prettier write
 	$(CARGO) fmt --all
@@ -149,7 +154,7 @@ db.cleanup: ## drop all leftover t_* test databases from the dev Postgres
 	| while read db; do \
 		[ -z "$$db" ] && continue; \
 		echo "drop $$db"; \
-		docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d postgres -c "DROP DATABASE IF EXISTS \"$$db\"" >/dev/null; \
+		docker compose -f deploy/compose/dev.yml exec -T postgres psql -U knot -d postgres -c "DROP DATABASE IF EXISTS \"$$db\"" >/dev/null </dev/null; \
 	done; \
 	echo "done"
 

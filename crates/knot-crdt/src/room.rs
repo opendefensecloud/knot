@@ -206,6 +206,21 @@ pub enum Event {
         accepted_by: Uuid,
         reply: oneshot::Sender<Result<i64, crate::suggestions::ApplySuggestionError>>,
     },
+    /// Move the top-level blocks the anchors `start..end` lie in to a new
+    /// page ([`crate::move_blocks`]). After catching up, the room builds the
+    /// new page's content and awaits `commit` (which stores it) while holding
+    /// the doc, so nothing changes between what was copied and what is cut.
+    /// Then it replaces the blocks with a link, persists that as an `edit`
+    /// row by `by_user` and fans it out once stored. A refused commit or an
+    /// anchor that doesn't resolve changes nothing; a failed persist evicts
+    /// the room (the new page then holds the blocks, and so does the source).
+    MoveBlocksOut {
+        start: Vec<u8>,
+        end: Vec<u8>,
+        by_user: Option<Uuid>,
+        commit: crate::move_blocks::Commit,
+        reply: oneshot::Sender<Result<i64, crate::move_blocks::MoveBlocksError>>,
+    },
     /// Whether the doc records `suggestion_id` as applied under the claim's
     /// `apply_token` ([`crate::suggestions::is_applied`]), after catching up
     /// on persisted updates. The marker in the doc is the single source of
@@ -602,6 +617,10 @@ impl Room {
                         let result = self.on_apply_suggestion(request, by_user, accepted_by).await;
                         let _ = reply.send(result);
                     }
+                    Some(Event::MoveBlocksOut { start, end, by_user, commit, reply }) => {
+                        let result = self.on_move_blocks_out(start, end, by_user, commit).await;
+                        let _ = reply.send(result);
+                    }
                     Some(Event::SuggestionApplied { suggestion_id, apply_token, reply }) => {
                         use crate::suggestions::{APPLIED_MAP, is_applied};
                         use yrs::Transact;
@@ -873,6 +892,58 @@ impl Room {
             )
             .await
             .map_err(ApplySuggestionError::Persist)?;
+        self.fan_out(&framed, None);
+        Ok(seq)
+    }
+
+    /// `Event::MoveBlocksOut`: see there.
+    async fn on_move_blocks_out(
+        &mut self,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        by_user: Option<Uuid>,
+        commit: crate::move_blocks::Commit,
+    ) -> Result<i64, crate::move_blocks::MoveBlocksError> {
+        use crate::move_blocks::{MoveBlocksError, Prepared, block_range, child_state, cut};
+        use yrs::{ReadTxn, StateVector, Transact};
+        // As `on_apply_suggestion`: the selected text may come from another
+        // replica's edit this room hasn't seen yet.
+        let _ = self.catch_up().await;
+        // Before any transaction (see `on_replace`).
+        let frag = self.doc.inner().get_or_insert_xml_fragment("default");
+        let (first, last, state) = {
+            let txn = self.doc.inner().transact();
+            let (first, last) = block_range(&txn, &frag, &start, &end)?;
+            (
+                first,
+                last,
+                txn.encode_state_as_update_v1(&StateVector::default()),
+            )
+        };
+        let child_state = child_state(&state, first, last)?;
+        // ponytail: the room handles no other event until the commit's one DB
+        // transaction ends; add a deadline if that ever takes long.
+        let link = commit(Prepared { child_state })
+            .await
+            .map_err(MoveBlocksError::Refused)?;
+        let ((), update) = self.capturing_update(|txn| {
+            cut(&frag, txn, first, last, &link.title, &link.href);
+        });
+        let Some(update) = update else {
+            self.evict(format_args!("a move to subpage produced no update"));
+            return Err(MoveBlocksError::Persist("no update".into()));
+        };
+        metrics::counter!("knot_room_updates_total", "source" => "move").increment(1);
+        let framed = wrap_sync_update(&update);
+        let seq = self
+            .persist_server_edit(
+                update,
+                by_user,
+                knot_storage::UpdateSource::Edit,
+                Some(link.meta),
+            )
+            .await
+            .map_err(MoveBlocksError::Persist)?;
         self.fan_out(&framed, None);
         Ok(seq)
     }

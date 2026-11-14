@@ -63,7 +63,7 @@ type Stub = {
   /** Answer to any PUT or DELETE; defaults to 204. */
   write?: { status: number; body?: unknown };
   /** `GET /api/workspace/members`; defaults to Ada alone. */
-  members?: { user_id: string; email: string; display_name: string; role: string }[] | "error";
+  members?: { user_id: string; email: string; display_name: string; role: string; kind?: string }[] | "error";
   /** Holds back the members answer until it resolves. */
   membersGate?: Promise<void>;
 };
@@ -294,6 +294,33 @@ describe("PermissionsDialog access", () => {
     expect(await screen.findByText("Only workspace members can be added.")).toBeTruthy();
   });
 
+  it("offers no owner role for a bot and maps the server's refusal", async () => {
+    const BOT = "55555555-5555-5555-5555-555555555555";
+    renderDialog({
+      members: [
+        { user_id: ADA, email: "ada@example.com", display_name: "Ada Lovelace", role: "editor" },
+        { user_id: BOT, email: "bot@example.com", display_name: "CI Bot", role: "editor", kind: "bot" },
+      ],
+      write: {
+        status: 422,
+        body: { error: { code: "bot.owner_forbidden", message: "", details: {} } },
+      },
+    });
+    const role = await screen.findByTestId("grant-role");
+    fireEvent.change(role, { target: { value: "owner" } });
+    expect(role).toHaveValue("owner");
+
+    const picker = await screen.findByTestId("grant-user");
+    fireEvent.focus(picker);
+    fireEvent.mouseDown(await screen.findByTestId(`grant-user-option-${BOT}`));
+    expect(within(role).queryByText("Owner")).toBeNull();
+    expect(within(role).getAllByRole("option")).toHaveLength(2);
+    expect(role).toHaveValue("editor");
+
+    fireEvent.click(screen.getByTestId("grant-add"));
+    expect(await screen.findByText("A bot can't be a page owner.")).toBeTruthy();
+  });
+
   it("hints that inherit shares subpages on a restricted page", async () => {
     renderDialog({ doc: { restricted: true, within_restricted: true, restriction_root_id: "d1" } });
 
@@ -501,5 +528,30 @@ describe("PermissionsDialog people list", () => {
     const keyWarnings = consoleError.mock.calls.filter((call) => String(call[0]).includes("same key"));
     expect(keyWarnings).toEqual([]);
     consoleError.mockRestore();
+  });
+});
+
+describe("PermissionsDialog when a limit refuses a change", () => {
+  const TOO_FAST = {
+    status: 429,
+    body: { error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 5 } } },
+  };
+
+  it("says to slow down when adding a grant is refused", async () => {
+    renderDialog({ write: TOO_FAST });
+    const picker = await screen.findByTestId("grant-user");
+    fireEvent.focus(picker);
+    fireEvent.mouseDown(await screen.findByTestId(`grant-user-option-${ADA}`));
+    fireEvent.click(screen.getByTestId("grant-add"));
+
+    expect(await screen.findByTestId("toast-warn")).toHaveTextContent("You're doing that too fast. Try again in 5 s.");
+    expect(screen.queryByTestId("toast-error")).toBeNull();
+  });
+
+  it("says to slow down when making a share link is refused", async () => {
+    renderDialog({ write: TOO_FAST });
+    fireEvent.click(await screen.findByTestId("share-enable"));
+
+    expect(await screen.findByTestId("toast-warn")).toHaveTextContent("You're doing that too fast. Try again in 5 s.");
   });
 });

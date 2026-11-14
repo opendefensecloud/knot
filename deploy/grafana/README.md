@@ -18,6 +18,7 @@ The dashboard has a single template variable `instance` (Prometheus instance lab
 - **Top-line row** — requests/s, P95 latency, 5xx rate, active rooms (four stat panels at a glance)
 - **HTTP row** — requests by route, P50/P95/P99 latency, error rate by route
 - **Internals row** — CRDT updates/s by source (`local`|`peer`), snapshots/s, DB pool size+idle, DB pool busy %
+- **Limits row** — rate-limited requests/s by bucket (`knot_rate_limited_total`, WebSocket upgrade refusals as `collab_upgrade` and `collab_sockets`), quota refusals/s by quota and scope, collab throttling/s by kind and action (frames delayed, presence coalesced, repeated sync requests ignored), the P95 of collab throttle waits, and requests to the sign-in and share-link routes whose `X-Forwarded-For` came from an untrusted peer, by `reason`: `no_trusted_proxies` (knot is behind a proxy and `trustedProxies` is empty; set it in the chart when this isn't 0) or `untrusted_peer` (a peer outside the list, a proxy left out or a client sending the header itself). The client-IP panel counts only while rate limits are on. Normal use keeps every panel in this row at 0; see "Rate limits and quotas" in `deploy/helm/knot/README.md`.
 
 ## SLO thresholds
 

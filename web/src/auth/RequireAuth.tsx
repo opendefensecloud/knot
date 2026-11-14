@@ -8,7 +8,9 @@ export function RequireAuth() {
   if (q.isLoading) return <div style={{ padding: 24 }}>Loading…</div>;
   const data = q.data;
   if (!data || "error" in data) {
-    return <Navigate to="/login" replace state={{ from: loc.pathname }} />;
+    // The whole link, so `?thread=` / `?suggestion=` survive the sign-in.
+    const from = loc.pathname + loc.search + loc.hash;
+    return <Navigate to="/login" replace state={{ from }} />;
   }
   return <Outlet />;
 }

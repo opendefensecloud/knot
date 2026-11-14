@@ -34,6 +34,8 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+# Trusted-proxy networks (client IP behind a reverse proxy).
+ipnet.workspace = true
 futures = "0.3"
 anyhow.workspace = true
 thiserror.workspace = true
@@ -79,6 +81,8 @@ yrs.workspace = true
 mimalloc = "0.1"
 
 [dev-dependencies]
+# Paused-time tests of the collab rate limits' waits.
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

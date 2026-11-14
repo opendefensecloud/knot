@@ -913,16 +913,21 @@ async fn migration_backfill_detaches_live_children() {
         .create("default", "W")
         .await
         .unwrap();
-    let user = PgUserStore::new(pool.clone())
-        .create_local("a@x.test", "A", "$h$")
-        .await
-        .unwrap();
+    // Raw SQL, not PgUserStore: the store reads columns added by later
+    // migrations than the ones applied here.
+    let user: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, display_name, password_hash)
+         VALUES ('a@x.test', 'A', '$h$') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let folder: Uuid = sqlx::query_scalar(
         "INSERT INTO documents (workspace_id, title, sort_key, created_by, archived_at)
          VALUES ($1, 'Old folder', 'm', $2, now() - interval '90 days') RETURNING id",
     )
     .bind(ws.id)
-    .bind(user.id)
+    .bind(user)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -932,7 +937,7 @@ async fn migration_backfill_detaches_live_children() {
     )
     .bind(ws.id)
     .bind(folder)
-    .bind(user.id)
+    .bind(user)
     .fetch_one(&pool)
     .await
     .unwrap();

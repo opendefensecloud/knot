@@ -274,7 +274,7 @@ async fn emit_comment_notifications(
 /// Fire-and-forget: tell any active room for `doc_id` that its comments changed,
 /// so connected clients refetch. Reads `state.pool` directly, same as the
 /// notification path reads its individual stores.
-fn notify_comment_change(state: &AppState, doc_id: Uuid) {
+pub(crate) fn notify_comment_change(state: &AppState, doc_id: Uuid) {
     let Some(pool) = state.pool.as_ref().cloned() else {
         return;
     };

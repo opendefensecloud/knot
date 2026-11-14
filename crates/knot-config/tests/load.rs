@@ -224,3 +224,88 @@ fn oidc_extra_audiences_accepts_single_numeric_value() {
         Ok(())
     });
 }
+
+#[test]
+fn rate_limit_and_quota_settings_parse_from_the_environment() {
+    figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
+        let defaults = Config::load::<&str>(None).expect("load defaults");
+        assert!(defaults.rate_limit_enabled);
+        assert_eq!(defaults.rate_limit_scale, 1.0);
+        assert_eq!(defaults.rate_limit_collab_max_sockets, 64);
+        assert!(defaults.trusted_proxies.is_empty());
+        assert_eq!(defaults.quota_blob_bytes_per_workspace, 0);
+
+        jail.set_env("KNOT_RATE_LIMIT_ENABLED", "false");
+        jail.set_env("KNOT_RATE_LIMIT_SCALE", "0.5");
+        jail.set_env("KNOT_RATE_LIMIT_COLLAB_MAX_SOCKETS", "8");
+        jail.set_env("KNOT_TRUSTED_PROXIES", "10.0.0.0/8, 192.168.1.5 ,fd00::/8");
+        jail.set_env("KNOT_QUOTA_PAGES_PER_USER", "500");
+        jail.set_env("KNOT_QUOTA_PAGES_PER_WORKSPACE", "20000");
+        jail.set_env("KNOT_QUOTA_BLOB_BYTES_PER_USER", "1073741824");
+        jail.set_env("KNOT_QUOTA_BLOB_BYTES_PER_WORKSPACE", "10737418240");
+        let configured = Config::load::<&str>(None).expect("load from env");
+        assert!(!configured.rate_limit_enabled);
+        assert_eq!(configured.rate_limit_scale, 0.5);
+        assert_eq!(configured.rate_limit_collab_max_sockets, 8);
+        assert_eq!(configured.trusted_proxies_list().expect("parses").len(), 3);
+        assert_eq!(configured.quota_pages_per_user, 500);
+        assert_eq!(configured.quota_pages_per_workspace, 20_000);
+        assert_eq!(configured.quota_blob_bytes_per_user, 1024 * 1024 * 1024);
+        assert_eq!(
+            configured.quota_blob_bytes_per_workspace,
+            10 * 1024 * 1024 * 1024
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn integer_rate_limit_scale_parses_from_the_environment() {
+    // figment's Env provider reads a bare "2" as an integer; the f64 field
+    // must still accept it (Helm renders `scale: 2` as "2").
+    figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
+        jail.set_env("KNOT_RATE_LIMIT_SCALE", "2");
+        let configured = Config::load::<&str>(None).expect("load");
+        assert_eq!(configured.rate_limit_scale, 2.0);
+        Ok(())
+    });
+}
+
+#[test]
+fn single_trusted_proxy_address_parses_from_the_environment() {
+    figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
+        jail.set_env("KNOT_TRUSTED_PROXIES", "10.42.0.7");
+        let configured = Config::load::<&str>(None).expect("load");
+        assert_eq!(
+            configured.trusted_proxies_list().expect("parses"),
+            vec!["10.42.0.7/32".parse::<ipnet::IpNet>().unwrap()]
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn invalid_rate_limit_settings_fail_to_load_naming_the_env_var() {
+    for (env_var, bad_value) in [
+        ("KNOT_RATE_LIMIT_SCALE", "0"),
+        ("KNOT_RATE_LIMIT_SCALE", "101"),
+        ("KNOT_RATE_LIMIT_COLLAB_MAX_SOCKETS", "0"),
+        ("KNOT_TRUSTED_PROXIES", "0.0.0.0/0"),
+        ("KNOT_TRUSTED_PROXIES", "::/0"),
+        ("KNOT_TRUSTED_PROXIES", "10.0.0.0/8,bogus"),
+    ] {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
+            jail.set_env(env_var, bad_value);
+            let error = Config::load::<&str>(None).expect_err("must fail validation");
+            assert!(
+                error.to_string().contains(env_var),
+                "{env_var}={bad_value}: {error}"
+            );
+            Ok(())
+        });
+    }
+}

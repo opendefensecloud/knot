@@ -48,7 +48,7 @@ export function placeCaretAtReadingLine(view: EditorView, scope: ParentNode): vo
 
   // A click in read-only text moves the browser's selection but not the
   // editor's (the view is not focused), so prefer the DOM's: "click where you
-  // want to edit, then ⌘E" keeps the caret at the click.
+  // want to edit, then ⌘E (Ctrl+E)" keeps the caret at the click.
   const selection = domSelectionIn(view) ?? view.state.selection;
   const head = view.coordsAtPos(selection.head);
   const strategy = chooseCaretStrategy({
@@ -126,8 +126,11 @@ export function revealCaretBelowBand(view: EditorView, scope: ParentNode): void 
 /** Space left between the band and a revealed caret line, in px. */
 const REVEAL_GAP = 4;
 
-/** The browser's selection as an editor selection, when it lies in `view`. */
-function domSelectionIn(view: EditorView): Selection | null {
+/**
+ * The browser's selection as an editor selection, when it lies in `view`.
+ * Also how LineBoundaryKeys reads back a caret the browser moved.
+ */
+export function domSelectionIn(view: EditorView): Selection | null {
   const domSelection = view.dom.ownerDocument.getSelection();
   const { anchorNode, focusNode } = domSelection ?? {};
   if (!domSelection || !anchorNode || !focusNode) return null;

@@ -2,9 +2,8 @@ import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { createContext, useContext, type ReactNode } from "react";
 
 import { type ApiError } from "../lib/api";
-import { type Session } from "../lib/validators";
 
-import { authApi } from "./session.api";
+import { authApi, type Session } from "./session.api";
 
 type SessionQuery = UseQueryResult<{ ok: Session } | { error: ApiError }, Error>;
 

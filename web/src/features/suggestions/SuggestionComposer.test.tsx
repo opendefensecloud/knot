@@ -174,3 +174,21 @@ describe("SuggestionComposer", () => {
     expect(createErrorMessage("http_error")).toBe("Couldn't send suggestion");
   });
 });
+
+describe("SuggestionComposer when a limit refuses it", () => {
+  it("says to slow down instead of the generic error", async () => {
+    api.create.mockResolvedValue({
+      error: { code: "rate.limited", message: "too many requests", details: { retry_after_secs: 4 }, status: 429 },
+    });
+    renderComposer(REPLACE);
+    fireEvent.change(screen.getByTestId("suggestion-composer-replace"), { target: { value: "charlotte" } });
+    fireEvent.click(screen.getByTestId("suggestion-composer-submit"));
+    await waitFor(() =>
+      expect(useUi.getState().toasts).toMatchObject([
+        { kind: "warn", text: "You're doing that too fast. Try again in 4 s.", key: "limit" },
+      ]),
+    );
+    // The composer stays open with what was typed.
+    expect(screen.getByTestId("suggestion-composer-replace")).toHaveValue("charlotte");
+  });
+});

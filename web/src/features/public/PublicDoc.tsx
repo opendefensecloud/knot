@@ -1,7 +1,19 @@
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 
+import { apiErrorFrom } from "../../lib/api";
+import { limitErrorText } from "../../lib/limitErrors";
+
 type Fetched = { status: number; html: string };
+
+/** The wait a 429 from the share link's per-IP limit asks for, as text.
+ *  Any 429 here is that limit, envelope or not. */
+function rateLimitedText(body: string): string {
+  let parsed: unknown;
+  try { parsed = JSON.parse(body); } catch { parsed = undefined; }
+  const error = apiErrorFrom(429, parsed);
+  return limitErrorText({ ...error, code: "rate.limited" }) ?? "";
+}
 
 export default function PublicDoc() {
   const { token } = useParams<{ token: string }>();
@@ -32,6 +44,14 @@ export default function PublicDoc() {
       <main style={{ padding: 40, textAlign: "center" }}>
         <h1>Link expired or revoked</h1>
         <p style={{ color: "#666" }}>This share link is no longer active.</p>
+      </main>
+    );
+  }
+  if (q.data.status === 429) {
+    return (
+      <main style={{ padding: 40, textAlign: "center" }}>
+        <h1>Too many requests</h1>
+        <p style={{ color: "#666" }}>{rateLimitedText(q.data.html)}</p>
       </main>
     );
   }

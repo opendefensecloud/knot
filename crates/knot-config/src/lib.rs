@@ -164,6 +164,39 @@ pub struct Config {
     /// The share of one core each history worker may use on average: after
     /// each page it sleeps `compute × (1 / share − 1)`. In (0, 1].
     pub history_cpu_share: f64,
+
+    /// Turns every HTTP and collab WebSocket rate limit on or off. Quotas
+    /// and the per-import caps are separate and stay as configured.
+    pub rate_limit_enabled: bool,
+    /// Multiplies the burst and refill rate of every rate-limit bucket (the
+    /// per-bucket numbers are constants in the server). Scaled values never
+    /// drop below a floor, so no setting makes a wait last days. Buckets live
+    /// in each replica's memory: with N replicas a user can get up to N × the
+    /// limit, so divide by N for a hard ceiling. In (0, 100].
+    pub rate_limit_scale: f64,
+    /// Open collab WebSockets (doc and board) one user may hold on this
+    /// replica; the next upgrade gets a 429. Minimum 1.
+    pub rate_limit_collab_max_sockets: u32,
+    /// Comma-separated IPs or CIDRs of reverse proxies whose
+    /// `X-Forwarded-For` is believed (a bare IP is one address). Empty: the
+    /// client is the TCP peer. List only the ingress controller's addresses;
+    /// `0.0.0.0/0` and `::/0` are refused. A single address could arrive from
+    /// the env as a number, hence `de_string_or_number`.
+    #[serde(deserialize_with = "de_string_or_number")]
+    pub trusted_proxies: String,
+    /// Pages one user may create in the workspace (`documents.created_by`),
+    /// archived ones included until purged. `0` turns the quota off.
+    pub quota_pages_per_user: u64,
+    /// Pages the workspace may hold, archived ones included until purged.
+    /// `0` turns the quota off.
+    pub quota_pages_per_workspace: u64,
+    /// Bytes of files one user may upload (`blobs.created_by`), archived
+    /// ones included until purged. `0` turns the quota off.
+    pub quota_blob_bytes_per_user: u64,
+    /// Bytes of files the workspace may hold, archived ones included until
+    /// purged. Without a per-user quota, one account can use all of it. `0`
+    /// turns the quota off.
+    pub quota_blob_bytes_per_workspace: u64,
 }
 
 impl Default for Config {
@@ -203,6 +236,14 @@ impl Default for Config {
             history_workers: 1,
             history_replay_max_bytes: DEFAULT_HISTORY_REPLAY_MAX_BYTES,
             history_cpu_share: 0.5,
+            rate_limit_enabled: true,
+            rate_limit_scale: 1.0,
+            rate_limit_collab_max_sockets: 64,
+            trusted_proxies: String::new(),
+            quota_pages_per_user: 0,
+            quota_pages_per_workspace: 0,
+            quota_blob_bytes_per_user: 0,
+            quota_blob_bytes_per_workspace: 0,
         }
     }
 }
@@ -230,6 +271,21 @@ impl Config {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
+            .collect()
+    }
+
+    /// Parse `trusted_proxies` (comma-separated IPs or CIDRs) into networks.
+    /// Entries are trimmed and empty ones skipped; a bare IP becomes a `/32`
+    /// or `/128`, and an IPv4-mapped IPv6 address or network becomes its
+    /// IPv4 form. Refused: a prefix length of 0 (it would let every client
+    /// choose its own address), a mapped network shorter than /96, and host
+    /// bits after the prefix (`10.0.0.5/8`). Empty when unset.
+    pub fn trusted_proxies_list(&self) -> Result<Vec<ipnet::IpNet>, ConfigError> {
+        self.trusted_proxies
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(parse_trusted_proxy)
             .collect()
     }
 
@@ -272,6 +328,19 @@ impl Config {
                 "KNOT_HISTORY_CPU_SHARE must be > 0 and <= 1".into(),
             ));
         }
+        // Written so that NaN fails too.
+        let rate_limit_scale_valid = self.rate_limit_scale > 0.0 && self.rate_limit_scale <= 100.0;
+        if !rate_limit_scale_valid {
+            return Err(ConfigError::Invalid(
+                "KNOT_RATE_LIMIT_SCALE must be > 0 and <= 100".into(),
+            ));
+        }
+        if self.rate_limit_collab_max_sockets == 0 {
+            return Err(ConfigError::Invalid(
+                "KNOT_RATE_LIMIT_COLLAB_MAX_SOCKETS must be >= 1".into(),
+            ));
+        }
+        self.trusted_proxies_list()?;
         if self.db_max_connections == 0 {
             return Err(ConfigError::Invalid(
                 "KNOT_DB_MAX_CONNECTIONS must be >= 1".into(),
@@ -326,6 +395,71 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// One `trusted_proxies` entry: a CIDR (`10.0.0.0/8`, `fd00::/8`) or a bare
+/// address. An IPv4-mapped IPv6 entry (`::ffff:10.0.0.0/104`) becomes its
+/// IPv4 form (`10.0.0.0/8`), as peers are compared in IPv4. Refused: a /0
+/// network, a mapped CIDR shorter than /96 (it isn't an IPv4 network) and
+/// host bits after the prefix (`10.0.0.5/8`: which was meant, the address
+/// or the network?). Errors name the env var and the entry.
+fn parse_trusted_proxy(entry: &str) -> Result<ipnet::IpNet, ConfigError> {
+    let invalid_entry = |reason: String| {
+        ConfigError::Invalid(format!(
+            "KNOT_TRUSTED_PROXIES entry {entry:?} is not valid: {reason}"
+        ))
+    };
+    let network = if entry.contains('/') {
+        let written_network = entry.parse::<ipnet::IpNet>().map_err(|parse_error| {
+            invalid_entry(format!("{parse_error} (expected an IP or CIDR)"))
+        })?;
+        canonical_network(written_network).ok_or_else(|| {
+            invalid_entry(
+                "an IPv4-mapped IPv6 network needs a prefix of at least /96; \
+                 write the IPv4 network instead"
+                    .into(),
+            )
+        })?
+    } else {
+        let address = entry.parse::<std::net::IpAddr>().map_err(|parse_error| {
+            invalid_entry(format!("{parse_error} (expected an IP or CIDR)"))
+        })?;
+        ipnet::IpNet::from(address.to_canonical())
+    };
+    if network.prefix_len() == 0 {
+        return Err(invalid_entry(
+            "a /0 network trusts every address, so any client could choose its own IP".into(),
+        ));
+    }
+    if network.trunc() != network {
+        return Err(invalid_entry(format!(
+            "host bits are set after the /{prefix}; write the network {network_form}, \
+             or the bare address for a single proxy",
+            prefix = network.prefix_len(),
+            network_form = network.trunc(),
+        )));
+    }
+    Ok(network)
+}
+
+/// `network` with an IPv4-mapped IPv6 network (`::ffff:a.b.c.d/96+n`) as
+/// the IPv4 network `a.b.c.d/n`; `None` for a mapped network shorter than
+/// /96. Host bits are kept, for the caller to refuse.
+fn canonical_network(network: ipnet::IpNet) -> Option<ipnet::IpNet> {
+    const MAPPED_PREFIX_LEN: u8 = 96;
+    let ipnet::IpNet::V6(v6_network) = network else {
+        return Some(network);
+    };
+    let Some(mapped_address) = v6_network.addr().to_ipv4_mapped() else {
+        return Some(network);
+    };
+    if v6_network.prefix_len() < MAPPED_PREFIX_LEN {
+        return None;
+    }
+    let v4_network =
+        ipnet::Ipv4Net::new(mapped_address, v6_network.prefix_len() - MAPPED_PREFIX_LEN)
+            .expect("a /96..=/128 mapped prefix leaves a valid IPv4 prefix");
+    Some(ipnet::IpNet::V4(v4_network))
 }
 
 #[cfg(test)]
@@ -503,6 +637,227 @@ mod tests {
             ] {
                 std::env::remove_var(k);
             }
+        }
+    }
+
+    #[test]
+    fn rate_limit_and_quota_defaults() {
+        let defaults = Config::default();
+        assert!(defaults.rate_limit_enabled);
+        assert_eq!(defaults.rate_limit_scale, 1.0);
+        assert_eq!(defaults.rate_limit_collab_max_sockets, 64);
+        assert!(defaults.trusted_proxies.is_empty());
+        assert!(
+            defaults
+                .trusted_proxies_list()
+                .expect("empty parses")
+                .is_empty()
+        );
+        assert_eq!(
+            (
+                defaults.quota_pages_per_user,
+                defaults.quota_pages_per_workspace,
+                defaults.quota_blob_bytes_per_user,
+                defaults.quota_blob_bytes_per_workspace,
+            ),
+            (0, 0, 0, 0),
+            "quotas are off by default"
+        );
+        let valid_defaults = Config {
+            session_key: KEY.into(),
+            ..Default::default()
+        };
+        assert!(valid_defaults.validate().is_ok());
+    }
+
+    #[test]
+    fn rate_limit_scale_must_be_in_zero_hundred() {
+        let with_scale = |scale: f64| Config {
+            session_key: KEY.into(),
+            rate_limit_scale: scale,
+            ..Default::default()
+        };
+        for bad_scale in [0.0, -1.0, 100.5, f64::NAN, f64::INFINITY] {
+            let error = with_scale(bad_scale).validate().unwrap_err().to_string();
+            assert!(
+                error.contains("KNOT_RATE_LIMIT_SCALE must be > 0 and <= 100"),
+                "{bad_scale}: {error}"
+            );
+        }
+        for good_scale in [0.01, 0.5, 1.0, 100.0] {
+            assert!(with_scale(good_scale).validate().is_ok(), "{good_scale}");
+        }
+    }
+
+    #[test]
+    fn collab_max_sockets_must_be_at_least_one() {
+        let with_sockets = |sockets: u32| Config {
+            session_key: KEY.into(),
+            rate_limit_collab_max_sockets: sockets,
+            ..Default::default()
+        };
+        let error = with_sockets(0).validate().unwrap_err().to_string();
+        assert!(
+            error.contains("KNOT_RATE_LIMIT_COLLAB_MAX_SOCKETS must be >= 1"),
+            "{error}"
+        );
+        assert!(with_sockets(1).validate().is_ok());
+    }
+
+    fn with_trusted_proxies(trusted_proxies: &str) -> Config {
+        Config {
+            session_key: KEY.into(),
+            trusted_proxies: trusted_proxies.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trusted_proxies_list_parses_nets_and_bare_addresses() {
+        let config = with_trusted_proxies("10.0.0.0/8, 192.168.1.5 ,fd00::/8");
+        let parsed_nets = config.trusted_proxies_list().expect("parses");
+        let expected_nets: Vec<ipnet::IpNet> = ["10.0.0.0/8", "192.168.1.5/32", "fd00::/8"]
+            .iter()
+            .map(|net| net.parse().unwrap())
+            .collect();
+        assert_eq!(parsed_nets, expected_nets);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn trusted_proxies_bare_ipv6_becomes_a_single_address() {
+        let parsed_nets = with_trusted_proxies("fd00::1")
+            .trusted_proxies_list()
+            .expect("parses");
+        assert_eq!(
+            parsed_nets,
+            vec!["fd00::1/128".parse::<ipnet::IpNet>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn trusted_proxies_bare_mapped_ipv6_becomes_ipv4() {
+        let parsed_nets = with_trusted_proxies("::ffff:10.0.0.7")
+            .trusted_proxies_list()
+            .expect("parses");
+        assert_eq!(
+            parsed_nets,
+            vec!["10.0.0.7/32".parse::<ipnet::IpNet>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn trusted_proxies_skips_empty_entries() {
+        let parsed_nets = with_trusted_proxies(" , 10.1.2.3,, ")
+            .trusted_proxies_list()
+            .expect("parses");
+        assert_eq!(
+            parsed_nets,
+            vec!["10.1.2.3/32".parse::<ipnet::IpNet>().unwrap()]
+        );
+        assert!(
+            with_trusted_proxies(" ,, ")
+                .trusted_proxies_list()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn trusted_proxies_refuses_networks_that_trust_everyone() {
+        for everything in ["0.0.0.0/0", "::/0", "10.0.0.0/8, ::/0", "10.0.0.0/0"] {
+            let config = with_trusted_proxies(everything);
+            let list_error = config.trusted_proxies_list().unwrap_err().to_string();
+            assert!(
+                list_error.contains("KNOT_TRUSTED_PROXIES"),
+                "{everything}: {list_error}"
+            );
+            let validate_error = config.validate().unwrap_err().to_string();
+            assert!(
+                validate_error.contains("KNOT_TRUSTED_PROXIES"),
+                "{everything}: {validate_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_proxies_mapped_networks_become_ipv4() {
+        let parsed_nets = with_trusted_proxies("::ffff:10.0.0.0/104, ::ffff:192.168.1.5/128")
+            .trusted_proxies_list()
+            .expect("parses");
+        let expected_nets: Vec<ipnet::IpNet> = ["10.0.0.0/8", "192.168.1.5/32"]
+            .iter()
+            .map(|net| net.parse().unwrap())
+            .collect();
+        assert_eq!(parsed_nets, expected_nets);
+        let ipv4_peer: std::net::IpAddr = "10.9.8.7".parse().unwrap();
+        assert!(
+            parsed_nets[0].contains(&ipv4_peer),
+            "a mapped /104 matches 10.0.0.0/8 peers"
+        );
+    }
+
+    #[test]
+    fn trusted_proxies_refuses_a_mapped_network_that_trusts_everyone() {
+        let config = with_trusted_proxies("::ffff:0:0/96");
+        let list_error = config.trusted_proxies_list().unwrap_err().to_string();
+        assert!(
+            list_error.contains("KNOT_TRUSTED_PROXIES") && list_error.contains("/0 network"),
+            "{list_error}"
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn trusted_proxies_refuses_mapped_networks_shorter_than_96() {
+        for too_short in ["::ffff:10.0.0.0/95", "::ffff:0:0/80"] {
+            let config = with_trusted_proxies(too_short);
+            let list_error = config.trusted_proxies_list().unwrap_err().to_string();
+            assert!(
+                list_error.contains("KNOT_TRUSTED_PROXIES")
+                    && list_error.contains(too_short)
+                    && list_error.contains("/96"),
+                "{too_short}: {list_error}"
+            );
+            assert!(config.validate().is_err(), "{too_short}");
+        }
+    }
+
+    #[test]
+    fn trusted_proxies_refuses_host_bits_and_suggests_the_network() {
+        for (with_host_bits, network_form) in [
+            ("10.0.0.5/8", "10.0.0.0/8"),
+            ("fd00::1/8", "fd00::/8"),
+            ("::ffff:10.0.0.5/104", "10.0.0.0/8"),
+        ] {
+            let config = with_trusted_proxies(with_host_bits);
+            let list_error = config.trusted_proxies_list().unwrap_err().to_string();
+            assert!(
+                list_error.contains("KNOT_TRUSTED_PROXIES")
+                    && list_error.contains(with_host_bits)
+                    && list_error.contains(network_form),
+                "{with_host_bits}: {list_error}"
+            );
+            assert!(config.validate().is_err(), "{with_host_bits}");
+        }
+    }
+
+    #[test]
+    fn trusted_proxies_refuses_malformed_entries() {
+        for malformed in [
+            "not-an-ip",
+            "10.0.0.0/33",
+            "10.0.0",
+            "fd00::/129",
+            "10.0.0.1:80",
+        ] {
+            let config = with_trusted_proxies(malformed);
+            let list_error = config.trusted_proxies_list().unwrap_err().to_string();
+            assert!(
+                list_error.contains("KNOT_TRUSTED_PROXIES") && list_error.contains(malformed),
+                "{malformed}: {list_error}"
+            );
+            assert!(config.validate().is_err(), "{malformed}");
         }
     }
 
