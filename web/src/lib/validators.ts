@@ -403,6 +403,16 @@ const historyViewSchema = v.object({
 export type HistoryView = v.InferOutput<typeof historyViewSchema>;
 export const HistoryView = historyViewSchema;
 
+/**
+ * What "Restore here" did (POST /api/docs/{id}/history/entries/{eid}/restore):
+ * `restored` undid the changes since the version, `fallback` replaced the
+ * whole page (comments may have lost their place), `unchanged` found the
+ * page already equal to the version and wrote nothing.
+ */
+const restoreAnswerSchema = v.object({ outcome: v.picklist(["restored", "fallback", "unchanged"]) });
+export type RestoreAnswer = v.InferOutput<typeof restoreAnswerSchema>;
+export const RestoreAnswer = restoreAnswerSchema;
+
 export function parse<T>(schema: v.GenericSchema<unknown, T>, data: unknown): T {
   return v.parse(schema, data);
 }

@@ -1,17 +1,20 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft } from "lucide-react";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 
 import { Button } from "../../../components/ui/Button";
-import { unwrapResult } from "../../../lib/api";
+import { unwrapResult, type ApiError } from "../../../lib/api";
 import { historyApi } from "../../../lib/history.api";
-import { notifyFailure } from "../../../lib/limitErrors";
+import { LIMIT_TOAST_KEY, limitErrorText, notifyFailure } from "../../../lib/limitErrors";
 import type { HistoryEntry, HistoryView } from "../../../lib/validators";
 import { useUi } from "../../../stores/ui";
 import { docsApi } from "../docs.api";
+import { duplicateErrorText } from "../DuplicateDialog";
+import { markDocEditMode } from "../editMode";
 import { copy } from "./copy";
 import { HistoryDocViewer } from "./HistoryDocViewer";
-import { entryLine, showsChanges } from "./timeline";
+import { entryLine, formatDateTime, showsChanges } from "./timeline";
 
 /** A view and the `ended_at` its query was fetched for: while a placeholder
  *  stands in, `endedAt` is the older version's, so it names what is on
@@ -37,16 +40,29 @@ function viewErrorText(error: unknown): string {
   return copy.cantShow;
 }
 
+/** The toast of a finished Restore here, by what it did. */
+const RESTORED_TOASTS = {
+  restored: ["info", copy.restored],
+  fallback: ["warn", copy.restoredFallback],
+  unchanged: ["info", copy.restoreUnchanged],
+} as const;
+
 /**
  * The version pane: the page as it was right after `entry`, read-only, under
  * the page's current title, with a bar holding the entry's line, the
- * "Show changes" switch and "Restore here".
+ * "Show changes" switch, "Restore here" and "Restore as new page".
  *
  * The view's key carries the entry's `ended_at`, so an open session the poll
  * extended is fetched again; until it arrives the same entry's previous
  * version stays on screen (`aria-busy`, Restore disabled), while another
  * entry never shows the previous one's text. A superseded request is
  * aborted, and the server drops its render.
+ *
+ * "Restore as new page" shows beside "Restore here" only when the sidebar's
+ * list (`["docs"]`) holds the page with a visible parent and not as a
+ * template, as the sidebar offers Duplicate; while the list loads, failed
+ * or lacks the page, it stays hidden, and a page too large to restore here
+ * is then not sent to it.
  */
 export function VersionView({
   docId,
@@ -70,6 +86,7 @@ export function VersionView({
   focusBack: boolean;
 }) {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const notify = useUi((s) => s.notify);
   const kindShowsChanges = showsChanges(entry.kind);
   // A baseline or erase entry is asked for, and cached, once, as changes=0.
@@ -121,13 +138,50 @@ export function VersionView({
 
   const switchLabelId = useId();
 
+  // The sidebar's own list and cache: the page's row says whether a copy
+  // can go beside it. `docsApi.list` resolves an error rather than
+  // rejecting, so a settled query alone is not enough.
+  const docsList = useQuery({ queryKey: ["docs"], queryFn: () => docsApi.list() });
+  const listed = docsList.data && "ok" in docsList.data ? docsList.data.ok.find((d) => d.id === docId) : undefined;
+  const copyable = listed !== undefined && !listed.parent_hidden && !listed.is_template;
+
+  const showRestore = canRestore && data !== undefined && data.view.can_restore;
+  const showAsNew = showRestore && copyable;
+
+  /** Says why either restore failed when the version's history answered
+   *  it; false when the error is the restore's own. */
+  function historyFailed(error: ApiError, entryId: number): boolean {
+    const { status, code } = error;
+    if (status === 409 && code === "history.moved") {
+      // The entry moved on since this version loaded: show the new one.
+      notify("warn", copy.restoreMoved);
+      void qc.invalidateQueries({ queryKey: ["history", docId, "entries"] });
+      void qc.invalidateQueries({ queryKey: ["history", docId, "view", entryId] });
+    } else if (status === 409 && code === "history.rebuilding") {
+      notify("error", copy.rebuilding);
+    } else if (status === 404 && code === "history.not_found") {
+      // A rebuild replaced the entry: refresh the list and the selection.
+      notify("error", copy.notFound);
+      void qc.invalidateQueries({ queryKey: ["history", docId] });
+    } else if (status === 503 && code === "history.busy") {
+      // Nothing was replayed or sent; the reader may try again.
+      notify("error", copy.busy);
+    } else if (status === 409 && code === "history.too_large") {
+      notify("error", copy.restoreVersionTooLarge);
+    } else {
+      return false;
+    }
+    return true;
+  }
+
   const restore = useMutation({
     // The result as it is: `unwrapResult` would drop `details`, where a
     // rate limit's wait lives.
     mutationFn: (v: { entryId: number; endedAt: string }) => historyApi.restoreEntry(docId, v.entryId, v.endedAt),
     onSuccess: (r, v) => {
       if (!("error" in r)) {
-        notify("info", copy.restored);
+        const [kind, text] = RESTORED_TOASTS[r.ok.outcome];
+        notify(kind, text);
         void qc.invalidateQueries({ queryKey: ["doc", docId] });
         // The restore is credited to the restorer; show them in the byline.
         void qc.invalidateQueries({ queryKey: ["contributors", docId] });
@@ -135,24 +189,17 @@ export function VersionView({
         onRestored();
         return;
       }
+      if (historyFailed(r.error, v.entryId)) return;
       const { status, code } = r.error;
-      if (status === 409 && code === "history.moved") {
-        // The entry moved on since this version loaded: show the new one.
-        notify("warn", copy.restoreMoved);
-        void qc.invalidateQueries({ queryKey: ["history", docId, "entries"] });
-        void qc.invalidateQueries({ queryKey: ["history", docId, "view", v.entryId] });
-      } else if (status === 408 || status === 504) {
+      if (status === 408 || status === 504) {
         restoreUnknown();
-      } else if (status === 503 && code === "history.busy") {
-        // Nothing was replayed or sent; the reader may try again.
-        notify("error", copy.busy);
-      } else if (status === 409 && code === "history.rebuilding") {
-        notify("error", copy.rebuilding);
-      } else if (status === 404 && code === "history.not_found") {
-        // A rebuild replaced the entry: refresh the list and the selection.
-        notify("error", copy.notFound);
-        void qc.invalidateQueries({ queryKey: ["history", docId] });
+      } else if (status === 409 && code === "history.restore_busy") {
+        notify("error", copy.restoreBusy);
+      } else if (status === 409 && code === "restore.too_large") {
+        // Only where the copy is offered does the toast point to it.
+        notify("error", showAsNew ? copy.restoreTooLarge : copy.restoreTooLargeNoCopy);
       } else {
+        // 500 `history.restore_failed` (nothing verified) among the rest.
         notifyFailure(notify, r.error, copy.restoreFailed);
       }
     },
@@ -171,15 +218,65 @@ export function VersionView({
     void qc.invalidateQueries({ queryKey: ["history", docId] });
   }
 
+  // Set on the click, cleared when the answer is handled: `isPending`
+  // arrives a render too late to stop a double click making two pages.
+  const copyStarted = useRef(false);
+  const restoreAsNew = useMutation({
+    mutationFn: (v: { entryId: number; label: string; endedAt: string }) =>
+      historyApi.restoreAsNew(docId, v.entryId, { version_label: v.label, ended_at: v.endedAt }),
+    onSuccess: (r, v) => {
+      if (!("error" in r)) {
+        notify("info", copy.restoredAsNew);
+        void qc.invalidateQueries({ queryKey: ["docs"] });
+        markDocEditMode(r.ok.id);
+        onRestored();
+        void navigate(`/doc/${r.ok.id}`);
+        return;
+      }
+      if (historyFailed(r.error, v.entryId)) return;
+      const { status, code } = r.error;
+      if (limitErrorText(r.error) !== null) {
+        notify("warn", duplicateErrorText(r.error), { key: LIMIT_TOAST_KEY });
+      } else if (status === 413 || code === "doc.duplicate_busy") {
+        notify("error", duplicateErrorText(r.error));
+      } else if (status === 403) {
+        notify("error", copy.restoreAsNewForbidden);
+      } else if (status === 408 || status === 504) {
+        copyUnknown();
+      } else {
+        // 409 `doc.duplicate_conflict` and `doc.sort_key_conflict` among
+        // the rest, as the sidebar's Duplicate says them.
+        notify("error", copy.restoreAsNewFailed);
+      }
+    },
+    onError: () => copyUnknown(),
+    onSettled: () => {
+      copyStarted.current = false;
+    },
+  });
+
+  /** No answer, or the router's timeout: the page may exist all the same. */
+  function copyUnknown() {
+    notify("warn", copy.restoreAsNewUnknown);
+    void qc.invalidateQueries({ queryKey: ["docs"] });
+  }
+
+  const pending = restore.isPending || restoreAsNew.isPending;
+
   function onRestore() {
-    if (!data || placeholder) return;
+    if (!data || placeholder || pending || copyStarted.current) return;
     if (!window.confirm(copy.restoreConfirm)) return;
     // The version on screen, which is `entry.ended_at` whenever the button
     // is enabled.
     restore.mutate({ entryId: entry.id, endedAt: data.endedAt });
   }
 
-  const showRestore = canRestore && data !== undefined && data.view.can_restore;
+  function onRestoreAsNew() {
+    if (!data || placeholder || pending || copyStarted.current) return;
+    copyStarted.current = true;
+    restoreAsNew.mutate({ entryId: entry.id, label: formatDateTime(entry.ended_at), endedAt: data.endedAt });
+  }
+
 
   return (
     <div
@@ -234,10 +331,22 @@ export function VersionView({
             size="sm"
             variant="primary"
             data-testid="history-restore"
-            disabled={placeholder || restore.isPending}
+            disabled={placeholder || pending}
             onClick={onRestore}
           >
             {restore.isPending ? copy.restoring : copy.restoreHere}
+          </Button>
+        )}
+        {showAsNew && (
+          <Button
+            type="button"
+            size="sm"
+            variant="secondary"
+            data-testid="history-restore-as-new"
+            disabled={placeholder || pending}
+            onClick={onRestoreAsNew}
+          >
+            {restoreAsNew.isPending ? copy.restoringAsNew : copy.restoreAsNew}
           </Button>
         )}
       </div>

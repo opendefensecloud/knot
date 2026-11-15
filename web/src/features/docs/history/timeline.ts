@@ -159,10 +159,13 @@ export function entryLine(e: HistoryEntry, now: Date, timeZone?: string): string
 
 const acceptedAuthor = v.nullable(HistoryAuthor);
 
-/** `accepted by Bea, Unknown author` for a session whose suggestions others
- *  accepted (`meta.accepted_by`: the list's author objects, null for a
- *  person it could not load); null when nobody did. */
+/** The line under an entry's: for a restore that replaced the whole page
+ *  (`meta.fallback`), that comments may have lost their place; for a
+ *  session whose suggestions others accepted, `accepted by Bea, Unknown
+ *  author` (`meta.accepted_by`: the list's author objects, null for a
+ *  person it could not load); else null. */
 export function entryNote(e: HistoryEntry): string | null {
+  if (e.kind === "restore") return e.meta.fallback === true ? copy.restoreFallbackNote : null;
   const accepted = e.meta.accepted_by;
   if (!Array.isArray(accepted) || accepted.length === 0) return null;
   const names = accepted.map((el: unknown) => {

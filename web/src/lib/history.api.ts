@@ -1,5 +1,5 @@
 import { apiFetch, type ApiError, type ApiResult } from "./api";
-import { HistoryPage, HistoryView, parse } from "./validators";
+import { Doc, HistoryPage, HistoryView, parse, RestoreAnswer } from "./validators";
 
 function historyPath(docId: string): string {
   return `/api/docs/${encodeURIComponent(docId)}/history`;
@@ -30,15 +30,31 @@ export const historyApi = {
     });
   },
 
-  /** Replaces the page's content with the entry's version. `endedAt` is the
-   *  `ended_at` of the version the reader saw: the server answers 409
-   *  `history.moved` when the entry has moved on since. */
-  async restoreEntry(docId: string, entryId: number, endedAt: string): Promise<ApiResult<void>> {
-    const res = await apiFetch<unknown>(
+  /** Brings the page back to the entry's version and says how. `endedAt`
+   *  is the `ended_at` of the version the reader saw: the server answers
+   *  409 `history.moved` when the entry has moved on since. */
+  async restoreEntry(docId: string, entryId: number, endedAt: string): Promise<ApiResult<RestoreAnswer>> {
+    return apiFetch<RestoreAnswer>(
       `${historyPath(docId)}/entries/${entryId}/restore?ended_at=${encodeURIComponent(endedAt)}`,
-      { method: "POST" },
+      { method: "POST", parser: (data) => parse(RestoreAnswer, data) },
     );
-    return "error" in res ? res : { ok: undefined };
+  },
+
+  /** Copies the entry's version into a new page beside the page, through
+   *  Duplicate, and answers that page as Duplicate does. `version_label`
+   *  ends the new title (`… (version of <label>)`); `ended_at`, as for
+   *  `restoreEntry`, makes a moved entry a 409 `history.moved`. */
+  async restoreAsNew(
+    docId: string,
+    entryId: number,
+    body: { version_label: string; ended_at: string },
+  ): Promise<ApiResult<Doc>> {
+    const r = await apiFetch<unknown>(`${historyPath(docId)}/entries/${entryId}/restore-as-new`, {
+      method: "POST",
+      body,
+    });
+    if ("error" in r) return r;
+    return { ok: parse(Doc, r.ok) };
   },
 
   /** Live markdown export from the active room (no snapshot lookup). */

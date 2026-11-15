@@ -11,16 +11,21 @@ import { copy } from "./copy";
 import { HistoryDrawer } from "./HistoryDrawer";
 import { entryLine } from "./timeline";
 
-const api = vi.hoisted(() => ({ entries: vi.fn(), view: vi.fn(), restoreEntry: vi.fn() }));
-const docs = vi.hoisted(() => ({ get: vi.fn() }));
+const api = vi.hoisted(() => ({ entries: vi.fn(), view: vi.fn(), restoreEntry: vi.fn(), restoreAsNew: vi.fn() }));
+const docs = vi.hoisted(() => ({ get: vi.fn(), list: vi.fn() }));
 
 vi.mock("../../../lib/history.api", () => ({
-  historyApi: { entries: api.entries, view: api.view, restoreEntry: api.restoreEntry },
+  historyApi: {
+    entries: api.entries,
+    view: api.view,
+    restoreEntry: api.restoreEntry,
+    restoreAsNew: api.restoreAsNew,
+  },
 }));
 
 vi.mock("../docs.api", async (importOriginal) => {
   const m = await importOriginal<typeof import("../docs.api")>();
-  return { ...m, docsApi: { ...m.docsApi, get: docs.get } };
+  return { ...m, docsApi: { ...m.docsApi, get: docs.get, list: docs.list } };
 });
 
 function entry(id: number, over: Partial<HistoryEntry> = {}): HistoryEntry {
@@ -103,6 +108,8 @@ function stubMatchMedia(matches: boolean) {
 beforeEach(() => {
   api.view.mockResolvedValue(viewOk());
   docs.get.mockResolvedValue({ ok: { id: "d1", title: "Plan" } });
+  // The sidebar's list, so no test reaches the real `GET /api/docs`.
+  docs.list.mockResolvedValue({ ok: [] });
 });
 
 afterEach(() => {
@@ -113,7 +120,9 @@ afterEach(() => {
   api.entries.mockReset();
   api.view.mockReset();
   api.restoreEntry.mockReset();
+  api.restoreAsNew.mockReset();
   docs.get.mockReset();
+  docs.list.mockReset();
   useUi.setState({ toasts: [] });
 });
 
@@ -497,7 +506,7 @@ describe("HistoryDrawer", () => {
 
   it("closes after a successful restore", async () => {
     api.entries.mockResolvedValue({ ok: page([entry(7, { open: true })]) });
-    api.restoreEntry.mockResolvedValue({ ok: undefined });
+    api.restoreEntry.mockResolvedValue({ ok: { outcome: "restored" } });
     vi.spyOn(window, "confirm").mockReturnValue(true);
     const { onClose } = renderDrawer();
     fireEvent.click(await screen.findByTestId("history-entry-7"));
@@ -506,6 +515,6 @@ describe("HistoryDrawer", () => {
     fireEvent.click(restore);
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
     expect(api.restoreEntry).toHaveBeenCalledWith("d1", 7, "2025-11-03T12:00:00Z");
-    expect(useUi.getState().toasts.map((t) => t.text)).toEqual([copy.restored]);
+    expect(useUi.getState().toasts.map((t) => t.text)).toEqual(["Restored."]);
   });
 });

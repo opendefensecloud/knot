@@ -2,7 +2,8 @@
  * The version pane: the page as it was right after an entry, read-only,
  * with the entry's own changes highlighted, and "Restore here".
  *
- * `historyApi`, `docsApi.get` and `boardsApi.getSvg` are mocked. An HTTP
+ * `historyApi`, `docsApi.get`, `docsApi.list` (the sidebar's list, empty
+ * unless a test says otherwise) and `boardsApi.getSvg` are mocked. An HTTP
  * error is mocked as a resolved `{error}`, as `apiFetch` answers it; a
  * rejection stands for a parse or network error only. The real
  * `HistoryDocViewer` runs (React node views included) inside a counting
@@ -17,28 +18,30 @@ import type { JSONContent } from "@tiptap/core";
 import { EditorContent, useEditor } from "@tiptap/react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createElement, useEffect, type ComponentProps } from "react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import * as v from "valibot";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { HistoryEntry, HistoryView } from "../../../lib/validators";
+import { Doc, DocWithRole, parse, type HistoryEntry, type HistoryView } from "../../../lib/validators";
 import { useUi } from "../../../stores/ui";
 import { createSchemaExtensions } from "../../editor/extensions";
 import { copy } from "./copy";
+import { formatDateTime } from "./timeline";
 import { viewerContent } from "./viewerContent";
 import { VersionView } from "./VersionView";
 
-const api = vi.hoisted(() => ({ view: vi.fn(), restoreEntry: vi.fn() }));
-const docs = vi.hoisted(() => ({ get: vi.fn() }));
+const api = vi.hoisted(() => ({ view: vi.fn(), restoreEntry: vi.fn(), restoreAsNew: vi.fn() }));
+const docs = vi.hoisted(() => ({ get: vi.fn(), list: vi.fn() }));
 const boards = vi.hoisted(() => ({ getSvg: vi.fn() }));
 const mounts = vi.hoisted(() => ({ count: 0 }));
 
 vi.mock("../../../lib/history.api", () => ({
-  historyApi: { view: api.view, restoreEntry: api.restoreEntry },
+  historyApi: { view: api.view, restoreEntry: api.restoreEntry, restoreAsNew: api.restoreAsNew },
 }));
 
 vi.mock("../docs.api", async (importOriginal) => {
   const m = await importOriginal<typeof import("../docs.api")>();
-  return { ...m, docsApi: { ...m.docsApi, get: docs.get } };
+  return { ...m, docsApi: { ...m.docsApi, get: docs.get, list: docs.list } };
 });
 
 vi.mock("../../../lib/boards.api", async (importOriginal) => {
@@ -110,6 +113,42 @@ function apiError(status: number, code: string, details: Record<string, unknown>
   return { error: { status, code, message: code, details } };
 }
 
+/** A row of `GET /api/docs` as the server sends it, parsed as `docsApi.list`
+ *  parses it: by default the page `d1`, editable, under a visible parent. */
+function listRow(over: Record<string, unknown> = {}) {
+  return {
+    id: "d1",
+    workspace_id: "w1",
+    parent_id: "p1",
+    title: "Plan",
+    sort_key: "m",
+    icon: null,
+    created_by: "u-ann",
+    archived: false,
+    is_template: false,
+    archived_at: null,
+    archive_root_id: null,
+    restricted: false,
+    within_restricted: false,
+    parent_hidden: false,
+    effective_role: "editor",
+    ...over,
+  };
+}
+
+function listOk(...rows: Record<string, unknown>[]): { ok: Doc[] } {
+  return { ok: parse(v.array(Doc), rows) };
+}
+
+/** The doc a restore as a new page answers. */
+const NEW_DOC = parse(Doc, { ...listRow({ id: "n1", title: "Plan (version of …)" }), effective_role: null });
+
+/** Where the router is: VersionView navigates to the new page. */
+function LocationProbe() {
+  const location = useLocation();
+  return <output data-testid="location">{location.pathname}</output>;
+}
+
 type Props = ComponentProps<typeof VersionView>;
 
 function renderView(over: Partial<Props> = {}) {
@@ -130,9 +169,10 @@ function renderView(over: Partial<Props> = {}) {
     ...over,
   };
   const ui = (pr: Props) => (
-    <MemoryRouter>
+    <MemoryRouter initialEntries={["/doc/d1"]}>
       <QueryClientProvider client={qc}>
         <VersionView {...pr} />
+        <LocationProbe />
       </QueryClientProvider>
     </MemoryRouter>
   );
@@ -164,6 +204,7 @@ beforeEach(() => {
   mounts.count = 0;
   vi.mocked(viewerContent).mockClear();
   docs.get.mockResolvedValue({ ok: { id: "d1", title: "Plan" } });
+  docs.list.mockResolvedValue({ ok: [] });
   boards.getSvg.mockResolvedValue({ ok: '<svg xmlns="http://www.w3.org/2000/svg"></svg>' });
   useUi.setState({ toasts: [] });
 });
@@ -174,7 +215,9 @@ afterEach(() => {
   vi.restoreAllMocks();
   api.view.mockReset();
   api.restoreEntry.mockReset();
+  api.restoreAsNew.mockReset();
   docs.get.mockReset();
+  docs.list.mockReset();
   boards.getSvg.mockReset();
   useUi.setState({ toasts: [] });
 });
@@ -527,7 +570,7 @@ describe("VersionView", () => {
     expect(v.onRestored).not.toHaveBeenCalled();
   });
 
-  it("restores after confirming and refreshes doc, byline and history", async () => {
+  it("restores after confirming and says so", async () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
     const e = entry(7);
     api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
@@ -540,7 +583,7 @@ describe("VersionView", () => {
     await waitFor(() => expect(api.restoreEntry).toHaveBeenCalledWith("d1", 7, e.ended_at));
     await waitFor(() => expect(screen.getByTestId("history-restore")).toHaveTextContent(copy.restoring));
     expect(screen.getByTestId("history-restore")).toBeDisabled();
-    act(() => answer({ ok: undefined }));
+    act(() => answer({ ok: { outcome: "restored" } }));
     await waitFor(() => expect(v.onRestored).toHaveBeenCalledTimes(1));
     expect(invalidatedKeys(v.invalidate)).toEqual(
       expect.arrayContaining([
@@ -549,7 +592,258 @@ describe("VersionView", () => {
         ["history", "d1"],
       ]),
     );
-    expect(toastTexts()).toEqual([copy.restored]);
+    expect(toastTexts()).toEqual(["Restored."]);
+    expect(useUi.getState().toasts[0]?.kind).toBe("info");
+  });
+
+  it("a fallback restore says comments may have lost their place", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
+    api.restoreEntry.mockResolvedValue({ ok: { outcome: "fallback" } });
+    const v = renderView();
+    fireEvent.click(await screen.findByTestId("history-restore"));
+    await waitFor(() => expect(v.onRestored).toHaveBeenCalledTimes(1));
+    expect(useUi.getState().toasts).toMatchObject([{ kind: "warn", text: copy.restoredFallback }]);
+    expect(invalidatedKeys(v.invalidate)).toEqual(
+      expect.arrayContaining([
+        ["doc", "d1"],
+        ["contributors", "d1"],
+        ["history", "d1"],
+      ]),
+    );
+  });
+
+  it("restoring the current version says it already matches", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
+    api.restoreEntry.mockResolvedValue({ ok: { outcome: "unchanged" } });
+    const v = renderView();
+    fireEvent.click(await screen.findByTestId("history-restore"));
+    await waitFor(() => expect(v.onRestored).toHaveBeenCalledTimes(1));
+    expect(toastTexts()).toEqual([copy.restoreUnchanged]);
+    expect(invalidatedKeys(v.invalidate)).toEqual(expect.arrayContaining([["history", "d1"]]));
+  });
+
+  it("a busy page asks to try again", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
+    api.restoreEntry.mockResolvedValue(apiError(409, "history.restore_busy"));
+    const v = renderView();
+    fireEvent.click(await screen.findByTestId("history-restore"));
+    await waitFor(() => expect(toastTexts()).toEqual([copy.restoreBusy]));
+    expect(v.onRestored).not.toHaveBeenCalled();
+  });
+
+  it("a page too large to restore here suggests a new page", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    docs.list.mockResolvedValue(listOk(listRow({ id: "other" }), listRow()));
+    api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
+    api.restoreEntry.mockResolvedValueOnce(apiError(409, "restore.too_large"));
+    const v = renderView();
+    await screen.findByTestId("history-restore-as-new");
+    fireEvent.click(screen.getByTestId("history-restore"));
+    await waitFor(() => expect(toastTexts()).toEqual([copy.restoreTooLarge]));
+    expect(copy.restoreTooLarge).toContain("as a new page");
+
+    useUi.setState({ toasts: [] });
+    api.restoreEntry.mockResolvedValueOnce(apiError(409, "history.too_large"));
+    await waitFor(() => expect(screen.getByTestId("history-restore")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("history-restore"));
+    await waitFor(() => expect(toastTexts()).toEqual([copy.restoreVersionTooLarge]));
+
+    useUi.setState({ toasts: [] });
+    api.restoreEntry.mockResolvedValueOnce(apiError(500, "history.restore_failed"));
+    await waitFor(() => expect(screen.getByTestId("history-restore")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("history-restore"));
+    await waitFor(() => expect(toastTexts()).toEqual([copy.restoreFailed]));
+    expect(v.onRestored).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a template", () => listOk(listRow({ is_template: true }))],
+    ["no row for the page", () => listOk(listRow({ id: "other" }))],
+  ])("a page too large to restore here says only that when it cannot be copied (%s)", async (_name, list) => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    docs.list.mockResolvedValue(list());
+    api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
+    api.restoreEntry.mockResolvedValue(apiError(409, "restore.too_large"));
+    const v = renderView();
+    fireEvent.click(await screen.findByTestId("history-restore"));
+    await waitFor(() => expect(toastTexts()).toEqual([copy.restoreTooLargeNoCopy]));
+    expect(toastTexts()[0]).not.toContain("new page");
+    expect(screen.queryByTestId("history-restore-as-new")).toBeNull();
+    expect(v.onRestored).not.toHaveBeenCalled();
+  });
+
+  it("restores as a new page and opens it", async () => {
+    const confirm = vi.spyOn(window, "confirm");
+    const e = entry(7);
+    docs.list.mockResolvedValue(listOk(listRow()));
+    api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
+    let answer!: (r: unknown) => void;
+    api.restoreAsNew.mockReturnValue(new Promise((res) => (answer = res)));
+    const v = renderView({ entry: e });
+    const button = await screen.findByTestId("history-restore-as-new");
+    expect(button).toHaveTextContent(copy.restoreAsNew);
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(confirm).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(api.restoreAsNew).toHaveBeenCalledWith("d1", 7, {
+        version_label: formatDateTime(e.ended_at),
+        ended_at: e.ended_at,
+      }),
+    );
+    expect(api.restoreAsNew).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.getByTestId("history-restore-as-new")).toHaveTextContent(copy.restoringAsNew));
+    expect(screen.getByTestId("history-restore-as-new")).toBeDisabled();
+    expect(screen.getByTestId("history-restore")).toBeDisabled();
+    expect(screen.getByTestId("location")).toHaveTextContent("/doc/d1");
+
+    act(() => answer({ ok: NEW_DOC }));
+    await waitFor(() => expect(v.onRestored).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("location")).toHaveTextContent("/doc/n1");
+    expect(toastTexts()).toEqual([copy.restoredAsNew]);
+    expect(invalidatedKeys(v.invalidate)).toContainEqual(["docs"]);
+    expect(window.sessionStorage.getItem("knot.editMode.n1")).toBe("1");
+    window.sessionStorage.removeItem("knot.editMode.n1");
+  });
+
+  it("shows Restore as new page from the sidebar's docs list", async () => {
+    docs.get.mockResolvedValue({
+      ok: parse(DocWithRole, { ...listRow(), effective_role: "editor", parent_hidden: false }),
+    });
+    docs.list.mockResolvedValue(listOk(listRow()));
+    api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
+    renderView();
+    const button = await screen.findByTestId("history-restore-as-new");
+    expect(button).toHaveTextContent(copy.restoreAsNew);
+    expect(docs.list).toHaveBeenCalledTimes(1);
+    // The page's own record carries no parent_hidden: it is not the source.
+    const record = await (docs.get.mock.results[0]!.value as Promise<{ ok: object }>);
+    expect("parent_hidden" in record.ok).toBe(false);
+    // The copy is the secondary action, after Restore here.
+    const restore = screen.getByTestId("history-restore");
+    expect(restore.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it.each([
+    ["a template", () => Promise.resolve(listOk(listRow({ is_template: true })))],
+    ["a hidden parent", () => Promise.resolve(listOk(listRow({ parent_hidden: true })))],
+    ["no row for the page", () => Promise.resolve(listOk(listRow({ id: "other" })))],
+    ["a list still loading", () => new Promise(() => {})],
+    ["a list that failed", () => Promise.resolve(apiError(500, "internal"))],
+    ["a list that rejected", () => Promise.reject(new TypeError("Failed to fetch"))],
+  ])("hides Restore as new page for %s", async (_name, list) => {
+    docs.list.mockImplementation(list);
+    api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
+    renderView();
+    await screen.findByTestId("history-restore");
+    await waitFor(() => expect(docs.list).toHaveBeenCalled());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.queryByTestId("history-restore-as-new")).toBeNull();
+  });
+
+  it("hides both restores when the version can't be restored", async () => {
+    docs.list.mockResolvedValue(listOk(listRow()));
+    api.view.mockResolvedValue(viewOk(doc(p(text("one"))), { can_restore: false }));
+    renderView();
+    await waitFor(() => expect(versionDoc()).toHaveTextContent("one"));
+    await waitFor(() => expect(docs.list).toHaveBeenCalled());
+    expect(screen.queryByTestId("history-restore")).toBeNull();
+    expect(screen.queryByTestId("history-restore-as-new")).toBeNull();
+    cleanup();
+
+    api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
+    renderView({ canRestore: false });
+    await waitFor(() => expect(versionDoc()).toHaveTextContent("one"));
+    expect(screen.queryByTestId("history-restore")).toBeNull();
+    expect(screen.queryByTestId("history-restore-as-new")).toBeNull();
+  });
+
+  it("says why a new page could not be made", async () => {
+    docs.list.mockResolvedValue(listOk(listRow()));
+    api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
+    const v = renderView();
+    await screen.findByTestId("history-restore-as-new");
+
+    async function copyWith(result: () => Promise<unknown>): Promise<void> {
+      useUi.setState({ toasts: [] });
+      v.invalidate.mockClear();
+      api.restoreAsNew.mockReset();
+      api.restoreAsNew.mockImplementation(result);
+      await waitFor(() => expect(screen.getByTestId("history-restore-as-new")).toBeEnabled());
+      fireEvent.click(screen.getByTestId("history-restore-as-new"));
+      await waitFor(() => expect(useUi.getState().toasts).toHaveLength(1));
+    }
+    const answer = (status: number, code: string, details: Record<string, unknown> = {}) => () =>
+      Promise.resolve(apiError(status, code, details));
+
+    await copyWith(answer(403, "acl.editor_required"));
+    expect(toastTexts()).toEqual([copy.restoreAsNewForbidden]);
+    await copyWith(answer(403, "quota.exceeded", { quota: "pages", scope: "workspace", limit: 10 }));
+    expect(useUi.getState().toasts).toMatchObject([
+      { kind: "warn", text: "This workspace has reached its page limit.", key: "limit" },
+    ]);
+    await copyWith(answer(429, "rate.limited", { retry_after_secs: 7 }));
+    expect(useUi.getState().toasts).toMatchObject([
+      { kind: "warn", text: "You're doing that too fast. Try again in 7 s.", key: "limit" },
+    ]);
+    await copyWith(answer(413, "doc.duplicate_too_large"));
+    expect(toastTexts()).toEqual(["This page is too large to duplicate (over 200 pages or 200 MB of files)."]);
+    await copyWith(answer(503, "doc.duplicate_busy"));
+    expect(toastTexts()).toEqual(["Too many copies are being made right now. Try again in a moment."]);
+    await copyWith(answer(409, "history.moved"));
+    expect(toastTexts()).toEqual([copy.restoreMoved]);
+    expect(invalidatedKeys(v.invalidate)).toEqual(
+      expect.arrayContaining([
+        ["history", "d1", "entries"],
+        ["history", "d1", "view", 7],
+      ]),
+    );
+    await copyWith(answer(409, "history.rebuilding"));
+    expect(toastTexts()).toEqual([copy.rebuilding]);
+    await copyWith(answer(404, "history.not_found"));
+    expect(toastTexts()).toEqual([copy.notFound]);
+    expect(invalidatedKeys(v.invalidate)).toContainEqual(["history", "d1"]);
+    await copyWith(answer(503, "history.busy"));
+    expect(toastTexts()).toEqual([copy.busy]);
+    await copyWith(answer(409, "history.too_large"));
+    expect(toastTexts()).toEqual([copy.restoreVersionTooLarge]);
+    for (const code of ["doc.duplicate_conflict", "doc.sort_key_conflict"]) {
+      await copyWith(answer(409, code));
+      expect(toastTexts()).toEqual([copy.restoreAsNewFailed]);
+    }
+    await copyWith(answer(404, "doc.not_found"));
+    expect(toastTexts()).toEqual([copy.restoreAsNewFailed]);
+    for (const result of [
+      answer(408, "request.timeout"),
+      answer(504, "gateway.timeout"),
+      () => Promise.reject(new TypeError("Failed to fetch")),
+    ]) {
+      await copyWith(result);
+      expect(toastTexts()).toEqual([copy.restoreAsNewUnknown]);
+      expect(invalidatedKeys(v.invalidate)).toContainEqual(["docs"]);
+    }
+    await copyWith(answer(500, "internal"));
+    expect(toastTexts()).toEqual([copy.restoreAsNewFailed]);
+    expect(v.onRestored).not.toHaveBeenCalled();
+    expect(screen.getByTestId("location")).toHaveTextContent("/doc/d1");
+  });
+
+  it("the confirm text describes the revert", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    api.view.mockResolvedValue(viewOk(doc(p(text("one")))));
+    renderView();
+    fireEvent.click(await screen.findByTestId("history-restore"));
+    expect(confirm).toHaveBeenCalledWith(copy.restoreConfirm);
+    expect(copy.restoreConfirm).toBe(
+      "Bring the page back to this version? Changes made after it are undone, including edits made meanwhile to parts it removes. The restore shows in History.",
+    );
+    expect(copy.restoreConfirm).not.toContain("canonical schema");
   });
 
   it("a restore of a moved entry asks to check the new version", async () => {
