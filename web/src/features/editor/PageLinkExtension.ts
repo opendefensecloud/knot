@@ -32,11 +32,12 @@ const TRIGGER = "[[";
 type Range = { from: number; to: number };
 
 /** Replaces `range` with a link to `id`, then a space outside the link so
- *  typing on does not extend it. */
-function insertDocLink(editor: Editor, range: Range, id: string, title: string) {
-  editor
-    .chain()
-    .focus()
+ *  typing on does not extend it. `focus: false` after an awaited create:
+ *  the picker never took focus, and a delayed focus would fire after the
+ *  user may have moved on. */
+function insertDocLink(editor: Editor, range: Range, id: string, title: string, focus = true) {
+  const chain = editor.chain();
+  (focus ? chain.focus() : chain)
     .insertContentAt(range, [
       { type: "text", text: title, marks: [{ type: "link", attrs: { href: `${DOC_HREF_PREFIX}${id}` } }] },
       { type: "text", text: " " },
@@ -188,7 +189,7 @@ export const PageLinkExtension = Extension.create<PageLinkOptions>({
         const { doc, selection } = editor.state;
         const stillThere = range.to <= doc.content.size && doc.textBetween(range.from, range.to) === typed;
         const at = stillThere ? range : { from: selection.from, to: selection.from };
-        insertDocLink(editor, at, created.id, created.title);
+        insertDocLink(editor, at, created.id, created.title, false);
       } finally {
         popup.busy = false;
       }
