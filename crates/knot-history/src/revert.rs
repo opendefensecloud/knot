@@ -29,7 +29,7 @@
 //!
 //! Pure: no database, no tokio, no knot-crdt. States are encoded with
 //! [`replay::own_state`](crate::replay) and updates captured with
-//! `observe_update_v1`; nothing here calls `Update::merge` or
+//! `observe_update_v1`; nothing here calls `Update`'s `merge` or
 //! `merge_updates`.
 
 use std::collections::{BTreeMap, HashSet};
@@ -413,7 +413,7 @@ fn undo_step(
     trace.undo_captures = Some(captures.len());
     if captures.len() != 1 {
         // Never merged (Rulings): yrs 0.27.3's encoding defect sits in
-        // `Update::merge`.
+        // `Update`'s `merge`.
         return Ok(Err(format!("the undo captured {} updates", captures.len())));
     }
     let mut update = captures.pop().unwrap_or_default();

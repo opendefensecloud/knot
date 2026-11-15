@@ -16,7 +16,7 @@ Targets apply to a single knot deployment serving a single workspace. Multi-regi
 | `/auth/oidc/*` | follows the IdP's own SLO, never tighter than 99 % | 30-day rolling |
 
 A response with status `5xx` or a dropped TCP connection counts against the budget. `4xx` does not (user error), and neither does a `429 rate.limited` refusal or a refused collab WebSocket upgrade (429): a client past a rate limit is not an outage. Watch those separately (below).
-The page history view's and restore's designed answers `503 history.busy`, `500 history.view_failed` and `504 restore.timeout` count against the budget like any other 5xx, and the alert rules do not exclude them; `busy` is a capacity signal: watch `knot_history_views_total{outcome="busy"}` against `history.workers`.
+The page history view's and restore's designed answers `503 history.busy`, `500 history.view_failed`, `500 history.restore_failed`, `500 restore.apply` and `504 restore.timeout` count against the budget like any other 5xx, and the alert rules do not exclude them; `busy` is a capacity signal: watch `knot_history_views_total{outcome="busy"}` and `knot_history_restore_total{outcome="busy"}` against `history.workers`. A restore's `409 history.restore_busy` (the page kept changing on every attempt) is a client-side answer (4xx) and does not count.
 
 PromQL — error rate:
 
@@ -35,7 +35,7 @@ clamp_min(sum(rate(knot_http_requests_total{route!~"/api/health.*"}[5m])), 1)
 | `POST /auth/login`, `POST /auth/password` | **P95 < 500 ms**, **P99 < 1 s** | Argon2id verify dominates |
 | `POST /auth/setup` | **P95 < 2 s**, **P99 < 5 s** | One-time first-run; Argon2id hash + workspace bootstrap |
 | `GET/POST /api/docs/{id}/markdown` | **P95 < 1 s**, **P99 < 3 s** | Markdown round-trip via room actor |
-| `GET /api/docs/{id}/history/entries/{eid}/view`, `POST /api/docs/{id}/history/entries/{eid}/restore` | **P95 < 1 s**, **P99 < 30 s** | Replay of a past version under a shared replay slot (waits up to 5 s for it, renders up to 20 s; restore up to 15 s plus the room's 8 s) |
+| `GET /api/docs/{id}/history/entries/{eid}/view`, `POST /api/docs/{id}/history/entries/{eid}/restore`, `POST /api/docs/{id}/history/entries/{eid}/restore-as-new` | **P95 < 1 s**, **P99 < 30 s** | Replay of a past version under a shared replay slot (waits up to 5 s for it, renders up to 20 s); restore: replay, revert plan and room apply, within 27 s; restore as new page: replay and a duplicate slot within 27 s, then the copy |
 
 PromQL — overall P95:
 

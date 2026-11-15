@@ -12,7 +12,8 @@ A fix for pages that lost an edit: snapshots, the first sync and exports
 no longer hold text at the wrong place. One database migration runs on
 upgrade, and every page's history is rebuilt once; read Upgrading first.
 The History drawer becomes a timeline of who changed what, and any
-version can be opened with its changes highlighted.
+version can be opened with its changes highlighted and restored, in
+place or as a new page.
 
 ### Upgrading
 - Upgrade from 0.9.14. One database migration runs on upgrade:
@@ -102,7 +103,8 @@ version can be opened with its changes highlighted.
   endpoint now answers an empty list), and browsers with the new app
   that reach a 0.9.14 pod read "This version can't be shown" until that
   pod is replaced; a Restore here that reaches one fails with "Restore
-  failed" and changes nothing, so it can be tried again. (#TBD)
+  failed" and changes nothing, so it can be tried again, and a Restore
+  as new page that reaches one also fails and creates nothing. (#TBD)
 - The hourly snapshot cleanup now keeps the 3 newest snapshots of each
   page, the newest one boot trusts, and those page history has still to
   check; pages not yet rebuilt keep the old rule (the 5 newest plus one
@@ -121,13 +123,14 @@ version can be opened with its changes highlighted.
   the error budget and can add to it while the builder catches up. A
   builder that waits more than 5 minutes for a slot hands the page back
   and retries it later. (#TBD)
-- Versions and restores whose replay input is over
-  `history.replayMaxBytes` (very large pages, or one very long editing
-  session) answer "too large" until `replayMaxBytes` is raised together
-  with the memory limit; restore by snapshot had no such limit. Earlier
-  versions from before page history answer "too large" from about
-  3.81 MiB at the default 4 MiB (3,813,003 bytes), since their replay
-  needs more memory. "Show changes" is skipped above about 0.44 MiB of
+- Versions and restores whose replay input is over 40/41 of
+  `history.replayMaxBytes` (about 3.90 MiB at the default 4 MiB,
+  4,092,003 bytes: very large pages, or one very long editing session)
+  answer "too large" until `replayMaxBytes` is raised together with the
+  memory limit; restore by snapshot had no such limit. Earlier versions
+  from before page history answer "too large" from about 3.64 MiB at
+  the default (3,813,002 bytes), since their replay needs more memory.
+  "Show changes" is skipped above about 0.44 MiB of
   replay input at the default (466,033 bytes; the version is then shown
   without highlighting), and it highlights nothing on many entries of
   pages that lost an edit before this release. (#TBD)
@@ -142,12 +145,42 @@ version can be opened with its changes highlighted.
   wrote (`pending_revs IS NOT NULL`): an older one is restored as stored
   and can hold misplaced text on a page that lost an edit. (#TBD)
 - The History drawer's snapshot list and its Markdown preview are gone.
-  Restore picks a timeline entry and still goes through Markdown, as
-  before (formatting outside the canonical schema is not kept).
+  Restore here changes only what differs from the chosen version, so
+  comments, suggestions and authorship on unchanged text stay; when it
+  cannot, it replaces the whole page, and the timeline and the reader
+  are told that comments may have lost their place.
   `GET /api/docs/{id}/history` answers an empty list, and the snapshot
-  preview and restore endpoints by seq stay for operators. Version views
-  and restores run one at a time per person, bot or API key user (a
-  second one waits for the first, up to 5 s). (#TBD)
+  preview and restore endpoints by seq stay for operators. Each person,
+  bot or API key user renders one version at a time and runs one
+  restore at a time, in place or as a new page (a second waits for the
+  first up to 5 s, then answers busy), per replica. (#TBD)
+- Restore here needs the version and the live page together under the
+  revert limit: 40/51 of `replayMaxBytes`, at most 12 MiB (about
+  3.14 MiB at the default, 3,289,650 bytes), so pages over about
+  1.57 MiB cannot be restored in place at the default. They answer
+  "This page is too large to restore here" (409 `restore.too_large`);
+  Restore as new page needs only the version under the version limit,
+  so it still works. The same answer comes, for 10 minutes on that pod,
+  for a version whose revert took over 10 s or that was found over the
+  limit. (#TBD)
+- Restore here answers within 30 s. On a page edited throughout its
+  five attempts it answers that the page kept changing (409
+  `history.restore_busy`); out of time before anything was sent, busy
+  (503, nothing changed); out of time after it was sent, a timeout (504:
+  the change may still apply, so check the page). A restore whose page
+  cannot catch up with its stored log answers busy (503) and counts as
+  `failed` in `knot_history_restore_total`. (#TBD)
+- Edits not yet saved on the server when a restore applies, including
+  those of a tab that was offline, are lost if they are in a part the
+  restore removes; after a whole-page replace, all of them are. Text
+  waiting for an edit the server never got is not restored away and can
+  reappear after a restore when that edit arrives. (#TBD)
+- A page stored nested deeper than the editor's limit before that limit
+  existed cannot be restored in place ("Restore failed"); restore it as
+  a new page. (#TBD)
+- Restore as new page waits for a duplicate slot like Duplicate (503
+  `doc.duplicate_busy` when none frees in time; nothing is created).
+  (#TBD)
 
 ### Added
 - Metrics `knot_room_boot_fallbacks_total{reason}`,
@@ -164,10 +197,25 @@ version can be opened with its changes highlighted.
   changes). (#TBD)
 - `GET /api/docs/{id}/history/entries/{eid}/view` shows a version (API
   keys need `read`; not rate-limited), and
-  `POST /api/docs/{id}/history/entries/{eid}/restore` restores it (API
-  keys need `update`; counts as a write for rate limits; not recorded in
-  the page audit log, the timeline shows it). Both need Editor+ on the
-  page. (#TBD)
+  `POST /api/docs/{id}/history/entries/{eid}/restore` restores it in
+  place and answers 200 with
+  `{"outcome": "restored" | "fallback" | "unchanged"}` (API keys need
+  `update`; counts as a write for rate limits; not recorded in the page
+  audit log, the timeline shows it). Both need Editor+ on the page.
+  (#TBD)
+- Restore as new page in the History drawer copies a version into a new
+  page right after the original, titled
+  `<title> (version of <date>)`, without its subpages:
+  `POST /api/docs/{id}/history/entries/{eid}/restore-as-new` with the
+  body `{"version_label", "ended_at"}` (`ended_at` optional) answers 201
+  with the new page. It needs Editor+ on the page, API keys need
+  `create`, it counts as an `expensive` request like Duplicate, and it is
+  recorded in the new page's audit log as a copy. The new page's history
+  starts "Created from `<title>`, version of `<date>`". (#TBD)
+- Metric `knot_history_restore_total{outcome}`: alert on `apply_failed`,
+  `failed` and `unverified`; `fallback` is worth watching (comments may
+  have lost their place); `stale` and `busy` are capacity or contention
+  signals. (#TBD)
 - Metrics `knot_history_views_total{outcome}` (alert on `failed` and
   `timeout`; `not_found`, `rebuilding` and `no_changes` are normal),
   `knot_history_view_seconds`, and
@@ -186,6 +234,11 @@ version can be opened with its changes highlighted.
   stayed hidden after the missing edit arrived (as it could before this
   release) usually shows once the page is next loaded into a new editing
   session. (#TBD)
+- Restore here in the History drawer no longer goes through Markdown,
+  which lost formatting outside its schema and detached comments. The
+  operator's restore by snapshot
+  (`POST /api/docs/{id}/history/{seq}/restore`), kept for pages without
+  a restorable entry, still does. (#TBD)
 
 ## [0.9.14] - 2026-11-14
 
