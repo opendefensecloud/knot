@@ -14,8 +14,8 @@ use knot_history::builder::{
 };
 use knot_history::canonical::visible_content;
 use knot_history::{
-    BuildLimits, Builder, CHECKPOINT_FLOOR_BYTES, PassResult, ReplayMode, Replayer, TestHooks,
-    history_permits,
+    BuildLimits, Builder, CHECKPOINT_FLOOR_BYTES, HistoryPermits, PassResult, ReplayMode, Replayer,
+    TestHooks, history_permits,
 };
 use knot_storage::{
     DocStore, DocUpdate, NewUpdate, PgDocStore, PgSnapshotStore, PgUpdatesStore, UpdateSource,
@@ -66,6 +66,7 @@ pub fn limits() -> BuildLimits {
         checkpoint_floor: CHECKPOINT_FLOOR_BYTES,
         debounce: Duration::ZERO,
         cpu_share: 1.0,
+        compute_wait: Duration::from_secs(5 * 60),
         hooks: TestHooks::default(),
     }
 }
@@ -304,16 +305,12 @@ impl Db {
             .id
     }
 
-    /// A builder with its own `workers` permits.
+    /// A builder with permits of its own (four workers).
     pub fn builder(&self, limits: BuildLimits) -> Arc<Builder> {
         self.builder_with(limits, history_permits(4))
     }
 
-    pub fn builder_with(
-        &self,
-        limits: BuildLimits,
-        permits: Arc<tokio::sync::Semaphore>,
-    ) -> Arc<Builder> {
+    pub fn builder_with(&self, limits: BuildLimits, permits: HistoryPermits) -> Arc<Builder> {
         Arc::new(Builder::new(
             self.pool.clone(),
             self.updates.clone(),

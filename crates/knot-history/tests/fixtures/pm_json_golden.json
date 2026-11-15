@@ -1,0 +1,793 @@
+[
+  {
+    "name": "marks",
+    "update": "ARkBAAcBB2RlZmF1bHQDCXBhcmFncmFwaAcAAQAGBgABAQRib2xkAnt9hAECBGJvbGSGAQYEYm9sZARudWxshAEHASCGAQgGaXRhbGljAnt9hAEJBml0YWxpY4YBDwZpdGFsaWMEbnVsbIQBEAEghgERBGNvZGUCe32EARIEY29kZYYBFgRjb2RlBG51bGyEARcBIIYBGAZzdHJpa2UCe32EARkGc3RyaWtlhgEfBnN0cmlrZQRudWxshAEgASCGASEJdW5kZXJsaW5lAnt9hAEiCXVuZGVybGluZYYBKwl1bmRlcmxpbmUEbnVsbIQBLAEghgEtBGxpbmtreyJocmVmIjoiaHR0cHM6Ly9leGFtcGxlLmNvbSIsInRhcmdldCI6Il9ibGFuayIsInJlbCI6Im5vb3BlbmVyIG5vcmVmZXJyZXIiLCJjbGFzcyI6bnVsbCwidGl0bGUiOiJFeGFtcGxlIn2EAS4EbGlua4YBMgRsaW5rBG51bGwA",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "bold",
+              "marks": [
+                {
+                  "type": "bold",
+                  "attrs": {}
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": " "
+            },
+            {
+              "type": "text",
+              "text": "italic",
+              "marks": [
+                {
+                  "type": "italic",
+                  "attrs": {}
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": " "
+            },
+            {
+              "type": "text",
+              "text": "code",
+              "marks": [
+                {
+                  "type": "code",
+                  "attrs": {}
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": " "
+            },
+            {
+              "type": "text",
+              "text": "strike",
+              "marks": [
+                {
+                  "type": "strike",
+                  "attrs": {}
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": " "
+            },
+            {
+              "type": "text",
+              "text": "underline",
+              "marks": [
+                {
+                  "type": "underline",
+                  "attrs": {}
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": " "
+            },
+            {
+              "type": "text",
+              "text": "link",
+              "marks": [
+                {
+                  "type": "link",
+                  "attrs": {
+                    "href": "https://example.com",
+                    "target": "_blank",
+                    "rel": "noopener noreferrer",
+                    "class": null,
+                    "title": "Example"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "internal-links",
+    "update": "AQ0BAAcBB2RlZmF1bHQDCXBhcmFncmFwaAcAAQAGBgABAQRsaW5rggF7ImhyZWYiOiJrbm90Oi8vZG9jLzMzMzMzMzMzLTQ0NDQtNTU1NS02NjY2LTc3Nzc3Nzc3Nzc3NyIsInRhcmdldCI6Il9ibGFuayIsInJlbCI6Im5vb3BlbmVyIG5vcmVmZXJyZXIiLCJjbGFzcyI6bnVsbCwidGl0bGUiOm51bGx9hAECBFBhZ2WGAQYEbGluawRudWxshAEHASCGAQgEbGlua4MBeyJocmVmIjoia25vdDovL3VzZXIvNDQ0NDQ0NDQtNTU1NS02NjY2LTc3NzctODg4ODg4ODg4ODg4IiwidGFyZ2V0IjoiX2JsYW5rIiwicmVsIjoibm9vcGVuZXIgbm9yZWZlcnJlciIsImNsYXNzIjpudWxsLCJ0aXRsZSI6bnVsbH2EAQkGQEFsaWNlhgEPBGxpbmsEbnVsbIQBEAEghgERBGxpbmtzeyJocmVmIjoia25vdDovL3RpbWUvMjAyNi0wNi0wNFQxNzowMDowMFoiLCJ0YXJnZXQiOiJfYmxhbmsiLCJyZWwiOiJub29wZW5lciBub3JlZmVycmVyIiwiY2xhc3MiOm51bGwsInRpdGxlIjpudWxsfYQBEgVKdW4gNIYBFwRsaW5rBG51bGwA",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "Page",
+              "marks": [
+                {
+                  "type": "link",
+                  "attrs": {
+                    "href": "knot://doc/33333333-4444-5555-6666-777777777777",
+                    "target": "_blank",
+                    "rel": "noopener noreferrer",
+                    "class": null,
+                    "title": null
+                  }
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": " "
+            },
+            {
+              "type": "text",
+              "text": "@Alice",
+              "marks": [
+                {
+                  "type": "link",
+                  "attrs": {
+                    "href": "knot://user/44444444-5555-6666-7777-888888888888",
+                    "target": "_blank",
+                    "rel": "noopener noreferrer",
+                    "class": null,
+                    "title": null
+                  }
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": " "
+            },
+            {
+              "type": "text",
+              "text": "Jun 4",
+              "marks": [
+                {
+                  "type": "link",
+                  "attrs": {
+                    "href": "knot://time/2026-06-04T17:00:00Z",
+                    "target": "_blank",
+                    "rel": "noopener noreferrer",
+                    "class": null,
+                    "title": null
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "headings",
+    "update": "AQwBAAcBB2RlZmF1bHQDB2hlYWRpbmcHAAEABgQAAQEHbGV2ZWwgMSgAAQAFbGV2ZWwBfQGHAQADB2hlYWRpbmcHAAEKBgQAAQsHbGV2ZWwgMigAAQoFbGV2ZWwBfQKHAQoDB2hlYWRpbmcHAAEUBgQAARUHbGV2ZWwgMygAARQFbGV2ZWwBfQMA",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "heading",
+          "attrs": {
+            "level": 1
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "level 1"
+            }
+          ]
+        },
+        {
+          "type": "heading",
+          "attrs": {
+            "level": 2
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "level 2"
+            }
+          ]
+        },
+        {
+          "type": "heading",
+          "attrs": {
+            "level": 3
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "level 3"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "blockquote-nested",
+    "update": "AQgBAAcBB2RlZmF1bHQDCmJsb2NrcXVvdGUHAAEAAwlwYXJhZ3JhcGgHAAEBBgQAAQIFb3V0ZXKHAQEDCmJsb2NrcXVvdGUHAAEIAwlwYXJhZ3JhcGgHAAEJBgQAAQoFaW5uZXIA",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "blockquote",
+          "content": [
+            {
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "outer"
+                }
+              ]
+            },
+            {
+              "type": "blockquote",
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "inner"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "code-block",
+    "update": "AQQBAAcBB2RlZmF1bHQDCmNvZGVfYmxvY2sHAAEABgQAAQEcZm4gbWFpbigpIHsKICAgIGxldCB4ID0gMTsKfSgAAQAIbGFuZ3VhZ2UBdwRydXN0AA==",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "code_block",
+          "attrs": {
+            "language": "rust"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "fn main() {\n    let x = 1;\n}"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "horizontal-rule",
+    "update": "AQcBAAcBB2RlZmF1bHQDCXBhcmFncmFwaAcAAQAGBAABAQVhYm92ZYcBAAMPaG9yaXpvbnRhbF9ydWxlhwEHAwlwYXJhZ3JhcGgHAAEIBgQAAQkFYmVsb3cA",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "above"
+            }
+          ]
+        },
+        {
+          "type": "horizontal_rule"
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "below"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "lists-nested",
+    "update": "AQ8BAAcBB2RlZmF1bHQDDG9yZGVyZWRfbGlzdAcAAQADCWxpc3RfaXRlbQcAAQEDCXBhcmFncmFwaAcAAQIGBAABAwV0aHJlZYcBAgMLYnVsbGV0X2xpc3QHAAEJAwlsaXN0X2l0ZW0HAAEKAwlwYXJhZ3JhcGgHAAELBgQAAQwGYnVsbGV0hwEBAwlsaXN0X2l0ZW0HAAETAwlwYXJhZ3JhcGgHAAEUBgQAARUEZm91cigAAQAFc3RhcnQBfQMA",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "ordered_list",
+          "attrs": {
+            "start": 3
+          },
+          "content": [
+            {
+              "type": "list_item",
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "three"
+                    }
+                  ]
+                },
+                {
+                  "type": "bullet_list",
+                  "content": [
+                    {
+                      "type": "list_item",
+                      "content": [
+                        {
+                          "type": "paragraph",
+                          "content": [
+                            {
+                              "type": "text",
+                              "text": "bullet"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "list_item",
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "four"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "task-list",
+    "update": "AQsBAAcBB2RlZmF1bHQDC2J1bGxldF9saXN0BwABAAMJbGlzdF9pdGVtBwABAQMJcGFyYWdyYXBoBwABAgYEAAEDBGRvbmUoAAEBB2NoZWNrZWQBeIcBAQMJbGlzdF9pdGVtBwABCQMJcGFyYWdyYXBoBwABCgYEAAELBHRvZG8oAAEJB2NoZWNrZWQBeQA=",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "bullet_list",
+          "content": [
+            {
+              "type": "list_item",
+              "attrs": {
+                "checked": true
+              },
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "done"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "list_item",
+              "attrs": {
+                "checked": false
+              },
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "todo"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "list-hard-break",
+    "update": "AQgBAAcBB2RlZmF1bHQDC2J1bGxldF9saXN0BwABAAMJbGlzdF9pdGVtBwABAQMJcGFyYWdyYXBoBwABAgYEAAEDCGxpbmUgb25lhwEDAwpoYXJkX2JyZWFrhwEMBgQAAQ0IbGluZSB0d28A",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "bullet_list",
+          "content": [
+            {
+              "type": "list_item",
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "line one"
+                    },
+                    {
+                      "type": "hard_break"
+                    },
+                    {
+                      "type": "text",
+                      "text": "line two"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "table",
+    "update": "ASIBAAcBB2RlZmF1bHQDBXRhYmxlBwABAAMJdGFibGVfcm93BwABAQMMdGFibGVfaGVhZGVyBwABAgMJcGFyYWdyYXBoBwABAwYEAAEEAUEoAAECB2NvbHNwYW4BfQEoAAECB3Jvd3NwYW4BfQGHAQIDDHRhYmxlX2hlYWRlcgcAAQgDCXBhcmFncmFwaAcAAQkGBAABCgFCKAABCAdjb2xzcGFuAX0BKAABCAdyb3dzcGFuAX0BhwEIAwx0YWJsZV9oZWFkZXIHAAEOAwlwYXJhZ3JhcGgHAAEPBgQAARABQygAAQ4HY29sc3BhbgF9ASgAAQ4Hcm93c3BhbgF9AYcBAQMJdGFibGVfcm93BwABFAMKdGFibGVfY2VsbAcAARUDCXBhcmFncmFwaAcAARYGBAABFwR3aWRlKAABFQdjb2xzcGFuAX0CKAABFQdyb3dzcGFuAX0BKAABFQVhbGlnbgF3BmNlbnRlcocBFQMKdGFibGVfY2VsbAcAAR8DCXBhcmFncmFwaAcAASAGBAABIQFjKAABHwdjb2xzcGFuAX0BKAABHwdyb3dzcGFuAX0BAA==",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "table",
+          "content": [
+            {
+              "type": "table_row",
+              "content": [
+                {
+                  "type": "table_header",
+                  "attrs": {
+                    "colspan": 1,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "type": "paragraph",
+                      "content": [
+                        {
+                          "type": "text",
+                          "text": "A"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "table_header",
+                  "attrs": {
+                    "colspan": 1,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "type": "paragraph",
+                      "content": [
+                        {
+                          "type": "text",
+                          "text": "B"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "table_header",
+                  "attrs": {
+                    "colspan": 1,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "type": "paragraph",
+                      "content": [
+                        {
+                          "type": "text",
+                          "text": "C"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "table_row",
+              "content": [
+                {
+                  "type": "table_cell",
+                  "attrs": {
+                    "colspan": 2,
+                    "rowspan": 1,
+                    "align": "center"
+                  },
+                  "content": [
+                    {
+                      "type": "paragraph",
+                      "content": [
+                        {
+                          "type": "text",
+                          "text": "wide"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "table_cell",
+                  "attrs": {
+                    "colspan": 1,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "type": "paragraph",
+                      "content": [
+                        {
+                          "type": "text",
+                          "text": "c"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "image",
+    "update": "AQQBAAcBB2RlZmF1bHQDBWltYWdlKAABAANzcmMBdxlodHRwczovL2V4YW1wbGUuY29tL2EucG5nKAABAANhbHQBdwhBbiBpbWFnZSgAAQAFdGl0bGUBdwdBIHRpdGxlAA==",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "image",
+          "attrs": {
+            "src": "https://example.com/a.png",
+            "alt": "An image",
+            "title": "A title"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "attachment",
+    "update": "AQUBAAcBB2RlZmF1bHQDCmF0dGFjaG1lbnQoAAEAA3VybAF3Ly9hcGkvYmxvYnMvMjIyMjIyMjItMzMzMy00NDQ0LTU1NTUtNjY2NjY2NjY2NjY2KAABAARuYW1lAXcKcmVwb3J0LnBkZigAAQAEc2l6ZQF9gCAoAAEAC2NvbnRlbnRUeXBlAXcPYXBwbGljYXRpb24vcGRmAA==",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "attachment",
+          "attrs": {
+            "url": "/api/blobs/22222222-3333-4444-5555-666666666666",
+            "name": "report.pdf",
+            "size": 2048,
+            "contentType": "application/pdf"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "excalidraw-board",
+    "update": "AQMBAAcBB2RlZmF1bHQDEGV4Y2FsaWRyYXdfYm9hcmQoAAEACGJvYXJkX2lkAXckMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1KAABAAVsYWJlbAF3DEFyY2hpdGVjdHVyZQA=",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "excalidraw_board",
+          "attrs": {
+            "board_id": "11111111-2222-3333-4444-555555555555",
+            "label": "Architecture"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "empty-paragraph",
+    "update": "AQEBAAcBB2RlZmF1bHQDCXBhcmFncmFwaAA=",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph"
+        }
+      ]
+    }
+  },
+  {
+    "name": "empty-doc",
+    "update": "AAA=",
+    "expected": {
+      "type": "doc",
+      "content": []
+    }
+  },
+  {
+    "name": "hashed-mark",
+    "update": "AQUBAAcBB2RlZmF1bHQDCXBhcmFncmFwaAcAAQAGBgABAQ5ib2xkLS1BYkNkMTIzNAJ7fYQBAgF4hgEDDmJvbGQtLUFiQ2QxMjM0BG51bGwA",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "x",
+              "marks": [
+                {
+                  "type": "bold",
+                  "attrs": {}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "unknown-tag",
+    "update": "AQQBAAcBB2RlZmF1bHQDB2NhbGxvdXQHAAEAAwlwYXJhZ3JhcGgHAAEBBgQAAQIGaW5zaWRlAA==",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "callout",
+          "content": [
+            {
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "inside"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "unknown-mark",
+    "update": "AQUBAAcBB2RlZmF1bHQDCXBhcmFncmFwaAcAAQAGBgABAQdjb21tZW50C3siaWQiOiJjMSJ9hAECAXiGAQMHY29tbWVudARudWxsAA==",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "x",
+              "marks": [
+                {
+                  "type": "comment",
+                  "attrs": {
+                    "id": "c1"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "mark-true",
+    "update": "AQUBAAcBB2RlZmF1bHQDCXBhcmFncmFwaAcAAQAGBgABAQRib2xkBHRydWWEAQIBeIYBAwRib2xkBG51bGwA",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "x",
+              "marks": [
+                {
+                  "type": "bold",
+                  "attrs": true
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "import-code-link",
+    "update": "AQcBAAcBB2RlZmF1bHQDCXBhcmFncmFwaAcAAQAGBgABAQRsaW5rHnsiaHJlZiI6Imh0dHBzOi8vZXhhbXBsZS5jb20ifYYBAgRjb2RlBHRydWWEAQMBeIYBBARsaW5rBG51bGyGAQUEY29kZQRudWxsAA==",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "x",
+              "marks": [
+                {
+                  "type": "link",
+                  "attrs": {
+                    "href": "https://example.com"
+                  }
+                },
+                {
+                  "type": "code",
+                  "attrs": true
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "import-code-bold",
+    "update": "AQcBAAcBB2RlZmF1bHQDCXBhcmFncmFwaAcAAQAGBgABAQRib2xkBHRydWWGAQIEY29kZQR0cnVlhAEDAXiGAQQEYm9sZARudWxshgEFBGNvZGUEbnVsbAA=",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "x",
+              "marks": [
+                {
+                  "type": "bold",
+                  "attrs": true
+                },
+                {
+                  "type": "code",
+                  "attrs": true
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

@@ -114,6 +114,14 @@ pub struct AppState {
     pub duplicate_permits: Arc<tokio::sync::Semaphore>,
     /// How long a duplicate waits for a permit before it is refused as busy.
     pub duplicate_busy_wait: std::time::Duration,
+    /// The process's one set of page-history replay permits, shared by the
+    /// history builder and [`AppState::history_views`]. `main` sizes it
+    /// from `history_workers`; the constructors give one compute permit.
+    pub history_permits: knot_history::HistoryPermits,
+    /// Renders past versions of a page (`GET
+    /// /api/docs/{id}/history/entries/{eid}/view`); `None` without a pool,
+    /// where the view answers 500 `internal`.
+    pub history_views: Option<Arc<knot_history::Views>>,
     /// The HTTP and collab rate limits. Built from `config` in
     /// [`router_with_state`]; the constructors leave them off.
     pub rate_limits: Arc<rate_limit::RateLimits>,
@@ -179,6 +187,8 @@ impl AppState {
                 duplicate::MAX_CONCURRENT_DUPLICATES,
             )),
             duplicate_busy_wait: duplicate::BUSY_WAIT,
+            history_permits: knot_history::history_permits(1),
+            history_views: None,
             rate_limits: Arc::new(rate_limit::RateLimits::disabled()),
             trusted_proxies: Arc::new(client_ip::TrustedProxies::default()),
             quota_audit: Arc::new(quota::QuotaAuditThrottle::new()),
@@ -225,6 +235,12 @@ impl AppState {
             Arc::new(knot_storage::PgFavoriteStore::new(pool.clone()));
         let contributors: Arc<dyn knot_storage::ContributorStore> =
             Arc::new(knot_storage::PgContributorStore::new(pool.clone()));
+        let history_permits = knot_history::history_permits(1);
+        let history_views = Arc::new(knot_history::Views::new(
+            pool.clone(),
+            history_permits.clone(),
+            knot_history::ViewLimits::default(),
+        ));
         Self {
             pool: Some(pool),
             users: Some(users),
@@ -267,6 +283,8 @@ impl AppState {
                 duplicate::MAX_CONCURRENT_DUPLICATES,
             )),
             duplicate_busy_wait: duplicate::BUSY_WAIT,
+            history_permits,
+            history_views: Some(history_views),
             rate_limits: Arc::new(rate_limit::RateLimits::disabled()),
             trusted_proxies: Arc::new(client_ip::TrustedProxies::default()),
             quota_audit: Arc::new(quota::QuotaAuditThrottle::new()),

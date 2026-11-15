@@ -14,8 +14,16 @@
 //! - [`words`]: the words an entry added and removed, counted in that diff.
 //! - [`canonical`]: a page's visible content as plain JSON, for comparing
 //!   two states by what a reader sees.
+//! - [`mod@pm_json`]: a page as y-tiptap's ProseMirror JSON, what the history
+//!   viewer shows (M1.4), and an entry's "Show changes" render on its diff.
+//! - [`view`]: a past version rendered for the viewer (M1.4), plain or
+//!   with the entry's own changes, the input caps that keep it within the
+//!   builder's memory rule, and the `Views` service that loads, bounds,
+//!   renders and caches versions and loads a restore's state.
 //! - [`pass`]: one builder pass as pure compute (attribution, gap check,
 //!   checkpoints), and the window replay every other reader uses.
+//! - [`permits`]: the process's compute permits, shared by the builder and
+//!   the views, and the builder slots its pacing holds instead.
 //! - [`genesis`]: a page's history before `history_since`, as one
 //!   checkpoint and its pre-rollout entries.
 //! - [`builder`]: the background builder that claims dirty pages, runs
@@ -37,25 +45,27 @@ pub mod isolate;
 pub mod list;
 pub mod pass;
 pub mod people;
+pub mod permits;
+pub mod pm_json;
 pub mod replay;
 pub mod sessions;
 pub mod sizes;
 mod store;
+pub mod view;
 pub mod words;
 
 pub use builder::{
-    BUILDER_VERSION, BuildLimits, Builder, PassResult, TestHooks, failure_backoff, history_permits,
-    pacing_delay,
+    BUILDER_VERSION, BuildLimits, Builder, PassResult, TestHooks, failure_backoff, pacing_delay,
 };
 pub use claims::{Claims, ClaimsError, Credit, ParkedClaim};
 pub use diff::{
-    ChunkKind, DiffError, EntryDiff, TextChunk, entry_diff, strip_zero_clocks, text_chunks,
+    ChunkKind, DiffError, EntryDiff, TextChunk, entry_diff, lo_doc, strip_zero_clocks, text_chunks,
 };
 pub use genesis::{BaselineInput, GenesisError, GenesisInput, GenesisOutput, build_genesis};
 pub use isolate::{IsolateError, run_isolated};
 pub use list::{
     CATCHING_UP_REVS, Cursor, CursorError, DEFAULT_LIMIT, EntryRow, HistoryPage, MAX_LIMIT,
-    list_entries, referenced_docs, referenced_people, render_page,
+    list_entries, load_titles, referenced_docs, referenced_people, render_page,
 };
 pub use pass::{
     CHECKPOINT_FLOOR_BYTES, CHECKPOINT_STATE_FRACTION, CheckpointKind, CheckpointWrite, KeptGap,
@@ -65,6 +75,11 @@ pub use pass::{
 pub use people::{
     ANONYMIZED_SQL, AuthorView, HistoryPerson, byline_view, history_author_view, load_people,
 };
+pub use permits::{ComputeGuard, HistoryPermits, StallWatch, history_permits};
+pub use pm_json::{
+    HISTORY_CHANGE, HISTORY_DELETE, HISTORY_INSERT, KNOWN_MARKS, KNOWN_NODES, RENDERER_VERSION,
+    mark_name, placeholder, pm_json, pm_json_diff,
+};
 pub use replay::{ReplayError, ReplayMode, Replayer, RowEffect, RowOutcome};
 pub use sessions::{
     Contribution, ContributionKind, EntryDraft, EntryKind, Grouper, SEAL_MARGIN, SESSION_GAP,
@@ -72,5 +87,12 @@ pub use sessions::{
 };
 pub use sizes::{
     HISTORY_TABLES, SIZE_LOCK_KEY, SIZE_SAMPLE_EVERY, sample_table_sizes, spawn_size_sampler,
+};
+pub use view::{
+    BUILD_MEMORY_FACTOR, PLAIN_MEMORY_FACTOR, PRINCIPAL_RENDERS, RESTORE_TIMEOUT, RenderError,
+    RenderHooks, RenderStage, Rendered, RenderedView, Restorable, SHIFTED_MEMORY_FACTOR, StageCell,
+    VIEW_CACHE_BYTES, VIEW_CACHE_TTL, VIEW_MEMORY_FACTOR, VIEW_PERMIT_WAIT, VIEW_TIMEOUT,
+    ViewError, ViewHooks, ViewInput, ViewLimits, Views, baseline_max_input_bytes, merge_gap_at_end,
+    render, render_staged, shows_changes, state_input, view_max_input_bytes,
 };
 pub use words::{WordCounts, count_words, entry_word_counts};

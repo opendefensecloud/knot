@@ -39,7 +39,7 @@ import {
   editModeShortcutLabel,
   isEditModeShortcut,
 } from "./editMode";
-import { HistoryDrawer } from "./HistoryDrawer";
+import { HistoryDrawer } from "./history/HistoryDrawer";
 import { DocWidthToggle } from "./DocWidthToggle";
 import { ImportMarkdownButton } from "./ImportMarkdownButton";
 import { captureReadingAnchor, findScroller, holdReadingPosition, type ReadingAnchor } from "./readingAnchor";
@@ -683,7 +683,7 @@ export default function DocPage() {
       </div>
       <Outlet />
       {historyOpen && id && !archived && (
-        <HistoryDrawer docId={id} onClose={() => setHistoryOpen(false)} />
+        <HistoryDrawer docId={id} canRestore={canEditDoc} onClose={() => setHistoryOpen(false)} />
       )}
       {commentSidebarOpen && id && !archived && <CommentSidebar docId={id} />}
       <span role="status" aria-live="polite" className="sr-only" data-testid="edit-mode-announcer">

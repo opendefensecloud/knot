@@ -56,7 +56,7 @@ settled during the design and the user has not weighed in.
 | What else on the page an erase cleans | **(design call)** Everything knot stores **for this page**: update log, snapshots, any history or checkpoint table, `markdown_cache`, the search index, and copies of page text in this page's comments (`anchor_text`), change suggestions (`original_text`, `proposed_text`, `context_before`), tasks (`doc_tasks.text`), notification excerpts and `audit_events.data`. Matches there are replaced by `[removed]`. |
 | What an erase does not reach | **(design call)** Other pages (copies made by Duplicate or "Restore as new page", or text pasted elsewhere), images and attachments, and database backups, WAL archives and replicas taken before the erase. The dialog says this in one sentence. Removal is **logical**: no knot API, UI or table query returns the text afterwards. Knot additionally asks Postgres to vacuum the rewritten rows, best effort. |
 | Open and offline editors during an erase | **(design call)** The erased text must not come back. Every open editor of the page is forced to reload from the server. Edits that the server had not received yet are lost, and the dialog warns about this when the page is open elsewhere. The server keeps a durable record of the erased content and rejects incoming updates that would bring it back (for example an offline tab reconnecting). Typing the same text again later, as a new edit, is allowed. |
-| Data protection: removing a person from history | **(user)** Exact times stay. An **admin function** replaces a person's name in **all** history with "Former member". **(design call)** Instance admins only (`crates/knot-server/src/admin.rs`), for one user at a time, across all workspaces. It is irreversible and covers timeline entries, contributor credit (`doc_contributors`, byline) and the restore, erase and accept wording. It does not change comments or suggestions they wrote, and it does not remove their content. History must therefore reference authors in a way that can be rewritten in one place. |
+| Data protection: removing a person from history | **(user)** Exact times stay. An **admin function** replaces a person's name in **all** history with "Former member". **(design call)** Instance admins only (`crates/knot-server/src/admin.rs`), for one user at a time, across all workspaces. It is irreversible and covers timeline entries, contributor credit (`doc_contributors`, byline) and the restore, erase and accept wording. It does not change comments or suggestions they wrote, and it does not remove their content. History must therefore reference authors in a way that can be rewritten in one place. **Dropped (user, 2026-11-14):** M4 is not built; former members keep their names in history, and there is no admin function or "Former member" wording. See the architecture's deviation notes. |
 | Access to the past follows current access | **(design call, from the brainstorm)** History is gated by the page's **current** access. Someone who gets access later, or a page moved out of a restricted area, exposes the page's whole past. Erase is the remedy for anything that must not be seen. No access history is stored. |
 | Backups | **(design call)** Covered by "What an erase does not reach". |
 | Existing pages (before rollout) | **(design call)** Their early history is already gone, because the current GC deletes it. Whatever survives at rollout (the remaining snapshots) appears at the bottom of the timeline as "Earlier versions (author unknown)", each viewable and restorable, under a line "Complete history starts `<rollout date>`". New pages have complete history from creation. Since the room-snapshot-pending fix, an old snapshot that may hold misplaced text is viewed and restored from its trusted prefix, so text that only it held past a lost edit is not shown ([that plan](../plans/2026-11-08-room-snapshot-pending.md), Rulings 7 and 20). |
@@ -73,7 +73,7 @@ settled during the design and the user has not weighed in.
   suggestions, or restored as a new page beside the original.
 - An owner can erase a secret from all of history in a few clicks.
 - An instance admin can turn a person into "Former member" across all
-  history.
+  history. **Dropped (user, 2026-11-14)**, see the Data protection row.
 - Live editing is not slower than today.
 
 ## Non-goals (v1)
@@ -135,7 +135,7 @@ with the dimmed live page visible on its left:
 | Markdown import / replace, template | `<Name> replaced the content (import)` / `Created from template <name>` |
 | Task checkbox toggled | Part of the toggler's session like any edit. |
 | Erase | `<Owner> removed content from history` |
-| Anonymized author | `Former member` wherever the name would appear |
+| Anonymized author | `Former member` wherever the name would appear **Dropped (user, 2026-11-14)**, see the Data protection row. |
 | Pre-rollout | Section `Earlier versions (author unknown)` with one entry per surviving snapshot, then the line `Complete history starts <date>` |
 
 ## Constraints (from reading the code)

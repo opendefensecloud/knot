@@ -6,6 +6,8 @@
 //! - PUT    /api/docs/{id}/restricted  body: {restricted}; make it a restriction boundary (owner)
 //! - GET    /api/docs/{id}/access  who can see it, for the permissions dialog (any reader)
 //! - GET    /api/docs/{id}/audit   the page audit log and its export stats (editor+, also archived; `routes::api::audit`)
+//! - GET    /api/docs/{id}/history/entries/{eid}/view  a past version, rendered (editor+, also archived; `routes::api::history`)
+//! - POST   /api/docs/{id}/history/entries/{eid}/restore  replace the page with that version (editor+, not archived; `routes::api::history`)
 //! - POST   /api/docs/{id}/move   reparent / reorder
 //! - POST   /api/docs/{id}/duplicate  body: {include_subpages?}; copy right after it (editor+ here and on the parent)
 //! - DELETE /api/docs/{id}        move to the archive, with its subtree (editor+)
@@ -98,6 +100,14 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/docs/{id}/history/entries",
             get(crate::routes::api::history::entries),
+        )
+        .route(
+            "/api/docs/{id}/history/entries/{eid}/view",
+            get(crate::routes::api::history::view_entry),
+        )
+        .route(
+            "/api/docs/{id}/history/entries/{eid}/restore",
+            post(crate::routes::api::history::restore_entry),
         )
         .route(
             "/api/docs/{id}/history/{seq}/markdown",

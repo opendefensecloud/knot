@@ -70,24 +70,85 @@ async fn count(pool: &PgPool, table: &str, doc: Uuid) -> i64 {
         .unwrap()
 }
 
+/// A second page in `doc`'s workspace that the current history builder has
+/// built: its genesis checkpoint is older than its `snapshots` fixed
+/// snapshots (revs 1..=snapshots, created now), which it has all probed.
+async fn seed_built_doc(pool: &PgPool, doc: Uuid, updates: usize, snapshots: i64) -> Uuid {
+    let built: Uuid = sqlx::query_scalar(
+        "INSERT INTO documents (workspace_id, title, sort_key, created_by)
+         SELECT workspace_id, 'Built', 'n', created_by FROM documents WHERE id = $1
+         RETURNING id",
+    )
+    .bind(doc)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    for _ in 0..updates {
+        sqlx::query("INSERT INTO doc_updates (doc_id, update_bytes) VALUES ($1, '\\x01')")
+            .bind(built)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO doc_history_state (doc_id, builder_version, genesis_rev, snapshot_checked_rev)
+         VALUES ($1, $2, 0, $3)",
+    )
+    .bind(built)
+    .bind(knot_history::BUILDER_VERSION)
+    .bind(snapshots)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO doc_history_checkpoints (doc_id, rev, kind, state_bytes, state_vector, created_at)
+         VALUES ($1, 0, 'genesis', '\\x00', '\\x00', now() - interval '2 days')",
+    )
+    .bind(built)
+    .execute(pool)
+    .await
+    .unwrap();
+    for rev in 1..=snapshots {
+        sqlx::query(
+            "INSERT INTO doc_snapshots
+                 (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch, pending_revs)
+             VALUES ($1, $2, '\\x01', '\\x00', $2, 0, '{}')",
+        )
+        .bind(built)
+        .bind(rev)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    built
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_thins_snapshots_but_keeps_every_update() {
     let db = knot_test_support::fresh_db().await;
     let snapshots = PgSnapshotStore::new(db.pool.clone());
+    // No history state: gc's 5 newest and 1 a day for 30 days.
     let doc = seed_doc(&db.pool, 20, 8).await;
+    // Built by the current builder and fully probed: the 3 newest.
+    let built = seed_built_doc(&db.pool, doc, 6, 8).await;
 
-    let run = knot_crdt::gc_run_once(&db.pool, &snapshots).await.unwrap();
+    let run = knot_crdt::gc_run_once(&db.pool, &snapshots, knot_history::BUILDER_VERSION)
+        .await
+        .unwrap();
     assert_eq!(
         run,
         GcRun::Ran {
-            docs: 1,
-            snapshots_deleted: 3
+            docs: 2,
+            snapshots_deleted: 3 + 5
         }
-    ); // 8 - keep 5
+    ); // 8 - keep 5, 8 - keep 3
     assert_eq!(count(&db.pool, "doc_snapshots", doc).await, 5);
+    assert_eq!(count(&db.pool, "doc_snapshots", built).await, 3);
     assert_eq!(count(&db.pool, "doc_updates", doc).await, 20);
+    assert_eq!(count(&db.pool, "doc_updates", built).await, 6);
     // Baselines are only the migration's copy; GC adds none.
     assert_eq!(count(&db.pool, "doc_history_baselines", doc).await, 0);
+    assert_eq!(count(&db.pool, "doc_history_baselines", built).await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -106,7 +167,9 @@ async fn gc_is_single_flight_across_replicas() {
         .unwrap();
     assert!(held);
     assert_eq!(
-        knot_crdt::gc_run_once(pool, &snapshots).await.unwrap(),
+        knot_crdt::gc_run_once(pool, &snapshots, knot_history::BUILDER_VERSION)
+            .await
+            .unwrap(),
         GcRun::Skipped
     );
 
@@ -117,7 +180,9 @@ async fn gc_is_single_flight_across_replicas() {
         .await
         .unwrap();
     assert!(matches!(
-        knot_crdt::gc_run_once(pool, &snapshots).await.unwrap(),
+        knot_crdt::gc_run_once(pool, &snapshots, knot_history::BUILDER_VERSION)
+            .await
+            .unwrap(),
         GcRun::Ran { .. }
     ));
 

@@ -2078,11 +2078,15 @@ name = "knot-history"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "knot-config",
+ "knot-crdt",
+ "knot-markdown",
  "knot-storage",
  "knot-test-support",
  "metrics",
+ "moka",
  "serde",
  "serde_json",
  "sqlx",

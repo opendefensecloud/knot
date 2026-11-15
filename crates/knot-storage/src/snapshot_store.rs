@@ -80,6 +80,24 @@ pub struct SnapshotMeta {
     pub created_at: DateTime<Utc>,
 }
 
+/// How [`SnapshotStore::thin`] thins a page's snapshots (page history
+/// M1.4). A page the current history builder has built (a
+/// `doc_history_state` row with `builder_version >= builder_version` and a
+/// `genesis_rev`) keeps the `keep_newest` newest in boot order, the one
+/// `latest_trusted` returns, and the snapshots the builder has still to
+/// probe: per unprobed `snapshot_rev` the row it would probe, for the
+/// `keep_unprobed` lowest revs, and every unprobed row written at or
+/// before the page's `genesis` checkpoint. Every other page keeps what
+/// `gc(legacy_keep_recent, legacy_retain_days)` keeps.
+#[derive(Clone, Copy, Debug)]
+pub struct ThinPolicy {
+    pub keep_newest: i64,
+    pub keep_unprobed: i64,
+    pub builder_version: i32,
+    pub legacy_keep_recent: i64,
+    pub legacy_retain_days: i32,
+}
+
 #[derive(Debug, Error)]
 pub enum SnapshotStoreError {
     #[error("sqlx: {0}")]
@@ -161,6 +179,12 @@ pub trait SnapshotStore: Send + Sync + 'static {
         keep_recent: i64,
         retain_days: i32,
     ) -> Result<u64, SnapshotStoreError>;
+
+    /// Thins the page's snapshots by `policy` ([`ThinPolicy`]); returns
+    /// how many it deleted. Stores that keep no snapshots delete nothing.
+    async fn thin(&self, _doc_id: Uuid, _policy: ThinPolicy) -> Result<u64, SnapshotStoreError> {
+        Ok(0)
+    }
 
     /// Most recent `limit` snapshots for a doc, newest-first, metadata only.
     async fn list(&self, doc_id: Uuid, limit: i64)
@@ -431,6 +455,70 @@ impl SnapshotStore for PgSnapshotStore {
         .bind(doc_id)
         .bind(keep_recent)
         .bind(retain_days)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    async fn thin(&self, doc_id: Uuid, policy: ThinPolicy) -> Result<u64, SnapshotStoreError> {
+        let state: Option<(i32, Option<i64>)> = sqlx::query_as(
+            "SELECT builder_version, genesis_rev FROM doc_history_state WHERE doc_id = $1",
+        )
+        .bind(doc_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let built = matches!(state, Some((v, Some(_))) if v >= policy.builder_version);
+        if !built {
+            return self
+                .gc(doc_id, policy.legacy_keep_recent, policy.legacy_retain_days)
+                .await;
+        }
+        // Each keep set scans its own `doc_snapshots s`, which shadows the
+        // DELETE's `s`, so `older_writer_sql("s")` binds to the scanned row.
+        // A snapshot is unprobed while the builder has still to check it:
+        // stamped, above `snapshot_checked_rev`, not skipped (compared in
+        // SQL, never decoded). The last clause re-checks the state the
+        // policy was chosen by: a page sent back to a rebuild since loses
+        // nothing this run.
+        let unprobed = "s.snapshot_rev IS NOT NULL \
+                        AND s.snapshot_rev > st.snapshot_checked_rev \
+                        AND NOT (s.snapshot_rev = ANY(st.skip_snapshots))";
+        let r = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM doc_snapshots s
+             WHERE s.doc_id = $1
+               AND s.snapshot_seq NOT IN (
+                   SELECT s.snapshot_seq FROM doc_snapshots s WHERE s.doc_id = $1
+                   ORDER BY s.snapshot_rev DESC NULLS LAST, s.snapshot_seq DESC LIMIT $2)
+               AND s.snapshot_seq NOT IN (
+                   SELECT s.snapshot_seq FROM doc_snapshots s
+                   WHERE s.doc_id = $1 AND NOT ({older_writer})
+                   ORDER BY s.snapshot_rev DESC NULLS LAST, s.snapshot_seq DESC LIMIT 1)
+               AND s.snapshot_seq NOT IN (
+                   SELECT p.snapshot_seq FROM (
+                       SELECT DISTINCT ON (s.snapshot_rev) s.snapshot_rev, s.snapshot_seq
+                       FROM doc_snapshots s
+                       JOIN doc_history_state st ON st.doc_id = s.doc_id
+                       WHERE s.doc_id = $1 AND {unprobed}
+                       ORDER BY s.snapshot_rev, s.snapshot_seq DESC
+                   ) p
+                   ORDER BY p.snapshot_rev LIMIT $3)
+               AND s.snapshot_seq NOT IN (
+                   SELECT s.snapshot_seq FROM doc_snapshots s
+                   JOIN doc_history_state st ON st.doc_id = s.doc_id
+                   WHERE s.doc_id = $1 AND {unprobed}
+                     AND s.created_at <= (
+                         SELECT max(c.created_at) FROM doc_history_checkpoints c
+                         WHERE c.doc_id = $1 AND c.kind = 'genesis'))
+               AND EXISTS (
+                   SELECT 1 FROM doc_history_state st
+                   WHERE st.doc_id = $1 AND st.genesis_rev IS NOT NULL
+                     AND st.builder_version >= $4)",
+            older_writer = older_writer_sql("s"),
+        )))
+        .bind(doc_id)
+        .bind(policy.keep_newest)
+        .bind(policy.keep_unprobed)
+        .bind(policy.builder_version)
         .execute(&self.pool)
         .await?;
         Ok(r.rows_affected())

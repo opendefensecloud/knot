@@ -64,6 +64,7 @@ pub use short_links::{
 };
 pub use snapshot_store::{
     DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStamp, SnapshotStore, SnapshotStoreError,
+    ThinPolicy,
 };
 pub use suggestions::{
     NewSuggestion, PgSuggestionStore, Suggestion, SuggestionKind, SuggestionReply,
