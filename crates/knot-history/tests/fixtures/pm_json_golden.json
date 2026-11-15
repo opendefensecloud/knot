@@ -616,6 +616,21 @@
     }
   },
   {
+    "name": "table-of-contents",
+    "update": "AQIBAAcBB2RlZmF1bHQDEXRhYmxlX29mX2NvbnRlbnRzKAABAAhtYXhMZXZlbAF9AgA=",
+    "expected": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "table_of_contents",
+          "attrs": {
+            "maxLevel": 2
+          }
+        }
+      ]
+    }
+  },
+  {
     "name": "empty-paragraph",
     "update": "AQEBAAcBB2RlZmF1bHQDCXBhcmFncmFwaAA=",
     "expected": {

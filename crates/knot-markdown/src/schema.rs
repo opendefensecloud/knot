@@ -20,6 +20,7 @@ pub enum NodeKind {
     ExcalidrawBoard,
     Image,
     Attachment,
+    TableOfContents,
     Table,
     TableRow,
     TableCell,
@@ -43,6 +44,7 @@ impl NodeKind {
             Self::ExcalidrawBoard => "excalidraw_board",
             Self::Image => "image",
             Self::Attachment => "attachment",
+            Self::TableOfContents => "table_of_contents",
             Self::Table => "table",
             Self::TableRow => "table_row",
             Self::TableCell => "table_cell",
@@ -84,41 +86,11 @@ pub struct MarkMarkdownMeta {
 
 pub fn mark_serialization(kind: MarkKind) -> MarkMarkdownMeta {
     match kind {
-        MarkKind::Bold => MarkMarkdownMeta {
-            delimiter: "**",
-            open_tag: "",
-            close_tag: "",
-            no_nesting: false,
-        },
-        MarkKind::Italic => MarkMarkdownMeta {
-            delimiter: "*",
-            open_tag: "",
-            close_tag: "",
-            no_nesting: false,
-        },
-        MarkKind::Code => MarkMarkdownMeta {
-            delimiter: "`",
-            open_tag: "",
-            close_tag: "",
-            no_nesting: true,
-        },
-        MarkKind::Strike => MarkMarkdownMeta {
-            delimiter: "~~",
-            open_tag: "",
-            close_tag: "",
-            no_nesting: false,
-        },
-        MarkKind::Underline => MarkMarkdownMeta {
-            delimiter: "",
-            open_tag: "<u>",
-            close_tag: "</u>",
-            no_nesting: false,
-        },
-        MarkKind::Link => MarkMarkdownMeta {
-            delimiter: "",
-            open_tag: "",
-            close_tag: "",
-            no_nesting: false,
-        },
+        MarkKind::Bold => MarkMarkdownMeta { delimiter: "**", open_tag: "", close_tag: "", no_nesting: false },
+        MarkKind::Italic => MarkMarkdownMeta { delimiter: "*", open_tag: "", close_tag: "", no_nesting: false },
+        MarkKind::Code => MarkMarkdownMeta { delimiter: "`", open_tag: "", close_tag: "", no_nesting: true },
+        MarkKind::Strike => MarkMarkdownMeta { delimiter: "~~", open_tag: "", close_tag: "", no_nesting: false },
+        MarkKind::Underline => MarkMarkdownMeta { delimiter: "", open_tag: "<u>", close_tag: "</u>", no_nesting: false },
+        MarkKind::Link => MarkMarkdownMeta { delimiter: "", open_tag: "", close_tag: "", no_nesting: false },
     }
 }

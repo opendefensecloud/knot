@@ -104,6 +104,7 @@ const REGISTERED_EXTENSIONS = [
   "table",
   "table_cell",
   "table_header",
+  "table_of_contents",
   "table_row",
   "text",
   // v3 core. addGlobalAttributes() returns [] unless `direction` is
@@ -196,6 +197,7 @@ describe("editor schema alignment", () => {
         { type: "blockquote", content: [{ type: "paragraph", content: [{ type: "text", text: "q" }] }] },
         { type: "code_block", content: [{ type: "text", text: "x" }] },
         { type: "horizontal_rule" },
+        { type: "table_of_contents", attrs: { maxLevel: 2 } },
         {
           type: "bullet_list",
           content: [
@@ -349,6 +351,7 @@ const CREATE_EXTENSIONS_ORDER = [
   "image",
   "attachment",
   "excalidraw_board",
+  "table_of_contents",
   "knotTaskList",
   "knotInternalLink",
   "knotMention",
