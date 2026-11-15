@@ -672,16 +672,38 @@ pub enum DiagramRef {
 
 /// Calls `f` for every block, depth first in document order.
 /// The page's headings as `(level, text)`, in order, empty ones left out.
+/// A heading's text ends at its first line break, and headings in table
+/// cells are left out, as on the public page, where Markdown has them as a
+/// cell's text.
 fn headings(blocks: &[Block]) -> Vec<(u8, String)> {
-    let mut out = Vec::new();
-    visit_blocks(blocks, &mut |b| {
-        if let Block::Heading { level, .. } = b {
-            let text = plain_text(std::slice::from_ref(b));
-            if !text.trim().is_empty() {
-                out.push((*level, text));
+    fn text(content: &[Inline]) -> String {
+        let mut s = String::new();
+        for inline in content {
+            match inline {
+                Inline::Run(r) => s.push_str(&r.text),
+                Inline::Link { runs, .. } => runs.iter().for_each(|r| s.push_str(&r.text)),
+                Inline::Break => break,
             }
         }
-    });
+        s
+    }
+    fn walk(blocks: &[Block], out: &mut Vec<(u8, String)>) {
+        for b in blocks {
+            match b {
+                Block::Heading { level, content } => {
+                    let t = text(content);
+                    if !t.trim().is_empty() {
+                        out.push((*level, t));
+                    }
+                }
+                Block::Quote(inner) => walk(inner, out),
+                Block::List(list) => list.items.iter().for_each(|i| walk(&i.blocks, out)),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(blocks, &mut out);
     out
 }
 

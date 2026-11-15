@@ -20,14 +20,30 @@ type HeadingInfo = { pos: number; size: number; level: number; text: string; slu
  *  heading shown (deeper ones stay at 4). */
 export type TocEntry = { level: number; text: string; slug: string };
 
+/** The text a heading's anchor and entry come from: up to its first hard
+ *  break, as Markdown ends a heading line there. */
+function headingText(node: PMNode): string {
+  let text = "";
+  let ended = false;
+  node.forEach((child) => {
+    if (ended) return;
+    if (child.type.name === "hard_break") ended = true;
+    else text += child.textContent;
+  });
+  return text;
+}
+
 /** The headings of `doc` in order, every one slugged (empty ones too, as
- *  the public page does, so the ids agree). */
+ *  the public page does, so the ids agree). Headings in table cells are
+ *  left out: Markdown writes a cell as one line of text, so the public page
+ *  has no heading there. */
 function headingsOf(doc: PMNode): HeadingInfo[] {
   const slug = slugger();
   const out: HeadingInfo[] = [];
   doc.descendants((node, pos) => {
+    if (node.type.name === "table_cell" || node.type.name === "table_header") return false;
     if (node.type.name !== "heading") return true;
-    const text = node.textContent;
+    const text = headingText(node);
     const level = Number(node.attrs.level);
     out.push({
       pos,

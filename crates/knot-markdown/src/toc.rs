@@ -128,18 +128,50 @@ fn marker_only(src: &str, range: Range<usize>) -> Option<Range<usize>> {
     })
 }
 
-/// The range to replace and the depth when table cell `range` holds the
-/// marker, maybe after a `knot:toc` comment, and nothing else.
+/// The range to replace and the depth of a marker (maybe after a
+/// `knot:toc` comment) at the start or the end of table cell `range`, set
+/// off from the cell's other text by whitespace: the serializer joins a
+/// cell's blocks onto its one line with a space.
 fn cell_marker(src: &str, range: Range<usize>) -> Option<(Range<usize>, u8)> {
     let slice = src.get(range.clone())?;
     let trimmed = slice.trim();
-    let lead = slice.len() - slice.trim_start().len();
-    let start = range.start + lead;
-    let full = start..start + trimmed.len();
-    if trimmed == TOC_MARKER {
-        return Some((full, TOC_DEFAULT_LEVEL));
+    let start = range.start + (slice.len() - slice.trim_start().len());
+    // At the start: `[comment] marker`, then the end or whitespace.
+    if let Some((len, level)) = leading_marker(trimmed) {
+        return Some((start..start + len, level));
     }
-    let comment_end = trimmed.find("-->")? + 3;
-    let level = toc_comment_level(&trimmed[..comment_end])?;
-    (trimmed[comment_end..].trim() == TOC_MARKER).then_some((full, level))
+    // At the end: whitespace or the start, then `[comment] marker`.
+    let body = trimmed.strip_suffix(TOC_MARKER)?;
+    let before = body.trim_end();
+    if !before.is_empty() && before.len() == body.len() {
+        return None;
+    }
+    let (at, level) = match before.rfind("<!--") {
+        Some(c) if before.ends_with("-->") => match toc_comment_level(&before[c..]) {
+            Some(level) if c == 0 || before[..c].ends_with(char::is_whitespace) => (c, level),
+            _ => (body.len(), TOC_DEFAULT_LEVEL),
+        },
+        _ => (body.len(), TOC_DEFAULT_LEVEL),
+    };
+    if at > 0 && !trimmed[..at].ends_with(char::is_whitespace) {
+        return None;
+    }
+    Some((start + at..start + trimmed.len(), level))
+}
+
+/// The length and depth when `text` starts with a marker (maybe after a
+/// `knot:toc` comment) followed by the end or whitespace.
+fn leading_marker(text: &str) -> Option<(usize, u8)> {
+    let (rest, level, used) = if text.starts_with("<!--") {
+        let end = text.find("-->")? + 3;
+        let level = toc_comment_level(&text[..end])?;
+        let after = &text[end..];
+        let gap = after.len() - after.trim_start().len();
+        (&after[gap..], level, end + gap)
+    } else {
+        (text, TOC_DEFAULT_LEVEL, 0)
+    };
+    let after = rest.strip_prefix(TOC_MARKER)?;
+    (after.is_empty() || after.starts_with(char::is_whitespace))
+        .then_some((used + TOC_MARKER.len(), level))
 }

@@ -921,3 +921,18 @@ fn toc_without_max_level_lists_three_levels() {
     ]));
     assert_eq!(toc_entries(&w.doc.blocks), vec![(0, "A".into())]);
 }
+
+#[test]
+fn toc_leaves_out_headings_in_table_cells() {
+    let cell = |children| el("table_cell", vec![], children);
+    let w = walk(&build(vec![
+        el("table_of_contents", vec![], vec![]),
+        el(
+            "table",
+            vec![],
+            vec![el("table_row", vec![], vec![cell(vec![h(2, "In cell")])])],
+        ),
+        h(2, "B"),
+    ]));
+    assert_eq!(toc_entries(&w.doc.blocks), vec![(0, "B".into())]);
+}

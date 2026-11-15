@@ -73,7 +73,7 @@ export function TableOfContentsView({ node, editor, getPos, updateAttributes }: 
                 data-testid="toc-entry"
                 onClick={(e) => {
                   e.preventDefault();
-                  if (scrollToHeading(entry.slug)) {
+                  if (scrollToHeading(entry.slug, editor.view.dom)) {
                     window.history.replaceState(window.history.state, "", `#${entry.slug}`);
                   }
                 }}

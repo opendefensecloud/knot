@@ -192,3 +192,84 @@ fn bare_marker_in_table_cell() {
 fn _uses(t: &yrs::TextRef, txn: &yrs::Transaction) -> String {
     t.get_string(txn) + &t.len(txn).to_string()
 }
+
+/// A blockquote or table cell holding `blocks` (`None`: a table of contents
+/// of that depth; `Some(text)`: a paragraph), the export of it, and the
+/// blocks the export reads back as.
+fn round_trip_in(
+    container: &str,
+    blocks: &[Result<&str, &str>],
+) -> (String, Vec<(String, Option<String>)>) {
+    let doc = YrsEngine.new_doc();
+    {
+        let y = doc.inner();
+        let frag = y.get_or_insert_xml_fragment("default");
+        let mut txn = y.transact_mut();
+        let parent = if container == "cell" {
+            let table = frag.push_back(&mut txn, XmlElementPrelim::empty("table"));
+            let row = table.push_back(&mut txn, XmlElementPrelim::empty("table_row"));
+            let cell = row.push_back(&mut txn, XmlElementPrelim::empty("table_header"));
+            let other = row.push_back(&mut txn, XmlElementPrelim::empty("table_header"));
+            let p = other.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new("x"));
+            cell
+        } else {
+            frag.push_back(&mut txn, XmlElementPrelim::empty("blockquote"))
+        };
+        for block in blocks {
+            match block {
+                Ok(text) => {
+                    let p = parent.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+                    p.push_back(&mut txn, XmlTextPrelim::new(*text));
+                }
+                Err(level) => {
+                    let toc =
+                        parent.push_back(&mut txn, XmlElementPrelim::empty("table_of_contents"));
+                    toc.insert_attribute(&mut txn, "maxLevel", *level);
+                }
+            }
+        }
+    }
+    let md = markdown(&doc);
+    let back = parse(&md);
+    let shape = if container == "cell" {
+        first_cell(&back)
+    } else {
+        let y = back.inner();
+        let txn = y.transact();
+        let frag = txn.get_xml_fragment("default").expect("fragment");
+        let quote = match frag.get(&txn, 0) {
+            Some(XmlOut::Element(e)) => e,
+            other => panic!("expected a quote, got {other:?}"),
+        };
+        let children = (0..quote.len(&txn))
+            .filter_map(|i| quote.get(&txn, i))
+            .collect();
+        tags_of(&txn, children)
+    };
+    (md, shape)
+}
+
+#[test]
+fn toc_after_a_paragraph_in_a_quote_round_trips() {
+    let (md, shape) = round_trip_in("quote", &[Ok("para"), Err("3")]);
+    assert_eq!(shape, vec![para(), toc("3")], "{md}");
+}
+
+#[test]
+fn toc_before_a_paragraph_in_a_quote_round_trips() {
+    let (md, shape) = round_trip_in("quote", &[Err("2"), Ok("after")]);
+    assert_eq!(shape, vec![toc("2"), para()], "{md}");
+}
+
+#[test]
+fn toc_after_a_paragraph_in_a_cell_round_trips() {
+    let (md, shape) = round_trip_in("cell", &[Ok("para"), Err("3")]);
+    assert_eq!(shape, vec![para(), toc("3")], "{md}");
+}
+
+#[test]
+fn toc_before_a_paragraph_in_a_cell_round_trips() {
+    let (md, shape) = round_trip_in("cell", &[Err("2"), Ok("after")]);
+    assert_eq!(shape, vec![toc("2"), para()], "{md}");
+}

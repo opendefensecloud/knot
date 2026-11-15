@@ -28,9 +28,11 @@ impl Slugger {
 }
 
 fn base_slug(title: &str) -> String {
-    let kept: String = title
-        .nfkd()
-        .flat_map(char::to_lowercase)
+    // NFKD, then lower case for the whole string, as JavaScript's
+    // `normalize("NFKD").toLowerCase()` does (a final sigma stays `ς`).
+    let lower = title.nfkd().collect::<String>().to_lowercase();
+    let kept: String = lower
+        .chars()
         .filter(|&c| {
             (c.is_alphabetic() && !is_combining_mark(c))
                 || c.is_numeric()

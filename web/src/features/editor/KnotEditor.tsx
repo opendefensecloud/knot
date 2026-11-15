@@ -568,7 +568,7 @@ function EditorBody({
     let frame = 0;
     const attempt = () => {
       if (done || editor.isDestroyed) return;
-      if (scrollToHeading(slug)) {
+      if (scrollToHeading(slug, editor.view.dom)) {
         done = true;
         pair.doc.off("update", onUpdate);
       }

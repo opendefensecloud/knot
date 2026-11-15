@@ -7,13 +7,22 @@
  * (`web/src/lib/outline.ts`, Apache-2.0).
  */
 
+/** Rust's `char::is_whitespace`: JavaScript's `\s` without U+FEFF and with
+ *  U+0085, so both sides split on the same characters. */
+const SPACE = "[\\s\\u0085]";
+const DROP = new RegExp(`\\uFEFF|\\p{M}|(?!${SPACE})[^\\p{Alphabetic}\\p{N}-]`, "gu");
+const SPACES = new RegExp(`${SPACE}+`, "gu");
+
 function baseSlug(title: string): string {
+  // Letters are Unicode Alphabetic without marks, as Rust's
+  // `is_alphabetic` and `is_combining_mark` give them.
   const joined = title
     .normalize("NFKD")
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s-]/gu, "")
+    .replace(DROP, "")
+    .replace(SPACES, " ")
     .trim()
-    .replace(/\s+/g, "-");
+    .replace(/ /g, "-");
   return joined === "" ? "section" : joined;
 }
 

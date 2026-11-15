@@ -1,8 +1,12 @@
 [
-  { "titles": ["Plan", "Tasks", "Tasks", "Café"], "slugs": ["plan", "tasks", "tasks-1", "cafe"] },
-  { "titles": ["C++ & Rust"], "slugs": ["c-rust"] },
-  { "titles": ["  Hallo   Welt  "], "slugs": ["hallo-welt"] },
-  { "titles": ["🚀"], "slugs": ["section"] },
-  { "titles": ["Über uns", "über uns"], "slugs": ["uber-uns", "uber-uns-1"] },
-  { "titles": ["section", "🚀"], "slugs": ["section", "section-1"] }
+  {"titles": ["Plan", "Tasks", "Tasks", "Café"], "slugs": ["plan", "tasks", "tasks-1", "cafe"]},
+  {"titles": ["C++ & Rust"], "slugs": ["c-rust"]},
+  {"titles": ["  Hallo   Welt  "], "slugs": ["hallo-welt"]},
+  {"titles": ["🚀"], "slugs": ["section"]},
+  {"titles": ["Über uns", "über uns"], "slugs": ["uber-uns", "uber-uns-1"]},
+  {"titles": ["section", "🚀"], "slugs": ["section", "section-1"]},
+  {"titles": ["ΟΔΟΣ"], "slugs": ["οδος"]},
+  {"titles": ["🅰️ Plan"], "slugs": ["🅰-plan"]},
+  {"titles": ["🅐 x"], "slugs": ["🅐-x"]},
+  {"titles": ["a﻿b"], "slugs": ["ab"]}
 ]

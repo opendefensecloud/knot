@@ -40,6 +40,22 @@ describe("heading anchors", () => {
     ]);
   });
 
+  it("leaves out headings in table cells, which Markdown writes as text", () => {
+    bound = mountBoundEditor();
+    bound.editor.commands.setContent(
+      "<table><tr><td><h2>Tasks</h2></td></tr></table><h2>Tasks</h2>",
+    );
+    expect(tocEntries(bound.editor.state.doc, 3).map((e) => e.slug)).toEqual(["tasks"]);
+    const ids = Array.from(bound.editor.view.dom.querySelectorAll("h2")).map((h) => h.id);
+    expect(ids).toEqual(["", "tasks"]);
+  });
+
+  it("ends a heading's anchor text at a hard break, as Markdown does", () => {
+    bound = mountBoundEditor();
+    bound.editor.commands.setContent("<h2>A<br>B</h2>");
+    expect(tocEntries(bound.editor.state.doc, 3).map((e) => [e.text, e.slug])).toEqual([["A", "a"]]);
+  });
+
   it("skips empty headings but keeps the slugs of the rest stable", () => {
     bound = mountBoundEditor();
     bound.editor.commands.setContent("<h2></h2><h2>B</h2><h2>  </h2>");

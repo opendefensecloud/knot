@@ -1076,6 +1076,9 @@ enum Block {
         ends_open: bool,
     },
     Table,
+    /// A table of contents: `[[_TOC_]]` (after its comment), read back only
+    /// when it is a paragraph of its own, so blank lines go on both sides.
+    Toc,
 }
 
 impl Block {
@@ -1100,6 +1103,7 @@ impl Block {
             },
             "blockquote" => Block::Quote { ends_open },
             "table" => Block::Table,
+            "table_of_contents" => Block::Toc,
             _ if matches!(lines, [Line::Blank]) => Block::Blank,
             _ => Block::Text,
         }
@@ -1108,11 +1112,13 @@ impl Block {
     /// Whether `next`, written on the line right below this block, would be
     /// read as part of it, so that a blank line must go between them.
     fn needs_blank_line_before(self, next: Block, in_quote: bool) -> bool {
-        use Block::{Blank, Code, Heading, Image, List, Quote, Rule, Table, Text};
+        use Block::{Blank, Code, Heading, Image, List, Quote, Rule, Table, Text, Toc};
         match (self, next) {
             // Nothing goes on after a heading, code block or rule, and an
             // empty paragraph is a blank line already.
             (Heading | Code | Rule | Blank, _) | (_, Blank) => false,
+            // The marker must be a paragraph of its own, in a quote too.
+            (Toc, _) | (_, Toc) => true,
             // In a quote, the importer reads each line of a paragraph as a
             // paragraph of its own, an image or board alone on its line
             // included (P2).
