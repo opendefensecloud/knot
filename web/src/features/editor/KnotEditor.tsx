@@ -30,6 +30,7 @@ import { isEditModeShortcut } from "../docs/editMode";
 import { stickyCoverBottom } from "../docs/readingAnchor";
 import { workspaceApi } from "../workspace/workspace.api";
 import { docsApi } from "../docs/docs.api";
+import { notifyFailure } from "../../lib/limitErrors";
 import { SELECTION_FLOAT_WIDTH, computeAddCommentPos } from "./addCommentPos";
 import { createExtensions } from "./extensions";
 import {
@@ -349,6 +350,33 @@ function EditorBody({
             display_name: m.display_name,
             email: m.email,
           }));
+        },
+        // `[[` page links: the sidebar's doc list (readable, not archived,
+        // no templates), and for editors of this page a subpage on the fly.
+        // The server checks the right to add a subpage here either way.
+        pageLinks: {
+          listPages: async () => {
+            const r = await qc.fetchQuery({
+              queryKey: ["docs"],
+              queryFn: () => docsApi.list(),
+              staleTime: 30_000,
+            });
+            if ("error" in r) return [];
+            return r.ok.map(({ id, title, parent_id }) => ({ id, title, parent_id }));
+          },
+          currentDocId: docId,
+          createSubpage: role === "viewer"
+            ? null
+            : async (title) => {
+              const r = await docsApi.create({ title, parent_id: docId });
+              if ("error" in r) {
+                notifyFailure(notify, r.error, "Couldn't create the page.");
+                return null;
+              }
+              await qc.invalidateQueries({ queryKey: ["docs"] });
+              const created = r.ok as { id: string; title: string };
+              return { id: created.id, title: created.title };
+            },
         },
       }),
       editable: canEdit,

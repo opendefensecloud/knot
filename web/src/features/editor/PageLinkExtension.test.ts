@@ -71,11 +71,12 @@ function press(editor: Editor, key: string) {
 
 /** The first paragraph's text runs with their link hrefs. */
 function runs(editor: Editor) {
-  const para = editor.getJSON().content?.[0];
-  return (para?.content ?? []).map((n) => ({
-    text: n.text,
-    href: n.marks?.find((m) => m.type === "link")?.attrs?.href as string | undefined,
-  }));
+  const out: { text: string | undefined; href: string | undefined }[] = [];
+  editor.state.doc.firstChild?.forEach((n) => {
+    const link = n.marks.find((m) => m.type.name === "link");
+    out.push({ text: n.text, href: link ? (link.attrs.href as string) : undefined });
+  });
+  return out;
 }
 
 describe("[[ page links", () => {
