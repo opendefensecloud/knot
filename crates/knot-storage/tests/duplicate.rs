@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use knot_storage::blobs::Result as BlobResult;
 use knot_storage::duplicate::{
-    BlobCopy, BoardCopy, DuplicatePlan, PageCopy, apply_duplicate, purge_stale_copies,
+    BlobCopy, BoardCopy, CopyVersion, DuplicatePlan, PageCopy, apply_duplicate, purge_stale_copies,
     record_pending_copies,
 };
 use knot_storage::{
@@ -165,6 +165,7 @@ fn page(parent: Option<Uuid>, title: &str, state: &[u8]) -> PageCopy {
         icon: Some("📄".into()),
         restricted: false,
         state: state.to_vec(),
+        version: None,
     }
 }
 
@@ -988,4 +989,208 @@ async fn copied_pages_get_a_copy_sourced_first_row() {
                 .unwrap();
         assert_eq!(head_rev, 1);
     }
+}
+
+/// Sets `doc`'s heads row to `content_epoch`, inserting it when missing.
+async fn set_epoch(pool: &PgPool, doc: Uuid, content_epoch: i32) {
+    sqlx::query(
+        "INSERT INTO doc_history_heads (doc_id, content_epoch) VALUES ($1, $2)
+         ON CONFLICT (doc_id) DO UPDATE SET content_epoch = EXCLUDED.content_epoch",
+    )
+    .bind(doc)
+    .bind(content_epoch)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A version of entry 7 replayed at `content_epoch`.
+fn version_at_epoch(content_epoch: i32) -> CopyVersion {
+    CopyVersion {
+        entry_id: 7,
+        at: chrono::Utc::now(),
+        content_epoch,
+    }
+}
+
+/// A plan that copies a version of `source`, under `parent`, replayed at
+/// `content_epoch`.
+fn version_plan(
+    w: &World,
+    source: Uuid,
+    parent: Option<Uuid>,
+    content_epoch: i32,
+) -> DuplicatePlan {
+    let mut plan = plan_for(w, source, parent);
+    plan.top.source_id = source;
+    plan.top.version = Some(version_at_epoch(content_epoch));
+    plan
+}
+
+/// A version replayed at another content epoch than the source's (an
+/// erase in between) is never written as a copy: the epoch Ruling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_copy_of_another_epoch_is_a_conflict() {
+    let w = world().await;
+    let s = w.seed(None, "S", "g").await;
+    set_epoch(&w.pool, s, 1).await;
+    let plan = version_plan(&w, s, None, 0);
+    record_pending_copies(&w.pool, &[Uuid::new_v4()])
+        .await
+        .unwrap();
+    let before = w.counts().await;
+
+    let result = apply_duplicate(&w.pool, &plan).await;
+
+    assert!(
+        matches!(result, Err(DocStoreError::DuplicateConflict)),
+        "{:?}",
+        result.map(|o| o.top)
+    );
+    assert_eq!(w.counts().await, before);
+    let copies: i64 = sqlx::query_scalar("SELECT count(*) FROM documents WHERE id = $1")
+        .bind(plan.top.new_id)
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(copies, 0);
+    let audited: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE target_id = $1")
+        .bind(plan.top.new_id)
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(audited, 0);
+
+    // At the source's epoch: copied.
+    let plan = version_plan(&w, s, None, 1);
+    let outcome = apply_duplicate(&w.pool, &plan).await.unwrap();
+    assert_eq!(outcome.top.id, plan.top.new_id);
+
+    // No heads row (a page never written): epoch 0.
+    let t = w.seed(None, "T", "m").await;
+    let heads: i64 = sqlx::query_scalar("SELECT count(*) FROM doc_history_heads WHERE doc_id = $1")
+        .bind(t)
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(heads, 0);
+    let plan = version_plan(&w, t, None, 0);
+    let outcome = apply_duplicate(&w.pool, &plan).await.unwrap();
+    assert_eq!(outcome.top.id, plan.top.new_id);
+}
+
+/// A version copy reads the source's heads row only after the parent's
+/// row (the top page's foreign key check) and the source's page row: the
+/// M1.2 lock order. While it waits on the parent it holds nothing on the
+/// source's heads row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_copy_locks_the_parent_before_the_sources_heads_row() {
+    let w = world().await;
+    let p = w.seed(None, "P", "g").await;
+    let s = w.seed(Some(p), "S", "g").await;
+    set_epoch(&w.pool, s, 0).await;
+    let mut blocker = w.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM documents WHERE id = $1 FOR UPDATE")
+        .bind(p)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let copy = {
+        let (pool, plan) = (w.pool.clone(), version_plan(&w, s, Some(p), 0));
+        tokio::spawn(async move { apply_duplicate(&pool, &plan).await })
+    };
+    // The copy waits on the parent.
+    wait_for_lock_waits(&w.pool, 1).await;
+
+    let mut third = w.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM doc_history_heads WHERE doc_id = $1 FOR UPDATE NOWAIT")
+        .bind(s)
+        .execute(&mut *third)
+        .await
+        .expect("the copy holds nothing on the source's heads row");
+    third.rollback().await.unwrap();
+    blocker.rollback().await.unwrap();
+
+    let result = copy.await.unwrap();
+    assert!(result.is_ok(), "{:?}", result.map(|o| o.top));
+}
+
+/// A version copy and a purge of its source's parent lock the parent, the
+/// source's page row and its heads row in the same order, so they never
+/// deadlock.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_copy_and_a_purge_of_its_parent_do_not_deadlock() {
+    let w = world().await;
+    let keys = lexorank::spread(20);
+    for (round, key) in keys.iter().enumerate() {
+        let p = w.seed(None, &format!("P{round}"), key).await;
+        let s = w.seed(Some(p), "S", "g").await;
+        set_epoch(&w.pool, s, 0).await;
+        w.store.archive(w.ws, p, w.owner).await.unwrap();
+        let plan = version_plan(&w, s, Some(p), 0);
+
+        let (copied, purged) = tokio::join!(
+            apply_duplicate(&w.pool, &plan),
+            w.store.purge(w.ws, p, None)
+        );
+
+        assert!(
+            matches!(copied, Ok(_) | Err(DocStoreError::DuplicateConflict)),
+            "round {round}: {:?}",
+            copied.map(|o| o.top)
+        );
+        assert!(purged.is_ok(), "round {round}: {purged:?}");
+    }
+}
+
+/// A version copy's first row and its audit row name the version.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_copy_names_its_version() {
+    let w = world().await;
+    let s = w.seed(None, "S", "g").await;
+    let mut plan = version_plan(&w, s, None, 0);
+    plan.top.source_title = "S".into();
+    let at = plan.top.version.as_ref().unwrap().at;
+
+    let outcome = apply_duplicate(&w.pool, &plan).await.unwrap();
+
+    let meta: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT meta FROM doc_updates WHERE seq = $1")
+            .bind(outcome.pages[0].1)
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        meta,
+        Some(serde_json::json!({
+            "source_doc_id": s.to_string(),
+            "source_title": "S",
+            "version_entry_id": 7,
+            "version_at": at.to_rfc3339(),
+        }))
+    );
+    assert_eq!(
+        audit_data(&w.pool, plan.top.new_id).await,
+        [serde_json::json!({"source_id": s.to_string(), "version_entry_id": 7})]
+    );
+
+    // Without a version: the source only.
+    let plain = plan_for(&w, s, None);
+    apply_duplicate(&w.pool, &plain).await.unwrap();
+    assert_eq!(
+        audit_data(&w.pool, plain.top.new_id).await,
+        [serde_json::json!({"source_id": s.to_string()})]
+    );
+}
+
+/// The data of the `doc.duplicate` audit rows about `target`.
+async fn audit_data(pool: &PgPool, target: Uuid) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT data FROM audit_events WHERE target_id = $1 AND action = 'doc.duplicate'
+          ORDER BY id",
+    )
+    .bind(target)
+    .fetch_all(pool)
+    .await
+    .unwrap()
 }

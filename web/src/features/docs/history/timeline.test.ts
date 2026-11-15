@@ -235,6 +235,14 @@ describe("entryNote", () => {
     expect(entryNote(entry({ meta: {} }))).toBeNull();
     expect(entryNote(entry({ meta: { accepted_by: [] } }))).toBeNull();
   });
+
+  it("a fallback restore entry carries a note", () => {
+    expect(entryNote(entry({ kind: "restore", meta: { fallback: true } }))).toBe(copy.restoreFallbackNote);
+    expect(entryNote(entry({ kind: "restore", meta: { fallback: null } }))).toBeNull();
+    expect(entryNote(entry({ kind: "restore", meta: {} }))).toBeNull();
+    // Only a restore's meta says how it was made.
+    expect(entryNote(entry({ meta: { fallback: true } }))).toBeNull();
+  });
 });
 
 describe("showsChanges", () => {

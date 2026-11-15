@@ -229,6 +229,10 @@ fn describe_history_metrics() {
         "knot_history_views_total",
         "History version views, by outcome: cached (served from the view cache, or joined another request's render), rendered, diff_failed (rendered, but without changes because the diff step failed or panicked), no_changes (a Show changes request answered with the plain version without trying the diff: over the diff cap, the builder's word count failed, or an earlier diff of it timed out; cached or rendered), not_found, rebuilding (the page's history is an older builder's, until its rebuild), too_large, busy (no render slot or replay permit within the wait), failed (render, replay, panic, skipped baseline, earlier timeout, store error), timeout"
     );
+    describe_counter!(
+        "knot_history_restore_total",
+        "Restore here requests (restores of a page in place to a history entry) whose target replay succeeded or that were refused before it because the version is recorded too slow or over the revert cap, by outcome: restored (reverted by undo), fallback (reverted by a whole-page replace, so comments may have lost their place), unchanged (the page already matched the version; nothing written), stale (409 history.restore_busy: the page changed between export and apply on every attempt), unverified (500 history.restore_failed: no revert verified, or the page nests past the limit), too_large (409 restore.too_large: the version, alone or with the live page, over the revert cap or too slow to plan, now or recorded), apply_failed (500 restore.apply: the room refused the verified update), busy (503 at the plan's permit wait, with too little time left to plan, at the room's acquire wait, or the deadline before a revert was sent), timeout (504: the deadline after a revert was sent, or its reply was lost; it may still apply), failed (a plan that failed or panicked, a room whose acquire failed, that closed or failed its export, a version replayed at another content epoch, or a room that could not catch up with the page's log on the last attempt: 503 history.busy, a database or log problem, not contention). Restore as new page is not counted here"
+    );
     describe_histogram!(
         "knot_history_view_seconds",
         Unit::Seconds,
@@ -391,6 +395,7 @@ mod tests {
             ("knot_history_replay_seconds", "histogram"),
             ("knot_history_views_total", "counter"),
             ("knot_history_view_seconds", "histogram"),
+            ("knot_history_restore_total", "counter"),
         ];
         want.sort();
         let want: Vec<(String, &str)> = want.into_iter().map(|(n, k)| (n.to_owned(), k)).collect();
@@ -417,6 +422,23 @@ mod tests {
             "timeout",
         ] {
             assert!(views.contains(outcome), "{outcome} missing: {views}");
+        }
+        let restores = rec
+            .description("knot_history_restore_total")
+            .expect("described");
+        for outcome in [
+            "restored",
+            "fallback",
+            "unchanged",
+            "stale",
+            "unverified",
+            "too_large",
+            "apply_failed",
+            "busy",
+            "timeout",
+            "failed",
+        ] {
+            assert!(restores.contains(outcome), "{outcome} missing: {restores}");
         }
         let timeouts = rec
             .description("knot_history_replay_timeouts_total")

@@ -28,11 +28,30 @@ export const copy = {
   cantShow: "This version can't be shown.",
   restoreHere: "Restore here",
   restoring: "Restoring…",
-  restoreConfirm: "Replace the current content with this version? Formatting outside the canonical schema is not kept.",
-  restored: "Restored — your editor will refresh shortly.",
+  restoreConfirm:
+    "Bring the page back to this version? Changes made after it are undone, including edits made meanwhile to parts it removes. The restore shows in History.",
+  restored: "Restored.",
+  restoredFallback: "Restored. The whole page was replaced, so comments may have lost their place.",
+  restoreUnchanged: "The page already matches this version.",
+  restoreBusy: "The page kept changing while it was restored. Try again in a moment.",
+  /** 409 `restore.too_large` while "Restore as new page" shows. */
+  restoreTooLarge: "This page is too large to restore here. Restore this version as a new page instead.",
+  /** 409 `restore.too_large` while "Restore as new page" is hidden. */
+  restoreTooLargeNoCopy: "This page is too large to restore here.",
+  /** 409 `history.too_large`, from either restore. */
+  restoreVersionTooLarge: "This version is too large to restore.",
+  /** The timeline note of a restore that replaced the whole page. */
+  restoreFallbackNote: "The whole page was replaced; comments may have lost their place.",
   restoreFailed: "Restore failed",
   restoreMoved: "This entry changed while you were reading it. Check the new version and restore again.",
   restoreUnknown: "The restore may not have completed. Check the page before trying again.",
+  restoreAsNew: "Restore as new page",
+  restoringAsNew: "Creating page…",
+  restoredAsNew: "Created a page from this version.",
+  restoreAsNewFailed: "Couldn't create a page from this version.",
+  restoreAsNewForbidden: "You can't add a page next to this one.",
+  /** 408, 504 or no answer. */
+  restoreAsNewUnknown: "The page may have been created. Check the sidebar before trying again.",
   rebuilding: "History for this page is being rebuilt. Versions can be opened again when it's done.",
   gap: "Changes saved without an author",
   unknownAuthor: "Unknown author",

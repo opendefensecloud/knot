@@ -7,7 +7,8 @@
 //! - GET    /api/docs/{id}/access  who can see it, for the permissions dialog (any reader)
 //! - GET    /api/docs/{id}/audit   the page audit log and its export stats (editor+, also archived; `routes::api::audit`)
 //! - GET    /api/docs/{id}/history/entries/{eid}/view  a past version, rendered (editor+, also archived; `routes::api::history`)
-//! - POST   /api/docs/{id}/history/entries/{eid}/restore  replace the page with that version (editor+, not archived; `routes::api::history`)
+//! - POST   /api/docs/{id}/history/entries/{eid}/restore  revert the page to that version (editor+, not archived; `routes::api::history`)
+//! - POST   /api/docs/{id}/history/entries/{eid}/restore-as-new  body: {version_label, ended_at?}; copy that version right after it, as Duplicate (editor+ here and on the parent; `routes::api::history`)
 //! - POST   /api/docs/{id}/move   reparent / reorder
 //! - POST   /api/docs/{id}/duplicate  body: {include_subpages?}; copy right after it (editor+ here and on the parent)
 //! - DELETE /api/docs/{id}        move to the archive, with its subtree (editor+)
@@ -108,6 +109,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/docs/{id}/history/entries/{eid}/restore",
             post(crate::routes::api::history::restore_entry),
+        )
+        .route(
+            "/api/docs/{id}/history/entries/{eid}/restore-as-new",
+            post(crate::routes::api::history::restore_as_new),
         )
         .route(
             "/api/docs/{id}/history/{seq}/markdown",
@@ -266,7 +271,7 @@ async fn caller_doc_response(
 }
 
 /// [`caller_doc_response`] as a JSON answer with `status`.
-async fn doc_answer(
+pub(crate) async fn doc_answer(
     state: &AppState,
     ctx: &AuthContext,
     status: StatusCode,
@@ -782,6 +787,7 @@ async fn duplicate(
         doc_id,
         body.include_subpages,
         permit,
+        None,
     );
     match answer.await {
         Ok(Ok(top)) => doc_answer(&state, &ctx, StatusCode::CREATED, &top).await,
@@ -883,7 +889,7 @@ async fn move_to_subpage(
 /// `503 doc.duplicate_busy`: every duplicate permit stayed taken for the
 /// busy wait. A retry is worth it once a copy may have ended: after
 /// [`BUSY_WAIT`], the time a duplicate waits for a permit.
-fn duplicate_busy() -> Response {
+pub(crate) fn duplicate_busy() -> Response {
     let mut response = json_err(
         StatusCode::SERVICE_UNAVAILABLE,
         "doc.duplicate_busy",
@@ -895,7 +901,7 @@ fn duplicate_busy() -> Response {
     response
 }
 
-fn duplicate_error(e: DuplicateError) -> Response {
+pub(crate) fn duplicate_error(e: DuplicateError) -> Response {
     match e {
         DuplicateError::EditorRequired => {
             json_err(StatusCode::FORBIDDEN, "acl.editor_required", "")
@@ -1458,7 +1464,8 @@ async fn create_from_template_inline(
     }
 }
 
-async fn read_json<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, ()> {
+/// `req`'s body as JSON (at most 64 KiB); `Err` when it is not `T`.
+pub(crate) async fn read_json<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, ()> {
     let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024)
         .await
         .map_err(|_| ())?;

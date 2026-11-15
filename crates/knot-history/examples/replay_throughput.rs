@@ -1,6 +1,7 @@
 //! Page history M1.3, Task 5: replay throughput, the checkpoint policy and
 //! the doc-memory factor F that set `DEFAULT_HISTORY_REPLAY_MAX_BYTES`;
-//! M1.4, Task 3: the memory factors of a version view.
+//! M1.4, Task 3: the memory factors of a version view; M2, Task 2: the
+//! revert's memory factor and its time cap.
 //!
 //! ```text
 //! cargo run --release -p knot-history --example replay_throughput
@@ -51,6 +52,20 @@
 //!    page of the diff cap's size. Then (M1.4, Task 8) a baseline that may
 //!    be shifted, near 4 MiB: (h) its view and (i) its restore, each
 //!    through `view::state_input`, summarized apart from the others.
+//! 8. reverts (M2, Task 2): `revert::plan` on workload 6's two pages
+//!    grown to 4 MiB plus a session of 20 small rows, against the live
+//!    room's state: (a) to the version a quarter of the way in (the large
+//!    undo), (b) to the version before the session (the small undo), (c)
+//!    (a) by the whole-page replace (`skip_undo`), (d) to the head (the
+//!    unchanged check) and (c′) (a) with an undo that fails verification
+//!    and then the replace (`corrupt_undo`), input = the version's state
+//!    plus the live state: they set `view::REVERT_MEMORY_FACTOR`; then (e)
+//!    (a) and (c′) timed on pages scaled to 1×, 2× and 4× the memory cap at
+//!    the default replay cap, which set `view::REVERT_TIME_CAP_BYTES`; then
+//!    (f) a restore's replay with M2's finishes (`revert::target`,
+//!    `revert::copy_state`) on a session's window and the state of both
+//!    pages and on workload 7's shifted baseline, checked against
+//!    `PLAIN_MEMORY_FACTOR` and `SHIFTED_MEMORY_FACTOR`.
 //!
 //! The cap rule: the largest power of two at most min(the slower of
 //! workloads 1-2 × 2 s, (512 MiB − 256 MiB) ÷ (1 worker × F)), at most
@@ -69,9 +84,11 @@ use std::time::Instant;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use knot_crdt::{Engine, YrsEngine};
+use knot_history::revert::{self, RevertHooks, RevertKind, RevertOutcome, RevertTarget};
 use knot_history::view::{
-    BUILD_MEMORY_FACTOR, PLAIN_MEMORY_FACTOR, RenderHooks, VIEW_MEMORY_FACTOR, ViewInput, render,
-    state_input, view_max_input_bytes,
+    BUILD_MEMORY_FACTOR, PLAIN_MEMORY_FACTOR, REVERT_MEMORY_FACTOR, REVERT_TIME_CAP_BYTES,
+    RenderHooks, SHIFTED_MEMORY_FACTOR, VIEW_MEMORY_FACTOR, ViewInput, render,
+    revert_max_input_bytes, state_input, view_max_input_bytes,
 };
 use knot_history::{
     CHECKPOINT_FLOOR_BYTES, CheckpointKind, CheckpointWrite, Claims, EntryDraft, EntryKind,
@@ -1587,15 +1604,10 @@ fn view_factors() {
     shifted_baseline();
 }
 
-/// (h) A view and (i) a restore of a baseline that may be shifted (M1.4,
-/// Task 8), kept out of [`view_factors`]' maxima: workload 6's typing page
-/// grown to 4 MiB, plus `fixtures::overlapping_skips_as`'s `t0`, `t2` and
-/// `t3` by a client of its own (`t1` and `t2b` withheld), so its pending
-/// update holds overlapping Skips, encoded as yrs encodes a full state
-/// (`encode_state_as_update_v1`, which merges the pending update in at a
-/// shifted clock): what a room wrote before the knot-crdt fix. Both cut it
-/// to its trusted prefix through `view::state_input` before they replay.
-fn shifted_baseline() {
+/// [`shifted_baseline`]'s and workload 8 (f)'s shifted baseline: workload
+/// 6's typing page grown to 4 MiB with `fixtures::overlapping_skips_as`'s
+/// `t0`, `t2` and `t3` merged in as yrs encodes a full state.
+fn shifted_state() -> Vec<u8> {
     let page = GrownPage::new(Growth::Typing, 4 * MIB);
     let o = fixtures::overlapping_skips_as(0x7e57_0001);
     let doc = Doc::new();
@@ -1616,6 +1628,20 @@ fn shifted_baseline() {
         bytes.abs_diff(4 * MIB) * 20 <= 4 * MIB,
         "{bytes} bytes is not within 5 % of 4 MiB"
     );
+    state
+}
+
+/// (h) A view and (i) a restore of a baseline that may be shifted (M1.4,
+/// Task 8), kept out of [`view_factors`]' maxima: workload 6's typing page
+/// grown to 4 MiB, plus `fixtures::overlapping_skips_as`'s `t0`, `t2` and
+/// `t3` by a client of its own (`t1` and `t2b` withheld), so its pending
+/// update holds overlapping Skips, encoded as yrs encodes a full state
+/// (`encode_state_as_update_v1`, which merges the pending update in at a
+/// shifted clock): what a room wrote before the knot-crdt fix. Both cut it
+/// to its trusted prefix through `view::state_input` before they replay.
+fn shifted_baseline() {
+    let state = shifted_state();
+    let bytes = state.len();
 
     let input = state.clone();
     let h = measure(|| {
@@ -1689,6 +1715,483 @@ fn shifted_baseline() {
 }
 
 // ---------------------------------------------------------------------------
+// Workload 8: reverts (M2, Task 2)
+// ---------------------------------------------------------------------------
+
+/// `REVERT_TIMEOUT / 2`: what a whole plan at the time cap may take.
+const REVERT_PLAN_SECS: f64 = 5.0;
+
+/// The skip-GC state of `rows` through `through`, replayed from an empty
+/// doc (the genesis checkpoint): what a restore's target replay hands to
+/// `revert::target`.
+fn version_state(rows: &[DocUpdate], through: i64) -> Vec<u8> {
+    let mut r = Replayer::new(ReplayMode::KeepDeleted);
+    for row in rows.iter().take_while(|row| rev_of(row) <= through) {
+        let outcome = r.apply(&row.update_bytes).outcome;
+        assert_eq!(outcome, RowOutcome::Applied, "rev {}", rev_of(row));
+    }
+    r.encode_state()
+}
+
+/// Workload 6's page grown to `size`, then 20 small rows (one session), as
+/// a restore sees it: the live room's state and three versions.
+struct RevertPage {
+    /// The room's state after every row (GC, pending-free: the export).
+    live: Vec<u8>,
+    /// The version a quarter of the way into the rows, replayed from the
+    /// genesis checkpoint: reverting to it undoes most of the page.
+    quarter: RevertTarget,
+    /// The version before the last session (the checkpoint, before the 20
+    /// small rows): reverting to it undoes those rows only.
+    session: RevertTarget,
+    /// The version after every row: the live page already renders as it.
+    head: RevertTarget,
+}
+
+impl RevertPage {
+    fn new(growth: Growth, size: usize) -> RevertPage {
+        let mut page = GrownPage::new(growth, size);
+        for _ in 0..20 {
+            page.small_row(growth);
+        }
+        let rows = std::mem::take(&mut page.log.rows);
+        let live = page.ed.state();
+        let checkpoint_rev = page.checkpoint_rev;
+        let checkpoint_state = std::mem::take(&mut page.checkpoint_state);
+        drop(page);
+        let target = |state: Vec<u8>| revert::target(&state).expect("the version's target");
+        let quarter = target(version_state(&rows, (rows.len() as i64 / 4).max(1)));
+        let mut from_checkpoint = Replayer::from_state(ReplayMode::KeepDeleted, &checkpoint_state)
+            .expect("the checkpoint");
+        let session = target(from_checkpoint.encode_state());
+        for row in rows_in(&rows, checkpoint_rev, i64::MAX) {
+            let outcome = from_checkpoint.apply(&row.update_bytes).outcome;
+            assert_eq!(outcome, RowOutcome::Applied, "rev {}", rev_of(&row));
+        }
+        let head = target(from_checkpoint.encode_state());
+        RevertPage {
+            live,
+            quarter,
+            session,
+            head,
+        }
+    }
+}
+
+/// One measured plan: input (`target.state.len() + live.len()`), peak heap
+/// above the start (the returned update included) and wall time.
+struct RevertRun {
+    name: &'static str,
+    input: usize,
+    peak: usize,
+    secs: f64,
+}
+
+impl RevertRun {
+    fn factor(&self) -> f64 {
+        (self.input + self.peak) as f64 / self.input as f64
+    }
+
+    fn print(&self) {
+        println!(
+            "  {}: input {:.2} MiB, peak heap above start {:.2} MiB, F = (input + peak) / input {:.2}, {:.3} s",
+            self.name,
+            mib(self.input),
+            mib(self.peak),
+            self.factor(),
+            self.secs,
+        );
+    }
+}
+
+/// What a plan is expected to answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Expect {
+    Undo,
+    Fallback,
+    /// A fallback after an undo that ran and failed its verification.
+    FallbackAfterUnverifiedUndo,
+    Unchanged,
+}
+
+/// `revert::plan` of `target` against `live`, measured; panics unless it
+/// answers `expect`.
+fn plan_run(
+    name: &'static str,
+    target: &RevertTarget,
+    live: &[u8],
+    hooks: RevertHooks,
+    expect: Expect,
+) -> RevertRun {
+    let m = measure(|| revert::plan_traced(target, live, hooks));
+    let (result, trace) = m.value;
+    let got = match &result {
+        Ok(RevertOutcome::Unchanged) => Expect::Unchanged,
+        Ok(RevertOutcome::Revert {
+            kind: RevertKind::Undo,
+            ..
+        }) => Expect::Undo,
+        Ok(RevertOutcome::Revert {
+            kind: RevertKind::Fallback,
+            ..
+        }) if trace.undo_unverified.is_some() => Expect::FallbackAfterUnverifiedUndo,
+        Ok(RevertOutcome::Revert {
+            kind: RevertKind::Fallback,
+            ..
+        }) => Expect::Fallback,
+        Err(e) => panic!("{name}: {e} ({trace:?})"),
+    };
+    assert_eq!(got, expect, "{name}: {trace:?}");
+    drop(result);
+    RevertRun {
+        name,
+        input: target.state.len() + live.len(),
+        peak: m.peak,
+        secs: m.secs,
+    }
+}
+
+/// (a) the large undo, (b) the small undo, (c) the fallback alone, (d) the
+/// unchanged check and (c′) an undo that fails verification, then the
+/// fallback, on `page`.
+fn revert_cases(page: &RevertPage) -> Vec<RevertRun> {
+    let skip_undo = RevertHooks {
+        skip_undo: true,
+        ..RevertHooks::default()
+    };
+    let corrupt_undo = RevertHooks {
+        corrupt_undo: true,
+        ..RevertHooks::default()
+    };
+    let live = &page.live;
+    vec![
+        plan_run(
+            "(a) a quarter in: the large undo",
+            &page.quarter,
+            live,
+            RevertHooks::default(),
+            Expect::Undo,
+        ),
+        plan_run(
+            "(b) one session back: the small undo",
+            &page.session,
+            live,
+            RevertHooks::default(),
+            Expect::Undo,
+        ),
+        plan_run(
+            "(c) (a) by the whole-page replace",
+            &page.quarter,
+            live,
+            skip_undo,
+            Expect::Fallback,
+        ),
+        plan_run(
+            "(d) the unchanged check",
+            &page.head,
+            live,
+            RevertHooks::default(),
+            Expect::Unchanged,
+        ),
+        plan_run(
+            "(c′) (a), its undo unverified, then the replace",
+            &page.quarter,
+            live,
+            corrupt_undo,
+            Expect::FallbackAfterUnverifiedUndo,
+        ),
+    ]
+}
+
+/// (a) and (c′) of [`revert_cases`] only: the undo path and the slowest
+/// path a plan can take.
+fn timed_cases(page: &RevertPage) -> [RevertRun; 2] {
+    let corrupt_undo = RevertHooks {
+        corrupt_undo: true,
+        ..RevertHooks::default()
+    };
+    [
+        plan_run(
+            "(a) the large undo",
+            &page.quarter,
+            &page.live,
+            RevertHooks::default(),
+            Expect::Undo,
+        ),
+        plan_run(
+            "(c′) unverified undo, then the replace",
+            &page.quarter,
+            &page.live,
+            corrupt_undo,
+            Expect::FallbackAfterUnverifiedUndo,
+        ),
+    ]
+}
+
+/// (f) `Views::restore_input`'s work with M2's finishes: the replay,
+/// `encode_state`, drop, then `revert::target` (Restore here) or
+/// `revert::copy_state` (Restore as new page), measured as
+/// `PLAIN_MEMORY_FACTOR` and `SHIFTED_MEMORY_FACTOR` were (input = the
+/// version's input bytes, the finish's result held at the peak).
+fn restore_finish(name: &'static str, input: ViewInput, input_bytes: usize, copy: bool) -> ViewRun {
+    let m = measure(|| {
+        let replayer = match input {
+            ViewInput::State(bytes) => {
+                // As `Views::restore_input` does: a prefix replaces bytes
+                // that may be shifted, others are replayed as they are.
+                let bytes = if knot_history::replay::may_be_shifted(&bytes) {
+                    let prefix = state_input(&bytes).expect("the prefix");
+                    drop(bytes);
+                    prefix
+                } else {
+                    bytes
+                };
+                Replayer::from_state(ReplayMode::KeepDeleted, &bytes).expect("the state applies")
+            }
+            ViewInput::Window(w) => replay_window(w).expect("the window"),
+        };
+        let state = replayer.encode_state();
+        drop(replayer);
+        if copy {
+            (None, Some(revert::copy_state(&state).expect("the copy")))
+        } else {
+            (Some(revert::target(&state).expect("the target")), None)
+        }
+    });
+    drop(m.value);
+    ViewRun {
+        name,
+        input: input_bytes,
+        peak: m.peak,
+        secs: m.secs,
+    }
+}
+
+/// (f) on workload 6's page: a session's window (author B's session among
+/// the 20 small rows, as workload 7's (a)) and the page's state as a
+/// baseline, each with both finishes.
+fn restore_finishes(growth: Growth) -> Vec<ViewRun> {
+    let mut page = GrownPage::new(growth, 4 * MIB);
+    for _ in 0..20 {
+        page.small_row(growth);
+    }
+    let checkpoint_rev = page.checkpoint_rev;
+    let checkpoint_state = std::mem::take(&mut page.checkpoint_state);
+    let rows = std::mem::take(&mut page.log.rows);
+    drop(page);
+    let mut pass = one_pass(
+        checkpoint_state.clone(),
+        rows_in(&rows, checkpoint_rev, i64::MAX),
+    );
+    pass.checkpoint_rev = checkpoint_rev;
+    pass.built_rev = checkpoint_rev;
+    pass.snapshot_checked_rev = checkpoint_rev;
+    let out = run_pass(pass).expect("the pass");
+    let end_rev = out
+        .entries
+        .iter()
+        .find(|e| e.kind == EntryKind::Session && e.author == Some(author(1)))
+        .and_then(|e| e.end_rev)
+        .expect("author B's session");
+    drop(out);
+    let window_rows = rows_in(&rows, checkpoint_rev, end_rev);
+    let window_input = checkpoint_state.len() + bytes_of(&window_rows);
+    let window = || {
+        ViewInput::Window(WindowInput {
+            mode: ReplayMode::KeepDeleted,
+            checkpoint_state: checkpoint_state.clone(),
+            reapply: Vec::new(),
+            rows: window_rows.clone(),
+            gap_states: Vec::new(),
+            skip_revs: BTreeSet::new(),
+            end_rev,
+            merge_gap_at_end: false,
+            progress: Progress::default(),
+            hooks: ReplayHooks::default(),
+        })
+    };
+    let state = || ViewInput::State(checkpoint_state.clone());
+    let runs = vec![
+        restore_finish("(f) window, revert::target", window(), window_input, false),
+        restore_finish(
+            "(f) window, revert::copy_state",
+            window(),
+            window_input,
+            true,
+        ),
+        restore_finish(
+            "(f) state, revert::target",
+            state(),
+            checkpoint_state.len(),
+            false,
+        ),
+        restore_finish(
+            "(f) state, revert::copy_state",
+            state(),
+            checkpoint_state.len(),
+            true,
+        ),
+    ];
+    println!(
+        "== 8 (f). a restore's replay with M2's finishes: {}, 4 MiB",
+        growth.name()
+    );
+    for r in &runs {
+        println!(
+            "  {}: input {:.2} MiB, peak heap above start {:.2} MiB, F = (input + peak) / input {:.2}, {:.3} s",
+            r.name,
+            mib(r.input),
+            mib(r.peak),
+            r.factor(),
+            r.secs,
+        );
+    }
+    runs
+}
+
+/// (f) on workload 7's shifted baseline, through `view::state_input`.
+fn shifted_restore_finishes() -> Vec<ViewRun> {
+    let state = shifted_state();
+    let bytes = state.len();
+    let runs = vec![
+        restore_finish(
+            "(f) shifted baseline, revert::target",
+            ViewInput::State(state.clone()),
+            bytes,
+            false,
+        ),
+        restore_finish(
+            "(f) shifted baseline, revert::copy_state",
+            ViewInput::State(state),
+            bytes,
+            true,
+        ),
+    ];
+    println!(
+        "== 8 (f). a shifted baseline's restore with M2's finishes: {}, {:.2} MiB",
+        Growth::Typing.name(),
+        mib(bytes)
+    );
+    for r in &runs {
+        println!(
+            "  {}: input {:.2} MiB, peak heap above start {:.2} MiB, F = (input + peak) / input {:.2}, {:.3} s",
+            r.name,
+            mib(r.input),
+            mib(r.peak),
+            r.factor(),
+            r.secs,
+        );
+    }
+    runs
+}
+
+fn reverts() {
+    // (a)-(d) and (c′) on workload 6's two 4 MiB pages.
+    let mut factor = 0.0f64;
+    let mut ratio = Vec::new();
+    for growth in [Growth::Typing, Growth::Pastes] {
+        let page = RevertPage::new(growth, 4 * MIB);
+        println!(
+            "== 8. reverts: {}, 4 MiB; live {:.2} MiB, versions: a quarter in {:.2} MiB, one session back {:.2} MiB, the head {:.2} MiB",
+            growth.name(),
+            mib(page.live.len()),
+            mib(page.quarter.state.len()),
+            mib(page.session.state.len()),
+            mib(page.head.state.len()),
+        );
+        let runs = revert_cases(&page);
+        for r in &runs {
+            r.print();
+            factor = factor.max(r.factor());
+        }
+        let peak_of = |prefix: &str| {
+            runs.iter()
+                .find(|r| r.name.starts_with(prefix))
+                .map_or(0, |r| r.peak)
+        };
+        let (a, c, c2) = (peak_of("(a)"), peak_of("(c)"), peak_of("(c′)"));
+        println!(
+            "  (c′)'s peak {:.2} MiB against the larger of (a) and (c) {:.2} MiB and their sum {:.2} MiB",
+            mib(c2),
+            mib(a.max(c)),
+            mib(a + c),
+        );
+        ratio.push((growth, runs[0].input as f64 / page.live.len() as f64));
+    }
+    let f = factor.ceil() as u64;
+    let memory_cap = 4 * MIB as u64 * BUILD_MEMORY_FACTOR / f.max(BUILD_MEMORY_FACTOR);
+    println!(
+        "== 8. summary: largest F {factor:.2}, rounded up {f}: a memory cap of {:.2} MiB at the default 4 MiB replay cap (REVERT_MEMORY_FACTOR {REVERT_MEMORY_FACTOR}, REVERT_TIME_CAP_BYTES {:.2} MiB: revert_max_input_bytes(4 MiB) {:.2} MiB)",
+        mib(memory_cap as usize),
+        mib(REVERT_TIME_CAP_BYTES as usize),
+        mib(revert_max_input_bytes(4 * MIB as u64) as usize),
+    );
+
+    // (e) (a) and (c′) at 1×, 2× and 4× the memory cap.
+    let mut timed: BTreeMap<usize, Vec<(usize, f64)>> = BTreeMap::new();
+    for (growth, ratio) in ratio {
+        for k in [1usize, 2, 4] {
+            let live_size = (k as f64 * memory_cap as f64 / ratio) as usize;
+            let page = RevertPage::new(growth, live_size);
+            let runs = timed_cases(&page);
+            let input = runs[0].input;
+            println!(
+                "== 8 (e). reverts: {}, {k}× the memory cap: input {:.2} MiB ({:.2}× the cap)",
+                growth.name(),
+                mib(input),
+                input as f64 / memory_cap as f64,
+            );
+            for r in &runs {
+                r.print();
+            }
+            let slower = runs[0].secs.max(runs[1].secs);
+            timed.entry(k).or_default().push((input, slower));
+        }
+    }
+    // The largest input whose every page (and every smaller size) planned
+    // in under `REVERT_TIMEOUT / 2`, rounded down to a MiB.
+    let mut time_cap = None;
+    for (k, runs) in &timed {
+        if runs.iter().any(|(_, s)| *s >= REVERT_PLAN_SECS) {
+            println!("== 8 (e). at {k}× the memory cap a plan took {REVERT_PLAN_SECS} s or more");
+            break;
+        }
+        let input = runs.iter().map(|(i, _)| *i).min().expect("a run");
+        time_cap = Some(input / MIB * MIB);
+    }
+    match time_cap {
+        Some(cap) => println!(
+            "== 8 (e). summary: the time cap is {:.0} MiB (memory cap {:.2} MiB)",
+            mib(cap),
+            mib(memory_cap as usize)
+        ),
+        None => println!("== 8 (e). summary: no size planned within {REVERT_PLAN_SECS} s"),
+    }
+
+    // (f) the restore's replay with M2's finishes.
+    let mut plain = Vec::new();
+    for growth in [Growth::Typing, Growth::Pastes] {
+        plain.extend(restore_finishes(growth));
+    }
+    let shifted = shifted_restore_finishes();
+    let largest = |runs: &[ViewRun]| runs.iter().map(ViewRun::factor).fold(0.0f64, f64::max);
+    let (f_plain, f_shifted) = (largest(&plain), largest(&shifted));
+    println!(
+        "== 8 (f). summary: largest plain F {f_plain:.4} (PLAIN_MEMORY_FACTOR {PLAIN_MEMORY_FACTOR}: {}), largest shifted-baseline F {f_shifted:.4} (SHIFTED_MEMORY_FACTOR {SHIFTED_MEMORY_FACTOR}: {})",
+        if f_plain <= PLAIN_MEMORY_FACTOR as f64 {
+            "holds"
+        } else {
+            "exceeded"
+        },
+        if f_shifted <= SHIFTED_MEMORY_FACTOR as f64 {
+            "holds"
+        } else {
+            "exceeded"
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Workload 5: a row parked for good under typing
 // ---------------------------------------------------------------------------
 
@@ -1758,7 +2261,7 @@ fn parked_for_good() {
 
 // ---------------------------------------------------------------------------
 
-/// Runs every workload and derives the cap; with arguments (`1` to `7`),
+/// Runs every workload and derives the cap; with arguments (`1` to `8`),
 /// runs only those workloads.
 fn main() {
     let only: Vec<String> = std::env::args().skip(1).collect();
@@ -1778,6 +2281,7 @@ fn main() {
                     checkpoint_heavy(Growth::Pastes);
                 }
                 "7" => view_factors(),
+                "8" => reverts(),
                 other => panic!("no workload {other}"),
             }
         }
@@ -1795,6 +2299,7 @@ fn main() {
     }
     parked_for_good();
     view_factors();
+    reverts();
 
     let slower = t1.mib_per_sec.min(t2.mib_per_sec);
     let f = factors.iter().copied().fold(0.0f64, f64::max).ceil();

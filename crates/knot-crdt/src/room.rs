@@ -50,9 +50,20 @@
 //!   ([`crate::pending::check_reparks`]); when the check fails it is
 //!   withheld, and the pending content is persisted again as a row when it
 //!   has a faithful encoding (Ruling 9).
+//! - **Restore here** (page history M2): the revert is computed off the
+//!   actor (knot-history); the room only exports and applies.
+//!   `ExportForRevert` catches up and exports the pending-free state with
+//!   the room's `content_version`, a counter that one after-transaction
+//!   callback on the doc moves with every transaction that integrated or
+//!   deleted something (an edit past a clock gap included, which the state
+//!   vector does not show). `ApplyRevert` catches up again and applies the
+//!   revert, through the `ApplyUpdate` path, only when the version is still
+//!   the one the revert was planned on; otherwise it is refused as `Stale`
+//!   (or `NotCaughtUp`) and nothing is applied.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -295,6 +306,33 @@ pub enum Event {
         apply_token: Uuid,
         reply: oneshot::Sender<bool>,
     },
+    /// The page as a revert is planned on (Restore here): after a catch-up
+    /// on rows other replicas persisted, the doc's state without its pending
+    /// content (as `ExportState`), the room's `content_version` and its
+    /// content epoch ([`RevertBase`]). A catch-up that did not catch up (a
+    /// failed read, a rev gap) is reported as `caught_up: false`, never as
+    /// an error: the state is exported either way. `Err` only when the
+    /// state does not encode.
+    ExportForRevert(oneshot::Sender<Result<RevertBase, EngineError>>),
+    /// Apply a revert planned on the export whose `content_version` was
+    /// `expected_version`. The room catches up first; when that does not
+    /// catch up it answers [`RevertRefused::NotCaughtUp`], and when the
+    /// version moved since the export (an edit, a caught-up row, another
+    /// revert) [`RevertRefused::Stale`], each with nothing applied.
+    /// Otherwise the update goes through the `ApplyUpdate` path, with
+    /// `source` (`restore` or `restore_fallback`) and `meta`: Ruling 25's
+    /// pre-check, the nesting limit, persist before fan-out and eviction on
+    /// a failed persist; its refusal is [`RevertRefused::Apply`], and `reply`
+    /// carries the row's seq.
+    ApplyRevert {
+        update_bytes: Vec<u8>,
+        expected_version: u64,
+        by_user: Option<Uuid>,
+        source: knot_storage::UpdateSource,
+        /// The restore's row meta: ids and timestamps only.
+        meta: serde_json::Value,
+        reply: oneshot::Sender<Result<i64, RevertRefused>>,
+    },
     Shutdown,
     /// The room's log bookkeeping, for tests.
     #[cfg(test)]
@@ -308,6 +346,41 @@ pub enum Event {
     /// production path reaches.
     #[cfg(test)]
     FailCheck(i64),
+}
+
+/// What [`Event::ExportForRevert`] answers: the page a revert is planned on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevertBase {
+    /// The doc's state without its pending content
+    /// (`Engine::encode_state_as_update`).
+    pub state: Vec<u8>,
+    /// The room's `content_version` at the export, which
+    /// [`Event::ApplyRevert`] must find unchanged.
+    pub version: u64,
+    /// Whether the export's own catch-up caught up with the page's log.
+    pub caught_up: bool,
+    /// The room's content epoch (fixed for the room's life).
+    pub epoch: i32,
+}
+
+/// Why [`Event::ApplyRevert`] applied nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RevertRefused {
+    #[error("the page changed since its export")]
+    Stale,
+    #[error("the room could not catch up with the page's log")]
+    NotCaughtUp,
+    #[error("the revert was refused: {0}")]
+    Apply(String),
+}
+
+/// Whether a transaction on the room's doc changed its content: it
+/// integrated or deleted something (the engine's `changed` rule without its
+/// pending part). Never a state-vector comparison: yrs 0.27.3's doc state
+/// vector stops at a client's first Skip, so an edit integrated past a clock
+/// gap leaves it unchanged.
+fn content_changed(txn: &yrs::TransactionMut) -> bool {
+    !txn.insert_set().is_empty() || !txn.delete_set().is_empty()
 }
 
 /// What [`Event::Probe`] reports.
@@ -412,6 +485,11 @@ pub struct Room {
     /// The blocks the doc holds past a gap in their client's clock, which
     /// updates from outside are pre-checked against (Ruling 25).
     past_gap: PastGap,
+    /// How many transactions on the doc changed its content since the room
+    /// started ([`content_changed`]), counted by the after-transaction
+    /// callback `Room::start` registers on the doc: what
+    /// [`Event::ApplyRevert`] compares with its export's version.
+    content_version: Arc<AtomicU64>,
     /// Revs every re-park check refuses ([`Event::FailCheck`]).
     #[cfg(test)]
     fail_check: std::collections::BTreeSet<i64>,
@@ -596,6 +674,31 @@ impl Room {
             updates_since_snapshot: 0,
             last_apply_at: std::time::Instant::now(),
         };
+        // Every change to the doc from here on goes through a yrs
+        // transaction, so one keyed callback counts them all, whatever made
+        // them. Keyed, with no `yrs::Subscription` kept: without yrs's `sync`
+        // feature a `Subscription` is `!Send`, and the room is moved into
+        // `tokio::spawn` below; the callback lives as long as the doc, which
+        // the room never replaces.
+        let content_version = Arc::new(AtomicU64::new(0));
+        {
+            let version = content_version.clone();
+            booted
+                .doc
+                .inner()
+                .observe_after_transaction_with(
+                    "knot.content_version",
+                    move |txn: &mut yrs::TransactionMut| {
+                        if content_changed(txn) {
+                            version.fetch_add(1, Ordering::SeqCst);
+                        }
+                    },
+                )
+                // Only an open transaction on the doc refuses it, and the
+                // boot just built it: an `Err` is a defect, and swallowing
+                // it would leave every stale check passing.
+                .expect("a room's doc has no open transaction before its actor starts");
+        }
         let room = Self {
             doc_id: deps.doc_id,
             engine: deps.engine,
@@ -627,6 +730,7 @@ impl Room {
             withheld: None,
             reparked: None,
             past_gap: booted.past_gap,
+            content_version,
             #[cfg(test)]
             fail_check: std::collections::BTreeSet::new(),
         };
@@ -726,6 +830,18 @@ impl Room {
                             .encode_state_as_update(&self.doc, None)
                             .map(|bytes| (bytes, self.last_applied_seq));
                         let _ = reply.send(r);
+                    }
+                    Some(Event::ExportForRevert(reply)) => {
+                        let result = self.on_export_for_revert().await;
+                        let _ = reply.send(result);
+                    }
+                    Some(Event::ApplyRevert {
+                        update_bytes, expected_version, by_user, source, meta, reply,
+                    }) => {
+                        let result = self
+                            .on_apply_revert(update_bytes, expected_version, by_user, source, meta)
+                            .await;
+                        let _ = reply.send(result);
                     }
                     Some(Event::ReplaceWithMarkdown { update_bytes, by_user, source, meta, reply }) => {
                         let result = self.on_replace(update_bytes, by_user, source, meta).await;
@@ -1097,6 +1213,43 @@ impl Room {
             .map_err(MoveBlocksError::Persist)?;
         self.fan_out(&framed, None);
         Ok(seq)
+    }
+
+    /// `Event::ExportForRevert`: catch up, then export the pending-free
+    /// state with the version and the epoch it was read at.
+    async fn on_export_for_revert(&mut self) -> Result<RevertBase, EngineError> {
+        let caught_up = self.catch_up().await;
+        let state = self.engine.encode_state_as_update(&self.doc, None)?;
+        Ok(RevertBase {
+            state,
+            version: self.content_version.load(Ordering::SeqCst),
+            caught_up,
+            epoch: self.content_epoch,
+        })
+    }
+
+    /// `Event::ApplyRevert`: catch up, refuse a revert planned on a page
+    /// the room has left since (or could not catch up with), else apply it
+    /// as `Event::ApplyUpdate` applies an update.
+    async fn on_apply_revert(
+        &mut self,
+        update_bytes: Vec<u8>,
+        expected_version: u64,
+        by_user: Option<Uuid>,
+        source: knot_storage::UpdateSource,
+        meta: serde_json::Value,
+    ) -> Result<i64, RevertRefused> {
+        // A row another replica stored since the export moves the version
+        // here, so it is compared below.
+        if !self.catch_up().await {
+            return Err(RevertRefused::NotCaughtUp);
+        }
+        if self.content_version.load(Ordering::SeqCst) != expected_version {
+            return Err(RevertRefused::Stale);
+        }
+        self.on_apply_update(update_bytes, by_user, source, Some(meta))
+            .await
+            .map_err(|e| RevertRefused::Apply(e.to_string()))
     }
 
     /// Runs `mutate` in one transaction on the live doc and returns its
@@ -6019,6 +6172,846 @@ pub(crate) mod tests {
             1
         );
         assert!(drain(&mut peer_rx).is_empty(), "the row was fanned out");
+        shut_down(&h).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Restore here (page history M2): the room's `content_version`, the
+    // export a revert is planned on, and the apply that refuses a revert
+    // planned on a page the room has left since.
+    // -----------------------------------------------------------------------
+
+    use knot_history::revert::{self, RevertHooks, RevertKind, RevertOutcome, RevertTarget};
+
+    /// `Event::ExportForRevert`'s answer.
+    async fn export_for_revert(h: &RoomHandle) -> RevertBase {
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Event::ExportForRevert(tx)).await.unwrap();
+        rx.await.unwrap().expect("the state encodes")
+    }
+
+    /// The room's `content_version`, read through an export.
+    async fn version(h: &RoomHandle) -> u64 {
+        export_for_revert(h).await.version
+    }
+
+    /// Sends an `Event::ApplyRevert` and returns its reply.
+    async fn apply_revert_as(
+        h: &RoomHandle,
+        update_bytes: Vec<u8>,
+        expected_version: u64,
+        by_user: Option<Uuid>,
+        source: knot_storage::UpdateSource,
+        meta: serde_json::Value,
+    ) -> Result<i64, RevertRefused> {
+        let (reply, rx) = oneshot::channel();
+        h.tx.send(Event::ApplyRevert {
+            update_bytes,
+            expected_version,
+            by_user,
+            source,
+            meta,
+            reply,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+            .await
+            .expect("the room never answered the revert")
+            .expect("the room dropped the revert's reply")
+    }
+
+    /// [`apply_revert_as`] of a `restore` row by nobody.
+    async fn apply_revert(
+        h: &RoomHandle,
+        update_bytes: Vec<u8>,
+        expected_version: u64,
+    ) -> Result<i64, RevertRefused> {
+        apply_revert_as(
+            h,
+            update_bytes,
+            expected_version,
+            None,
+            knot_storage::UpdateSource::Restore,
+            serde_json::json!({ "target_entry_id": 1 }),
+        )
+        .await
+    }
+
+    /// A GC doc that applied `states` in order.
+    fn doc_of_states(states: &[&[u8]]) -> yrs::Doc {
+        use yrs::{Transact, Update, updates::decoder::Decode};
+        let doc = yrs::Doc::new();
+        for s in states {
+            doc.transact_mut()
+                .apply_update(Update::decode_v1(s).unwrap())
+                .unwrap();
+        }
+        doc
+    }
+
+    /// The page `states` render, as a revert's target and its verification
+    /// compare it ([`revert::rendered`]).
+    fn rendered_of(states: &[&[u8]]) -> Vec<u8> {
+        revert::rendered(&doc_of_states(states)).unwrap()
+    }
+
+    /// The room's page as a revert compares it.
+    async fn rendered_room(h: &RoomHandle) -> Vec<u8> {
+        rendered_of(&[&export(h).await])
+    }
+
+    /// The verified revert from `live` back to `version`.
+    fn planned(version: &RevertTarget, live: &[u8], hooks: RevertHooks) -> (Vec<u8>, RevertKind) {
+        match revert::plan(version, live, hooks).expect("a verified revert") {
+            RevertOutcome::Revert { update, kind, .. } => (update, kind),
+            RevertOutcome::Unchanged => panic!("the page already renders as the version"),
+        }
+    }
+
+    /// An update removing the first top-level block of the page `state`.
+    fn first_block_removed(state: &[u8]) -> Vec<u8> {
+        use yrs::{ReadTxn, Transact, XmlFragment};
+        let doc = doc_of_states(&[state]);
+        let frag = doc.get_or_insert_xml_fragment("default");
+        let sv = doc.transact().state_vector();
+        frag.remove_range(&mut doc.transact_mut(), 0, 1);
+        doc.transact().encode_diff_v1(&sv)
+    }
+
+    /// The decoded state vector of a join.
+    fn joined_state_vector(joined: &JoinState) -> yrs::StateVector {
+        use yrs::updates::decoder::Decode;
+        yrs::StateVector::decode_v1(&joined.state_vector).unwrap()
+    }
+
+    /// Joins a fresh connection and returns what it was sent with its
+    /// receiver.
+    async fn join_peer(h: &RoomHandle) -> (JoinState, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel(64);
+        let joined = join_with(h, Uuid::new_v4(), ConnHandle::new(tx), false).await;
+        (joined, rx)
+    }
+
+    /// Client 2's next edit on [`stuck_content_page`]'s booted doc, which
+    /// holds client 2's T2 ("c" at the start of paragraph B, 2#2) past the
+    /// gap 2#0..2#2: client 2, whose own doc holds its whole history (T1
+    /// "ab" at the end of B, 2#0..2#1, then T2), types "d" right after
+    /// "c" (2#3) and sends it against the room's clocks. Its one block
+    /// follows T2 in client 2's clock, so the room integrates it without
+    /// filling the gap: the room's state vector, which stops at the gap,
+    /// does not move.
+    fn past_gap_append() -> Vec<u8> {
+        use yrs::block::ClientID;
+        use yrs::{GetString, ReadTxn, Text, Transact, Update, updates::decoder::Decode};
+        let (paras, _) = skip_underflow_parts();
+        let c = yrs::Doc::with_client_id(2);
+        c.transact_mut()
+            .apply_update(Update::decode_v1(&paras).unwrap())
+            .unwrap();
+        let frag = c.get_or_insert_xml_fragment("default");
+        let b = {
+            let txn = c.transact();
+            let b = crate::test_fixtures::text_at(&frag, &txn, 1).expect("paragraph B's text");
+            assert_eq!(
+                b.get_string(&txn),
+                "x",
+                "fixture: B before client 2's edits"
+            );
+            b
+        };
+        b.insert(&mut c.transact_mut(), 1, "ab");
+        b.insert(&mut c.transact_mut(), 0, "c");
+        let room: yrs::StateVector = [
+            (
+                ClientID::new(1),
+                c.transact().state_vector().get(&ClientID::new(1)),
+            ),
+            (ClientID::new(2), 3),
+        ]
+        .into_iter()
+        .collect();
+        b.insert(&mut c.transact_mut(), 1, "d");
+        let update = c.transact().encode_diff_v1(&room);
+        let mut expected = yrs::IdSet::new();
+        expected.insert(yrs::ID::new(ClientID::new(2), 3), 1);
+        assert_eq!(
+            Update::decode_v1(&update).unwrap().insertions(true),
+            expected,
+            "fixture: the edit is 2#3 alone"
+        );
+        update
+    }
+
+    fn underflow_refusals(rec: &CountingRecorder, source: &str) -> u64 {
+        rec.counter(
+            "knot_room_updates_underflow_refused_total",
+            &[("source", source)],
+        )
+    }
+
+    /// Review Focus 1 (the content_version Ruling): every event that
+    /// changes the page moves the version, and nothing else does.
+    #[tokio::test(start_paused = true)]
+    async fn content_version_moves_with_every_change_and_only_then() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let log = Log::new();
+        log.push(1, 1, seed_paragraph(SEED_TEXT));
+        log.push(2, 2, task_page(41));
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let (conn, _rx) = join(&h).await;
+        let mut v = version(&h).await;
+        let moved = |what: &str, before: u64, after: u64| {
+            assert!(
+                after > before,
+                "{what} did not move the version ({before} → {after})"
+            );
+            after
+        };
+        let stayed = |what: &str, before: u64, after: u64| {
+            assert_eq!(after, before, "{what} moved the version");
+            after
+        };
+
+        send_edit(&h, conn, para(60, "inbound")).await;
+        v = moved("an inbound edit", v, version(&h).await);
+        send_edit(&h, conn, para(60, "inbound")).await;
+        v = stayed("an inbound resend of known content", v, version(&h).await);
+        h.tx.send(Event::AwarenessIn {
+            from: conn,
+            payload: vec![1, 2, 3],
+        })
+        .await
+        .unwrap();
+        v = stayed("an AwarenessIn", v, version(&h).await);
+
+        apply_update(&h, para(61, "applied"), None).await;
+        v = moved("an ApplyUpdate", v, version(&h).await);
+        apply_update(&h, para(61, "applied"), None).await;
+        v = stayed("an ApplyUpdate that changes nothing", v, version(&h).await);
+
+        server_edit(&h, ServerEdit::Task).await.expect("the task");
+        v = moved("a PatchTaskChecked", v, version(&h).await);
+
+        apply_suggestion(&h, replace_world("world"), None)
+            .await
+            .expect("the suggestion");
+        v = moved("an ApplySuggestion", v, version(&h).await);
+
+        // "hel" of the seed paragraph, which the suggestion left alone.
+        let move_out = |commit: crate::move_blocks::Commit| {
+            let h = &h;
+            async move {
+                let (reply, rx) = oneshot::channel();
+                h.tx.send(Event::MoveBlocksOut {
+                    start: seed_anchor(2, yrs::Assoc::After),
+                    end: seed_anchor(4, yrs::Assoc::Before),
+                    by_user: None,
+                    commit,
+                    reply,
+                })
+                .await
+                .unwrap();
+                rx.await.unwrap()
+            }
+        };
+        let refused: crate::move_blocks::Commit =
+            Box::new(|_| Box::pin(async { Err("the new page was refused".to_string()) }));
+        assert!(matches!(
+            move_out(refused).await,
+            Err(crate::move_blocks::MoveBlocksError::Refused(_))
+        ));
+        v = stayed(
+            "a MoveBlocksOut whose commit is refused",
+            v,
+            version(&h).await,
+        );
+        let stored: crate::move_blocks::Commit = Box::new(|_| {
+            Box::pin(async {
+                Ok(crate::move_blocks::Link {
+                    title: "T".into(),
+                    href: "knot://doc/x".into(),
+                    meta: serde_json::json!({}),
+                })
+            })
+        });
+        move_out(stored).await.expect("the move");
+        v = moved("a MoveBlocksOut that cuts a block", v, version(&h).await);
+
+        let e0 = export_for_revert(&h).await;
+        assert_eq!(e0.version, v);
+        server_edit(&h, ServerEdit::Replace)
+            .await
+            .expect("the replace");
+        let e1 = export_for_revert(&h).await;
+        v = moved("a ReplaceWithMarkdown", v, e1.version);
+
+        let target = revert::target(&e0.state).unwrap();
+        let (update, _) = planned(&target, &e1.state, RevertHooks::default());
+        apply_revert(&h, update.clone(), e1.version)
+            .await
+            .expect("the revert applies");
+        v = moved("an ApplyRevert that applies", v, version(&h).await);
+        assert_eq!(rendered_room(&h).await, target.json);
+        // The concurrent-restores Ruling: a second revert planned on the
+        // same export is planned again.
+        assert_eq!(
+            apply_revert(&h, update, e1.version).await,
+            Err(RevertRefused::Stale)
+        );
+        v = stayed("a stale ApplyRevert", v, version(&h).await);
+
+        // Another replica's row, with no bus message: the export's own
+        // catch-up reads it.
+        let p = until_probe(&h, "every own row is stored", |p| p.in_flight == 0).await;
+        let head = log.with(|s| s.rows.iter().filter_map(|r| r.rev).max().unwrap());
+        assert_eq!(p.applied_through_rev, head, "{p:?}");
+        let seq = log.with(|s| s.next_seq) + 1;
+        log.push(head + 1, seq, para(70, "other"));
+        let caught = export_for_revert(&h).await;
+        assert!(caught.caught_up);
+        moved("a row another writer appended", v, caught.version);
+        assert!(exported_page(&h).await.contains("other"));
+        assert_eq!(underflow_refusals(&rec, "inbound"), 0);
+        shut_down(&h).await;
+
+        // Past a gap: an edit the doc integrates after the T2 content it
+        // holds past the gap 2#0..2#2 leaves the state vector as it was and
+        // still moves the version.
+        let (paras, _) = skip_underflow_parts();
+        let (log, snapshots) = stuck_content_page(paras, Some(vec![1]));
+        assert_boot_holds_t2_past_the_gap(&log, &snapshots).await;
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let (sender, _sender_rx) = join(&h).await;
+        let (before, _) = join_peer(&h).await;
+        let v = version(&h).await;
+        let edit = past_gap_append();
+        send_edit(&h, sender, edit.clone()).await;
+        let after_v = version(&h).await;
+        assert_eq!(
+            underflow_refusals(&rec, "inbound"),
+            0,
+            "the pre-check refused it"
+        );
+        until("the edit is stored", || log.appended().len() == 1).await;
+        assert!(same_update(&log.appended()[0].bytes, &edit));
+        let (after, _) = join_peer(&h).await;
+        assert_eq!(
+            joined_state_vector(&after),
+            joined_state_vector(&before),
+            "fixture: the edit moved the state vector"
+        );
+        assert!(
+            exported_page(&h).await.contains("cdx"),
+            "{}",
+            exported_page(&h).await
+        );
+        moved("an edit integrated past a clock gap", v, after_v);
+        shut_down(&h).await;
+    }
+
+    /// Review Focus 1: a revert planned before an edit integrated past a
+    /// clock gap is stale, though the state vector did not move.
+    #[tokio::test(start_paused = true)]
+    async fn apply_revert_after_a_past_gap_edit_is_stale() {
+        let (paras, _) = skip_underflow_parts();
+        let (log, snapshots) = stuck_content_page(paras, Some(vec![1]));
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let (sender, _sender_rx) = join(&h).await;
+        let e = export_for_revert(&h).await;
+        let edit = past_gap_append();
+        send_edit(&h, sender, edit.clone()).await;
+        let (update, _) = planned(
+            &revert::target(&para(80, "version")).unwrap(),
+            &e.state,
+            RevertHooks::default(),
+        );
+        assert_eq!(
+            apply_revert(&h, update, e.version).await,
+            Err(RevertRefused::Stale)
+        );
+        until_probe(&h, "the edit is stored", |p| p.in_flight == 0).await;
+        let appended = log.appended();
+        assert_eq!(appended.len(), 1, "the revert was persisted");
+        assert!(same_update(&appended[0].bytes, &edit));
+        shut_down(&h).await;
+    }
+
+    /// A room holding pending content exports its state without it, and
+    /// the same version until something changes.
+    #[tokio::test(start_paused = true)]
+    async fn export_for_revert_is_the_pending_free_state_and_its_version() {
+        let (_, u2) = cross_client_parked();
+        let log = Log::new();
+        log.push(1, 1, para(41, "one"));
+        log.push(2, 2, u2);
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let p = probe(&h).await;
+        assert_eq!(p.parked_revs, vec![2], "precondition: u2 is parked");
+
+        let e = export_for_revert(&h).await;
+        assert!(e.caught_up);
+        assert_eq!(
+            e.state,
+            export(&h).await,
+            "not the engine's pending-free state"
+        );
+        assert!(
+            pend::claims(&measured_doc(&[&e.state])).is_none(),
+            "the export parks content"
+        );
+        assert!(!pend::parks_when_applied(&e.state));
+        assert_eq!(export_for_revert(&h).await.version, e.version);
+        assert_eq!(e.epoch, p.content_epoch);
+        shut_down(&h).await;
+    }
+
+    /// A revert is persisted as one row of its source, meta and author,
+    /// and fanned out only once that row is stored.
+    #[tokio::test(start_paused = true)]
+    async fn apply_revert_persists_before_fan_out_with_its_source_and_meta() {
+        let log = Log::new();
+        log.push(1, 1, para(41, "one"));
+        log.push(2, 2, para(42, "two"));
+        let snapshots = Arc::new(Stamps::default());
+        let (h, mut jobs, events, _done) = detached(&log, &snapshots, RARE).await;
+        let (joined, mut peer_rx) = join_peer(&h).await;
+        let e = export_for_revert(&h).await;
+        let update = first_block_removed(&e.state);
+        let user = Uuid::new_v4();
+        let meta = serde_json::json!({ "target_entry_id": 3 });
+
+        let reply = {
+            let h = RoomHandle {
+                tx: h.tx.clone(),
+                shutdown: h.shutdown.clone(),
+                revoked: h.revoked.clone(),
+                writer_done: h.writer_done.clone(),
+            };
+            let update = update.clone();
+            let meta = meta.clone();
+            tokio::spawn(async move {
+                apply_revert_as(
+                    &h,
+                    update,
+                    e.version,
+                    Some(user),
+                    knot_storage::UpdateSource::RestoreFallback,
+                    meta,
+                )
+                .await
+            })
+        };
+        let mut job = tokio::time::timeout(std::time::Duration::from_secs(10), jobs.recv())
+            .await
+            .expect("no job was handed to the writer")
+            .expect("the room ended");
+        assert_eq!(job.source, knot_storage::UpdateSource::RestoreFallback);
+        assert_eq!(job.meta, Some(meta));
+        assert_eq!(job.by_user_id, Some(user));
+        assert!(same_update(&job.bytes, &update));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            drain(&mut peer_rx).is_empty(),
+            "fanned out before it was stored"
+        );
+        assert!(!reply.is_finished(), "answered before it was stored");
+
+        job.persisted.take().unwrap().send(Ok(3)).unwrap();
+        acknowledge(&events, 3);
+        assert_eq!(reply.await.unwrap(), Ok(3));
+        let frames = drain(&mut peer_rx);
+        assert!(
+            frames.iter().any(|f| is_frame_of(f, &job.bytes)),
+            "the stored row was not fanned out"
+        );
+        let mut peer: Vec<Vec<u8>> = vec![joined.update.clone()];
+        peer.extend(frames.iter().map(|f| unwrap_frame(f)));
+        let peer: Vec<&[u8]> = peer.iter().map(Vec::as_slice).collect();
+        let room = export(&h).await;
+        assert_eq!(rendered_of(&peer), rendered_of(&[&room]));
+        assert_eq!(
+            state_vector(&measured_doc(&peer)),
+            state_vector(&measured_doc(&[&room]))
+        );
+        assert!(!exported_page(&h).await.contains("one"));
+        shut_down(&h).await;
+    }
+
+    /// Review Focus 1: a revert planned before an edit is refused, and
+    /// changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn apply_revert_with_a_stale_version_changes_nothing() {
+        let log = Log::new();
+        log.push(1, 1, para(41, "one"));
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let e = export_for_revert(&h).await;
+        apply_update(&h, para(42, "two"), None).await;
+        let before = export(&h).await;
+        let appended = log.appended().len();
+
+        let update = first_block_removed(&e.state);
+        assert_eq!(
+            apply_revert(&h, update, e.version).await,
+            Err(RevertRefused::Stale)
+        );
+        assert_eq!(export(&h).await, before, "the doc changed");
+        assert_eq!(log.appended().len(), appended, "the revert was persisted");
+        assert_eq!(appended, 1);
+        shut_down(&h).await;
+    }
+
+    /// Review Focus 1: a row another replica stored since the export is
+    /// caught up before the version is compared.
+    #[tokio::test(start_paused = true)]
+    async fn apply_revert_catches_up_first() {
+        let log = Log::new();
+        log.push(1, 1, para(41, "one"));
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let e = export_for_revert(&h).await;
+        log.push(2, 2, para(43, "other"));
+
+        let update = first_block_removed(&e.state);
+        assert_eq!(
+            apply_revert(&h, update, e.version).await,
+            Err(RevertRefused::Stale)
+        );
+        assert_eq!(probe(&h).await.applied_through_rev, 2);
+        let page = exported_page(&h).await;
+        assert!(page.contains("other") && page.contains("one"), "{page}");
+        assert!(log.appended().is_empty(), "the revert was persisted");
+        shut_down(&h).await;
+    }
+
+    /// Review Focus 1: a room stuck behind a rev gap applies no revert.
+    #[tokio::test(start_paused = true)]
+    async fn apply_revert_that_cannot_catch_up_is_not_caught_up() {
+        let log = Log::new();
+        log.push(1, 1, para(41, "one"));
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let e = export_for_revert(&h).await;
+        // A rev gap: rev 2 is not (yet) visible.
+        log.push(3, 3, para(43, "three"));
+        let before = export(&h).await;
+
+        let update = first_block_removed(&e.state);
+        assert_eq!(
+            apply_revert(&h, update, e.version).await,
+            Err(RevertRefused::NotCaughtUp)
+        );
+        assert_eq!(export(&h).await, before, "the doc changed");
+        assert_eq!(probe(&h).await.applied_through_rev, 1);
+        assert!(log.appended().is_empty(), "the revert was persisted");
+        shut_down(&h).await;
+    }
+
+    /// The `NotCaughtUp` Ruling: the export says when its catch-up stopped,
+    /// and still exports the pending-free state.
+    #[tokio::test(start_paused = true)]
+    async fn export_for_revert_says_when_it_could_not_catch_up() {
+        let log = Log::new();
+        log.push(1, 1, para(41, "one"));
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let e = export_for_revert(&h).await;
+        assert!(e.caught_up);
+        assert_eq!(e.state, export(&h).await);
+
+        log.push(3, 3, para(43, "three"));
+        let e = export_for_revert(&h).await;
+        assert!(!e.caught_up);
+        assert_eq!(e.state, export(&h).await);
+        assert!(!exported_page(&h).await.contains("three"));
+        shut_down(&h).await;
+    }
+
+    /// Review Focus 5 (the pending-export Ruling): on a room holding pending
+    /// content the revert shows exactly the target and parks nothing new;
+    /// the pending content shows again once its dependency arrives.
+    #[tokio::test(start_paused = true)]
+    async fn a_revert_on_a_room_with_pending_content_shows_the_target() {
+        let (u1, u2) = cross_client_parked();
+        let rows = [para(41, "one"), u2, para(42, "two")];
+        let log = Log::new();
+        for (rev, row) in (1..).zip(&rows) {
+            log.push(rev, rev, row.clone());
+        }
+        let snapshots = Arc::new(Stamps::default());
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let (conn, _conn_rx) = join(&h).await;
+        let (parked_before, mut peer_rx) = join_peer(&h).await;
+        let probed = probe(&h).await;
+        assert_eq!(probed.parked_revs, vec![2], "precondition: u2 is parked");
+
+        // The rows before the last visible edit ("two").
+        let version = {
+            let mut replay = knot_history::Replayer::new(knot_history::ReplayMode::KeepDeleted);
+            for row in &rows[..2] {
+                replay.apply(row);
+            }
+            revert::target(&replay.encode_state()).unwrap()
+        };
+        let e = export_for_revert(&h).await;
+        let (update, kind) = planned(&version, &e.state, RevertHooks::default());
+        println!("a revert on a room with pending content: {kind:?}");
+        let seq = apply_revert_as(
+            &h,
+            update,
+            e.version,
+            None,
+            kind.source(),
+            serde_json::json!({ "target_entry_id": 1 }),
+        )
+        .await
+        .expect("the revert applies");
+        assert!(seq > 0);
+        assert_eq!(rendered_room(&h).await, version.json);
+        let row = log.appended().last().cloned().expect("the revert's row");
+        assert_eq!(row.source, kind.source());
+        assert!(
+            drain(&mut peer_rx)
+                .iter()
+                .any(|f| is_frame_of(f, &row.bytes)),
+            "the revert was not fanned out"
+        );
+        let (parked_after, _) = join_peer(&h).await;
+        assert_eq!(probe(&h).await.parked_revs, probed.parked_revs);
+        assert_eq!(parked_after.pending.len(), parked_before.pending.len());
+        assert!(
+            parked_after
+                .pending
+                .iter()
+                .zip(&parked_before.pending)
+                .all(|(a, b)| same_update(a, b)),
+            "the parked rows changed"
+        );
+        assert_eq!(
+            parked_after.pending_for_readers,
+            parked_before.pending_for_readers
+        );
+
+        // u2's dependency arrives: what drains shows.
+        send_edit(&h, conn, u1).await;
+        let page = exported_page(&h).await;
+        assert!(
+            page.contains("front") && page.contains("back held"),
+            "{page}"
+        );
+        assert_eq!(probe(&h).await.parked_revs, Vec::<i64>::new());
+        shut_down(&h).await;
+    }
+
+    /// The two versions of [`a_revert_on_a_room_holding_blocks_past_a_gap_applies`].
+    #[derive(Debug, Clone, Copy)]
+    enum PastGapVersion {
+        /// The room's own export, then a paragraph added after it.
+        Export,
+        /// The log's rows up to rev 1: `t2_only` alone, whose dependency
+        /// is missing, so an empty page.
+        Rev1,
+    }
+
+    /// One case of [`a_revert_on_a_room_holding_blocks_past_a_gap_applies`]
+    /// on a fresh room.
+    async fn a_revert_past_a_gap(which: PastGapVersion, hooks: RevertHooks) {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let (paras, t2_only) = skip_underflow_parts();
+        let (log, snapshots) = stuck_content_page(paras, Some(vec![1]));
+        assert_boot_holds_t2_past_the_gap(&log, &snapshots).await;
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let (conn, _conn_rx) = join(&h).await;
+        let (_, mut peer_rx) = join_peer(&h).await;
+        let version = match which {
+            PastGapVersion::Export => {
+                let e0 = export_for_revert(&h).await;
+                send_edit(&h, conn, para(90, "added")).await;
+                until("the paragraph is stored", || log.appended().len() == 1).await;
+                revert::target(&e0.state).unwrap()
+            }
+            PastGapVersion::Rev1 => {
+                let mut replay = knot_history::Replayer::new(knot_history::ReplayMode::KeepDeleted);
+                replay.apply(&t2_only);
+                revert::target(&replay.encode_state()).unwrap()
+            }
+        };
+        let e = export_for_revert(&h).await;
+        let (update, kind) = planned(&version, &e.state, hooks);
+        println!("a revert past a gap, {which:?}, {hooks:?}: {kind:?}");
+        drain(&mut peer_rx);
+        apply_revert_as(
+            &h,
+            update,
+            e.version,
+            None,
+            kind.source(),
+            serde_json::json!({ "target_entry_id": 1 }),
+        )
+        .await
+        .expect("the revert applies");
+        assert_eq!(rendered_room(&h).await, version.json, "{which:?} {kind:?}");
+        assert_eq!(underflow_refusals(&rec, "apply_update"), 0);
+        assert_eq!(underflow_refusals(&rec, "inbound"), 0);
+        let row = log.appended().last().cloned().expect("the revert's row");
+        assert_eq!(row.source, kind.source());
+        assert!(
+            drain(&mut peer_rx)
+                .iter()
+                .any(|f| is_frame_of(f, &row.bytes)),
+            "the revert was not fanned out"
+        );
+        assert!(!h.shutdown.is_cancelled(), "the room was evicted");
+        shut_down(&h).await;
+    }
+
+    /// Review Focus 5: a planned, verified revert (undo and fallback) goes
+    /// through the room's export encoder and its past-gap pre-check on a
+    /// booted page that holds blocks past a gap.
+    #[tokio::test(start_paused = true)]
+    async fn a_revert_on_a_room_holding_blocks_past_a_gap_applies() {
+        let fallback = RevertHooks {
+            skip_undo: true,
+            ..RevertHooks::default()
+        };
+        for which in [PastGapVersion::Export, PastGapVersion::Rev1] {
+            for hooks in [RevertHooks::default(), fallback] {
+                a_revert_past_a_gap(which, hooks).await;
+            }
+        }
+    }
+
+    /// Ruling 25: a revert the past-gap pre-check refuses changes nothing
+    /// and keeps the room.
+    #[tokio::test(start_paused = true)]
+    async fn an_apply_revert_the_underflow_pre_check_refuses_changes_nothing() {
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let (paras, _) = skip_underflow_parts();
+        let (log, snapshots) = stuck_content_page(paras, Some(vec![1]));
+        let (_, resend, _) = skip_underflow_case();
+        let (h, _bus, _) = room_on_log(&log, &snapshots, RARE).await;
+        let before = export(&h).await;
+        let e = export_for_revert(&h).await;
+
+        let refused = apply_revert(&h, resend, e.version).await;
+        assert!(
+            matches!(refused, Err(RevertRefused::Apply(_))),
+            "{refused:?}"
+        );
+        assert_eq!(export(&h).await, before, "the doc changed");
+        assert!(log.appended().is_empty(), "the revert was persisted");
+        assert_eq!(underflow_refusals(&rec, "apply_update"), 1);
+        assert_eq!(version(&h).await, e.version);
+        assert!(!h.shutdown.is_cancelled(), "the room was evicted");
+        shut_down(&h).await;
+    }
+
+    /// A revert the store does not take evicts the room, which writes no
+    /// snapshot and fans nothing out (as `persist_failure_evicts_room`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revert_whose_persist_fails_evicts_the_room() {
+        let snapshots = Arc::new(CountingSnapshots::default());
+        let h =
+            spawn_suggestion_room_with(Uuid::new_v4(), Arc::new(FailingUpdates), snapshots.clone())
+                .await;
+        let (_conn, mut conn_rx) = join(&h).await;
+        while conn_rx.try_recv().is_ok() {}
+        let e = export_for_revert(&h).await;
+
+        let refused = apply_revert(&h, first_block_removed(&e.state), e.version).await;
+        assert!(
+            matches!(refused, Err(RevertRefused::Apply(_))),
+            "{refused:?}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.shutdown.cancelled())
+            .await
+            .expect("a persist failure did not evict the room");
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.tx.closed())
+            .await
+            .expect("the evicted room's actor did not end");
+        assert_eq!(
+            snapshots.inserts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the evicted room snapshotted the unpersisted revert"
+        );
+        let mut fanned_out = Vec::new();
+        while let Ok(frame) = conn_rx.try_recv() {
+            fanned_out.push(frame);
+        }
+        assert!(
+            fanned_out.is_empty(),
+            "a connection got the unpersisted revert: {fanned_out:?}"
+        );
+    }
+
+    /// The content_version Ruling: the callback lives in `Room::start`, so
+    /// a room built without a writer counts too, and it stays live past the
+    /// re-park `run` does right after start.
+    #[tokio::test(start_paused = true)]
+    async fn content_version_counts_from_room_start() {
+        use yrs::{ReadTxn, Transact, updates::encoder::Encode};
+        let log = Log::new();
+        log.push(1, 1, para(41, "one"));
+        let snapshots = Arc::new(Stamps::default());
+        let (h, mut jobs, _events, _done) = detached(&log, &snapshots, RARE).await;
+        let (conn, _rx) = join(&h).await;
+        let v = version(&h).await;
+        handed_over(&h, conn, para(42, "two"), &mut jobs).await;
+        assert!(version(&h).await > v, "an inbound edit did not move it");
+        shut_down(&h).await;
+
+        // A legacy snapshot whose own bytes hold u2's pending content, which
+        // no row carries: boot carries it, and `run` re-parks it at once.
+        let (_, u2) = cross_client_parked();
+        let three = para(3, "three");
+        let bytes = measured_doc(&[&u2, &three])
+            .inner()
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        assert!(pend::parks_when_applied(&bytes) && !pend::may_be_shifted(&bytes));
+        let log = Log::new();
+        log.push(1, 1, three);
+        let snapshots = Arc::new(Stamps::default());
+        *snapshots.serve.lock().unwrap() = Some(knot_storage::DocSnapshot {
+            doc_id: Uuid::nil(),
+            snapshot_seq: 1,
+            state_vector: state_vector(&measured_doc(&[&bytes])).encode_v1(),
+            state_bytes: bytes,
+            created_at: sqlx::types::chrono::Utc::now(),
+            snapshot_rev: Some(1),
+            epoch: Some(0),
+            pending_revs: None,
+            older_writer: false,
+        });
+        let boot = crate::hydrate::boot(
+            &YrsEngine,
+            log.as_ref(),
+            snapshots.as_ref(),
+            Uuid::nil(),
+            BootMode::Room,
+        )
+        .await
+        .unwrap();
+        assert!(!boot.carry.is_empty(), "precondition: boot carries u2");
+        let (h, mut jobs, _events, _done) = detached(&log, &snapshots, RARE).await;
+        let repark = tokio::time::timeout(std::time::Duration::from_secs(10), jobs.recv())
+            .await
+            .expect("no re-park")
+            .expect("the room ended");
+        assert_eq!(repark.meta, Some(serde_json::json!({ "repark": "legacy" })));
+        let (conn, _rx) = join(&h).await;
+        let v = version(&h).await;
+        handed_over(&h, conn, para(43, "four"), &mut jobs).await;
+        assert!(
+            version(&h).await > v,
+            "an inbound edit after the re-park did not move it"
+        );
         shut_down(&h).await;
     }
 }

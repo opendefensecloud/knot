@@ -87,7 +87,9 @@ async function decoration(mark: Locator): Promise<{ line: string; color: string 
 }
 
 test("a session's version shows its text, highlighted, and restores", async ({ page }) => {
-  test.setTimeout(120_000);
+  // The import and session entries can each take 60 s, and the restore
+  // entry waits for another builder pass.
+  test.setTimeout(180_000);
   await newDoc(page);
 
   const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
@@ -143,9 +145,75 @@ test("a session's version shows its text, highlighted, and restores", async ({ p
   await expect(doc.locator("ins.history-insert")).toHaveCount(0, { timeout: 15_000 });
   await expect(doc).toContainText(V1);
 
+  // A second tab on the same page. Both tabs carry a marker that a reload
+  // or a navigation would clear, so the restore must reach them as a
+  // live update.
+  const second = await page.context().newPage();
+  await second.goto(page.url());
+  const secondEditor = second.locator("[data-testid='editor-host'] .ProseMirror");
+  await expect(secondEditor).toContainText("Only this.", { timeout: 10_000 });
+  for (const p of [page, second]) {
+    await p.evaluate(() => {
+      (window as unknown as { __noReload?: number }).__noReload = 1;
+    });
+  }
+
   page.once("dialog", (d) => void d.accept());
   await page.getByTestId("history-restore").click();
+  for (const [p, ed] of [
+    [page, editor],
+    [second, secondEditor],
+  ] as const) {
+    await expect(ed).toContainText(V1, { timeout: 10_000 });
+    await expect(ed).not.toContainText("Only this.", { timeout: 10_000 });
+    expect(await p.evaluate(() => (window as unknown as { __noReload?: number }).__noReload)).toBe(
+      1,
+    );
+  }
+  await second.close();
+
+  // The restore is on the timeline.
+  await openHistory(page);
+  await waitForEntries(page, page.locator("[data-testid^='history-entry-'][data-kind='restore']"));
+});
+
+test("a version restores as a new page beside the original", async ({ page }) => {
+  test.setTimeout(120_000);
+  await newDoc(page);
+  const original = new URL(page.url()).pathname;
+
+  const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
+  await editor.click();
+  await page.keyboard.type(V1);
+  await page.waitForTimeout(500);
+
+  page.once("dialog", (d) => void d.accept());
+  await page.getByTestId("doc-import-md-input").setInputFiles({
+    name: "replacement.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from("# Replacement\n\nOnly this.\n"),
+  });
+  await expect(editor).toContainText("Only this.", { timeout: 10_000 });
+  await expect(editor).not.toContainText(V1, { timeout: 10_000 });
+
+  await openHistory(page);
+  const sessions = page.locator("[data-testid^='history-entry-'][data-kind='session']");
+  await waitForEntries(page, sessions);
+  await sessions.first().click();
+  await expect(page.getByTestId("history-version-doc")).toContainText(V1, { timeout: 15_000 });
+
+  await page.getByTestId("history-restore-as-new").click();
+  await page.waitForURL((url) => url.pathname.startsWith("/doc/") && url.pathname !== original, {
+    timeout: 30_000,
+  });
+  await expect(page.getByTestId("doc-title")).toHaveValue(/\(version of /, { timeout: 10_000 });
   await expect(editor).toContainText(V1, { timeout: 10_000 });
+  await expect(editor).not.toContainText("Only this.");
+
+  // The original is unchanged.
+  await page.goto(original);
+  await expect(editor).toContainText("Only this.", { timeout: 10_000 });
+  await expect(editor).not.toContainText(V1);
 });
 
 test("the drawer stacks on a narrow screen", async ({ page }) => {

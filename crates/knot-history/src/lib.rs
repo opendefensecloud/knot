@@ -16,6 +16,8 @@
 //!   two states by what a reader sees.
 //! - [`mod@pm_json`]: a page as y-tiptap's ProseMirror JSON, what the history
 //!   viewer shows (M1.4), and an entry's "Show changes" render on its diff.
+//! - [`revert`]: Restore here (M2): the verified update that brings a
+//!   live page back to a version, by yrs's undo or a whole-page replace.
 //! - [`view`]: a past version rendered for the viewer (M1.4), plain or
 //!   with the entry's own changes, the input caps that keep it within the
 //!   builder's memory rule, and the `Views` service that loads, bounds,
@@ -48,6 +50,7 @@ pub mod people;
 pub mod permits;
 pub mod pm_json;
 pub mod replay;
+pub mod revert;
 pub mod sessions;
 pub mod sizes;
 mod store;
@@ -81,6 +84,7 @@ pub use pm_json::{
     mark_name, placeholder, pm_json, pm_json_diff,
 };
 pub use replay::{ReplayError, ReplayMode, Replayer, RowEffect, RowOutcome};
+pub use revert::{RevertError, RevertHooks, RevertKind, RevertOutcome, RevertTarget};
 pub use sessions::{
     Contribution, ContributionKind, EntryDraft, EntryKind, Grouper, SEAL_MARGIN, SESSION_GAP,
     UnknownEntryKind,
@@ -89,10 +93,12 @@ pub use sizes::{
     HISTORY_TABLES, SIZE_LOCK_KEY, SIZE_SAMPLE_EVERY, sample_table_sizes, spawn_size_sampler,
 };
 pub use view::{
-    BUILD_MEMORY_FACTOR, PLAIN_MEMORY_FACTOR, PRINCIPAL_RENDERS, RESTORE_TIMEOUT, RenderError,
-    RenderHooks, RenderStage, Rendered, RenderedView, Restorable, SHIFTED_MEMORY_FACTOR, StageCell,
-    VIEW_CACHE_BYTES, VIEW_CACHE_TTL, VIEW_MEMORY_FACTOR, VIEW_PERMIT_WAIT, VIEW_TIMEOUT,
-    ViewError, ViewHooks, ViewInput, ViewLimits, Views, baseline_max_input_bytes, merge_gap_at_end,
-    render, render_staged, shows_changes, state_input, view_max_input_bytes,
+    BUILD_MEMORY_FACTOR, PLAIN_MEMORY_FACTOR, PRINCIPAL_RENDERS, PlanError, RESTORE_TIMEOUT,
+    RESTORES_PER_PRINCIPAL, REVERT_MEMORY_FACTOR, REVERT_MIN_PLAN_TIME, REVERT_TIME_CAP_BYTES,
+    REVERT_TIMEOUT, RenderError, RenderHooks, RenderStage, Rendered, RenderedView, Restorable,
+    RestorePermit, RestoreTicket, SHIFTED_MEMORY_FACTOR, StageCell, VIEW_CACHE_BYTES,
+    VIEW_CACHE_TTL, VIEW_MEMORY_FACTOR, VIEW_PERMIT_WAIT, VIEW_TIMEOUT, ViewError, ViewHooks,
+    ViewInput, ViewLimits, Views, baseline_max_input_bytes, merge_gap_at_end, render,
+    render_staged, revert_max_input_bytes, shows_changes, state_input, view_max_input_bytes,
 };
 pub use words::{WordCounts, count_words, entry_word_counts};

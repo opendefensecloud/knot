@@ -3,9 +3,17 @@
 //! GET  /api/docs/{doc_id}/history/entries/{eid}/view?changes=0|1
 //!                                              → a past version, rendered (M1.4)
 //! POST /api/docs/{doc_id}/history/entries/{eid}/restore?ended_at=<RFC 3339>
-//!                                              → replace the live doc with that
-//!                                                version, through Markdown (M1.4,
-//!                                                until M2's verified restore)
+//!                                              → revert the live doc in place to
+//!                                                that version: a verified CRDT
+//!                                                revert (M2, `history_restore`),
+//!                                                200 `{"outcome": …}`
+//! POST /api/docs/{doc_id}/history/entries/{eid}/restore-as-new
+//!      body `{"version_label": …, "ended_at"?: <RFC 3339>}`
+//!                                              → copy that version into a new
+//!                                                page right after it, as
+//!                                                Duplicate does (M2,
+//!                                                `crate::duplicate`), 201 with
+//!                                                the new page
 //!
 //! The snapshot routes before the timeline:
 //! GET  /api/docs/{doc_id}/history              → `[]` (it no longer lists snapshots)
@@ -16,11 +24,14 @@
 //! drawer whose list came from an old pod still previews and restores on
 //! a new pod during the upgrade, and the seq restore is the operator's
 //! workaround for a page without a restorable entry. No client of the
-//! release calls them; they go in the release after it.
+//! release calls them; they go in the release after it. The seq restore
+//! still replaces the page through the Markdown round trip
+//! (`markdown_round_trip`); the entry restore no longer does.
 
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
@@ -34,22 +45,31 @@ use chrono::{DateTime, Utc};
 use knot_crdt::{Engine, YrsEngine};
 use knot_docs::DocAccess;
 use knot_docs::acl::ResolveError;
-use knot_history::{Cursor, DEFAULT_LIMIT, MAX_LIMIT, ViewError};
+use knot_history::{Cursor, DEFAULT_LIMIT, MAX_LIMIT, PlanError, REVERT_MIN_PLAN_TIME, ViewError};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::{AuthContext, DocArchived, require_editor};
+use crate::auth::{AuthContext, DocArchived, EffectiveDocRole, require_editor};
+use crate::duplicate::VersionCopy;
+use crate::history_restore::{
+    LiveRoom, RESTORE_DEADLINE, RestoreFailure, restore_answer, revert_attempts,
+};
 use crate::http_error::json_err;
 
-/// How long an entry restore waits for the room to be acquired, take the
-/// replace and reply, together (Rulings: the permit wait, the restore's
-/// replay and this stay under the router's 30 s timeout). The seq
-/// restore waits without a bound, as before.
+/// How long an entry restore waits for each of its room calls: the room's
+/// acquire, each export and each apply, never past the restore's
+/// `RESTORE_DEADLINE` (`history_restore`). The seq restore waits without
+/// a bound, as before.
 pub(crate) const RESTORE_ROOM_WAIT: Duration = Duration::from_secs(8);
+
+/// Most characters a Restore as new page's `version_label` may have once
+/// trimmed: the client sends a formatted date and time.
+pub(crate) const VERSION_LABEL_MAX_CHARS: usize = 64;
 
 /// `GET /api/docs/{id}/history`: the snapshot list of the drawer before
 /// the timeline. It lists nothing (`[]`), behind its gates, so a 0.9.14
@@ -188,13 +208,16 @@ fn markdown_round_trip(state_bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(update_bytes)
 }
 
-/// `POST /api/docs/{id}/history/entries/{eid}/restore?ended_at=`: replaces
-/// the page's content with the version right after entry `eid`, through
-/// the Markdown round trip (the interim restore until M2). Editors and
-/// owners only; an archived page is refused by the middleware. When
-/// `ended_at` (the version the reader saw) is given and the entry has
-/// moved on since, nothing is sent: 409 `history.moved`. The query is read
-/// as pairs, so a bad or repeated `ended_at` is a JSON 400.
+/// `POST /api/docs/{id}/history/entries/{eid}/restore?ended_at=`: reverts
+/// the page in place to the version right after entry `eid` (M2's Restore
+/// here): a verified CRDT revert that changes only what differs, planned
+/// against the live room's export and applied only to the state it was
+/// planned on (`crate::history_restore`). Answers 200
+/// `{"outcome": "restored" | "fallback" | "unchanged"}`. Editors and owners
+/// only; an archived page is refused by the middleware. When `ended_at`
+/// (the version the reader saw) is given and the entry has moved on since,
+/// nothing is sent: 409 `history.moved`. The query is read as pairs, so a
+/// bad or repeated `ended_at` is a JSON 400.
 pub async fn restore_entry(
     State(state): State<AppState>,
     Path((doc_id, eid)): Path<(Uuid, String)>,
@@ -222,20 +245,38 @@ pub async fn restore_entry(
     let Some(views) = state.history_views.clone() else {
         return internal();
     };
+    let deadline = Instant::now() + RESTORE_DEADLINE;
+    // Every answer from here on is logged within the restore's span.
+    let span = tracing::info_span!("restore", %doc_id, entry_id);
+    let answer = |r| span.in_scope(|| restore_answer(r));
 
     // The principal: the person, the bot, or the user an API key acts for.
+    // One restore at a time per principal on this pod, held until the
+    // answer (the restore-permit Ruling); not counted when refused.
+    let _restoring = match views.restore_permit(ctx.user_id, deadline).await {
+        Ok(permit) => permit,
+        Err(e) => return view_error(&e),
+    };
+
     // `seen` is compared as an instant (the reader may write the offset
     // either way), before the replay and again on the entry it loaded.
     let restorable = match views
-        .restore_input(ctx.user_id, doc_id, entry_id, seen, markdown_round_trip)
+        .restore_target(ctx.user_id, doc_id, entry_id, seen, deadline)
         .await
     {
         Ok(r) => r,
-        Err(e) => {
+        Err(PlanError::TooSlow | PlanError::OverCap) => {
+            return answer(Err(RestoreFailure::TooLarge));
+        }
+        Err(PlanError::View(e)) => {
             if matches!(e, ViewError::Failed(_) | ViewError::Store(_)) {
                 tracing::error!(error = %e, %doc_id, entry_id, "history restore");
             }
             return view_error(&e);
+        }
+        Err(PlanError::Unverified(reason)) => {
+            tracing::warn!(%doc_id, entry_id, reason, "history restore target");
+            return answer(Err(RestoreFailure::Unverified));
         }
     };
 
@@ -244,15 +285,195 @@ pub async fn restore_entry(
         "target_rev": restorable.end_rev,
         "target_ended_at": restorable.ended_at.to_rfc3339(),
     });
-    send_replace(
-        &state,
+    // A plan with too little time left would be refused anyway; the room
+    // is not woken for it (the cancellation Ruling).
+    if deadline.saturating_duration_since(Instant::now()) < REVERT_MIN_PLAN_TIME {
+        return answer(Err(RestoreFailure::Busy));
+    }
+    let Some(rooms) = state.rooms_v2.clone() else {
+        return answer(Err(RestoreFailure::Failed("no room registry".into())));
+    };
+    let acquire = async move {
+        rooms
+            .acquire(doc_id)
+            .await
+            .map(|h| {
+                let tx = h.tx.clone();
+                (h, tx)
+            })
+            .map_err(|e| format!("{e:?}"))
+    };
+    let wait = RESTORE_ROOM_WAIT.min(deadline.saturating_duration_since(Instant::now()));
+    let room = match LiveRoom::acquire_within(acquire, wait).await {
+        Ok(room) => room,
+        Err(failure) => return answer(Err(failure)),
+    };
+
+    let target = Arc::new(restorable.value);
+    let ticket = &restorable.ticket;
+    let views = &views;
+    let plan = |live: Vec<u8>| {
+        let target = target.clone();
+        async move {
+            views
+                .plan_revert(ctx.user_id, ticket, target, live, deadline)
+                .await
+        }
+    };
+    let result = revert_attempts(
+        &room,
+        plan,
+        deadline,
+        restorable.content_epoch,
         doc_id,
         ctx.user_id,
-        restorable.value,
         meta,
-        Some(RESTORE_ROOM_WAIT),
     )
-    .await
+    .instrument(span.clone())
+    .await;
+    answer(result)
+}
+
+/// The body of a Restore as new page.
+#[derive(Deserialize)]
+struct RestoreAsNewRequest {
+    /// How the reader names the version, in the copy's title.
+    version_label: String,
+    /// The version the reader saw (RFC 3339); absent, the entry is copied
+    /// as it is now (the `ended_at` Ruling).
+    #[serde(default)]
+    ended_at: Option<String>,
+}
+
+/// `version_label` trimmed, when it is a label: not empty, at most
+/// [`VERSION_LABEL_MAX_CHARS`] characters, no control character.
+fn version_label(label: &str) -> Option<&str> {
+    let label = label.trim();
+    let fits = !label.is_empty() && label.chars().count() <= VERSION_LABEL_MAX_CHARS;
+    (fits && !label.chars().any(char::is_control)).then_some(label)
+}
+
+/// `POST /api/docs/{id}/history/entries/{eid}/restore-as-new` with
+/// `{"version_label", "ended_at"?}`: copies the version right after entry
+/// `eid` into a new page right after this one, titled "<title> (version of
+/// <label>)", through Duplicate (`crate::duplicate`, the restore-as-new
+/// Ruling): its checks and page quota first, then the version's replay
+/// (under the caller's restore permit, held until the answer), then a
+/// duplicate slot within what is left of [`RESTORE_DEADLINE`]. Answers 201
+/// with the new page, as Duplicate does. Editors and owners only; an
+/// archived page is refused (Duplicate's check).
+#[tracing::instrument(skip_all, name = "history.restore_as_new")]
+pub async fn restore_as_new(
+    State(state): State<AppState>,
+    Path((doc_id, eid)): Path<(Uuid, String)>,
+    req: Request,
+) -> Response {
+    use crate::routes::api::docs::{doc_answer, duplicate_busy, duplicate_error, read_json};
+
+    if let Some(r) = require_editor(&req) {
+        return r;
+    }
+    // Present: require_editor rejected the request otherwise.
+    let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
+        return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
+    };
+    let Some(role) = req.extensions().get::<EffectiveDocRole>().copied() else {
+        return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
+    };
+    let Ok(entry_id) = eid.parse::<i64>() else {
+        return bad_request("entry id");
+    };
+    let Ok(body) = read_json::<RestoreAsNewRequest>(req).await else {
+        return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
+    };
+    let Some(label) = version_label(&body.version_label) else {
+        return bad_request("version_label");
+    };
+    let seen = match body.ended_at.as_deref().map(DateTime::parse_from_rfc3339) {
+        None => None,
+        Some(Ok(at)) => Some(at.with_timezone(&Utc)),
+        Some(Err(_)) => return bad_request("ended_at"),
+    };
+    // Duplicate's answers before the replay: none of them needs it.
+    if let Err(e) = crate::duplicate::check(&state, &ctx, role.0, doc_id).await {
+        return duplicate_error(e);
+    }
+    if let Err(response) = crate::quota::enforce_pages(&state, &ctx, 1).await {
+        return response;
+    }
+    let Some(views) = state.history_views.clone() else {
+        return internal();
+    };
+    let deadline = Instant::now() + RESTORE_DEADLINE;
+    // One restore at a time per principal on this pod, in place or as a
+    // new page, held until the answer (the restore-permit Ruling).
+    let _restoring = match views.restore_permit(ctx.user_id, deadline).await {
+        Ok(permit) => permit,
+        Err(e) => return view_error(&e),
+    };
+    let version = match views
+        .restore_input_by(
+            ctx.user_id,
+            doc_id,
+            entry_id,
+            seen,
+            deadline,
+            knot_history::revert::copy_state,
+        )
+        .await
+    {
+        Ok(version) => version,
+        Err(e) => {
+            if matches!(e, ViewError::Failed(_) | ViewError::Store(_)) {
+                tracing::error!(error = %e, %doc_id, entry_id, "history restore as new");
+            }
+            return view_error(&e);
+        }
+    };
+    // After the replay, so no duplicate slot is held through a wait for a
+    // compute permit; within what is left of the deadline, so the copy
+    // starts before the router's timeout.
+    let wait = state
+        .duplicate_busy_wait
+        .min(deadline.saturating_duration_since(Instant::now()));
+    if wait.is_zero() {
+        return duplicate_busy();
+    }
+    let permit =
+        match tokio::time::timeout(wait, state.duplicate_permits.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "duplicate permits closed");
+                return internal();
+            }
+            Err(_) => return duplicate_busy(),
+        };
+    let copy = VersionCopy {
+        state: version.value,
+        entry_id,
+        at: version.ended_at,
+        content_epoch: version.content_epoch,
+        label: label.to_string(),
+    };
+    // On a task of its own, as Duplicate's: dropping this handler can't
+    // stop the copy halfway.
+    let answer = crate::duplicate::start(
+        state.clone(),
+        ctx.clone(),
+        role.0,
+        doc_id,
+        false,
+        permit,
+        Some(copy),
+    );
+    match answer.await {
+        Ok(Ok(top)) => doc_answer(&state, &ctx, StatusCode::CREATED, &top).await,
+        Ok(Err(e)) => duplicate_error(e),
+        Err(_) => {
+            tracing::error!("restore as new task ended without an answer");
+            internal()
+        }
+    }
 }
 
 /// Replaces `doc_id`'s content with `update_bytes` through its room, as a
