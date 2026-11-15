@@ -56,7 +56,9 @@ fn top(doc: &DocHandle) -> Vec<(String, Option<String>)> {
     let y = doc.inner();
     let txn = y.transact();
     let frag = txn.get_xml_fragment("default").expect("fragment");
-    let children = (0..frag.len(&txn)).filter_map(|i| frag.get(&txn, i)).collect();
+    let children = (0..frag.len(&txn))
+        .filter_map(|i| frag.get(&txn, i))
+        .collect();
     tags_of(&txn, children)
 }
 
@@ -81,7 +83,9 @@ fn first_cell(doc: &DocHandle) -> Vec<(String, Option<String>)> {
     let row = first_el(&table);
     // The header row's cell holds the marker in these tests.
     let cell = first_el(&row);
-    let children = (0..cell.len(&txn)).filter_map(|i| cell.get(&txn, i)).collect();
+    let children = (0..cell.len(&txn))
+        .filter_map(|i| cell.get(&txn, i))
+        .collect();
     tags_of(&txn, children)
 }
 
@@ -110,14 +114,20 @@ fn toc_without_attribute_is_bare_marker() {
 #[test]
 fn toc_depth_writes_comment() {
     let md = markdown(&doc_with_toc(Some(Any::from("2"))));
-    assert!(md.contains("\n<!-- knot:toc maxLevel=2 -->\n[[_TOC_]]\n"), "{md}");
+    assert!(
+        md.contains("\n<!-- knot:toc maxLevel=2 -->\n[[_TOC_]]\n"),
+        "{md}"
+    );
 }
 
 #[test]
 fn toc_depth_from_the_editor_is_a_number() {
     // The editor stores attributes as JSON numbers.
     let md = markdown(&doc_with_toc(Some(Any::Number(2.0))));
-    assert!(md.contains("<!-- knot:toc maxLevel=2 -->\n[[_TOC_]]\n"), "{md}");
+    assert!(
+        md.contains("<!-- knot:toc maxLevel=2 -->\n[[_TOC_]]\n"),
+        "{md}"
+    );
 }
 
 #[test]
@@ -162,7 +172,10 @@ fn toc_in_table_cell_round_trips() {
     let doc = parse(src);
     assert_eq!(first_cell(&doc), vec![toc("1")]);
     let once = markdown(&doc);
-    assert!(once.contains("<!-- knot:toc maxLevel=1 --> [[_TOC_]]"), "{once}");
+    assert!(
+        once.contains("<!-- knot:toc maxLevel=1 --> [[_TOC_]]"),
+        "{once}"
+    );
     let again = parse(&once);
     assert_eq!(first_cell(&again), vec![toc("1")]);
     assert_eq!(markdown(&again), once);

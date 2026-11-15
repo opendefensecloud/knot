@@ -8,8 +8,8 @@ pub mod remap;
 pub mod schema;
 pub mod slug;
 pub mod tasks;
-pub mod toc;
 pub mod to_markdown;
+pub mod toc;
 
 pub use to_markdown::{SerError, serialise, serialise_reporting, serialise_with_report};
 

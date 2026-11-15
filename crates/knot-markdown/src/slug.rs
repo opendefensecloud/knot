@@ -39,5 +39,9 @@ fn base_slug(title: &str) -> String {
         })
         .collect();
     let joined = kept.split_whitespace().collect::<Vec<_>>().join("-");
-    if joined.is_empty() { "section".to_owned() } else { joined }
+    if joined.is_empty() {
+        "section".to_owned()
+    } else {
+        joined
+    }
 }
