@@ -20,10 +20,13 @@ const PAGES = [
 ];
 
 let cleanup: () => void = () => {};
+/** The Y.Doc of the editor `mount` made last, to play a collaborator. */
+let currentDoc: Y.Doc;
 afterEach(() => cleanup());
 
 function mount(pageLinks: Partial<PageLinkOptions> = {}) {
   const ydoc = new Y.Doc();
+  currentDoc = ydoc;
   const awareness = new Awareness(ydoc);
   const element = document.createElement("div");
   document.body.appendChild(element);
@@ -179,5 +182,39 @@ describe("[[ page links", () => {
     expect(editor.state.selection.from).toBe(caret);
     press(editor, "Tab");
     expect(editor.state.selection.$from.node(-1).textContent).toBe("Urlaubsplanung ");
+  });
+
+  it("ends at ]] so Enter after a closed [[…]] makes a new line", async () => {
+    const createSubpage = vi.fn(() => Promise.resolve({ id: "n", title: "Neu" }));
+    const editor = mount({ createSubpage });
+    typeText(editor.view, "Siehe [[Urlaub]] danach");
+    await tick();
+    expect(popup()).toBeNull();
+    press(editor, "Enter");
+    await tick();
+    expect(createSubpage).not.toHaveBeenCalled();
+  });
+
+  it("links in place when a collaborator edits earlier in the page meanwhile", async () => {
+    let resolve: (v: { id: string; title: string }) => void = () => {};
+    const createSubpage = vi.fn(() => new Promise<{ id: string; title: string }>((r) => (resolve = r)));
+    const editor = mount({ listPages: () => Promise.resolve([]), createSubpage });
+    typeText(editor.view, "Oben");
+    editor.commands.splitBlock();
+    typeText(editor.view, "[[Neu");
+    await tick();
+    press(editor, "Enter");
+
+    // A remote change: text inserted at the start of the first paragraph.
+    const remote = new Y.Doc();
+    Y.applyUpdate(remote, Y.encodeStateAsUpdate(currentDoc));
+    const first = remote.getXmlFragment("default").get(0) as Y.XmlElement;
+    (first.get(0) as Y.XmlText).insert(0, "Bob: ");
+    Y.applyUpdate(currentDoc, Y.encodeStateAsUpdate(remote, Y.encodeStateVector(currentDoc)));
+
+    resolve({ id: "n", title: "Neu" });
+    await tick();
+    expect(editor.state.doc.child(0).textContent).toBe("Bob: Oben");
+    expect(editor.state.doc.child(1).textContent).toBe("Neu ");
   });
 });

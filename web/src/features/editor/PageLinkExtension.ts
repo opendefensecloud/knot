@@ -28,6 +28,10 @@ export type PageLinkOptions = {
 };
 
 const TRIGGER = "[[";
+const CLOSE = "]]";
+
+/** The picker's suggestion state: where `[[query` stands right now. */
+const PAGE_LINK_KEY = new PluginKey("knotPageLinkSuggestion");
 
 type Range = { from: number; to: number };
 
@@ -187,9 +191,19 @@ export const PageLinkExtension = Extension.create<PageLinkOptions>({
         const created = await opts.createSubpage(title);
         if (!created || editor.isDestroyed) return;
         const { doc, selection } = editor.state;
+        // A collaborator's edit replaces the whole document under y-tiptap,
+        // so `range` may be stale; the suggestion plugin has recomputed
+        // where `[[query` stands now.
+        const live = PAGE_LINK_KEY.getState(editor.state) as { active?: boolean; range?: Range; text?: string } | undefined;
         const stillThere = range.to <= doc.content.size && doc.textBetween(range.from, range.to) === typed;
-        const at = stillThere ? range : { from: selection.from, to: selection.from };
+        const at = live?.active && live.range && live.text === typed
+          ? live.range
+          : stillThere
+            ? range
+            : { from: selection.from, to: selection.from };
         insertDocLink(editor, at, created.id, created.title, false);
+      } catch {
+        // The caller reports its own failures; a throw leaves the text.
       } finally {
         popup.busy = false;
       }
@@ -198,10 +212,15 @@ export const PageLinkExtension = Extension.create<PageLinkOptions>({
     return [
       Suggestion<PageLinkItem>({
         editor: this.editor,
-        pluginKey: new PluginKey("knotPageLinkSuggestion"),
+        pluginKey: PAGE_LINK_KEY,
         char: TRIGGER,
         allowSpaces: true,
-        allow: ({ state, range }) => allowedHere(state, range),
+        // With spaces allowed the query would run to the end of the line, so
+        // `[[Urlaub]] danach` + Enter would create "Urlaub]] danach". A
+        // typed `]]` closes the picker instead.
+        allow: ({ state, range }) =>
+          allowedHere(state, range)
+          && !state.doc.textBetween(range.from, range.to).slice(TRIGGER.length).includes(CLOSE),
         items: async ({ query }) => {
           const pages = await opts.listPages();
           const items: PageLinkItem[] = pageLinkCandidates(pages, query, opts.currentDocId).map((page) => ({

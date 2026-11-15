@@ -30,9 +30,9 @@ import { isEditModeShortcut } from "../docs/editMode";
 import { stickyCoverBottom } from "../docs/readingAnchor";
 import { workspaceApi } from "../workspace/workspace.api";
 import { docsApi } from "../docs/docs.api";
-import { notifyFailure } from "../../lib/limitErrors";
 import { SELECTION_FLOAT_WIDTH, computeAddCommentPos } from "./addCommentPos";
 import { createExtensions } from "./extensions";
+import { subpageCreator } from "./pageLinkCreate";
 import {
   type HighlightedComment,
   refreshHighlights,
@@ -367,16 +367,11 @@ function EditorBody({
           currentDocId: docId,
           createSubpage: role === "viewer"
             ? null
-            : async (title) => {
-              const r = await docsApi.create({ title, parent_id: docId });
-              if ("error" in r) {
-                notifyFailure(notify, r.error, "Couldn't create the page.");
-                return null;
-              }
-              await qc.invalidateQueries({ queryKey: ["docs"] });
-              const created = r.ok as { id: string; title: string };
-              return { id: created.id, title: created.title };
-            },
+            : subpageCreator(docId, {
+              create: (body) => docsApi.create(body),
+              refreshDocs: () => void qc.invalidateQueries({ queryKey: ["docs"] }),
+              notify,
+            }),
         },
       }),
       editable: canEdit,
