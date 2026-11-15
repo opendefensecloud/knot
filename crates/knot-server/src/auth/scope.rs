@@ -80,8 +80,9 @@ pub const SUBTREE_DENIED: &[&str] = &[
 
 /// S10: routes open to a subtree key, each with why that is safe. Every
 /// `/api` route path is in SUBTREE_DENIED or has a row here (tested). Rows
-/// carry the method: a method added to a route later stays closed to subtree
-/// keys until listed (an integration test pins this against the real router).
+/// carry the method. The list is an allow-list enforced at runtime (fail
+/// closed): `scope_mw` refuses a subtree key on any route or method not
+/// listed, and an integration test pins the rows against the real router.
 pub const SUBTREE_OK: &[(Method, &str)] = &[
     // Resolved through the doc ACL (route layer or handler), which masks
     // everything outside the root. Destinations are checked separately.
@@ -267,14 +268,27 @@ pub fn required_scope(method: &Method, matched: &str) -> Scope {
         .unwrap_or_else(|| method_default(method))
 }
 
-/// Whether `method` on the route template `matched` refuses API keys. axum
-/// answers HEAD with the GET handler, so a GET row covers HEAD as well.
-pub fn session_only(method: &Method, matched: &str) -> bool {
-    let method = if method == Method::HEAD {
+/// axum answers HEAD with the GET handler, so HEAD is looked up as GET.
+fn head_as_get(method: &Method) -> &Method {
+    if method == Method::HEAD {
         &Method::GET
     } else {
         method
-    };
+    }
+}
+
+/// Whether a key with a scope root may call `method` on `matched`: only the
+/// rows of [`SUBTREE_OK`] (an allow-list, so a route or method added later
+/// is refused until listed).
+fn subtree_ok(method: &Method, matched: &str) -> bool {
+    let method = head_as_get(method);
+    SUBTREE_OK.iter().any(|(m, p)| m == method && *p == matched)
+}
+
+/// Whether `method` on the route template `matched` refuses API keys. axum
+/// answers HEAD with the GET handler, so a GET row covers HEAD as well.
+pub fn session_only(method: &Method, matched: &str) -> bool {
+    let method = head_as_get(method);
     SESSION_ONLY
         .iter()
         .any(|(m, p)| m == method && *p == matched)
@@ -313,7 +327,7 @@ pub async fn scope_mw(req: Request<Body>, next: Next) -> Response {
         .extensions()
         .get::<AuthContext>()
         .is_some_and(|ctx| ctx.root_doc_id.is_some());
-    if has_root && matched.is_some_and(|m| SUBTREE_DENIED.contains(&m)) {
+    if has_root && matched.is_some_and(|m| SUBTREE_DENIED.contains(&m) || !subtree_ok(&method, m)) {
         tracing::info!(
             %key_id,
             %method,
@@ -624,6 +638,10 @@ mod tests {
     }
 
     fn keyed(routes: Router, scopes: &[&str]) -> Router {
+        keyed_with_root(routes, scopes, None)
+    }
+
+    fn keyed_with_root(routes: Router, scopes: &[&str], root_doc_id: Option<Uuid>) -> Router {
         let scopes =
             Scopes::from_names(&scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
         routes
@@ -635,7 +653,7 @@ mod tests {
                         user_id: Uuid::nil(),
                         workspace_id: Uuid::nil(),
                         role: WorkspaceRole::Editor,
-                        root_doc_id: None,
+                        root_doc_id,
                     });
                     req.extensions_mut().insert(ApiPrincipal {
                         key_id: Uuid::nil(),
@@ -778,6 +796,40 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(logs.text(), "");
+    }
+
+    /// S10: a route or method outside SUBTREE_OK is refused for a key with a
+    /// root, at runtime; a key without one reaches the handler.
+    #[tokio::test]
+    async fn subtree_key_is_refused_outside_subtree_ok() {
+        let routes = || Router::new().route("/api/not-listed", post(|| async { "ran" }));
+        let (status, v) = call(
+            keyed_with_root(routes(), &["create"], Some(Uuid::nil())),
+            "/api/not-listed",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(v["error"]["code"], "api_key.subtree_denied");
+        let (status, _) = call(keyed(routes(), &["create"]), "/api/not-listed").await;
+        assert_eq!(status, StatusCode::OK);
+        // A listed row passes; the same path with another method does not.
+        let listed = || {
+            Router::new().route(
+                "/api/docs",
+                post(|| async { "ran" })
+                    .get(|| async { "ran" })
+                    .delete(|| async { "ran" }),
+            )
+        };
+        let root = Some(Uuid::nil());
+        let (status, _) = call(keyed_with_root(listed(), &["create"], root), "/api/docs").await;
+        assert_eq!(status, StatusCode::OK);
+        let req = request(Method::DELETE, "/api/docs");
+        let resp = keyed_with_root(listed(), &["delete"], root)
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

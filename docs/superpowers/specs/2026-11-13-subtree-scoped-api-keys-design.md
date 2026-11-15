@@ -128,7 +128,7 @@ root with `403 api_key.subtree_denied`:
 | `GET /api/notifications`, `GET /api/notifications/unread_count`, `POST /api/notifications/read` | the user's inbox; doc-less notifications pass the visibility filter, and `read` checks no ACL at all |
 | `POST /api/whats-new/seen` | changes the user's state |
 
-`SUBTREE_OK` (rows of method and route template) lists the rest, each with a one-line reason: every
+`SUBTREE_OK` (rows of method and route template; an allow-list checked at runtime) lists the rest, each with a one-line reason: every
 `/api/docs/{id}/…`, `/api/blobs/{id}`, `/api/boards/{id}…` and
 `/api/short-links/{code}` route (resolved through the doc ACL), `GET
 /api/docs` (tree, filtered by `Visibility`), `GET /api/search` and `GET
@@ -193,11 +193,14 @@ refusals (`key_id`, method, route template).
   page is not named), and `within_restricted` / `/access` may reveal that a
   page above the root is restricted. Accepted: those grants govern the pages
   inside.
-- **`SUBTREE_OK` is keyed by method** (`(Method, &str)`), so a method added to
-  an open route later stays closed to subtree keys until listed. The
-  integration test `subtree_ok_rows_match_the_real_router_methods` pins it:
-  every unlisted method on a listed path must answer 405, every listed one
-  must not.
+- **`SUBTREE_OK` is an allow-list enforced at runtime** (fail-closed),
+  keyed by method (`(Method, &str)`): `scope_mw` refuses a key with a root
+  on any route or method without a row (`403 api_key.subtree_denied`), so a
+  method added to an open route later stays closed until listed. The
+  integration test `subtree_ok_rows_match_the_real_router_methods` pins the
+  table against the router: with an unscoped key every unlisted method on a
+  listed path must answer 405 and every listed one must not; with a subtree
+  key every unlisted one is `subtree_denied` and no listed one is.
 
 ## Documentation
 
