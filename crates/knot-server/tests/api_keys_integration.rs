@@ -335,6 +335,18 @@ async fn bot_ownership_guards() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"]["code"], "bot.restricted_forbidden", "{body}");
+    // So is restoring a version of it as a new page, before any replay:
+    // `inner` has no entry 1, so a replay would answer 404.
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{inner}/history/entries/1/restore-as-new"),
+        Some(serde_json::json!({"version_label": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "bot.restricted_forbidden", "{body}");
 
     // Restricting a page: no key may, and a bot has nothing but keys (the
     // bot guard behind it is pinned in the handler's own tests).
@@ -2435,8 +2447,10 @@ async fn every_scope_override_matches_a_real_route() {
 }
 
 /// Bots view and restore history entries under their page role, as
-/// people do (Rulings): a bot Editor's key with `read` and `update`
-/// reaches both handlers, which answer for the missing entry.
+/// people do (Rulings): a bot Editor's key with `read`, `update` and
+/// `create` reaches the three handlers, which answer for the missing
+/// entry (Restore as new page after Duplicate's checks, which a bot
+/// editor of a top-level, unrestricted page passes).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bot_editor_reaches_history_views_and_restores() {
     let state = state_with_owner("owner@example.com", "ownerpass1").await;
@@ -2449,7 +2463,7 @@ async fn a_bot_editor_reaches_history_views_and_restores() {
         "POST",
         "/api/auth/api-keys",
         Some(serde_json::json!({
-            "name": "ci", "scopes": ["read", "update"], "user_id": bot,
+            "name": "ci", "scopes": ["read", "update", "create"], "user_id": bot,
         })),
     )
     .await;
@@ -2465,6 +2479,16 @@ async fn a_bot_editor_reaches_history_views_and_restores() {
         assert_eq!(st, StatusCode::NOT_FOUND, "{method} {uri}: {body}");
         assert_eq!(body["error"]["code"], "history.not_found", "{body}");
     }
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{doc}/history/entries/1/restore-as-new"),
+        Some(serde_json::json!({"version_label": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "history.not_found", "{body}");
 }
 
 // ---------------------------------------------------------------------------

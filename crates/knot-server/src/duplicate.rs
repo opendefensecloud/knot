@@ -19,6 +19,12 @@
 //!   Nothing is deleted on the request path: if the transaction doesn't
 //!   commit, the hourly purge job removes them (`archive::run_purge_once`).
 //!
+//! Restore as new page (`POST /api/docs/{id}/history/entries/{eid}/restore-as-new`)
+//! is a duplicate with a [`VersionCopy`]: the source page only, never its
+//! subpages, with a past version's content instead of its current one,
+//! titled "<title> (version of <label>)". Its checks, quota, bot rules,
+//! restricted copy, board and file copies and placement are Duplicate's.
+//!
 //! The route runs a duplicate through [`start`], on a task of its own, so
 //! the request timeout or a client going away can't stop it halfway. The
 //! answer comes as soon as the copy is stored; the refresh of the copy's
@@ -31,11 +37,13 @@ use std::fmt;
 use std::time::Duration;
 
 use axum::response::Response;
+use chrono::{DateTime, Utc};
 use knot_crdt::{DocHandle, Engine, YrsEngine};
 use knot_docs::{DocAccess, Visibility};
 use knot_markdown::remap::{Refs, Remap, references, remap_refs};
 use knot_storage::duplicate::{
-    BlobCopy, BoardCopy, DuplicatePlan, PageCopy, apply_duplicate, record_pending_copies,
+    BlobCopy, BoardCopy, CopyVersion, DuplicatePlan, PageCopy, apply_duplicate,
+    record_pending_copies,
 };
 use knot_storage::{
     BlobStoreError, Board, BoardStore, BoardStoreError, DocStoreError, Document, SubtreeRow,
@@ -59,6 +67,34 @@ pub const MAX_DUPLICATE_BLOB_BYTES: i64 = 200 * 1024 * 1024;
 pub const MAX_CONCURRENT_DUPLICATES: usize = 2;
 /// How long a duplicate waits for a free slot before it is refused as busy.
 pub const BUSY_WAIT: Duration = Duration::from_secs(5);
+
+/// A past version of the source to copy instead of its current content
+/// (Restore as new page).
+pub struct VersionCopy {
+    /// The version's content: a GC'd, pending-free Yjs state
+    /// (`knot_history::revert::copy_state`).
+    pub state: Vec<u8>,
+    /// Its timeline entry, and when that entry ended.
+    pub entry_id: i64,
+    pub at: DateTime<Utc>,
+    /// The content epoch it was replayed at: the copy is refused at
+    /// another (the epoch Ruling).
+    pub content_epoch: i32,
+    /// How the reader names the version, in the copy's title.
+    pub label: String,
+}
+
+impl fmt::Debug for VersionCopy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VersionCopy")
+            .field("state", &self.state.len())
+            .field("entry_id", &self.entry_id)
+            .field("at", &self.at)
+            .field("content_epoch", &self.content_epoch)
+            .field("label", &self.label)
+            .finish()
+    }
+}
 
 /// Why [`run`] made no copy.
 #[derive(Debug, thiserror::Error)]
@@ -132,8 +168,10 @@ struct Page {
     icon: Option<String>,
     /// Its page is a restriction boundary, and so is the copy.
     restricted: bool,
-    /// Its current content, transient. Remapped in place before it is
-    /// stored.
+    /// The version it copies (the top page of a Restore as new page).
+    version: Option<CopyVersion>,
+    /// Its current content, or the version's, transient. Remapped in
+    /// place before it is stored.
     content: DocHandle,
     refs: Refs,
 }
@@ -193,11 +231,21 @@ pub fn start(
     source_id: Uuid,
     include_subpages: bool,
     permit: OwnedSemaphorePermit,
+    version: Option<VersionCopy>,
 ) -> oneshot::Receiver<Result<Document, DuplicateError>> {
     let (answer, answered) = oneshot::channel();
     tokio::spawn(
         async move {
-            match run(state.clone(), ctx, doc_role, source_id, include_subpages).await {
+            match run(
+                state.clone(),
+                ctx,
+                doc_role,
+                source_id,
+                include_subpages,
+                version,
+            )
+            .await
+            {
                 Ok(Copied { top, refresh }) => {
                     let _ = answer.send(Ok(top));
                     refresh.run(&state).await;
@@ -266,15 +314,18 @@ pub async fn check(
 }
 
 /// Copy `source_id` as `ctx`'s user, whose role on the page is `doc_role`,
-/// right after it, with its live subpages when `include_subpages`. Returns
-/// once the copy is stored, with the refresh of its derived data still to
-/// run.
+/// right after it, with its live subpages when `include_subpages`. With a
+/// `version`, the copy is that version of the page alone: no subpages,
+/// whatever `include_subpages` says, its content `version.state`, its
+/// title "<title> (version of <label>)". Returns once the copy is stored,
+/// with the refresh of its derived data still to run.
 pub async fn run(
     state: AppState,
     ctx: AuthContext,
     doc_role: WorkspaceRole,
     source_id: Uuid,
     include_subpages: bool,
+    version: Option<VersionCopy>,
 ) -> Result<Copied, DuplicateError> {
     let source = check(&state, &ctx, doc_role, source_id).await?;
     let not_configured = |what: &str| internal(format!("{what} not configured"));
@@ -291,7 +342,7 @@ pub async fn run(
     let acl = state.acl.as_ref().ok_or_else(|| not_configured("acl"))?;
     let ws = ctx.workspace_id;
 
-    let live_subpages = if include_subpages {
+    let live_subpages = if include_subpages && version.is_none() {
         docs.live_subtree(ws, source_id).await.map_err(internal)?
     } else {
         Vec::new()
@@ -327,11 +378,15 @@ pub async fn run(
         .collect();
     // The top page goes under the source's parent; every subpage under the
     // copy of its parent, which comes before it.
+    let top_title = match &version {
+        Some(v) => format!("{} (version of {})", source.title, v.label),
+        None => format!("{} (copy)", source.title),
+    };
     let outline = std::iter::once((
         source_id,
         source.title.clone(),
         source.parent_id,
-        format!("{} (copy)", source.title),
+        top_title,
         source.icon.clone(),
         source.restricted,
     ))
@@ -345,9 +400,28 @@ pub async fn run(
             row.restricted,
         )
     }));
+    let mut version = version;
     let mut pages = Vec::with_capacity(page_ids.len());
     for (id, source_title, parent, title, icon, restricted) in outline {
-        let (content, _seq) = current_snapshot(&state, id).await.map_err(internal)?;
+        // Only the top page is ever the version (a version copy has no
+        // subpages).
+        let (content, copied_version) = match version.take() {
+            Some(v) => {
+                let engine = YrsEngine;
+                let content = engine.new_doc();
+                engine.apply_update(&content, &v.state).map_err(internal)?;
+                let copied = CopyVersion {
+                    entry_id: v.entry_id,
+                    at: v.at,
+                    content_epoch: v.content_epoch,
+                };
+                (content, Some(copied))
+            }
+            None => (
+                current_snapshot(&state, id).await.map_err(internal)?.0,
+                None,
+            ),
+        };
         let refs = references(content.inner());
         pages.push(Page {
             new_id: page_ids[&id],
@@ -357,6 +431,7 @@ pub async fn run(
             title,
             icon,
             restricted,
+            version: copied_version,
             content,
             refs,
         });
@@ -421,6 +496,7 @@ pub async fn run(
             state: engine
                 .encode_state_as_update(&page.content, None)
                 .map_err(internal)?,
+            version: page.version.clone(),
         });
     }
     let mut board_copies = Vec::with_capacity(boards.len());

@@ -353,6 +353,16 @@ mod tests {
         assert!(!session_only(&Method::POST, p));
     }
 
+    /// Restore as new page creates a page and copies boards and files, as
+    /// Duplicate does: `create` by the POST default, no `OVERRIDES` row,
+    /// open to keys (Rulings).
+    #[test]
+    fn the_history_restore_as_new_is_a_create() {
+        let p = "/api/docs/{id}/history/entries/{eid}/restore-as-new";
+        assert_eq!(required_scope(&Method::POST, p), Scope::Create);
+        assert!(!session_only(&Method::POST, p));
+    }
+
     /// axum answers HEAD with the GET handler, so a GET row covers HEAD too.
     #[test]
     fn head_on_a_session_only_get_route_is_session_only() {

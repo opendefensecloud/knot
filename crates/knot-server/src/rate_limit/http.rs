@@ -98,6 +98,11 @@ impl HttpBucket {
 /// pinned to a real route by a test.
 pub const NAMED_ROUTES: &[(&str, &str, HttpBucket)] = &[
     ("POST", "/api/docs/{id}/duplicate", HttpBucket::Expensive),
+    (
+        "POST",
+        "/api/docs/{id}/history/entries/{eid}/restore-as-new",
+        HttpBucket::Expensive,
+    ),
     ("POST", "/api/workspace/import", HttpBucket::Expensive),
     ("GET", "/api/workspace/export", HttpBucket::Export),
     ("GET", "/api/docs/{doc_id}/export", HttpBucket::Export),
@@ -524,6 +529,19 @@ mod tests {
         }
     }
 
+    /// Restore as new page creates a page and copies boards and files, as
+    /// Duplicate does: the same `expensive` class (Rulings).
+    #[test]
+    fn history_restores_as_new_are_expensive() {
+        assert_eq!(
+            classify(
+                &Method::POST,
+                "/api/docs/{id}/history/entries/{eid}/restore-as-new"
+            ),
+            Some(HttpBucket::Expensive)
+        );
+    }
+
     /// A history entry's restore is a page write like the Markdown
     /// import: `classify`'s default for a mutating `/api` route, with no
     /// `NAMED_ROUTES` row; its view is not limited (Rulings).
@@ -659,6 +677,11 @@ mod tests {
                 "POST",
                 format!("/api/docs/{doc}/history/entries/1/restore"),
                 "/api/docs/{id}/history/entries/{eid}/restore",
+            ),
+            (
+                "POST",
+                format!("/api/docs/{doc}/history/entries/1/restore-as-new"),
+                "/api/docs/{id}/history/entries/{eid}/restore-as-new",
             ),
         ] {
             assert_eq!(

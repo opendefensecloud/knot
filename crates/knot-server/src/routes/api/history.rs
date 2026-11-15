@@ -7,6 +7,13 @@
 //!                                                that version: a verified CRDT
 //!                                                revert (M2, `history_restore`),
 //!                                                200 `{"outcome": …}`
+//! POST /api/docs/{doc_id}/history/entries/{eid}/restore-as-new
+//!      body `{"version_label": …, "ended_at"?: <RFC 3339>}`
+//!                                              → copy that version into a new
+//!                                                page right after it, as
+//!                                                Duplicate does (M2,
+//!                                                `crate::duplicate`), 201 with
+//!                                                the new page
 //!
 //! The snapshot routes before the timeline:
 //! GET  /api/docs/{doc_id}/history              → `[]` (it no longer lists snapshots)
@@ -47,7 +54,8 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::{AuthContext, DocArchived, require_editor};
+use crate::auth::{AuthContext, DocArchived, EffectiveDocRole, require_editor};
+use crate::duplicate::VersionCopy;
 use crate::history_restore::{
     LiveRoom, RESTORE_DEADLINE, RestoreFailure, restore_answer, revert_attempts,
 };
@@ -58,6 +66,10 @@ use crate::http_error::json_err;
 /// `RESTORE_DEADLINE` (`history_restore`). The seq restore waits without
 /// a bound, as before.
 pub(crate) const RESTORE_ROOM_WAIT: Duration = Duration::from_secs(8);
+
+/// Most characters a Restore as new page's `version_label` may have once
+/// trimmed: the client sends a formatted date and time.
+pub(crate) const VERSION_LABEL_MAX_CHARS: usize = 64;
 
 /// `GET /api/docs/{id}/history`: the snapshot list of the drawer before
 /// the timeline. It lists nothing (`[]`), behind its gates, so a 0.9.14
@@ -320,6 +332,148 @@ pub async fn restore_entry(
     .instrument(span.clone())
     .await;
     answer(result)
+}
+
+/// The body of a Restore as new page.
+#[derive(Deserialize)]
+struct RestoreAsNewRequest {
+    /// How the reader names the version, in the copy's title.
+    version_label: String,
+    /// The version the reader saw (RFC 3339); absent, the entry is copied
+    /// as it is now (the `ended_at` Ruling).
+    #[serde(default)]
+    ended_at: Option<String>,
+}
+
+/// `version_label` trimmed, when it is a label: not empty, at most
+/// [`VERSION_LABEL_MAX_CHARS`] characters, no control character.
+fn version_label(label: &str) -> Option<&str> {
+    let label = label.trim();
+    let fits = !label.is_empty() && label.chars().count() <= VERSION_LABEL_MAX_CHARS;
+    (fits && !label.chars().any(char::is_control)).then_some(label)
+}
+
+/// `POST /api/docs/{id}/history/entries/{eid}/restore-as-new` with
+/// `{"version_label", "ended_at"?}`: copies the version right after entry
+/// `eid` into a new page right after this one, titled "<title> (version of
+/// <label>)", through Duplicate (`crate::duplicate`, the restore-as-new
+/// Ruling): its checks and page quota first, then the version's replay
+/// (under the caller's restore permit, held until the answer), then a
+/// duplicate slot within what is left of [`RESTORE_DEADLINE`]. Answers 201
+/// with the new page, as Duplicate does. Editors and owners only; an
+/// archived page is refused (Duplicate's check).
+#[tracing::instrument(skip_all, name = "history.restore_as_new")]
+pub async fn restore_as_new(
+    State(state): State<AppState>,
+    Path((doc_id, eid)): Path<(Uuid, String)>,
+    req: Request,
+) -> Response {
+    use crate::routes::api::docs::{doc_answer, duplicate_busy, duplicate_error, read_json};
+
+    if let Some(r) = require_editor(&req) {
+        return r;
+    }
+    // Present: require_editor rejected the request otherwise.
+    let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
+        return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
+    };
+    let Some(role) = req.extensions().get::<EffectiveDocRole>().copied() else {
+        return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
+    };
+    let Ok(entry_id) = eid.parse::<i64>() else {
+        return bad_request("entry id");
+    };
+    let Ok(body) = read_json::<RestoreAsNewRequest>(req).await else {
+        return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
+    };
+    let Some(label) = version_label(&body.version_label) else {
+        return bad_request("version_label");
+    };
+    let seen = match body.ended_at.as_deref().map(DateTime::parse_from_rfc3339) {
+        None => None,
+        Some(Ok(at)) => Some(at.with_timezone(&Utc)),
+        Some(Err(_)) => return bad_request("ended_at"),
+    };
+    // Duplicate's answers before the replay: none of them needs it.
+    if let Err(e) = crate::duplicate::check(&state, &ctx, role.0, doc_id).await {
+        return duplicate_error(e);
+    }
+    if let Err(response) = crate::quota::enforce_pages(&state, &ctx, 1).await {
+        return response;
+    }
+    let Some(views) = state.history_views.clone() else {
+        return internal();
+    };
+    let deadline = Instant::now() + RESTORE_DEADLINE;
+    // One restore at a time per principal on this pod, in place or as a
+    // new page, held until the answer (the restore-permit Ruling).
+    let _restoring = match views.restore_permit(ctx.user_id, deadline).await {
+        Ok(permit) => permit,
+        Err(e) => return view_error(&e),
+    };
+    let version = match views
+        .restore_input_by(
+            ctx.user_id,
+            doc_id,
+            entry_id,
+            seen,
+            deadline,
+            knot_history::revert::copy_state,
+        )
+        .await
+    {
+        Ok(version) => version,
+        Err(e) => {
+            if matches!(e, ViewError::Failed(_) | ViewError::Store(_)) {
+                tracing::error!(error = %e, %doc_id, entry_id, "history restore as new");
+            }
+            return view_error(&e);
+        }
+    };
+    // After the replay, so no duplicate slot is held through a wait for a
+    // compute permit; within what is left of the deadline, so the copy
+    // starts before the router's timeout.
+    let wait = state
+        .duplicate_busy_wait
+        .min(deadline.saturating_duration_since(Instant::now()));
+    if wait.is_zero() {
+        return duplicate_busy();
+    }
+    let permit =
+        match tokio::time::timeout(wait, state.duplicate_permits.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "duplicate permits closed");
+                return internal();
+            }
+            Err(_) => return duplicate_busy(),
+        };
+    let copy = VersionCopy {
+        state: version.value,
+        entry_id,
+        at: version.ended_at,
+        content_epoch: version.content_epoch,
+        label: label.to_string(),
+    };
+    // On a task of its own, as Duplicate's: dropping this handler can't
+    // stop the copy halfway.
+    let answer = crate::duplicate::start(
+        state.clone(),
+        ctx.clone(),
+        role.0,
+        doc_id,
+        false,
+        permit,
+        Some(copy),
+    );
+    match answer.await {
+        Ok(Ok(top)) => doc_answer(&state, &ctx, StatusCode::CREATED, &top).await,
+        Ok(Err(e)) => duplicate_error(e),
+        Err(_) => {
+            tracing::error!("restore as new task ended without an answer");
+            internal()
+        }
+    }
 }
 
 /// Replaces `doc_id`'s content with `update_bytes` through its room, as a
