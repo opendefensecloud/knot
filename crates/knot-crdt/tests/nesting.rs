@@ -2083,3 +2083,11 @@ fn a_shallow_edit_on_a_page_with_nothing_pending_is_not_measured_deep() {
         assert_eq!(measured.max_depth, own);
     });
 }
+
+/// The nesting Ruling (page history M2): a revert refuses a page nested
+/// deeper than knot-history's `revert::MAX_NESTING`, which mirrors this
+/// crate's limit because knot-history cannot depend on knot-crdt.
+#[test]
+fn the_revert_nesting_limit_is_the_rooms() {
+    assert_eq!(knot_history::revert::MAX_NESTING, MAX_NESTING);
+}
