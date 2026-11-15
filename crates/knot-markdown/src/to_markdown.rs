@@ -205,6 +205,15 @@ fn write_block<T: ReadTxn>(
         "horizontal_rule" => {
             buf.push_str("---\n");
         }
+        "table_of_contents" => {
+            let level = crate::toc::toc_level(attr(el, txn, "maxLevel").as_deref());
+            if let Some(comment) = crate::toc::toc_comment(level) {
+                buf.push_str(&comment);
+                buf.push('\n');
+            }
+            buf.push_str(crate::toc::TOC_MARKER);
+            buf.push('\n');
+        }
         "table" => {
             // Collect rows.  Within each row, collect cells with (text, align).
             let len = el.len(txn);
@@ -378,6 +387,7 @@ const BLOCKS: &[&str] = &[
     "bullet_list",
     "ordered_list",
     "excalidraw_board",
+    "table_of_contents",
     "image",
     "attachment",
     "table",
