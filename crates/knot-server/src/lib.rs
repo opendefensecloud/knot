@@ -36,6 +36,7 @@ pub mod comments_listener;
 pub mod duplicate;
 pub mod export;
 pub mod export_check;
+pub(crate) mod history_restore;
 pub mod history_stats;
 pub mod http_error;
 pub mod metrics;

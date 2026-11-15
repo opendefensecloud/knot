@@ -7,7 +7,7 @@
 //! - GET    /api/docs/{id}/access  who can see it, for the permissions dialog (any reader)
 //! - GET    /api/docs/{id}/audit   the page audit log and its export stats (editor+, also archived; `routes::api::audit`)
 //! - GET    /api/docs/{id}/history/entries/{eid}/view  a past version, rendered (editor+, also archived; `routes::api::history`)
-//! - POST   /api/docs/{id}/history/entries/{eid}/restore  replace the page with that version (editor+, not archived; `routes::api::history`)
+//! - POST   /api/docs/{id}/history/entries/{eid}/restore  revert the page to that version (editor+, not archived; `routes::api::history`)
 //! - POST   /api/docs/{id}/move   reparent / reorder
 //! - POST   /api/docs/{id}/duplicate  body: {include_subpages?}; copy right after it (editor+ here and on the parent)
 //! - DELETE /api/docs/{id}        move to the archive, with its subtree (editor+)

@@ -2,13 +2,15 @@
 //! who may view a past version of a page, the response it answers (a
 //! rendered ProseMirror doc in a per-request envelope), how `?changes=`
 //! is read, and how each `ViewError` reaches the client; and
-//! `POST …/entries/{eid}/restore`, the interim Markdown restore. Entries are
+//! `POST …/entries/{eid}/restore`, Restore here (M2): a verified revert
+//! in place through the page's room. Entries are
 //! built by the real builder (`Builder::build_page`) from rows the stores
 //! wrote; a test that changes the views' limits or hooks swaps
 //! `AppState::history_views` and builds a new router from that state.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -23,7 +25,8 @@ use knot_history::builder::{
 };
 use knot_history::{
     BUILDER_VERSION, BuildLimits, Builder, CHECKPOINT_FLOOR_BYTES, HistoryPermits, PassResult,
-    TestHooks, ViewLimits, Views, history_permits,
+    ReplayMode, Replayer, RevertHooks, RevertTarget, TestHooks, ViewLimits, Views, history_permits,
+    revert,
 };
 use knot_server::{AppState, router_with_state};
 use knot_storage::{
@@ -33,7 +36,13 @@ use knot_storage::{
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
-use yrs::{Doc, ReadTxn, StateVector, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+use yrs::types::Attrs;
+use yrs::updates::decoder::Decode;
+use yrs::{
+    Any, Assoc, ClientID, Doc, GetString, ID, IndexedSequence, Out, ReadTxn, StateVector,
+    StickyIndex, Text, Transact, Update, Xml, XmlElementPrelim, XmlElementRef, XmlFragment,
+    XmlFragmentRef, XmlOut, XmlTextPrelim,
+};
 
 const PASSWORD: &str = "hunter22";
 
@@ -388,6 +397,95 @@ impl Typist {
             .transact()
             .encode_state_as_update_v1(&StateVector::default())
     }
+
+    /// Appends typed content: a heading of level 2, a bullet list whose
+    /// item is checked, a table cell 120 wide and a linked word; returns
+    /// the update.
+    fn rich(&self) -> Vec<u8> {
+        let frag = self.0.get_or_insert_xml_fragment("default");
+        let before = self.0.transact().state_vector();
+        {
+            let mut txn = self.0.transact_mut();
+            let h = frag.push_back(&mut txn, XmlElementPrelim::empty("heading"));
+            h.insert_attribute(&mut txn, "level", Any::Number(2.0));
+            h.push_back(&mut txn, XmlTextPrelim::new("Heading"));
+            let list = frag.push_back(&mut txn, XmlElementPrelim::empty("bullet_list"));
+            let item = list.push_back(&mut txn, XmlElementPrelim::empty("list_item"));
+            item.insert_attribute(&mut txn, "checked", Any::Bool(true));
+            let p = item.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new("task"));
+            let table = frag.push_back(&mut txn, XmlElementPrelim::empty("table"));
+            let row = table.push_back(&mut txn, XmlElementPrelim::empty("table_row"));
+            let cell = row.push_back(&mut txn, XmlElementPrelim::empty("table_cell"));
+            cell.insert_attribute(&mut txn, "colwidth", widths(120.0));
+            let p = cell.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new("cell"));
+            let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            let site = p.push_back(&mut txn, XmlTextPrelim::new("site"));
+            site.format(&mut txn, 0, 4, link("https://a.example"));
+        }
+        self.0.transact().encode_state_as_update_v1(&before)
+    }
+
+    /// Sets `key` to `value` on child `child` of `default`, or on its first
+    /// descendant element that has `key` when the child itself has none;
+    /// returns the update.
+    fn set_attr(&self, child: u32, key: &str, value: Any) -> Vec<u8> {
+        let frag = self.0.get_or_insert_xml_fragment("default");
+        let before = self.0.transact().state_vector();
+        {
+            let mut txn = self.0.transact_mut();
+            let Some(XmlOut::Element(top)) = frag.get(&txn, child) else {
+                panic!("child {child} is not an element");
+            };
+            let mut stack = vec![top];
+            let target = loop {
+                let e = stack
+                    .pop()
+                    .unwrap_or_else(|| panic!("no {key} under {child}"));
+                if e.get_attribute(&txn, key).is_some() {
+                    break e;
+                }
+                for i in (0..e.len(&txn)).rev() {
+                    if let Some(XmlOut::Element(c)) = e.get(&txn, i) {
+                        stack.push(c);
+                    }
+                }
+            };
+            target.insert_attribute(&mut txn, key, value);
+        }
+        self.0.transact().encode_state_as_update_v1(&before)
+    }
+
+    /// Links the whole text of paragraph `child` of `default` to `href`;
+    /// returns the update.
+    fn relink(&self, child: u32, href: &str) -> Vec<u8> {
+        let frag = self.0.get_or_insert_xml_fragment("default");
+        let before = self.0.transact().state_vector();
+        {
+            let mut txn = self.0.transact_mut();
+            let Some(XmlOut::Element(p)) = frag.get(&txn, child) else {
+                panic!("child {child} is not an element");
+            };
+            let Some(XmlOut::Text(t)) = p.get(&txn, 0) else {
+                panic!("child {child} holds no text");
+            };
+            let len = t.len(&txn);
+            t.format(&mut txn, 0, len, link(href));
+        }
+        self.0.transact().encode_state_as_update_v1(&before)
+    }
+}
+
+/// A `colwidth` value.
+fn widths(w: f64) -> Any {
+    Any::Array(Arc::from(vec![Any::Number(w)]))
+}
+
+/// The `link` mark to `href`.
+fn link(href: &str) -> Attrs {
+    let m: HashMap<String, Any> = [("href".to_string(), Any::from(href))].into();
+    [("link".into(), Any::from(m))].into_iter().collect()
 }
 
 /// Appends one `edit` row per update, by `who`, now.
@@ -1065,7 +1163,7 @@ async fn a_colleague_opening_the_same_version_is_not_blocked() {
 }
 
 // ---------------------------------------------------------------------------
-// Restore (the interim Markdown restore, until M2)
+// Restore here (M2: a verified revert in place)
 // ---------------------------------------------------------------------------
 
 fn restore_uri(doc: Uuid, eid: impl std::fmt::Display, query: &str) -> String {
@@ -1094,10 +1192,228 @@ async fn restore(
     restore_on(&fx.app, session, doc, eid, query).await
 }
 
-/// A 204 with no body.
+/// A 200 restore that wrote the version, by undo or by the whole-page
+/// replace; its outcome.
 #[track_caller]
-fn restored(a: &Answer) {
+fn restored(a: &Answer) -> String {
+    let body = a.ok();
+    let outcome = body["outcome"].as_str().unwrap_or_default().to_string();
+    assert!(outcome == "restored" || outcome == "fallback", "{}", a.body);
+    assert_eq!(body, json!({ "outcome": outcome }), "{}", a.body);
+    assert!(
+        a.header("content-type")
+            .is_some_and(|t| t.starts_with("application/json")),
+        "{:?}",
+        a.headers
+    );
+    outcome
+}
+
+/// A 200 restore whose outcome is exactly `outcome`.
+#[track_caller]
+fn restored_as(a: &Answer, outcome: &str) {
+    assert_eq!(a.ok(), json!({ "outcome": outcome }), "{}", a.body);
+}
+
+/// The seq restore's answer: a 204 with no body.
+#[track_caller]
+fn seq_restored(a: &Answer) {
     assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    assert_eq!(a.body, "");
+}
+
+/// `knot_history_restore_total{outcome}`, from a recorder installed once
+/// for this test process (each nextest test is a process of its own, and
+/// the counters are emitted on the runtime's workers, which a thread-local
+/// recorder misses). Tests read it before and after: deltas only.
+fn restore_total(outcome: &str) -> u64 {
+    restore_counts()
+        .lock()
+        .unwrap()
+        .get(outcome)
+        .map_or(0, |count| count.load(Ordering::Relaxed))
+}
+
+type RestoreCounts = Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>;
+
+fn restore_counts() -> &'static RestoreCounts {
+    static COUNTS: OnceLock<RestoreCounts> = OnceLock::new();
+    COUNTS.get_or_init(|| {
+        let counts = RestoreCounts::default();
+        metrics::set_global_recorder(RestoreRecorder(Arc::clone(&counts)))
+            .expect("no other recorder in this test process");
+        counts
+    })
+}
+
+struct RestoreRecorder(RestoreCounts);
+
+impl metrics::Recorder for RestoreRecorder {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        if key.name() != "knot_history_restore_total" {
+            return metrics::Counter::noop();
+        }
+        let outcome = key
+            .labels()
+            .find(|label| label.key() == "outcome")
+            .map(|label| label.value().to_owned())
+            .unwrap_or_default();
+        let count = Arc::clone(self.0.lock().unwrap().entry(outcome).or_default());
+        metrics::Counter::from_arc(count)
+    }
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// The audit rows about `target`, oldest first.
+async fn audit_rows(fx: &Fixture, target: Uuid) -> Vec<(String, Value)> {
+    sqlx::query_as("SELECT action, data FROM audit_events WHERE target_id = $1 ORDER BY id")
+        .bind(target)
+        .fetch_all(&fx.pool)
+        .await
+        .unwrap()
+}
+
+/// One stored row of a page's log.
+struct Row {
+    source: Option<String>,
+    by: Option<Uuid>,
+    bytes: Vec<u8>,
+}
+
+/// `doc`'s rows, in rev order.
+async fn rows(fx: &Fixture, doc: Uuid) -> Vec<Row> {
+    let rows: Vec<(Option<String>, Option<Uuid>, Vec<u8>)> = sqlx::query_as(
+        "SELECT source, by_user_id, update_bytes FROM doc_updates
+          WHERE doc_id = $1 ORDER BY rev, seq",
+    )
+    .bind(doc)
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(source, by, bytes)| Row { source, by, bytes })
+        .collect()
+}
+
+/// The page its rows store: a GC replay of them, as a room boots it.
+async fn stored(fx: &Fixture, doc: Uuid) -> Replayer {
+    let mut page = Replayer::new(ReplayMode::Gc);
+    for row in rows(fx, doc).await {
+        page.apply(&row.bytes);
+    }
+    page
+}
+
+/// What a verified revert must render: the stored page, rendered as
+/// `RevertTarget::json` is (`revert::rendered`).
+async fn stored_rendered(fx: &Fixture, doc: Uuid) -> Vec<u8> {
+    revert::rendered(stored(fx, doc).await.doc()).unwrap()
+}
+
+/// Entry `eid`'s Restore here target, through the fixture's views.
+async fn target_of(fx: &Fixture, doc: Uuid, eid: i64) -> RevertTarget {
+    let views = fx.state.history_views.as_ref().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(27);
+    match views
+        .restore_target(fx.owner.id, doc, eid, None, deadline)
+        .await
+    {
+        Ok(r) => r.value,
+        Err(e) => panic!("restore_target {eid}: {e}"),
+    }
+}
+
+/// Every client whose blocks `bytes` inserts, deleted ones included.
+fn inserted_clients(bytes: &[u8]) -> HashSet<ClientID> {
+    Update::decode_v1(bytes)
+        .unwrap()
+        .insertions(true)
+        .client_ids()
+        .collect()
+}
+
+/// The id of `needle`'s first character in the first text of `doc`'s
+/// `default` that holds it.
+fn char_id(doc: &Doc, needle: &str) -> ID {
+    sticky_at(doc, needle)
+        .id()
+        .cloned()
+        .expect("a relative index")
+}
+
+/// A sticky index on `needle`'s first character in the first text of
+/// `doc`'s `default` that holds it.
+fn sticky_at(doc: &Doc, needle: &str) -> StickyIndex {
+    let frag = doc.get_or_insert_xml_fragment("default");
+    let txn = doc.transact();
+    let mut stack: Vec<XmlOut> = (0..frag.len(&txn))
+        .rev()
+        .filter_map(|i| frag.get(&txn, i))
+        .collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            XmlOut::Element(e) => {
+                for i in (0..e.len(&txn)).rev() {
+                    if let Some(c) = e.get(&txn, i) {
+                        stack.push(c);
+                    }
+                }
+            }
+            XmlOut::Text(t) => {
+                if let Some(at) = t.get_string(&txn).find(needle) {
+                    return t
+                        .sticky_index(&txn, at as u32, Assoc::After)
+                        .expect("an index inside the text");
+                }
+            }
+            XmlOut::Fragment(_) => {}
+        }
+    }
+    panic!("{needle:?} not in the page");
+}
+
+/// The element of `frag` (a page's `default`) at `path` (child indices).
+fn element_at<T: ReadTxn>(frag: &XmlFragmentRef, txn: &T, path: &[u32]) -> XmlElementRef {
+    let Some(XmlOut::Element(mut e)) = frag.get(txn, path[0]) else {
+        panic!("no element at {path:?}");
+    };
+    for &i in &path[1..] {
+        let Some(XmlOut::Element(c)) = e.get(txn, i) else {
+            panic!("no element at {path:?}");
+        };
+        e = c;
+    }
+    e
 }
 
 /// The page's live content as Markdown, read by the owner.
@@ -1170,11 +1486,38 @@ fn query_value(at: &str) -> String {
     at.replace('+', "%2B")
 }
 
-/// The `meta` of `doc`'s newest `restore` row, as the room stored it.
+/// The `meta` of `doc`'s newest restore row (`restore` or
+/// `restore_fallback`), as the room stored it.
 async fn stored_restore_meta(fx: &Fixture, doc: Uuid) -> Value {
     sqlx::query_scalar(
-        "SELECT meta FROM doc_updates WHERE doc_id = $1 AND source = 'restore'
+        "SELECT meta FROM doc_updates
+          WHERE doc_id = $1 AND source IN ('restore', 'restore_fallback')
           ORDER BY rev DESC LIMIT 1",
+    )
+    .bind(doc)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap()
+}
+
+/// The `source` of `doc`'s newest restore row.
+async fn stored_restore_source(fx: &Fixture, doc: Uuid) -> String {
+    sqlx::query_scalar(
+        "SELECT source FROM doc_updates
+          WHERE doc_id = $1 AND source IN ('restore', 'restore_fallback')
+          ORDER BY rev DESC LIMIT 1",
+    )
+    .bind(doc)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap()
+}
+
+/// How many of `doc`'s rows are restores.
+async fn restore_rows(fx: &Fixture, doc: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM doc_updates
+          WHERE doc_id = $1 AND source IN ('restore', 'restore_fallback')",
     )
     .bind(doc)
     .fetch_one(&fx.pool)
@@ -1227,10 +1570,355 @@ async fn replaced_page(fx: &Fixture) -> (Uuid, i64) {
 async fn restoring_a_session_brings_back_its_text() {
     let fx = fixture().await;
     let (doc, sid) = replaced_page(&fx).await;
-    restored(&restore(&fx, Some(&fx.editor.session), doc, sid, "").await);
+    let earlier: HashSet<ClientID> = rows(&fx, doc)
+        .await
+        .iter()
+        .flat_map(|r| inserted_clients(&r.bytes))
+        .collect();
+    let audited = audit_rows(&fx, doc).await;
+
+    restored_as(
+        &restore(&fx, Some(&fx.editor.session), doc, sid, "").await,
+        "restored",
+    );
     let md = markdown(&fx, doc).await;
     assert!(md.contains("first version"), "{md}");
     assert!(!md.contains("other"), "{md}");
+    assert_eq!(
+        stored_rendered(&fx, doc).await,
+        target_of(&fx, doc, sid).await.json
+    );
+
+    // One restore row, by the caller, its text under a client of its own.
+    let newest = rows(&fx, doc).await.pop().unwrap();
+    assert_eq!(newest.source.as_deref(), Some("restore"));
+    assert_eq!(newest.by, Some(fx.editor.id));
+    let clients = inserted_clients(&newest.bytes);
+    assert!(!clients.is_empty());
+    assert!(clients.is_disjoint(&earlier), "{clients:?} {earlier:?}");
+    // A restore in place writes no audit row.
+    assert_eq!(audit_rows(&fx, doc).await, audited);
+}
+
+/// A page where the editor typed "keep this", then the owner "and that"
+/// (two sessions), built; returns it and the two sessions.
+async fn kept_page(fx: &Fixture) -> (Uuid, i64, i64) {
+    let doc = page(fx, "Kept").await;
+    let t = Typist::new(50);
+    append(fx, doc, fx.editor.id, vec![t.para("keep this")]).await;
+    append(fx, doc, fx.owner.id, vec![t.para("and that")]).await;
+    build(fx, doc).await;
+    let a = session_of(fx, doc, fx.editor.id).await;
+    let b = session_of(fx, doc, fx.owner.id).await;
+    (doc, a, b)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_keeps_unchanged_text_and_its_anchors() {
+    let fx = fixture().await;
+    let (doc, a, _) = kept_page(&fx).await;
+    let before = stored(&fx, doc).await;
+    let keep = char_id(before.doc(), "keep");
+    let anchor = sticky_at(before.doc(), "keep");
+
+    restored_as(
+        &restore(&fx, Some(&fx.editor.session), doc, a, "").await,
+        "restored",
+    );
+    let after = stored(&fx, doc).await;
+    assert_eq!(char_id(after.doc(), "keep"), keep);
+    assert_eq!(anchor.id(), Some(&keep));
+    assert!(anchor.get_offset(&after.doc().transact()).is_some());
+    let md = markdown(&fx, doc).await;
+    assert!(md.contains("keep this"), "{md}");
+    assert!(!md.contains("and that"), "{md}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restoring_the_entry_before_a_restore_undoes_it() {
+    let fx = fixture().await;
+    let (doc, a, b) = kept_page(&fx).await;
+    let editor = Some(&fx.editor.session);
+    let before = rows(&fx, doc).await;
+    let clients_of = |who: Uuid| -> HashSet<ClientID> {
+        before
+            .iter()
+            .filter(|r| r.by == Some(who))
+            .flat_map(|r| inserted_clients(&r.bytes))
+            .collect()
+    };
+    let b_inserted: Vec<Update> = before
+        .iter()
+        .filter(|r| r.by == Some(fx.owner.id))
+        .map(|r| Update::decode_v1(&r.bytes).unwrap())
+        .collect();
+    let keep = char_id(stored(&fx, doc).await.doc(), "keep");
+
+    restored_as(&restore(&fx, editor, doc, a, "").await, "restored");
+    // The first restore only deletes B's paragraph: since A's version
+    // nothing was deleted, so its undo has nothing to redo.
+    let first = rows(&fx, doc).await.pop().unwrap();
+    let first_update = Update::decode_v1(&first.bytes).unwrap();
+    assert!(first_update.insertions(true).is_empty());
+    let deleted = first_update.delete_set();
+    assert!(!deleted.is_empty());
+    for (client, ranges) in deleted.iter() {
+        for range in ranges.iter() {
+            for clock in range.clone() {
+                let id = ID::new(*client, clock);
+                assert!(
+                    b_inserted.iter().any(|u| u.insertions(true).contains(&id)),
+                    "{id:?} is not B's"
+                );
+            }
+        }
+    }
+
+    build(&fx, doc).await;
+    let listed = entries(&fx, doc).await;
+    assert_eq!(listed[0]["kind"], "restore", "{listed:#?}");
+    assert_eq!(listed[1]["id"], json!(b), "{listed:#?}");
+    restored_as(&restore(&fx, editor, doc, b, "").await, "restored");
+    assert_eq!(
+        stored_rendered(&fx, doc).await,
+        target_of(&fx, doc, b).await.json
+    );
+    let md = markdown(&fx, doc).await;
+    assert!(md.contains("keep this") && md.contains("and that"), "{md}");
+
+    // The second restore redoes B's paragraph under a client of its own.
+    let second = rows(&fx, doc).await.pop().unwrap();
+    let clients = inserted_clients(&second.bytes);
+    assert_eq!(clients.len(), 1, "{clients:?}");
+    let mut earlier = clients_of(fx.editor.id);
+    earlier.extend(clients_of(fx.owner.id));
+    earlier.extend(before.iter().flat_map(|r| inserted_clients(&r.bytes)));
+    earlier.extend(inserted_clients(&first.bytes));
+    assert!(clients.is_disjoint(&earlier), "{clients:?} {earlier:?}");
+    // Text neither restore touched keeps its id.
+    assert_eq!(char_id(stored(&fx, doc).await.doc(), "keep"), keep);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restoring_the_entry_before_a_fallback_restore_undoes_it() {
+    let fx = fixture().await;
+    let (doc, a, b) = kept_page(&fx).await;
+    let editor = Some(&fx.editor.session);
+    let fallback = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.hooks.revert.skip_undo = true;
+    });
+    restored_as(&restore_on(&fallback, editor, doc, a, "").await, "fallback");
+    build(&fx, doc).await;
+    let outcome = restored(&restore(&fx, editor, doc, b, "").await);
+    println!("the restore of the entry before a fallback restore: {outcome}");
+    assert_eq!(
+        stored_rendered(&fx, doc).await,
+        target_of(&fx, doc, b).await.json
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fallback_restore_is_recorded_and_listed() {
+    let fx = fixture().await;
+    let doc = page(&fx, "Rich").await;
+    let t = Typist::new(80);
+    append(&fx, doc, fx.editor.id, vec![t.rich()]).await;
+    append(
+        &fx,
+        doc,
+        fx.owner.id,
+        vec![
+            t.set_attr(0, "level", Any::Number(3.0)),
+            t.set_attr(1, "checked", Any::Bool(false)),
+            t.set_attr(2, "colwidth", widths(200.0)),
+            t.relink(3, "https://b.example"),
+        ],
+    )
+    .await;
+    build(&fx, doc).await;
+    let sid = session_of(&fx, doc, fx.editor.id).await;
+
+    let app = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.hooks.revert.skip_undo = true;
+    });
+    restored_as(
+        &restore_on(&app, Some(&fx.editor.session), doc, sid, "").await,
+        "fallback",
+    );
+    assert_eq!(stored_restore_source(&fx, doc).await, "restore_fallback");
+    let page = stored(&fx, doc).await;
+    {
+        // The root first: taking it waits for every open transaction.
+        let frag = page.doc().get_or_insert_xml_fragment("default");
+        let txn = page.doc().transact();
+        let attr = |path: &[u32], key: &str| element_at(&frag, &txn, path).get_attribute(&txn, key);
+        assert_eq!(attr(&[0], "level"), Some(Out::Any(Any::Number(2.0))));
+        assert_eq!(attr(&[1, 0], "checked"), Some(Out::Any(Any::Bool(true))));
+        assert_eq!(attr(&[2, 0, 0], "colwidth"), Some(Out::Any(widths(120.0))));
+    }
+    assert_eq!(
+        revert::rendered(page.doc()).unwrap(),
+        target_of(&fx, doc, sid).await.json
+    );
+
+    build(&fx, doc).await;
+    let newest = entries(&fx, doc).await[0].clone();
+    assert_eq!(newest["kind"], "restore", "{newest}");
+    assert_eq!(newest["meta"]["fallback"], json!(true), "{newest}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_nothing_verifies_writes_nothing() {
+    let fx = fixture().await;
+    let (doc, sid) = replaced_page(&fx).await;
+    let before = markdown(&fx, doc).await;
+    let count = rows(&fx, doc).await.len();
+    let app = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.hooks.revert = RevertHooks {
+            skip_undo: true,
+            fail_fallback: true,
+            ..Default::default()
+        };
+    });
+    restore_on(&app, Some(&fx.editor.session), doc, sid, "")
+        .await
+        .error(StatusCode::INTERNAL_SERVER_ERROR, "history.restore_failed");
+    assert_eq!(rows(&fx, doc).await.len(), count);
+    assert_eq!(markdown(&fx, doc).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_restores_by_one_person_run_one_at_a_time() {
+    let fx = fixture().await;
+    restore_total("busy");
+    let mut pages = Vec::new();
+    for _ in 0..3 {
+        pages.push(typed_page(&fx, &[fx.editor.id, fx.owner.id]).await);
+    }
+    let renders = counter();
+    let app = router_with_views(&fx, history_permits(2), |l| {
+        l.permit_wait = Duration::from_millis(300);
+        l.hooks.hold_render = Duration::from_secs(1);
+        l.hooks.renders = Some(renders.clone());
+    });
+    let busy = restore_total("busy");
+    let editor = Some(&fx.editor.session);
+    let started = std::time::Instant::now();
+    let by_editor = |(doc, ids): &(Uuid, Vec<i64>)| {
+        let (doc, eid) = (*doc, ids[0]);
+        let (app, renders) = (&app, &renders);
+        async move {
+            let a = restore_on(app, editor, doc, eid, "").await;
+            (a, count(renders), started.elapsed())
+        }
+    };
+    let (first, second, owner) = tokio::join!(
+        by_editor(&pages[0]),
+        by_editor(&pages[1]),
+        restore_on(&app, Some(&fx.owner.session), pages[2].0, pages[2].1[0], ""),
+    );
+    let (served, refused, refused_page) = if first.0.status == StatusCode::OK {
+        (first, second, &pages[1])
+    } else {
+        (second, first, &pages[0])
+    };
+    restored(&served.0);
+    refused.0.busy();
+    // Refused at its permit wait, before its replay, while the two other
+    // targets were held.
+    assert_eq!(refused.1, 2, "renders when the 503 arrived");
+    assert!(
+        refused.2 >= Duration::from_millis(250) && refused.2 < Duration::from_secs(1),
+        "{:?}",
+        refused.2
+    );
+    restored(&owner);
+    assert_eq!(count(&renders), 4);
+    assert_eq!(restore_total("busy"), busy);
+
+    restored(&restore_on(&app, editor, refused_page.0, refused_page.1[0], "").await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restoring_the_current_version_changes_nothing() {
+    let fx = fixture().await;
+    let (doc, ids) = typed_page(&fx, &[fx.editor.id, fx.owner.id]).await;
+    let count = rows(&fx, doc).await.len();
+    restored_as(
+        &restore(&fx, Some(&fx.editor.session), doc, ids[1], "").await,
+        "unchanged",
+    );
+    assert_eq!(rows(&fx, doc).await.len(), count);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_too_large_to_revert_is_a_409() {
+    let fx = fixture().await;
+    restore_total("too_large");
+    let (doc, sid) = replaced_page(&fx).await;
+    let before = markdown(&fx, doc).await;
+    let too_large = restore_total("too_large");
+    let app = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.max_revert_input_bytes = 64;
+    });
+    restore_on(&app, Some(&fx.editor.session), doc, sid, "")
+        .await
+        .error(StatusCode::CONFLICT, "restore.too_large");
+    assert_eq!(markdown(&fx, doc).await, before);
+    assert_eq!(restore_total("too_large"), too_large + 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_over_the_revert_cap_is_refused_before_any_export() {
+    let fx = fixture().await;
+    restore_total("too_large");
+    let rooms = fx.state.rooms_v2.as_ref().unwrap();
+    let editor = Some(&fx.editor.session);
+
+    // The version alone over the cap: no acquire, so no export.
+    let (doc, ids) = typed_page(&fx, &[fx.editor.id, fx.owner.id]).await;
+    let target = target_of(&fx, doc, ids[0]).await.state.len();
+    assert!(rooms.get_active(doc).is_none());
+    let renders = counter();
+    let app = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.max_revert_input_bytes = target as i64 - 1;
+        l.hooks.renders = Some(renders.clone());
+    });
+    restore_on(&app, editor, doc, ids[0], "")
+        .await
+        .error(StatusCode::CONFLICT, "restore.too_large");
+    assert!(rooms.get_active(doc).is_none());
+    assert_eq!(count(&renders), 1, "the target only");
+
+    // The version with the live page over the cap: one export.
+    let (doc2, ids2) = typed_page(&fx, &[fx.editor.id, fx.owner.id]).await;
+    let target2 = target_of(&fx, doc2, ids2[0]).await.state.len();
+    let live2 = stored(&fx, doc2).await.encode_state().len();
+    assert!(rooms.get_active(doc2).is_none());
+    let renders2 = counter();
+    let app2 = router_with_views(&fx, fx.state.history_permits.clone(), |l| {
+        l.max_revert_input_bytes = (target2 + live2 / 2) as i64;
+        l.hooks.renders = Some(renders2.clone());
+    });
+    let too_large = restore_total("too_large");
+    restore_on(&app2, editor, doc2, ids2[0], "")
+        .await
+        .error(StatusCode::CONFLICT, "restore.too_large");
+    assert!(rooms.get_active(doc2).is_some());
+    assert_eq!(count(&renders2), 1, "the target only");
+    assert_eq!(restore_total("too_large"), too_large + 1);
+
+    // Again on each: refused before the replay (the over-cap record).
+    restore_on(&app, editor, doc, ids[0], "")
+        .await
+        .error(StatusCode::CONFLICT, "restore.too_large");
+    assert_eq!(count(&renders), 1);
+    let too_large = restore_total("too_large");
+    restore_on(&app2, editor, doc2, ids2[0], "")
+        .await
+        .error(StatusCode::CONFLICT, "restore.too_large");
+    assert_eq!(count(&renders2), 1);
+    assert_eq!(restore_total("too_large"), too_large + 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1256,7 +1944,10 @@ async fn a_restore_is_listed_as_restored_to_its_target() {
     assert_eq!(stored["target_rev"], json!(end_rev), "{stored}");
     assert_eq!(stored["target_entry_id"], json!(sid), "{stored}");
 
-    // The same instant with another offset spelling, percent-encoded.
+    // The same instant with another offset spelling, percent-encoded, on
+    // a page that differs from the version again.
+    import_replace(&fx, doc, "# changed again\n").await;
+    assert_eq!(restore_rows(&fx, doc).await, 1);
     let plus = ended_at.to_rfc3339();
     assert!(plus.ends_with("+00:00"), "{plus}");
     let a = restore(
@@ -1268,6 +1959,7 @@ async fn a_restore_is_listed_as_restored_to_its_target() {
     )
     .await;
     restored(&a);
+    assert_eq!(restore_rows(&fx, doc).await, 2);
     let stored = stored_restore_meta(&fx, doc).await;
     assert_eq!(instant(&stored["target_ended_at"]), ended_at, "{stored}");
 
@@ -1320,7 +2012,15 @@ async fn restoring_a_baseline_entry_works() {
     // row builds on it), so the page reads otherwise before the restore.
     assert_ne!(markdown(&fx, doc).await, expected);
 
-    restored(&restore(&fx, Some(&fx.editor.session), doc, eid, "").await);
+    // The live room holds no item of the baseline's client (its legacy row
+    // waits, pending, for the baseline's paragraph, and the export leaves
+    // pending content out), so the undo captures nothing: the whole-page
+    // replace restores it.
+    restored_as(
+        &restore(&fx, Some(&fx.editor.session), doc, eid, "").await,
+        "fallback",
+    );
+    assert_eq!(stored_restore_source(&fx, doc).await, "restore_fallback");
     assert_eq!(markdown(&fx, doc).await, expected);
     let stored = stored_restore_meta(&fx, doc).await;
     assert_eq!(stored["target_rev"], Value::Null, "{stored}");
@@ -1336,7 +2036,13 @@ async fn restoring_a_baseline_entry_works() {
     .fetch_one(&fx.pool)
     .await
     .unwrap();
-    restored(&restore(&fx, Some(&fx.editor.session), doc, rollout, "").await);
+    // The live page holds only the first restore's copy, under its own
+    // client, which an undo cannot turn into the baseline client's text.
+    restored_as(
+        &restore(&fx, Some(&fx.editor.session), doc, rollout, "").await,
+        "fallback",
+    );
+    assert_eq!(stored_restore_source(&fx, doc).await, "restore_fallback");
     let stored = stored_restore_meta(&fx, doc).await;
     assert_eq!(stored["target_rev"], json!(genesis_rev), "{stored}");
     let md = markdown(&fx, doc).await;
@@ -1626,7 +2332,7 @@ async fn a_page_given_up_at_genesis_restores_only_its_baselines() {
         None,
     )
     .await;
-    restored(&a);
+    seq_restored(&a);
     let md = markdown(&fx, doc).await;
     assert!(md.contains("one") && !md.contains("two"), "{md}");
 }
