@@ -409,7 +409,7 @@ fn assert_parity(file: &str, cases: &[Case]) {
 #[test]
 fn pm_json_matches_y_tiptap_on_the_golden_corpus() {
     let cases = read_cases("pm_json_golden.json");
-    assert_eq!(cases.len(), 21);
+    assert_eq!(cases.len(), 22);
     assert_parity("pm_json_golden.json", &cases);
 }
 
