@@ -16,6 +16,8 @@
 //!   two states by what a reader sees.
 //! - [`mod@pm_json`]: a page as y-tiptap's ProseMirror JSON, what the history
 //!   viewer shows (M1.4), and an entry's "Show changes" render on its diff.
+//! - [`revert`]: Restore here (M2): the verified update that brings a
+//!   live page back to a version, by yrs's undo or a whole-page replace.
 //! - [`view`]: a past version rendered for the viewer (M1.4), plain or
 //!   with the entry's own changes, the input caps that keep it within the
 //!   builder's memory rule, and the `Views` service that loads, bounds,
@@ -48,6 +50,7 @@ pub mod people;
 pub mod permits;
 pub mod pm_json;
 pub mod replay;
+pub mod revert;
 pub mod sessions;
 pub mod sizes;
 mod store;
@@ -81,6 +84,7 @@ pub use pm_json::{
     mark_name, placeholder, pm_json, pm_json_diff,
 };
 pub use replay::{ReplayError, ReplayMode, Replayer, RowEffect, RowOutcome};
+pub use revert::{RevertError, RevertHooks, RevertKind, RevertOutcome, RevertTarget};
 pub use sessions::{
     Contribution, ContributionKind, EntryDraft, EntryKind, Grouper, SEAL_MARGIN, SESSION_GAP,
     UnknownEntryKind,

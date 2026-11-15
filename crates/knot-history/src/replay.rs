@@ -65,6 +65,15 @@ impl ReplayMode {
             }),
         }
     }
+
+    /// A doc of this mode whose own edits use `client`.
+    fn new_doc_as(self, client: ClientID) -> Doc {
+        Doc::with_options(Options {
+            client_id: client,
+            skip_gc: self == ReplayMode::KeepDeleted,
+            ..Default::default()
+        })
+    }
 }
 
 /// How an apply ended.
@@ -184,8 +193,22 @@ impl Replayer {
     /// delete set, no pending content; the caller re-applies the rows of
     /// the checkpoint's `pending_revs`).
     pub fn from_state(mode: ReplayMode, state: &[u8]) -> Result<Replayer, ReplayError> {
+        Replayer::from_doc(mode, mode.new_doc(), state)
+    }
+
+    /// [`Replayer::from_state`] on a doc whose own edits use `client`: a
+    /// revert's plan and scratch docs (`revert`), which write under a fresh
+    /// client id.
+    pub(crate) fn from_state_as(
+        mode: ReplayMode,
+        state: &[u8],
+        client: ClientID,
+    ) -> Result<Replayer, ReplayError> {
+        Replayer::from_doc(mode, mode.new_doc_as(client), state)
+    }
+
+    fn from_doc(mode: ReplayMode, doc: Doc, state: &[u8]) -> Result<Replayer, ReplayError> {
         let update = Update::decode_v1(state).map_err(|e| ReplayError::State(e.to_string()))?;
-        let doc = mode.new_doc();
         doc.transact_mut()
             .apply_update(update)
             .map_err(|e| ReplayError::State(e.to_string()))?;
@@ -776,7 +799,7 @@ pub fn trusted_prefix(state: &[u8]) -> Option<Vec<u8>> {
 /// A doc's blocks and delete set as a v1 update, without its pending
 /// content (`encode_state_as_update` with an encoder skips
 /// `merge_pending_v1`; module docs).
-fn own_state<T: ReadTxn>(txn: &T) -> Vec<u8> {
+pub(crate) fn own_state<T: ReadTxn>(txn: &T) -> Vec<u8> {
     let mut encoder = EncoderV1::new();
     txn.encode_state_as_update(&StateVector::default(), &mut encoder);
     encoder.to_vec()
@@ -785,7 +808,7 @@ fn own_state<T: ReadTxn>(txn: &T) -> Vec<u8> {
 /// The blocks a doc holds, deleted ones included (its pending structs are
 /// not in the block store). `None` when the doc's own state does not decode
 /// again.
-fn held<T: ReadTxn>(txn: &T) -> Option<IdSet> {
+pub(crate) fn held<T: ReadTxn>(txn: &T) -> Option<IdSet> {
     Some(Update::decode_v1(&own_state(txn)).ok()?.insertions(true))
 }
 

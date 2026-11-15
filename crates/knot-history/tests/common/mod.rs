@@ -153,6 +153,7 @@ pub struct History {
     room: Doc,
     rows: Vec<DocUpdate>,
     now: DateTime<Utc>,
+    shapes: Vec<(i64, Shape)>,
 }
 
 impl History {
@@ -163,6 +164,7 @@ impl History {
             room: Doc::new(),
             rows: Vec::new(),
             now: at(0),
+            shapes: Vec::new(),
         }
     }
 
@@ -177,6 +179,47 @@ impl History {
 
     pub fn rows(&self) -> &[DocUpdate] {
         &self.rows
+    }
+
+    /// `steps` random structured steps from `seed` ([`Shape`]), over a page
+    /// that A seeds (row 1) with a heading, a paragraph, a bullet list
+    /// whose items carry `checked`, an ordered list (`start`), a 2×2 table
+    /// (`colspan`, `colwidth`) and a closing paragraph; B and C pull it.
+    /// Each step's row is delivered by `generate`'s rules (pulls, resends,
+    /// held-back rows, gaps).
+    pub fn generate_rich(seed: u64, steps: usize) -> History {
+        let mut h = History::new(seed);
+        let seed_row = h.clients[0].txn(rich::seed);
+        h.edit_at(0, seed_row, at(0));
+        h.pull(1);
+        h.pull(2);
+        for _ in 0..steps {
+            h.rich_step();
+        }
+        h
+    }
+
+    /// The rev of each step's row and the step's kind, for
+    /// [`History::generate_rich`] (empty for other histories). The seed
+    /// row is no step.
+    pub fn shapes(&self) -> &[(i64, Shape)] {
+        &self.shapes
+    }
+
+    fn rich_step(&mut self) {
+        let editor = self.rng.below(3);
+        if self.rng.chance(40) && !has_gaps(&self.room) {
+            self.clients[editor].pull(&self.room);
+        }
+        let drawn = rich::SHAPES[self.rng.below(rich::SHAPES.len())];
+        let shape = {
+            let c = &self.clients[editor];
+            let mut txn = c.doc.transact_mut();
+            rich::edit(&mut txn, &c.frag, drawn, &mut self.rng)
+        };
+        if let Some(rev) = self.deliver() {
+            self.shapes.push((rev, shape));
+        }
     }
 
     pub fn room(&self) -> &Doc {
@@ -286,6 +329,13 @@ impl History {
                 random_edit(&c.doc, &c.frag, &mut self.rng);
             }
         }
+        self.deliver();
+    }
+
+    /// One client delivers a row: its increment, a reconnect resend, a
+    /// held-back update, the previous row again, or (rarely) a restore by
+    /// A. Returns the rev of the row it appended, if any.
+    fn deliver(&mut self) -> Option<i64> {
         let gap = Duration::seconds(1 + self.rng.below(30 * 60) as i64);
         let created_at = self.now + gap;
         let c = self.rng.below(3);
@@ -306,53 +356,49 @@ impl History {
                 let p = frag.insert(txn, 0, XmlElementPrelim::empty("paragraph"));
                 p.push_back(txn, XmlTextPrelim::new(word));
             });
-            self.push_at(
+            return Some(self.push_at(
                 Some(author(0)),
                 bytes,
                 Some(UpdateSource::Restore),
                 None,
                 created_at,
-            );
-            return;
+            ));
         }
         if pick < 10
             && !has_gaps(&self.room)
             && let Some(last) = self.rows.last().cloned()
         {
             // A retried append that had committed: the same row again.
-            self.push_at(
+            return Some(self.push_at(
                 last.by_user_id,
                 last.update_bytes,
                 last.source,
                 last.meta,
                 created_at,
-            );
-            return;
+            ));
         }
         if pick < 25 && !self.clients[c].held.is_empty() {
             let i = self.rng.below(self.clients[c].held.len());
             let bytes = self.clients[c].held.remove(i);
-            self.edit_at(c, bytes, created_at);
-            return;
+            return Some(self.edit_at(c, bytes, created_at));
         }
         if pick < 45 && !has_gaps(&self.room) {
             let client = &self.clients[c];
             client.take_undelivered();
             let sv = self.room.transact().state_vector();
             let bytes = client.doc.transact().encode_state_as_update_v1(&sv);
-            self.edit_at(c, bytes, created_at);
-            return;
+            return Some(self.edit_at(c, bytes, created_at));
         }
         let own = self.clients[c].take_undelivered();
         if own.is_empty() {
-            return;
+            return None;
         }
         let merged = yrs::merge_updates_v1(&own).expect("merge own updates");
         if self.rng.chance(15) {
             self.clients[c].held.push(merged);
-            return;
+            return None;
         }
-        self.edit_at(c, merged, created_at);
+        Some(self.edit_at(c, merged, created_at))
     }
 
     /// A rows at 09:00, 09:15, 09:30, 09:40 and B rows at 09:10, 09:20, each
@@ -404,5 +450,593 @@ impl History {
         });
         h.edit_at(0, a, at(5));
         h
+    }
+}
+
+/// The kind of a [`History::generate_rich`] step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Shape {
+    /// A word typed into, or characters deleted from, any text; or a new
+    /// paragraph.
+    Text,
+    /// A range of a text formatted bold or italic.
+    Bold,
+    /// A typed attribute set: heading `level`, list item `checked`, table
+    /// cell `colwidth` or `colspan`.
+    Attribute,
+    /// A list item nested into its previous sibling's sub-list.
+    ListNest,
+    /// A nested list item moved out, after the item holding its list.
+    ListUnnest,
+    /// A list item deleted and reinserted with its content elsewhere in its
+    /// list.
+    ListMove,
+    TableRowAdd,
+    TableRowRemove,
+    /// A paragraph split at a character.
+    Split,
+    /// A paragraph joined with the paragraph after it.
+    Join,
+    /// Never drawn: labels the revert-of-a-revert plans in the properties'
+    /// per-shape print.
+    Revert,
+}
+
+/// The structured edits of [`History::generate_rich`].
+pub mod rich {
+    use super::Shape;
+    use super::fixtures::Rng;
+    use std::sync::Arc;
+    use yrs::types::Attrs;
+    use yrs::types::text::YChange;
+    use yrs::{
+        Any, Out, ReadTxn, Text, TransactionMut, Xml, XmlElementPrelim, XmlElementRef, XmlFragment,
+        XmlFragmentRef, XmlOut, XmlTextPrelim, XmlTextRef,
+    };
+
+    /// The shapes a step draws from.
+    pub const SHAPES: [Shape; 10] = [
+        Shape::Text,
+        Shape::Bold,
+        Shape::Attribute,
+        Shape::ListNest,
+        Shape::ListUnnest,
+        Shape::ListMove,
+        Shape::TableRowAdd,
+        Shape::TableRowRemove,
+        Shape::Split,
+        Shape::Join,
+    ];
+
+    /// Where an element sits: the root fragment or an element.
+    #[derive(Clone)]
+    pub enum Parent {
+        Root(XmlFragmentRef),
+        El(XmlElementRef),
+    }
+
+    impl Parent {
+        fn children<T: ReadTxn>(&self, txn: &T) -> Vec<XmlOut> {
+            match self {
+                Parent::Root(f) => f.children(txn).collect(),
+                Parent::El(e) => e.children(txn).collect(),
+            }
+        }
+
+        fn len<T: ReadTxn>(&self, txn: &T) -> u32 {
+            match self {
+                Parent::Root(f) => f.len(txn),
+                Parent::El(e) => e.len(txn),
+            }
+        }
+
+        fn remove(&self, txn: &mut TransactionMut, i: u32) {
+            match self {
+                Parent::Root(f) => f.remove_range(txn, i, 1),
+                Parent::El(e) => e.remove_range(txn, i, 1),
+            }
+        }
+
+        fn insert_el(&self, txn: &mut TransactionMut, i: u32, tag: &str) -> XmlElementRef {
+            match self {
+                Parent::Root(f) => f.insert(txn, i, XmlElementPrelim::empty(tag)),
+                Parent::El(e) => e.insert(txn, i, XmlElementPrelim::empty(tag)),
+            }
+        }
+
+        fn insert_text(&self, txn: &mut TransactionMut, i: u32) -> XmlTextRef {
+            match self {
+                Parent::Root(f) => f.insert(txn, i, XmlTextPrelim::new("")),
+                Parent::El(e) => e.insert(txn, i, XmlTextPrelim::new("")),
+            }
+        }
+    }
+
+    /// An element of the page, where it sits, and the index (in the walk's
+    /// output) of the element holding it.
+    pub struct Node {
+        pub el: XmlElementRef,
+        pub parent: Parent,
+        pub index: u32,
+        pub up: Option<usize>,
+    }
+
+    /// Every element under `frag`, in a fixed order.
+    pub fn walk<T: ReadTxn>(txn: &T, frag: &XmlFragmentRef) -> Vec<Node> {
+        let mut out = Vec::new();
+        let mut stack = vec![(Parent::Root(frag.clone()), None)];
+        while let Some((parent, up)) = stack.pop() {
+            for (i, child) in parent.children(txn).into_iter().enumerate() {
+                if let XmlOut::Element(el) = child {
+                    out.push(Node {
+                        el: el.clone(),
+                        parent: parent.clone(),
+                        index: i as u32,
+                        up,
+                    });
+                    stack.push((Parent::El(el), Some(out.len() - 1)));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every text under `frag`, in a fixed order.
+    pub fn texts<T: ReadTxn>(txn: &T, frag: &XmlFragmentRef) -> Vec<XmlTextRef> {
+        let mut out = Vec::new();
+        let mut stack = vec![Parent::Root(frag.clone())];
+        while let Some(parent) = stack.pop() {
+            for child in parent.children(txn) {
+                match child {
+                    XmlOut::Element(el) => stack.push(Parent::El(el)),
+                    XmlOut::Text(t) => out.push(t),
+                    XmlOut::Fragment(_) => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// An element's content, read out so it can be written elsewhere.
+    pub enum Tree {
+        El {
+            tag: String,
+            attrs: Vec<(String, Any)>,
+            children: Vec<Tree>,
+        },
+        Text(Vec<(String, Attrs)>),
+    }
+
+    pub fn read<T: ReadTxn>(txn: &T, node: XmlOut) -> Option<Tree> {
+        match node {
+            XmlOut::Element(el) => {
+                let mut attrs: Vec<(String, Any)> = el
+                    .attributes(txn)
+                    .filter_map(|(k, v)| match v {
+                        Out::Any(a) => Some((k.to_string(), a)),
+                        _ => None,
+                    })
+                    .collect();
+                attrs.sort_by(|a, b| a.0.cmp(&b.0));
+                Some(Tree::El {
+                    tag: el.tag().to_string(),
+                    attrs,
+                    children: el.children(txn).filter_map(|c| read(txn, c)).collect(),
+                })
+            }
+            XmlOut::Text(t) => Some(Tree::Text(chunks(txn, &t))),
+            XmlOut::Fragment(_) => None,
+        }
+    }
+
+    /// A text's string chunks with their attributes.
+    pub fn chunks<T: ReadTxn>(txn: &T, t: &XmlTextRef) -> Vec<(String, Attrs)> {
+        t.diff(txn, YChange::identity)
+            .into_iter()
+            .filter_map(|d| match d.insert {
+                Out::Any(Any::String(s)) => {
+                    Some((s.to_string(), d.attributes.map(|a| *a).unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn append(txn: &mut TransactionMut, t: &XmlTextRef, chunks: Vec<(String, Attrs)>) {
+        for (s, attrs) in chunks {
+            let end = t.len(txn);
+            t.insert_with_attributes(txn, end, &s, attrs);
+        }
+    }
+
+    pub fn write(txn: &mut TransactionMut, parent: &Parent, at: u32, tree: Tree) {
+        match tree {
+            Tree::El {
+                tag,
+                attrs,
+                children,
+            } => {
+                let el = parent.insert_el(txn, at, &tag);
+                for (k, v) in attrs {
+                    el.insert_attribute(txn, k, v);
+                }
+                let me = Parent::El(el);
+                for (i, child) in children.into_iter().enumerate() {
+                    write(txn, &me, i as u32, child);
+                }
+            }
+            Tree::Text(chunks) => {
+                let t = parent.insert_text(txn, at);
+                append(txn, &t, chunks);
+            }
+        }
+    }
+
+    fn para(txn: &mut TransactionMut, parent: &Parent, at: u32, text: &str) -> XmlElementRef {
+        let p = parent.insert_el(txn, at, "paragraph");
+        let t = Parent::El(p.clone()).insert_text(txn, 0);
+        t.insert(txn, 0, text);
+        p
+    }
+
+    fn item(txn: &mut TransactionMut, list: &XmlElementRef, text: &str, checked: Option<bool>) {
+        let n = list.len(txn);
+        let li = list.insert(txn, n, XmlElementPrelim::empty("list_item"));
+        if let Some(c) = checked {
+            li.insert_attribute(txn, "checked", Any::Bool(c));
+        }
+        para(txn, &Parent::El(li), 0, text);
+    }
+
+    fn cell(txn: &mut TransactionMut, row: &XmlElementRef, text: &str) {
+        let n = row.len(txn);
+        let c = row.insert(txn, n, XmlElementPrelim::empty("table_cell"));
+        c.insert_attribute(txn, "colspan", Any::Number(1.0));
+        c.insert_attribute(
+            txn,
+            "colwidth",
+            Any::Array(Arc::from(vec![Any::Number(100.0)])),
+        );
+        para(txn, &Parent::El(c), 0, text);
+    }
+
+    /// The seeded page.
+    pub fn seed(txn: &mut TransactionMut, frag: &XmlFragmentRef) {
+        let root = Parent::Root(frag.clone());
+        let h = root.insert_el(txn, 0, "heading");
+        h.insert_attribute(txn, "level", Any::Number(1.0));
+        Parent::El(h).insert_text(txn, 0).insert(txn, 0, "Title");
+        para(txn, &root, 1, "intro text here");
+        let bl = root.insert_el(txn, 2, "bullet_list");
+        for w in ["one", "two", "three"] {
+            item(txn, &bl, w, Some(false));
+        }
+        let ol = root.insert_el(txn, 3, "ordered_list");
+        ol.insert_attribute(txn, "start", Any::Number(1.0));
+        for w in ["first", "second", "third"] {
+            item(txn, &ol, w, None);
+        }
+        let table = root.insert_el(txn, 4, "table");
+        for r in ["1", "2"] {
+            let row = table.insert(txn, table.len(txn), XmlElementPrelim::empty("table_row"));
+            cell(txn, &row, &format!("a{r}"));
+            cell(txn, &row, &format!("b{r}"));
+        }
+        para(txn, &root, 5, "closing words");
+    }
+
+    fn is_list(tag: &str) -> bool {
+        tag == "bullet_list" || tag == "ordered_list"
+    }
+
+    fn pick<'a, T>(rng: &mut Rng, items: &'a [T]) -> Option<&'a T> {
+        (!items.is_empty()).then(|| &items[rng.below(items.len())])
+    }
+
+    /// One `shape` edit on the page in `txn`; one that finds nothing to edit
+    /// does a `Text` edit instead. Returns the shape it did.
+    pub fn edit(
+        txn: &mut TransactionMut,
+        frag: &XmlFragmentRef,
+        shape: Shape,
+        rng: &mut Rng,
+    ) -> Shape {
+        let done = match shape {
+            Shape::Text => false,
+            Shape::Bold => bold(txn, frag, rng),
+            Shape::Attribute => attribute(txn, frag, rng),
+            Shape::ListNest => list_nest(txn, frag, rng),
+            Shape::ListUnnest => list_unnest(txn, frag, rng),
+            Shape::ListMove => list_move(txn, frag, rng),
+            Shape::TableRowAdd => table_row_add(txn, frag, rng),
+            Shape::TableRowRemove => table_row_remove(txn, frag, rng),
+            Shape::Split => split(txn, frag, rng),
+            Shape::Join => join(txn, frag, rng),
+            Shape::Revert => false,
+        };
+        if done {
+            return shape;
+        }
+        text(txn, frag, rng);
+        Shape::Text
+    }
+
+    fn text(txn: &mut TransactionMut, frag: &XmlFragmentRef, rng: &mut Rng) {
+        let all = texts(txn, frag);
+        let choice = rng.below(4);
+        match (choice, pick(rng, &all).cloned()) {
+            (0 | 1, Some(t)) => {
+                let at = rng.below(t.len(txn) as usize + 1) as u32;
+                let word = rng.word();
+                t.insert(txn, at, &word);
+            }
+            (2, Some(t)) if t.len(txn) > 2 => {
+                let at = rng.below(t.len(txn) as usize - 2) as u32;
+                t.remove_range(txn, at, 1 + rng.below(2) as u32);
+            }
+            _ => {
+                let n = frag.len(txn);
+                let at = rng.below(n as usize + 1) as u32;
+                let word = rng.word();
+                para(txn, &Parent::Root(frag.clone()), at, &word);
+            }
+        }
+    }
+
+    fn bold(txn: &mut TransactionMut, frag: &XmlFragmentRef, rng: &mut Rng) -> bool {
+        let all: Vec<XmlTextRef> = texts(txn, frag)
+            .into_iter()
+            .filter(|t| t.len(txn) > 0)
+            .collect();
+        let Some(t) = pick(rng, &all).cloned() else {
+            return false;
+        };
+        let len = t.len(txn);
+        let from = rng.below(len as usize) as u32;
+        let count = 1 + rng.below((len - from) as usize) as u32;
+        let mark = if rng.chance(50) { "bold" } else { "italic" };
+        let attrs: Attrs = [(mark.into(), Any::Bool(true))].into_iter().collect();
+        t.format(txn, from, count, attrs);
+        true
+    }
+
+    fn attribute(txn: &mut TransactionMut, frag: &XmlFragmentRef, rng: &mut Rng) -> bool {
+        let nodes: Vec<XmlElementRef> = walk(txn, frag)
+            .into_iter()
+            .map(|n| n.el)
+            .filter(|el| matches!(el.tag().as_ref(), "heading" | "list_item" | "table_cell"))
+            .collect();
+        let Some(el) = pick(rng, &nodes).cloned() else {
+            return false;
+        };
+        match el.tag().as_ref() {
+            "heading" => {
+                let level = 1 + rng.below(3);
+                el.insert_attribute(txn, "level", Any::Number(level as f64));
+            }
+            "list_item" => {
+                let checked = rng.chance(50);
+                el.insert_attribute(txn, "checked", Any::Bool(checked));
+            }
+            _ => {
+                if rng.chance(50) {
+                    let w = 50 * (1 + rng.below(6));
+                    el.insert_attribute(
+                        txn,
+                        "colwidth",
+                        Any::Array(Arc::from(vec![Any::Number(w as f64)])),
+                    );
+                } else {
+                    let span = 1 + rng.below(2);
+                    el.insert_attribute(txn, "colspan", Any::Number(span as f64));
+                }
+            }
+        }
+        true
+    }
+
+    /// List items with their node index, in lists of the page.
+    fn list_items(nodes: &[Node]) -> Vec<usize> {
+        (0..nodes.len())
+            .filter(|&i| {
+                nodes[i].el.tag().as_ref() == "list_item"
+                    && nodes[i]
+                        .up
+                        .is_some_and(|u| is_list(nodes[u].el.tag().as_ref()))
+            })
+            .collect()
+    }
+
+    fn list_nest(txn: &mut TransactionMut, frag: &XmlFragmentRef, rng: &mut Rng) -> bool {
+        let nodes = walk(txn, frag);
+        let candidates: Vec<usize> = list_items(&nodes)
+            .into_iter()
+            .filter(|&i| nodes[i].index > 0)
+            .collect();
+        let Some(&i) = pick(rng, &candidates) else {
+            return false;
+        };
+        let n = &nodes[i];
+        let Some(XmlOut::Element(prev)) = n.parent.children(txn).get(n.index as usize - 1).cloned()
+        else {
+            return false;
+        };
+        let Some(tree) = read(txn, XmlOut::Element(n.el.clone())) else {
+            return false;
+        };
+        n.parent.remove(txn, n.index);
+        let sub = prev.children(txn).find_map(|c| match c {
+            XmlOut::Element(e) if e.tag().as_ref() == "bullet_list" => Some(e),
+            _ => None,
+        });
+        let sub = match sub {
+            Some(sub) => sub,
+            None => {
+                let end = prev.len(txn);
+                prev.insert(txn, end, XmlElementPrelim::empty("bullet_list"))
+            }
+        };
+        let end = sub.len(txn);
+        write(txn, &Parent::El(sub), end, tree);
+        true
+    }
+
+    fn list_unnest(txn: &mut TransactionMut, frag: &XmlFragmentRef, rng: &mut Rng) -> bool {
+        let nodes = walk(txn, frag);
+        // An item whose list sits in an item of an outer list.
+        let candidates: Vec<(usize, usize, usize)> = list_items(&nodes)
+            .into_iter()
+            .filter_map(|i| {
+                let list = nodes[i].up?;
+                let gp = nodes[list].up?;
+                (nodes[gp].el.tag().as_ref() == "list_item"
+                    && nodes[gp]
+                        .up
+                        .is_some_and(|u| is_list(nodes[u].el.tag().as_ref())))
+                .then_some((i, list, gp))
+            })
+            .collect();
+        let Some(&(i, list, gp)) = pick(rng, &candidates) else {
+            return false;
+        };
+        let Some(tree) = read(txn, XmlOut::Element(nodes[i].el.clone())) else {
+            return false;
+        };
+        if nodes[list].el.len(txn) == 1 {
+            nodes[list].parent.remove(txn, nodes[list].index);
+        } else {
+            nodes[i].parent.remove(txn, nodes[i].index);
+        }
+        write(txn, &nodes[gp].parent, nodes[gp].index + 1, tree);
+        true
+    }
+
+    fn list_move(txn: &mut TransactionMut, frag: &XmlFragmentRef, rng: &mut Rng) -> bool {
+        let nodes = walk(txn, frag);
+        let candidates: Vec<usize> = list_items(&nodes)
+            .into_iter()
+            .filter(|&i| nodes[i].parent.len(txn) > 1)
+            .collect();
+        let Some(&i) = pick(rng, &candidates) else {
+            return false;
+        };
+        let n = &nodes[i];
+        let Some(tree) = read(txn, XmlOut::Element(n.el.clone())) else {
+            return false;
+        };
+        n.parent.remove(txn, n.index);
+        let len = n.parent.len(txn);
+        let mut to = rng.below(len as usize + 1) as u32;
+        if to == n.index {
+            to = (to + 1) % (len + 1);
+        }
+        write(txn, &n.parent, to, tree);
+        true
+    }
+
+    fn tables(txn: &TransactionMut, frag: &XmlFragmentRef) -> Vec<XmlElementRef> {
+        walk(txn, frag)
+            .into_iter()
+            .map(|n| n.el)
+            .filter(|el| el.tag().as_ref() == "table")
+            .collect()
+    }
+
+    fn table_row_add(txn: &mut TransactionMut, frag: &XmlFragmentRef, rng: &mut Rng) -> bool {
+        let all = tables(txn, frag);
+        let Some(table) = pick(rng, &all).cloned() else {
+            return false;
+        };
+        let at = rng.below(table.len(txn) as usize + 1) as u32;
+        let row = table.insert(txn, at, XmlElementPrelim::empty("table_row"));
+        let (a, b) = (rng.word(), rng.word());
+        cell(txn, &row, &a);
+        cell(txn, &row, &b);
+        true
+    }
+
+    fn table_row_remove(txn: &mut TransactionMut, frag: &XmlFragmentRef, rng: &mut Rng) -> bool {
+        let all: Vec<XmlElementRef> = tables(txn, frag)
+            .into_iter()
+            .filter(|t| t.len(txn) > 1)
+            .collect();
+        let Some(table) = pick(rng, &all).cloned() else {
+            return false;
+        };
+        let at = rng.below(table.len(txn) as usize) as u32;
+        table.remove_range(txn, at, 1);
+        true
+    }
+
+    /// The first text of `p`, if it has one.
+    fn text_of<T: ReadTxn>(txn: &T, p: &XmlElementRef) -> Option<XmlTextRef> {
+        p.children(txn).find_map(|c| match c {
+            XmlOut::Text(t) => Some(t),
+            _ => None,
+        })
+    }
+
+    fn split(txn: &mut TransactionMut, frag: &XmlFragmentRef, rng: &mut Rng) -> bool {
+        let nodes = walk(txn, frag);
+        let candidates: Vec<(usize, XmlTextRef)> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.el.tag().as_ref() == "paragraph")
+            .filter_map(|(i, n)| Some((i, text_of(txn, &n.el)?)))
+            .filter(|(_, t)| t.len(txn) >= 2)
+            .collect();
+        let Some((i, t)) = pick(rng, &candidates).cloned() else {
+            return false;
+        };
+        let len = t.len(txn);
+        let k = 1 + rng.below(len as usize - 1) as u32;
+        // The texts are ASCII, so a byte offset is a character offset.
+        let mut tail = Vec::new();
+        let mut pos = 0u32;
+        for (s, attrs) in chunks(txn, &t) {
+            let n = s.len() as u32;
+            if pos + n > k {
+                let from = k.saturating_sub(pos) as usize;
+                tail.push((s[from..].to_string(), attrs));
+            }
+            pos += n;
+        }
+        t.remove_range(txn, k, len - k);
+        let n = &nodes[i];
+        let p = n.parent.insert_el(txn, n.index + 1, "paragraph");
+        let t2 = Parent::El(p).insert_text(txn, 0);
+        append(txn, &t2, tail);
+        true
+    }
+
+    fn join(txn: &mut TransactionMut, frag: &XmlFragmentRef, rng: &mut Rng) -> bool {
+        let nodes = walk(txn, frag);
+        let candidates: Vec<(usize, XmlElementRef)> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.el.tag().as_ref() == "paragraph")
+            .filter_map(
+                |(i, n)| match n.parent.children(txn).get(n.index as usize + 1) {
+                    Some(XmlOut::Element(next)) if next.tag().as_ref() == "paragraph" => {
+                        Some((i, next.clone()))
+                    }
+                    _ => None,
+                },
+            )
+            .collect();
+        let Some((i, next)) = pick(rng, &candidates).cloned() else {
+            return false;
+        };
+        let moved = text_of(txn, &next)
+            .map(|t| chunks(txn, &t))
+            .unwrap_or_default();
+        let n = &nodes[i];
+        n.parent.remove(txn, n.index + 1);
+        let t = match text_of(txn, &n.el) {
+            Some(t) => t,
+            None => Parent::El(n.el.clone()).insert_text(txn, 0),
+        };
+        append(txn, &t, moved);
+        true
     }
 }
