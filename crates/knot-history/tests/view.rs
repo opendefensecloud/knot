@@ -1689,9 +1689,18 @@ async fn a_joined_caller_renders_after_the_first_is_dropped() {
     });
     let rec = CountingRecorder::default();
     let _g = metrics::set_default_local_recorder(&rec);
+    // The second starts once the first renders, so the first is the one
+    // rendering (on a slow runner a second started at once can overtake
+    // the first's loads, render itself, and leave the first only joined).
     let (first, second) = tokio::join!(
         drop_once_rendering(views.view(anyone(), doc, s.id, false), &renders),
-        views.view(anyone(), doc, s.id, false),
+        async {
+            wait_until("the first render", Duration::from_secs(10), || {
+                count(&renders) >= 1
+            })
+            .await;
+            views.view(anyone(), doc, s.id, false).await
+        },
     );
     assert!(first.is_none(), "the first was dropped");
     assert!(second.is_ok(), "{:?}", second.err());
