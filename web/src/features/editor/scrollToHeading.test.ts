@@ -22,7 +22,7 @@ describe("scrollToHeading", () => {
     const heading = document.getElementById("tasks-1")!;
     heading.getBoundingClientRect = () => ({ top: 500 }) as DOMRect;
     expect(scrollToHeading("tasks-1")).toBe(true);
-    expect(scrollBy).toHaveBeenCalledWith({ top: 500 - 68, behavior: "smooth" });
+    expect(scrollBy).toHaveBeenCalledWith({ top: 500 - 68, behavior: "auto" });
   });
 
   it("says false when there is no such heading", () => {

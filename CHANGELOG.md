@@ -8,6 +8,33 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Added
+- Table of contents block. Insert it from the editor toolbar (the list-tree
+  button) and it lists the page's headings in a box, kept current as
+  anyone edits, without writing to the page itself. **Levels** sets how deep
+  it goes (1–6, 3 by default), per box. A click jumps to the heading, just
+  below the sticky bar, and puts its anchor in the URL; opening a page with
+  such a link scrolls there. The box works anywhere a block does, including
+  a table cell, and looks the same in every skin. (#TBD)
+- Headings have anchor ids the way GitHub makes them (`#tasks`, `#tasks-1`
+  for a second "Tasks", `#cafe` for "Café"), in the editor and on public
+  pages alike. (#TBD)
+- Markdown: a table of contents is GitLab's own `[[_TOC_]]`, with
+  `<!-- knot:toc maxLevel=N -->` on the line before it when its depth is not
+  3, so an exported page shows a real table of contents in GitLab. Import
+  and Markdown paste read both forms back. Public share pages show the box
+  with working links; DOCX and ODT exports list the headings under
+  "Contents" with Word's and LibreOffice's own table of contents styles.
+  (#TBD)
+
+### Operators — read before upgrading
+- **Tell people to reload, and do not roll back past this release once
+  pages have a table of contents.** A browser tab that does not know the new
+  block removes it from the shared page as soon as it opens that page, for
+  everyone. That is any tab left open from before the upgrade, and any
+  client after a rollback. The box can be inserted again; nothing else on
+  the page is affected.
+
 ## [0.10.0] - 2026-11-15
 
 A page history release, with a fix for pages that lost an edit: their
