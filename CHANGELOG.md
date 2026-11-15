@@ -8,6 +8,11 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Fixed
+- An API key needs `update`, not `create`, for
+  `POST /api/docs/{id}/move-to-subpage`: it cuts blocks out of an
+  existing page, so a `create`-only key could change that page.
+
 ## [0.10.0] - 2026-11-15
 
 A page history release, with a fix for pages that lost an edit: their

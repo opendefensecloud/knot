@@ -26,7 +26,7 @@ A key acts as the user (or bot) it belongs to, in that user's workspace, with th
   |---|---|
   | `read` | GET/HEAD (the page audit log included), plus `POST /api/docs/{id}/export/{format}` (renders a file; writes only its `doc.export` audit row) |
   | `create` | every other POST: new pages, duplicates, restores as a new page (`…/history/entries/{eid}/restore-as-new`), uploads, comments, replies, suggestions (not the session-only routes above) |
-  | `update` | PATCH/PUT, plus the POSTs `…/move`, `…/markdown` (import), `…/restore`, `…/history/entries/{eid}/restore`, `…/history/{seq}/restore`, `…/template`, `…/comments/{thread_id}/resolve` and `/unresolve`, `…/suggestions/{sid}/accept`, `/reject`, `/withdraw`, `/api/notifications/read`, `/api/whats-new/seen` |
+  | `update` | PATCH/PUT, plus the POSTs `…/move`, `…/move-to-subpage` (cuts blocks out of the page, though it opens a new one), `…/markdown` (import), `…/restore`, `…/history/entries/{eid}/restore`, `…/history/{seq}/restore`, `…/template`, `…/comments/{thread_id}/resolve` and `/unresolve`, `…/suggestions/{sid}/accept`, `/reject`, `/withdraw`, `/api/notifications/read`, `/api/whats-new/seen` |
   | `delete` | DELETE (archive, share links, …; not the session-only routes above), plus `POST /api/docs/{id}/purge` |
 
   Missing scope → `403 {"error":{"code":"api_key.scope_denied","details":{"scope":"update"}}}` naming the scope it needed. A script that reads a page and writes it back as markdown needs `read` + `update`. So does an agent that reads its tasks, ticks them and writes progress into existing pages; opening a new page (for a handoff, say) or leaving a comment is a create and needs `create` too.

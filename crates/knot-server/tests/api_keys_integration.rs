@@ -2446,6 +2446,28 @@ async fn every_scope_override_matches_a_real_route() {
     }
 }
 
+/// Move to subpage cuts blocks out of an existing page, so it is an
+/// update: a `create`-only key is denied, an `update` key reaches the
+/// handler (which then refuses the bogus anchors).
+#[tokio::test(flavor = "multi_thread")]
+async fn move_to_subpage_needs_update_not_create() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let doc = matrix_doc(&app, &s, "page").await;
+    let uri = format!("/api/docs/{doc}/move-to-subpage");
+    let body = serde_json::json!({"start": "!", "end": "!", "title": "sub"});
+
+    let create_key = matrix_key(&app, &s, &["create"]).await;
+    let (st, res) = guards_bearer(&app, &create_key, "POST", &uri, Some(body.clone())).await;
+    assert_scope_denied(st, &res, "update");
+
+    let update_key = matrix_key(&app, &s, &["update"]).await;
+    let (st, res) = guards_bearer(&app, &update_key, "POST", &uri, Some(body)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{res}");
+    assert_eq!(res["error"]["code"], "move.invalid_anchor", "{res}");
+}
+
 /// Bots view and restore history entries under their page role, as
 /// people do (Rulings): a bot Editor's key with `read`, `update` and
 /// `create` reaches the three handlers, which answer for the missing
