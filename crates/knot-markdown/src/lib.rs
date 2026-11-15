@@ -6,6 +6,7 @@ pub mod legacy;
 pub mod normalise;
 pub mod remap;
 pub mod schema;
+pub mod slug;
 pub mod tasks;
 pub mod to_markdown;
 
