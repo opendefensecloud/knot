@@ -10,7 +10,7 @@ use yrs::{Any, Out, ReadTxn, Text, Transact, Xml, XmlFragment, XmlOut, XmlTextRe
 
 use crate::model::{
     Align, Block, Cell, ExportDoc, ImageSource, Inline, LinkTarget, List, ListItem, Marks, Run,
-    Table,
+    Table, TocEntry,
 };
 use crate::tables::resolve_shares;
 
@@ -63,10 +63,11 @@ struct Tally {
 pub fn walk(doc: &yrs::Doc) -> Walked {
     let txn = doc.transact();
     let mut tally = Tally::default();
-    let blocks = match txn.get_xml_fragment("default") {
+    let mut blocks = match txn.get_xml_fragment("default") {
         Some(frag) => walk_blocks(&frag, &txn, &mut tally, 0),
         None => Vec::new(),
     };
+    fill_tocs(&mut blocks);
     Walked {
         doc: ExportDoc { blocks },
         unknown_elements: tally.unknown,
@@ -454,6 +455,13 @@ fn walk_single<T: ReadTxn>(
                 label,
             }
         }
+        "table_of_contents" => Block::Toc {
+            max_level: attr(el, txn, "maxLevel")
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|n| n.fract() == 0.0 && (1.0..=6.0).contains(n))
+                .map_or(3, |n| n as u8),
+            entries: Vec::new(),
+        },
         "attachment" => Block::Attachment {
             url: attr(el, txn, "url").unwrap_or_default(),
             name: attr(el, txn, "name").unwrap_or_default(),
@@ -663,6 +671,52 @@ pub enum DiagramRef {
 }
 
 /// Calls `f` for every block, depth first in document order.
+/// The page's headings as `(level, text)`, in order, empty ones left out.
+fn headings(blocks: &[Block]) -> Vec<(u8, String)> {
+    let mut out = Vec::new();
+    visit_blocks(blocks, &mut |b| {
+        if let Block::Heading { level, .. } = b {
+            let text = plain_text(std::slice::from_ref(b));
+            if !text.trim().is_empty() {
+                out.push((*level, text));
+            }
+        }
+    });
+    out
+}
+
+/// Fills every [`Block::Toc`] with the headings down to its depth.
+fn fill_tocs(blocks: &mut [Block]) {
+    let all = headings(blocks);
+    fn fill(blocks: &mut [Block], all: &[(u8, String)]) {
+        for b in blocks {
+            match b {
+                Block::Toc { max_level, entries } => {
+                    let shown: Vec<&(u8, String)> =
+                        all.iter().filter(|(l, _)| l <= max_level).collect();
+                    let top = shown.iter().map(|(l, _)| *l).min().unwrap_or(1);
+                    *entries = shown
+                        .into_iter()
+                        .map(|(l, text)| TocEntry {
+                            level: (l - top).min(4),
+                            text: text.clone(),
+                        })
+                        .collect();
+                }
+                Block::Quote(inner) => fill(inner, all),
+                Block::List(list) => list.items.iter_mut().for_each(|i| fill(&mut i.blocks, all)),
+                Block::Table(table) => table
+                    .rows
+                    .iter_mut()
+                    .flatten()
+                    .for_each(|c| fill(&mut c.blocks, all)),
+                _ => {}
+            }
+        }
+    }
+    fill(blocks, &all);
+}
+
 fn visit_blocks<'a>(blocks: &'a [Block], f: &mut impl FnMut(&'a Block)) {
     for b in blocks {
         f(b);

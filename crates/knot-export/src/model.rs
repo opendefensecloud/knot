@@ -39,6 +39,20 @@ pub enum Block {
         name: String,
         size: Option<u64>,
     },
+    /// A table of contents: the page's headings down to `max_level`, filled
+    /// in by the walk once every heading is known.
+    Toc {
+        max_level: u8,
+        entries: Vec<TocEntry>,
+    },
+}
+
+/// One line of a [`Block::Toc`]: `level` 0–4 below the shallowest heading
+/// shown (deeper ones stay at 4), and the heading's text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TocEntry {
+    pub level: u8,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
