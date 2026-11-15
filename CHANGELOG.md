@@ -154,10 +154,11 @@ place or as a new page.
   bot or API key user renders one version at a time and runs one
   restore at a time, in place or as a new page (a second waits for the
   first up to 5 s, then answers busy), per replica. (#TBD)
-- Restore here needs the version and the live page together under the
-  revert limit: 40/51 of `replayMaxBytes`, at most 12 MiB (about
-  3.14 MiB at the default, 3,289,650 bytes), so pages over about
-  1.57 MiB cannot be restored in place at the default. They answer
+- Restore here needs the version, its deleted text included, and the
+  live page together under the revert limit: 40/51 of `replayMaxBytes`,
+  at most 12 MiB (about 3.14 MiB at the default, 3,289,650 bytes). For
+  a version about the size of the page, pages over about 1.57 MiB
+  cannot be restored in place at the default. They answer
   "This page is too large to restore here" (409 `restore.too_large`);
   Restore as new page needs only the version under the version limit,
   so it still works. The same answer comes, for 10 minutes on that pod,
@@ -166,10 +167,11 @@ place or as a new page.
 - Restore here answers within 30 s. On a page edited throughout its
   five attempts it answers that the page kept changing (409
   `history.restore_busy`); out of time before anything was sent, busy
-  (503, nothing changed); out of time after it was sent, a timeout (504:
-  the change may still apply, so check the page). A restore whose page
-  cannot catch up with its stored log answers busy (503) and counts as
-  `failed` in `knot_history_restore_total`. (#TBD)
+  (503, nothing changed); out of time while handing it to a busy page
+  or after it was sent, a timeout (504: the change may still apply, so
+  check the page). A restore whose page cannot catch up with its stored
+  log answers busy (503) and counts as `failed` in
+  `knot_history_restore_total`. (#TBD)
 - Edits not yet saved on the server when a restore applies, including
   those of a tab that was offline, are lost if they are in a part the
   restore removes; after a whole-page replace, all of them are. Text
@@ -208,10 +210,11 @@ place or as a new page.
   `<title> (version of <date>)`, without its subpages:
   `POST /api/docs/{id}/history/entries/{eid}/restore-as-new` with the
   body `{"version_label", "ended_at"}` (`ended_at` optional) answers 201
-  with the new page. It needs Editor+ on the page, API keys need
-  `create`, it counts as an `expensive` request like Duplicate, and it is
-  recorded in the new page's audit log as a copy. The new page's history
-  starts "Created from `<title>`, version of `<date>`". (#TBD)
+  with the new page. It needs Editor+ on the page and where the copy
+  goes, as Duplicate; API keys need `create`. It counts as an
+  `expensive` request like Duplicate and is recorded in the new page's
+  audit log as a copy. The new page's history starts "Created from
+  `<title>`, version of `<date>`". (#TBD)
 - Metric `knot_history_restore_total{outcome}`: alert on `apply_failed`,
   `failed` and `unverified`; `fallback` is worth watching (comments may
   have lost their place); `stale` and `busy` are capacity or contention

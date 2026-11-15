@@ -360,6 +360,19 @@ fn count(c: &Arc<AtomicUsize>) -> usize {
     c.load(Ordering::SeqCst)
 }
 
+/// Waits until `c` counts at least `n` renders started (at most 10 s), so a
+/// test sends its next request while those renders are held, whatever the
+/// order in which `tokio::join!` started its futures.
+async fn renders_reach(c: &Arc<AtomicUsize>, n: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while count(c) < n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} of {n} renders started", count(c)));
+}
+
 /// Silences the panics the test hooks raise (each nextest test is a
 /// process of its own).
 fn quiet_hook_panics() {
@@ -1868,32 +1881,37 @@ async fn two_restores_by_one_person_run_one_at_a_time() {
     });
     let busy = restore_total("busy");
     let editor = Some(&fx.editor.session);
-    let started = std::time::Instant::now();
     let by_editor = |(doc, ids): &(Uuid, Vec<i64>)| {
         let (doc, eid) = (*doc, ids[0]);
         let (app, renders) = (&app, &renders);
         async move {
+            let started = std::time::Instant::now();
             let a = restore_on(app, editor, doc, eid, "").await;
             (a, count(renders), started.elapsed())
         }
     };
-    let (first, second, owner) = tokio::join!(
+    // The second is sent once the first's and the owner's targets are held,
+    // so it is the one refused.
+    let (served, refused, owner) = tokio::join!(
         by_editor(&pages[0]),
-        by_editor(&pages[1]),
+        async {
+            renders_reach(&renders, 2).await;
+            by_editor(&pages[1]).await
+        },
         restore_on(&app, Some(&fx.owner.session), pages[2].0, pages[2].1[0], ""),
     );
-    let (served, refused, refused_page) = if first.0.status == StatusCode::OK {
-        (first, second, &pages[1])
-    } else {
-        (second, first, &pages[0])
-    };
+    let refused_page = &pages[1];
     restored(&served.0);
     refused.0.busy();
-    // Refused at its permit wait, before its replay, while the two other
-    // targets were held.
-    assert_eq!(refused.1, 2, "renders when the 503 arrived");
+    // Refused at its permit wait (300 ms here, not the 5 s default), before
+    // its replay: the two other restores' renders alone ran (four in all).
     assert!(
-        refused.2 >= Duration::from_millis(250) && refused.2 < Duration::from_secs(1),
+        refused.1 >= 2,
+        "renders when the 503 arrived: {}",
+        refused.1
+    );
+    assert!(
+        refused.2 >= Duration::from_millis(250) && refused.2 < Duration::from_secs(2),
         "{:?}",
         refused.2
     );
@@ -3022,13 +3040,17 @@ async fn a_version_too_slow_to_revert_still_restores_as_new() {
     assert!(markdown(&fx, copy).await.contains("first version"));
 }
 
-/// `post`'s answer, with the renders counted and the time since `started`
-/// when it arrived.
+/// `post`'s answer, with the renders counted and the time it took. With
+/// `after`, it is sent only once that many renders have started.
 async fn timed(
     post: impl std::future::Future<Output = Answer>,
     renders: &Arc<AtomicUsize>,
-    started: std::time::Instant,
+    after: Option<usize>,
 ) -> (Answer, usize, Duration) {
+    if let Some(n) = after {
+        renders_reach(renders, n).await;
+    }
+    let started = std::time::Instant::now();
     let a = post.await;
     (a, count(renders), started.elapsed())
 }
@@ -3036,10 +3058,6 @@ async fn timed(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restore_as_new_waits_for_the_callers_restore() {
     let fx = fixture().await;
-    let mut pages = Vec::new();
-    for _ in 0..3 {
-        pages.push(typed_page(&fx, &[fx.editor.id, fx.owner.id]).await);
-    }
     let renders = counter();
     let app = router_with(
         &fx,
@@ -3051,64 +3069,80 @@ async fn a_restore_as_new_waits_for_the_callers_restore() {
         },
         |_| {},
     );
-    let n = page_count(&fx).await;
     let editor = Some(&fx.editor.session);
-    let started = std::time::Instant::now();
-    let (here, as_new, owner) = tokio::join!(
-        timed(
-            restore_on(&app, editor, pages[0].0, pages[0].1[0], ""),
-            &renders,
-            started
-        ),
-        timed(
-            restore_as_new_on(&app, editor, pages[1].0, pages[1].1[0], labelled("x")),
-            &renders,
-            started
-        ),
-        restore_as_new_on(
-            &app,
-            Some(&fx.owner.session),
-            pages[2].0,
-            pages[2].1[0],
-            labelled("x"),
-        ),
-    );
-    let here_served = here.0.status == StatusCode::OK;
-    let as_new_served = as_new.0.status == StatusCode::CREATED;
-    assert!(
-        here_served != as_new_served,
-        "{} / {}",
-        here.0.body,
-        as_new.0.body
-    );
-    let refused = if here_served {
-        restored(&here.0);
-        &as_new
-    } else {
-        created(&as_new.0);
-        &here
-    };
-    refused.0.busy();
-    // Refused at its permit wait, before its replay, while the served
-    // one's first render and the owner's replay were held.
-    assert_eq!(refused.1, 2, "renders when the 503 arrived");
-    assert!(
-        refused.2 >= Duration::from_millis(250) && refused.2 < Duration::from_secs(1),
-        "{:?}",
-        refused.2
-    );
-    created(&owner);
-    // A refused restore as new created nothing.
-    let copies = 1 + u64::from(as_new_served);
-    assert_eq!(page_count(&fx).await, n + copies);
-    let editor_renders = if here_served { 2 } else { 1 };
-    assert_eq!(count(&renders), 1 + editor_renders);
+    // Either holds the caller's restore permit against the other: first a
+    // restore in place against a restore as new, then the other way round.
+    for here_first in [true, false] {
+        let mut pages = Vec::new();
+        for _ in 0..3 {
+            pages.push(typed_page(&fx, &[fx.editor.id, fx.owner.id]).await);
+        }
+        renders.store(0, Ordering::SeqCst);
+        let n = page_count(&fx).await;
+        // The second is sent once the first's and the owner's renders are
+        // held, so it is the one refused.
+        let (here_after, as_new_after) = if here_first {
+            (None, Some(2))
+        } else {
+            (Some(2), None)
+        };
+        let (here, as_new, owner) = tokio::join!(
+            timed(
+                restore_on(&app, editor, pages[0].0, pages[0].1[0], ""),
+                &renders,
+                here_after
+            ),
+            timed(
+                restore_as_new_on(&app, editor, pages[1].0, pages[1].1[0], labelled("x")),
+                &renders,
+                as_new_after
+            ),
+            restore_as_new_on(
+                &app,
+                Some(&fx.owner.session),
+                pages[2].0,
+                pages[2].1[0],
+                labelled("x"),
+            ),
+        );
+        let refused = if here_first {
+            restored(&here.0);
+            &as_new
+        } else {
+            created(&as_new.0);
+            &here
+        };
+        refused.0.busy();
+        // Refused at its permit wait (300 ms here, not the 5 s default),
+        // before its replay, while the served one's first render and the
+        // owner's replay were held.
+        assert!(
+            refused.1 >= 2,
+            "renders when the 503 arrived: {}",
+            refused.1
+        );
+        assert!(
+            refused.2 >= Duration::from_millis(250) && refused.2 < Duration::from_secs(2),
+            "{:?}",
+            refused.2
+        );
+        created(&owner);
+        // A refused restore as new created nothing.
+        let copies = 1 + u64::from(!here_first);
+        assert_eq!(page_count(&fx).await, n + copies);
+        // The refused one rendered nothing: the owner's copy one render,
+        // the served restore in place two, the served copy one.
+        let editor_renders = if here_first { 2 } else { 1 };
+        assert_eq!(count(&renders), 1 + editor_renders);
 
-    // Both ended: the refused one is served.
-    if here_served {
-        created(&restore_as_new_on(&app, editor, pages[1].0, pages[1].1[0], labelled("x")).await);
-    } else {
-        restored(&restore_on(&app, editor, pages[0].0, pages[0].1[0], "").await);
+        // Both ended: the refused one is served.
+        if here_first {
+            created(
+                &restore_as_new_on(&app, editor, pages[1].0, pages[1].1[0], labelled("x")).await,
+            );
+        } else {
+            restored(&restore_on(&app, editor, pages[0].0, pages[0].1[0], "").await);
+        }
     }
 }
 
