@@ -20,9 +20,12 @@ use common::db::{
 use common::metrics::CountingRecorder;
 use common::{Client, History, author};
 use knot_history::canonical::visible_content;
+use knot_history::revert::{self, Checkpoint};
 use knot_history::{
-    BUILDER_VERSION, EntryKind, HistoryPermits, ReplayMode, Replayer, VIEW_PERMIT_WAIT, ViewError,
-    ViewLimits, Views, history_permits, list_entries, merge_gap_at_end, pm_json, state_input,
+    BUILDER_VERSION, EntryKind, HistoryPermits, PlanError, REVERT_MIN_PLAN_TIME, ReplayMode,
+    Replayer, Restorable, RevertHooks, RevertKind, RevertOutcome, RevertTarget, VIEW_PERMIT_WAIT,
+    ViewError, ViewLimits, Views, history_permits, list_entries, merge_gap_at_end, pm_json,
+    state_input,
 };
 use knot_storage::UpdateSource;
 use serde_json::{Value, json};
@@ -1948,12 +1951,46 @@ async fn a_baseline_that_may_be_shifted_views_and_restores_from_its_prefix() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_page_lifted_from_version_1_views_no_phantom() {
-    use knot_history::replay::trusted_prefix;
-    let db = db().await;
+/// A page lifted from builder version 1: the fix's shifted baseline with
+/// its legacy rows `t0`, `t2`, `t3`, two rows of client 3 (rows 4 and 5)
+/// and a fixed room's snapshot at rev 5 holding G, built, then given the
+/// gap checkpoint 0.9.14 wrote at rev 4 and marked as built by version 1.
+struct LiftedPage {
+    doc: Uuid,
+    builder: Arc<knot_history::Builder>,
+    /// The page's five rows.
+    rows: Vec<Vec<u8>>,
+    /// The gap content only the room's snapshot holds.
+    g: Vec<u8>,
+    baseline: Vec<u8>,
+}
+
+impl LiftedPage {
+    /// Every id a restore of the page may name: the rows', the baseline's
+    /// trusted prefix's and G's.
+    fn allowed(&self) -> yrs::IdSet {
+        let rows: Vec<&[u8]> = self.rows.iter().map(Vec::as_slice).collect();
+        insertions_of_all(&rows)
+            .merge(&insertions(
+                &knot_history::replay::trusted_prefix(&self.baseline).expect("the prefix"),
+            ))
+            .merge(&insertions(&self.g))
+    }
+
+    /// The room's state at rev 5: the rows plus G.
+    fn room(&self) -> Vec<u8> {
+        state_of(
+            self.rows
+                .iter()
+                .map(Vec::as_slice)
+                .chain([self.g.as_slice()]),
+        )
+    }
+}
+
+async fn page_lifted_from_version_1(db: &Db) -> LiftedPage {
     let b = db.builder(limits());
-    let (doc, baseline, o) = page_with_a_shifted_baseline(&db).await;
+    let (doc, baseline, o) = page_with_a_shifted_baseline(db).await;
     let e4 = edit_by_client_3(&[&o.t0], 2, "four");
     let e5 = edit_by_client_3(&[&o.t0, &e4], 1, "five");
     assert_eq!(db.append(doc, 2, &e4).await, 4);
@@ -1998,6 +2035,41 @@ async fn a_page_lifted_from_version_1_views_no_phantom() {
         doc,
     )
     .await;
+    LiftedPage {
+        doc,
+        builder: b,
+        rows: rows.iter().map(|r| r.to_vec()).collect(),
+        g,
+        baseline,
+    }
+}
+
+/// The rebuilt lifted page's entries, after asserting the rebuild made the
+/// session over rows 4-5 and the gap entry at rev 5.
+async fn rebuilt(db: &Db, p: &LiftedPage) -> Vec<Entry> {
+    build_clean(&p.builder, p.doc).await;
+    assert_eq!(db.state(p.doc).await.builder_version, BUILDER_VERSION);
+    let entries = db.entries(p.doc).await;
+    assert!(
+        entries.iter().any(|e| e.kind == "session"
+            && e.start_rev.is_some_and(|s| s <= 4)
+            && e.end_rev.is_some_and(|e| e >= 5)),
+        "no session covers rows 4-5: {entries:#?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.kind == "gap" && e.end_rev == Some(5)),
+        "no gap entry at rev 5: {entries:#?}"
+    );
+    entries
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_lifted_from_version_1_views_no_phantom() {
+    let db = db().await;
+    let p = page_lifted_from_version_1(&db).await;
+    let doc = p.doc;
 
     // Version 1's entries: refused until the rebuild.
     let views = views_with(&db.pool, &history_permits(1), |_| {});
@@ -2022,25 +2094,8 @@ async fn a_page_lifted_from_version_1_views_no_phantom() {
         );
     }
 
-    build_clean(&b, doc).await;
-    assert_eq!(db.state(doc).await.builder_version, BUILDER_VERSION);
-    let entries = db.entries(doc).await;
-    assert!(
-        entries.iter().any(|e| e.kind == "session"
-            && e.start_rev.is_some_and(|s| s <= 4)
-            && e.end_rev.is_some_and(|e| e >= 5)),
-        "no session covers rows 4-5: {entries:#?}"
-    );
-    assert!(
-        entries
-            .iter()
-            .any(|e| e.kind == "gap" && e.end_rev == Some(5)),
-        "no gap entry at rev 5: {entries:#?}"
-    );
-
-    let allowed = insertions_of_all(&rows)
-        .merge(&insertions(&trusted_prefix(&baseline).expect("the prefix")))
-        .merge(&insertions(&g));
+    let entries = rebuilt(&db, &p).await;
+    let allowed = p.allowed();
     for e in &entries {
         let r = views
             .restore_input(anyone(), doc, e.id, None, |bytes| Ok(bytes.to_vec()))
@@ -2146,4 +2201,706 @@ async fn a_baseline_over_the_shifted_cap_is_too_large() {
         .restore_input(anyone(), doc, baseline.id, None, len)
         .await
         .expect("the baseline restores");
+}
+
+// ---------------------------------------------------------------------------
+// Restore here: the target and the plan (M2 Task 4)
+// ---------------------------------------------------------------------------
+
+/// A restore's deadline as the route sets it.
+fn in_27s() -> Instant {
+    Instant::now() + Duration::from_secs(27)
+}
+
+/// The checkpoints a plan asks at, as `ViewHooks::revert_checkpoints`
+/// records them.
+type Checkpoints = Arc<std::sync::Mutex<Vec<Checkpoint>>>;
+
+fn checkpoints() -> Checkpoints {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+fn seen(c: &Checkpoints) -> Vec<Checkpoint> {
+    c.lock().unwrap().clone()
+}
+
+/// How often a plan reached the undo's verification.
+fn undo_verifies(c: &Checkpoints) -> usize {
+    seen(c)
+        .into_iter()
+        .filter(|c| *c == Checkpoint::UndoVerify)
+        .count()
+}
+
+/// A page where A typed "one" and later B "two" (two sessions), built;
+/// returns the page, A's and B's sessions and the live state (its rows).
+async fn one_then_two(db: &Db) -> (Uuid, Entry, Entry, Vec<u8>) {
+    let doc = db.page().await;
+    let mut h = History::new(1);
+    for (who, t) in [(0, "one"), (1, "two")] {
+        let u = typed(&mut h, who, t);
+        db.append(doc, who, &u).await;
+    }
+    build_clean(&db.builder(limits()), doc).await;
+    let entries = db.entries(doc).await;
+    let rows = db.row_bytes(doc).await;
+    (
+        doc,
+        session_of(&entries, 0),
+        session_of(&entries, 1),
+        state_of(rows.iter().map(Vec::as_slice)),
+    )
+}
+
+/// Restore here's target of entry `e`.
+async fn target_of(views: &Views, doc: Uuid, e: &Entry) -> Restorable<RevertTarget> {
+    views
+        .restore_target(anyone(), doc, e.id, None, in_27s())
+        .await
+        .unwrap_or_else(|err| panic!("the target of {e:?}: {err:?}"))
+}
+
+/// pm_json of a GC replay of `live` with `update` applied, if any.
+fn page_after(live: &[u8], update: Option<&[u8]>) -> Value {
+    let mut r = Replayer::from_state(ReplayMode::Gc, live).expect("the live state");
+    if let Some(u) = update {
+        r.apply(u);
+    }
+    pm_json(r.doc())
+}
+
+fn took_between(started: Instant, low: Duration, high: Duration) {
+    let took = started.elapsed();
+    assert!(took >= low && took < high, "took {took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_revert_reverts_to_the_entrys_version() {
+    let db = db().await;
+    let (doc, a, _, live) = one_then_two(&db).await;
+    let views = views_with(&db.pool, &history_permits(1), |_| {});
+    let t = target_of(&views, doc, &a).await;
+    assert_eq!(t.content_epoch, 0, "the page's epoch");
+    let target = Arc::new(t.value);
+    match views
+        .plan_revert(anyone(), &t.ticket, target.clone(), live.clone(), in_27s())
+        .await
+    {
+        Ok(RevertOutcome::Revert {
+            update,
+            kind: RevertKind::Undo,
+            ..
+        }) => {
+            revert::verify(&live, &update, &target.json).expect("the revert verifies");
+            assert_eq!(text_of(&page_after(&live, Some(&update))), "one");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn plan_revert_over_the_revert_cap_is_too_large() {
+    let db = db().await;
+    let (doc, a, _, live) = one_then_two(&db).await;
+    let permits = history_permits(1);
+    let probe = views_with(&db.pool, &permits, |_| {});
+    let n = i64::try_from(target_of(&probe, doc, &a).await.value.state.len()).unwrap();
+    let both = n + i64::try_from(live.len()).unwrap();
+    let renders = counter();
+
+    // Between the target alone and the target with the live page.
+    let views = views_with(&db.pool, &permits, |l| {
+        l.max_revert_input_bytes = both - 1;
+        l.hooks.renders = Some(renders.clone());
+    });
+    assert!(n < both, "the target alone fits");
+    let t = target_of(&views, doc, &a).await;
+    assert_eq!(count(&renders), 1);
+    let r = views
+        .plan_revert(
+            anyone(),
+            &t.ticket,
+            Arc::new(t.value),
+            live.clone(),
+            in_27s(),
+        )
+        .await;
+    assert!(matches!(r, Err(PlanError::OverCap)), "{r:?}");
+    assert_eq!(count(&renders), 1, "the target's render only");
+    assert!(matches!(
+        views
+            .restore_target(anyone(), doc, a.id, None, in_27s())
+            .await,
+        Err(PlanError::OverCap)
+    ));
+    assert_eq!(count(&renders), 1, "refused before its replay");
+    views
+        .restore_input(anyone(), doc, a.id, None, revert::copy_state)
+        .await
+        .expect("only restores here are refused");
+    assert_eq!(count(&renders), 2);
+
+    // Below the target alone: refused after the target's replay.
+    let alone = views_with(&db.pool, &permits, |l| {
+        l.max_revert_input_bytes = n - 1;
+        l.hooks.renders = Some(renders.clone());
+    });
+    for replays in [1, 0] {
+        let before = count(&renders);
+        assert!(matches!(
+            alone
+                .restore_target(anyone(), doc, a.id, None, in_27s())
+                .await,
+            Err(PlanError::OverCap)
+        ));
+        assert_eq!(count(&renders), before + replays);
+    }
+}
+
+#[tokio::test]
+async fn plan_revert_waits_no_longer_than_its_deadline() {
+    let db = db().await;
+    let (doc, a, _, live) = one_then_two(&db).await;
+    let permits = history_permits(1);
+    let renders = counter();
+    let views = views_with(&db.pool, &permits, |l| {
+        l.min_plan_time = Duration::from_millis(50);
+        l.permit_wait = Duration::from_secs(5);
+        l.hooks.renders = Some(renders.clone());
+    });
+    let t = target_of(&views, doc, &a).await;
+    let before = count(&renders);
+    let held = permits.compute().await;
+    let started = Instant::now();
+    let r = views
+        .plan_revert(
+            anyone(),
+            &t.ticket,
+            Arc::new(t.value),
+            live,
+            started + Duration::from_millis(400),
+        )
+        .await;
+    assert!(matches!(r, Err(PlanError::View(ViewError::Busy))), "{r:?}");
+    took_between(started, Duration::from_millis(350), Duration::from_secs(1));
+    assert_eq!(count(&renders), before);
+    drop(held);
+}
+
+#[tokio::test]
+async fn a_plan_that_times_out_is_too_slow_and_blocks_only_restores_here() {
+    let db = db().await;
+    let (doc, a, _, live) = one_then_two(&db).await;
+    let permits = history_permits(2);
+    let renders = counter();
+    let marks = checkpoints();
+    let views = views_with(&db.pool, &permits, |l| {
+        l.hooks.hold_render = Duration::from_secs(2);
+        l.hooks.renders = Some(renders.clone());
+        l.hooks.revert_checkpoints = Some(marks.clone());
+        l.revert_timeout = Duration::from_millis(300);
+    });
+    let rec = CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&rec);
+    let t = views
+        .restore_input(anyone(), doc, a.id, None, revert::target)
+        .await
+        .expect("the target");
+    let target = Arc::new(t.value);
+    let r = views
+        .plan_revert(anyone(), &t.ticket, target.clone(), live.clone(), in_27s())
+        .await;
+    assert!(matches!(r, Err(PlanError::TooSlow)), "{r:?}");
+    assert_eq!(view_timeouts(&rec), 1);
+
+    let before = count(&renders);
+    let r = views
+        .plan_revert(anyone(), &t.ticket, target, live, in_27s())
+        .await;
+    assert!(matches!(r, Err(PlanError::TooSlow)), "{r:?}");
+    assert!(matches!(
+        views
+            .restore_target(anyone(), doc, a.id, None, in_27s())
+            .await,
+        Err(PlanError::TooSlow)
+    ));
+    assert_eq!(count(&renders), before, "refused before any replay");
+
+    views
+        .restore_input(anyone(), doc, a.id, None, revert::target)
+        .await
+        .expect("restore_input does not check the plan's record");
+    views
+        .restore_input(anyone(), doc, a.id, None, revert::copy_state)
+        .await
+        .expect("restore as new page still works");
+    views
+        .view(anyone(), doc, a.id, false)
+        .await
+        .expect("the view still works");
+    wait_until("the plan thread's end", Duration::from_secs(3), || {
+        stalled_gauge(&rec) == Some(0.0)
+    })
+    .await;
+    assert_eq!(
+        seen(&marks),
+        [Checkpoint::Undo],
+        "cancelled: it stopped at its first checkpoint"
+    );
+    assert_eq!(view_timeouts(&rec), 1);
+}
+
+#[tokio::test]
+async fn a_recorded_revert_refuses_the_target_before_its_replay() {
+    let db = db().await;
+    let (doc, a, b, live) = one_then_two(&db).await;
+    let permits = history_permits(1);
+    let renders = counter();
+    let views = views_with(&db.pool, &permits, |l| {
+        l.permit_wait = Duration::from_millis(300);
+        l.hooks.hold_render = Duration::from_secs(2);
+        l.hooks.renders = Some(renders.clone());
+        l.revert_timeout = Duration::from_millis(300);
+    });
+    let rec = CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&rec);
+    let t = target_of(&views, doc, &a).await;
+    let r = views
+        .plan_revert(anyone(), &t.ticket, Arc::new(t.value), live, in_27s())
+        .await;
+    assert!(matches!(r, Err(PlanError::TooSlow)), "{r:?}");
+    wait_until("the plan thread's end", Duration::from_secs(3), || {
+        permits.stalled() == 0 && stalled_gauge(&rec) == Some(0.0)
+    })
+    .await;
+
+    let held = permits.compute().await;
+    let before = count(&renders);
+    let started = Instant::now();
+    assert!(matches!(
+        views
+            .restore_target(anyone(), doc, a.id, None, in_27s())
+            .await,
+        Err(PlanError::TooSlow)
+    ));
+    took_between(started, Duration::ZERO, Duration::from_millis(100));
+    assert_eq!(count(&renders), before);
+
+    let started = Instant::now();
+    let r = views
+        .restore_target(anyone(), doc, b.id, None, in_27s())
+        .await;
+    assert!(
+        matches!(r, Err(PlanError::View(ViewError::Busy))),
+        "{:?}",
+        r.err()
+    );
+    took_between(started, Duration::from_millis(250), Duration::from_secs(1));
+    assert_eq!(count(&renders), before);
+    drop(held);
+}
+
+#[tokio::test]
+async fn a_plan_the_deadline_cuts_short_is_busy_and_records_nothing() {
+    let db = db().await;
+    let (doc, a, _, live) = one_then_two(&db).await;
+    let permits = history_permits(2);
+    let renders = counter();
+    let marks = checkpoints();
+    let views = views_with(&db.pool, &permits, |l| {
+        l.min_plan_time = Duration::from_millis(50);
+        l.hooks.hold_render = Duration::from_secs(2);
+        l.hooks.renders = Some(renders.clone());
+        l.hooks.revert_checkpoints = Some(marks.clone());
+        l.revert_timeout = Duration::from_secs(10);
+    });
+    let rec = CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&rec);
+    let t = views
+        .restore_input(anyone(), doc, a.id, None, revert::target)
+        .await
+        .expect("the target");
+    let target = Arc::new(t.value);
+    let plan = |deadline: Instant| {
+        views.plan_revert(anyone(), &t.ticket, target.clone(), live.clone(), deadline)
+    };
+
+    let started = Instant::now();
+    let r = plan(started + Duration::from_millis(500)).await;
+    assert!(matches!(r, Err(PlanError::View(ViewError::Busy))), "{r:?}");
+    took_between(started, Duration::from_millis(400), Duration::from_secs(1));
+    assert_eq!(view_timeouts(&rec), 0, "not recorded, not counted");
+
+    // Dropped.
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(300),
+        plan(Instant::now() + Duration::from_millis(400)),
+    )
+    .await;
+    assert!(dropped.is_err(), "the request was dropped");
+    wait_until("both plan threads ended", Duration::from_secs(10), || {
+        permits.stalled() == 0 && stalled_gauge(&rec) == Some(0.0)
+    })
+    .await;
+    assert_eq!(count(&renders), 3, "the target and two plans");
+    assert_eq!(view_timeouts(&rec), 0, "each ended within its full timeout");
+    assert_eq!(undo_verifies(&marks), 2, "neither was cancelled");
+
+    match plan(in_27s()).await {
+        Ok(RevertOutcome::Revert { .. }) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(undo_verifies(&marks), 3);
+    views
+        .restore_input(anyone(), doc, a.id, None, revert::copy_state)
+        .await
+        .expect("nothing recorded");
+}
+
+#[tokio::test]
+async fn a_cut_short_plan_that_keeps_running_is_recorded() {
+    let db = db().await;
+    let (doc, a, _, live) = one_then_two(&db).await;
+    let permits = history_permits(1);
+    let renders = counter();
+    let marks = checkpoints();
+    let views = Arc::new(views_with(&db.pool, &permits, |l| {
+        l.min_plan_time = Duration::from_millis(50);
+        l.hooks.hold_render = Duration::from_secs(2);
+        l.hooks.renders = Some(renders.clone());
+        l.hooks.revert_checkpoints = Some(marks.clone());
+        l.hooks.revert.corrupt_undo = true;
+        l.revert_timeout = Duration::from_secs(1);
+    }));
+    let rec = CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&rec);
+    let t = views
+        .restore_input(anyone(), doc, a.id, None, revert::target)
+        .await
+        .expect("the target");
+    let (ticket, target) = (t.ticket, Arc::new(t.value));
+
+    let started = Instant::now();
+    let r = views
+        .plan_revert(
+            anyone(),
+            &ticket,
+            target.clone(),
+            live.clone(),
+            started + Duration::from_millis(300),
+        )
+        .await;
+    assert!(matches!(r, Err(PlanError::View(ViewError::Busy))), "{r:?}");
+    took_between(started, Duration::from_millis(250), Duration::from_secs(1));
+    assert_eq!(view_timeouts(&rec), 0, "cut short, not timed out");
+
+    // It waits for the only compute permit, which the first plan's thread
+    // holds until it ends (about 2 s after it started).
+    let second = tokio::spawn({
+        let (views, ticket, target, live) =
+            (views.clone(), ticket.clone(), target.clone(), live.clone());
+        async move {
+            views
+                .plan_revert(anyone(), &ticket, target, live, in_27s())
+                .await
+        }
+    });
+    wait_until("the watcher's record", Duration::from_millis(1800), || {
+        view_timeouts(&rec) == 1
+    })
+    .await;
+    assert!(!second.is_finished(), "the second plan still waits");
+    let r = second.await.unwrap();
+    assert!(matches!(r, Err(PlanError::TooSlow)), "{r:?}");
+    assert_eq!(count(&renders), 2, "never a second plan thread");
+
+    let started = Instant::now();
+    let r = views
+        .plan_revert(anyone(), &ticket, target, live, in_27s())
+        .await;
+    assert!(matches!(r, Err(PlanError::TooSlow)), "{r:?}");
+    took_between(started, Duration::ZERO, Duration::from_millis(100));
+    assert_eq!(count(&renders), 2);
+
+    wait_until("the plan thread's end", Duration::from_secs(3), || {
+        permits.stalled() == 0 && stalled_gauge(&rec) == Some(0.0)
+    })
+    .await;
+    views
+        .restore_input(anyone(), doc, a.id, None, revert::copy_state)
+        .await
+        .expect("only restores here are refused");
+    assert_eq!(
+        seen(&marks),
+        [Checkpoint::Undo],
+        "cancelled at its full timeout: no undo, no fallback"
+    );
+    assert_eq!(view_timeouts(&rec), 1);
+}
+
+#[tokio::test]
+async fn restore_waits_are_bounded_by_the_restores_deadline() {
+    let db = db().await;
+    let (doc, a, _, _) = one_then_two(&db).await;
+    let permits = history_permits(1);
+    let renders = counter();
+    let views = views_with(&db.pool, &permits, |l| {
+        l.permit_wait = Duration::from_secs(5);
+        l.hooks.renders = Some(renders.clone());
+    });
+    let held = permits.compute().await;
+    let started = Instant::now();
+    let r = views
+        .restore_target(
+            anyone(),
+            doc,
+            a.id,
+            None,
+            started + Duration::from_millis(400),
+        )
+        .await;
+    assert!(
+        matches!(r, Err(PlanError::View(ViewError::Busy))),
+        "{:?}",
+        r.err()
+    );
+    took_between(started, Duration::from_millis(350), Duration::from_secs(1));
+    let started = Instant::now();
+    let r = views
+        .restore_input_by(
+            anyone(),
+            doc,
+            a.id,
+            None,
+            started + Duration::from_millis(400),
+            revert::copy_state,
+        )
+        .await;
+    assert!(matches!(r, Err(ViewError::Busy)), "{:?}", r.err());
+    took_between(started, Duration::from_millis(350), Duration::from_secs(1));
+    assert_eq!(count(&renders), 0);
+    drop(held);
+    target_of(&views, doc, &a).await;
+    assert_eq!(count(&renders), 1);
+}
+
+#[tokio::test]
+async fn a_plan_nothing_verifies_is_unverified() {
+    let db = db().await;
+    let (doc, a, _, live) = one_then_two(&db).await;
+    let views = views_with(&db.pool, &history_permits(1), |l| {
+        l.hooks.revert = RevertHooks {
+            skip_undo: true,
+            fail_fallback: true,
+            ..RevertHooks::default()
+        };
+    });
+    let t = target_of(&views, doc, &a).await;
+    let r = views
+        .plan_revert(anyone(), &t.ticket, Arc::new(t.value), live, in_27s())
+        .await;
+    assert!(matches!(r, Err(PlanError::Unverified(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn a_restore_permit_is_one_per_principal() {
+    let db = db().await;
+    let (doc, a, _, _) = one_then_two(&db).await;
+    let renders = counter();
+    let views = views_with(&db.pool, &history_permits(1), |l| {
+        l.permit_wait = Duration::from_millis(300);
+        l.hooks.renders = Some(renders.clone());
+    });
+    let (pa, pb) = (Uuid::new_v4(), Uuid::new_v4());
+    let first = views
+        .restore_permit(pa, in_27s())
+        .await
+        .expect("A's permit");
+
+    let started = Instant::now();
+    let r = views.restore_permit(pa, in_27s()).await;
+    assert!(matches!(r, Err(ViewError::Busy)), "{r:?}");
+    took_between(started, Duration::from_millis(250), Duration::from_secs(1));
+    let started = Instant::now();
+    let r = views
+        .restore_permit(pa, started + Duration::from_millis(100))
+        .await;
+    assert!(matches!(r, Err(ViewError::Busy)), "{r:?}");
+    took_between(
+        started,
+        Duration::from_millis(90),
+        Duration::from_millis(250),
+    );
+
+    let started = Instant::now();
+    let other = views
+        .restore_permit(pb, in_27s())
+        .await
+        .expect("B's permit");
+    took_between(started, Duration::ZERO, Duration::from_millis(100));
+    drop(other);
+
+    let started = Instant::now();
+    drop(first);
+    let again = views.restore_permit(pa, in_27s()).await.expect("A's again");
+    took_between(started, Duration::ZERO, Duration::from_millis(100));
+    assert_eq!(count(&renders), 0, "it renders nothing");
+
+    views
+        .view(pa, doc, a.id, false)
+        .await
+        .expect("a view does not take the restore permit");
+    assert_eq!(count(&renders), 1);
+    drop(again);
+}
+
+#[tokio::test]
+async fn a_dropped_plan_is_cancelled_at_once() {
+    let db = db().await;
+    let (doc, a, _, live) = one_then_two(&db).await;
+    let permits = history_permits(1);
+    let renders = counter();
+    let marks = checkpoints();
+    let views = views_with(&db.pool, &permits, |l| {
+        l.hooks.hold_render = Duration::from_secs(1);
+        l.hooks.renders = Some(renders.clone());
+        l.hooks.revert_checkpoints = Some(marks.clone());
+        l.hooks.revert.corrupt_undo = true;
+        l.revert_timeout = Duration::from_secs(10);
+    });
+    let rec = CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&rec);
+    let t = target_of(&views, doc, &a).await;
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(300),
+        views.plan_revert(anyone(), &t.ticket, Arc::new(t.value), live, in_27s()),
+    )
+    .await;
+    assert!(dropped.is_err(), "the request was dropped");
+    wait_until("the plan thread's end", Duration::from_secs(3), || {
+        permits.stalled() == 0 && stalled_gauge(&rec) == Some(0.0)
+    })
+    .await;
+    assert_eq!(seen(&marks), [Checkpoint::Undo], "cancelled at once");
+    assert_eq!(view_timeouts(&rec), 0);
+    assert_eq!(count(&renders), 2, "the target and the plan");
+}
+
+#[tokio::test]
+async fn a_plan_with_too_little_time_left_starts_no_thread() {
+    let db = db().await;
+    let (doc, a, _, live) = one_then_two(&db).await;
+    let permits = history_permits(1);
+    let renders = counter();
+    let views = views_with(&db.pool, &permits, |l| {
+        assert_eq!(l.min_plan_time, REVERT_MIN_PLAN_TIME);
+        l.hooks.renders = Some(renders.clone());
+    });
+    let t = target_of(&views, doc, &a).await;
+    let target = Arc::new(t.value);
+    let before = count(&renders);
+
+    let started = Instant::now();
+    let r = views
+        .plan_revert(
+            anyone(),
+            &t.ticket,
+            target.clone(),
+            live.clone(),
+            started + Duration::from_millis(10),
+        )
+        .await;
+    assert!(matches!(r, Err(PlanError::View(ViewError::Busy))), "{r:?}");
+    took_between(started, Duration::ZERO, Duration::from_millis(100));
+    assert_eq!(count(&renders), before);
+    let granted = tokio::time::timeout(Duration::from_millis(100), permits.compute())
+        .await
+        .expect("no permit taken");
+    drop(granted);
+
+    // The permit comes after 500 ms, with less than the floor left then.
+    let held = permits.compute().await;
+    let started = Instant::now();
+    let (r, ()) = tokio::join!(
+        views.plan_revert(
+            anyone(),
+            &t.ticket,
+            target,
+            live,
+            started + REVERT_MIN_PLAN_TIME + Duration::from_millis(300),
+        ),
+        async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(held);
+        }
+    );
+    assert!(matches!(r, Err(PlanError::View(ViewError::Busy))), "{r:?}");
+    took_between(
+        started,
+        Duration::from_millis(450),
+        Duration::from_millis(1500),
+    );
+    assert_eq!(count(&renders), before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_lifted_from_version_1_restores_no_phantom() {
+    let db = db().await;
+    let p = page_lifted_from_version_1(&db).await;
+    let doc = p.doc;
+    let entries = rebuilt(&db, &p).await;
+    let allowed = p.allowed();
+    let live = p.room();
+    let views = views_with(&db.pool, &history_permits(1), |_| {});
+    let mut kinds = Vec::new();
+    for e in &entries {
+        let target = views
+            .restore_input(anyone(), doc, e.id, None, revert::target)
+            .await
+            .unwrap_or_else(|err| panic!("{e:?}: {err:?}"));
+        let copy = views
+            .restore_input(anyone(), doc, e.id, None, revert::copy_state)
+            .await
+            .unwrap_or_else(|err| panic!("{e:?}: {err:?}"));
+        for (what, state) in [("target", &target.value.state), ("copy", &copy.value)] {
+            let held = insertions(state);
+            assert!(
+                within(&held, &allowed),
+                "the {what} of the {} entry {:?}..{:?} names {:?}",
+                e.kind,
+                e.start_rev,
+                e.end_rev,
+                held.diff(&allowed)
+            );
+        }
+
+        let v = json_of(&views.view(anyone(), doc, e.id, false).await.unwrap());
+        let t = views
+            .restore_target(anyone(), doc, e.id, None, in_27s())
+            .await
+            .unwrap_or_else(|err| panic!("{e:?}: {err:?}"));
+        let json: Value = serde_json::from_slice(&t.value.json).expect("the target's JSON");
+        assert_eq!(json, v, "{e:?}");
+        let target = Arc::new(t.value);
+        let kind = match views
+            .plan_revert(anyone(), &t.ticket, target.clone(), live.clone(), in_27s())
+            .await
+        {
+            Ok(RevertOutcome::Unchanged) => {
+                assert_eq!(page_after(&live, None), v, "{e:?}");
+                "unchanged"
+            }
+            Ok(RevertOutcome::Revert { update, kind, .. }) => {
+                revert::verify(&live, &update, &target.json)
+                    .unwrap_or_else(|why| panic!("{e:?}: {why}"));
+                assert_eq!(page_after(&live, Some(&update)), v, "{e:?}");
+                kind.outcome()
+            }
+            // Task 1 recorded no gap exceptions (every gap case's
+            // whole-page replace verified), so none is allowed here.
+            Err(err) => panic!("{e:?}: {err:?}"),
+        };
+        kinds.push((e.kind.clone(), e.start_rev, e.end_rev, kind));
+    }
+    println!("plans per entry (kind, start, end, outcome): {kinds:?}");
 }

@@ -31,6 +31,7 @@ use crate::pass::{Progress, WindowError, WindowInput, replay_window};
 use crate::permits::{ComputeGuard, HistoryPermits, StallWatch};
 use crate::pm_json::{RENDERER_VERSION, pm_json, pm_json_diff};
 use crate::replay::{ReplayMode, Replayer};
+use crate::revert::{self, Checkpoint, RevertError, RevertHooks, RevertOutcome, RevertTarget};
 use crate::sessions::EntryKind;
 use crate::store::{self, StoreError, ViewEntry, ViewLoaded};
 
@@ -199,6 +200,13 @@ pub fn revert_max_input_bytes(replay_max_bytes: u64) -> i64 {
     let cap = by_memory.min(u128::from(REVERT_TIME_CAP_BYTES));
     i64::try_from(cap).unwrap_or(i64::MAX)
 }
+
+/// The least time a plan of a revert must have left before the restore's
+/// deadline to be started at all ([`ViewLimits::min_plan_time`]'s
+/// default): a plan started with less would answer busy almost at once
+/// and then hold a compute permit for its whole run with nobody reading
+/// its answer; 2 s leaves a small page's plan time to finish.
+pub const REVERT_MIN_PLAN_TIME: Duration = Duration::from_secs(2);
 
 /// What a view replays.
 // Built once per render and moved into the replay thread; a box would only
@@ -439,6 +447,11 @@ const TIMED_OUT_KEYS: u64 = 1_024;
 const PRINCIPALS_PRUNE_AT: usize = 1_024;
 /// How many versions found over the diff cap are remembered.
 const OVER_DIFF_CAP_KEYS: u64 = 4_096;
+/// How many versions found over the revert cap are remembered.
+const OVER_REVERT_CAP_KEYS: u64 = 4_096;
+/// Restores (in place or as a new page) one principal may run at a time
+/// on this process (the restore-permit Ruling).
+pub const RESTORES_PER_PRINCIPAL: usize = 1;
 
 const EARLIER_TIMEOUT: &str = "an earlier render of this version timed out";
 const SKIPPED_BASELINE: &str = "the history builder skipped this baseline";
@@ -471,6 +484,9 @@ pub struct ViewLimits {
     pub restore_timeout: Duration,
     /// How long one plan of a revert may run ([`REVERT_TIMEOUT`]).
     pub revert_timeout: Duration,
+    /// A plan with less than this left before the restore's deadline is
+    /// not started ([`REVERT_MIN_PLAN_TIME`]; tests lower it).
+    pub min_plan_time: Duration,
     pub cache_bytes: u64,
     pub cache_ttl: Duration,
     #[doc(hidden)]
@@ -487,6 +503,7 @@ impl ViewLimits {
             timeout: VIEW_TIMEOUT,
             restore_timeout: RESTORE_TIMEOUT,
             revert_timeout: REVERT_TIMEOUT,
+            min_plan_time: REVERT_MIN_PLAN_TIME,
             cache_bytes: VIEW_CACHE_BYTES,
             cache_ttl: VIEW_CACHE_TTL,
             hooks: ViewHooks::default(),
@@ -512,8 +529,12 @@ pub struct ViewHooks {
     pub panic_in_diff: bool,
     /// [`RenderHooks::hold_in_diff`].
     pub hold_in_diff: Duration,
-    /// Counts render threads started (views and restores).
+    /// Counts render threads started (views, restores and plans).
     pub renders: Option<Arc<AtomicUsize>>,
+    /// Faults injected into each plan of a revert.
+    pub revert: RevertHooks,
+    /// Records every [`Checkpoint`] a plan of a revert asks at.
+    pub revert_checkpoints: Option<Arc<Mutex<Vec<Checkpoint>>>>,
 }
 
 /// A rendered version: ProseMirror JSON, serialized.
@@ -576,6 +597,39 @@ fn store_error(e: StoreError) -> ViewError {
     ViewError::Store(e.to_string())
 }
 
+/// Why a Restore here's target or plan was not served.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum PlanError {
+    /// As a view or restore is refused.
+    #[error(transparent)]
+    View(#[from] ViewError),
+    /// Neither the undo nor the whole-page replace verified, or a page
+    /// nests past the limit ([`RevertError::Unverified`]).
+    #[error("no revert verified: {0}")]
+    Unverified(String),
+    /// A plan of this version ran its full [`REVERT_TIMEOUT`], now or
+    /// within [`VIEW_CACHE_TTL`].
+    #[error("a revert of this version timed out")]
+    TooSlow,
+    /// The version alone, or with the live page, is over
+    /// [`ViewLimits::max_revert_input_bytes`], now or within
+    /// [`VIEW_CACHE_TTL`].
+    #[error("this version is over the revert cap")]
+    OverCap,
+}
+
+/// Which version a Restore here plans to: the entry's record key for its
+/// plans, as its target was replayed. Opaque.
+#[derive(Clone, Debug)]
+pub struct RestoreTicket(ViewKey);
+
+/// One of a principal's restores on this process
+/// ([`Views::restore_permit`]); released when dropped.
+#[derive(Debug)]
+pub struct RestorePermit {
+    _permit: OwnedSemaphorePermit,
+}
+
 /// A restore's input: what `finish` made of the entry's state, and the
 /// entry as read in the transaction that loaded it.
 pub struct Restorable<T> {
@@ -585,6 +639,11 @@ pub struct Restorable<T> {
     /// legacy baseline.
     pub end_rev: Option<i64>,
     pub ended_at: DateTime<Utc>,
+    /// The page's content epoch the version was replayed at (the epoch
+    /// Ruling: never written back at another).
+    pub content_epoch: i32,
+    /// What [`Views::plan_revert`] plans this version under.
+    pub ticket: RestoreTicket,
 }
 
 /// What the cache, and the record of timed-out renders, are keyed by.
@@ -597,12 +656,14 @@ struct ViewKey {
     variant: ViewVariant,
 }
 
-/// The cache holds `Plain` and `Changes` only; `Restore` is a record key.
+/// The cache holds `Plain` and `Changes` only; `Restore` (a restore's
+/// replay) and `Revert` (a Restore here's plan) are record keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ViewVariant {
     Plain,
     Changes,
     Restore,
+    Revert,
 }
 
 impl ViewKey {
@@ -626,10 +687,11 @@ impl ViewKey {
     /// The key a render of this key that hung in `stage` is recorded
     /// under: a Show changes render that hung in its diff step blocks only
     /// the diff, one that hung anywhere else the plain version; a restore
-    /// blocks only restores.
+    /// blocks only restores, and a plan only Restore here.
     fn hung_in(&self, stage: RenderStage) -> ViewKey {
         match (self.variant, stage) {
-            (ViewVariant::Restore, _) | (ViewVariant::Changes, RenderStage::Diff) => self.clone(),
+            (ViewVariant::Restore | ViewVariant::Revert, _)
+            | (ViewVariant::Changes, RenderStage::Diff) => self.clone(),
             _ => self.with(ViewVariant::Plain),
         }
     }
@@ -725,10 +787,25 @@ struct Granted {
     started: Instant,
 }
 
+/// What `run` and [`Abandon`] do when a render outlives its timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnTimeout {
+    /// A hang: cancelled at once, counted, logged and recorded under its
+    /// key ([`ViewError::TimedOut`]).
+    Record,
+    /// A plan whose timeout the restore's deadline cut below its full one
+    /// (`full_after`, the revert timeout): not yet a hang, so not cancelled
+    /// ([`ViewError::Busy`]). Its watcher ([`watch_cut_short`]) records it
+    /// and cancels it only if its thread still runs `full_after` after it
+    /// started (the timeouts and cancellation Rulings).
+    CutShort { full_after: Duration },
+}
+
 /// Held by a render's async side while its thread runs. Dropped armed (the
-/// request was dropped), it cancels the render, counts the thread stalled
-/// and, while the thread runs, hands it to a stall watcher (Rulings on
-/// cancellation).
+/// request was dropped), it marks the thread stalled and, while the thread
+/// runs, hands it to a stall watcher (Rulings on cancellation): a
+/// [`OnTimeout::Record`] render is cancelled at once, a
+/// [`OnTimeout::CutShort`] plan only by [`watch_cut_short`] at `full`.
 struct Abandon {
     armed: bool,
     progress: Progress,
@@ -738,6 +815,10 @@ struct Abandon {
     stage: StageCell,
     slot: PrincipalSlot,
     deadline: Instant,
+    on_timeout: OnTimeout,
+    /// When a cut-short plan has run its full timeout (`started +
+    /// full_after`); unused with [`OnTimeout::Record`].
+    full: Instant,
 }
 
 impl Drop for Abandon {
@@ -745,7 +826,13 @@ impl Drop for Abandon {
         if !self.armed {
             return;
         }
-        self.progress.cancel();
+        let cut_short = match self.on_timeout {
+            OnTimeout::Record => {
+                self.progress.cancel();
+                None
+            }
+            OnTimeout::CutShort { .. } => Some((self.progress.clone(), self.full)),
+        };
         self.watch.timed_out();
         self.records.set_stalled_gauge();
         if !self.watch.running() {
@@ -760,15 +847,18 @@ impl Drop for Abandon {
                 self.stage.clone(),
                 self.slot.clone(),
                 self.deadline,
+                cut_short,
             ));
         }
     }
 }
 
-/// The stall watcher of a render whose request was dropped: at the
-/// render's deadline, if its thread still runs, it records the timeout as
-/// the request would have and frees the principal's slot; when the thread
-/// ends, it sets the stalled gauge and starts the record's TTL.
+/// The stall watcher of a render whose request was dropped. At the
+/// render's deadline, if its thread still runs, it frees the principal's
+/// slot and, for a render (`cut_short` is `None`), records the timeout as
+/// the request would have; a cut-short plan (`cut_short` holds its
+/// progress and `full`) is handed to [`watch_cut_short`] instead. When the
+/// thread ends, it sets the stalled gauge and starts the record's TTL.
 async fn watch_dropped(
     watch: StallWatch,
     records: Records,
@@ -776,6 +866,7 @@ async fn watch_dropped(
     stage: StageCell,
     slot: PrincipalSlot,
     deadline: Instant,
+    cut_short: Option<(Progress, Instant)>,
 ) {
     let ended = watch.ended();
     tokio::pin!(ended);
@@ -783,6 +874,14 @@ async fn watch_dropped(
     tokio::select! {
         () = &mut ended => {}
         () = tokio::time::sleep_until(deadline) => {
+            if let Some((progress, full)) = cut_short {
+                slot.empty();
+                if watch.running() {
+                    warn_cut_short(&key, true);
+                }
+                watch_cut_short(watch, records, key, stage, progress, full, true).await;
+                return;
+            }
             if watch.running() {
                 recorded = Some(records.record_timeout(&key, stage.get(), true));
             }
@@ -804,6 +903,79 @@ async fn watch_timed_out(watch: StallWatch, records: Records, recorded: ViewKey)
     records.set_stalled_gauge();
 }
 
+/// The stall watcher of a plan the restore's deadline cut short: it waits
+/// for the thread's end or `full`, whichever comes first. Ended first:
+/// nothing is recorded or counted. Still running at `full`: the key is
+/// recorded then, counted and logged as a [`OnTimeout::Record`] timeout
+/// is, and the plan cancelled (it stops at its next checkpoint); the
+/// record lasts [`VIEW_CACHE_TTL`] from the thread's end. Either way it
+/// sets the stalled gauge once the thread ended.
+async fn watch_cut_short(
+    watch: StallWatch,
+    records: Records,
+    key: ViewKey,
+    stage: StageCell,
+    progress: Progress,
+    full: Instant,
+    dropped: bool,
+) {
+    let ended = watch.ended();
+    tokio::pin!(ended);
+    let mut recorded = None;
+    tokio::select! {
+        () = &mut ended => {}
+        () = tokio::time::sleep_until(full) => {
+            if watch.running() {
+                recorded = Some(records.record_timeout(&key, stage.get(), dropped));
+                progress.cancel();
+            }
+            ended.await;
+        }
+    }
+    if let Some(k) = recorded {
+        records.thread_ended(&k);
+    }
+    records.set_stalled_gauge();
+}
+
+fn warn_cut_short(key: &ViewKey, dropped: bool) {
+    tracing::warn!(
+        entry_id = key.entry_id,
+        dropped,
+        "revert plan cut short by the restore deadline"
+    );
+}
+
+/// `input` with a window's replay reporting to `progress`.
+fn with_progress(mut input: ViewInput, progress: &Progress) -> ViewInput {
+    if let ViewInput::Window(w) = &mut input {
+        w.progress = progress.clone();
+    }
+    input
+}
+
+/// The semaphore of `principal` in `map`, created with `permits` when
+/// nobody holds or waits for it; the map is pruned of dead semaphores
+/// past [`PRINCIPALS_PRUNE_AT`] entries.
+fn semaphore_of(
+    map: &Mutex<HashMap<Uuid, Weak<Semaphore>>>,
+    principal: Uuid,
+    permits: usize,
+) -> Arc<Semaphore> {
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match map.get(&principal).and_then(Weak::upgrade) {
+        Some(s) => s,
+        None => {
+            let s = Arc::new(Semaphore::new(permits));
+            map.insert(principal, Arc::downgrade(&s));
+            if map.len() > PRINCIPALS_PRUNE_AT {
+                map.retain(|_, w| w.strong_count() > 0);
+            }
+            s
+        }
+    }
+}
+
 /// The history views of one process: an entry's version rendered as
 /// ProseMirror JSON (plain or with its changes), cached, and the input of
 /// its restore.
@@ -816,8 +988,15 @@ pub struct Views {
     /// `Changes` keys whose input was over the diff cap when sized, so a
     /// repeat goes to the plain key without sizing it again.
     over_diff_cap: moka::sync::Cache<ViewKey, ()>,
+    /// `Revert` keys whose version, alone or with the live page, was over
+    /// the revert cap, so a repeat is refused before its replay (the
+    /// records Ruling).
+    over_revert_cap: moka::sync::Cache<ViewKey, ()>,
     /// Each principal's render slot, while someone holds or waits for it.
     principals: Mutex<HashMap<Uuid, Weak<Semaphore>>>,
+    /// Each principal's restores ([`RESTORES_PER_PRINCIPAL`]), while
+    /// someone holds or waits for one.
+    restorers: Mutex<HashMap<Uuid, Weak<Semaphore>>>,
 }
 
 impl Views {
@@ -841,6 +1020,10 @@ impl Views {
             .max_capacity(OVER_DIFF_CAP_KEYS)
             .time_to_live(limits.cache_ttl)
             .build();
+        let over_revert_cap = moka::sync::Cache::builder()
+            .max_capacity(OVER_REVERT_CAP_KEYS)
+            .time_to_live(limits.cache_ttl)
+            .build();
         Views {
             pool,
             permits,
@@ -848,7 +1031,9 @@ impl Views {
             cache,
             records,
             over_diff_cap,
+            over_revert_cap,
             principals: Mutex::new(HashMap::new()),
+            restorers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -988,12 +1173,16 @@ impl Views {
         let stage = StageCell::default();
         let thread_stage = stage.clone();
         let started = granted.started;
+        let progress = Progress::default();
+        let input = with_progress(input, &progress);
         let (doc, rendered_changes, diff_error) = self
             .run(
                 granted,
                 key,
                 self.limits.timeout,
+                OnTimeout::Record,
                 input,
+                progress,
                 stage,
                 move |input| {
                     let r = render_staged(input, sets, hooks, &thread_stage)
@@ -1034,31 +1223,114 @@ impl Views {
         seen: Option<DateTime<Utc>>,
         finish: impl FnOnce(&[u8]) -> Result<T, String> + Send + 'static,
     ) -> Result<Restorable<T>, ViewError> {
+        let deadline = Instant::now() + self.limits.permit_wait;
+        self.restore_input_inner(principal, doc_id, entry_id, seen, deadline, false, finish)
+            .await
+            .map_err(view_error)
+    }
+
+    /// [`Views::restore_input`] bounded by a restore's `deadline` (Restore
+    /// as new page): the principal's render slot and the compute permit
+    /// are waited for until `min(now + permit_wait, deadline)`. The
+    /// replay's timeout stays [`ViewLimits::restore_timeout`], never cut
+    /// by the deadline (the cancellation Ruling: a cut replay timeout
+    /// would be recorded under the restore key, refusing both restores of
+    /// the version).
+    pub async fn restore_input_by<T: Send + 'static>(
+        &self,
+        principal: Uuid,
+        doc_id: Uuid,
+        entry_id: i64,
+        seen: Option<DateTime<Utc>>,
+        deadline: Instant,
+        finish: impl FnOnce(&[u8]) -> Result<T, String> + Send + 'static,
+    ) -> Result<Restorable<T>, ViewError> {
+        self.restore_input_inner(principal, doc_id, entry_id, seen, deadline, false, finish)
+            .await
+            .map_err(view_error)
+    }
+
+    /// Restore here's target: [`Views::restore_input_by`] with
+    /// [`revert::target`], refusing first, before the input is sized, any
+    /// permit is taken or anything loaded or replayed, a version whose
+    /// plans are recorded too slow ([`PlanError::TooSlow`]) or over the
+    /// revert cap ([`PlanError::OverCap`]); and after the replay a version
+    /// whose state alone is over [`ViewLimits::max_revert_input_bytes`]
+    /// (recorded, [`PlanError::OverCap`]), so no live page is exported for
+    /// it.
+    pub async fn restore_target(
+        &self,
+        principal: Uuid,
+        doc_id: Uuid,
+        entry_id: i64,
+        seen: Option<DateTime<Utc>>,
+        deadline: Instant,
+    ) -> Result<Restorable<RevertTarget>, PlanError> {
+        let r = self
+            .restore_input_inner(
+                principal,
+                doc_id,
+                entry_id,
+                seen,
+                deadline,
+                true,
+                revert::target,
+            )
+            .await?;
+        if over(r.value.state.len(), self.limits.max_revert_input_bytes) {
+            self.over_revert_cap.insert(r.ticket.0.clone(), ());
+            return Err(PlanError::OverCap);
+        }
+        Ok(r)
+    }
+
+    /// What [`Views::restore_input`], [`Views::restore_input_by`] and
+    /// [`Views::restore_target`] share: the permits are waited for until
+    /// `min(now + permit_wait, deadline)`; with `check_revert`, a version
+    /// whose `Revert` key is recorded is refused first.
+    #[allow(clippy::too_many_arguments)] // the restore's cohesive options
+    async fn restore_input_inner<T: Send + 'static>(
+        &self,
+        principal: Uuid,
+        doc_id: Uuid,
+        entry_id: i64,
+        seen: Option<DateTime<Utc>>,
+        deadline: Instant,
+        check_revert: bool,
+        finish: impl FnOnce(&[u8]) -> Result<T, String> + Send + 'static,
+    ) -> Result<Restorable<T>, PlanError> {
         let moved = |ended_at: DateTime<Utc>| seen.is_some_and(|at| at != ended_at);
         let entry = self.entry(doc_id, entry_id).await?;
         if moved(entry.ended_at) {
-            return Err(ViewError::Moved);
+            return Err(ViewError::Moved.into());
         }
         let plain = ViewKey::of(&entry, ViewVariant::Plain);
         let key = plain.with(ViewVariant::Restore);
         if self.records.recorded(&plain) || self.records.recorded(&key) {
-            return Err(ViewError::Failed(EARLIER_TIMEOUT.to_string()));
+            return Err(ViewError::Failed(EARLIER_TIMEOUT.to_string()).into());
+        }
+        if check_revert {
+            self.revert_refused(&plain.with(ViewVariant::Revert))?;
         }
         self.input_bytes(&entry).await?;
-        let deadline = Instant::now() + self.limits.permit_wait;
+        let deadline = deadline.min(Instant::now() + self.limits.permit_wait);
         let slot = self.slot_within(principal, deadline).await?;
         let granted = self.compute_until(slot, deadline).await?;
         let (input, _, _, loaded, _) = self.load(&entry).await?;
         if moved(loaded.ended_at) {
-            return Err(ViewError::Moved);
+            return Err(ViewError::Moved.into());
         }
         let stage = StageCell::default();
+        let progress = Progress::default();
+        let input = with_progress(input, &progress);
         let value = self
             .run(
                 granted,
                 key,
                 self.limits.restore_timeout,
+                OnTimeout::Record,
                 input,
+                progress,
                 stage,
                 move |input| {
                     let replayer = match input {
@@ -1080,7 +1352,135 @@ impl Views {
             kind: loaded.kind,
             end_rev: loaded.end_rev,
             ended_at: loaded.ended_at,
+            content_epoch: loaded.content_epoch,
+            ticket: RestoreTicket(ViewKey::of(&loaded, ViewVariant::Revert)),
         })
+    }
+
+    /// A plan's `Revert` key recorded: too slow, or over the revert cap.
+    fn revert_refused(&self, key: &ViewKey) -> Result<(), PlanError> {
+        if self.records.recorded(key) {
+            Err(PlanError::TooSlow)
+        } else if self.over_revert_cap.contains_key(key) {
+            Err(PlanError::OverCap)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// One of `principal`'s restores on this process (the restore-permit
+    /// Ruling), waited for until `min(now + permit_wait, deadline)`, else
+    /// [`ViewError::Busy`]. It takes no render slot or compute permit and
+    /// renders nothing; a view never takes it.
+    pub async fn restore_permit(
+        &self,
+        principal: Uuid,
+        deadline: Instant,
+    ) -> Result<RestorePermit, ViewError> {
+        let restores = semaphore_of(&self.restorers, principal, RESTORES_PER_PRINCIPAL);
+        let until = deadline.min(Instant::now() + self.limits.permit_wait);
+        match tokio::time::timeout_at(until, restores.acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(RestorePermit { _permit: permit }),
+            _ => Err(ViewError::Busy),
+        }
+    }
+
+    /// One plan of a Restore here: the verified update that brings `live`
+    /// (the room's pending-free export) back to `target`, the version
+    /// `ticket` names, computed on a replay thread under the principal's
+    /// render slot and a compute permit.
+    ///
+    /// In order: a version whose plans are recorded too slow or over the
+    /// revert cap is refused ([`PlanError::TooSlow`], [`PlanError::OverCap`]),
+    /// one whose view or restore is recorded hung fails as they do; over
+    /// [`ViewLimits::max_revert_input_bytes`] (`target.state.len() +
+    /// live.len()`) is recorded and [`PlanError::OverCap`]; with less than
+    /// [`ViewLimits::min_plan_time`] left before `deadline`, or no slot and
+    /// permit by `min(now + permit_wait, deadline)`, it is
+    /// [`ViewError::Busy`]; once both are held the record and the time
+    /// left are checked again. The plan then runs within `min(revert
+    /// timeout, deadline − now)`: a full timeout is recorded,
+    /// [`PlanError::TooSlow`]; one the deadline cut shorter answers
+    /// [`ViewError::Busy`], and is recorded only if its thread still runs
+    /// when its full timeout has passed (its stall watcher records it then).
+    pub async fn plan_revert(
+        &self,
+        principal: Uuid,
+        ticket: &RestoreTicket,
+        target: Arc<RevertTarget>,
+        live: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<RevertOutcome, PlanError> {
+        let key = ticket.0.clone();
+        self.revert_refused(&key)?;
+        if self.records.recorded(&key.with(ViewVariant::Plain))
+            || self.records.recorded(&key.with(ViewVariant::Restore))
+        {
+            return Err(ViewError::Failed(EARLIER_TIMEOUT.to_string()).into());
+        }
+        if over(
+            target.state.len().saturating_add(live.len()),
+            self.limits.max_revert_input_bytes,
+        ) {
+            self.over_revert_cap.insert(key, ());
+            return Err(PlanError::OverCap);
+        }
+        if deadline.saturating_duration_since(Instant::now()) < self.limits.min_plan_time {
+            return Err(ViewError::Busy.into());
+        }
+        let wait = deadline.min(Instant::now() + self.limits.permit_wait);
+        let slot = self.slot_within(principal, wait).await?;
+        let granted = self.compute_until(slot, wait).await?;
+        // A plan of this version recorded while this one waited, or the
+        // time it had left spent waiting: both released, nothing run.
+        self.revert_refused(&key)?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left < self.limits.min_plan_time {
+            return Err(ViewError::Busy.into());
+        }
+        let full = self.limits.revert_timeout;
+        let timeout = full.min(left);
+        let on_timeout = if timeout == full {
+            OnTimeout::Record
+        } else {
+            OnTimeout::CutShort { full_after: full }
+        };
+        let progress = Progress::default();
+        let go_on = progress.clone();
+        let hooks = self.limits.hooks.revert;
+        let checkpoints = self.limits.hooks.revert_checkpoints.clone();
+        let planned = self
+            .run(
+                granted,
+                key,
+                timeout,
+                on_timeout,
+                (target, live),
+                progress,
+                StageCell::default(),
+                move |(target, live)| {
+                    Ok(revert::plan_with(&target, &live, hooks, &|c| {
+                        if let Some(seen) = &checkpoints {
+                            seen.lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .push(c);
+                        }
+                        !go_on.is_cancelled()
+                    }))
+                },
+            )
+            .await;
+        match planned {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(RevertError::Unverified(why))) => Err(PlanError::Unverified(why)),
+            Ok(Err(e @ (RevertError::Live(_) | RevertError::Target(_)))) => {
+                Err(ViewError::Failed(e.to_string()).into())
+            }
+            // Never read: whoever cancelled it has answered already.
+            Ok(Err(RevertError::Cancelled)) => Err(ViewError::Failed("cancelled".into()).into()),
+            Err(ViewError::TimedOut) => Err(PlanError::TooSlow),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The entry, unless the page is being rebuilt or it is a baseline the
@@ -1127,23 +1527,7 @@ impl Views {
         principal: Uuid,
         deadline: Instant,
     ) -> Result<OwnedSemaphorePermit, ViewError> {
-        let slot = {
-            let mut principals = self
-                .principals
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match principals.get(&principal).and_then(Weak::upgrade) {
-                Some(s) => s,
-                None => {
-                    let s = Arc::new(Semaphore::new(PRINCIPAL_RENDERS));
-                    principals.insert(principal, Arc::downgrade(&s));
-                    if principals.len() > PRINCIPALS_PRUNE_AT {
-                        principals.retain(|_, w| w.strong_count() > 0);
-                    }
-                    s
-                }
-            }
-        };
+        let slot = semaphore_of(&self.principals, principal, PRINCIPAL_RENDERS);
         match tokio::time::timeout_at(deadline, slot.acquire_owned()).await {
             Ok(Ok(permit)) => Ok(permit),
             _ => Err(ViewError::Busy),
@@ -1199,28 +1583,36 @@ impl Views {
     }
 
     /// Runs `f(input)` on a replay thread holding `granted`'s permit and
-    /// slot, within `timeout`. A timeout is counted, logged and recorded
-    /// under `key` by the stage the thread is in, the slot is freed and the
-    /// thread watched until it ends; a dropped call does the same through
-    /// [`Abandon`].
-    async fn run<T: Send + 'static>(
+    /// slot, within `timeout`; `progress` is the one the thread reads (a
+    /// window's replay, a plan's checkpoints). On a timeout the slot is
+    /// freed, the thread counted stalled and watched until it ends, and by
+    /// `on_timeout`: [`OnTimeout::Record`] cancels `progress`, counts, logs
+    /// and records the timeout under `key` by the stage the thread is in
+    /// ([`ViewError::TimedOut`]); [`OnTimeout::CutShort`] logs a warning
+    /// and hands the thread to [`watch_cut_short`] at `started +
+    /// full_after` ([`ViewError::Busy`]). A dropped call does the same
+    /// through [`Abandon`].
+    #[allow(clippy::too_many_arguments)] // the render's cohesive run options
+    async fn run<I: Send + 'static, T: Send + 'static>(
         &self,
         granted: Granted,
         key: ViewKey,
         timeout: Duration,
-        mut input: ViewInput,
+        on_timeout: OnTimeout,
+        input: I,
+        progress: Progress,
         stage: StageCell,
-        f: impl FnOnce(ViewInput) -> Result<T, String> + Send + 'static,
+        f: impl FnOnce(I) -> Result<T, String> + Send + 'static,
     ) -> Result<T, ViewError> {
         let Granted {
             guard,
             slot,
             started,
         } = granted;
-        let progress = Progress::default();
-        if let ViewInput::Window(w) = &mut input {
-            w.progress = progress.clone();
-        }
+        let full = match on_timeout {
+            OnTimeout::Record => started + timeout,
+            OnTimeout::CutShort { full_after } => started + full_after,
+        };
         let watch = guard.stall_watch();
         let mut abandon = Abandon {
             armed: true,
@@ -1231,6 +1623,8 @@ impl Views {
             stage: stage.clone(),
             slot: slot.clone(),
             deadline: started + timeout,
+            on_timeout,
+            full,
         };
         let release = SlotRelease(slot.clone());
         let hooks = self.limits.hooks.clone();
@@ -1257,16 +1651,48 @@ impl Views {
             Err(IsolateError::Panicked(m)) => {
                 Err(ViewError::Failed(format!("the render panicked: {m}")))
             }
-            Err(IsolateError::TimedOut) => {
-                progress.cancel();
-                watch.timed_out();
-                let recorded = self.records.record_timeout(&key, stage.get(), false);
-                self.records.set_stalled_gauge();
-                slot.empty();
-                tokio::spawn(watch_timed_out(watch, self.records.clone(), recorded));
-                Err(ViewError::TimedOut)
-            }
+            Err(IsolateError::TimedOut) => match on_timeout {
+                OnTimeout::Record => {
+                    progress.cancel();
+                    watch.timed_out();
+                    let recorded = self.records.record_timeout(&key, stage.get(), false);
+                    self.records.set_stalled_gauge();
+                    slot.empty();
+                    tokio::spawn(watch_timed_out(watch, self.records.clone(), recorded));
+                    Err(ViewError::TimedOut)
+                }
+                OnTimeout::CutShort { .. } => {
+                    watch.timed_out();
+                    self.records.set_stalled_gauge();
+                    slot.empty();
+                    warn_cut_short(&key, false);
+                    tokio::spawn(watch_cut_short(
+                        watch,
+                        self.records.clone(),
+                        key,
+                        stage,
+                        progress,
+                        full,
+                        false,
+                    ));
+                    Err(ViewError::Busy)
+                }
+            },
         }
+    }
+}
+
+/// Whether `n` bytes are over `cap`.
+fn over(n: usize, cap: i64) -> bool {
+    i64::try_from(n).map_or(true, |n| n > cap)
+}
+
+/// A restore's error as a [`ViewError`]: only `View` arises without the
+/// revert checks.
+fn view_error(e: PlanError) -> ViewError {
+    match e {
+        PlanError::View(v) => v,
+        other => ViewError::Failed(other.to_string()),
     }
 }
 
