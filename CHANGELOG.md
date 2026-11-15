@@ -14,7 +14,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   (Team › Urlaub). Enter or a click inserts a link to the page. The last
   row, `Create subpage "…"`, adds the typed title as a subpage of the
   current page and links it, and you stay where you were writing. Editors
-  of the page see that row; readers do not. Inside code `[[` stays text.
+  of the page see that row; readers do not. Inside code `[[` stays text, and
+  a typed `]]` closes the picker. (#TBD)
 
 ## [0.10.0] - 2026-11-15
 
