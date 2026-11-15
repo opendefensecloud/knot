@@ -1,4 +1,7 @@
 import { Node, mergeAttributes } from "@tiptap/core";
+import { ReactNodeViewRenderer } from "@tiptap/react";
+
+import { TableOfContentsView } from "./TableOfContentsView";
 
 /**
  * TableOfContents — atom block that lists the page's headings. It stores
@@ -37,5 +40,8 @@ export const TableOfContents = Node.create({
   },
   renderHTML({ HTMLAttributes }) {
     return ["div", mergeAttributes(HTMLAttributes, { "data-knot-toc": "true" })];
+  },
+  addNodeView() {
+    return ReactNodeViewRenderer(TableOfContentsView);
   },
 });

@@ -19,10 +19,11 @@ import {
   ListIndentDecrease,
   ListIndentIncrease,
   ListOrdered,
+  ListTree,
   Lock,
   MessageSquarePlus,
-  Paperclip,
   Network,
+  Paperclip,
   PenSquare,
   Quote,
   Strikethrough,
@@ -307,6 +308,13 @@ export function EditorToolbar({
             </Btn>
           </>
         )}
+        <Btn
+          testId="toolbar-toc"
+          label="Table of contents"
+          onClick={() => c().insertContent({ type: "table_of_contents", attrs: { maxLevel: 3 } }).run()}
+        >
+          <ListTree size={15} aria-hidden />
+        </Btn>
         <Btn
           testId="toolbar-suggest"
           label="Suggest an insertion"

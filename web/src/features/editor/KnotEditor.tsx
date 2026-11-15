@@ -32,6 +32,7 @@ import { workspaceApi } from "../workspace/workspace.api";
 import { docsApi } from "../docs/docs.api";
 import { SELECTION_FLOAT_WIDTH, computeAddCommentPos } from "./addCommentPos";
 import { createExtensions } from "./extensions";
+import { scrollToHeading } from "./scrollToHeading";
 import {
   type HighlightedComment,
   refreshHighlights,
@@ -551,6 +552,39 @@ function EditorBody({
   // No editor, no live state: the cards fall back to "unknown" (e.g. in the
   // Markdown view) rather than showing what this page last saw.
   useEffect(() => () => { setSuggestionLive({}); }, [setSuggestionLive]);
+
+  // Opening a page at `#<heading id>` (a copied table of contents link):
+  // scroll there once that heading has arrived, then stop listening.
+  useEffect(() => {
+    if (!editor) return;
+    let slug = "";
+    try {
+      slug = decodeURIComponent(window.location.hash.slice(1));
+    } catch {
+      return;
+    }
+    if (!slug) return;
+    let done = false;
+    let frame = 0;
+    const attempt = () => {
+      if (done || editor.isDestroyed) return;
+      if (scrollToHeading(slug)) {
+        done = true;
+        pair.doc.off("update", onUpdate);
+      }
+    };
+    const onUpdate = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(attempt);
+    };
+    onUpdate();
+    pair.doc.on("update", onUpdate);
+    return () => {
+      done = true;
+      cancelAnimationFrame(frame);
+      pair.doc.off("update", onUpdate);
+    };
+  }, [editor, pair.doc]);
 
   // Push the readable pages into the doc-link decorations. Guarded like the
   // highlight effect above: the outgoing editor may already be destroyed.

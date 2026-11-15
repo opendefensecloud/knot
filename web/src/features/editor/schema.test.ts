@@ -75,6 +75,8 @@ const REGISTERED_EXTENSIONS = [
   "italic",
   "keymap",
   "knotDateTime",
+  // Decorations only: GitHub-style ids on headings; no document change.
+  "knotHeadingAnchors",
   "knotInternalLink",
   // Input rules that nest list items on a typed indent, and a paste transform
   // that nests aria-level list items. Both produce ordinary nested lists.
@@ -352,6 +354,7 @@ const CREATE_EXTENSIONS_ORDER = [
   "attachment",
   "excalidraw_board",
   "table_of_contents",
+  "knotHeadingAnchors",
   "knotTaskList",
   "knotInternalLink",
   "knotMention",
