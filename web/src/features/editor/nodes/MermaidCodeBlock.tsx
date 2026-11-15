@@ -64,6 +64,11 @@ export const MermaidCodeBlock = CodeBlock.extend({
   },
 });
 
+/** The history viewer's change marker for this block, if it has one. */
+function historyChange(node: ReactNodeViewProps["node"]): string | undefined {
+  return (node.attrs.historyChange as string | null | undefined) ?? undefined;
+}
+
 function MermaidNodeView(props: ReactNodeViewProps) {
   const { node } = props;
   const lang = (node.attrs.language as string | null) ?? "";
@@ -72,7 +77,7 @@ function MermaidNodeView(props: ReactNodeViewProps) {
   // Non-mermaid: render the standard editable <pre><code> via NodeViewContent.
   if (!isMermaid) {
     return (
-      <NodeViewWrapper as="div" className="my-3">
+      <NodeViewWrapper as="div" className="my-3" data-history-change={historyChange(node)}>
         <pre className="bg-muted text-fg rounded-md p-3 overflow-x-auto">
           <NodeViewContent<"code"> as="code" />
         </pre>
@@ -126,6 +131,7 @@ function MermaidPreview(props: ReactNodeViewProps) {
     <NodeViewWrapper
       as="div"
       data-testid="mermaid-node"
+      data-history-change={historyChange(node)}
       className="my-3 rounded-md border border-border bg-surface overflow-hidden"
     >
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border bg-muted/40">

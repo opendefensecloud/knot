@@ -1,10 +1,14 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 import { reset } from "../support/reset";
 
-test.beforeAll(reset);
+// Each test bootstraps through /setup, and POST /auth/setup answers 410 once
+// an owner exists, so reset per test, not once per file.
+test.beforeEach(reset);
 
-test("type → snapshot → edit → restore brings back the snapshot text", async ({ page }) => {
+const V1 = "First version of the doc.";
+
+async function newDoc(page: Page) {
   await page.goto("/setup");
   await page.getByTestId("setup-email").fill("o@e.com");
   await page.getByTestId("setup-display-name").fill("O");
@@ -17,66 +21,222 @@ test("type → snapshot → edit → restore brings back the snapshot text", asy
   await expect(page.getByTestId("status-dot")).toHaveAttribute("data-status", "connected", {
     timeout: 10_000,
   });
+}
 
-  // V1: type the snapshot we'll restore to. With KNOT_SNAPSHOT_EVERY_N=1
-  // the writer snapshots after every batch.
-  const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
-  await editor.click();
-  await page.keyboard.type("First version of the doc.");
-  await page.waitForTimeout(500);
+/** Below 640 px the sidebar starts open with its backdrop over the page,
+ *  and nothing closes it on navigation; tap its right-hand side, as
+ *  mobile.spec.ts does (the sidebar covers the left 260 px). */
+async function closeSidebarIfOpen(page: Page) {
+  const backdrop = page.getByTestId("sidebar-backdrop");
+  if (await backdrop.count()) await backdrop.click({ position: { x: 350, y: 300 } });
+  await expect(backdrop).toHaveCount(0);
+}
 
-  // Open history and pin down the snapshot that actually holds ALL of V1.
-  //
-  // KNOT_SNAPSHOT_EVERY_N=1 snapshots after every persisted batch, so typing V1
-  // leaves a trail of prefix snapshots ("F", "First version of the", …). The
-  // list is ORDER BY snapshot_seq DESC, so the OLDEST entry is complete only if
-  // every keystroke happened to land in a single batch — true on a fast machine,
-  // false on a loaded CI runner. That is what made this spec flaky: it restored
-  // a prefix and then asserted on the full string.
-  //
-  // Poll the newest snapshot until it contains the whole of V1, then remember it
-  // by seq so the same one can be re-selected after V2.
+async function openHistory(page: Page) {
   await page.getByTestId("open-history").click();
   await expect(page.getByTestId("history-drawer")).toBeVisible();
-  const snapButtons = page.locator("[data-testid^='history-snap-']");
-  await expect.poll(() => snapButtons.count(), { timeout: 10_000 }).toBeGreaterThan(0);
+}
+
+/**
+ * Waits up to 60 s for `entries` to match at least one row. The builder
+ * writes a session only after its 10 s debounce and a 2 s tick, and the
+ * drawer polls on its own, so the spec only watches the DOM. Once, after
+ * 30 s without a row, it reloads the page and reopens the drawer: a reload
+ * empties the query cache, so the reopened drawer starts with a fresh first
+ * fetch whatever the poll interval is (closing and reopening alone would
+ * not, as the cached list is younger than the 30 s staleTime).
+ */
+async function waitForEntries(page: Page, entries: Locator, narrow = false) {
+  const started = Date.now();
+  let reopened = false;
   await expect
     .poll(
       async () => {
-        await snapButtons.first().click();
-        return (await page.getByTestId("history-preview").textContent()) ?? "";
+        const n = await entries.count();
+        if (n === 0 && !reopened && Date.now() - started > 30_000) {
+          reopened = true;
+          await page.reload();
+          if (narrow) await closeSidebarIfOpen(page);
+          await openHistory(page);
+        }
+        return n;
       },
-      { timeout: 15_000 },
+      { timeout: 60_000 },
     )
-    .toContain("First version of the doc.");
-  const v1TestId = (await snapButtons.first().getAttribute("data-testid")) ?? "";
-  expect(v1TestId).not.toBe("");
-  // Close history; we'll come back after editing.
-  await page.getByTestId("history-close").click();
+    .toBeGreaterThan(0);
+}
 
-  // V2: replace what's there with new text.
+/** A colour token as the browser resolves it inside `scope` (an rgb()
+ *  string), read from a probe element styled `color: var(<token>)`. */
+async function resolvedColor(scope: Locator, token: string): Promise<string> {
+  return scope.evaluate((el, name) => {
+    const probe = document.createElement("span");
+    probe.style.color = `var(${name})`;
+    el.appendChild(probe);
+    const color = getComputedStyle(probe).color;
+    probe.remove();
+    return color;
+  }, token);
+}
+
+async function decoration(mark: Locator): Promise<{ line: string; color: string }> {
+  return mark.evaluate((el) => {
+    const s = getComputedStyle(el);
+    return { line: s.textDecorationLine, color: s.textDecorationColor };
+  });
+}
+
+test("a session's version shows its text, highlighted, and restores", async ({ page }) => {
+  // The import and session entries can each take 60 s, and the restore
+  // entry waits for another builder pass.
+  test.setTimeout(180_000);
+  await newDoc(page);
+
+  const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
   await editor.click();
-  await page.keyboard.press("ControlOrMeta+a");
-  await page.keyboard.press("Delete");
-  await page.keyboard.type("Completely different content.");
+  await page.keyboard.type(V1);
   await page.waitForTimeout(500);
 
-  // Sanity: editor reflects V2 now.
-  await expect(editor).toContainText("Completely different content.");
-
-  // Re-open history and select the exact V1 snapshot identified above.
-  await page.getByTestId("open-history").click();
-  await expect(page.getByTestId("history-drawer")).toBeVisible();
-  await page.getByTestId(v1TestId).click();
-  // Assert the FULL text, not just "First version" — a prefix snapshot would
-  // satisfy the looser check and only fail later, at the restore assertion.
-  await expect(page.getByTestId("history-preview")).toContainText("First version of the doc.", {
-    timeout: 5_000,
+  // The import replaces the body (the page is not empty, so it asks first)
+  // and seals the typing session.
+  page.once("dialog", (d) => void d.accept());
+  await page.getByTestId("doc-import-md-input").setInputFiles({
+    name: "replacement.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from("# Replacement\n\nOnly this.\n"),
   });
-  // Confirm prompt → accept; then click Restore.
+  // Sanity: the editor shows the import, so the last assertion can only
+  // pass through the restore.
+  await expect(editor).toContainText("Only this.", { timeout: 10_000 });
+  await expect(editor).not.toContainText(V1, { timeout: 10_000 });
+
+  await openHistory(page);
+  await waitForEntries(page, page.locator("[data-testid^='history-entry-'][data-kind='import']"));
+  const session = page.locator("[data-testid^='history-entry-'][data-kind='session']").first();
+  await expect(session).toBeVisible({ timeout: 60_000 });
+  const importEntry = page.locator("[data-testid^='history-entry-'][data-kind='import']").first();
+
+  // The session's version: its text, marked as added.
+  await session.click();
+  const doc = page.getByTestId("history-version-doc");
+  await expect(doc).toContainText(V1, { timeout: 15_000 });
+  const ins = doc.locator("ins.history-insert").first();
+  await expect(ins).toBeVisible({ timeout: 15_000 });
+  const added = await resolvedColor(doc, "--color-history-added");
+  expect(added).toMatch(/^rgb/);
+  const insStyle = await decoration(ins);
+  expect(insStyle.line).toContain("underline");
+  expect(insStyle.color).toBe(added);
+
+  // The import's version: the session's text, struck through.
+  await importEntry.click();
+  const del = doc.locator("del.history-delete", { hasText: V1 }).first();
+  await expect(del).toBeVisible({ timeout: 15_000 });
+  const destructive = await resolvedColor(doc, "--color-destructive");
+  expect(destructive).toMatch(/^rgb/);
+  const delStyle = await decoration(del);
+  expect(delStyle.line).toContain("line-through");
+  expect(delStyle.color).toBe(destructive);
+
+  // Back to the session, highlighting off.
+  await session.click();
+  await expect(doc).toContainText(V1, { timeout: 15_000 });
+  await page.getByTestId("history-show-changes").click();
+  await expect(doc.locator("ins.history-insert")).toHaveCount(0, { timeout: 15_000 });
+  await expect(doc).toContainText(V1);
+
+  // A second tab on the same page. Both tabs carry a marker that a reload
+  // or a navigation would clear, so the restore must reach them as a
+  // live update.
+  const second = await page.context().newPage();
+  await second.goto(page.url());
+  const secondEditor = second.locator("[data-testid='editor-host'] .ProseMirror");
+  await expect(secondEditor).toContainText("Only this.", { timeout: 10_000 });
+  for (const p of [page, second]) {
+    await p.evaluate(() => {
+      (window as unknown as { __noReload?: number }).__noReload = 1;
+    });
+  }
+
   page.once("dialog", (d) => void d.accept());
   await page.getByTestId("history-restore").click();
+  for (const [p, ed] of [
+    [page, editor],
+    [second, secondEditor],
+  ] as const) {
+    await expect(ed).toContainText(V1, { timeout: 10_000 });
+    await expect(ed).not.toContainText("Only this.", { timeout: 10_000 });
+    expect(await p.evaluate(() => (window as unknown as { __noReload?: number }).__noReload)).toBe(
+      1,
+    );
+  }
+  await second.close();
 
-  // Editor reflects V1 after the room update fans out.
-  await expect(editor).toContainText("First version of the doc.", { timeout: 10_000 });
+  // The restore is on the timeline.
+  await openHistory(page);
+  await waitForEntries(page, page.locator("[data-testid^='history-entry-'][data-kind='restore']"));
+});
+
+test("a version restores as a new page beside the original", async ({ page }) => {
+  test.setTimeout(120_000);
+  await newDoc(page);
+  const original = new URL(page.url()).pathname;
+
+  const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
+  await editor.click();
+  await page.keyboard.type(V1);
+  await page.waitForTimeout(500);
+
+  page.once("dialog", (d) => void d.accept());
+  await page.getByTestId("doc-import-md-input").setInputFiles({
+    name: "replacement.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from("# Replacement\n\nOnly this.\n"),
+  });
+  await expect(editor).toContainText("Only this.", { timeout: 10_000 });
+  await expect(editor).not.toContainText(V1, { timeout: 10_000 });
+
+  await openHistory(page);
+  const sessions = page.locator("[data-testid^='history-entry-'][data-kind='session']");
+  await waitForEntries(page, sessions);
+  await sessions.first().click();
+  await expect(page.getByTestId("history-version-doc")).toContainText(V1, { timeout: 15_000 });
+
+  await page.getByTestId("history-restore-as-new").click();
+  await page.waitForURL((url) => url.pathname.startsWith("/doc/") && url.pathname !== original, {
+    timeout: 30_000,
+  });
+  await expect(page.getByTestId("doc-title")).toHaveValue(/\(version of /, { timeout: 10_000 });
+  await expect(editor).toContainText(V1, { timeout: 10_000 });
+  await expect(editor).not.toContainText("Only this.");
+
+  // The original is unchanged.
+  await page.goto(original);
+  await expect(editor).toContainText("Only this.", { timeout: 10_000 });
+  await expect(editor).not.toContainText(V1);
+});
+
+test("the drawer stacks on a narrow screen", async ({ page }) => {
+  test.setTimeout(120_000);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await newDoc(page);
+  await closeSidebarIfOpen(page);
+
+  const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
+  await editor.click();
+  await page.keyboard.type(V1);
+  await page.waitForTimeout(500);
+
+  await openHistory(page);
+  const timeline = page.getByTestId("history-timeline");
+  await expect(timeline).toBeVisible();
+  const sessions = page.locator("[data-testid^='history-entry-'][data-kind='session']");
+  await waitForEntries(page, sessions, true);
+
+  await sessions.first().click();
+  await expect(page.getByTestId("history-version")).toBeVisible({ timeout: 15_000 });
+  await expect(timeline).toBeHidden();
+
+  await page.getByTestId("history-back").click();
+  await expect(timeline).toBeVisible();
 });

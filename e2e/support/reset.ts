@@ -68,6 +68,7 @@ const TABLES = [
   "document_grants",
   "documents",
   "share_tokens",
+  "user_favorites",
   "sessions",
   "workspace_members",
   "users",

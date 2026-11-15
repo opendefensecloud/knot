@@ -92,6 +92,22 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
         "Rooms that evicted themselves after applying an inbound update that nested the document's types past knot_crdt::nesting::MAX_NESTING (the authoritative post-apply check), whether yrs applied all of the update or rejected the rest. The update was neither persisted nor fanned out, every connection of the room was closed (the sender with 4422, every other one with 1012) so its client reconnects, and the next join reloads the page from storage"
     );
     describe_counter!("knot_room_snapshots_total", "Snapshots written to storage");
+    describe_counter!(
+        "knot_room_boot_fallbacks_total",
+        "Page boots, by rooms and read-only loads alike, that did not boot from the page's latest snapshot as stored, or that had a row refused by the skip-underflow guards, by reason: legacy (a snapshot from before the pending-encoding fix whose bytes may hold shifted blocks, booted from its trusted prefix and the whole log), rollout (a snapshot an older pod wrote during the rollout, replaced by the newest trusted snapshot, or by the whole log when none survives), missing_row (a row the snapshot names is missing or fails to apply; the rows after the snapshot still load) or underflow (the guards refused a row). A rollout boot that found a trusted snapshot whose own rule held, and a missing_row boot, read only the rows after the snapshot; every other fallback replays the page's whole log. Counted once per boot that returns, never for one that fails"
+    );
+    describe_counter!(
+        "knot_room_snapshots_withheld_total",
+        "Room snapshots not written because the log rows recorded for the page's pending content would not re-park it over the snapshot, by reason: uncovered (pending content that no recorded row carries) or underflow (a recorded row the skip-underflow guards refused, excluded from the snapshot's rows, and the rest left content uncovered). Counted once per room for each distinct withholding (same reason, same pending ids, same recorded rows); a written snapshot ends it. Before it withholds, the room persists the pending content again as log rows when it has a faithful encoding (knot_room_pending_reparked_total)"
+    );
+    describe_counter!(
+        "knot_room_pending_reparked_total",
+        "Log rows a room persisted, without an author, to carry the page's pending content again, by reason: legacy (content only a pre-fix snapshot held, written once at boot), uncovered or underflow (content the recorded rows did not re-park when a snapshot was due; see knot_room_snapshots_withheld_total)"
+    );
+    describe_counter!(
+        "knot_room_updates_underflow_refused_total",
+        "Updates a live room did not apply because they meet yrs's skip underflow over blocks the room holds past a gap in their client's clock (a reconnecting editor's resend after a restart integrated content its lost edit had left pending), by source: inbound (a socket's update; its sender stays connected), apply_update (a server-side update, answered with an error) or catch_up (another replica's log row; one the room does not already hold also counts on knot_room_row_apply_errors_total). Nothing of such an update is applied, persisted or fanned out"
+    );
     describe_histogram!(
         "knot_room_hydrate_seconds",
         Unit::Seconds,
@@ -145,7 +161,7 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     Ok(())
 }
 
-/// Page history (M1.2's log and M1.3's builder).
+/// Page history (M1.2's log, M1.3's builder and M1.4's views).
 fn describe_history_metrics() {
     describe_gauge!(
         "knot_history_table_bytes",
@@ -162,7 +178,7 @@ fn describe_history_metrics() {
     );
     describe_gauge!(
         "knot_history_replay_threads_stalled",
-        "Replay threads of this replica that timed out and still run, each holding a worker until it ends"
+        "Replay threads of this replica, the builder's and the history views', that timed out or whose view request was dropped and still run, each holding a worker until it ends"
     );
     describe_counter!(
         "knot_history_rows_built_total",
@@ -182,7 +198,7 @@ fn describe_history_metrics() {
     );
     describe_counter!(
         "knot_history_snapshots_unchecked_total",
-        "Room snapshots the history builder left out of its gap check, by reason (refused|corrupt|undecodable|panic|timeout|too_large|kept_gap)"
+        "Room snapshots the history builder left out of its gap check, by reason (refused|corrupt|undecodable|panic|timeout|too_large|kept_gap|pending)"
     );
     describe_counter!(
         "knot_history_build_failures_total",
@@ -190,7 +206,7 @@ fn describe_history_metrics() {
     );
     describe_counter!(
         "knot_history_replay_timeouts_total",
-        "History replays that ran past their timeout, by phase (genesis|build|words)"
+        "History replays that ran past their timeout, by phase (genesis|build|words|view); view counts history views and restores, also those whose request was dropped before the timeout"
     );
     describe_counter!(
         "knot_history_pages_given_up_total",
@@ -208,6 +224,19 @@ fn describe_history_metrics() {
         "knot_history_replay_seconds",
         Unit::Seconds,
         "Compute time of one history replay, by phase (genesis|build|words)"
+    );
+    describe_counter!(
+        "knot_history_views_total",
+        "History version views, by outcome: cached (served from the view cache, or joined another request's render), rendered, diff_failed (rendered, but without changes because the diff step failed or panicked), no_changes (a Show changes request answered with the plain version without trying the diff: over the diff cap, the builder's word count failed, or an earlier diff of it timed out; cached or rendered), not_found, rebuilding (the page's history is an older builder's, until its rebuild), too_large, busy (no render slot or replay permit within the wait), failed (render, replay, panic, skipped baseline, earlier timeout, store error), timeout"
+    );
+    describe_counter!(
+        "knot_history_restore_total",
+        "Restore here requests (restores of a page in place to a history entry) whose target replay succeeded or that were refused before it because the version is recorded too slow or over the revert cap, by outcome: restored (reverted by undo), fallback (reverted by a whole-page replace, so comments may have lost their place), unchanged (the page already matched the version; nothing written), stale (409 history.restore_busy: the page changed between export and apply on every attempt), unverified (500 history.restore_failed: no revert verified, or the page nests past the limit), too_large (409 restore.too_large: the version, alone or with the live page, over the revert cap or too slow to plan, now or recorded), apply_failed (500 restore.apply: the room refused the verified update), busy (503 at the plan's permit wait, with too little time left to plan, at the room's acquire wait, or the deadline before a revert was sent), timeout (504: the deadline after a revert was sent, or its reply was lost; it may still apply), failed (a plan that failed or panicked, a room whose acquire failed, that closed or failed its export, a version replayed at another content epoch, or a room that could not catch up with the page's log on the last attempt: 503 history.busy, a database or log problem, not contention). Restore as new page is not counted here"
+    );
+    describe_histogram!(
+        "knot_history_view_seconds",
+        Unit::Seconds,
+        "Time from a history view's replay permit to its rendered body, on a cache miss"
     );
 }
 
@@ -280,26 +309,50 @@ mod tests {
         assert_eq!(normalize_addr("127.0.0.1:9090").unwrap(), "127.0.0.1:9090");
     }
 
-    /// Keeps every description: (name, kind, unit).
+    /// One description: (name, kind, unit, description).
+    type Described = (String, &'static str, Option<Unit>, String);
+
+    /// Keeps every description.
     #[derive(Default)]
-    struct Descriptions(Mutex<Vec<(String, &'static str, Option<Unit>)>>);
+    struct Descriptions(Mutex<Vec<Described>>);
 
     impl Descriptions {
-        fn push(&self, name: KeyName, kind: &'static str, unit: Option<Unit>) {
+        fn push(&self, name: KeyName, kind: &'static str, unit: Option<Unit>, text: SharedString) {
             let name = name.as_str().to_owned();
-            self.0.lock().unwrap().push((name, kind, unit));
+            let text = text.into_owned();
+            self.0.lock().unwrap().push((name, kind, unit, text));
+        }
+
+        /// The unit `name` was described with.
+        fn unit(&self, name: &str) -> Option<Unit> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(n, ..)| n == name)
+                .and_then(|(_, _, u, _)| *u)
+        }
+
+        /// The description `name` was described with.
+        fn description(&self, name: &str) -> Option<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(n, ..)| n == name)
+                .map(|(.., d)| d.clone())
         }
     }
 
     impl Recorder for Descriptions {
-        fn describe_counter(&self, name: KeyName, unit: Option<Unit>, _: SharedString) {
-            self.push(name, "counter", unit);
+        fn describe_counter(&self, name: KeyName, unit: Option<Unit>, text: SharedString) {
+            self.push(name, "counter", unit, text);
         }
-        fn describe_gauge(&self, name: KeyName, unit: Option<Unit>, _: SharedString) {
-            self.push(name, "gauge", unit);
+        fn describe_gauge(&self, name: KeyName, unit: Option<Unit>, text: SharedString) {
+            self.push(name, "gauge", unit, text);
         }
-        fn describe_histogram(&self, name: KeyName, unit: Option<Unit>, _: SharedString) {
-            self.push(name, "histogram", unit);
+        fn describe_histogram(&self, name: KeyName, unit: Option<Unit>, text: SharedString) {
+            self.push(name, "histogram", unit, text);
         }
         fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
             Counter::noop()
@@ -321,7 +374,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|(n, k, _)| (n.clone(), *k))
+            .map(|(n, k, ..)| (n.clone(), *k))
             .collect();
         got.sort();
         let mut want = vec![
@@ -340,21 +393,59 @@ mod tests {
             ("knot_history_words_skipped_total", "counter"),
             ("knot_history_legacy_mismatch_total", "counter"),
             ("knot_history_replay_seconds", "histogram"),
+            ("knot_history_views_total", "counter"),
+            ("knot_history_view_seconds", "histogram"),
+            ("knot_history_restore_total", "counter"),
         ];
         want.sort();
         let want: Vec<(String, &str)> = want.into_iter().map(|(n, k)| (n.to_owned(), k)).collect();
         assert_eq!(got, want);
 
-        let unit = |name: &str| {
-            rec.0
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|(n, _, _)| n == name)
-                .and_then(|(_, _, u)| *u)
-        };
-        assert_eq!(unit("knot_history_table_bytes"), Some(Unit::Bytes));
-        assert_eq!(unit("knot_history_replay_seconds"), Some(Unit::Seconds));
+        assert_eq!(rec.unit("knot_history_table_bytes"), Some(Unit::Bytes));
+        assert_eq!(rec.unit("knot_history_replay_seconds"), Some(Unit::Seconds));
+        assert_eq!(rec.unit("knot_history_view_seconds"), Some(Unit::Seconds));
+
+        // Every outcome the views record, named where operators read them.
+        let views = rec
+            .description("knot_history_views_total")
+            .expect("described");
+        for outcome in [
+            "cached",
+            "rendered",
+            "diff_failed",
+            "no_changes",
+            "not_found",
+            "rebuilding",
+            "too_large",
+            "busy",
+            "failed",
+            "timeout",
+        ] {
+            assert!(views.contains(outcome), "{outcome} missing: {views}");
+        }
+        let restores = rec
+            .description("knot_history_restore_total")
+            .expect("described");
+        for outcome in [
+            "restored",
+            "fallback",
+            "unchanged",
+            "stale",
+            "unverified",
+            "too_large",
+            "apply_failed",
+            "busy",
+            "timeout",
+            "failed",
+        ] {
+            assert!(restores.contains(outcome), "{outcome} missing: {restores}");
+        }
+        let timeouts = rec
+            .description("knot_history_replay_timeouts_total")
+            .expect("described");
+        for phase in ["genesis", "build", "words", "view"] {
+            assert!(timeouts.contains(phase), "{phase} missing: {timeouts}");
+        }
     }
 
     #[test]
@@ -366,7 +457,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|(n, k, _)| (n.clone(), *k))
+            .map(|(n, k, ..)| (n.clone(), *k))
             .collect();
         got.sort();
         let mut want = vec![
@@ -381,14 +472,10 @@ mod tests {
         let want: Vec<(String, &str)> = want.into_iter().map(|(n, k)| (n.to_owned(), k)).collect();
         assert_eq!(got, want);
 
-        let unit = rec
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(n, _, _)| n == "knot_collab_throttle_wait_seconds")
-            .and_then(|(_, _, u)| *u);
-        assert_eq!(unit, Some(Unit::Seconds));
+        assert_eq!(
+            rec.unit("knot_collab_throttle_wait_seconds"),
+            Some(Unit::Seconds)
+        );
     }
 
     #[test]
@@ -400,7 +487,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|(n, k, _)| (n.clone(), *k))
+            .map(|(n, k, ..)| (n.clone(), *k))
             .collect();
         assert_eq!(
             got,

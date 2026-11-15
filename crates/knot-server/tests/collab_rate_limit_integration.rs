@@ -16,14 +16,17 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "../../knot-crdt/tests/common/fixtures.rs"]
+mod fixtures;
+
 use futures_util::{SinkExt, StreamExt};
 use knot_auth::{Hasher, Throttle};
 use knot_config::Config;
 use knot_server::protocol::{YSyncMessage, decode};
 use knot_server::{AppState, router_with_state};
 use knot_storage::{
-    BoardStore, PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdatesStore, WorkspaceRole,
-    sort_key_between,
+    BoardStore, NewUpdate, PgSnapshotStore, PgUpdatesStore, SnapshotStore, UpdateSource,
+    UpdatesStore, WorkspaceRole, sort_key_between,
 };
 use tokio::net::TcpListener;
 use tokio::time::Instant;
@@ -284,6 +287,11 @@ struct Peer {
     step2_received: usize,
     /// Presence frames received, in order.
     awareness_received: Vec<Vec<u8>>,
+    /// Answer the room's SyncStep1 without the doc's pending content
+    /// (`encode_diff_v1`), not with yrs's `encode_state_as_update_v1`,
+    /// which merges the whole pending update into the answer whatever the
+    /// state vector.
+    step1_pending_free: bool,
 }
 
 /// Dial `path` with `session`'s cookie.
@@ -319,6 +327,21 @@ async fn refused_upgrade(
 impl Peer {
     /// Connect, send SyncStep1 and wait for the room's state.
     async fn join(fx: &Fixture, path: &str, session: &Session) -> Peer {
+        Self::join_answering(fx, path, session, false).await
+    }
+
+    /// [`Peer::join`] for a peer that answers the room's SyncStep1 without
+    /// its pending content (`Peer::step1_pending_free`).
+    async fn join_pending_free(fx: &Fixture, path: &str, session: &Session) -> Peer {
+        Self::join_answering(fx, path, session, true).await
+    }
+
+    async fn join_answering(
+        fx: &Fixture,
+        path: &str,
+        session: &Session,
+        step1_pending_free: bool,
+    ) -> Peer {
         let mut ws = dial(fx, path, session).await.expect("ws connect");
         let doc = Doc::new();
         let state_vector = doc.transact().state_vector().encode_v1();
@@ -332,6 +355,7 @@ impl Peer {
             ws,
             step2_received: 0,
             awareness_received: Vec::new(),
+            step1_pending_free,
         };
         assert!(
             peer.pump_until(DEADLINE, |peer| peer.step2_received >= 1)
@@ -385,7 +409,11 @@ impl Peer {
         match decode(bytes) {
             Ok(YSyncMessage::SyncStep1(state_vector)) => {
                 let state_vector = StateVector::decode_v1(&state_vector).unwrap();
-                let reply = self.doc.transact().encode_state_as_update_v1(&state_vector);
+                let reply = if self.step1_pending_free {
+                    self.doc.transact().encode_diff_v1(&state_vector)
+                } else {
+                    self.doc.transact().encode_state_as_update_v1(&state_vector)
+                };
                 self.send_frame(sync_frame(1, &reply)).await;
             }
             Ok(YSyncMessage::SyncStep2(update)) => {
@@ -405,6 +433,21 @@ impl Peer {
 
     /// Process inbound frames until `done` holds or `within` elapses.
     async fn pump_until(&mut self, within: Duration, done: impl Fn(&Peer) -> bool) -> bool {
+        self.pump(within, done, false).await
+    }
+
+    /// [`Peer::pump_until`] that fails on a close frame: the session must
+    /// stay open meanwhile.
+    async fn pump_open_until(&mut self, within: Duration, done: impl Fn(&Peer) -> bool) -> bool {
+        self.pump(within, done, true).await
+    }
+
+    async fn pump(
+        &mut self,
+        within: Duration,
+        done: impl Fn(&Peer) -> bool,
+        fail_on_close: bool,
+    ) -> bool {
         let deadline = Instant::now() + within;
         loop {
             if done(self) {
@@ -416,6 +459,9 @@ impl Peer {
             }
             match tokio::time::timeout(remaining, self.ws.next()).await {
                 Ok(Some(Ok(tungstenite::Message::Binary(bytes)))) => self.handle(&bytes).await,
+                Ok(Some(Ok(tungstenite::Message::Close(frame)))) if fail_on_close => {
+                    panic!("the server closed the socket: {frame:?}")
+                }
                 Ok(Some(Ok(_))) => {}
                 Ok(Some(Err(error))) => panic!("ws error: {error}"),
                 Ok(None) => panic!("server closed the socket"),
@@ -848,4 +894,236 @@ async fn a_reconnect_loop_to_one_doc_is_refused_with_429() {
     let other_doc = fx.another_doc("Skimmed").await;
     Peer::join(&fx, &format!("/collab/doc/{other_doc}"), &fx.writer).await;
     Peer::join(&fx, &path, &fx.reader).await;
+}
+
+// ---------------------------------------------------------------------------
+// Parked rows in the join handshake (Ruling 5, Review Focus 3)
+// ---------------------------------------------------------------------------
+
+/// The ids `updates` insert.
+fn insertions_of<'a>(updates: impl IntoIterator<Item = &'a Vec<u8>>) -> yrs::IdSet {
+    updates.into_iter().fold(yrs::IdSet::new(), |acc, u| {
+        acc.merge(&Update::decode_v1(u).unwrap().insertions(true))
+    })
+}
+
+/// Whether `doc` holds every id of `ids` as a pending struct.
+fn holds_pending(doc: &Doc, ids: &yrs::IdSet) -> bool {
+    let txn = doc.transact();
+    let pending = txn
+        .store()
+        .pending_update()
+        .map(|p| p.update.insertions(true))
+        .unwrap_or_default();
+    !knot_crdt::pending::holds_any(&ids.diff(&pending))
+}
+
+/// The text of a fresh doc that applied `updates` in order.
+fn reference_text<'a>(updates: impl IntoIterator<Item = &'a Vec<u8>>) -> String {
+    let doc = Doc::new();
+    for u in updates {
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(u).unwrap())
+            .unwrap();
+    }
+    doc_text(&doc)
+}
+
+/// Seeds the page's log with `rows` by the writer in one append, before
+/// any room opens it: neither throttled nor paced by the room's writer.
+async fn seed_rows<'a>(fx: &Fixture, rows: impl IntoIterator<Item = &'a Vec<u8>>) {
+    let rows: Vec<NewUpdate> = rows
+        .into_iter()
+        .map(|bytes| NewUpdate {
+            by_user_id: Some(fx.writer.user_id),
+            bytes: bytes.clone(),
+            source: UpdateSource::Edit,
+            meta: None,
+        })
+        .collect();
+    PgUpdatesStore::new(fx.pool.clone())
+        .append(fx.doc_id, 0, &rows)
+        .await
+        .unwrap();
+}
+
+async fn row_count(fx: &Fixture) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM doc_updates WHERE doc_id = $1")
+        .bind(fx.doc_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap()
+}
+
+async fn until_rows(fx: &Fixture, n: i64) {
+    let deadline = Instant::now() + DEADLINE;
+    while row_count(fx).await < n {
+        assert!(
+            Instant::now() < deadline,
+            "the page never held {n} rows ({} rows)",
+            row_count(fx).await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A join on a page whose log parks `1 + k` rows, with the collab limits
+/// on: the reader's doc holds every parked row pending with no close frame,
+/// and drains once the writer sends the dependency. Returns the time from
+/// the reader's dial until it held every row pending.
+async fn join_parked_rows(k: usize, writer_pending_free: bool) -> Duration {
+    let fx = fixture(limited_config(1.0, 64)).await;
+    let (u1, u2, tail) = fixtures::cross_client_parked_tail(k);
+    seed_rows(&fx, std::iter::once(&u2).chain(&tail)).await;
+    let parked = insertions_of(std::iter::once(&u2).chain(&tail));
+
+    let dialled = Instant::now();
+    let mut reader = Peer::join(&fx, &fx.doc_path(), &fx.reader).await;
+    assert!(
+        reader
+            .pump_open_until(DEADLINE, |p| holds_pending(&p.doc, &parked))
+            .await,
+        "the reader never held all {} rows pending",
+        k + 1
+    );
+    let joined = dialled.elapsed();
+
+    let mut writer = if writer_pending_free {
+        Peer::join_pending_free(&fx, &fx.doc_path(), &fx.writer).await
+    } else {
+        Peer::join(&fx, &fx.doc_path(), &fx.writer).await
+    };
+    writer.send_frame(sync_frame(2, &u1)).await;
+    let want = reference_text(std::iter::once(&u1).chain([&u2]).chain(&tail));
+    assert!(
+        reader
+            .pump_open_until(DEADLINE, |p| p.doc_text() == want)
+            .await,
+        "the reader never drained"
+    );
+    joined
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_with_300_parked_rows_is_not_throttled() {
+    let joined = join_parked_rows(300, false).await;
+    println!("a join of 301 parked rows: {joined:?}");
+}
+
+/// Ruling 4's k: 3,001 parked rows join within the deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_with_3000_parked_rows_completes_in_bounded_time() {
+    let joined = join_parked_rows(3000, true).await;
+    println!("a join of 3,001 parked rows: {joined:?}");
+    assert!(joined < DEADLINE, "{joined:?}");
+}
+
+/// Ruling 5's writer queue: a joiner whose handshake waits on its own
+/// socket keeps every frame the room fans out meanwhile, more than the
+/// room's 256-slot channel holds, and stays registered.
+///
+/// The handshake holds a 12 MiB frame: above what loopback's socket buffers
+/// take together (Linux autotunes them up to 6 MiB receive and 4 MiB send)
+/// and below tungstenite's 16 MiB frame limit. That frame is the page's
+/// SyncStep2, a paragraph of 12 MiB, with `cross_client_parked`'s u2 parked
+/// behind it (its u1 is never sent): a 12 MiB *parked* row would make every
+/// one of the writer's 300 applies re-encode the page's pending update
+/// (main's pending fingerprint and nesting prefilter), about 0.9 s each in
+/// a debug build, which outlasts the reader's 75 s silence limit. The
+/// reader sends its SyncStep1 once the writer's updates are queued: the
+/// room answers it with the page's whole state, another 12 MiB, which past
+/// `HANDSHAKE_BUFFER_BYTES` would stop the queue (Ruling 5's bound).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_whose_handshake_is_slow_keeps_its_place_while_others_type() {
+    let fx = fixture(limited_config(1.0, 64)).await;
+    let big = {
+        let author = Doc::with_client_id(21);
+        let fragment = author.get_or_insert_xml_fragment("default");
+        {
+            let mut txn = author.transact_mut();
+            let paragraph = fragment.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            paragraph.push_back(&mut txn, XmlTextPrelim::new("x".repeat(12 * 1024 * 1024)));
+        }
+        author.transact().encode_diff_v1(&StateVector::default())
+    };
+    let (_, u2) = fixtures::cross_client_parked();
+    seed_rows(&fx, [&big, &u2]).await;
+
+    // A process-wide counter: this holds under nextest (`make test.rust`),
+    // which runs each test in its own process. Under plain `cargo test`,
+    // other tests' joins in the same binary can raise it too, so run this
+    // test alone there (`-- --test-threads=1` or by its name).
+    let queued_before = knot_server::handshake_frames_queued();
+    let mut reader_ws = dial(&fx, &fx.doc_path(), &fx.reader)
+        .await
+        .expect("ws connect");
+
+    let mut writer = Peer::join_pending_free(&fx, &fx.doc_path(), &fx.writer).await;
+    // After the 12 MiB paragraph, at index 1.
+    writer.type_paragraph("W").await;
+    let typed: String = (0..300)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    for (i, ch) in typed.chars().enumerate() {
+        let at = 1 + i as u32;
+        writer
+            .edit(move |roots, txn| {
+                let Some(yrs::XmlOut::Element(p)) = roots.fragment.get(txn, 1) else {
+                    panic!("no paragraph of the writer's own")
+                };
+                let Some(yrs::XmlOut::Text(text)) = p.get(txn, 0) else {
+                    panic!("no text")
+                };
+                yrs::Text::insert(&text, txn, at, &ch.to_string());
+            })
+            .await;
+    }
+    // The two seeded rows, the paragraph and the 300 characters.
+    until_rows(&fx, 303).await;
+    let empty = Doc::new().transact().state_vector().encode_v1();
+    reader_ws
+        .send(tungstenite::Message::Binary(sync_frame(0, &empty).into()))
+        .await
+        .unwrap();
+
+    let mut reader = Peer {
+        doc: Doc::new(),
+        ws: reader_ws,
+        step2_received: 0,
+        awareness_received: vec![],
+        step1_pending_free: true,
+    };
+    let want = format!("W{typed}");
+    // The writer's paragraph alone: the page's text is 12 MiB.
+    let writers_paragraph = |p: &Peer| {
+        let fragment = p.doc.get_or_insert_xml_fragment("default");
+        let txn = p.doc.transact();
+        fixtures::text_at(&fragment, &txn, 1).map(|text| text.get_string(&txn))
+    };
+    assert!(
+        reader
+            .pump_open_until(DEADLINE, |p| writers_paragraph(p).as_deref() == Some(&want))
+            .await,
+        "the reader never got the writer's 300 characters"
+    );
+    assert!(
+        holds_pending(&reader.doc, &insertions_of([&u2])),
+        "the parked row came with the handshake"
+    );
+    let queued = knot_server::handshake_frames_queued() - queued_before;
+    println!("room frames queued during the slow handshake: {queued}");
+    assert!(queued >= 300, "only {queued} frames were queued");
+
+    reader.type_paragraph("reader").await;
+    until_rows(&fx, 304).await;
+    assert!(
+        !writer
+            .pump_open_until(Duration::from_millis(500), |_| false)
+            .await
+    );
+    assert!(
+        !reader
+            .pump_open_until(Duration::from_millis(500), |_| false)
+            .await
+    );
 }

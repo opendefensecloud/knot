@@ -7,7 +7,7 @@
 -- validation scans api_keys, where every root_doc_id is still NULL.
 -- documents first: it is the busier table.
 SET LOCAL lock_timeout = '5s';
-SELECT knot_lock_tables('20261114120001_api_keys_root_doc_fk',
+SELECT knot_lock_tables('20261115120001_api_keys_root_doc_fk',
                         ARRAY['documents', 'api_keys']::regclass[],
                         'SHARE ROW EXCLUSIVE');
 

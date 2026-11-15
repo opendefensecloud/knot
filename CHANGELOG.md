@@ -8,9 +8,395 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
-### Added
+A fix for pages that lost an edit: snapshots, the first sync and exports
+no longer hold text at the wrong place. One database migration runs on
+upgrade, and every page's history is rebuilt once; read Upgrading first.
+The History drawer becomes a timeline of who changed what, and any
+version can be opened with its changes highlighted and restored, in
+place or as a new page.
 
+### Upgrading
+- Upgrade from 0.9.14. One database migration runs on upgrade:
+  `20261114140000_snapshot_pending_revs` adds a column to
+  `doc_snapshots`. It takes its lock through `knot_lock_tables`, in
+  bounded attempts, and gives up after 45 s; each attempt pauses, for at
+  most 100 ms, opening or exporting a page that is not already open, the
+  Markdown refresh, the old history drawer's snapshot list, preview and
+  restore, the history builder's snapshot reads and snapshot writes, and
+  once it has the lock it commits at once (no rewrite). Edits and open
+  pages go on. If it gives up, re-run the upgrade. Pass
+  `helm upgrade --timeout` of at least 3 minutes plus your rollout time.
+  0.9.14 pods that restart after it commits crash-loop until new pods
+  replace them, and rolling back to 0.9.14 needs a database restore.
+  (#TBD)
+- Every page's history is rebuilt once in the background after the
+  upgrade: history that 0.9.12 to 0.9.14 built could hold text at the
+  wrong place, taken from old snapshots. Expect about one read of
+  `doc_updates` and the CPU share `history.cpuShare` allows, as for the
+  first build. `knot_history_builder_lag_revs` does not show this
+  rebuild (it counts edited pages only); watch
+  `SELECT count(*) FROM doc_history_state WHERE builder_version < 2`
+  fall to 0. Until a page is rebuilt,
+  `GET /api/docs/{id}/history/entries` reports `catching_up: true` for
+  it, also when an earlier build gave it up (it then reports
+  `unavailable: false` until it is tried again). History entries get new
+  ids, so API clients that stored ids from that endpoint list them again.
+  Pages given up before are tried again. Changes without an author that
+  0.9.12 to 0.9.14 recorded are found again from the snapshots still
+  kept. Snapshot cleanup kept only recent snapshots and one a day for
+  30 days, so such a change whose snapshot is gone moves to a later
+  version: by about a day if it was found in the 30 days before the
+  upgrade, and by up to the age of the oldest kept snapshot if it was
+  found earlier. One the page no longer holds leaves history. (#TBD)
+- Pages whose last snapshot was written before this release and holds
+  text past an edit the server never got (such text may be at the wrong
+  place), and pages that 0.9.14 pods edited during the rollout, read more
+  of their edit log on each open until they are edited again (an idle
+  page's new snapshot cannot replace a 0.9.14 snapshot at the same
+  point). Watch `knot_room_boot_fallbacks_total`. (#TBD)
+- A page whose edit log holds a change that would corrupt the page if
+  replayed (a rare shape after a lost edit) opens without that change and
+  saves no more snapshots, for good: the edit log cannot be changed.
+  While no editor has it open, its Markdown refresh, search entry and
+  `export-check` fail for it, and so do creating a page from it as a
+  template and Duplicate of that page or of any page above it (Duplicate
+  copies the whole subtree and fails as a whole). Opening it in the
+  editor makes these work while it stays open. Before this release such
+  pages loaded silently corrupted. The log line
+  `a log row failed to apply at boot` and
+  `knot_room_row_apply_errors_total{phase="boot"}` name them. (#TBD)
+- An editor whose earlier edit the server lost, reconnecting to a page
+  that holds its later text past that edit, has its reconnect sync
+  refused, so edits it made while offline stay in that browser tab; edits
+  after the sync save as usual. Before this release the same sync could
+  corrupt the page. The log line `an update would corrupt the page` and
+  `knot_room_updates_underflow_refused_total` name it. (#TBD)
+- Keep the rollout short. While 0.9.14 pods serve a page that new pods
+  snapshotted, content waiting for a lost edit can be missing from their
+  copy, its Markdown, search entry and exports when that edit arrives,
+  until a new pod opens the page. Their hourly snapshot cleanup can also
+  delete the snapshot a page boots from, which makes that page read its
+  whole edit log on each open until it is edited again. (#TBD)
+- Pages that lost an edit before 0.9.9 can lose text that only their old
+  snapshot held past that edit: it cannot be told from misplaced text.
+  The log line `the page's latest snapshot cannot be trusted` reports
+  `dropped` (text lost for certain) and `dropped_past_gap` (misplaced
+  text and text past the lost edit together, so an upper bound on lost
+  text). History views do not show that text either. The old snapshot
+  stays in the database. A page whose old snapshot did not load at all
+  before this release now opens from the part of it that loads. (#TBD)
+- Text misplaced before this release that the server already took in
+  stays on the page, and history can list it as a change without an
+  author. (#TBD)
+- Reload browser tabs once the rollout has finished (no 0.9.14 pod is
+  serving any more): a tab that joined a 0.9.14 pod holds its misplaced
+  text and sends it back when it reconnects, and a tab reloaded
+  mid-rollout can land on a 0.9.14 pod again. (#TBD)
+- Opening a version in the History drawer is refused, with "History for
+  this page is being rebuilt", until this release's builder has rebuilt
+  the page's history (the rebuild above), and the drawer says history is
+  still being built meanwhile. Progress:
+  `SELECT count(*) FROM doc_history_state WHERE builder_version < 2`
+  falls to 0. (#TBD)
+- During the rolling upgrade, browsers still running the 0.9.14 app show
+  an empty History list until they reload (the old snapshot list
+  endpoint now answers an empty list), and browsers with the new app
+  that reach a 0.9.14 pod read "This version can't be shown" until that
+  pod is replaced; a Restore here that reaches one fails with "Restore
+  failed" and changes nothing, so it can be tried again, and a Restore
+  as new page that reaches one also fails and creates nothing. (#TBD)
+- The hourly snapshot cleanup now keeps the 3 newest snapshots of each
+  page, the newest one boot trusts, and those page history has still to
+  check; pages not yet rebuilt keep the old rule (the 5 newest plus one
+  a day for 30 days), so `doc_snapshots` shrinks once the rebuild is
+  done. (#TBD)
+- Version views share the `history.workers` replay slots and memory
+  bound with the history builder. A view waits behind the replays
+  running or queued when it arrives, at most one builder replay per
+  worker; the server answers "busy" after 5 s and the drawer retries for
+  about half a minute, so on a busy single-worker replica opening a
+  version can take that long, or end in "busy" behind a large page's
+  first build. Views still get one slot with `history.workers: 0`, but
+  with `history.workers: 0` on every replica no page is rebuilt after
+  the upgrade, so every version stays refused as being rebuilt: at least
+  one replica must run the builder. "Busy" answers (503) count as 5xx in
+  the error budget and can add to it while the builder catches up. A
+  builder that waits more than 5 minutes for a slot hands the page back
+  and retries it later. (#TBD)
+- Versions and restores whose replay input is over 40/41 of
+  `history.replayMaxBytes` (about 3.90 MiB at the default 4 MiB,
+  4,092,003 bytes: very large pages, or one very long editing session)
+  answer "too large" until `replayMaxBytes` is raised together with the
+  memory limit; restore by snapshot had no such limit. Earlier versions
+  from before page history answer "too large" from about 3.64 MiB at
+  the default (3,813,002 bytes), since their replay needs more memory.
+  "Show changes" is skipped above about 0.44 MiB of
+  replay input at the default (466,033 bytes; the version is then shown
+  without highlighting), and it highlights nothing on many entries of
+  pages that lost an edit before this release. (#TBD)
+- Restore from the drawer needs a timeline entry, so pages whose history
+  was given up, pages still being rebuilt and every page on an instance
+  whose replicas all run `history.workers: 0` offer no restore of recent
+  states in the drawer. Operators can still restore by snapshot,
+  `POST /api/docs/{id}/history/{seq}/restore`, with a seq read from the
+  database (no endpoint lists them any more):
+  `SELECT snapshot_seq, created_at, pending_revs IS NOT NULL
+  FROM doc_snapshots WHERE doc_id = …`. Prefer a snapshot this release
+  wrote (`pending_revs IS NOT NULL`): an older one is restored as stored
+  and can hold misplaced text on a page that lost an edit. (#TBD)
+- The History drawer's snapshot list and its Markdown preview are gone.
+  Restore here changes only what differs from the chosen version, so
+  comments, suggestions and authorship on unchanged text stay; when it
+  cannot, it replaces the whole page, and the timeline and the reader
+  are told that comments may have lost their place.
+  `GET /api/docs/{id}/history` answers an empty list, and the snapshot
+  preview and restore endpoints by seq stay for operators. Each person,
+  bot or API key user renders one version at a time and runs one
+  restore at a time, in place or as a new page (a second waits for the
+  first up to 5 s, then answers busy), per replica. (#TBD)
+- Restore here needs the version, its deleted text included, and the
+  live page together under the revert limit: 40/51 of `replayMaxBytes`,
+  at most 12 MiB (about 3.14 MiB at the default, 3,289,650 bytes). For
+  a version about the size of the page, pages over about 1.57 MiB
+  cannot be restored in place at the default. They answer
+  "This page is too large to restore here" (409 `restore.too_large`);
+  Restore as new page needs only the version under the version limit,
+  so it still works. The same answer comes, for 10 minutes on that pod,
+  for a version whose revert took over 10 s or that was found over the
+  limit. (#TBD)
+- Restore here answers within 30 s. On a page edited throughout its
+  five attempts it answers that the page kept changing (409
+  `history.restore_busy`); out of time before anything was sent, busy
+  (503, nothing changed); out of time while handing it to a busy page
+  or after it was sent, a timeout (504: the change may still apply, so
+  check the page). A restore whose page cannot catch up with its stored
+  log answers busy (503) and counts as `failed` in
+  `knot_history_restore_total`. (#TBD)
+- Edits not yet saved on the server when a restore applies, including
+  those of a tab that was offline, are lost if they are in a part the
+  restore removes; after a whole-page replace, all of them are. Text
+  waiting for an edit the server never got is not restored away and can
+  reappear after a restore when that edit arrives. (#TBD)
+- A page stored nested deeper than the editor's limit before that limit
+  existed cannot be restored in place ("Restore failed"); restore it as
+  a new page. (#TBD)
+- Restore as new page waits for a duplicate slot like Duplicate (503
+  `doc.duplicate_busy` when none frees in time; nothing is created).
+  (#TBD)
+
+### Added
 - API keys can be limited to one page and its subpages (Settings → API keys → Pages). Such a key can't call workspace-wide endpoints.
+- Metrics `knot_room_boot_fallbacks_total{reason}`,
+  `knot_room_snapshots_withheld_total{reason}`,
+  `knot_room_pending_reparked_total{reason}` and
+  `knot_room_updates_underflow_refused_total{source}`, and the `pending`
+  reason of `knot_history_snapshots_unchecked_total`. (#TBD)
+- The History drawer is a timeline: day headings, one entry per editing
+  session with who, when and the words added and removed, plus restores,
+  copies (a page made with Move to subpage names the page it came from),
+  imports, templates, changes saved without an author and earlier
+  versions from before page history. Clicking an entry shows the page as
+  it was right after it, with that entry's changes highlighted (Show
+  changes). (#TBD)
+- `GET /api/docs/{id}/history/entries/{eid}/view` shows a version (API
+  keys need `read`; not rate-limited), and
+  `POST /api/docs/{id}/history/entries/{eid}/restore` restores it in
+  place and answers 200 with
+  `{"outcome": "restored" | "fallback" | "unchanged"}` (API keys need
+  `update`; counts as a write for rate limits; not recorded in the page
+  audit log, the timeline shows it). Both need Editor+ on the page.
+  (#TBD)
+- Restore as new page in the History drawer copies a version into a new
+  page right after the original, titled
+  `<title> (version of <date>)`, without its subpages:
+  `POST /api/docs/{id}/history/entries/{eid}/restore-as-new` with the
+  body `{"version_label", "ended_at"}` (`ended_at` optional) answers 201
+  with the new page. It needs Editor+ on the page and where the copy
+  goes, as Duplicate; API keys need `create`. It counts as an
+  `expensive` request like Duplicate and is recorded in the new page's
+  audit log as a copy. The new page's history starts "Created from
+  `<title>`, version of `<date>`". (#TBD)
+- Metric `knot_history_restore_total{outcome}`: alert on `apply_failed`,
+  `failed` and `unverified`; `fallback` is worth watching (comments may
+  have lost their place); `stale` and `busy` are capacity or contention
+  signals. (#TBD)
+- Metrics `knot_history_views_total{outcome}` (alert on `failed` and
+  `timeout`; `not_found`, `rebuilding` and `no_changes` are normal),
+  `knot_history_view_seconds`, and
+  `knot_history_replay_timeouts_total{phase="view"}`;
+  `knot_history_replay_threads_stalled` also counts version views that
+  timed out or whose request was dropped while they still run. (#TBD)
+
+### Fixed
+- Pages whose content was waiting for an edit the server never got could
+  save snapshots and send joining editors text at the wrong place (a yrs
+  encoding bug). Text never typed could show up, and later text could go
+  missing from history. (#TBD)
+- Snapshots, the first sync, exports, Duplicate and "Move to subpage" now
+  hold only placed content. The waiting content stays in the edit log,
+  and joining editors receive it as it was sent. Waiting content that
+  stayed hidden after the missing edit arrived (as it could before this
+  release) usually shows once the page is next loaded into a new editing
+  session. (#TBD)
+- Restore here in the History drawer no longer goes through Markdown,
+  which lost formatting outside its schema and detached comments. The
+  operator's restore by snapshot
+  (`POST /api/docs/{id}/history/{seq}/restore`), kept for pages without
+  a restorable entry, still does. (#TBD)
+
+## [0.9.14] - 2026-11-14
+
+A feature release: favorites. Star the pages you use most and they are
+listed at the top of the sidebar. One small database migration runs on
+upgrade; read Upgrading first.
+
+### Upgrading
+- Upgrade from 0.9.13. One database migration runs on upgrade:
+  `20261114120000_user_favorites` creates the empty `user_favorites`
+  table, for favorites. Its foreign keys need a `SHARE ROW EXCLUSIVE`
+  lock on `documents`, `users` and `workspaces`, which it takes through
+  `knot_lock_tables`, in attempts that each wait at most 100 ms; once it
+  has them it creates the table and commits at once. Page writes
+  (creating, renaming, moving, archiving or purging pages, among others)
+  and changes to members and workspaces pause for those moments; page
+  loads go on. It gives up after 45 s instead of queueing writes behind a
+  long transaction; if it gives up, re-run the upgrade once that
+  transaction has finished. Pass `helm upgrade --timeout` of at least
+  3 minutes plus your rollout time. 0.9.13 pods that restart after it
+  commits crash-loop until new pods replace them, since they don't start
+  on a database with a migration they don't know.
+- Rolling back to 0.9.13 needs no database restore: run
+  `DROP TABLE user_favorites;` and
+  `DELETE FROM _sqlx_migrations WHERE version = 20261114120000;` in one
+  transaction, then roll back. Everyone's favorites are lost.
+
+### Added
+- Favorites: star the pages you use most and they stay one click away. A
+  star shows on a page in the sidebar when you point at it or reach it
+  with the keyboard, and the page's menu has "Add to favorites"; both are
+  there for everyone, Viewers included. Starred pages are listed in a
+  Favorites section at the top of the sidebar, above Documents, in the
+  order you starred them; click a star again, there or in the tree, to
+  remove one. The section can be collapsed and is hidden while you have
+  none. Favorites are yours alone and follow you to every browser:
+  nobody else sees them, and starring is not recorded in the page's audit
+  log. A page you can no longer open (its access changed, or it was
+  archived) leaves your list and comes back when you can open it again;
+  purging a page removes it for good. Templates can't be starred. You can
+  have up to 200 favorites in a workspace, counting those hidden from you.
+- `GET /api/me/favorites` lists your favorites in the workspace, oldest
+  star first, as `[{doc_id, title, icon, favorited_at}]`, leaving out
+  pages you can't read, archived pages and templates. API keys need the
+  `read` scope.
+- `PUT /api/me/favorites/{doc_id}` stars a page you can read → 204;
+  starring it again changes nothing. A page you can't read answers
+  `403 acl.no_grant`, like an unknown one; an archived page
+  `409 doc.archived` (`404 doc.not_found` for a Viewer); a template
+  `422 favorite.not_a_page`; the 201st favorite
+  `409 favorite.limit_reached` with `details.limit`. API keys need the
+  `update` scope.
+- `DELETE /api/me/favorites/{doc_id}` removes your star → 204, also when
+  there was none. It checks no access, so a page that was archived or
+  hidden from you can still be unstarred. API keys need the `delete`
+  scope.
+
+## [0.9.13] - 2026-11-13
+
+A feature release: a per-page audit log that records every file export,
+and moving a selection to a new subpage with its comments. One database
+migration runs on upgrade, and exports now fail closed when they can't be
+recorded; read Upgrading first.
+
+### Upgrading
+- Upgrade from 0.9.12. One database migration runs on upgrade:
+  `20261113120000_audit_doc_index` builds one index on `audit_events`,
+  for the page audit log. While it builds it holds a `SHARE` lock on the
+  table, so every write that adds an audit row waits: creating, renaming,
+  moving, archiving, restoring, duplicating and purging pages (the archive
+  retention job's purge too), marking and unmarking templates, restricting
+  pages and changing their access, member invites, role changes and
+  removals, password changes, and creating and revoking API keys, whether
+  made in the app or with an API key, and quota refusals when quotas are
+  on. Edits, sign-ins and page loads go on.
+  Exports wait too, and one that waits more than 5 s is refused with
+  `503 audit.unavailable` (see below). The migration takes its lock
+  through `knot_lock_tables`, in bounded attempts, and gives up after 45 s
+  instead of queueing those writes behind a long transaction; if it gives
+  up, re-run the upgrade once that transaction has finished. Pass
+  `helm upgrade --timeout` of at least 3 minutes plus your rollout time.
+  The table is small unless your instance wrote many audit rows; the chart
+  README says how to build the index ahead of time on a large
+  `audit_events`. 0.9.12 pods that restart after it commits crash-loop
+  until new pods replace them, and rolling back to 0.9.12 needs a database
+  restore.
+- `audit_events` now grows by one row per exported page: a Word or
+  OpenDocument export writes one, a Markdown zip one per page in it, so a
+  workspace export writes one per page. There is still no retention.
+- Exports now depend on the audit log: a file export is sent only once its
+  audit rows are written, and is refused with `503 audit.unavailable` when
+  they can't be (fail closed). An `audit_events` outage, or a database that
+  refuses inserts into it, blocks every Word, OpenDocument and Markdown zip
+  export until it is fixed, those made with API keys included. An insert
+  that hangs (a lock on `audit_events`, a lost synchronous standby) is
+  given up on after 5 s and refused the same way. Alert on
+  `knot_audit_write_failures_total`.
+
+### Added
+- Each page has an audit log for its editors and owners, under "Audit
+  log" in the page header and the sidebar's menu: who exported the page
+  (Word, OpenDocument, Markdown zip, also as part of a subpage or
+  workspace export), when and how, and who changed its access or the
+  page, with export stats on top. Bots are marked "(bot)", and an export
+  made with an API key says so. Viewers can't open it; the export menu
+  tells everyone that exports are recorded. Exports made before this
+  release were not recorded, and reading the page, the Markdown view,
+  attachment downloads and public link views are not recorded.
+- `GET /api/docs/{id}/audit?category=&cursor=&limit=` lists a page's
+  audit events, newest first, and on the first page its export stats.
+  Editor+ on the page, also when it is archived. API keys need the `read`
+  scope, and the key's user (a bot's included) needs Editor+ on the page.
+  A bot is shown with `"bot": true`.
+- File exports are recorded in `audit_events` as `doc.export`, one row
+  per page the file contains, with the person who exported it, before the
+  file is sent. An export made with an API key names the key's user, and
+  its rows also keep the key's id (`data.api_key_id`) for operators; the
+  audit log shows only `details.via_api_key: true`, never the key. An
+  export that can't be recorded is refused with `503 audit.unavailable`
+  and no file, and the app says "Export blocked: it couldn't be recorded
+  in the audit log. Try again later." Failed, refused and `HEAD` requests
+  are not recorded.
+- Metric `knot_audit_write_failures_total{action}`: failed audit writes,
+  one per failed insert however many rows it held (an export insert given
+  up on after 5 s included). For `doc.export` each is one refused export,
+  however many pages it covered; for member invites, role changes that
+  don't demote an owner, API key creation and revocation and quota
+  refusals the request went on without its row. Member removals, owner
+  demotions and password changes also get an `api-key.revoke-cascade` row
+  from a database trigger in their own transaction, so while
+  `audit_events` refuses inserts they fail, uncounted. Normal use keeps it
+  at 0; the chart README says why it is worth an alert.
+- "Move to subpage" in the selection toolbar, for editors in edit mode
+  (#92): the top-level blocks a selection touches move to a new child
+  page, under the title you confirm, and a link to it takes their place.
+  Comment threads (with their replies, reactions and resolved state) and
+  suggestions that sit entirely inside the moved blocks move with them,
+  and their notifications now point to the new page; ones that cross the
+  edge of the selection stay on the page. It counts against the page
+  quota like any new page, and Ctrl+Z can't undo it. The new page's audit
+  log records it as `doc.move_to_subpage`. API:
+  `POST /api/docs/{id}/move-to-subpage`.
+
+### Changed
+- `doc.grant` audit rows now carry the principal, role and inherit flag,
+  and `doc.grant.delete` rows the principal. Older rows have neither and
+  show as "changed access" or "removed access" in the page audit log.
+
+### Fixed
+- Numbered lists no longer cut off the first digit of their markers from
+  item 10 on ("10." showed as ".0.", #95). The gutter now grows with each
+  list's widest number, counting its start number, so "104." in a list
+  that starts at 95 fits too. In the terminal skin even "1." to "9." were
+  clipped; they fit now as well.
 
 ## [0.9.12] - 2026-11-13
 
@@ -1565,7 +1951,9 @@ First tagged release. Feature-complete for single-workspace teams.
 - Helm chart with migrate hook, NetworkPolicy, ServiceMonitor, PrometheusRule,
   and multi-arch (amd64 + arm64) scratch image.
 
-[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.12...HEAD
+[Unreleased]: https://github.com/opendefensecloud/knot/compare/v0.9.14...HEAD
+[0.9.14]: https://github.com/opendefensecloud/knot/compare/v0.9.13...v0.9.14
+[0.9.13]: https://github.com/opendefensecloud/knot/compare/v0.9.12...v0.9.13
 [0.9.12]: https://github.com/opendefensecloud/knot/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/opendefensecloud/knot/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/opendefensecloud/knot/compare/v0.9.9...v0.9.10

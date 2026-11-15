@@ -1,0 +1,1978 @@
+//! A past version of a page, as the history viewer shows it (M1.4): the
+//! entry's replay rendered as ProseMirror JSON, plain ([`pm_json`]) or with
+//! the entry's own changes marked ([`pm_json_diff`]), and the input caps
+//! that keep a view within the builder's memory rule.
+//!
+//! [`render`], [`render_staged`], [`shows_changes`], [`merge_gap_at_end`]
+//! and [`view_max_input_bytes`] are pure (no database, no tokio): a render
+//! runs on the replay thread (`isolate::run_isolated`) under a compute
+//! permit. [`Views`] is the service around them: it loads an entry's input
+//! in a read transaction, bounds who renders what and when, renders, and
+//! caches the serialized result.
+
+use std::collections::{HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
+
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+use sqlx::PgPool;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
+use uuid::Uuid;
+use yrs::IdSet;
+
+use crate::diff::{DiffError, entry_diff};
+use crate::isolate::{IsolateError, run_isolated};
+use crate::pass::{Progress, WindowError, WindowInput, replay_window};
+use crate::permits::{ComputeGuard, HistoryPermits, StallWatch};
+use crate::pm_json::{RENDERER_VERSION, pm_json, pm_json_diff};
+use crate::replay::{ReplayMode, Replayer};
+use crate::revert::{self, Checkpoint, RevertError, RevertHooks, RevertOutcome, RevertTarget};
+use crate::sessions::EntryKind;
+use crate::store::{self, StoreError, ViewEntry, ViewLoaded};
+
+/// M1.3's doc-memory factor F, which `DEFAULT_HISTORY_REPLAY_MAX_BYTES`
+/// was set by: a build's peak heap plus its input, over its input, at
+/// most 40, so `workers × 40 × cap` bounds the builder's replay memory.
+pub const BUILD_MEMORY_FACTOR: u64 = 40;
+
+/// The Show changes view's memory factor: (input + peak heap above the
+/// start) / input of a `changes=1` render, which holds the skip-GC replay,
+/// the union doc, `D_lo`, the JSON `Value` and its serialization at once.
+/// Set by M1.4 Task 3's spike (`cargo run --release -p knot-history
+/// --example replay_throughput 7`).
+///
+/// On workload 6's 4 MiB pages, a session of a few rows measured 59.7
+/// (interleaved one-character typing) and 5.1 (pastes). But the render
+/// emits one text node per changed *item*: yrs 0.27.3's `DiffAssembler`
+/// starts a chunk at every added or removed item (`types/text.rs:617-631`),
+/// and each node costs about 3.5 KiB of heap. So a session whose one row
+/// deletes the whole typing page (400,020 struck text nodes) peaked
+/// 1,321 MiB above its start, F = 317.1 (321.1 at 1.36 MiB); one that
+/// undoes one client's typing (every third character) measured 173.6; and
+/// `tests/diff_memory.rs`'s page, whose client ids 1-3 encode denser than
+/// real 32-bit ids, with a third of it highlighted, 327.5. Pastes stay
+/// near 5 in every shape.
+///
+/// F grows on smaller pages, because fixed costs weigh more. So the factor
+/// is set where the rule binds, on a typing page of the diff cap's own
+/// size. With 360 the diff cap of the default 4 MiB replay cap is
+/// 4 MiB × 40 / 360 = 0.44 MiB. There, the whole-page deletion measured
+/// F = 338.5 and held 151.8 MiB (input + peak), within the builder's
+/// 40 × 4 MiB = 160 MiB. 330 would give a 0.48 MiB cap, where it measured
+/// 343.4 and 168.6 MiB.
+///
+/// The render time grows with texts × deleted blocks. The whole-page
+/// deletion took 26.2 s at 4.18 MiB and 2.8 s at 1.36 MiB, but only 0.38 s
+/// at the diff cap, well under the 10 s the spike allows.
+pub const VIEW_MEMORY_FACTOR: u64 = 360;
+
+/// The plain view's and the restore's memory factor (M1.4 Task 3's spike,
+/// as [`VIEW_MEMORY_FACTOR`]; raised by M2, below).
+///
+/// On workload 6's 4 MiB pages (interleaved typing / pastes): a plain view
+/// of a session's window measured 39.1 / 4.6; a baseline view of the state
+/// 39.1 / 4.6; and a restore (the replay, `encode_state`, and the Markdown
+/// round trip of `apply_update`, `to_markdown::serialise` and
+/// `from_markdown::parse`) 39.1 / 6.7. A 4 MiB page whose every other word
+/// is bold, one text node per word, measured 16.4. The decoded checkpoint
+/// dominates, as in M1.3's F. Each took at most 0.14 s, well within
+/// `RESTORE_TIMEOUT` − 5 s.
+///
+/// M2 (Task 2's case (f), `replay_throughput 8`) raised it from 40 to 41:
+/// a restore's replay with M2's finishes (the replay, `encode_state`, the
+/// replay dropped, then `revert::target` for Restore here or
+/// `revert::copy_state` for Restore as new page) decodes the state once
+/// more while it holds that state and its copy, and peaked 3.82 MiB above
+/// the Markdown round trip. On workload 6's 4 MiB typing page, a
+/// session's window and the state as a baseline each measured 40.00 with
+/// either finish (163.02 MiB above a 4.18 MiB input; the largest 40.0041),
+/// against 6.15 / 5.15 (`target` / `copy_state`) on the pastes page. So
+/// the plain cap is `replay_max_bytes × 40 / 41`, 3.90 MiB at the default
+/// 4 MiB.
+pub const PLAIN_MEMORY_FACTOR: u64 = 41;
+
+/// The memory factor of a view or restore of a baseline that may be
+/// shifted (M1.4 Task 8's measurement, workload 7's (h) and (i)): its
+/// bytes are cut to their trusted prefix first ([`state_input`]), which
+/// builds a skip-GC scratch doc and a fresh GC doc of its own before the
+/// render builds one. On workload 6's 4 MiB typing page with the knot-crdt
+/// fix's overlapping Skips merged into it as yrs encodes them (4.18 MiB),
+/// the view and the restore (the replay, `encode_state` and the Markdown
+/// round trip) each measured 43.40, against 39.1 for the same page's
+/// unshifted state; rounded up, 44. With M2's finishes (`revert::target`,
+/// `revert::copy_state`, Task 2's case (f)) it measured 43.40 again. Only
+/// `baseline` entries pay it (the rollout entry and every window keep the
+/// plain cap): [`baseline_max_input_bytes`].
+pub const SHIFTED_MEMORY_FACTOR: u64 = 44;
+
+/// The largest baseline state a view or restore of a `baseline` entry may
+/// load, given the plain cap: `max_plain_input_bytes ×
+/// max(PLAIN_MEMORY_FACTOR, BUILD_MEMORY_FACTOR) /
+/// max(SHIFTED_MEMORY_FACTOR, BUILD_MEMORY_FACTOR)`, so cutting a shifted
+/// baseline to its prefix stays within the builder's memory rule.
+/// 3,813,002 bytes (3.64 MiB) at the default 4 MiB replay cap.
+pub fn baseline_max_input_bytes(max_plain_input_bytes: i64) -> i64 {
+    let cap = i128::from(max_plain_input_bytes)
+        * i128::from(PLAIN_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR))
+        / i128::from(SHIFTED_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR));
+    i64::try_from(cap).unwrap_or(i64::MAX)
+}
+
+/// The largest replay input a view may load (the diff cap with `changes`,
+/// the plain cap without): `replay_max_bytes × BUILD_MEMORY_FACTOR /
+/// max(F, BUILD_MEMORY_FACTOR)` with F = [`VIEW_MEMORY_FACTOR`] or
+/// [`PLAIN_MEMORY_FACTOR`], so a view holding a compute permit takes no
+/// more than the builder's `40 × replay_max_bytes`. Never above
+/// `replay_max_bytes`; saturates at `i64::MAX` (the database's sum type).
+pub fn view_max_input_bytes(replay_max_bytes: u64, changes: bool) -> i64 {
+    let f = if changes {
+        VIEW_MEMORY_FACTOR
+    } else {
+        PLAIN_MEMORY_FACTOR
+    };
+    let cap = u128::from(replay_max_bytes) * u128::from(BUILD_MEMORY_FACTOR)
+        / u128::from(f.max(BUILD_MEMORY_FACTOR));
+    i64::try_from(cap).unwrap_or(i64::MAX)
+}
+
+/// A Restore here's plan's memory factor: (input + peak heap above the
+/// start) / input of `revert::plan`, input being the version's skip-GC
+/// state plus the live page's export (`target.state.len() + live.len()`).
+/// A plan holds the live page as a GC doc throughout, the version with the
+/// live page applied in one skip-GC doc during the undo, and a GC replay
+/// of the live page plus the update with its JSON during each
+/// verification. Set by M2 Task 2's spike (`cargo run --release -p
+/// knot-history --example replay_throughput 8`).
+///
+/// On workload 6's 4 MiB pages (interleaved one-character typing /
+/// pastes), with the live page 4.18 / 4.03 MiB: (a) reverting to the
+/// version a quarter of the way in (1.01 / 1.76 MiB; the large undo)
+/// measured 50.53 / 4.96, in 0.33 / 0.04 s; (b) reverting to the version
+/// before the last session (the small undo) 38.13 / 3.82; (c) (a) by the
+/// whole-page replace alone 50.95 / 4.52; (d) the unchanged check 20.04 /
+/// 2.80; and (c′) (a) with an undo that fails its verification and then
+/// the whole-page replace 50.95 / 4.96, in 0.50 / 0.06 s. (c′)'s peak
+/// (259.21 MiB on the typing page) is the larger of (a)'s and (c)'s, not
+/// their sum: the undo's docs are dropped before the replace starts.
+/// Rounded up, 51, so the memory cap is `replay_max_bytes × 40 / 51`,
+/// 3.14 MiB at the default 4 MiB. At 1×, 2× and 4× that cap the typing
+/// page measured 49.52, 48.82 and 48.48 ((c′)): F did not grow on the
+/// smaller pages near the cap.
+pub const REVERT_MEMORY_FACTOR: u64 = 51;
+
+/// The largest revert input a plan may take whatever `replay_max_bytes`
+/// is: a time bound, so it does not scale with the replay cap. Every
+/// plan measured at it (M2 Task 2's case (e)) took under half of
+/// [`REVERT_TIMEOUT`] on both the undo path and the slowest path a plan
+/// can take (an undo that fails verification, then the whole-page
+/// replace), so a revert too slow to finish is refused as too large
+/// before it runs, not after a timeout.
+///
+/// On workload 6's pages scaled to 1×, 2× and 4× the default memory cap
+/// (3.14 MiB), (a) the large undo / (c′) the failed undo and the replace
+/// took: typing, 3.24 MiB of input 0.18 / 0.31 s, 6.58 MiB 0.38 / 0.65 s,
+/// 13.26 MiB 0.79 / 1.31 s; pastes, 3.44 MiB 0.02 / 0.04 s, 6.37 MiB
+/// 0.04 / 0.07 s, 12.43 MiB 0.08 / 0.14 s. Every size planned within 5 s,
+/// so the cap is the largest size measured on both pages (12.43 MiB),
+/// rounded down to a MiB: 12 MiB. It binds only above a replay cap of
+/// about 15.3 MiB.
+pub const REVERT_TIME_CAP_BYTES: u64 = 12 * 1024 * 1024;
+
+/// How long one plan of a revert may run (`Views::plan_revert`, per
+/// attempt, never past the restore's deadline).
+pub const REVERT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest revert input (`target.state.len() + live.len()`, and the
+/// version's state alone right after its replay) a Restore here may plan:
+/// `min(replay_max_bytes × BUILD_MEMORY_FACTOR / max(REVERT_MEMORY_FACTOR,
+/// BUILD_MEMORY_FACTOR), REVERT_TIME_CAP_BYTES)`, so a plan holding a
+/// compute permit takes no more than the builder's `40 × replay_max_bytes`
+/// and plans within half of [`REVERT_TIMEOUT`]. The time cap does not
+/// scale with `replay_max_bytes`. Saturates at `i64::MAX`.
+pub fn revert_max_input_bytes(replay_max_bytes: u64) -> i64 {
+    let by_memory = u128::from(replay_max_bytes) * u128::from(BUILD_MEMORY_FACTOR)
+        / u128::from(REVERT_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR));
+    let cap = by_memory.min(u128::from(REVERT_TIME_CAP_BYTES));
+    i64::try_from(cap).unwrap_or(i64::MAX)
+}
+
+/// The least time a plan of a revert must have left before the restore's
+/// deadline to be started at all ([`ViewLimits::min_plan_time`]'s
+/// default): a plan started with less would answer busy almost at once
+/// and then hold a compute permit for its whole run with nobody reading
+/// its answer; 2 s leaves a small page's plan time to finish.
+pub const REVERT_MIN_PLAN_TIME: Duration = Duration::from_secs(2);
+
+/// What a view replays.
+// Built once per render and moved into the replay thread; a box would only
+// add an allocation.
+#[allow(clippy::large_enum_variant)]
+pub enum ViewInput {
+    /// A baseline's state, rendered from [`state_input`] (its trusted
+    /// prefix when it may be shifted).
+    State(Vec<u8>),
+    /// An entry's window: the checkpoint at or before its start, the rows
+    /// through its end.
+    Window(WindowInput),
+}
+
+/// Why a version could not be rendered at all.
+#[derive(Debug, thiserror::Error)]
+pub enum RenderError {
+    /// The baseline state does not decode or apply.
+    #[error("the state does not apply: {0}")]
+    State(String),
+    /// The window replay failed or was cancelled.
+    #[error("the replay failed: {0}")]
+    Window(#[from] WindowError),
+    /// The diff step was cancelled ([`DiffError::Cancelled`], the only
+    /// variant it carries: every other diff failure falls back to the plain
+    /// render, [`Rendered::diff_error`]).
+    #[error("the render failed: {0}")]
+    Diff(#[from] DiffError),
+}
+
+/// A rendered version.
+#[derive(Debug)]
+pub struct Rendered {
+    /// ProseMirror JSON, `{"type": "doc", "content": [...]}`.
+    pub doc: Value,
+    /// Whether the entry's own changes are marked in `doc`.
+    pub changes: bool,
+    /// Why the diff step failed or panicked, when changes were asked for
+    /// and `doc` is the plain render instead.
+    pub diff_error: Option<String>,
+}
+
+/// Test hooks; production code leaves them at their default.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RenderHooks {
+    /// Panics inside the diff step.
+    pub panic_in_diff: bool,
+    /// Sleeps inside the diff step, before the union doc is built; like
+    /// the union build it stands for, the sleep does not see a cancel.
+    pub hold_in_diff: Duration,
+}
+
+/// Renders `input` ([`render_staged`] with a stage nobody reads).
+pub fn render(
+    input: ViewInput,
+    changes: Option<(IdSet, IdSet)>,
+    hooks: RenderHooks,
+) -> Result<Rendered, RenderError> {
+    render_staged(input, changes, hooks, &StageCell::default())
+}
+
+/// What a render thread is doing, read by the async side when the render
+/// times out (Rulings on skipping the diff): a hang in the diff step only
+/// keeps the Show changes render from being tried again; a hang anywhere
+/// else blocks the version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RenderStage {
+    /// The replay: `replay_window`, or `Replayer::from_state`.
+    Replay = 0,
+    /// A `pm_json` walk (the fallback after a failed diff included) and
+    /// its serialization.
+    Plain = 1,
+    /// `entry_diff`, `D_lo`, `pm_json_diff` and the serialization of their
+    /// output.
+    Diff = 2,
+}
+
+/// A render's [`RenderStage`], shared between its thread and the async
+/// side; [`RenderStage::Replay`] until set.
+#[derive(Clone, Default, Debug)]
+pub struct StageCell(Arc<AtomicU8>);
+
+impl StageCell {
+    pub fn set(&self, s: RenderStage) {
+        self.0.store(s as u8, Ordering::SeqCst);
+    }
+
+    pub fn get(&self) -> RenderStage {
+        match self.0.load(Ordering::SeqCst) {
+            1 => RenderStage::Plain,
+            2 => RenderStage::Diff,
+            _ => RenderStage::Replay,
+        }
+    }
+}
+
+/// Renders `input`, publishing its stage through `stage`. A
+/// [`ViewInput::State`] renders plain from [`state_input`] (`changes` is
+/// ignored). A
+/// [`ViewInput::Window`] is replayed with its own `progress`; with
+/// `changes` (the entry's insert and delete sets) the diff step
+/// ([`entry_diff`], then [`pm_json_diff`]) runs under `catch_unwind`, and
+/// when it fails, other than by a cancel, or panics, the version is the
+/// plain render of the same replay with the reason in
+/// [`Rendered::diff_error`]: the diff step only reads the replay, so the
+/// replay is intact after the unwind.
+pub fn render_staged(
+    input: ViewInput,
+    changes: Option<(IdSet, IdSet)>,
+    hooks: RenderHooks,
+    stage: &StageCell,
+) -> Result<Rendered, RenderError> {
+    stage.set(RenderStage::Replay);
+    let window = match input {
+        ViewInput::State(bytes) => {
+            let bytes = owned_state_input(bytes)?;
+            let r = Replayer::from_state(ReplayMode::KeepDeleted, &bytes)
+                .map_err(|e| RenderError::State(e.to_string()))?;
+            stage.set(RenderStage::Plain);
+            return Ok(plain(r.doc(), None));
+        }
+        ViewInput::Window(w) => w,
+    };
+    let progress = window.progress.clone();
+    let replay = replay_window(window)?;
+    let h = replay.doc();
+    let Some((inserted, deleted)) = changes else {
+        stage.set(RenderStage::Plain);
+        return Ok(plain(h, None));
+    };
+    stage.set(RenderStage::Diff);
+    let diffed = catch_unwind(AssertUnwindSafe(|| {
+        if hooks.panic_in_diff {
+            panic!("test hook: panic in the diff");
+        }
+        if !hooks.hold_in_diff.is_zero() {
+            std::thread::sleep(hooks.hold_in_diff);
+        }
+        let d = entry_diff(h, &inserted, &deleted)?;
+        pm_json_diff(h, &d, &progress)
+    }));
+    match diffed {
+        Ok(Ok(doc)) => Ok(Rendered {
+            doc,
+            changes: true,
+            diff_error: None,
+        }),
+        Ok(Err(DiffError::Cancelled)) => Err(RenderError::Diff(DiffError::Cancelled)),
+        Ok(Err(e)) => {
+            stage.set(RenderStage::Plain);
+            Ok(plain(h, Some(e.to_string())))
+        }
+        Err(panic) => {
+            stage.set(RenderStage::Plain);
+            Ok(plain(
+                h,
+                Some(format!("the diff panicked: {}", panic_message(&*panic))),
+            ))
+        }
+    }
+}
+
+/// The state a baseline is viewed and restored from: when the bytes
+/// [`may_be_shifted`](crate::replay::may_be_shifted) (a baseline a room
+/// wrote before the knot-crdt fix), their
+/// [`trusted_prefix`](crate::replay::trusted_prefix), else the bytes as
+/// they are. Runs on the replay thread, in stage [`RenderStage::Replay`];
+/// it returns bytes only, so every doc the two checks build is dropped
+/// before the render builds its own.
+pub fn state_input(bytes: &[u8]) -> Result<Vec<u8>, RenderError> {
+    Ok(shifted_prefix(bytes)?.unwrap_or_else(|| bytes.to_vec()))
+}
+
+/// [`state_input`] for a caller that owns the bytes: they come back as
+/// they are, not copied, when they cannot be shifted (a copy of a 4 MiB
+/// state would add 1 to the plain view's memory factor), and are dropped
+/// once the prefix replaces them.
+fn owned_state_input(bytes: Vec<u8>) -> Result<Vec<u8>, RenderError> {
+    Ok(shifted_prefix(&bytes)?.unwrap_or(bytes))
+}
+
+/// The trusted prefix of `bytes` when they may be shifted; `None` when
+/// they cannot be.
+fn shifted_prefix(bytes: &[u8]) -> Result<Option<Vec<u8>>, RenderError> {
+    if !crate::replay::may_be_shifted(bytes) {
+        return Ok(None);
+    }
+    crate::replay::trusted_prefix(bytes)
+        .map(Some)
+        .ok_or_else(|| RenderError::State("the baseline's trusted prefix does not decode".into()))
+}
+
+fn plain(h: &yrs::Doc, diff_error: Option<String>) -> Rendered {
+    Rendered {
+        doc: pm_json(h),
+        changes: false,
+        diff_error,
+    }
+}
+
+/// A panic payload's message, as `std`'s default hook prints it.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a non-string payload")
+}
+
+// ---------------------------------------------------------------------------
+// The views service
+// ---------------------------------------------------------------------------
+
+/// How long a view or restore waits for its principal's render slot and a
+/// compute permit, together.
+pub const VIEW_PERMIT_WAIT: Duration = Duration::from_secs(5);
+/// How long a view's render may run (under the router's 30 s with
+/// [`VIEW_PERMIT_WAIT`] and the loads).
+pub const VIEW_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a restore's replay and Markdown round trip may run (with the
+/// permit wait and the room's `RESTORE_ROOM_WAIT`, under the router's
+/// 30 s).
+pub const RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
+/// The view cache's size, in serialized bytes.
+pub const VIEW_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+/// How long a cached view, and the record of a timed-out render, lasts.
+pub const VIEW_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Cache-miss renders (views and restores together) one principal may have
+/// inside their deadline (Rulings on rate limits).
+pub const PRINCIPAL_RENDERS: usize = 1;
+
+/// Keys `Views::timed_out` holds at most (a key whose thread still runs is
+/// kept in `stalled_keys` as well, so the cap never drops it).
+const TIMED_OUT_KEYS: u64 = 1_024;
+/// The principals map is pruned of dead slots past this many entries.
+const PRINCIPALS_PRUNE_AT: usize = 1_024;
+/// How many versions found over the diff cap are remembered.
+const OVER_DIFF_CAP_KEYS: u64 = 4_096;
+/// How many versions found over the revert cap are remembered.
+const OVER_REVERT_CAP_KEYS: u64 = 4_096;
+/// Restores (in place or as a new page) one principal may run at a time
+/// on this process (the restore-permit Ruling).
+pub const RESTORES_PER_PRINCIPAL: usize = 1;
+
+const EARLIER_TIMEOUT: &str = "an earlier render of this version timed out";
+const SKIPPED_BASELINE: &str = "the history builder skipped this baseline";
+
+/// A Show changes view (`changes=1`) is offered for every kind but these.
+pub fn shows_changes(kind: EntryKind) -> bool {
+    !matches!(kind, EntryKind::Baseline | EntryKind::Erase)
+}
+
+/// Whether an entry's window replay merges the gap state at its `end_rev`
+/// ("After M1.3"): for the gap entry itself, and for a session the gap was
+/// credited to.
+pub fn merge_gap_at_end(kind: EntryKind, meta: &Value, end_rev: i64) -> bool {
+    kind == EntryKind::Gap || meta.get("gap_credit_rev").and_then(Value::as_i64) == Some(end_rev)
+}
+
+/// What bounds the views of one process.
+#[derive(Clone)]
+pub struct ViewLimits {
+    /// A `changes=1` view tries the diff only up to this input.
+    pub max_changes_input_bytes: i64,
+    /// Every view and restore answers `TooLarge` above this input (a
+    /// `baseline` entry above [`baseline_max_input_bytes`] of it).
+    pub max_plain_input_bytes: i64,
+    /// A Restore here answers `OverCap` above this revert input
+    /// ([`revert_max_input_bytes`]).
+    pub max_revert_input_bytes: i64,
+    pub permit_wait: Duration,
+    pub timeout: Duration,
+    pub restore_timeout: Duration,
+    /// How long one plan of a revert may run ([`REVERT_TIMEOUT`]).
+    pub revert_timeout: Duration,
+    /// A plan with less than this left before the restore's deadline is
+    /// not started ([`REVERT_MIN_PLAN_TIME`]; tests lower it).
+    pub min_plan_time: Duration,
+    pub cache_bytes: u64,
+    pub cache_ttl: Duration,
+    #[doc(hidden)]
+    pub hooks: ViewHooks,
+}
+
+impl ViewLimits {
+    pub fn from_config(cfg: &knot_config::Config) -> ViewLimits {
+        ViewLimits {
+            max_changes_input_bytes: view_max_input_bytes(cfg.history_replay_max_bytes, true),
+            max_plain_input_bytes: view_max_input_bytes(cfg.history_replay_max_bytes, false),
+            max_revert_input_bytes: revert_max_input_bytes(cfg.history_replay_max_bytes),
+            permit_wait: VIEW_PERMIT_WAIT,
+            timeout: VIEW_TIMEOUT,
+            restore_timeout: RESTORE_TIMEOUT,
+            revert_timeout: REVERT_TIMEOUT,
+            min_plan_time: REVERT_MIN_PLAN_TIME,
+            cache_bytes: VIEW_CACHE_BYTES,
+            cache_ttl: VIEW_CACHE_TTL,
+            hooks: ViewHooks::default(),
+        }
+    }
+}
+
+impl Default for ViewLimits {
+    fn default() -> ViewLimits {
+        ViewLimits::from_config(&knot_config::Config::default())
+    }
+}
+
+/// Test hooks; production code leaves them at their default.
+#[doc(hidden)]
+#[derive(Default, Clone)]
+pub struct ViewHooks {
+    /// Sleeps on the render thread before the replay (stage `Replay`).
+    pub hold_render: Duration,
+    /// Panics on the render thread before the replay.
+    pub panic_render: bool,
+    /// [`RenderHooks::panic_in_diff`].
+    pub panic_in_diff: bool,
+    /// [`RenderHooks::hold_in_diff`].
+    pub hold_in_diff: Duration,
+    /// Counts render threads started (views, restores and plans).
+    pub renders: Option<Arc<AtomicUsize>>,
+    /// Faults injected into each plan of a revert.
+    pub revert: RevertHooks,
+    /// Records every [`Checkpoint`] a plan of a revert asks at.
+    pub revert_checkpoints: Option<Arc<Mutex<Vec<Checkpoint>>>>,
+}
+
+/// A rendered version: ProseMirror JSON, serialized.
+#[derive(Debug)]
+pub struct RenderedView {
+    pub entry_id: i64,
+    pub kind: EntryKind,
+    /// Whether the entry's own changes are marked in `doc`.
+    pub changes: bool,
+    pub doc: Bytes,
+}
+
+/// Why a view or restore was not served.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ViewError {
+    /// No such entry on this page, or what it replays is gone (a rebuild).
+    #[error("no such history entry")]
+    NotFound,
+    /// The page's history was built by an older builder version, until
+    /// its rebuild.
+    #[error("the page's history is being rebuilt")]
+    Rebuilding,
+    /// The replay input is over the plain cap.
+    #[error("the version is too large to render")]
+    TooLarge,
+    /// No render slot of the principal, or no compute permit, within the
+    /// permit wait.
+    #[error("no replay slot within the wait")]
+    Busy,
+    /// The replay or render failed, panicked, or is known to hang.
+    #[error("the version could not be rendered: {0}")]
+    Failed(String),
+    /// The render did not finish within its timeout.
+    #[error("the render timed out")]
+    TimedOut,
+    /// A restore's entry no longer ends when the reader saw it end.
+    #[error("the entry changed since it was read")]
+    Moved,
+    #[error("store: {0}")]
+    Store(String),
+}
+
+impl ViewError {
+    /// Its `knot_history_views_total` outcome.
+    fn outcome(&self) -> &'static str {
+        match self {
+            ViewError::NotFound => "not_found",
+            ViewError::Rebuilding => "rebuilding",
+            ViewError::TooLarge => "too_large",
+            ViewError::Busy => "busy",
+            ViewError::Failed(_) | ViewError::Store(_) => "failed",
+            ViewError::TimedOut => "timeout",
+            // Restores only, which are not counted.
+            ViewError::Moved => "moved",
+        }
+    }
+}
+
+fn store_error(e: StoreError) -> ViewError {
+    ViewError::Store(e.to_string())
+}
+
+/// Why a Restore here's target or plan was not served.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum PlanError {
+    /// As a view or restore is refused.
+    #[error(transparent)]
+    View(#[from] ViewError),
+    /// Neither the undo nor the whole-page replace verified, or a page
+    /// nests past the limit ([`RevertError::Unverified`]).
+    #[error("no revert verified: {0}")]
+    Unverified(String),
+    /// A plan of this version ran its full [`REVERT_TIMEOUT`], now or
+    /// within [`VIEW_CACHE_TTL`].
+    #[error("a revert of this version timed out")]
+    TooSlow,
+    /// The version alone, or with the live page, is over
+    /// [`ViewLimits::max_revert_input_bytes`], now or within
+    /// [`VIEW_CACHE_TTL`].
+    #[error("this version is over the revert cap")]
+    OverCap,
+}
+
+/// Which version a Restore here plans to: the entry's record key for its
+/// plans, as its target was replayed. Opaque.
+#[derive(Clone, Debug)]
+pub struct RestoreTicket(ViewKey);
+
+/// One of a principal's restores on this process
+/// ([`Views::restore_permit`]); released when dropped.
+#[derive(Debug)]
+pub struct RestorePermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+/// A restore's input: what `finish` made of the entry's state, and the
+/// entry as read in the transaction that loaded it.
+pub struct Restorable<T> {
+    pub value: T,
+    pub kind: EntryKind,
+    /// As stored: the genesis rev for the rollout entry, `None` for a
+    /// legacy baseline.
+    pub end_rev: Option<i64>,
+    pub ended_at: DateTime<Utc>,
+    /// The page's content epoch the version was replayed at (the epoch
+    /// Ruling: never written back at another).
+    pub content_epoch: i32,
+    /// What [`Views::plan_revert`] plans this version under.
+    pub ticket: RestoreTicket,
+}
+
+/// What the cache, and the record of timed-out renders, are keyed by.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ViewKey {
+    entry_id: i64,
+    updated_at: DateTime<Utc>,
+    content_epoch: i32,
+    renderer: u32,
+    variant: ViewVariant,
+}
+
+/// The cache holds `Plain` and `Changes` only; `Restore` (a restore's
+/// replay) and `Revert` (a Restore here's plan) are record keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ViewVariant {
+    Plain,
+    Changes,
+    Restore,
+    Revert,
+}
+
+impl ViewKey {
+    fn of(e: &ViewEntry, variant: ViewVariant) -> ViewKey {
+        ViewKey {
+            entry_id: e.id,
+            updated_at: e.updated_at,
+            content_epoch: e.content_epoch,
+            renderer: RENDERER_VERSION,
+            variant,
+        }
+    }
+
+    fn with(&self, variant: ViewVariant) -> ViewKey {
+        ViewKey {
+            variant,
+            ..self.clone()
+        }
+    }
+
+    /// The key a render of this key that hung in `stage` is recorded
+    /// under: a Show changes render that hung in its diff step blocks only
+    /// the diff, one that hung anywhere else the plain version; a restore
+    /// blocks only restores, and a plan only Restore here.
+    fn hung_in(&self, stage: RenderStage) -> ViewKey {
+        match (self.variant, stage) {
+            (ViewVariant::Restore | ViewVariant::Revert, _)
+            | (ViewVariant::Changes, RenderStage::Diff) => self.clone(),
+            _ => self.with(ViewVariant::Plain),
+        }
+    }
+}
+
+/// The record of renders that timed out, and the stalled gauge.
+#[derive(Clone)]
+struct Records {
+    permits: HistoryPermits,
+    /// Recorded keys, for `VIEW_CACHE_TTL` after their thread ended.
+    timed_out: moka::sync::Cache<ViewKey, ()>,
+    /// Recorded keys whose thread still runs.
+    stalled_keys: Arc<Mutex<HashSet<ViewKey>>>,
+}
+
+impl Records {
+    fn stalled_keys(&self) -> std::sync::MutexGuard<'_, HashSet<ViewKey>> {
+        self.stalled_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn recorded(&self, k: &ViewKey) -> bool {
+        self.timed_out.contains_key(k) || self.stalled_keys().contains(k)
+    }
+
+    /// A render of `k` timed out; its thread still runs.
+    fn record(&self, k: ViewKey) {
+        self.stalled_keys().insert(k.clone());
+        self.timed_out.insert(k, ());
+    }
+
+    /// The thread of a render recorded under `k` ended: the record lasts
+    /// `VIEW_CACHE_TTL` from now.
+    fn thread_ended(&self, k: &ViewKey) {
+        self.timed_out.insert(k.clone(), ());
+        self.stalled_keys().remove(k);
+    }
+
+    fn set_stalled_gauge(&self) {
+        metrics::gauge!("knot_history_replay_threads_stalled").set(self.permits.stalled() as f64);
+    }
+
+    /// A render of `key` hung past its timeout in `stage`: counted, logged
+    /// and recorded; returns the key recorded.
+    fn record_timeout(&self, key: &ViewKey, stage: RenderStage, dropped: bool) -> ViewKey {
+        let recorded = key.hung_in(stage);
+        self.record(recorded.clone());
+        metrics::counter!("knot_history_replay_timeouts_total", "phase" => "view").increment(1);
+        tracing::error!(
+            entry_id = key.entry_id,
+            variant = ?key.variant,
+            ?stage,
+            dropped,
+            "history view timed out"
+        );
+        recorded
+    }
+}
+
+/// A principal's render slot while a render holds it: emptied when the
+/// render's thread ends or at the render's deadline, whichever comes first.
+#[derive(Clone)]
+struct PrincipalSlot(Arc<Mutex<Option<OwnedSemaphorePermit>>>);
+
+impl PrincipalSlot {
+    fn new(permit: OwnedSemaphorePermit) -> PrincipalSlot {
+        PrincipalSlot(Arc::new(Mutex::new(Some(permit))))
+    }
+
+    fn empty(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    }
+}
+
+/// Empties the slot when the render thread's closure ends (or unwinds).
+struct SlotRelease(PrincipalSlot);
+
+impl Drop for SlotRelease {
+    fn drop(&mut self) {
+        self.0.empty();
+    }
+}
+
+/// A render that may start: its compute permit, its principal's slot, and
+/// when the permit was granted.
+struct Granted {
+    guard: ComputeGuard,
+    slot: PrincipalSlot,
+    started: Instant,
+}
+
+/// What `run` and [`Abandon`] do when a render outlives its timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnTimeout {
+    /// A hang: cancelled at once, counted, logged and recorded under its
+    /// key ([`ViewError::TimedOut`]).
+    Record,
+    /// A plan whose timeout the restore's deadline cut below its full one
+    /// (`full_after`, the revert timeout): not yet a hang, so not cancelled
+    /// ([`ViewError::Busy`]). Its watcher ([`watch_cut_short`]) records it
+    /// and cancels it only if its thread still runs `full_after` after it
+    /// started (the timeouts and cancellation Rulings).
+    CutShort { full_after: Duration },
+}
+
+/// Held by a render's async side while its thread runs. Dropped armed (the
+/// request was dropped), it marks the thread stalled and, while the thread
+/// runs, hands it to a stall watcher (Rulings on cancellation): a
+/// [`OnTimeout::Record`] render is cancelled at once, a
+/// [`OnTimeout::CutShort`] plan only by [`watch_cut_short`] at `full`.
+struct Abandon {
+    armed: bool,
+    progress: Progress,
+    watch: StallWatch,
+    records: Records,
+    key: ViewKey,
+    stage: StageCell,
+    slot: PrincipalSlot,
+    deadline: Instant,
+    on_timeout: OnTimeout,
+    /// When a cut-short plan has run its full timeout (`started +
+    /// full_after`); unused with [`OnTimeout::Record`].
+    full: Instant,
+}
+
+impl Drop for Abandon {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let cut_short = match self.on_timeout {
+            OnTimeout::Record => {
+                self.progress.cancel();
+                None
+            }
+            OnTimeout::CutShort { .. } => Some((self.progress.clone(), self.full)),
+        };
+        self.watch.timed_out();
+        self.records.set_stalled_gauge();
+        if !self.watch.running() {
+            return;
+        }
+        // No runtime (a test without one): nothing to watch with.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(watch_dropped(
+                self.watch.clone(),
+                self.records.clone(),
+                self.key.clone(),
+                self.stage.clone(),
+                self.slot.clone(),
+                self.deadline,
+                cut_short,
+            ));
+        }
+    }
+}
+
+/// The stall watcher of a render whose request was dropped. At the
+/// render's deadline, if its thread still runs, it frees the principal's
+/// slot and, for a render (`cut_short` is `None`), records the timeout as
+/// the request would have; a cut-short plan (`cut_short` holds its
+/// progress and `full`) is handed to [`watch_cut_short`] instead. When the
+/// thread ends, it sets the stalled gauge and starts the record's TTL.
+async fn watch_dropped(
+    watch: StallWatch,
+    records: Records,
+    key: ViewKey,
+    stage: StageCell,
+    slot: PrincipalSlot,
+    deadline: Instant,
+    cut_short: Option<(Progress, Instant)>,
+) {
+    let ended = watch.ended();
+    tokio::pin!(ended);
+    let mut recorded = None;
+    tokio::select! {
+        () = &mut ended => {}
+        () = tokio::time::sleep_until(deadline) => {
+            if let Some((progress, full)) = cut_short {
+                slot.empty();
+                if watch.running() {
+                    warn_cut_short(&key, true);
+                }
+                watch_cut_short(watch, records, key, stage, progress, full, true).await;
+                return;
+            }
+            if watch.running() {
+                recorded = Some(records.record_timeout(&key, stage.get(), true));
+            }
+            slot.empty();
+            ended.await;
+        }
+    }
+    if let Some(k) = recorded {
+        records.thread_ended(&k);
+    }
+    records.set_stalled_gauge();
+}
+
+/// The stall watcher of a render that timed out: when its thread ends, it
+/// sets the stalled gauge and starts the record's TTL.
+async fn watch_timed_out(watch: StallWatch, records: Records, recorded: ViewKey) {
+    watch.ended().await;
+    records.thread_ended(&recorded);
+    records.set_stalled_gauge();
+}
+
+/// The stall watcher of a plan the restore's deadline cut short: it waits
+/// for the thread's end or `full`, whichever comes first. Ended first:
+/// nothing is recorded or counted. Still running at `full`: the key is
+/// recorded then, counted and logged as a [`OnTimeout::Record`] timeout
+/// is, and the plan cancelled (it stops at its next checkpoint); the
+/// record lasts [`VIEW_CACHE_TTL`] from the thread's end. Either way it
+/// sets the stalled gauge once the thread ended.
+async fn watch_cut_short(
+    watch: StallWatch,
+    records: Records,
+    key: ViewKey,
+    stage: StageCell,
+    progress: Progress,
+    full: Instant,
+    dropped: bool,
+) {
+    let ended = watch.ended();
+    tokio::pin!(ended);
+    let mut recorded = None;
+    tokio::select! {
+        () = &mut ended => {}
+        () = tokio::time::sleep_until(full) => {
+            if watch.running() {
+                recorded = Some(records.record_timeout(&key, stage.get(), dropped));
+                progress.cancel();
+            }
+            ended.await;
+        }
+    }
+    if let Some(k) = recorded {
+        records.thread_ended(&k);
+    }
+    records.set_stalled_gauge();
+}
+
+fn warn_cut_short(key: &ViewKey, dropped: bool) {
+    tracing::warn!(
+        entry_id = key.entry_id,
+        dropped,
+        "revert plan cut short by the restore deadline"
+    );
+}
+
+/// `input` with a window's replay reporting to `progress`.
+fn with_progress(mut input: ViewInput, progress: &Progress) -> ViewInput {
+    if let ViewInput::Window(w) = &mut input {
+        w.progress = progress.clone();
+    }
+    input
+}
+
+/// The semaphore of `principal` in `map`, created with `permits` when
+/// nobody holds or waits for it; the map is pruned of dead semaphores
+/// past [`PRINCIPALS_PRUNE_AT`] entries.
+fn semaphore_of(
+    map: &Mutex<HashMap<Uuid, Weak<Semaphore>>>,
+    principal: Uuid,
+    permits: usize,
+) -> Arc<Semaphore> {
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match map.get(&principal).and_then(Weak::upgrade) {
+        Some(s) => s,
+        None => {
+            let s = Arc::new(Semaphore::new(permits));
+            map.insert(principal, Arc::downgrade(&s));
+            if map.len() > PRINCIPALS_PRUNE_AT {
+                map.retain(|_, w| w.strong_count() > 0);
+            }
+            s
+        }
+    }
+}
+
+/// The history views of one process: an entry's version rendered as
+/// ProseMirror JSON (plain or with its changes), cached, and the input of
+/// its restore.
+pub struct Views {
+    pool: PgPool,
+    permits: HistoryPermits,
+    limits: ViewLimits,
+    cache: moka::future::Cache<ViewKey, Arc<RenderedView>>,
+    records: Records,
+    /// `Changes` keys whose input was over the diff cap when sized, so a
+    /// repeat goes to the plain key without sizing it again.
+    over_diff_cap: moka::sync::Cache<ViewKey, ()>,
+    /// `Revert` keys whose version, alone or with the live page, was over
+    /// the revert cap, so a repeat is refused before its replay (the
+    /// records Ruling).
+    over_revert_cap: moka::sync::Cache<ViewKey, ()>,
+    /// Each principal's render slot, while someone holds or waits for it.
+    principals: Mutex<HashMap<Uuid, Weak<Semaphore>>>,
+    /// Each principal's restores ([`RESTORES_PER_PRINCIPAL`]), while
+    /// someone holds or waits for one.
+    restorers: Mutex<HashMap<Uuid, Weak<Semaphore>>>,
+}
+
+impl Views {
+    pub fn new(pool: PgPool, permits: HistoryPermits, limits: ViewLimits) -> Views {
+        let cache = moka::future::Cache::builder()
+            .max_capacity(limits.cache_bytes)
+            .weigher(|_: &ViewKey, v: &Arc<RenderedView>| {
+                u32::try_from(v.doc.len()).unwrap_or(u32::MAX)
+            })
+            .time_to_live(limits.cache_ttl)
+            .build();
+        let records = Records {
+            permits: permits.clone(),
+            timed_out: moka::sync::Cache::builder()
+                .max_capacity(TIMED_OUT_KEYS)
+                .time_to_live(limits.cache_ttl)
+                .build(),
+            stalled_keys: Arc::new(Mutex::new(HashSet::new())),
+        };
+        let over_diff_cap = moka::sync::Cache::builder()
+            .max_capacity(OVER_DIFF_CAP_KEYS)
+            .time_to_live(limits.cache_ttl)
+            .build();
+        let over_revert_cap = moka::sync::Cache::builder()
+            .max_capacity(OVER_REVERT_CAP_KEYS)
+            .time_to_live(limits.cache_ttl)
+            .build();
+        Views {
+            pool,
+            permits,
+            limits,
+            cache,
+            records,
+            over_diff_cap,
+            over_revert_cap,
+            principals: Mutex::new(HashMap::new()),
+            restorers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Entry `entry_id` of page `doc_id` as it was right after it, with its
+    /// own changes marked when `changes` is asked and possible. `principal`
+    /// is the caller (`AuthContext::user_id`), whose cache-miss renders run
+    /// one at a time.
+    pub async fn view(
+        &self,
+        principal: Uuid,
+        doc_id: Uuid,
+        entry_id: i64,
+        changes: bool,
+    ) -> Result<Arc<RenderedView>, ViewError> {
+        let (result, outcome) = match self
+            .view_counted(principal, doc_id, entry_id, changes)
+            .await
+        {
+            Ok((view, outcome)) => (Ok(view), outcome),
+            Err(e) => {
+                let outcome = e.outcome();
+                (Err(e), outcome)
+            }
+        };
+        metrics::counter!("knot_history_views_total", "outcome" => outcome).increment(1);
+        result
+    }
+
+    async fn view_counted(
+        &self,
+        principal: Uuid,
+        doc_id: Uuid,
+        entry_id: i64,
+        changes: bool,
+    ) -> Result<(Arc<RenderedView>, &'static str), ViewError> {
+        let entry = self.entry(doc_id, entry_id).await?;
+        let plain = ViewKey::of(&entry, ViewVariant::Plain);
+        if self.records.recorded(&plain) {
+            return Err(ViewError::Failed(EARLIER_TIMEOUT.to_string()));
+        }
+        let asked = changes && shows_changes(entry.kind);
+        let diff = plain.with(ViewVariant::Changes);
+        let mut effective = asked
+            && !entry.count_failed()
+            && !self.records.recorded(&diff)
+            && !self.over_diff_cap.contains_key(&diff);
+        if effective {
+            // Whatever the diff key holds was sized for this same key.
+            if let Some(hit) = self.cache.get(&diff).await {
+                return Ok((hit, "cached"));
+            }
+            let bytes = self.input_bytes(&entry).await?;
+            effective = bytes <= self.limits.max_changes_input_bytes;
+            if !effective {
+                self.over_diff_cap.insert(diff.clone(), ());
+            }
+        }
+        let lowered = asked && !effective;
+        let key = if effective {
+            diff.clone()
+        } else {
+            plain.clone()
+        };
+        if let Some(hit) = self.cache.get(&key).await {
+            return Ok((hit, if lowered { "no_changes" } else { "cached" }));
+        }
+        let deadline = Instant::now() + self.limits.permit_wait;
+        let slot = self.slot_within(principal, deadline).await?;
+        let diff_failed = AtomicBool::new(false);
+        let outgrown = AtomicBool::new(false);
+        let init = self.render_view(
+            entry,
+            key.clone(),
+            effective,
+            slot,
+            deadline,
+            (&diff_failed, &outgrown),
+        );
+        let got = self
+            .cache
+            .entry(key)
+            .or_try_insert_with(init)
+            .await
+            .map_err(|e| (*e).clone())?;
+        if got.is_fresh() && outgrown.load(Ordering::SeqCst) {
+            // The render is plain: it belongs under the plain key, and the
+            // diff key is over the cap from now on, as if sized so first.
+            // (Only while the key stands: a session the builder extended
+            // has a new `updated_at`, and so new keys.)
+            self.over_diff_cap.insert(diff.clone(), ());
+            self.cache.invalidate(&diff).await;
+            self.cache.insert(plain, got.value().clone()).await;
+        }
+        let outcome = if lowered {
+            "no_changes"
+        } else if !got.is_fresh() {
+            "cached"
+        } else if outgrown.load(Ordering::SeqCst) {
+            "no_changes"
+        } else if diff_failed.load(Ordering::SeqCst) {
+            "diff_failed"
+        } else {
+            "rendered"
+        };
+        Ok((got.into_value(), outcome))
+    }
+
+    /// The cache's init for `key`: the size check, a compute permit, the
+    /// load and the render. Records the render's time, or its timeout.
+    /// Sets `flags.0` when the diff failed and `flags.1` when the input
+    /// the load read had outgrown the diff cap (an open session the
+    /// builder extended while this waited), so it rendered plain.
+    async fn render_view(
+        &self,
+        entry: ViewEntry,
+        key: ViewKey,
+        changes: bool,
+        slot: OwnedSemaphorePermit,
+        deadline: Instant,
+        flags: (&AtomicBool, &AtomicBool),
+    ) -> Result<Arc<RenderedView>, ViewError> {
+        let (diff_failed, outgrown) = flags;
+        self.input_bytes(&entry).await?;
+        let granted = self.compute_until(slot, deadline).await?;
+        let (input, ins, del, _, bytes) = self.load(&entry).await?;
+        // The load sizes the input again: the diff cap is the memory rule,
+        // and it binds on what is rendered, not on what was sized first.
+        let fits = bytes <= self.limits.max_changes_input_bytes;
+        if changes && !fits {
+            outgrown.store(true, Ordering::SeqCst);
+        }
+        let sets = (changes && fits).then_some((ins, del));
+        let hooks = RenderHooks {
+            panic_in_diff: self.limits.hooks.panic_in_diff,
+            hold_in_diff: self.limits.hooks.hold_in_diff,
+        };
+        let stage = StageCell::default();
+        let thread_stage = stage.clone();
+        let started = granted.started;
+        let progress = Progress::default();
+        let input = with_progress(input, &progress);
+        let (doc, rendered_changes, diff_error) = self
+            .run(
+                granted,
+                key,
+                self.limits.timeout,
+                OnTimeout::Record,
+                input,
+                progress,
+                stage,
+                move |input| {
+                    let r = render_staged(input, sets, hooks, &thread_stage)
+                        .map_err(|e| e.to_string())?;
+                    let doc = serde_json::to_vec(&r.doc).map_err(|e| e.to_string())?;
+                    Ok((doc, r.changes, r.diff_error))
+                },
+            )
+            .await?;
+        metrics::histogram!("knot_history_view_seconds").record(started.elapsed().as_secs_f64());
+        if let Some(reason) = diff_error {
+            diff_failed.store(true, Ordering::SeqCst);
+            tracing::warn!(
+                entry_id = entry.id,
+                reason,
+                "history view rendered without changes"
+            );
+        }
+        Ok(Arc::new(RenderedView {
+            entry_id: entry.id,
+            kind: entry.kind,
+            changes: rendered_changes,
+            doc: Bytes::from(doc),
+        }))
+    }
+
+    /// The input of restoring entry `entry_id`: its state at its end,
+    /// replayed as its plain view is (without the cache) and handed to
+    /// `finish` on the replay thread, within [`ViewLimits::restore_timeout`].
+    /// With `seen` (the end the reader saw), an entry that ends at another
+    /// time is [`ViewError::Moved`]: checked before any permit is taken,
+    /// and again on the entry as the load read it, which is authoritative.
+    pub async fn restore_input<T: Send + 'static>(
+        &self,
+        principal: Uuid,
+        doc_id: Uuid,
+        entry_id: i64,
+        seen: Option<DateTime<Utc>>,
+        finish: impl FnOnce(&[u8]) -> Result<T, String> + Send + 'static,
+    ) -> Result<Restorable<T>, ViewError> {
+        let deadline = Instant::now() + self.limits.permit_wait;
+        self.restore_input_inner(principal, doc_id, entry_id, seen, deadline, false, finish)
+            .await
+            .map_err(view_error)
+    }
+
+    /// [`Views::restore_input`] bounded by a restore's `deadline` (Restore
+    /// as new page): the principal's render slot and the compute permit
+    /// are waited for until `min(now + permit_wait, deadline)`. The
+    /// replay's timeout stays [`ViewLimits::restore_timeout`], never cut
+    /// by the deadline (the cancellation Ruling: a cut replay timeout
+    /// would be recorded under the restore key, refusing both restores of
+    /// the version).
+    pub async fn restore_input_by<T: Send + 'static>(
+        &self,
+        principal: Uuid,
+        doc_id: Uuid,
+        entry_id: i64,
+        seen: Option<DateTime<Utc>>,
+        deadline: Instant,
+        finish: impl FnOnce(&[u8]) -> Result<T, String> + Send + 'static,
+    ) -> Result<Restorable<T>, ViewError> {
+        self.restore_input_inner(principal, doc_id, entry_id, seen, deadline, false, finish)
+            .await
+            .map_err(view_error)
+    }
+
+    /// Restore here's target: [`Views::restore_input_by`] with
+    /// [`revert::target`], refusing first, before the input is sized, any
+    /// permit is taken or anything loaded or replayed, a version whose
+    /// plans are recorded too slow ([`PlanError::TooSlow`]) or over the
+    /// revert cap ([`PlanError::OverCap`]); and after the replay a version
+    /// whose state alone is over [`ViewLimits::max_revert_input_bytes`]
+    /// (recorded, [`PlanError::OverCap`]), so no live page is exported for
+    /// it.
+    pub async fn restore_target(
+        &self,
+        principal: Uuid,
+        doc_id: Uuid,
+        entry_id: i64,
+        seen: Option<DateTime<Utc>>,
+        deadline: Instant,
+    ) -> Result<Restorable<RevertTarget>, PlanError> {
+        let r = self
+            .restore_input_inner(
+                principal,
+                doc_id,
+                entry_id,
+                seen,
+                deadline,
+                true,
+                revert::target,
+            )
+            .await?;
+        if over(r.value.state.len(), self.limits.max_revert_input_bytes) {
+            self.over_revert_cap.insert(r.ticket.0.clone(), ());
+            return Err(PlanError::OverCap);
+        }
+        Ok(r)
+    }
+
+    /// What [`Views::restore_input`], [`Views::restore_input_by`] and
+    /// [`Views::restore_target`] share: the permits are waited for until
+    /// `min(now + permit_wait, deadline)`; with `check_revert`, a version
+    /// whose `Revert` key is recorded is refused first.
+    #[allow(clippy::too_many_arguments)] // the restore's cohesive options
+    async fn restore_input_inner<T: Send + 'static>(
+        &self,
+        principal: Uuid,
+        doc_id: Uuid,
+        entry_id: i64,
+        seen: Option<DateTime<Utc>>,
+        deadline: Instant,
+        check_revert: bool,
+        finish: impl FnOnce(&[u8]) -> Result<T, String> + Send + 'static,
+    ) -> Result<Restorable<T>, PlanError> {
+        let moved = |ended_at: DateTime<Utc>| seen.is_some_and(|at| at != ended_at);
+        let entry = self.entry(doc_id, entry_id).await?;
+        if moved(entry.ended_at) {
+            return Err(ViewError::Moved.into());
+        }
+        let plain = ViewKey::of(&entry, ViewVariant::Plain);
+        let key = plain.with(ViewVariant::Restore);
+        if self.records.recorded(&plain) || self.records.recorded(&key) {
+            return Err(ViewError::Failed(EARLIER_TIMEOUT.to_string()).into());
+        }
+        if check_revert {
+            self.revert_refused(&plain.with(ViewVariant::Revert))?;
+        }
+        self.input_bytes(&entry).await?;
+        let deadline = deadline.min(Instant::now() + self.limits.permit_wait);
+        let slot = self.slot_within(principal, deadline).await?;
+        let granted = self.compute_until(slot, deadline).await?;
+        let (input, _, _, loaded, _) = self.load(&entry).await?;
+        if moved(loaded.ended_at) {
+            return Err(ViewError::Moved.into());
+        }
+        let stage = StageCell::default();
+        let progress = Progress::default();
+        let input = with_progress(input, &progress);
+        let value = self
+            .run(
+                granted,
+                key,
+                self.limits.restore_timeout,
+                OnTimeout::Record,
+                input,
+                progress,
+                stage,
+                move |input| {
+                    let replayer = match input {
+                        ViewInput::State(bytes) => {
+                            let bytes = owned_state_input(bytes).map_err(|e| e.to_string())?;
+                            Replayer::from_state(ReplayMode::KeepDeleted, &bytes)
+                                .map_err(|e| format!("the state does not apply: {e}"))?
+                        }
+                        ViewInput::Window(w) => replay_window(w).map_err(|e| e.to_string())?,
+                    };
+                    let state = replayer.encode_state();
+                    drop(replayer);
+                    finish(&state)
+                },
+            )
+            .await?;
+        Ok(Restorable {
+            value,
+            kind: loaded.kind,
+            end_rev: loaded.end_rev,
+            ended_at: loaded.ended_at,
+            content_epoch: loaded.content_epoch,
+            ticket: RestoreTicket(ViewKey::of(&loaded, ViewVariant::Revert)),
+        })
+    }
+
+    /// A plan's `Revert` key recorded: too slow, or over the revert cap.
+    fn revert_refused(&self, key: &ViewKey) -> Result<(), PlanError> {
+        if self.records.recorded(key) {
+            Err(PlanError::TooSlow)
+        } else if self.over_revert_cap.contains_key(key) {
+            Err(PlanError::OverCap)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// One of `principal`'s restores on this process (the restore-permit
+    /// Ruling), waited for until `min(now + permit_wait, deadline)`, else
+    /// [`ViewError::Busy`]. It takes no render slot or compute permit and
+    /// renders nothing; a view never takes it.
+    pub async fn restore_permit(
+        &self,
+        principal: Uuid,
+        deadline: Instant,
+    ) -> Result<RestorePermit, ViewError> {
+        let restores = semaphore_of(&self.restorers, principal, RESTORES_PER_PRINCIPAL);
+        let until = deadline.min(Instant::now() + self.limits.permit_wait);
+        match tokio::time::timeout_at(until, restores.acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(RestorePermit { _permit: permit }),
+            _ => Err(ViewError::Busy),
+        }
+    }
+
+    /// One plan of a Restore here: the verified update that brings `live`
+    /// (the room's pending-free export) back to `target`, the version
+    /// `ticket` names, computed on a replay thread under the principal's
+    /// render slot and a compute permit.
+    ///
+    /// In order: a version whose plans are recorded too slow or over the
+    /// revert cap is refused ([`PlanError::TooSlow`], [`PlanError::OverCap`]),
+    /// one whose view or restore is recorded hung fails as they do; over
+    /// [`ViewLimits::max_revert_input_bytes`] (`target.state.len() +
+    /// live.len()`) is recorded and [`PlanError::OverCap`]; with less than
+    /// [`ViewLimits::min_plan_time`] left before `deadline`, or no slot and
+    /// permit by `min(now + permit_wait, deadline)`, it is
+    /// [`ViewError::Busy`]; once both are held the record and the time
+    /// left are checked again. The plan then runs within `min(revert
+    /// timeout, deadline − now)`: a full timeout is recorded,
+    /// [`PlanError::TooSlow`]; one the deadline cut shorter answers
+    /// [`ViewError::Busy`], and is recorded only if its thread still runs
+    /// when its full timeout has passed (its stall watcher records it then).
+    pub async fn plan_revert(
+        &self,
+        principal: Uuid,
+        ticket: &RestoreTicket,
+        target: Arc<RevertTarget>,
+        live: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<RevertOutcome, PlanError> {
+        let key = ticket.0.clone();
+        self.revert_refused(&key)?;
+        if self.records.recorded(&key.with(ViewVariant::Plain))
+            || self.records.recorded(&key.with(ViewVariant::Restore))
+        {
+            return Err(ViewError::Failed(EARLIER_TIMEOUT.to_string()).into());
+        }
+        if over(
+            target.state.len().saturating_add(live.len()),
+            self.limits.max_revert_input_bytes,
+        ) {
+            self.over_revert_cap.insert(key, ());
+            return Err(PlanError::OverCap);
+        }
+        if deadline.saturating_duration_since(Instant::now()) < self.limits.min_plan_time {
+            return Err(ViewError::Busy.into());
+        }
+        let wait = deadline.min(Instant::now() + self.limits.permit_wait);
+        let slot = self.slot_within(principal, wait).await?;
+        let granted = self.compute_until(slot, wait).await?;
+        // A plan of this version recorded while this one waited, or the
+        // time it had left spent waiting: both released, nothing run.
+        self.revert_refused(&key)?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left < self.limits.min_plan_time {
+            return Err(ViewError::Busy.into());
+        }
+        let full = self.limits.revert_timeout;
+        let timeout = full.min(left);
+        let on_timeout = if timeout == full {
+            OnTimeout::Record
+        } else {
+            OnTimeout::CutShort { full_after: full }
+        };
+        let progress = Progress::default();
+        let go_on = progress.clone();
+        let hooks = self.limits.hooks.revert;
+        let checkpoints = self.limits.hooks.revert_checkpoints.clone();
+        let planned = self
+            .run(
+                granted,
+                key,
+                timeout,
+                on_timeout,
+                (target, live),
+                progress,
+                StageCell::default(),
+                move |(target, live)| {
+                    Ok(revert::plan_with(&target, &live, hooks, &|c| {
+                        if let Some(seen) = &checkpoints {
+                            seen.lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .push(c);
+                        }
+                        !go_on.is_cancelled()
+                    }))
+                },
+            )
+            .await;
+        match planned {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(RevertError::Unverified(why))) => Err(PlanError::Unverified(why)),
+            Ok(Err(e @ (RevertError::Live(_) | RevertError::Target(_)))) => {
+                Err(ViewError::Failed(e.to_string()).into())
+            }
+            // Never read: whoever cancelled it has answered already.
+            Ok(Err(RevertError::Cancelled)) => Err(ViewError::Failed("cancelled".into()).into()),
+            Err(ViewError::TimedOut) => Err(PlanError::TooSlow),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The entry, unless the page is being rebuilt or it is a baseline the
+    /// builder skipped.
+    async fn entry(&self, doc_id: Uuid, entry_id: i64) -> Result<ViewEntry, ViewError> {
+        let entry = store::load_view_entry(&self.pool, doc_id, entry_id)
+            .await
+            .map_err(store_error)?
+            .ok_or(ViewError::NotFound)?;
+        if entry.stale {
+            return Err(ViewError::Rebuilding);
+        }
+        if entry.skipped {
+            return Err(ViewError::Failed(SKIPPED_BASELINE.to_string()));
+        }
+        Ok(entry)
+    }
+
+    /// The entry's replay input size, within its cap.
+    async fn input_bytes(&self, entry: &ViewEntry) -> Result<i64, ViewError> {
+        match store::view_input_bytes(&self.pool, entry)
+            .await
+            .map_err(store_error)?
+        {
+            None => Err(ViewError::NotFound),
+            Some(n) if n > self.max_input_bytes(entry) => Err(ViewError::TooLarge),
+            Some(n) => Ok(n),
+        }
+    }
+
+    /// The plain cap, or for a baseline's state (cut to its trusted prefix
+    /// when it may be shifted) the lower [`baseline_max_input_bytes`].
+    fn max_input_bytes(&self, entry: &ViewEntry) -> i64 {
+        if entry.kind == EntryKind::Baseline && entry.baseline_id.is_some() {
+            baseline_max_input_bytes(self.limits.max_plain_input_bytes)
+        } else {
+            self.limits.max_plain_input_bytes
+        }
+    }
+
+    /// The principal's render slot by `deadline`.
+    async fn slot_within(
+        &self,
+        principal: Uuid,
+        deadline: Instant,
+    ) -> Result<OwnedSemaphorePermit, ViewError> {
+        let slot = semaphore_of(&self.principals, principal, PRINCIPAL_RENDERS);
+        match tokio::time::timeout_at(deadline, slot.acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err(ViewError::Busy),
+        }
+    }
+
+    /// A compute permit by `deadline`, for the render holding `slot`.
+    async fn compute_until(
+        &self,
+        slot: OwnedSemaphorePermit,
+        deadline: Instant,
+    ) -> Result<Granted, ViewError> {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        let guard = self
+            .permits
+            .compute_within(wait)
+            .await
+            .ok_or(ViewError::Busy)?;
+        Ok(Granted {
+            guard,
+            slot: PrincipalSlot::new(slot),
+            started: Instant::now(),
+        })
+    }
+
+    /// The entry's replay input, its id sets, the entry as the load read
+    /// it and the input's size.
+    async fn load(
+        &self,
+        entry: &ViewEntry,
+    ) -> Result<(ViewInput, IdSet, IdSet, ViewEntry, i64), ViewError> {
+        match store::load_view_input(
+            &self.pool,
+            entry.doc_id,
+            entry.id,
+            self.max_input_bytes(entry),
+        )
+        .await
+        .map_err(store_error)?
+        {
+            ViewLoaded::NotFound => Err(ViewError::NotFound),
+            ViewLoaded::Stale => Err(ViewError::Rebuilding),
+            ViewLoaded::TooLarge => Err(ViewError::TooLarge),
+            ViewLoaded::Skipped => Err(ViewError::Failed(SKIPPED_BASELINE.to_string())),
+            ViewLoaded::Load {
+                input,
+                ins,
+                del,
+                entry,
+                bytes,
+            } => Ok((input, ins, del, entry, bytes)),
+        }
+    }
+
+    /// Runs `f(input)` on a replay thread holding `granted`'s permit and
+    /// slot, within `timeout`; `progress` is the one the thread reads (a
+    /// window's replay, a plan's checkpoints). On a timeout the slot is
+    /// freed, the thread counted stalled and watched until it ends, and by
+    /// `on_timeout`: [`OnTimeout::Record`] cancels `progress`, counts, logs
+    /// and records the timeout under `key` by the stage the thread is in
+    /// ([`ViewError::TimedOut`]); [`OnTimeout::CutShort`] logs a warning
+    /// and hands the thread to [`watch_cut_short`] at `started +
+    /// full_after` ([`ViewError::Busy`]). A dropped call does the same
+    /// through [`Abandon`].
+    #[allow(clippy::too_many_arguments)] // the render's cohesive run options
+    async fn run<I: Send + 'static, T: Send + 'static>(
+        &self,
+        granted: Granted,
+        key: ViewKey,
+        timeout: Duration,
+        on_timeout: OnTimeout,
+        input: I,
+        progress: Progress,
+        stage: StageCell,
+        f: impl FnOnce(I) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, ViewError> {
+        let Granted {
+            guard,
+            slot,
+            started,
+        } = granted;
+        let full = match on_timeout {
+            OnTimeout::Record => started + timeout,
+            OnTimeout::CutShort { full_after } => started + full_after,
+        };
+        let watch = guard.stall_watch();
+        let mut abandon = Abandon {
+            armed: true,
+            progress: progress.clone(),
+            watch: watch.clone(),
+            records: self.records.clone(),
+            key: key.clone(),
+            stage: stage.clone(),
+            slot: slot.clone(),
+            deadline: started + timeout,
+            on_timeout,
+            full,
+        };
+        let release = SlotRelease(slot.clone());
+        let hooks = self.limits.hooks.clone();
+        let thread_stage = stage.clone();
+        let (result, _) = run_isolated(guard, timeout, move || {
+            let _release = release;
+            if let Some(n) = &hooks.renders {
+                n.fetch_add(1, Ordering::SeqCst);
+            }
+            thread_stage.set(RenderStage::Replay);
+            if !hooks.hold_render.is_zero() {
+                std::thread::sleep(hooks.hold_render);
+            }
+            if hooks.panic_render {
+                panic!("test hook: panic in the render");
+            }
+            f(input)
+        })
+        .await;
+        abandon.armed = false;
+        match result {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(ViewError::Failed(e)),
+            Err(IsolateError::Panicked(m)) => {
+                Err(ViewError::Failed(format!("the render panicked: {m}")))
+            }
+            Err(IsolateError::TimedOut) => match on_timeout {
+                OnTimeout::Record => {
+                    progress.cancel();
+                    watch.timed_out();
+                    let recorded = self.records.record_timeout(&key, stage.get(), false);
+                    self.records.set_stalled_gauge();
+                    slot.empty();
+                    tokio::spawn(watch_timed_out(watch, self.records.clone(), recorded));
+                    Err(ViewError::TimedOut)
+                }
+                OnTimeout::CutShort { .. } => {
+                    watch.timed_out();
+                    self.records.set_stalled_gauge();
+                    slot.empty();
+                    warn_cut_short(&key, false);
+                    tokio::spawn(watch_cut_short(
+                        watch,
+                        self.records.clone(),
+                        key,
+                        stage,
+                        progress,
+                        full,
+                        false,
+                    ));
+                    Err(ViewError::Busy)
+                }
+            },
+        }
+    }
+}
+
+/// Whether `n` bytes are over `cap`.
+fn over(n: usize, cap: i64) -> bool {
+    i64::try_from(n).map_or(true, |n| n > cap)
+}
+
+/// A restore's error as a [`ViewError`]: only `View` arises without the
+/// revert checks.
+fn view_error(e: PlanError) -> ViewError {
+    match e {
+        PlanError::View(v) => v,
+        other => ViewError::Failed(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use chrono::{TimeZone, Utc};
+    use knot_storage::{DocUpdate, UpdateSource};
+    use uuid::Uuid;
+    use yrs::updates::decoder::Decode;
+    use yrs::{
+        Doc, IdSet, ReadTxn, Text, Transact, Update, XmlElementPrelim, XmlFragment, XmlOut,
+        XmlTextPrelim,
+    };
+
+    use super::*;
+    use crate::pass::{Progress, ReplayHooks};
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_view_cap_keeps_the_build_memory_rule() {
+        let cap = 4 * MIB;
+        let diff = view_max_input_bytes(cap, true);
+        let plain = view_max_input_bytes(cap, false);
+        assert_eq!(
+            diff,
+            i64::try_from(cap * 40 / VIEW_MEMORY_FACTOR.max(40)).unwrap()
+        );
+        assert_eq!(
+            plain,
+            i64::try_from(cap * 40 / PLAIN_MEMORY_FACTOR.max(40)).unwrap()
+        );
+        assert!(
+            plain >= diff,
+            "the plain cap {plain} under the diff cap {diff}"
+        );
+        assert!(plain <= i64::try_from(cap).unwrap());
+        assert!(diff <= i64::try_from(cap).unwrap());
+        // `workers × F × cap` stays what the builder's F allows.
+        let baseline = baseline_max_input_bytes(plain);
+        let (plain_f, shifted_f) = (
+            PLAIN_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR),
+            SHIFTED_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR),
+        );
+        assert_eq!(
+            baseline,
+            i64::try_from(u64::try_from(plain).unwrap() * plain_f / shifted_f).unwrap(),
+            "the plain cap × {plain_f} / {shifted_f}"
+        );
+        assert!(baseline <= plain);
+        for (f, c) in [
+            (VIEW_MEMORY_FACTOR, diff),
+            (PLAIN_MEMORY_FACTOR, plain),
+            (SHIFTED_MEMORY_FACTOR, baseline),
+        ] {
+            assert!(u64::try_from(c).unwrap() * f.max(BUILD_MEMORY_FACTOR) <= cap * 40);
+        }
+        assert_eq!(
+            i128::from(baseline_max_input_bytes(i64::MAX)),
+            i128::from(i64::MAX) * i128::from(plain_f) / i128::from(shifted_f)
+        );
+        // A cap too large for the arithmetic saturates instead of wrapping.
+        assert_eq!(view_max_input_bytes(u64::MAX, false), i64::MAX);
+        assert!(view_max_input_bytes(u64::MAX, true) > 0);
+    }
+
+    #[test]
+    fn the_revert_cap_keeps_the_build_memory_rule() {
+        let cap = 4 * MIB;
+        let revert = revert_max_input_bytes(cap);
+        let by_memory = cap * BUILD_MEMORY_FACTOR / REVERT_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR);
+        assert_eq!(
+            revert,
+            i64::try_from(by_memory.min(REVERT_TIME_CAP_BYTES)).unwrap()
+        );
+        assert!(revert <= i64::try_from(cap).unwrap());
+        // `workers × F × cap` stays what the builder's F allows.
+        assert!(
+            u64::try_from(revert).unwrap() * REVERT_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR)
+                <= cap * BUILD_MEMORY_FACTOR
+        );
+        // The time cap is absolute: a larger replay cap does not raise it.
+        assert!(u64::try_from(revert_max_input_bytes(64 * MIB)).unwrap() <= REVERT_TIME_CAP_BYTES);
+        // A cap too large for the arithmetic saturates instead of wrapping.
+        assert_eq!(
+            revert_max_input_bytes(u64::MAX),
+            i64::try_from(REVERT_TIME_CAP_BYTES).unwrap()
+        );
+        let limits = ViewLimits::default();
+        assert_eq!(
+            limits.max_revert_input_bytes,
+            revert_max_input_bytes(knot_config::DEFAULT_HISTORY_REPLAY_MAX_BYTES)
+        );
+        assert_eq!(limits.revert_timeout, REVERT_TIMEOUT);
+    }
+
+    /// A doc of two paragraphs, as a state.
+    fn two_paragraphs() -> (Doc, Vec<u8>) {
+        let doc = Doc::with_client_id(7);
+        let frag = doc.get_or_insert_xml_fragment("default");
+        {
+            let mut txn = doc.transact_mut();
+            for s in ["one", "two"] {
+                let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+                p.push_back(&mut txn, XmlTextPrelim::new(s));
+            }
+        }
+        let state = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        (doc, state)
+    }
+
+    #[test]
+    fn a_state_input_renders_pm_json() {
+        let (doc, state) = two_paragraphs();
+        let r = render(ViewInput::State(state), None, RenderHooks::default()).expect("the render");
+        assert_eq!(r.doc, pm_json(&doc));
+        assert!(!r.changes);
+        assert_eq!(r.diff_error, None);
+        assert_eq!(r.doc["content"].as_array().map(Vec::len), Some(2));
+
+        let r = render(
+            ViewInput::State(vec![0xff, 0x01]),
+            None,
+            RenderHooks::default(),
+        );
+        assert!(matches!(r, Err(RenderError::State(_))), "{r:?}");
+    }
+
+    fn row(rev: i64, by: Uuid, update_bytes: Vec<u8>) -> DocUpdate {
+        DocUpdate {
+            seq: rev,
+            doc_id: Uuid::nil(),
+            update_bytes,
+            by_user_id: Some(by),
+            created_at: Utc.with_ymd_and_hms(2026, 11, 8, 9, 0, 0).unwrap()
+                + chrono::Duration::seconds(rev),
+            rev: Some(rev),
+            source: Some(UpdateSource::Edit),
+            meta: None,
+            epoch: Some(0),
+        }
+    }
+
+    /// Two authors on one page: A writes a paragraph, B appends to it, A
+    /// adds a second one. The window input from an empty checkpoint, and
+    /// A's merged insert and delete sets.
+    fn two_authors() -> (WindowInput, (IdSet, IdSet)) {
+        let a = Uuid::from_u128(0xa);
+        let b = Uuid::from_u128(0xb);
+        let docs = [Doc::with_client_id(1), Doc::with_client_id(2)];
+        let mut rows = Vec::new();
+        let mut write = |who: usize, f: &dyn Fn(&Doc)| {
+            let before = docs[who].transact().state_vector();
+            f(&docs[who]);
+            let update = docs[who].transact().encode_state_as_update_v1(&before);
+            let other = &docs[1 - who];
+            other
+                .transact_mut()
+                .apply_update(Update::decode_v1(&update).unwrap())
+                .unwrap();
+            let by = if who == 0 { a } else { b };
+            rows.push(row(rows.len() as i64 + 1, by, update));
+        };
+        write(0, &|d| {
+            let frag = d.get_or_insert_xml_fragment("default");
+            let mut txn = d.transact_mut();
+            let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new("alpha"));
+        });
+        write(1, &|d| {
+            let frag = d.get_or_insert_xml_fragment("default");
+            let mut txn = d.transact_mut();
+            let Some(XmlOut::Element(p)) = frag.get(&txn, 0) else {
+                panic!("a paragraph");
+            };
+            let Some(XmlOut::Text(t)) = p.get(&txn, 0) else {
+                panic!("a text");
+            };
+            t.insert(&mut txn, 5, " beta");
+        });
+        write(0, &|d| {
+            let frag = d.get_or_insert_xml_fragment("default");
+            let mut txn = d.transact_mut();
+            let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new("gamma"));
+        });
+
+        let mut replay = Replayer::new(ReplayMode::KeepDeleted);
+        let (mut ins, mut del) = (IdSet::new(), IdSet::new());
+        for r in &rows {
+            let e = replay.apply(&r.update_bytes);
+            if r.by_user_id == Some(a) {
+                ins.merge_with(e.inserted);
+                del.merge_with(e.deleted);
+            }
+        }
+        let end_rev = rows.len() as i64;
+        let input = WindowInput {
+            mode: ReplayMode::KeepDeleted,
+            checkpoint_state: Replayer::new(ReplayMode::KeepDeleted).encode_state(),
+            reapply: Vec::new(),
+            rows,
+            gap_states: Vec::new(),
+            skip_revs: BTreeSet::new(),
+            end_rev,
+            merge_gap_at_end: false,
+            progress: Progress::default(),
+            hooks: ReplayHooks::default(),
+        };
+        (input, (ins, del))
+    }
+
+    /// Runs `f` with the panic hook silenced, so a deliberate panic prints
+    /// nothing.
+    fn quietly<T>(f: impl FnOnce() -> T) -> T {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out = f();
+        std::panic::set_hook(hook);
+        out
+    }
+
+    #[test]
+    fn a_window_renders_with_and_without_changes() {
+        let (input, sets) = two_authors();
+        let plain = render(ViewInput::Window(input), None, RenderHooks::default()).unwrap();
+        assert!(!plain.changes);
+        assert_eq!(plain.diff_error, None);
+
+        let (input, _) = two_authors();
+        let diff = render(ViewInput::Window(input), Some(sets), RenderHooks::default()).unwrap();
+        assert!(diff.changes, "{:?}", diff.diff_error);
+        assert_eq!(diff.diff_error, None);
+        assert_ne!(diff.doc, plain.doc, "A's changes are marked");
+        assert!(
+            diff.doc
+                .to_string()
+                .contains(crate::pm_json::HISTORY_INSERT)
+        );
+    }
+
+    #[test]
+    fn a_diff_that_panics_falls_back_to_the_plain_render() {
+        let (input, sets) = two_authors();
+        let hooks = RenderHooks {
+            panic_in_diff: true,
+            ..RenderHooks::default()
+        };
+        let r = quietly(|| render(ViewInput::Window(input), Some(sets), hooks))
+            .expect("the plain render");
+        assert!(!r.changes);
+        let reason = r.diff_error.expect("the diff's failure");
+        assert!(reason.contains("panicked"), "{reason}");
+
+        let (input, _) = two_authors();
+        let plain = render(ViewInput::Window(input), None, RenderHooks::default()).unwrap();
+        assert_eq!(r.doc, plain.doc);
+    }
+
+    #[test]
+    fn a_cancelled_diff_is_an_error_not_a_fallback() {
+        let (input, sets) = two_authors();
+        let progress = input.progress.clone();
+        let hooks = RenderHooks {
+            hold_in_diff: Duration::from_secs(2),
+            ..RenderHooks::default()
+        };
+        let render =
+            std::thread::spawn(move || render(ViewInput::Window(input), Some(sets), hooks));
+        // The three-row replay is long done; the diff step is holding.
+        std::thread::sleep(Duration::from_millis(500));
+        progress.cancel();
+        let r = render.join().expect("no panic");
+        assert!(
+            matches!(r, Err(RenderError::Diff(DiffError::Cancelled))),
+            "{r:?}"
+        );
+    }
+}

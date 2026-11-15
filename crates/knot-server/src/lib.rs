@@ -36,9 +36,11 @@ pub mod comments_listener;
 pub mod duplicate;
 pub mod export;
 pub mod export_check;
+pub(crate) mod history_restore;
 pub mod history_stats;
 pub mod http_error;
 pub mod metrics;
+pub mod move_to_subpage;
 pub mod notifications_sweep;
 pub mod protocol;
 pub mod quota;
@@ -53,6 +55,8 @@ pub mod static_files;
 pub(crate) mod suggestion_notifications;
 pub mod suggestions_sweep;
 mod ws_writer;
+#[doc(hidden)]
+pub use ws_writer::handshake_frames_queued;
 
 use auth::SessionDeps;
 
@@ -83,6 +87,8 @@ pub struct AppState {
     pub board_rooms: Option<Arc<knot_crdt::BoardRooms>>,
     pub tasks: Option<Arc<dyn knot_storage::TaskStore>>,
     pub notifications: Option<Arc<dyn NotificationStore>>,
+    /// The pages each user starred.
+    pub favorites: Option<Arc<dyn knot_storage::FavoriteStore>>,
     pub contributors: Option<Arc<dyn knot_storage::ContributorStore>>,
     pub hasher: Arc<Hasher>,
     pub throttle: Arc<Throttle>,
@@ -109,6 +115,14 @@ pub struct AppState {
     pub duplicate_permits: Arc<tokio::sync::Semaphore>,
     /// How long a duplicate waits for a permit before it is refused as busy.
     pub duplicate_busy_wait: std::time::Duration,
+    /// The process's one set of page-history replay permits, shared by the
+    /// history builder and [`AppState::history_views`]. `main` sizes it
+    /// from `history_workers`; the constructors give one compute permit.
+    pub history_permits: knot_history::HistoryPermits,
+    /// Renders past versions of a page (`GET
+    /// /api/docs/{id}/history/entries/{eid}/view`); `None` without a pool,
+    /// where the view answers 500 `internal`.
+    pub history_views: Option<Arc<knot_history::Views>>,
     /// The HTTP and collab rate limits. Built from `config` in
     /// [`router_with_state`]; the constructors leave them off.
     pub rate_limits: Arc<rate_limit::RateLimits>,
@@ -156,6 +170,7 @@ impl AppState {
             board_rooms: None,
             tasks: None,
             notifications: None,
+            favorites: None,
             contributors: None,
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
@@ -173,6 +188,8 @@ impl AppState {
                 duplicate::MAX_CONCURRENT_DUPLICATES,
             )),
             duplicate_busy_wait: duplicate::BUSY_WAIT,
+            history_permits: knot_history::history_permits(1),
+            history_views: None,
             rate_limits: Arc::new(rate_limit::RateLimits::disabled()),
             trusted_proxies: Arc::new(client_ip::TrustedProxies::default()),
             quota_audit: Arc::new(quota::QuotaAuditThrottle::new()),
@@ -215,8 +232,16 @@ impl AppState {
             Arc::new(knot_storage::PgTaskStore::new(pool.clone()));
         let notifications: Arc<dyn NotificationStore> =
             Arc::new(PgNotificationStore::new(pool.clone()));
+        let favorites: Arc<dyn knot_storage::FavoriteStore> =
+            Arc::new(knot_storage::PgFavoriteStore::new(pool.clone()));
         let contributors: Arc<dyn knot_storage::ContributorStore> =
             Arc::new(knot_storage::PgContributorStore::new(pool.clone()));
+        let history_permits = knot_history::history_permits(1);
+        let history_views = Arc::new(knot_history::Views::new(
+            pool.clone(),
+            history_permits.clone(),
+            knot_history::ViewLimits::default(),
+        ));
         Self {
             pool: Some(pool),
             users: Some(users),
@@ -241,6 +266,7 @@ impl AppState {
             board_rooms: None,
             tasks: Some(tasks),
             notifications: Some(notifications),
+            favorites: Some(favorites),
             contributors: Some(contributors),
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
@@ -258,6 +284,8 @@ impl AppState {
                 duplicate::MAX_CONCURRENT_DUPLICATES,
             )),
             duplicate_busy_wait: duplicate::BUSY_WAIT,
+            history_permits,
+            history_views: Some(history_views),
             rate_limits: Arc::new(rate_limit::RateLimits::disabled()),
             trusted_proxies: Arc::new(client_ip::TrustedProxies::default()),
             quota_audit: Arc::new(quota::QuotaAuditThrottle::new()),

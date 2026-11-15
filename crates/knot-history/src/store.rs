@@ -26,8 +26,13 @@ use yrs::updates::encoder::Encode;
 use crate::builder::{BUILDER_VERSION, MAX_CRASHES, MAX_FAILURES, MAX_REBUILDS, MAX_TIMEOUTS};
 use crate::claims::{Claims, ClaimsError};
 use crate::genesis::{BaselineInput, GenesisOutput};
-use crate::pass::{CheckpointKind, CheckpointWrite, KeptGap, PassOutput, SnapshotProbe};
+use crate::pass::{
+    CheckpointKind, CheckpointWrite, KeptGap, PassOutput, Progress, ReplayHooks, SnapshotProbe,
+    WindowInput,
+};
+use crate::replay::ReplayMode;
 use crate::sessions::{EntryDraft, EntryKind, SEAL_MARGIN, SESSION_GAP};
+use crate::view::{ViewInput, merge_gap_at_end};
 use crate::words::WordCounts;
 
 type Tx = Transaction<'static, Postgres>;
@@ -37,6 +42,9 @@ pub(crate) const PASS_INTERRUPTED: &str = "pass interrupted";
 
 /// What a graceful shutdown writes instead (not a crash).
 pub(crate) const SHUTDOWN: &str = "shutdown";
+
+/// What a pass that waited out `BuildLimits::compute_wait` writes.
+pub(crate) const PERMIT_WAIT: &str = "waited too long for a replay slot";
 
 const PAGE_KEY_SHARE: &str = "SELECT 1 FROM documents WHERE id = $1 FOR KEY SHARE";
 
@@ -597,11 +605,23 @@ pub(crate) async fn release(pool: &PgPool, doc_id: Uuid, me: Uuid) -> Result<Wri
     Ok(Write::Done)
 }
 
-/// A graceful shutdown's release of the pages this builder had in flight:
-/// not a crash, so the claim's `failures` is taken back.
-pub(crate) async fn release_on_shutdown(pool: &PgPool, me: Uuid, ids: &[Uuid]) -> Result<u64> {
+/// A pass that ended before its work: the pages of `ids` this builder
+/// still holds are released with `last_error = reason` and the claim's
+/// failure taken back (a graceful shutdown or an expired permit wait is not
+/// a failed pass), and the word counts of `repend_words` that the passes
+/// took but never attempted are pending again, with their pages dirty (a
+/// sweep-claimed idle page is clean otherwise, Rulings). Lock order:
+/// documents, state, entries, heads; only the returned pages, the ones this
+/// builder held, are touched.
+pub(crate) async fn release_unfinished(
+    pool: &PgPool,
+    me: Uuid,
+    ids: &[Uuid],
+    reason: &str,
+    repend_words: &[i64],
+) -> Result<Vec<Uuid>> {
     if ids.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let mut tx = begin(pool).await?;
     sqlx::query("SET LOCAL lock_timeout = '10s'")
@@ -611,31 +631,55 @@ pub(crate) async fn release_on_shutdown(pool: &PgPool, me: Uuid, ids: &[Uuid]) -
         .bind(ids)
         .execute(&mut *tx)
         .await?;
-    let done = sqlx::query(
+    let released: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE doc_history_state
             SET claimed_by = NULL, claimed_until = NULL, failures = greatest(failures - 1, 0),
                 retry_after = NULL, last_error = $3, updated_at = now()
-          WHERE doc_id = ANY($1) AND claimed_by = $2",
+          WHERE doc_id = ANY($1) AND claimed_by = $2
+         RETURNING doc_id",
     )
     .bind(ids)
     .bind(me)
-    .bind(SHUTDOWN)
-    .execute(&mut *tx)
+    .bind(reason)
+    .fetch_all(&mut *tx)
     .await?;
+    if !repend_words.is_empty() && !released.is_empty() {
+        let mut repended: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE doc_history_entries SET words_pending = true, updated_at = now()
+              WHERE id = ANY($1) AND doc_id = ANY($2)
+             RETURNING doc_id",
+        )
+        .bind(repend_words)
+        .bind(&released)
+        .fetch_all(&mut *tx)
+        .await?;
+        repended.sort_unstable();
+        repended.dedup();
+        if !repended.is_empty() {
+            sqlx::query("UPDATE doc_history_heads SET dirty = true WHERE doc_id = ANY($1)")
+                .bind(&repended)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
     tx.commit().await?;
-    Ok(done.rows_affected())
+    Ok(released)
 }
 
 /// Starts a rebuild (Rulings): deletes the page's entries except `erase`
-/// ones and its genesis and periodic checkpoints (gap checkpoints are
-/// source data and stay), resets the state row's build columns
-/// (`skip_revs`, `skip_baselines` and `skip_snapshots` stay) and marks the
-/// page dirty.
+/// ones and its genesis and periodic checkpoints, resets the state row's
+/// build columns (`skip_revs`, `skip_baselines` and `skip_snapshots` stay)
+/// and marks the page dirty. Gap checkpoints are source data and stay,
+/// except a version-1 page's: this first drops those once, and clears that
+/// page's `skip_snapshots` ([`drop_version_1_gaps`], Ruling 14).
 pub(crate) async fn reset_for_rebuild(pool: &PgPool, doc_id: Uuid, me: Uuid) -> Result<Write> {
     let (mut tx, _, _) = match begin_leased(pool, doc_id, me).await? {
         Ok(t) => t,
         Err(w) => return Ok(w),
     };
+    if drop_version_1_gaps(&mut tx, doc_id, true).await? {
+        tracing::debug!(%doc_id, "history rebuild: version 1's gap checkpoints dropped");
+    }
     sqlx::query("DELETE FROM doc_history_entries WHERE doc_id = $1 AND kind <> 'erase'")
         .bind(doc_id)
         .execute(&mut *tx)
@@ -662,6 +706,60 @@ pub(crate) async fn reset_for_rebuild(pool: &PgPool, doc_id: Uuid, me: Uuid) -> 
         .await?;
     tx.commit().await?;
     Ok(Write::Done)
+}
+
+/// Drops the gap checkpoints of a page that version 1 built, and clears its
+/// `skip_snapshots`, in the caller's transaction (Ruling 14); returns
+/// whether it did.
+///
+/// Version 1 (0.9.12 to 0.9.14) started genesis from a baseline's raw
+/// bytes, and a gap checkpoint is the whole replay state at its rev, so
+/// every gap checkpoint version 1 wrote can hold the phantoms of a shifted
+/// baseline, and one derived from a shifted room snapshot holds that
+/// snapshot's phantoms as gap content. The version-2 passes find real gap
+/// content again from the snapshots still kept, those version 1 failed to
+/// probe (`skip_snapshots`) included; `skip_revs` and `skip_baselines`
+/// stay, as they name rows and baselines that failed to apply whatever the
+/// builder.
+///
+/// The page is version 1's when its `builder_version` is 1 (a version-2
+/// builder writes 2 at genesis and at a give-up), or, when
+/// `genesis_checkpoint_counts`, when its genesis checkpoint was written
+/// before the migration `20261114140000` committed (a page at version 0
+/// whose genesis version 1 wrote). Never from a gap checkpoint's own
+/// `created_at`, which is its source snapshot's. A later rebuild of a
+/// version-2 page (a rejected starting checkpoint, or a later
+/// `BUILDER_VERSION`) drops nothing: its gap checkpoints are source data.
+pub(crate) async fn drop_version_1_gaps(
+    tx: &mut PgConnection,
+    doc_id: Uuid,
+    genesis_checkpoint_counts: bool,
+) -> Result<bool> {
+    let version_1: bool = sqlx::query_scalar(
+        "SELECT coalesce((SELECT builder_version = 1 FROM doc_history_state WHERE doc_id = $1),
+                         false)
+             OR ($2 AND EXISTS (
+                     SELECT 1 FROM doc_history_checkpoints g
+                      WHERE g.doc_id = $1 AND g.kind = 'genesis'
+                        AND g.created_at < (SELECT m.installed_on FROM _sqlx_migrations m
+                                             WHERE m.version = 20261114140000)))",
+    )
+    .bind(doc_id)
+    .bind(genesis_checkpoint_counts)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !version_1 {
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM doc_history_checkpoints WHERE doc_id = $1 AND kind = 'gap'")
+        .bind(doc_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE doc_history_state SET skip_snapshots = '{}' WHERE doc_id = $1")
+        .bind(doc_id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -797,6 +895,11 @@ pub(crate) async fn write_genesis(
     };
     if genesis_rev.is_some() {
         return Ok(Write::LeaseLost);
+    }
+    // A page version 1 gave up at genesis is lifted without a reset, so it
+    // drops its gap checkpoints here (Ruling 14).
+    if drop_version_1_gaps(&mut tx, doc_id, false).await? {
+        tracing::debug!(%doc_id, "history genesis: version 1's gap checkpoints dropped");
     }
     // What a give-up at genesis listed: genesis lists them again.
     sqlx::query(
@@ -974,7 +1077,7 @@ pub(crate) struct PassLimits {
     pub max_snapshots: i64,
 }
 
-type SnapshotSize = (i64, i64, DateTime<Utc>, i64, i64);
+type SnapshotSize = (i64, i64, DateTime<Utc>, i64, i64, bool);
 type KeptSize = (i64, DateTime<Utc>, i64, i64);
 
 /// A pass's inputs (step 6), in one read transaction, sizes first.
@@ -1044,10 +1147,12 @@ pub(crate) async fn load_pass_inputs(
         "SELECT s.snapshot_rev, s.snapshot_seq, s.created_at, s.size,
                 coalesce((SELECT sum(octet_length(u.update_bytes)) FROM doc_updates u
                            WHERE u.doc_id = $1 AND u.rev > $3 AND u.rev <= s.snapshot_rev),
-                         0)::bigint
+                         0)::bigint,
+                s.legacy
            FROM (SELECT DISTINCT ON (snapshot_rev)
                         snapshot_rev, snapshot_seq, created_at,
-                        octet_length(state_bytes)::bigint AS size
+                        octet_length(state_bytes)::bigint AS size,
+                        pending_revs IS NULL AS legacy
                    FROM doc_snapshots
                   WHERE doc_id = $1 AND snapshot_rev > $2
                     AND snapshot_rev <> ALL (
@@ -1138,7 +1243,7 @@ pub(crate) async fn load_pass_inputs(
     taken_snapshots.extend(w.oversized.iter().copied());
     taken_snapshots.sort_unstable();
     for i in taken_snapshots {
-        let (rev, seq, created_at, ..) = snapshot_sizes[i];
+        let (rev, seq, created_at, _, _, legacy) = snapshot_sizes[i];
         if rev > last {
             continue;
         }
@@ -1159,6 +1264,7 @@ pub(crate) async fn load_pass_inputs(
             rev,
             created_at,
             state_bytes,
+            legacy,
         });
     }
     let mut kept_gaps = Vec::new();
@@ -1578,8 +1684,8 @@ pub(crate) async fn take_words_entry(
     Ok(Write::Done)
 }
 
-/// A word count's replay input.
-pub(crate) struct WordsLoad {
+/// A window's replay input: a word count's, or a view's.
+pub(crate) struct WindowLoad {
     pub checkpoint_state: Vec<u8>,
     pub reapply: Vec<DocUpdate>,
     pub rows: Vec<DocUpdate>,
@@ -1588,28 +1694,45 @@ pub(crate) struct WordsLoad {
     pub bytes: i64,
 }
 
-pub(crate) enum WordsLoaded {
+pub(crate) enum WindowLoaded {
     TooLarge,
-    Load(WordsLoad),
+    /// No checkpoint at or before `start_rev − 1` (a rebuild removed it).
+    NoCheckpoint,
+    Load(WindowLoad),
 }
 
-/// The replay input of the session `start_rev..=end_rev`'s word count: the
-/// latest checkpoint at or before `start_rev − 1`, the gap checkpoints
-/// after it through `end_rev`, its reapply rows and the rows through
-/// `end_rev`; sizes checked in SQL first.
+/// The replay input of the session `start_rev..=end_rev`'s word count (see
+/// [`load_window_inputs`]), in a read transaction of its own.
 pub(crate) async fn load_words_inputs(
     pool: &PgPool,
     doc_id: Uuid,
     start_rev: i64,
     end_rev: i64,
     cap: i64,
-) -> Result<WordsLoaded> {
+) -> Result<WindowLoaded> {
     let mut tx = begin_read(pool).await?;
-    let skip_revs: Vec<i64> =
-        sqlx::query_scalar("SELECT skip_revs FROM doc_history_state WHERE doc_id = $1")
-            .bind(doc_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let loaded = load_window_inputs(&mut tx, doc_id, start_rev, end_rev, cap).await?;
+    tx.commit().await?;
+    match loaded {
+        WindowLoaded::NoCheckpoint => Err(StoreError::Invalid(format!(
+            "no checkpoint at or before rev {}",
+            start_rev - 1
+        ))),
+        other => Ok(other),
+    }
+}
+
+/// The checkpoint a window `start_rev..=end_rev` starts from (the latest
+/// at or before `start_rev − 1`), its `pending_revs`, and the bytes the
+/// window's replay loads: the checkpoint, the gap checkpoints after it
+/// through `end_rev`, the reapply rows and the rows through `end_rev`.
+/// `None`: no such checkpoint.
+async fn window_size(
+    conn: &mut PgConnection,
+    doc_id: Uuid,
+    start_rev: i64,
+    end_rev: i64,
+) -> Result<Option<(i64, Vec<i64>, i64)>> {
     let cp: Option<(i64, i64, Vec<i64>)> = sqlx::query_as(
         "SELECT rev, octet_length(state_bytes)::bigint, pending_revs
            FROM doc_history_checkpoints WHERE doc_id = $1 AND rev <= $2
@@ -1617,13 +1740,10 @@ pub(crate) async fn load_words_inputs(
     )
     .bind(doc_id)
     .bind(start_rev - 1)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
     let Some((cp_rev, cp_size, pending_revs)) = cp else {
-        return Err(StoreError::Invalid(format!(
-            "no checkpoint at or before rev {}",
-            start_rev - 1
-        )));
+        return Ok(None);
     };
     let (gaps_size, rows_size): (i64, i64) = sqlx::query_as(
         "SELECT coalesce((SELECT sum(octet_length(state_bytes)) FROM doc_history_checkpoints
@@ -1636,18 +1756,45 @@ pub(crate) async fn load_words_inputs(
     .bind(cp_rev)
     .bind(end_rev)
     .bind(&pending_revs)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
-    let bytes = cp_size + gaps_size + rows_size;
+    Ok(Some((
+        cp_rev,
+        pending_revs,
+        cp_size + gaps_size + rows_size,
+    )))
+}
+
+/// The replay input of the window `start_rev..=end_rev`: the latest
+/// checkpoint at or before `start_rev − 1`, the gap checkpoints after it
+/// through `end_rev`, its reapply rows and the rows through `end_rev`;
+/// sizes checked in SQL first. Reads in the caller's transaction and
+/// never commits it.
+async fn load_window_inputs(
+    tx: &mut Tx,
+    doc_id: Uuid,
+    start_rev: i64,
+    end_rev: i64,
+    cap: i64,
+) -> Result<WindowLoaded> {
+    let skip_revs: Vec<i64> =
+        sqlx::query_scalar("SELECT skip_revs FROM doc_history_state WHERE doc_id = $1")
+            .bind(doc_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let Some((cp_rev, pending_revs, bytes)) = window_size(tx, doc_id, start_rev, end_rev).await?
+    else {
+        return Ok(WindowLoaded::NoCheckpoint);
+    };
     if bytes > cap {
-        return Ok(WordsLoaded::TooLarge);
+        return Ok(WindowLoaded::TooLarge);
     }
     let checkpoint_state: Vec<u8> = sqlx::query_scalar(
         "SELECT state_bytes FROM doc_history_checkpoints WHERE doc_id = $1 AND rev = $2",
     )
     .bind(doc_id)
     .bind(cp_rev)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     let gap_states: Vec<(i64, Vec<u8>)> = sqlx::query_as(
         "SELECT rev, state_bytes FROM doc_history_checkpoints
@@ -1656,14 +1803,13 @@ pub(crate) async fn load_words_inputs(
     .bind(doc_id)
     .bind(cp_rev)
     .bind(end_rev)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
-    let reapply = rows_at(&mut tx, doc_id, &pending_revs).await?;
-    let rows = rows_in_range(&mut tx, doc_id, cp_rev, Some(end_rev), i64::MAX, i64::MAX)
+    let reapply = rows_at(tx, doc_id, &pending_revs).await?;
+    let rows = rows_in_range(tx, doc_id, cp_rev, Some(end_rev), i64::MAX, i64::MAX)
         .await
         .map_err(updates_error)?;
-    tx.commit().await?;
-    Ok(WordsLoaded::Load(WordsLoad {
+    Ok(WindowLoaded::Load(WindowLoad {
         checkpoint_state,
         reapply,
         rows,
@@ -1671,6 +1817,410 @@ pub(crate) async fn load_words_inputs(
         skip_revs: skip_revs.into_iter().collect(),
         bytes,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Views (M1.4)
+// ---------------------------------------------------------------------------
+
+/// What a view needs of an entry before it loads anything: its cache key's
+/// inputs and the rules that answer without a replay.
+#[derive(Debug, Clone)]
+pub(crate) struct ViewEntry {
+    /// The request's page, never read back from a row.
+    pub doc_id: Uuid,
+    pub id: i64,
+    pub kind: EntryKind,
+    pub start_rev: Option<i64>,
+    pub end_rev: Option<i64>,
+    pub baseline_id: Option<i64>,
+    pub meta: Value,
+    pub ended_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub sealed: bool,
+    pub words_pending: bool,
+    pub words_added: Option<i32>,
+    /// A builder holds the page's lease.
+    pub leased: bool,
+    /// `doc_history_heads.content_epoch`, 0 without a heads row.
+    pub content_epoch: i32,
+    /// A baseline entry whose baseline is in `skip_baselines`.
+    pub skipped: bool,
+    /// The page's history was built by an older builder version.
+    pub stale: bool,
+}
+
+impl ViewEntry {
+    /// A sealed session whose word count the builder attempted and left
+    /// NULL while no builder holds the page (Rulings on skipping the diff,
+    /// (b): a count in progress is taken under a live lease).
+    pub fn count_failed(&self) -> bool {
+        self.kind == EntryKind::Session
+            && self.sealed
+            && !self.words_pending
+            && self.words_added.is_none()
+            && !self.leased
+    }
+}
+
+type ViewEntryCols = (
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Value,
+    DateTime<Utc>,
+    DateTime<Utc>,
+    bool,
+    bool,
+    Option<i32>,
+    bool,
+    i32,
+    bool,
+    bool,
+);
+
+/// The entry `$1` of page `$2`, with its page's lease, epoch, skipped
+/// baselines and builder version (`$3` = [`BUILDER_VERSION`]).
+const VIEW_ENTRY: &str = "SELECT e.kind, e.start_rev, e.end_rev, e.baseline_id, e.meta,
+            e.ended_at, e.updated_at, e.sealed, e.words_pending, e.words_added,
+            coalesce(s.claimed_until > now(), false),
+            coalesce(h.content_epoch, 0),
+            coalesce(e.baseline_id = ANY(s.skip_baselines), false),
+            coalesce(s.builder_version < $3, false)
+       FROM doc_history_entries e
+       LEFT JOIN doc_history_state s ON s.doc_id = $2
+       LEFT JOIN doc_history_heads h ON h.doc_id = $2
+      WHERE e.id = $1 AND e.doc_id = $2";
+
+/// [`VIEW_ENTRY`] with the entry's id sets.
+const VIEW_ENTRY_SETS: &str = "SELECT e.kind, e.start_rev, e.end_rev, e.baseline_id, e.meta,
+            e.ended_at, e.updated_at, e.sealed, e.words_pending, e.words_added,
+            coalesce(s.claimed_until > now(), false),
+            coalesce(h.content_epoch, 0),
+            coalesce(e.baseline_id = ANY(s.skip_baselines), false),
+            coalesce(s.builder_version < $3, false),
+            e.ins_ids, e.del_ids
+       FROM doc_history_entries e
+       LEFT JOIN doc_history_state s ON s.doc_id = $2
+       LEFT JOIN doc_history_heads h ON h.doc_id = $2
+      WHERE e.id = $1 AND e.doc_id = $2";
+
+fn view_entry(doc_id: Uuid, id: i64, c: ViewEntryCols) -> Result<ViewEntry> {
+    Ok(ViewEntry {
+        doc_id,
+        id,
+        kind: c
+            .0
+            .parse()
+            .map_err(|e: crate::sessions::UnknownEntryKind| StoreError::Invalid(e.to_string()))?,
+        start_rev: c.1,
+        end_rev: c.2,
+        baseline_id: c.3,
+        meta: c.4,
+        ended_at: c.5,
+        updated_at: c.6,
+        sealed: c.7,
+        words_pending: c.8,
+        words_added: c.9,
+        leased: c.10,
+        content_epoch: c.11,
+        skipped: c.12,
+        stale: c.13,
+    })
+}
+
+/// Entry `entry_id` of page `doc_id`; `None` when the page has no such
+/// entry.
+pub(crate) async fn load_view_entry(
+    pool: &PgPool,
+    doc_id: Uuid,
+    entry_id: i64,
+) -> Result<Option<ViewEntry>> {
+    let row: Option<ViewEntryCols> = sqlx::query_as(VIEW_ENTRY)
+        .bind(entry_id)
+        .bind(doc_id)
+        .bind(BUILDER_VERSION)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|c| view_entry(doc_id, entry_id, c)).transpose()
+}
+
+/// What an entry's view replays: a baseline's state, the page's genesis
+/// checkpoint (the rollout entry) or a window.
+enum ViewSource {
+    Baseline(i64),
+    Genesis,
+    Window { start_rev: i64, end_rev: i64 },
+}
+
+fn view_source(e: &ViewEntry) -> Result<ViewSource> {
+    match (e.kind, e.baseline_id, e.start_rev, e.end_rev) {
+        (EntryKind::Baseline, Some(id), _, _) => Ok(ViewSource::Baseline(id)),
+        (EntryKind::Baseline, None, _, _) => Ok(ViewSource::Genesis),
+        (_, _, Some(start_rev), Some(end_rev)) => Ok(ViewSource::Window { start_rev, end_rev }),
+        _ => Err(StoreError::Invalid(format!("entry {} has no revs", e.id))),
+    }
+}
+
+/// The genesis checkpoint's size with its `pending_revs` rows, and those
+/// revs; `None` without a genesis checkpoint.
+async fn genesis_size(conn: &mut PgConnection, doc_id: Uuid) -> Result<Option<(i64, Vec<i64>)>> {
+    let row: Option<(Vec<i64>, i64)> = sqlx::query_as(
+        "SELECT c.pending_revs,
+                (octet_length(c.state_bytes)
+                 + coalesce((SELECT sum(octet_length(u.update_bytes)) FROM doc_updates u
+                              WHERE u.doc_id = $1 AND u.rev = ANY(c.pending_revs)), 0))::bigint
+           FROM doc_history_checkpoints c WHERE c.doc_id = $1 AND c.kind = 'genesis'",
+    )
+    .bind(doc_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|(pending, size)| (size, pending)))
+}
+
+/// The `octet_length` sum of the entry's replay input, before any bytes
+/// are read; `None` when what it replays is gone (a rebuild removed it).
+pub(crate) async fn view_input_bytes(pool: &PgPool, e: &ViewEntry) -> Result<Option<i64>> {
+    let mut conn = pool.acquire().await?;
+    match view_source(e)? {
+        ViewSource::Baseline(id) => Ok(sqlx::query_scalar(
+            "SELECT octet_length(state_bytes)::bigint FROM doc_history_baselines
+              WHERE id = $1 AND doc_id = $2",
+        )
+        .bind(id)
+        .bind(e.doc_id)
+        .fetch_optional(&mut *conn)
+        .await?),
+        ViewSource::Genesis => Ok(genesis_size(&mut conn, e.doc_id)
+            .await?
+            .map(|(size, _)| size)),
+        ViewSource::Window { start_rev, end_rev } => {
+            Ok(window_size(&mut conn, e.doc_id, start_rev, end_rev)
+                .await?
+                .map(|(_, _, size)| size))
+        }
+    }
+}
+
+/// What [`load_view_input`] loaded.
+// One per render, moved into the replay thread; a box would only add an
+// allocation (as `ViewInput`).
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ViewLoaded {
+    /// The entry, or what it replays, is gone.
+    NotFound,
+    /// The page's history is an older builder version's now.
+    Stale,
+    /// Over the cap.
+    TooLarge,
+    /// The entry's baseline is in `skip_baselines` now.
+    Skipped,
+    Load {
+        input: ViewInput,
+        ins: IdSet,
+        del: IdSet,
+        /// The entry as read in the load's transaction.
+        entry: ViewEntry,
+        /// The input's size as the load checked it against the cap.
+        bytes: i64,
+    },
+}
+
+/// What a state load found.
+enum StateLoaded<T> {
+    Missing,
+    TooLarge,
+    Load(T),
+}
+
+/// A baseline's state, its size checked in SQL first.
+async fn load_baseline_state(
+    tx: &mut Tx,
+    doc_id: Uuid,
+    baseline_id: i64,
+    cap: i64,
+) -> Result<StateLoaded<Vec<u8>>> {
+    let size: Option<i64> = sqlx::query_scalar(
+        "SELECT octet_length(state_bytes)::bigint FROM doc_history_baselines
+          WHERE id = $1 AND doc_id = $2",
+    )
+    .bind(baseline_id)
+    .bind(doc_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match size {
+        None => return Ok(StateLoaded::Missing),
+        Some(size) if size > cap => return Ok(StateLoaded::TooLarge),
+        Some(_) => {}
+    }
+    let state: Vec<u8> = sqlx::query_scalar(
+        "SELECT state_bytes FROM doc_history_baselines WHERE id = $1 AND doc_id = $2",
+    )
+    .bind(baseline_id)
+    .bind(doc_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(StateLoaded::Load(state))
+}
+
+/// The genesis checkpoint's state, its `pending_revs` rows, its rev and
+/// the size of both, checked in SQL first.
+async fn load_genesis_state(
+    tx: &mut Tx,
+    doc_id: Uuid,
+    cap: i64,
+) -> Result<StateLoaded<(Vec<u8>, Vec<DocUpdate>, i64, i64)>> {
+    let Some((size, pending_revs)) = genesis_size(tx, doc_id).await? else {
+        return Ok(StateLoaded::Missing);
+    };
+    if size > cap {
+        return Ok(StateLoaded::TooLarge);
+    }
+    let (rev, state): (i64, Vec<u8>) = sqlx::query_as(
+        "SELECT rev, state_bytes FROM doc_history_checkpoints
+          WHERE doc_id = $1 AND kind = 'genesis'",
+    )
+    .bind(doc_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let reapply = rows_at(tx, doc_id, &pending_revs).await?;
+    Ok(StateLoaded::Load((state, reapply, rev, size)))
+}
+
+/// Entry `entry_id`'s replay input, in one read transaction committed
+/// before it returns: the entry read again (a page lifted to an older
+/// builder version since is [`ViewLoaded::Stale`], a baseline skipped
+/// since is [`ViewLoaded::Skipped`]), then its baseline's state, the
+/// genesis checkpoint with its pending rows (the rollout entry), or its
+/// window, each size checked against `cap` before any bytes are read.
+/// Whatever a rebuild removed since is [`ViewLoaded::NotFound`].
+pub(crate) async fn load_view_input(
+    pool: &PgPool,
+    doc_id: Uuid,
+    entry_id: i64,
+    cap: i64,
+) -> Result<ViewLoaded> {
+    type Cols = (
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Value,
+        DateTime<Utc>,
+        DateTime<Utc>,
+        bool,
+        bool,
+        Option<i32>,
+        bool,
+        i32,
+        bool,
+        bool,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    );
+    let mut tx = begin_read(pool).await?;
+    let row: Option<Cols> = sqlx::query_as(VIEW_ENTRY_SETS)
+        .bind(entry_id)
+        .bind(doc_id)
+        .bind(BUILDER_VERSION)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(c) = row else {
+        tx.commit().await?;
+        return Ok(ViewLoaded::NotFound);
+    };
+    let (ins, del) = (id_set(c.14.as_deref())?, id_set(c.15.as_deref())?);
+    let entry = view_entry(
+        doc_id,
+        entry_id,
+        (
+            c.0, c.1, c.2, c.3, c.4, c.5, c.6, c.7, c.8, c.9, c.10, c.11, c.12, c.13,
+        ),
+    )?;
+    if entry.stale {
+        tx.commit().await?;
+        return Ok(ViewLoaded::Stale);
+    }
+    if entry.skipped {
+        tx.commit().await?;
+        return Ok(ViewLoaded::Skipped);
+    }
+    let input = match view_source(&entry)? {
+        ViewSource::Baseline(id) => match load_baseline_state(&mut tx, doc_id, id, cap).await? {
+            StateLoaded::Missing => None,
+            StateLoaded::TooLarge => {
+                tx.commit().await?;
+                return Ok(ViewLoaded::TooLarge);
+            }
+            StateLoaded::Load(state) => {
+                let bytes = i64::try_from(state.len()).unwrap_or(i64::MAX);
+                Some((ViewInput::State(state), bytes))
+            }
+        },
+        ViewSource::Genesis => match load_genesis_state(&mut tx, doc_id, cap).await? {
+            StateLoaded::Missing => None,
+            StateLoaded::TooLarge => {
+                tx.commit().await?;
+                return Ok(ViewLoaded::TooLarge);
+            }
+            StateLoaded::Load((checkpoint_state, reapply, rev, bytes)) => {
+                let skip_revs: Vec<i64> =
+                    sqlx::query_scalar("SELECT skip_revs FROM doc_history_state WHERE doc_id = $1")
+                        .bind(doc_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let input = ViewInput::Window(WindowInput {
+                    mode: ReplayMode::KeepDeleted,
+                    checkpoint_state,
+                    reapply,
+                    rows: Vec::new(),
+                    gap_states: Vec::new(),
+                    skip_revs: skip_revs.into_iter().collect(),
+                    end_rev: rev,
+                    merge_gap_at_end: false,
+                    progress: Progress::default(),
+                    hooks: ReplayHooks::default(),
+                });
+                Some((input, bytes))
+            }
+        },
+        ViewSource::Window { start_rev, end_rev } => {
+            match load_window_inputs(&mut tx, doc_id, start_rev, end_rev, cap).await? {
+                WindowLoaded::NoCheckpoint => None,
+                WindowLoaded::TooLarge => {
+                    tx.commit().await?;
+                    return Ok(ViewLoaded::TooLarge);
+                }
+                WindowLoaded::Load(l) => {
+                    let input = ViewInput::Window(WindowInput {
+                        mode: ReplayMode::KeepDeleted,
+                        checkpoint_state: l.checkpoint_state,
+                        reapply: l.reapply,
+                        rows: l.rows,
+                        gap_states: l.gap_states,
+                        skip_revs: l.skip_revs,
+                        end_rev,
+                        merge_gap_at_end: merge_gap_at_end(entry.kind, &entry.meta, end_rev),
+                        progress: Progress::default(),
+                        hooks: ReplayHooks::default(),
+                    });
+                    Some((input, l.bytes))
+                }
+            }
+        }
+    };
+    tx.commit().await?;
+    Ok(match input {
+        None => ViewLoaded::NotFound,
+        Some((input, bytes)) => ViewLoaded::Load {
+            input,
+            ins,
+            del,
+            entry,
+            bytes,
+        },
+    })
 }
 
 /// Stores an entry's word counts, under the lease.
@@ -1704,7 +2254,17 @@ pub(crate) async fn write_words(
 // Candidates and gauges
 // ---------------------------------------------------------------------------
 
-/// Dirty pages to build, oldest write first, debounced (Rulings).
+/// Dirty pages to build, oldest write first, debounced (Rulings). Pages an
+/// older builder built (or gave up after genesis) are candidates too,
+/// whatever their dirty flag, unless claimed or backing off, after every
+/// dirty page (Ruling 14's version lift): the rebuild a `BUILDER_VERSION`
+/// bump asks for then runs at this loop's pace, not the sweep's.
+///
+/// Two arms, each limited, so the dirty arm keeps its partial index
+/// (`doc_history_heads_dirty_idx`) and the lift arm scans only
+/// `doc_history_state`, which matches nothing once the lift is done: one
+/// statement that ORs them joins every head to its state row on every
+/// tick. A page both arms return counts once, in the dirty order.
 pub(crate) async fn dirty_candidates(
     pool: &PgPool,
     exclude: &[Uuid],
@@ -1713,17 +2273,34 @@ pub(crate) async fn dirty_candidates(
     max_lag_revs: i64,
 ) -> Result<Vec<Uuid>> {
     Ok(sqlx::query_scalar(
-        "SELECT h.doc_id FROM doc_history_heads h
-           LEFT JOIN doc_history_state s USING (doc_id)
-          WHERE h.dirty AND NOT h.doc_id = ANY($2)
-            AND (s.doc_id IS NULL
-                 OR ((s.retry_after IS NULL OR s.retry_after <= now())
-                     AND (s.claimed_until IS NULL OR s.claimed_until < now())
-                     AND s.builder_version <= $1))
-            AND (h.last_write_at < now() - make_interval(secs => $4)
-                 OR h.head_rev - coalesce(s.built_rev, 0) >= $5)
-          ORDER BY h.last_write_at
-          LIMIT $3",
+        "SELECT doc_id FROM (
+           (SELECT h.doc_id, h.dirty, h.last_write_at FROM doc_history_heads h
+              LEFT JOIN doc_history_state s USING (doc_id)
+             WHERE h.dirty
+               AND NOT h.doc_id = ANY($2)
+               AND (s.doc_id IS NULL
+                    OR ((s.retry_after IS NULL OR s.retry_after <= now())
+                        AND (s.claimed_until IS NULL OR s.claimed_until < now())
+                        AND s.builder_version <= $1))
+               AND (h.last_write_at < now() - make_interval(secs => $4)
+                    OR h.head_rev - coalesce(s.built_rev, 0) >= $5)
+             ORDER BY h.last_write_at
+             LIMIT $3)
+           UNION ALL
+           (SELECT h.doc_id, h.dirty, h.last_write_at FROM doc_history_state s
+              JOIN doc_history_heads h USING (doc_id)
+             WHERE s.builder_version < $1
+               AND NOT s.doc_id = ANY($2)
+               AND (s.genesis_rev IS NOT NULL OR s.retry_after = 'infinity')
+               AND (s.retry_after IS NULL OR s.retry_after <= now()
+                    OR s.retry_after = 'infinity')
+               AND (s.claimed_until IS NULL OR s.claimed_until < now())
+             ORDER BY h.dirty DESC, h.last_write_at
+             LIMIT $3)
+         ) c
+         GROUP BY doc_id
+         ORDER BY bool_or(dirty) DESC, min(last_write_at)
+         LIMIT $3",
     )
     .bind(BUILDER_VERSION)
     .bind(exclude)

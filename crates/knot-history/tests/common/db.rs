@@ -14,8 +14,8 @@ use knot_history::builder::{
 };
 use knot_history::canonical::visible_content;
 use knot_history::{
-    BuildLimits, Builder, CHECKPOINT_FLOOR_BYTES, PassResult, ReplayMode, Replayer, TestHooks,
-    history_permits,
+    BuildLimits, Builder, CHECKPOINT_FLOOR_BYTES, HistoryPermits, PassResult, ReplayMode, Replayer,
+    TestHooks, history_permits,
 };
 use knot_storage::{
     DocStore, DocUpdate, NewUpdate, PgDocStore, PgSnapshotStore, PgUpdatesStore, UpdateSource,
@@ -66,6 +66,7 @@ pub fn limits() -> BuildLimits {
         checkpoint_floor: CHECKPOINT_FLOOR_BYTES,
         debounce: Duration::ZERO,
         cpu_share: 1.0,
+        compute_wait: Duration::from_secs(5 * 60),
         hooks: TestHooks::default(),
     }
 }
@@ -304,16 +305,12 @@ impl Db {
             .id
     }
 
-    /// A builder with its own `workers` permits.
+    /// A builder with permits of its own (four workers).
     pub fn builder(&self, limits: BuildLimits) -> Arc<Builder> {
         self.builder_with(limits, history_permits(4))
     }
 
-    pub fn builder_with(
-        &self,
-        limits: BuildLimits,
-        permits: Arc<tokio::sync::Semaphore>,
-    ) -> Arc<Builder> {
+    pub fn builder_with(&self, limits: BuildLimits, permits: HistoryPermits) -> Arc<Builder> {
         Arc::new(Builder::new(
             self.pool.clone(),
             self.updates.clone(),
@@ -417,8 +414,50 @@ impl Db {
             .expect("history_since")
     }
 
-    /// A stamped room snapshot at `rev` (written now).
+    /// A stamped room snapshot at `rev` (written now), as a fixed room
+    /// writes it: `pending_revs = '{}'`, nothing was pending.
     pub async fn snapshot(&self, doc: Uuid, rev: i64, state: &[u8]) {
+        sqlx::query(
+            "INSERT INTO doc_snapshots
+                 (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch,
+                  pending_revs)
+             VALUES ($1, (SELECT coalesce(max(snapshot_seq), 0) + 1000000
+                            FROM doc_snapshots WHERE doc_id = $1),
+                     $2, '\\x00', $3, 0, '{}')",
+        )
+        .bind(doc)
+        .bind(state)
+        .bind(rev)
+        .execute(&self.pool)
+        .await
+        .expect("snapshot");
+    }
+
+    /// [`Db::snapshot`] written at `created_at`: the `doc_snapshots_epoch`
+    /// trigger keeps a stamped row immutable, so a test backdates a
+    /// snapshot at insert, never by `UPDATE`.
+    pub async fn snapshot_at(&self, doc: Uuid, rev: i64, state: &[u8], created_at: DateTime<Utc>) {
+        sqlx::query(
+            "INSERT INTO doc_snapshots
+                 (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch,
+                  pending_revs, created_at)
+             VALUES ($1, (SELECT coalesce(max(snapshot_seq), 0) + 1000000
+                            FROM doc_snapshots WHERE doc_id = $1),
+                     $2, '\\x00', $3, 0, '{}', $4)",
+        )
+        .bind(doc)
+        .bind(state)
+        .bind(rev)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await
+        .expect("snapshot");
+    }
+
+    /// A stamped room snapshot at `rev` as a room wrote it before the fix
+    /// (`pending_revs` NULL: its bytes may hold yrs's shifted encoding).
+    /// A caller on a schema before `20261114140000` uses this one.
+    pub async fn legacy_snapshot(&self, doc: Uuid, rev: i64, state: &[u8]) {
         sqlx::query(
             "INSERT INTO doc_snapshots
                  (doc_id, snapshot_seq, state_bytes, state_vector, snapshot_rev, epoch)

@@ -335,6 +335,18 @@ async fn bot_ownership_guards() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"]["code"], "bot.restricted_forbidden", "{body}");
+    // So is restoring a version of it as a new page, before any replay:
+    // `inner` has no entry 1, so a replay would answer 404.
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{inner}/history/entries/1/restore-as-new"),
+        Some(serde_json::json!({"version_label": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "bot.restricted_forbidden", "{body}");
 
     // Restricting a page: no key may, and a bot has nothing but keys (the
     // bot guard behind it is pinned in the handler's own tests).
@@ -2423,6 +2435,7 @@ async fn every_scope_override_matches_a_real_route() {
             .replace("{thread_id}", &id)
             .replace("{suggestion_id}", &id)
             .replace("{seq}", "1")
+            .replace("{eid}", "1")
             .replace("{format}", "docx");
         assert!(!uri.contains('{'), "unsubstituted parameter in {template}");
         let (st, body) = guards_bearer(&app, &key, method.as_str(), &uri, None).await;
@@ -2432,6 +2445,51 @@ async fn every_scope_override_matches_a_real_route() {
             scope.as_str()
         );
     }
+}
+
+/// Bots view and restore history entries under their page role, as
+/// people do (Rulings): a bot Editor's key with `read`, `update` and
+/// `create` reaches the three handlers, which answer for the missing
+/// entry (Restore as new page after Duplicate's checks, which a bot
+/// editor of a top-level, unrestricted page passes).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_editor_reaches_history_views_and_restores() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let bot = invite_bot(&app, &s, &state, "history-bot@example.com").await;
+    let (st, minted) = send(
+        &app,
+        &s,
+        "POST",
+        "/api/auth/api-keys",
+        Some(serde_json::json!({
+            "name": "ci", "scopes": ["read", "update", "create"], "user_id": bot,
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{minted}");
+    let key = minted["key"].as_str().unwrap().to_string();
+    let doc = matrix_doc(&app, &s, "page").await;
+
+    for (method, uri) in [
+        ("GET", format!("/api/docs/{doc}/history/entries/1/view")),
+        ("POST", format!("/api/docs/{doc}/history/entries/1/restore")),
+    ] {
+        let (st, body) = guards_bearer(&app, &key, method, &uri, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{method} {uri}: {body}");
+        assert_eq!(body["error"]["code"], "history.not_found", "{body}");
+    }
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{doc}/history/entries/1/restore-as-new"),
+        Some(serde_json::json!({"version_label": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "history.not_found", "{body}");
 }
 
 // ---------------------------------------------------------------------------
@@ -3802,6 +3860,7 @@ async fn subtree_ok_rows_match_the_real_router_methods() {
                 .replace("{doc_id}", inner)
                 .replace("{principal}", &format!("user:{id}"))
                 .replace("{seq}", "1")
+                .replace("{eid}", "1")
                 .replace("{item_index}", "0")
                 .replace("{format}", "md")
                 .replace("{emoji}", "x")
@@ -3993,4 +4052,59 @@ async fn subtree_key_cannot_restore_a_page_to_the_top_level() {
     let (st, body) =
         guards_bearer(&app, &key, "POST", &format!("/api/docs/{a}/restore"), None).await;
     assert!(st.is_success(), "restore under a live parent: {st} {body}");
+}
+
+/// S10: Restore as new page runs Duplicate's destination check before any
+/// replay, so with no entry to copy the answer still shows where the copy
+/// would go: beside the root is outside (404), beside a top-level root is
+/// the top level (403 `api_key.subtree_denied`), beside a page inside
+/// passes and only the missing entry answers. The 201 cases live in
+/// `history_view_integration.rs` and `move_to_subpage_integration.rs`.
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_key_restores_as_new_only_beside_pages_inside() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let top = matrix_doc(&app, &s, "top").await;
+    let root = child_doc(&app, &s, &top, "root").await;
+    let inside = child_doc(&app, &s, &root, "inside").await;
+    let key = subtree_key(&app, &s, &root, &ALL_SCOPES).await;
+    let top_key = subtree_key(&app, &s, &top, &ALL_SCOPES).await;
+    let restore_as_new = |key: String, doc: String| {
+        let app = app.clone();
+        async move {
+            guards_bearer(
+                &app,
+                &key,
+                "POST",
+                &format!("/api/docs/{doc}/history/entries/1/restore-as-new"),
+                Some(serde_json::json!({"version_label": "x"})),
+            )
+            .await
+        }
+    };
+
+    let (st, body) = restore_as_new(key.clone(), root.clone()).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "doc.not_found", "{body}");
+    let (st, body) = restore_as_new(top_key, top.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "api_key.subtree_denied", "{body}");
+    let (st, body) = restore_as_new(key.clone(), inside).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "history.not_found", "{body}");
+    // A page outside is out of reach before any of that.
+    let (st, body) = restore_as_new(key.clone(), top.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "acl.no_grant", "{body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{top}/move-to-subpage"),
+        Some(serde_json::json!({"start": "", "end": "", "title": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "acl.no_grant", "{body}");
 }

@@ -234,12 +234,14 @@ export const DiagramList = diagramListSchema;
 /**
  * A person on the page audit log (GET /api/docs/{id}/audit), as the page
  * history shows them: `key` and `name` are null for a former or anonymized
- * member, who reads "Former member". Never an email.
+ * member, who reads "Former member". Never an email. `bot` is true for a
+ * bot account; the server sends it only then, so it defaults to false.
  */
 const auditAuthorSchema = v.object({
   key: v.nullable(v.string()),
   name: v.nullable(v.string()),
   former: v.boolean(),
+  bot: v.fallback(v.boolean(), false),
 });
 export type AuditAuthor = v.InferOutput<typeof auditAuthorSchema>;
 export const AuditAuthor = auditAuthorSchema;
@@ -249,8 +251,9 @@ export const AuditAuthor = auditAuthorSchema;
  * `access`, `changes` or `other`; `actor_kind` is `user`, `admin_cli`,
  * `retention` or `system` (kept as plain strings so a newer server's value
  * still renders). `details` is the server's per-action whitelist; the raw
- * audit data never reaches the client. `id` is an opaque token, never the
- * stored event id, and is what `cursor` takes back.
+ * audit data never reaches the client (a `doc.export` made with an API key
+ * has `via_api_key: true`, never the key). `id` is an opaque token, never
+ * the stored event id, and is what `cursor` takes back.
  */
 const docAuditEventSchema = v.object({
   id: v.string(),
@@ -304,6 +307,111 @@ const docAuditPageSchema = v.object({
 });
 export type DocAuditPage = v.InferOutput<typeof docAuditPageSchema>;
 export const DocAuditPage = docAuditPageSchema;
+
+/**
+ * One of the user's favorite pages (GET /api/me/favorites), oldest star
+ * first. Only pages the user can read that are neither archived nor
+ * templates are listed.
+ */
+const favoriteSchema = v.object({
+  doc_id: v.string(),
+  title: v.string(),
+  icon: v.nullable(v.string()),
+  favorited_at: v.string(),
+});
+export type Favorite = v.InferOutput<typeof favoriteSchema>;
+export const Favorite = favoriteSchema;
+
+const historyKindSchema = v.picklist([
+  "session",
+  "restore",
+  "copy",
+  "import",
+  "template",
+  "erase",
+  "baseline",
+  "gap",
+]);
+export type HistoryKind = v.InferOutput<typeof historyKindSchema>;
+
+/**
+ * The author of a page history entry, or a person who accepted its
+ * suggestions. `name` is null for a person the server could not name. The
+ * API also sends `former`, always false since M4 was dropped; `v.object`
+ * drops it, and nothing in the client reads it.
+ */
+const historyAuthorSchema = v.object({
+  key: v.nullable(v.string()),
+  name: v.nullable(v.string()),
+});
+export type HistoryAuthor = v.InferOutput<typeof historyAuthorSchema>;
+export const HistoryAuthor = historyAuthorSchema;
+
+/**
+ * One timeline entry (GET /api/docs/{id}/history/entries). `author` is null
+ * for a gap or a baseline, or when the person is gone; the word counts are
+ * null until the builder counted them. `meta` holds the kind's allowlisted
+ * keys (`accepted_by`, `target_ended_at`, `source_title`, …) and is read
+ * defensively by `features/docs/history/timeline.ts`.
+ */
+const historyEntrySchema = v.object({
+  id: v.number(),
+  kind: historyKindSchema,
+  author: v.nullable(historyAuthorSchema),
+  started_at: v.string(),
+  ended_at: v.string(),
+  open: v.boolean(),
+  words_added: v.nullable(v.number()),
+  words_removed: v.nullable(v.number()),
+  meta: v.record(v.string(), v.unknown()),
+});
+export type HistoryEntry = v.InferOutput<typeof historyEntrySchema>;
+export const HistoryEntry = historyEntrySchema;
+
+/**
+ * One keyset page of a page's timeline: log entries newest first, then the
+ * pre-rollout baselines. `next_cursor` is null on the last page.
+ */
+const historyPageSchema = v.object({
+  history_since: v.string(),
+  history_complete: v.boolean(),
+  catching_up: v.boolean(),
+  unavailable: v.boolean(),
+  entries: v.array(historyEntrySchema),
+  next_cursor: v.nullable(v.string()),
+});
+export type HistoryPage = v.InferOutput<typeof historyPageSchema>;
+export const HistoryPage = historyPageSchema;
+
+/**
+ * The page as it was right after an entry
+ * (GET /api/docs/{id}/history/entries/{eid}/view). `changes` is what was
+ * rendered, not what was asked. `doc` is ProseMirror JSON, passed through
+ * as sent: the viewer's schema checks it (`viewerContent`).
+ */
+const historyViewSchema = v.object({
+  entry_id: v.number(),
+  kind: historyKindSchema,
+  changes: v.boolean(),
+  can_restore: v.boolean(),
+  can_erase: v.boolean(),
+  doc: v.looseObject({
+    type: v.literal("doc"),
+    content: v.optional(v.array(v.unknown())),
+  }),
+});
+export type HistoryView = v.InferOutput<typeof historyViewSchema>;
+export const HistoryView = historyViewSchema;
+
+/**
+ * What "Restore here" did (POST /api/docs/{id}/history/entries/{eid}/restore):
+ * `restored` undid the changes since the version, `fallback` replaced the
+ * whole page (comments may have lost their place), `unchanged` found the
+ * page already equal to the version and wrote nothing.
+ */
+const restoreAnswerSchema = v.object({ outcome: v.picklist(["restored", "fallback", "unchanged"]) });
+export type RestoreAnswer = v.InferOutput<typeof restoreAnswerSchema>;
+export const RestoreAnswer = restoreAnswerSchema;
 
 export function parse<T>(schema: v.GenericSchema<unknown, T>, data: unknown): T {
   return v.parse(schema, data);

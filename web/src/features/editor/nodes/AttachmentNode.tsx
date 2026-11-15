@@ -15,6 +15,7 @@ function Renderer({ node }: ReactNodeViewProps) {
     <NodeViewWrapper
       as="div"
       data-testid="attachment-node"
+      data-history-change={(node.attrs.historyChange as string | null | undefined) ?? undefined}
       style={{
         display: "inline-flex",
         gap: 8,

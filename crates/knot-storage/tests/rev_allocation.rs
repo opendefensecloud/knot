@@ -451,7 +451,7 @@ async fn purge_racing_a_snapshot_write_never_deadlocks() {
             };
             tokio::time::timeout(
                 Duration::from_secs(5),
-                snapshots.insert_stamped(d, stamp, b"state", b"sv"),
+                snapshots.insert_stamped(d, stamp, b"state", b"sv", None),
             )
             .await
         }

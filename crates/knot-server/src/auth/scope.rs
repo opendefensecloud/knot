@@ -76,6 +76,10 @@ pub const SUBTREE_DENIED: &[&str] = &[
     "/api/notifications/read",
     // Changes the user's own state.
     "/api/whats-new/seen",
+    // The user's stars across the workspace: per-user state, and DELETE
+    // checks no ACL.
+    "/api/me/favorites",
+    "/api/me/favorites/{doc_id}",
 ];
 
 /// S10: routes open to a subtree key, each with why that is safe. Every
@@ -107,6 +111,16 @@ pub const SUBTREE_OK: &[(Method, &str)] = &[
     (Method::GET, "/api/docs/{id}/history/entries"),
     (Method::GET, "/api/docs/{id}/history/{seq}/markdown"),
     (Method::POST, "/api/docs/{id}/history/{seq}/restore"),
+    (Method::GET, "/api/docs/{id}/history/entries/{eid}/view"),
+    (Method::POST, "/api/docs/{id}/history/entries/{eid}/restore"),
+    // Duplicate's checks: the copy goes beside the page, so a parent
+    // outside the root is refused by the ACL and the top level here.
+    (
+        Method::POST,
+        "/api/docs/{id}/history/entries/{eid}/restore-as-new",
+    ),
+    // The new page goes under `{id}`, inside the root.
+    (Method::POST, "/api/docs/{id}/move-to-subpage"),
     (Method::GET, "/api/docs/{id}/contributors"),
     (Method::GET, "/api/docs/{id}/audit"),
     (Method::GET, "/api/docs/{id}/short-link"),
@@ -213,6 +227,11 @@ pub const OVERRIDES: &[(Method, &str, Scope)] = &[
         "/api/docs/{id}/history/{seq}/restore",
         Scope::Update,
     ),
+    (
+        Method::POST,
+        "/api/docs/{id}/history/entries/{eid}/restore",
+        Scope::Update,
+    ),
     (Method::POST, "/api/docs/{id}/template", Scope::Update),
     (
         Method::POST,
@@ -241,7 +260,7 @@ pub const OVERRIDES: &[(Method, &str, Scope)] = &[
         "/api/docs/{id}/suggestions/{suggestion_id}/withdraw",
         Scope::Update,
     ),
-    // Renders a file; writes nothing.
+    // Renders a file; writes nothing but its `doc.export` audit row.
     (Method::POST, "/api/docs/{id}/export/{format}", Scope::Read),
     (Method::POST, "/api/docs/{id}/purge", Scope::Delete),
 ];
@@ -492,6 +511,47 @@ mod tests {
         assert!(!session_only(&Method::GET, "/api/docs/{id}/access"));
     }
 
+    /// The page audit log only reads: `read`, like the grants and access
+    /// listings, with the user's page role still deciding in the handler.
+    #[test]
+    fn the_page_audit_log_is_a_read_open_to_keys() {
+        let p = "/api/docs/{id}/audit";
+        assert_eq!(required_scope(&Method::GET, p), Scope::Read);
+        assert!(!session_only(&Method::GET, p));
+        assert!(!session_only(&Method::HEAD, p));
+    }
+
+    /// A history version's view only reads: `read` by the GET default, no
+    /// `OVERRIDES` row, open to keys (Rulings); the page role still
+    /// decides in the handler (editor+).
+    #[test]
+    fn the_history_entry_view_is_a_read_open_to_keys() {
+        let p = "/api/docs/{id}/history/entries/{eid}/view";
+        assert_eq!(required_scope(&Method::GET, p), Scope::Read);
+        assert!(!session_only(&Method::GET, p));
+        assert!(!session_only(&Method::HEAD, p));
+    }
+
+    /// A history entry's restore replaces the page's content, as the seq
+    /// restore and the Markdown import do: `update` through its
+    /// `OVERRIDES` row, open to keys (Rulings).
+    #[test]
+    fn the_history_entry_restore_requires_update() {
+        let p = "/api/docs/{id}/history/entries/{eid}/restore";
+        assert_eq!(up(p), Scope::Update);
+        assert!(!session_only(&Method::POST, p));
+    }
+
+    /// Restore as new page creates a page and copies boards and files, as
+    /// Duplicate does: `create` by the POST default, no `OVERRIDES` row,
+    /// open to keys (Rulings).
+    #[test]
+    fn the_history_restore_as_new_is_a_create() {
+        let p = "/api/docs/{id}/history/entries/{eid}/restore-as-new";
+        assert_eq!(required_scope(&Method::POST, p), Scope::Create);
+        assert!(!session_only(&Method::POST, p));
+    }
+
     /// axum answers HEAD with the GET handler, so a GET row covers HEAD too.
     #[test]
     fn head_on_a_session_only_get_route_is_session_only() {
@@ -528,12 +588,12 @@ mod tests {
     #[test]
     fn every_override_row_is_covered_by_a_test_above() {
         // Guards against adding a row without its dedicated test.
-        assert_eq!(OVERRIDES.len(), 14);
+        assert_eq!(OVERRIDES.len(), 15);
     }
 
     #[test]
     fn subtree_tables_have_their_rows() {
-        assert_eq!(SUBTREE_DENIED.len(), 10);
+        assert_eq!(SUBTREE_DENIED.len(), 12);
         assert!(
             SUBTREE_DENIED
                 .iter()

@@ -99,7 +99,7 @@ describe("DocTree — move to archive", () => {
     );
   });
 
-  it("gives viewers no row menu and no archive link", async () => {
+  it("gives viewers no More button, no archive item and no archive link", async () => {
     vi.stubGlobal("fetch", server("viewer"));
     renderTree();
 

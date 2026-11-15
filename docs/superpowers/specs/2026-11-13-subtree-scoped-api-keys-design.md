@@ -100,14 +100,18 @@ with a root and a destination `parent_id == None`, answers
 - `routes/api/docs.rs::require_editable_destination` — `POST /api/docs`,
   `POST /api/docs/from-template/{id}`, `POST /api/docs/{id}/move`.
 - `duplicate.rs`, the `None` arm of `source.parent_id` — duplicating a
-  top-level page.
+  top-level page, and restoring a version of one as a new page
+  (`POST /api/docs/{id}/history/entries/{eid}/restore-as-new` runs
+  Duplicate's check before its replay).
 
 Everything else follows from the rule without its own code:
 
 - Creating, moving or duplicating under a parent outside the subtree:
   `require_editable_parent` sees no access, `404 doc.not_found`. On `/api/docs/{id}…` routes the existing `require_doc_role` guard answers `403 acl.no_grant`, the same as for a nonexistent page.
-- Moving or duplicating the root itself: the destination is the root's
-  parent, outside, so refused the same way.
+- Moving or duplicating the root itself, or restoring a version of it as a
+  new page: the destination is the root's parent, outside, so refused the
+  same way. Move to subpage puts the new page under the page it was cut
+  from, inside the subtree.
 - Restoring a page whose parent is archived, missing or absent would land it at the top level: `403 api_key.subtree_denied` for a subtree key.
 - Deleting, archiving or restoring the root: allowed under the key's HTTP
   scopes; the root belongs to its subtree.
@@ -127,6 +131,7 @@ root with `403 api_key.subtree_denied`:
 | `/api/workspace/export`, `/api/workspace/import`, `/api/workspace/archive` (all methods) | workspace-wide by definition |
 | `GET /api/notifications`, `GET /api/notifications/unread_count`, `POST /api/notifications/read` | the user's inbox; doc-less notifications pass the visibility filter, and `read` checks no ACL at all |
 | `POST /api/whats-new/seen` | changes the user's state |
+| `GET /api/me/favorites`, `PUT/DELETE /api/me/favorites/{doc_id}` | the user's stars across the workspace; `DELETE` checks no ACL |
 
 `SUBTREE_OK` (rows of method and route template; an allow-list checked at runtime) lists the rest, each with a one-line reason: every
 `/api/docs/{id}/…`, `/api/blobs/{id}`, `/api/boards/{id}…` and

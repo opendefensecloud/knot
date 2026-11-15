@@ -150,8 +150,23 @@ impl Client {
         Self::join_as(h, client, None).await
     }
 
-    /// An editor of client id `client` whose edits credit `by_user`.
+    /// An editor of client id `client` whose edits credit `by_user`. It
+    /// applies the join's state, then the rows that park the room's pending
+    /// content (`JoinState::pending`), as the web editor does with the
+    /// handshake's frames.
     pub async fn join_as(h: &RoomHandle, client: u64, by_user: Option<Uuid>) -> Self {
+        Self::join_seeded(h, client, by_user, &[]).await
+    }
+
+    /// [`Client::join_as`] whose doc first applied `seed` (unrecorded): an
+    /// editor that already holds content, such as the update the room's
+    /// pending content waits on.
+    pub async fn join_seeded(
+        h: &RoomHandle,
+        client: u64,
+        by_user: Option<Uuid>,
+        seed: &[&[u8]],
+    ) -> Self {
         let conn = Uuid::new_v4();
         let (tx, rx) = mpsc::channel(8192);
         let (reply, joined) = oneshot::channel();
@@ -186,7 +201,13 @@ impl Client {
             recording,
             _sub: sub,
         };
+        for update in seed {
+            client.apply(update);
+        }
         client.apply(&state.update);
+        for row in &state.pending {
+            client.apply(row);
+        }
         client
     }
 

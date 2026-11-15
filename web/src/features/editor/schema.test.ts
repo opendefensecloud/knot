@@ -7,13 +7,15 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Editor } from "@tiptap/core";
+import { Editor, getSchema } from "@tiptap/core";
 import * as Y from "yjs";
 import { Awareness } from "y-protocols/awareness";
 
 import canonical from "../../../../tools/schema.json";
 
-import { createExtensions } from "./extensions";
+import { viewerSchema } from "../docs/history/viewerContent";
+
+import { createExtensions, createSchemaExtensions } from "./extensions";
 import { NODE_KINDS, MARK_KINDS } from "./schema";
 
 function mount(): Editor {
@@ -78,6 +80,9 @@ const REGISTERED_EXTENSIONS = [
   // that nests aria-level list items. Both produce ordinary nested lists.
   "knotListNesting",
   "knotMention",
+  // Plugin-only: node decorations giving each <ol> its widest marker's digit
+  // count, for the stylesheet's marker gutter. View-only; no document change.
+  "knotOrderedListMarkerGutter",
   "knotTaskList",
   // Keymap-only: End/Home move the DOM selection on a Mac; no document change.
   "lineBoundaryKeys",
@@ -318,5 +323,89 @@ describe("editor schema alignment", () => {
       check("mark", name, Object.keys(type.spec.attrs ?? {}), declaredMarks.get(name));
     }
     editor.destroy();
+  });
+});
+
+/**
+ * `createExtensions`' own list, in order, as it was before
+ * `createSchemaExtensions` was split out of it. Extension order decides
+ * plugin order (and, between equal priorities, keymap and paste-rule
+ * order), so the split must leave it exactly as it was.
+ */
+const CREATE_EXTENSIONS_ORDER = [
+  "starterKit",
+  "bullet_list",
+  "ordered_list",
+  "list_item",
+  "knotListNesting",
+  "knotOrderedListMarkerGutter",
+  "hard_break",
+  "horizontal_rule",
+  "code_block",
+  "underline",
+  "link",
+  "collaboration",
+  "collaborationCaret",
+  "image",
+  "attachment",
+  "excalidraw_board",
+  "knotTaskList",
+  "knotInternalLink",
+  "knotMention",
+  "knotDateTime",
+  "lineBoundaryKeys",
+  "table",
+  "table_row",
+  "table_cell",
+  "table_header",
+  "commentsHighlight",
+  "suggestionsHighlight",
+];
+
+function liveExtensions() {
+  const doc = new Y.Doc();
+  return createExtensions({
+    doc,
+    awareness: new Awareness(doc),
+    user: { name: "test", color: "#000000" },
+  });
+}
+
+const sortedKeys = (o: object) => Object.keys(o).sort();
+
+describe("schema-only extensions", () => {
+  it("createExtensions keeps its extension order", () => {
+    expect(liveExtensions().map((e) => e.name)).toEqual(CREATE_EXTENSIONS_ORDER);
+  });
+
+  it("the schema extensions have the live schema's nodes and marks and no collaboration", () => {
+    const live = getSchema(liveExtensions());
+    const extensions = createSchemaExtensions({});
+    const schema = getSchema(extensions);
+    expect(sortedKeys(schema.nodes)).toEqual(sortedKeys(live.nodes));
+    expect(sortedKeys(schema.marks)).toEqual(sortedKeys(live.marks));
+    const names = extensions.map((e) => e.name);
+    for (const name of [
+      "collaboration",
+      "collaborationCaret",
+      "commentsHighlight",
+      "suggestionsHighlight",
+    ]) {
+      expect(names).not.toContain(name);
+    }
+  });
+
+  it("the viewer schema differs from the live one only in code", () => {
+    const live = getSchema(liveExtensions());
+    const viewer = viewerSchema();
+    expect(sortedKeys(viewer.nodes)).toEqual(sortedKeys(live.nodes));
+    expect(sortedKeys(viewer.marks)).toEqual(
+      [...sortedKeys(live.marks), "historyDelete", "historyInsert"].sort(),
+    );
+    expect(viewer.nodes.code_block?.spec.marks).toBe("historyInsert historyDelete");
+    expect(viewer.marks.code?.spec.excludes).toBe("code");
+    // The live editor's schema is untouched.
+    expect(live.nodes.code_block?.spec.marks).toBe("");
+    expect(live.marks.code?.spec.excludes).toBe("_");
   });
 });

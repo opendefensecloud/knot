@@ -14,13 +14,12 @@
 //! kept gap whose apply triggered it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use knot_storage::{UpdatesStore, UpdatesStoreError};
 use sqlx::PgPool;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -32,19 +31,27 @@ use crate::pass::{
     CHECKPOINT_FLOOR_BYTES, CheckpointKind, PassInput, PassOutput, PassStats, Progress,
     ReplayHooks, Stage, WindowError, WindowInput, replay_window, run_pass,
 };
+use crate::permits::{ComputeGuard, HistoryPermits};
 use crate::replay::{ReplayError, ReplayMode};
 use crate::store::{
     self, Claim, FailureAction, GenesisLoaded, PassLimits, PassLoad, PassLoaded, PassWrite,
-    Recorded, WordsLoaded, Write,
+    Recorded, WindowLoaded, Write,
 };
 use crate::words::{WordCounts, entry_word_counts};
 
 /// The builder's version: a page built by an older one is rebuilt, a page
 /// built by a newer one is left alone.
-pub const BUILDER_VERSION: i32 = 1;
+///
+/// 2 rebuilds every page that 0.9.12 to 0.9.14 built (Ruling 14): their
+/// genesis started from a baseline's raw bytes, which yrs's shifted
+/// encoding of pending content can fill with phantoms, so genesis now
+/// starts from a baseline's trusted prefix, and the rebuild drops the gap
+/// checkpoints version 1 derived (`store::drop_version_1_gaps`). A later
+/// PR that changes what the builder writes bumps it again.
+pub const BUILDER_VERSION: i32 = 2;
 /// How often the builder looks for dirty pages.
 pub const TICK: Duration = Duration::from_secs(2);
-/// Passes a loop keeps queued at once (they wait for a worker permit).
+/// Passes a loop keeps queued at once (they wait for a builder slot).
 pub const CLAIM_LIMIT: i64 = 20;
 /// How often the sweep runs (idle sessions, older builds, late snapshots,
 /// the gauges).
@@ -146,6 +153,9 @@ pub struct BuildLimits {
     pub debounce: Duration,
     /// The share of one core each worker may use on average.
     pub cpu_share: f64,
+    /// How long a claimed page waits for a compute permit before its pass
+    /// gives it back (`store::PERMIT_WAIT`).
+    pub compute_wait: Duration,
     #[doc(hidden)]
     pub hooks: TestHooks,
 }
@@ -166,6 +176,7 @@ impl BuildLimits {
             checkpoint_floor: CHECKPOINT_FLOOR_BYTES,
             debounce: DEBOUNCE,
             cpu_share: cfg.history_cpu_share,
+            compute_wait: LEASE,
             hooks: TestHooks::default(),
         }
     }
@@ -185,28 +196,6 @@ pub fn pacing_delay(compute: Duration, cpu_share: f64) -> Duration {
         return Duration::ZERO;
     }
     compute.mul_f64(1.0 / cpu_share - 1.0)
-}
-
-/// The worker permits: `workers` replays at once per replica (at least
-/// one). `main.rs` creates them once; M1.4's views share them.
-pub fn history_permits(workers: usize) -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(workers.max(1)))
-}
-
-/// A worker permit while it rides a replay thread, with the thread's state
-/// for the stalled-thread gauge: 0 running, 1 timed out, 2 ended.
-struct ComputeGuard {
-    _permit: OwnedSemaphorePermit,
-    state: Arc<AtomicU8>,
-    stalled: Arc<AtomicI64>,
-}
-
-impl Drop for ComputeGuard {
-    fn drop(&mut self) {
-        if self.state.swap(2, Ordering::SeqCst) == 1 {
-            self.stalled.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
 }
 
 /// A page's membership in this replica's in-flight set; leaving removes it,
@@ -244,9 +233,12 @@ pub struct Builder {
     pool: PgPool,
     updates: Arc<dyn UpdatesStore>,
     limits: BuildLimits,
-    permits: Arc<Semaphore>,
+    permits: HistoryPermits,
     in_flight: Arc<Mutex<HashSet<Uuid>>>,
-    stalled: Arc<AtomicI64>,
+    /// The word count each page's words phase took and has not been granted
+    /// a compute permit for yet (doc id → entry id). Left in place when the
+    /// pass is aborted, so `release_on_shutdown` pends it again (Rulings).
+    words_waiting: Arc<Mutex<HashMap<Uuid, i64>>>,
 }
 
 impl Builder {
@@ -260,7 +252,7 @@ impl Builder {
         pool: PgPool,
         updates: Arc<dyn UpdatesStore>,
         limits: BuildLimits,
-        permits: Arc<Semaphore>,
+        permits: HistoryPermits,
     ) -> Builder {
         assert!(
             limits.replay_timeout < limits.lease && limits.words_timeout < limits.lease,
@@ -273,7 +265,7 @@ impl Builder {
             limits,
             permits,
             in_flight: Arc::new(Mutex::new(HashSet::new())),
-            stalled: Arc::new(AtomicI64::new(0)),
+            words_waiting: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -285,21 +277,19 @@ impl Builder {
     /// One pass over `doc_id` (module docs). Cancellation-safe: dropping
     /// the future leaves only the committed claim, which the lease and the
     /// backoff cover.
+    ///
+    /// The call holds a builder slot throughout, pacing included, and a
+    /// compute permit only per compute (M1.4 Rulings), so a view waits for
+    /// at most one builder compute per worker and never for a pacing sleep.
     pub async fn build_page(&self, doc_id: Uuid) -> PassResult {
         let Some(_in_flight) = InFlight::enter(&self.in_flight, doc_id) else {
             return PassResult::Busy;
         };
-        let Ok(permit) = self.permits.clone().acquire_owned().await else {
-            return PassResult::Busy;
-        };
+        let _slot = self.permits.builder_slot().await;
         let mut run = Run {
             b: self,
             doc_id,
-            guard: Some(ComputeGuard {
-                _permit: permit,
-                state: Arc::new(AtomicU8::new(0)),
-                stalled: self.stalled.clone(),
-            }),
+            renewed: Instant::now(),
             compute: Duration::ZERO,
             count_failure: true,
         };
@@ -308,13 +298,11 @@ impl Builder {
             metrics::counter!("knot_history_build_failures_total").increment(1);
         }
         self.set_stalled_gauge();
-        // Pacing (Rulings (CPU)): the permit is held through the sleep.
-        if let Some(guard) = run.guard.take() {
-            let delay = pacing_delay(run.compute, self.limits.cpu_share);
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-            drop(guard);
+        // Pacing (Rulings (CPU)): the builder slot is held through the
+        // sleep; the compute permits went back after each compute.
+        let delay = pacing_delay(run.compute, self.limits.cpu_share);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
         result
     }
@@ -397,13 +385,33 @@ impl Builder {
     }
 
     /// Releases the leases this builder holds on `ids` after a graceful
-    /// shutdown: `last_error = 'shutdown'`, the claim's failure taken back.
+    /// shutdown: `last_error = 'shutdown'`, the claim's failure taken back,
+    /// and a word count an aborted pass took while it waited for its
+    /// compute permit pending again (Rulings).
     #[doc(hidden)]
     pub async fn release_on_shutdown(&self, ids: &[Uuid]) {
-        match store::release_on_shutdown(&self.pool, self.id, ids).await {
-            Ok(n) => tracing::info!(released = n, "history builder: leases released on shutdown"),
+        let repend: Vec<i64> = {
+            let mut waiting = self
+                .words_waiting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ids.iter().filter_map(|id| waiting.remove(id)).collect()
+        };
+        match store::release_unfinished(&self.pool, self.id, ids, store::SHUTDOWN, &repend).await {
+            Ok(released) => tracing::info!(
+                released = released.len(),
+                "history builder: leases released on shutdown"
+            ),
             Err(e) => tracing::warn!(error = %e, "history builder: release on shutdown failed"),
         }
+    }
+
+    /// Clears `doc_id`'s record in `words_waiting`.
+    fn forget_words_wait(&self, doc_id: Uuid) {
+        self.words_waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&doc_id);
     }
 
     fn in_flight_ids(&self) -> Vec<Uuid> {
@@ -443,8 +451,7 @@ impl Builder {
     }
 
     fn set_stalled_gauge(&self) {
-        metrics::gauge!("knot_history_replay_threads_stalled")
-            .set(self.stalled.load(Ordering::SeqCst) as f64);
+        metrics::gauge!("knot_history_replay_threads_stalled").set(self.permits.stalled() as f64);
     }
 
     /// One refilling loop; returns the pages in flight when it stopped.
@@ -510,8 +517,6 @@ enum Computed<T> {
     Done(T),
     Panicked(String),
     TimedOut,
-    /// The permit went with an earlier timed-out thread.
-    NoPermit,
 }
 
 /// What a failed pass records.
@@ -551,9 +556,10 @@ enum Phase {
 struct Run<'a> {
     b: &'a Builder,
     doc_id: Uuid,
-    /// The worker permit, while it is ours.
-    guard: Option<ComputeGuard>,
-    /// The wall time of the computes whose guard came back.
+    /// When the lease was last taken or renewed (at most this long ago).
+    renewed: Instant,
+    /// The wall time of the computes whose thread came back, from each
+    /// grant: what pacing pays for.
     compute: Duration,
     /// Whether a `Failed` counts in `knot_history_build_failures_total`.
     count_failure: bool,
@@ -727,10 +733,14 @@ impl Run<'_> {
         PassResult::Failed
     }
 
-    /// Renews the lease before a compute; `Err` ends the pass.
+    /// Renews the lease; `Err` ends the pass.
     async fn renew(&mut self) -> Result<(), PassResult> {
+        let at = Instant::now();
         match store::renew_lease(&self.b.pool, self.doc_id, self.b.id, self.limits().lease).await {
-            Ok(Write::Done) => Ok(()),
+            Ok(Write::Done) => {
+                self.renewed = at;
+                Ok(())
+            }
             Ok(w) => Err(self.lost(w, "renewal").await),
             Err(e) => Err(self
                 .fail(Failure::plain(format!("lease renewal: {e}")))
@@ -738,35 +748,97 @@ impl Run<'_> {
         }
     }
 
-    /// Runs `f` on a replay thread with the worker permit as its guard.
+    /// Waits for a compute permit under the claim (Rulings): one acquire
+    /// future, created once and pinned, so the wait keeps its FIFO place
+    /// while the lease is renewed every `lease / 3`; at most
+    /// `compute_wait`, then the page goes back (`Err(Busy)`). Once granted,
+    /// the lease is renewed again, so the compute gets a full lease.
+    async fn compute_permit(&mut self) -> Result<ComputeGuard, PassResult> {
+        let permits = self.b.permits.clone();
+        let acquire = permits.compute();
+        tokio::pin!(acquire);
+        let deadline = tokio::time::sleep(self.limits().compute_wait);
+        tokio::pin!(deadline);
+        let every = self.limits().lease / 3;
+        let guard = loop {
+            let renew_at = tokio::time::Instant::from_std(self.renewed + every);
+            tokio::select! {
+                biased;
+                guard = &mut acquire => break guard,
+                _ = &mut deadline => return Err(self.permit_wait_expired().await),
+                _ = tokio::time::sleep_until(renew_at) => self.renew().await?,
+            }
+        };
+        // The compute is the count's attempt now.
+        self.b.forget_words_wait(self.doc_id);
+        self.renew().await?;
+        Ok(guard)
+    }
+
+    /// A permit wait that ran out: not an attempt and not a failure. The
+    /// claim is released with its failure taken back, and a word count the
+    /// words phase took for it is pending again, its page dirty.
+    async fn permit_wait_expired(&mut self) -> PassResult {
+        self.count_failure = false;
+        let taken: Vec<i64> = self
+            .b
+            .words_waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&self.doc_id)
+            .copied()
+            .into_iter()
+            .collect();
+        tracing::warn!(doc_id = %self.doc_id, words = ?taken, "history build gave its page back: no replay slot");
+        match store::release_unfinished(
+            &self.b.pool,
+            self.b.id,
+            &[self.doc_id],
+            store::PERMIT_WAIT,
+            &taken,
+        )
+        .await
+        {
+            Ok(_) => PassResult::Busy,
+            Err(e) => {
+                self.count_failure = true;
+                self.fail(Failure::plain(format!(
+                    "release after the permit wait: {e}"
+                )))
+                .await
+            }
+        }
+    }
+
+    /// Runs `f` on a replay thread holding a compute permit of its own
+    /// (`compute_permit`); the permit rides the thread until it ends, also
+    /// after a timeout. The `Duration` is the compute's, from the grant's
+    /// renewal to the thread's result (or the timeout); pacing adds it when
+    /// the thread came back. `Err` ends the pass (a lost lease, a store
+    /// error, or a permit wait that ran out).
     async fn compute<T: Send + 'static>(
         &mut self,
         timeout: Duration,
         f: impl FnOnce() -> T + Send + 'static,
-    ) -> Computed<T> {
-        let Some(guard) = self.guard.take() else {
-            return Computed::NoPermit;
-        };
-        let state = guard.state.clone();
+    ) -> Result<(Computed<T>, Duration), PassResult> {
+        let guard = self.compute_permit().await?;
+        let watch = guard.stall_watch();
         let started = Instant::now();
         let (result, back) = run_isolated(guard, timeout, f).await;
-        if let Some(guard) = back {
-            self.compute += started.elapsed();
-            self.guard = Some(guard);
-        }
-        match result {
+        let took = started.elapsed();
+        drop(back);
+        let computed = match result {
             Ok(v) => Computed::Done(v),
             Err(IsolateError::Panicked(m)) => Computed::Panicked(m),
             Err(IsolateError::TimedOut) => {
-                if state
-                    .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    self.b.stalled.fetch_add(1, Ordering::SeqCst);
-                }
+                watch.timed_out();
                 Computed::TimedOut
             }
+        };
+        if !matches!(computed, Computed::TimedOut) {
+            self.compute += took;
         }
+        Ok((computed, took))
     }
 
     /// The failure of a panic or a timeout at `stage` (Task 7 step 7).
@@ -884,9 +956,6 @@ impl Run<'_> {
                 }
             };
             self.log_input(loaded.bytes);
-            if let Err(r) = self.renew().await {
-                return r;
-            }
             let progress = Progress::default();
             let input = GenesisInput {
                 page_created_at: loaded.page_created_at,
@@ -899,7 +968,6 @@ impl Run<'_> {
                 hooks: self.hooks().replay.clone(),
             };
             let hold = self.hold(self.hooks().hold_compute);
-            let started = Instant::now();
             let computed = self
                 .compute(self.limits().replay_timeout, move || {
                     if !hold.is_zero() {
@@ -908,8 +976,12 @@ impl Run<'_> {
                     build_genesis(input)
                 })
                 .await;
+            let (computed, took) = match computed {
+                Ok(c) => c,
+                Err(r) => return r,
+            };
             metrics::histogram!("knot_history_replay_seconds", "phase" => "genesis")
-                .record(started.elapsed().as_secs_f64());
+                .record(took.as_secs_f64());
             let phase = Phase::Genesis {
                 baseline: loaded.start,
             };
@@ -939,10 +1011,16 @@ impl Run<'_> {
                         .compute_failed(phase, &progress, Interrupted::TimedOut, "genesis")
                         .await;
                 }
-                Computed::NoPermit => return PassResult::Failed,
             };
             return match store::write_genesis(&self.b.pool, self.doc_id, self.b.id, &out).await {
                 Ok(Write::Done) => {
+                    if let Some(baseline_id) = out.from_prefix {
+                        tracing::info!(
+                            doc_id = %self.doc_id,
+                            baseline_id,
+                            "the baseline may hold misplaced text; genesis starts from its trusted prefix"
+                        );
+                    }
                     record_stats(&out.stats);
                     PassResult::Genesis {
                         genesis_rev: out.checkpoint.rev,
@@ -979,9 +1057,6 @@ impl Run<'_> {
         };
         let load = *load;
         self.log_input(load.bytes);
-        if let Err(r) = self.renew().await {
-            return r;
-        }
         let PassLoad {
             built_rev,
             checkpoint_rev,
@@ -1045,7 +1120,6 @@ impl Run<'_> {
             hooks: self.hooks().replay.clone(),
         };
         let hold = self.hold(self.hooks().hold_compute);
-        let started = Instant::now();
         let computed = self
             .compute(self.limits().replay_timeout, move || {
                 if !hold.is_zero() {
@@ -1054,8 +1128,12 @@ impl Run<'_> {
                 run_pass(input)
             })
             .await;
+        let (computed, took) = match computed {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
         metrics::histogram!("knot_history_replay_seconds", "phase" => "build")
-            .record(started.elapsed().as_secs_f64());
+            .record(took.as_secs_f64());
         let phase = Phase::Pass {
             cp_rev: checkpoint_rev,
             cp_kind: checkpoint_kind,
@@ -1076,7 +1154,6 @@ impl Run<'_> {
                     .compute_failed(phase, &progress, Interrupted::TimedOut, "build")
                     .await;
             }
-            Computed::NoPermit => return PassResult::Failed,
         };
         self.write_pass(built_rev, rows_exhausted, out, &gap_times)
             .await
@@ -1150,8 +1227,17 @@ impl Run<'_> {
     }
 
     /// The words phase (step 9): sealed sessions' counts, oldest first,
-    /// while the words budget lasts, and at least one when `forced`.
+    /// while the words budget lasts, and at least one when `forced`. A
+    /// count it took and has no compute permit for yet is recorded in
+    /// `Builder::words_waiting`; every return clears the record, an abort
+    /// leaves it for `release_on_shutdown`.
     async fn words(&mut self, forced: bool) -> Result<(), PassResult> {
+        let done = self.count_words(forced).await;
+        self.b.forget_words_wait(self.doc_id);
+        done
+    }
+
+    async fn count_words(&mut self, forced: bool) -> Result<(), PassResult> {
         let (pool, doc_id, me) = (self.b.pool.clone(), self.doc_id, self.b.id);
         let started = Instant::now();
         let mut attempted = 0;
@@ -1169,6 +1255,11 @@ impl Run<'_> {
                 Ok(w) => return Err(self.lost(w, "the word count").await),
                 Err(e) => return Err(self.fail(Failure::plain(format!("words: {e}"))).await),
             }
+            self.b
+                .words_waiting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(doc_id, entry.id);
             attempted += 1;
             let load = match store::load_words_inputs(
                 &pool,
@@ -1179,15 +1270,21 @@ impl Run<'_> {
             )
             .await
             {
-                Ok(WordsLoaded::Load(l)) => l,
-                Ok(WordsLoaded::TooLarge) => {
+                Ok(WindowLoaded::Load(l)) => l,
+                Ok(WindowLoaded::TooLarge) => {
+                    self.b.forget_words_wait(doc_id);
                     words_skipped("too_large");
                     continue;
+                }
+                // `load_words_inputs` answers a missing checkpoint as the
+                // error below; the arm only keeps the match exhaustive.
+                Ok(WindowLoaded::NoCheckpoint) => {
+                    let e = format!("no checkpoint at or before rev {}", entry.start_rev - 1);
+                    return Err(self.fail(Failure::plain(format!("words read: {e}"))).await);
                 }
                 Err(e) => return Err(self.fail(Failure::plain(format!("words read: {e}"))).await),
             };
             self.log_input(load.bytes);
-            self.renew().await?;
             let progress = Progress::default();
             let input = WindowInput {
                 mode: ReplayMode::KeepDeleted,
@@ -1204,8 +1301,7 @@ impl Run<'_> {
             let hold = self.hold(self.hooks().hold_words);
             let fail_words = self.hooks().fail_words;
             let (inserted, deleted) = (entry.inserted, entry.deleted);
-            let t = Instant::now();
-            let computed = self
+            let (computed, took) = self
                 .compute(self.limits().words_timeout, move || {
                     if !hold.is_zero() {
                         std::thread::sleep(hold);
@@ -1216,9 +1312,9 @@ impl Run<'_> {
                     }
                     Ok::<_, WindowError>(entry_word_counts(replayer.doc(), &inserted, &deleted))
                 })
-                .await;
+                .await?;
             metrics::histogram!("knot_history_replay_seconds", "phase" => "words")
-                .record(t.elapsed().as_secs_f64());
+                .record(took.as_secs_f64());
             let counts: WordCounts = match computed {
                 Computed::Done(Ok(Ok(c))) => c,
                 Computed::Done(Ok(Err(_))) => {
@@ -1233,9 +1329,7 @@ impl Run<'_> {
                     words_skipped("gap_state");
                     continue;
                 }
-                Computed::Done(Err(WindowError::Cancelled)) | Computed::NoPermit => {
-                    return Ok(());
-                }
+                Computed::Done(Err(WindowError::Cancelled)) => return Ok(()),
                 Computed::Panicked(m) => {
                     tracing::warn!(%doc_id, entry = entry.id, error = m, "history word count panicked");
                     words_skipped("panic");
@@ -1247,7 +1341,8 @@ impl Run<'_> {
                         .increment(1);
                     tracing::error!(%doc_id, entry = entry.id, "history replay timed out");
                     words_skipped("timeout");
-                    // The permit stayed with the thread.
+                    // The permit stayed with the thread; the phase ends
+                    // (M1.3).
                     return Ok(());
                 }
             };

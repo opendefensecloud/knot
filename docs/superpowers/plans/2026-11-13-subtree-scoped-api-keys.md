@@ -263,8 +263,8 @@ git commit -m "refactor(acl): thread the key's scope root through AclCache and A
 ### Task 3: `api_keys.root_doc_id` in the database and the store
 
 **Files:**
-- Create: `migrations/20261114120000_api_keys_root_doc.sql` (column, index, KB005 trigger)
-- Create: `migrations/20261114120001_api_keys_root_doc_fk.sql` (foreign key)
+- Create: `migrations/20261115120000_api_keys_root_doc.sql` (column, index, KB005 trigger)
+- Create: `migrations/20261115120001_api_keys_root_doc_fk.sql` (foreign key)
 - Modify: `crates/knot-storage/src/api_key_store.rs` (`ApiKey`, `NewApiKey`, `COLUMNS`, `ApiKeyRow`, `api_key_from_row`, `create`, `map_insert_err`, `ApiKeyStoreError`)
 - Modify: every `NewApiKey { … }` literal (store tests, `routes/api/api_keys.rs`, `tests/api_keys_integration.rs::guards_mint_all_scopes_key`, others the compiler finds) with `root_doc_id: None`
 - Test: `crates/knot-storage/tests/api_keys.rs`, `crates/knot-storage/tests/migrations_apply.rs`
@@ -327,7 +327,7 @@ Expected: compile error, no field `root_doc_id`.
 
 - [ ] **Step 3: Write the migrations** — two files, because `knot_lock_tables` takes one mode for all its tables and must never wait for one while holding another (its contract in `20261107120000_history_log_columns.sql`). Adding the column needs ACCESS EXCLUSIVE on `api_keys` only; the foreign key needs SHARE ROW EXCLUSIVE on both tables, which blocks no reader of `documents`. sqlx runs each file in its own transaction.
 
-`migrations/20261114120000_api_keys_root_doc.sql`:
+`migrations/20261115120000_api_keys_root_doc.sql`:
 
 ```sql
 -- Subtree-scoped API keys, step 1 of 2 (S10,
@@ -344,7 +344,7 @@ Expected: compile error, no field `root_doc_id`.
 -- reads. Take it in bounded attempts (knot_lock_tables, 20261107120000).
 -- The previous release never names the column, so it keeps working.
 SET LOCAL lock_timeout = '5s';
-SELECT knot_lock_tables('20261114120000_api_keys_root_doc',
+SELECT knot_lock_tables('20261115120000_api_keys_root_doc',
                         ARRAY['api_keys']::regclass[],
                         'ACCESS EXCLUSIVE');
 
@@ -382,7 +382,7 @@ CREATE TRIGGER api_keys_root_doc_guard
     FOR EACH ROW EXECUTE FUNCTION api_keys_root_doc_guard();
 ```
 
-`migrations/20261114120001_api_keys_root_doc_fk.sql`:
+`migrations/20261115120001_api_keys_root_doc_fk.sql`:
 
 ```sql
 -- Subtree-scoped API keys, step 2 of 2 (S10).
@@ -394,7 +394,7 @@ CREATE TRIGGER api_keys_root_doc_guard
 -- validation scans api_keys, where every root_doc_id is still NULL.
 -- documents first: it is the busier table.
 SET LOCAL lock_timeout = '5s';
-SELECT knot_lock_tables('20261114120001_api_keys_root_doc_fk',
+SELECT knot_lock_tables('20261115120001_api_keys_root_doc_fk',
                         ARRAY['documents', 'api_keys']::regclass[],
                         'SHARE ROW EXCLUSIVE');
 

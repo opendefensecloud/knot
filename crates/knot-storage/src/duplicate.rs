@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use sqlx::types::JsonValue;
 use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 use uuid::Uuid;
@@ -18,7 +19,7 @@ use uuid::Uuid;
 use crate::blobs::{BlobMetadata, BlobStore, BlobStoreError};
 use crate::doc_store::{COLS, DocRow, DocStoreError, Document, doc_from_row, map_unique};
 use crate::placement::{self, Placement};
-use crate::updates_store::{NewUpdate, UpdateSource, append_in_tx};
+use crate::updates_store::{DOC_KEY_SHARE_SQL, NewUpdate, UpdateSource, append_in_tx};
 use crate::{audit, invalidations, lexorank};
 
 /// One page of the copy.
@@ -41,6 +42,21 @@ pub struct PageCopy {
     pub restricted: bool,
     /// The page's content as one Yjs update.
     pub state: Vec<u8>,
+    /// Set on the top page of a Restore as new page: the version its
+    /// content is. `None` for a copy of the page as it is now.
+    pub version: Option<CopyVersion>,
+}
+
+/// The version of the source a page copies (Restore as new page): its
+/// timeline entry, when that entry ended, and the content epoch it was
+/// replayed at.
+#[derive(Debug, Clone)]
+pub struct CopyVersion {
+    pub entry_id: i64,
+    pub at: DateTime<Utc>,
+    /// The copy is refused when the source's content epoch is another one
+    /// (an erase in between): the epoch Ruling.
+    pub content_epoch: i32,
 }
 
 /// One drawing of the copy.
@@ -94,7 +110,9 @@ pub struct DuplicateOutcome {
 
 /// Stores `plan` in one transaction. `DuplicateConflict` when the source
 /// changed since the plan was made: it, or its parent, was moved, archived or
-/// purged, or the bytes of a file it copies from the database are gone.
+/// purged, the bytes of a file it copies from the database are gone, or,
+/// for a version copy, the source's content epoch is no longer the one the
+/// version was replayed at.
 /// Nothing is written then; the objects copied outside the database stay
 /// recorded in `blob_copy_pending` for `purge_stale_copies`.
 pub async fn apply_duplicate(
@@ -122,6 +140,9 @@ async fn apply_once(
             }
             e => DocStoreError::Sqlx(e),
         })?;
+    if let Some(version) = &plan.top.version {
+        check_epoch(&mut tx, plan.source_id, version.content_epoch).await?;
+    }
     for (page, key) in plan.pages.iter().zip(subpage_keys(&plan.pages)) {
         insert_page(&mut tx, plan, page, &key).await?;
     }
@@ -135,14 +156,19 @@ async fn apply_once(
     }
     let mut pages = Vec::with_capacity(plan.pages.len() + 1);
     for page in std::iter::once(&plan.top).chain(&plan.pages) {
+        let mut meta = serde_json::json!({
+            "source_doc_id": page.source_id,
+            "source_title": page.source_title,
+        });
+        if let Some(version) = &page.version {
+            meta["version_entry_id"] = JsonValue::from(version.entry_id);
+            meta["version_at"] = JsonValue::from(version.at.to_rfc3339());
+        }
         let row = NewUpdate {
             by_user_id: Some(plan.actor),
             bytes: page.state.clone(),
             source: UpdateSource::Copy,
-            meta: Some(serde_json::json!({
-                "source_doc_id": page.source_id,
-                "source_title": page.source_title,
-            })),
+            meta: Some(meta),
         };
         // A new page: content epoch 0, rev 1.
         let persisted = append_in_tx(&mut tx, page.new_id, 0, &[row]).await?;
@@ -159,7 +185,11 @@ async fn apply_once(
         .bind(&copied)
         .execute(&mut *tx)
         .await?;
-    let data = JsonValue::from_iter([("source_id", JsonValue::from(plan.source_id.to_string()))]);
+    let mut data =
+        JsonValue::from_iter([("source_id", JsonValue::from(plan.source_id.to_string()))]);
+    if let Some(version) = &plan.top.version {
+        data["version_entry_id"] = JsonValue::from(version.entry_id);
+    }
     audit::record_in_tx_with_data(
         &mut tx,
         plan.ws,
@@ -203,6 +233,40 @@ async fn apply_once(
         top: doc_from_row(row),
         pages,
     })
+}
+
+/// `DuplicateConflict` unless `source`'s content epoch is `expected`: a
+/// version copy writes no version replayed before an erase (the epoch
+/// Ruling). Called right after the top page's insert, whose foreign key
+/// check holds the parent's row: the source's page row comes next and its
+/// heads row last, the M1.2 lock order a purge of the parent also follows
+/// (its cascade reaches the heads row last), so the two never deadlock.
+/// Both reads hold `FOR KEY SHARE` until the commit, so an erase, which
+/// locks the heads row `FOR UPDATE`, ends either before the copy reads it
+/// or after the copy commits. No heads row (a page never written) is
+/// epoch 0.
+async fn check_epoch(
+    conn: &mut PgConnection,
+    source: Uuid,
+    expected: i32,
+) -> Result<(), DocStoreError> {
+    let page: Option<i32> = sqlx::query_scalar(DOC_KEY_SHARE_SQL)
+        .bind(source)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if page.is_none() {
+        return Err(DocStoreError::DuplicateConflict);
+    }
+    let epoch: Option<i32> = sqlx::query_scalar(
+        "SELECT content_epoch FROM doc_history_heads WHERE doc_id = $1 FOR KEY SHARE",
+    )
+    .bind(source)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if epoch.unwrap_or(0) != expected {
+        return Err(DocStoreError::DuplicateConflict);
+    }
+    Ok(())
 }
 
 /// The keys of `pages`, in order: each parent's copies get `spread` keys in

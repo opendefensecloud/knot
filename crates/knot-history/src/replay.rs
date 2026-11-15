@@ -25,6 +25,12 @@
 //! the doc's blocks and delete set only; a replay from a checkpoint first
 //! re-applies the original rows of the claims open at it (its
 //! `pending_revs`), which re-parks their content under its real ids.
+//!
+//! Every room snapshot written before the fix, and so every baseline, used
+//! that encoding. [`may_be_shifted`] tells which bytes may hold it, and
+//! [`trusted_prefix`] keeps the part of them that cannot: the probe leaves
+//! such a legacy snapshot unchecked (Ruling 13), and genesis starts from a
+//! baseline's prefix (Ruling 15).
 
 use std::collections::BTreeMap;
 
@@ -35,8 +41,8 @@ use yrs::block::{
 use yrs::encoding::read::{Cursor, Read};
 use yrs::encoding::write::Write;
 use yrs::updates::decoder::{Decode, Decoder, DecoderV1};
-use yrs::updates::encoder::{Encoder, EncoderV1};
-use yrs::{Doc, ID, IdSet, Options, ReadTxn, StateVector, Transact, Update};
+use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+use yrs::{Doc, ID, IdSet, Options, ReadTxn, Snapshot, StateVector, Transact, Update};
 
 use crate::pass::{Progress, ReplayHooks, Stage};
 
@@ -58,6 +64,15 @@ impl ReplayMode {
                 ..Default::default()
             }),
         }
+    }
+
+    /// A doc of this mode whose own edits use `client`.
+    fn new_doc_as(self, client: ClientID) -> Doc {
+        Doc::with_options(Options {
+            client_id: client,
+            skip_gc: self == ReplayMode::KeepDeleted,
+            ..Default::default()
+        })
     }
 }
 
@@ -178,8 +193,22 @@ impl Replayer {
     /// delete set, no pending content; the caller re-applies the rows of
     /// the checkpoint's `pending_revs`).
     pub fn from_state(mode: ReplayMode, state: &[u8]) -> Result<Replayer, ReplayError> {
+        Replayer::from_doc(mode, mode.new_doc(), state)
+    }
+
+    /// [`Replayer::from_state`] on a doc whose own edits use `client`: a
+    /// revert's plan and scratch docs (`revert`), which write under a fresh
+    /// client id.
+    pub(crate) fn from_state_as(
+        mode: ReplayMode,
+        state: &[u8],
+        client: ClientID,
+    ) -> Result<Replayer, ReplayError> {
+        Replayer::from_doc(mode, mode.new_doc_as(client), state)
+    }
+
+    fn from_doc(mode: ReplayMode, doc: Doc, state: &[u8]) -> Result<Replayer, ReplayError> {
         let update = Update::decode_v1(state).map_err(|e| ReplayError::State(e.to_string()))?;
-        let doc = mode.new_doc();
         doc.transact_mut()
             .apply_update(update)
             .map_err(|e| ReplayError::State(e.to_string()))?;
@@ -418,8 +447,9 @@ impl Replayer {
     /// starts after clock 0 only where a Skip of the doc ends, which is
     /// where a range of `past_gap` starts. So: some GC block of the update
     /// starts before the start of a `past_gap` range of its client and ends
-    /// after it. `tests/common/underflow.rs` holds the reproducer: a GC
-    /// block 2#0..2#3 over the doc's Skip 2#0..2#2 and its held 2#2.
+    /// after it. knot-crdt's `tests/common/fixtures.rs` holds the reproducer
+    /// (`skip_underflow_case`): a GC block 2#0..2#3 over the doc's Skip
+    /// 2#0..2#2 and its held 2#2.
     ///
     /// yrs does not expose an update's blocks; a decoded update's items are
     /// never marked deleted (yrs marks them on integration), so its GC
@@ -691,10 +721,85 @@ fn highest_clock(set: &IdSet, client: &ClientID) -> u32 {
         .unwrap_or(0)
 }
 
+/// Whether state bytes may hold blocks at shifted clocks (Rulings 13 and
+/// 15): they name a block at or past its client's first gap.
+/// `Update::state_vector` stops at a client's first Skip, and v1 writes
+/// clocks implicitly after each Skip, so a shifted block sits there; so does
+/// real text a doc integrated past a lost edit, which cannot be told from
+/// it. `false` when the bytes do not decode.
+///
+/// knot-crdt's `pending::may_be_shifted`, ported (knot-history does not
+/// depend on knot-crdt). The plan's test also required that a fresh replay
+/// of the bytes hold pending content; knot-crdt's spike found shifted
+/// states that park nothing (a fresh apply integrates every phantom as
+/// text), so both crates dropped that half (the plan's Task 1 Step 6).
+pub fn may_be_shifted(state: &[u8]) -> bool {
+    let Ok(u) = Update::decode_v1(state) else {
+        return false;
+    };
+    let past = at_or_above(&u.insertions(true), &u.state_vector());
+    past.iter().any(|(_, ranges)| !ranges.is_empty())
+}
+
+/// The part of `state` that cannot hold a shifted block: every block below
+/// its client's first gap, as a doc that applies `state` holds it, with the
+/// deletions among them, and without the blocks whose origins lie outside
+/// that part. `None` when the bytes do not decode. knot-crdt's
+/// `pending::trusted_prefix`, ported:
+///
+/// 1. Apply `state` to a scratch doc that keeps deleted content. yrs can
+///    refuse shifted bytes part way (a shifted block names a string item as
+///    its parent) and then stops before the delete set: the scratch doc
+///    keeps the blocks yrs integrated before the refused one, and the
+///    delete set is applied alone.
+/// 2. Take its state vector without zero-clock entries. It stops at each
+///    client's first gap, and holds no pending content.
+/// 3. Take the scratch doc's delete set, cut to the ids below that state
+///    vector.
+/// 4. Encode the scratch doc's blocks up to that state vector with that
+///    delete set (`encode_state_from_snapshot`).
+/// 5. Apply those bytes to a fresh GC doc and return its own state
+///    ([`own_state`]): a prefix block whose origin lies outside the prefix
+///    parks there and is dropped.
+pub fn trusted_prefix(state: &[u8]) -> Option<Vec<u8>> {
+    let update = Update::decode_v1(state).ok()?;
+    let scratch = ReplayMode::KeepDeleted.new_doc();
+    let deletes = update.delete_set().clone();
+    let prefix = {
+        let mut txn = scratch.transact_mut();
+        if txn.apply_update(update).is_err() {
+            let mut encoder = EncoderV1::new();
+            encoder.write_var(0u32);
+            deletes.encode(&mut encoder);
+            let deletes = Update::decode_v1(&encoder.to_vec()).ok()?;
+            txn.apply_update(deletes).ok()?;
+        }
+        let sv: StateVector = txn
+            .state_vector()
+            .iter()
+            .filter(|(_, clock)| **clock > 0)
+            .map(|(client, clock)| (*client, *clock))
+            .collect();
+        let mut below = IdSet::new();
+        for (client, clock) in sv.iter() {
+            below.insert(ID::new(*client, 0), *clock);
+        }
+        let ds = txn.snapshot().delete_set.intersect(&below);
+        let mut encoder = EncoderV1::new();
+        txn.encode_state_from_snapshot(&Snapshot::new(sv, ds), &mut encoder)
+            .ok()?;
+        encoder.to_vec()
+    };
+    let fresh = ReplayMode::Gc.new_doc();
+    let mut txn = fresh.transact_mut();
+    txn.apply_update(Update::decode_v1(&prefix).ok()?).ok()?;
+    Some(own_state(&txn))
+}
+
 /// A doc's blocks and delete set as a v1 update, without its pending
 /// content (`encode_state_as_update` with an encoder skips
 /// `merge_pending_v1`; module docs).
-fn own_state<T: ReadTxn>(txn: &T) -> Vec<u8> {
+pub(crate) fn own_state<T: ReadTxn>(txn: &T) -> Vec<u8> {
     let mut encoder = EncoderV1::new();
     txn.encode_state_as_update(&StateVector::default(), &mut encoder);
     encoder.to_vec()
@@ -703,7 +808,7 @@ fn own_state<T: ReadTxn>(txn: &T) -> Vec<u8> {
 /// The blocks a doc holds, deleted ones included (its pending structs are
 /// not in the block store). `None` when the doc's own state does not decode
 /// again.
-fn held<T: ReadTxn>(txn: &T) -> Option<IdSet> {
+pub(crate) fn held<T: ReadTxn>(txn: &T) -> Option<IdSet> {
     Some(Update::decode_v1(&own_state(txn)).ok()?.insertions(true))
 }
 

@@ -1,3 +1,5 @@
+import type { AnyExtension } from "@tiptap/core";
+import Code from "@tiptap/extension-code";
 import Collaboration from "@tiptap/extension-collaboration";
 import CollaborationCaret from "@tiptap/extension-collaboration-caret";
 import Image from "@tiptap/extension-image";
@@ -24,6 +26,7 @@ import {
   KnotOrderedList,
 } from "./SchemaNameOverrides";
 import { ListNestingExtension } from "./ListNestingExtension";
+import { OrderedListMarkerGutter } from "./OrderedListMarkerGutter";
 import { TaskListExtension } from "./TaskListExtension";
 import { InternalLinkExtension } from "./InternalLinkExtension";
 import { MentionExtension, type MentionMember } from "./MentionExtension";
@@ -263,52 +266,85 @@ const KnotImage = Image.extend({
   },
 });
 
-/** Canonical Tiptap extension set that matches the server schema generated
- *  from `tools/schema.json`. History is disabled because Yjs UndoManager
- *  owns undo. */
-export function createExtensions(opts: {
-  doc: Y.Doc;
-  awareness: Awareness;
-  user: { name: string; color: string };
-  onSelectComment?: (commentId: string) => void;
-  onSelectSuggestion?: (id: string) => void;
+/** StarterKit as both editors register it. */
+function starterKit(viewer: boolean) {
+  return StarterKit.configure({
+    // v2 called this `history`. Still disabled for the same reason: the Yjs
+    // UndoManager owns undo, and a second history plugin fights it.
+    undoRedo: false,
+    codeBlock: false,
+    // Disable the camelCase node defaults; we re-add snake_case versions
+    // below so the Y.XmlFragment matches our canonical schema.
+    bulletList: false,
+    orderedList: false,
+    listItem: false,
+    hardBreak: false,
+    horizontalRule: false,
+    // Bundled by StarterKit from v3 on. Link and Underline are registered
+    // explicitly below, and registering either twice makes the second
+    // configure() lose the argument fight for the click handler.
+    link: false,
+    underline: false,
+    // Appends a paragraph to any document not ending in one. Harmless in a
+    // local editor; here it is a write to a shared CRDT that every peer
+    // receives and that reaches the markdown export, triggered by opening
+    // a document rather than by editing it.
+    trailingNode: false,
+    // Its list types default to camelCase, so it is inert against this
+    // schema. Off rather than registered-and-doing-nothing.
+    listKeymap: false,
+    // The viewer registers its own `code` (viewerCode).
+    ...(viewer ? { code: false } : {}),
+  });
+}
+
+/**
+ * The history viewer's `code` mark excludes only itself (ProseMirror's
+ * default), where the live one excludes every mark (`excludes: "_"`).
+ *
+ * The Markdown importer stores inline code with every active mark on one run
+ * (`from_markdown.rs`), so an imported `` [`x`](url) `` is `link` + `code`
+ * and `` **`x`** `` is `bold` + `code`, which y-tiptap shows live; and a
+ * past version's diff puts `historyInsert` / `historyDelete` on inline code
+ * too. Under the live `excludes`, `check()` rejects all of these.
+ */
+const viewerCode = Code.extend({ excludes: "code" });
+
+/**
+ * The history viewer's code block also takes the diff marks, which the live
+ * one (`marks: ""`) refuses, so a change typed into a code block can be
+ * highlighted in place.
+ */
+const viewerCodeBlock = MermaidCodeBlock.extend({ marks: "historyInsert historyDelete" });
+
+/**
+ * The content extensions of the editor: every node, mark and editing aid of
+ * `createExtensions`, in its order, without collaboration and the comment
+ * and suggestion highlights (which need a Y.Doc).
+ *
+ * `viewer: true` builds the read-only history viewer's set. Its schema
+ * differs from the live one in two places only: `code` excludes only itself
+ * and `code_block` allows the diff marks (`historyInsert historyDelete`, from
+ * `features/docs/history/HistoryDiffExtension`, which the viewer adds). Its
+ * boards open no editor and its task checkboxes do not tick.
+ */
+export function createSchemaExtensions(opts: {
   navigate?: NavigateFunction;
   fetchMembers?: () => Promise<MentionMember[]>;
-}) {
+  viewer?: boolean;
+}): AnyExtension[] {
+  const viewer = opts.viewer === true;
   return [
-    StarterKit.configure({
-      // v2 called this `history`. Still disabled for the same reason: the Yjs
-      // UndoManager owns undo, and a second history plugin fights it.
-      undoRedo: false,
-      codeBlock: false,
-      // Disable the camelCase node defaults; we re-add snake_case versions
-      // below so the Y.XmlFragment matches our canonical schema.
-      bulletList: false,
-      orderedList: false,
-      listItem: false,
-      hardBreak: false,
-      horizontalRule: false,
-      // Bundled by StarterKit from v3 on. Link and Underline are registered
-      // explicitly below, and registering either twice makes the second
-      // configure() lose the argument fight for the click handler.
-      link: false,
-      underline: false,
-      // Appends a paragraph to any document not ending in one. Harmless in a
-      // local editor; here it is a write to a shared CRDT that every peer
-      // receives and that reaches the markdown export, triggered by opening
-      // a document rather than by editing it.
-      trailingNode: false,
-      // Its list types default to camelCase, so it is inert against this
-      // schema. Off rather than registered-and-doing-nothing.
-      listKeymap: false,
-    }),
+    starterKit(viewer),
+    ...(viewer ? [viewerCode] : []),
     KnotBulletList,
     KnotOrderedList,
     KnotListItem,
     ListNestingExtension,
+    OrderedListMarkerGutter,
     KnotHardBreak,
     KnotHorizontalRule,
-    MermaidCodeBlock,
+    viewer ? viewerCodeBlock : MermaidCodeBlock,
     Underline,
     KnotLink.configure({
       openOnClick: false,
@@ -316,19 +352,10 @@ export function createExtensions(opts: {
       HTMLAttributes: { rel: "noopener noreferrer", target: "_blank" },
       isAllowedUri: (url, { defaultValidate }) => isInternalHref(url) || defaultValidate(url),
     }),
-    Collaboration.configure({ document: opts.doc }),
-    // Successor to CollaborationCursor, which has no v3 release. Only ever
-    // reads `provider.awareness`, so the shim stands. `user.color` must be
-    // 6-digit hex: the extension replaces anything else with "transparent",
-    // which renders an invisible caret rather than warning (see colorFor).
-    CollaborationCaret.configure({
-      provider: { awareness: opts.awareness } as never,
-      user: opts.user,
-    }),
     KnotImage.configure({ inline: false, allowBase64: false }),
     Attachment,
-    ExcalidrawBoard,
-    TaskListExtension,
+    viewer ? ExcalidrawBoard.configure({ readOnly: true }) : ExcalidrawBoard,
+    viewer ? TaskListExtension.configure({ readOnly: true }) : TaskListExtension,
     InternalLinkExtension.configure({ navigate: opts.navigate ?? null }),
     MentionExtension.configure({
       fetchMembers: opts.fetchMembers ?? (() => Promise.resolve([])),
@@ -340,6 +367,40 @@ export function createExtensions(opts: {
     KnotTableRow,
     KnotTableCell,
     KnotTableHeader,
+  ];
+}
+
+/** Canonical Tiptap extension set that matches the server schema generated
+ *  from `tools/schema.json`: the schema extensions, with collaboration
+ *  inserted right after `link` and the comment and suggestion highlights
+ *  appended, so the order is the one this editor has always had. History is
+ *  disabled because Yjs UndoManager owns undo. */
+export function createExtensions(opts: {
+  doc: Y.Doc;
+  awareness: Awareness;
+  user: { name: string; color: string };
+  onSelectComment?: (commentId: string) => void;
+  onSelectSuggestion?: (id: string) => void;
+  navigate?: NavigateFunction;
+  fetchMembers?: () => Promise<MentionMember[]>;
+}): AnyExtension[] {
+  const content = createSchemaExtensions({
+    navigate: opts.navigate,
+    fetchMembers: opts.fetchMembers,
+  });
+  const afterLink = content.findIndex((e) => e.name === "link") + 1;
+  return [
+    ...content.slice(0, afterLink),
+    Collaboration.configure({ document: opts.doc }),
+    // Successor to CollaborationCursor, which has no v3 release. Only ever
+    // reads `provider.awareness`, so the shim stands. `user.color` must be
+    // 6-digit hex: the extension replaces anything else with "transparent",
+    // which renders an invisible caret rather than warning (see colorFor).
+    CollaborationCaret.configure({
+      provider: { awareness: opts.awareness } as never,
+      user: opts.user,
+    }),
+    ...content.slice(afterLink),
     CommentsHighlightExtension.configure({
       doc: opts.doc,
       comments: [],

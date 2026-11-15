@@ -79,14 +79,17 @@ pub async fn serve(
     if rooms.acl_epoch(doc_id) != acl_epoch_at_check {
         revoked.cancel();
     }
+    // The handshake, sent by the writer before any frame the board room
+    // fans out, as in `room::serve` (boards park no rows, Ruling 10).
+    let mut handshake = Vec::new();
     if !revoked.is_cancelled() {
-        let _ = out_tx.send(encode_sync_step2(&joined.update)).await;
+        handshake.push(encode_sync_step2(&joined.update));
         // Ask the client for what we lack, exactly as `room::serve` does: the
         // board provider has the same offline gap (edits made while the
         // socket is down are applied locally but never sent) and the same
         // SyncStep1 answer. Sent as its own WS message — BoardProvider
         // decodes one y-protocol message per frame.
-        let _ = out_tx.send(encode_sync_step1(&joined.state_vector)).await;
+        handshake.push(encode_sync_step1(&joined.state_vector));
     }
 
     let (sink, mut stream) = socket.split();
@@ -100,6 +103,7 @@ pub async fn serve(
     let done = CancellationToken::new();
     let writer = tokio::spawn(crate::ws_writer::run(
         sink,
+        handshake,
         out_rx,
         shutdown.clone(),
         revoked.clone(),

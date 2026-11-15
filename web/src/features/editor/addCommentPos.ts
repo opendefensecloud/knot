@@ -4,8 +4,12 @@ export const ADD_COMMENT_BUTTON_WIDTH = 112;
 /** "Suggest change" at the same size, which sits right of "Add comment". */
 export const SUGGEST_CHANGE_BUTTON_WIDTH = 128;
 
-/** Both selection-float buttons and the 4px gap between them. */
-export const SELECTION_FLOAT_WIDTH = ADD_COMMENT_BUTTON_WIDTH + 4 + SUGGEST_CHANGE_BUTTON_WIDTH;
+/** "Move to subpage", right of "Suggest change" (editors only). */
+export const MOVE_TO_SUBPAGE_BUTTON_WIDTH = 132;
+
+/** All selection-float buttons and the 4px gaps between them. */
+export const SELECTION_FLOAT_WIDTH =
+  ADD_COMMENT_BUTTON_WIDTH + 4 + SUGGEST_CHANGE_BUTTON_WIDTH + 4 + MOVE_TO_SUBPAGE_BUTTON_WIDTH;
 
 /** Height reserved above the caret for the button, matching its 12px/py-0.5 box. */
 const BUTTON_HEIGHT = 32;

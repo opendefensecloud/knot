@@ -98,6 +98,11 @@ impl HttpBucket {
 /// pinned to a real route by a test.
 pub const NAMED_ROUTES: &[(&str, &str, HttpBucket)] = &[
     ("POST", "/api/docs/{id}/duplicate", HttpBucket::Expensive),
+    (
+        "POST",
+        "/api/docs/{id}/history/entries/{eid}/restore-as-new",
+        HttpBucket::Expensive,
+    ),
     ("POST", "/api/workspace/import", HttpBucket::Expensive),
     ("GET", "/api/workspace/export", HttpBucket::Export),
     ("GET", "/api/docs/{doc_id}/export", HttpBucket::Export),
@@ -499,6 +504,9 @@ mod tests {
             (Method::GET, "/api/docs"),
             (Method::GET, "/api/docs/{id}"),
             (Method::GET, "/api/docs/{id}/audit"),
+            // A history version's render is bounded per principal and by
+            // the compute permits instead (Rulings).
+            (Method::GET, "/api/docs/{id}/history/entries/{eid}/view"),
             (Method::GET, "/api/search"),
             (Method::GET, "/api/short-links/{code}"),
             (Method::GET, "/api/healthz"),
@@ -519,6 +527,37 @@ mod tests {
         for (method, template) in unlimited {
             assert_eq!(classify(&method, template), None, "{method} {template}");
         }
+    }
+
+    /// Restore as new page creates a page and copies boards and files, as
+    /// Duplicate does: the same `expensive` class (Rulings).
+    #[test]
+    fn history_restores_as_new_are_expensive() {
+        assert_eq!(
+            classify(
+                &Method::POST,
+                "/api/docs/{id}/history/entries/{eid}/restore-as-new"
+            ),
+            Some(HttpBucket::Expensive)
+        );
+    }
+
+    /// A history entry's restore is a page write like the Markdown
+    /// import: `classify`'s default for a mutating `/api` route, with no
+    /// `NAMED_ROUTES` row; its view is not limited (Rulings).
+    #[test]
+    fn history_entry_restores_are_writes() {
+        assert_eq!(
+            classify(
+                &Method::POST,
+                "/api/docs/{id}/history/entries/{eid}/restore"
+            ),
+            Some(HttpBucket::Write)
+        );
+        assert_eq!(
+            classify(&Method::GET, "/api/docs/{id}/history/entries/{eid}/view"),
+            None
+        );
     }
 
     #[test]
@@ -546,6 +585,27 @@ mod tests {
                 ("public", Rate::per_minute(600, 600), true),
             ]
         );
+    }
+
+    /// The real router, answering with the template each request matched
+    /// in an `x-test-matched-path` header.
+    fn probe_router() -> Router {
+        crate::router().layer(axum::middleware::from_fn(
+            |request: Request, next: Next| async move {
+                let template = request
+                    .extensions()
+                    .get::<MatchedPath>()
+                    .map(|matched| matched.as_str().to_owned());
+                let mut response = next.run(request).await;
+                if let Some(template) = template {
+                    response.headers_mut().insert(
+                        "x-test-matched-path",
+                        HeaderValue::from_str(&template).unwrap(),
+                    );
+                }
+                response
+            },
+        ))
     }
 
     /// The template a request to `uri` matched in the real router (`None`
@@ -585,22 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_named_template_is_a_real_route() {
-        let app = crate::router().layer(axum::middleware::from_fn(
-            |request: Request, next: Next| async move {
-                let template = request
-                    .extensions()
-                    .get::<MatchedPath>()
-                    .map(|matched| matched.as_str().to_owned());
-                let mut response = next.run(request).await;
-                if let Some(template) = template {
-                    response.headers_mut().insert(
-                        "x-test-matched-path",
-                        HeaderValue::from_str(&template).unwrap(),
-                    );
-                }
-                response
-            },
-        ));
+        let app = probe_router();
         for (method_name, template, _) in NAMED_ROUTES.iter().chain(HANDLER_CHARGED_ROUTES) {
             let uri = concrete_uri(template);
             assert_eq!(
@@ -614,6 +659,37 @@ mod tests {
             matched_template(&app, "POST", "/api/no/such/route").await,
             None
         );
+    }
+
+    /// The history entry routes exist in the real router under the
+    /// templates `classify` and `required_scope` are tested with.
+    #[tokio::test]
+    async fn the_history_entry_templates_are_real_routes() {
+        let app = probe_router();
+        let doc = "0193e0c0-0000-7000-8000-000000000001";
+        for (method_name, uri, template) in [
+            (
+                "GET",
+                format!("/api/docs/{doc}/history/entries/1/view"),
+                "/api/docs/{id}/history/entries/{eid}/view",
+            ),
+            (
+                "POST",
+                format!("/api/docs/{doc}/history/entries/1/restore"),
+                "/api/docs/{id}/history/entries/{eid}/restore",
+            ),
+            (
+                "POST",
+                format!("/api/docs/{doc}/history/entries/1/restore-as-new"),
+                "/api/docs/{id}/history/entries/{eid}/restore-as-new",
+            ),
+        ] {
+            assert_eq!(
+                matched_template(&app, method_name, &uri).await.as_deref(),
+                Some(template),
+                "{method_name} {uri}"
+            );
+        }
     }
 
     #[test]

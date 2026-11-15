@@ -29,6 +29,7 @@ import { SCOPE_TOOLTIP, suggestionScope, type SuggestionScope } from "../suggest
 import { isEditModeShortcut } from "../docs/editMode";
 import { stickyCoverBottom } from "../docs/readingAnchor";
 import { workspaceApi } from "../workspace/workspace.api";
+import { docsApi } from "../docs/docs.api";
 import { SELECTION_FLOAT_WIDTH, computeAddCommentPos } from "./addCommentPos";
 import { createExtensions } from "./extensions";
 import {
@@ -602,6 +603,32 @@ function EditorBody({
     setAddCommentPos(null);
   }
 
+  /** Moves the top-level blocks the selection touches into a new subpage;
+   *  the server leaves a link in their place and moves their discussion. */
+  async function handleMoveToSubpage() {
+    if (!editor || !selectionRange) return;
+    const { from, to } = selectionRange;
+    const firstBlock = editor.state.doc.resolve(from).node(1).textContent.trim();
+    const title = window.prompt(
+      "Move the selected blocks to a new subpage titled:",
+      firstBlock.slice(0, 120) || "Untitled",
+    );
+    if (title === null) return;
+    const { start, end } = encodeAnchorRange(editor, pair.doc, from, to);
+    if (!start || !end) {
+      notify("error", "Couldn't move this selection.");
+      return;
+    }
+    setAddCommentPos(null);
+    const r = await docsApi.moveToSubpage(docId, { start, end, title });
+    if ("error" in r) {
+      notify("error", "Couldn't move this selection to a subpage.");
+      return;
+    }
+    await qc.invalidateQueries({ queryKey: ["docs"] });
+    notify("info", `Moved to "${r.ok.title}".`);
+  }
+
   /** Opens the suggestion composer for the current selection (a replace) or
    *  caret (an insertion). Read fresh: the selection is what will be sent. */
   function startSuggestion() {
@@ -666,6 +693,16 @@ function EditorBody({
             >
               Suggest change
             </button>
+            {canEdit && (
+              <button
+                type="button"
+                data-testid="move-to-subpage-float"
+                onClick={() => { void handleMoveToSubpage(); }}
+                className="bg-surface text-fg border border-border rounded px-2 py-0.5 text-[12px] font-medium cursor-pointer shadow-md hover:bg-muted transition-colors"
+              >
+                Move to subpage
+              </button>
+            )}
           </div>
         )}
         <EditorContent editor={editor} />

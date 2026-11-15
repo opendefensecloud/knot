@@ -61,7 +61,6 @@ use std::collections::{HashMap, HashSet};
 use yrs::block::ItemContent;
 use yrs::branch::BranchPtr;
 use yrs::types::text::YChange;
-use yrs::updates::encoder::Encode;
 use yrs::{
     ArrayRef, Assoc, BranchID, ClientID, ID, Map, MapRef, Out, ReadTxn, StickyIndex, Text,
     Transact, Xml, XmlFragment,
@@ -105,9 +104,12 @@ pub struct TooDeep {
 /// its origin points at. A parent in the update is followed up through the
 /// update; a parent in `doc` is measured there. The structs yrs holds back
 /// as pending (a dependency is missing) are read along with the update, as
-/// it may be the one they wait for. A type whose parent is still missing
-/// counts from depth 0, so a deep subtree is refused even before it can be
-/// integrated.
+/// it may be the one they wait for, but only when yrs encodes them
+/// faithfully ([`crate::pending::pending_update_v1`]): a pending update
+/// that holds overlapping Skips encodes its blocks at shifted ids, which
+/// would misplace its types (Ruling 12); the authoritative check measures
+/// what drains. A type whose parent is still missing counts from depth 0,
+/// so a deep subtree is refused even before it can be integrated.
 ///
 /// The cost is a decode of the update (and of what is pending) and, for each
 /// new type that hangs under existing content, a walk up from there. An
@@ -119,8 +121,8 @@ pub fn check_update(doc: &DocHandle, update: &[u8]) -> Result<(), TooDeep> {
     let Ok(mut items) = decode_items(update) else {
         return Ok(());
     };
-    if let Some(pending) = txn.store().pending_update()
-        && let Ok(pending) = decode_items(&pending.update.encode_v1())
+    if let crate::pending::PendingV1::Faithful(pending) = crate::pending::pending_update_v1(&txn)
+        && let Ok(pending) = decode_items(&pending)
     {
         items.extend(pending);
     }
@@ -171,8 +173,11 @@ pub fn inserted_type_ids(update: &[u8]) -> Result<Vec<ID>, yrs::encoding::read::
 /// This is the authoritative post-apply check: unlike [`check_update`] it
 /// does not predict yrs, it reads the integrated document. Call it on the
 /// same transaction that applied the update (after its `commit`), with the
-/// type ids of the update and of anything that was pending before it (this
-/// update may be what the pending content was waiting for).
+/// type ids of the update and, when the apply changed the doc's pending
+/// content, of every block of the clients it inserted for (this update may
+/// be what the pending content was waiting for; the engine reads those
+/// from the doc's own blocks, never from yrs's encoding of the pending
+/// update, Ruling 12).
 pub fn deepest_inserted_type_depth<T: ReadTxn>(txn: &T, ids: &[ID], limit: usize) -> usize {
     let mut depths: HashMap<BranchID, usize> = HashMap::new();
     let mut deepest = 0;

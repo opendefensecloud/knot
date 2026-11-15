@@ -12,8 +12,10 @@
 //!
 //! The reads serve the page audit log (`GET /api/docs/{id}/audit`): one
 //! page's events newest first ([`list_doc_events`]) and its counts
-//! ([`doc_stats`]), all on `audit_events_target_idx (target_id, id)`.
+//! ([`doc_stats`]), all on `audit_events_target_idx (target_id, id)`, and
+//! which of the people they name are bots ([`bots_among`]).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -318,6 +320,20 @@ pub async fn list_doc_events(
         .bind(limit)
         .fetch_all(pool)
         .await
+}
+
+/// The bots (`users.kind = 'bot'`) among `user_ids`, so the page audit log
+/// can mark them. Ids with no `users` row, and people, are not in it.
+pub async fn bots_among(pool: &PgPool, user_ids: &[Uuid]) -> Result<HashSet<Uuid>, sqlx::Error> {
+    if user_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let bot_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM users WHERE id = ANY($1) AND kind = 'bot'")
+            .bind(user_ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(bot_ids.into_iter().collect())
 }
 
 /// The counts of `doc_id`'s events over all of them: per action, exports

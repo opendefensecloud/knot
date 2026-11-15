@@ -42,10 +42,16 @@ export type AuditSentence = {
 
 const FORMER_MEMBER = "Former member";
 
-/** A person's name, or "Former member" for a former, anonymized or missing one. */
-export function personLabel(person: AuditAuthor | null): string {
+/** A person's name, "CI bot (bot)" for a bot, or "Former member" for a
+ *  former, anonymized or missing one. `bot` is checked as `=== true`, since
+ *  a grant row's person comes from the unvalidated `details`. */
+export function personLabel(person: AuditAuthor | Omit<AuditAuthor, "bot"> | null): string {
   if (!person || person.former || !person.name) return FORMER_MEMBER;
-  return person.name;
+  return isBot(person) ? `${person.name} (bot)` : person.name;
+}
+
+function isBot(person: AuditAuthor | Omit<AuditAuthor, "bot">): boolean {
+  return "bot" in person && person.bot === true;
 }
 
 /** Who did it: a person, or the kind of process when no person did. */
@@ -83,7 +89,19 @@ function plural(count: number, singular: string, pluralForm = `${singular}s`): s
   return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
+const VIA_API_KEY = ", with an API key";
+
+/** The export sentence, ending in ", with an API key" when the server says one was used. */
 function describeExport(details: Record<string, unknown>): Omit<AuditSentence, "actor"> {
+  const sentence = describeExportedContent(details);
+  if (details.via_api_key !== true) return sentence;
+  if (sentence.textAfterLink !== undefined) {
+    return { ...sentence, textAfterLink: `${sentence.textAfterLink}${VIA_API_KEY}` };
+  }
+  return { ...sentence, text: `${sentence.text}${VIA_API_KEY}` };
+}
+
+function describeExportedContent(details: Record<string, unknown>): Omit<AuditSentence, "actor"> {
   const format = stringField(details, "format");
   const scope = stringField(details, "scope");
   const formatLabel = format ? (FORMAT_SENTENCE_LABELS[format] ?? format) : null;
@@ -109,7 +127,7 @@ function describeExport(details: Record<string, unknown>): Omit<AuditSentence, "
   return { text: `exported this page${asFormat}${withDiagrams}` };
 }
 
-type Principal = { kind: "user"; label: string } | { kind: "group"; label: string };
+type Principal = { kind: "user"; label: string; bot: boolean } | { kind: "group"; label: string };
 
 /** The person or group a grant row names; null for an old row without one. */
 function principalOf(details: Record<string, unknown>): Principal | null {
@@ -118,7 +136,8 @@ function principalOf(details: Record<string, unknown>): Principal | null {
   if (principal.kind === "user") {
     const person = principal.person as AuditAuthor | null | undefined;
     const label = personLabel(person ?? null);
-    return { kind: "user", label: label === FORMER_MEMBER ? "a former member" : label };
+    if (label === FORMER_MEMBER) return { kind: "user", label: "a former member", bot: false };
+    return { kind: "user", label, bot: person ? isBot(person) : false };
   }
   if (principal.kind === "group" && typeof principal.name === "string") {
     return { kind: "group", label: `group ${principal.name}` };
@@ -170,9 +189,11 @@ export function describeAuditEvent(event: DocAuditEvent): AuditSentence {
     case "doc.grant.delete": {
       const principal = principalOf(details);
       if (!principal) return { actor, text: "removed access to this page" };
+      // "CI bot (bot)'s access" doesn't read; a bot takes the long form.
+      const possessive = principal.kind === "user" && !principal.bot;
       return {
         actor,
-        text: principal.kind === "user" ? `removed ${principal.label}'s access` : `removed the access of ${principal.label}`,
+        text: possessive ? `removed ${principal.label}'s access` : `removed the access of ${principal.label}`,
       };
     }
     default:

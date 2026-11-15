@@ -134,6 +134,7 @@ struct BoardEntry {
 
 async fn export_workspace(State(state): State<AppState>, req: Request) -> Response {
     let is_get = req.method() == Method::GET;
+    let api_key_id = super::audit::api_key_id_of(&req);
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
@@ -175,6 +176,7 @@ async fn export_workspace(State(state): State<AppState>, req: Request) -> Respon
         && let Err(refusal) = record_zip_export(
             &state,
             &ctx,
+            api_key_id,
             &exported_doc_ids,
             serde_json::json!({"scope": "workspace"}),
         )
@@ -196,6 +198,7 @@ async fn export_doc(
     req: Request,
 ) -> Response {
     let is_get = req.method() == Method::GET;
+    let api_key_id = super::audit::api_key_id_of(&req);
     let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
     };
@@ -251,7 +254,8 @@ async fn export_doc(
         } else {
             serde_json::json!({"scope": "page"})
         };
-        if let Err(refusal) = record_zip_export(&state, &ctx, &exported_doc_ids, scope_fields).await
+        if let Err(refusal) =
+            record_zip_export(&state, &ctx, api_key_id, &exported_doc_ids, scope_fields).await
         {
             return refusal;
         }
@@ -262,8 +266,9 @@ async fn export_doc(
 /// Records a built Markdown zip in the audit log before it is sent: one
 /// `doc.export` row per page in it, all sharing one `export_id`.
 /// `scope_fields` (`scope`, and `root_id` for a subtree) gain `format`,
-/// `export_id` and `doc_count`; those two are for operators, the audit log
-/// never sends them. Fail closed: when the rows can't be written (or there
+/// `export_id`, `doc_count` and, for an export made with an API key,
+/// `api_key_id`; the last three are for operators, the audit log never
+/// sends them. Fail closed: when the rows can't be written (or there
 /// is no database to write them to) the refusal to send instead of the zip
 /// is the `Err`, `503 audit.unavailable`. So is an insert that hangs: it is
 /// given up on after `audit::EXPORT_AUDIT_WRITE_TIMEOUT`, well inside the
@@ -273,6 +278,7 @@ async fn export_doc(
 async fn record_zip_export(
     state: &AppState,
     ctx: &AuthContext,
+    api_key_id: Option<Uuid>,
     exported_doc_ids: &[Uuid],
     scope_fields: serde_json::Value,
 ) -> Result<(), Response> {
@@ -280,7 +286,7 @@ async fn record_zip_export(
         tracing::error!("export refused: no database to record it in");
         return Err(audit_unavailable());
     };
-    let mut audit_data = scope_fields;
+    let mut audit_data = super::audit::with_api_key_id(scope_fields, api_key_id);
     if let Some(fields) = audit_data.as_object_mut() {
         fields.insert("format".into(), "markdown_zip".into());
         fields.insert("export_id".into(), Uuid::new_v4().to_string().into());

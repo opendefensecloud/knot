@@ -6,6 +6,9 @@
 //! - PUT    /api/docs/{id}/restricted  body: {restricted}; make it a restriction boundary (owner)
 //! - GET    /api/docs/{id}/access  who can see it, for the permissions dialog (any reader)
 //! - GET    /api/docs/{id}/audit   the page audit log and its export stats (editor+, also archived; `routes::api::audit`)
+//! - GET    /api/docs/{id}/history/entries/{eid}/view  a past version, rendered (editor+, also archived; `routes::api::history`)
+//! - POST   /api/docs/{id}/history/entries/{eid}/restore  revert the page to that version (editor+, not archived; `routes::api::history`)
+//! - POST   /api/docs/{id}/history/entries/{eid}/restore-as-new  body: {version_label, ended_at?}; copy that version right after it, as Duplicate (editor+ here and on the parent; `routes::api::history`)
 //! - POST   /api/docs/{id}/move   reparent / reorder
 //! - POST   /api/docs/{id}/duplicate  body: {include_subpages?}; copy right after it (editor+ here and on the parent)
 //! - DELETE /api/docs/{id}        move to the archive, with its subtree (editor+)
@@ -73,6 +76,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/docs/{id}", get(get_one).patch(rename).delete(archive))
         .route("/api/docs/{id}/move", post(move_doc))
         .route("/api/docs/{id}/duplicate", post(duplicate))
+        .route("/api/docs/{id}/move-to-subpage", post(move_to_subpage))
         .route(crate::auth::ARCHIVE_RESTORE_ROUTE, post(restore))
         .route(crate::auth::ARCHIVE_PURGE_ROUTE, post(purge))
         .route(
@@ -97,6 +101,18 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/docs/{id}/history/entries",
             get(crate::routes::api::history::entries),
+        )
+        .route(
+            "/api/docs/{id}/history/entries/{eid}/view",
+            get(crate::routes::api::history::view_entry),
+        )
+        .route(
+            "/api/docs/{id}/history/entries/{eid}/restore",
+            post(crate::routes::api::history::restore_entry),
+        )
+        .route(
+            "/api/docs/{id}/history/entries/{eid}/restore-as-new",
+            post(crate::routes::api::history::restore_as_new),
         )
         .route(
             "/api/docs/{id}/history/{seq}/markdown",
@@ -255,7 +271,7 @@ async fn caller_doc_response(
 }
 
 /// [`caller_doc_response`] as a JSON answer with `status`.
-async fn doc_answer(
+pub(crate) async fn doc_answer(
     state: &AppState,
     ctx: &AuthContext,
     status: StatusCode,
@@ -776,6 +792,7 @@ async fn duplicate(
         doc_id,
         body.include_subpages,
         permit,
+        None,
     );
     match answer.await {
         Ok(Ok(top)) => doc_answer(&state, &ctx, StatusCode::CREATED, &top).await,
@@ -787,10 +804,97 @@ async fn duplicate(
     }
 }
 
+#[derive(Deserialize)]
+struct MoveToSubpageRequest {
+    /// Base64 RelativePositions of the selection, as comment anchors.
+    start: String,
+    end: String,
+    title: String,
+}
+
+/// Move the top-level blocks a selection touches into a new child page,
+/// with their comments and suggestions. See `crate::move_to_subpage`.
+#[tracing::instrument(skip_all, name = "docs.move_to_subpage")]
+async fn move_to_subpage(
+    State(state): State<AppState>,
+    Path(doc_id): Path<Uuid>,
+    req: Request,
+) -> Response {
+    use crate::move_to_subpage::MoveError;
+    use base64::Engine as _;
+    let Some(ctx) = req.extensions().get::<AuthContext>().cloned() else {
+        return json_err(StatusCode::UNAUTHORIZED, "auth.session_required", "");
+    };
+    let Some(role) = req.extensions().get::<EffectiveDocRole>().copied() else {
+        return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
+    };
+    let Ok(body) = read_json::<MoveToSubpageRequest>(req).await else {
+        return json_err(StatusCode::BAD_REQUEST, "bad_request", "");
+    };
+    let decode = |s: &str| base64::engine::general_purpose::STANDARD.decode(s);
+    let (Ok(start), Ok(end)) = (decode(&body.start), decode(&body.end)) else {
+        return json_err(StatusCode::BAD_REQUEST, "move.invalid_anchor", "");
+    };
+    let title = match body.title.trim() {
+        "" => "Untitled".to_string(),
+        t => t.to_string(),
+    };
+    let result = match crate::move_to_subpage::check(&state, &ctx, role.0, doc_id).await {
+        Ok(_) => match crate::quota::enforce_pages(&state, &ctx, 1).await {
+            Ok(()) => match crate::move_to_subpage::start(
+                state.clone(),
+                ctx.clone(),
+                doc_id,
+                (start, end),
+                title,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(MoveError::Internal("move task ended".into())),
+            },
+            Err(response) => return response,
+        },
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(moved) => match caller_doc_response(&state, &ctx, &moved.doc).await {
+            Ok(doc) => (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "doc": doc,
+                    "moved": { "comments": moved.comments, "suggestions": moved.suggestions },
+                })),
+            )
+                .into_response(),
+            Err(response) => response,
+        },
+        Err(MoveError::EditorRequired) => {
+            json_err(StatusCode::FORBIDDEN, "acl.editor_required", "")
+        }
+        Err(MoveError::NotFound) => json_err(StatusCode::NOT_FOUND, "doc.not_found", ""),
+        Err(MoveError::IsTemplate) => {
+            json_err(StatusCode::UNPROCESSABLE_ENTITY, "doc.is_template", "")
+        }
+        Err(MoveError::Archived) => doc_archived(),
+        Err(MoveError::Destination(response)) => response,
+        Err(MoveError::AnchorLost) => {
+            json_err(StatusCode::UNPROCESSABLE_ENTITY, "move.anchor_lost", "")
+        }
+        Err(MoveError::SuggestionApplying) => {
+            json_err(StatusCode::CONFLICT, "move.suggestion_applying", "")
+        }
+        Err(MoveError::Internal(e)) => {
+            tracing::error!(error = %e, "move to subpage");
+            internal()
+        }
+    }
+}
+
 /// `503 doc.duplicate_busy`: every duplicate permit stayed taken for the
 /// busy wait. A retry is worth it once a copy may have ended: after
 /// [`BUSY_WAIT`], the time a duplicate waits for a permit.
-fn duplicate_busy() -> Response {
+pub(crate) fn duplicate_busy() -> Response {
     let mut response = json_err(
         StatusCode::SERVICE_UNAVAILABLE,
         "doc.duplicate_busy",
@@ -802,7 +906,7 @@ fn duplicate_busy() -> Response {
     response
 }
 
-fn duplicate_error(e: DuplicateError) -> Response {
+pub(crate) fn duplicate_error(e: DuplicateError) -> Response {
     match e {
         DuplicateError::EditorRequired => {
             json_err(StatusCode::FORBIDDEN, "acl.editor_required", "")
@@ -1383,7 +1487,8 @@ async fn create_from_template_inline(
     }
 }
 
-async fn read_json<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, ()> {
+/// `req`'s body as JSON (at most 64 KiB); `Err` when it is not `T`.
+pub(crate) async fn read_json<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, ()> {
     let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024)
         .await
         .map_err(|_| ())?;

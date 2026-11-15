@@ -181,10 +181,11 @@ async fn login(app: &axum::Router, email: &str) -> Session {
     }
 }
 
-/// A response: status, `Cache-Control` and body text.
+/// A response: status, `Cache-Control`, `Content-Type` and body text.
 struct Answer {
     status: StatusCode,
     cache_control: Option<String>,
+    content_type: Option<String>,
     body: String,
 }
 
@@ -231,14 +232,18 @@ async fn send(
     .unwrap();
     let r = fx.app.clone().oneshot(req).await.unwrap();
     let status = r.status();
-    let cache_control = r
-        .headers()
-        .get("cache-control")
-        .map(|v| v.to_str().unwrap().to_string());
+    let header = |name: &str| {
+        r.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+    let cache_control = header("cache-control");
+    let content_type = header("content-type");
     let bytes = r.into_body().collect().await.unwrap().to_bytes();
     Answer {
         status,
         cache_control,
+        content_type,
         body: String::from_utf8_lossy(&bytes).into_owned(),
     }
 }
@@ -388,6 +393,7 @@ fn limits() -> BuildLimits {
         checkpoint_floor: CHECKPOINT_FLOOR_BYTES,
         debounce: Duration::ZERO,
         cpu_share: 1.0,
+        compute_wait: Duration::from_secs(5 * 60),
         hooks: TestHooks::default(),
     }
 }
@@ -863,6 +869,62 @@ async fn catching_up_is_set_while_the_builder_lags() {
     assert_eq!(flags(&fx, lagging).await, (false, true, 1));
 }
 
+/// `UPDATE doc_history_state SET {set} WHERE doc_id = $1`, with `$2` bound
+/// to `version`.
+async fn set_version(fx: &Fixture, doc: Uuid, set: &str, version: i32) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE doc_history_state SET {set} WHERE doc_id = $1"
+    )))
+    .bind(doc)
+    .bind(version)
+    .execute(&fx.pool)
+    .await
+    .unwrap_or_else(|e| panic!("{set}: {e}"));
+}
+
+/// Ruling 14: a page an older builder built lists as catching up until a
+/// builder of this version has rebuilt it, also when the older one gave it
+/// up (whose entries can hold phantoms, so it is not reported unavailable).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_an_older_builder_built_lists_as_catching_up() {
+    use knot_history::builder::BUILDER_VERSION;
+    let fx = fixture().await;
+    let older = page(&fx, "Older").await;
+    append(&fx, older, fx.editor.id, paragraphs(4, 3)).await;
+    build(&fx, older).await;
+    assert_eq!(flags(&fx, older).await, (false, false, 1));
+    set_version(&fx, older, "builder_version = $2", BUILDER_VERSION - 1).await;
+    assert_eq!(
+        flags(&fx, older).await,
+        (true, false, 1),
+        "the flag changes, not the entries"
+    );
+    build(&fx, older).await;
+    assert_eq!(flags(&fx, older).await, (false, false, 1));
+
+    // Never edited: neither a heads nor a state row.
+    let untouched = page(&fx, "Untouched").await;
+    assert_eq!(flags(&fx, untouched).await, (false, false, 0));
+
+    // Given up by the older builder after genesis: catching up, not
+    // unavailable; given up by this one: unavailable, as before.
+    let given_up = page(&fx, "Given up").await;
+    append(&fx, given_up, fx.editor.id, paragraphs(5, 2)).await;
+    build(&fx, given_up).await;
+    set_version(
+        &fx,
+        given_up,
+        "builder_version = $2, retry_after = 'infinity'",
+        BUILDER_VERSION - 1,
+    )
+    .await;
+    let (catching_up, unavailable, _) = flags(&fx, given_up).await;
+    assert_eq!((catching_up, unavailable), (true, false));
+    set_version(&fx, given_up, "builder_version = $2", BUILDER_VERSION).await;
+    let (catching_up, unavailable, _) = flags(&fx, given_up).await;
+    assert_eq!((catching_up, unavailable), (false, true));
+}
+
 // ---------------------------------------------------------------------------
 // Meta
 // ---------------------------------------------------------------------------
@@ -1141,8 +1203,99 @@ async fn restore_and_accepted_suggestion_entries_carry_their_meta() {
     assert!(!body.contains(&suggestion.to_string()), "{body}");
 }
 
+/// A page made by Move to subpage: its first row is a `copy` with
+/// `{"moved_from": <source>}` and no `source_doc_id` (`move_to_subpage.rs`).
+/// Its entry names the source, by its title at list time, to readers who
+/// may read it (Rulings).
 #[tokio::test(flavor = "multi_thread")]
-async fn the_old_snapshot_list_still_answers() {
+async fn a_moved_subpage_names_the_page_it_came_from() {
+    let fx = fixture().await;
+    let create = |title: &'static str| {
+        let fx = &fx;
+        async move {
+            let a = send(
+                fx,
+                Some(&fx.owner.session),
+                "POST",
+                "/api/docs",
+                Some(json!({"title": title})),
+            )
+            .await;
+            assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+            a.json()["id"].as_str().unwrap().parse::<Uuid>().unwrap()
+        }
+    };
+    let rename = |doc: Uuid, title: &'static str| {
+        let fx = &fx;
+        async move {
+            let a = send(
+                fx,
+                Some(&fx.owner.session),
+                "PATCH",
+                &format!("/api/docs/{doc}"),
+                Some(json!({"title": title})),
+            )
+            .await;
+            assert!(a.status.is_success(), "rename: {} {}", a.status, a.body);
+        }
+    };
+    let source = create("Plan").await;
+    let child = create("Child").await;
+    fx.updates
+        .append(
+            child,
+            0,
+            &[NewUpdate {
+                by_user_id: Some(fx.owner.id),
+                bytes: Typist::new(7).para("moved text"),
+                source: UpdateSource::Copy,
+                meta: Some(json!({"moved_from": source})),
+            }],
+        )
+        .await
+        .expect("append");
+    build(&fx, child).await;
+
+    let (e, _) = entry_of(&fx, &fx.owner, child, "copy").await;
+    assert_eq!(
+        e["meta"],
+        json!({"moved": true, "moved_from": source, "source_title": "Plan"})
+    );
+    rename(source, "").await;
+    let (e, _) = entry_of(&fx, &fx.owner, child, "copy").await;
+    assert_eq!(
+        e["meta"],
+        json!({"moved": true, "moved_from": source, "source_title": null})
+    );
+
+    // The source restricted: the editor, who reaches the child (a
+    // top-level page, outside the source's restriction) but not the
+    // source, sees neither its id nor its title.
+    rename(source, "Secret plan").await;
+    let a = send(
+        &fx,
+        Some(&fx.owner.session),
+        "PUT",
+        &format!("/api/docs/{source}/restricted"),
+        Some(json!({"restricted": true})),
+    )
+    .await;
+    assert!(a.status.is_success(), "restrict: {} {}", a.status, a.body);
+    let (e, body) = entry_of(&fx, &fx.editor, child, "copy").await;
+    assert_eq!(e["meta"], json!({"moved": true, "source_hidden": true}));
+    assert!(!body.contains(&source.to_string()), "{body}");
+    assert!(!body.contains("Secret plan"), "{body}");
+    let (e, _) = entry_of(&fx, &fx.owner, child, "copy").await;
+    assert_eq!(
+        e["meta"],
+        json!({"moved": true, "moved_from": source, "source_title": "Secret plan"})
+    );
+}
+
+/// The seq snapshot list stays routed through the combined release (a
+/// 0.9.14 drawer may call it on a new pod) and lists nothing (Rulings).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_old_snapshot_list_answers_an_empty_json_list() {
     let fx = fixture().await;
     let doc = page(&fx, "Old drawer").await;
     let t = Typist::new(9);
@@ -1151,16 +1304,22 @@ async fn the_old_snapshot_list_still_answers() {
         .insert(doc, 1, &t.state(), &[0])
         .await
         .unwrap();
-    let listed = send(
+    let a = send(
         &fx,
         Some(&fx.editor.session),
         "GET",
         &format!("/api/docs/{doc}/history"),
         None,
     )
-    .await
-    .ok();
-    let snapshots = listed.as_array().expect("the SnapshotMeta array");
-    assert_eq!(snapshots.len(), 1, "{listed}");
-    assert_eq!(snapshots[0]["snapshot_seq"], json!(1));
+    .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(
+        a.content_type
+            .as_deref()
+            .is_some_and(|t| t.starts_with("application/json")),
+        "{:?}",
+        a.content_type
+    );
+    assert_eq!(a.cache_control.as_deref(), Some("private, no-store"));
+    assert_eq!(a.json(), json!([]));
 }

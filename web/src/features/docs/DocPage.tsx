@@ -25,6 +25,7 @@ import { CommentSidebar } from "../comments/CommentSidebar";
 import { MarkdownView } from "../editor/MarkdownView";
 import type { KnotEditorHandle } from "../editor/readingCaret";
 import { ExportMenu } from "../export/ExportMenu";
+import { FAVORITES_KEY } from "../favorites/useFavorites";
 import { CopyLinkButton } from "./CopyLinkButton";
 import { archiveErrorText, purgeConfirmText, purgeErrorText } from "./archive";
 import { ArchivedBanner } from "./ArchivedBanner";
@@ -38,7 +39,7 @@ import {
   editModeShortcutLabel,
   isEditModeShortcut,
 } from "./editMode";
-import { HistoryDrawer } from "./HistoryDrawer";
+import { HistoryDrawer } from "./history/HistoryDrawer";
 import { DocWidthToggle } from "./DocWidthToggle";
 import { ImportMarkdownButton } from "./ImportMarkdownButton";
 import { captureReadingAnchor, findScroller, holdReadingPosition, type ReadingAnchor } from "./readingAnchor";
@@ -464,6 +465,9 @@ export default function DocPage() {
     await qc.invalidateQueries({ queryKey: ["doc"] });
     await qc.invalidateQueries({ queryKey: ["docs"] });
     await qc.invalidateQueries({ queryKey: ["archive"] });
+    // The favorites list leaves archived pages out: a restored one may be
+    // a favorite again.
+    await qc.invalidateQueries({ queryKey: FAVORITES_KEY });
   }
 
   async function restoreFromArchive() {
@@ -679,7 +683,7 @@ export default function DocPage() {
       </div>
       <Outlet />
       {historyOpen && id && !archived && (
-        <HistoryDrawer docId={id} onClose={() => setHistoryOpen(false)} />
+        <HistoryDrawer docId={id} canRestore={canEditDoc} onClose={() => setHistoryOpen(false)} />
       )}
       {commentSidebarOpen && id && !archived && <CommentSidebar docId={id} />}
       <span role="status" aria-live="polite" className="sr-only" data-testid="edit-mode-announcer">

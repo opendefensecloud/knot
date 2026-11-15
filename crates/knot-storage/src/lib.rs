@@ -8,10 +8,12 @@ pub mod comments;
 pub mod contributors;
 pub mod doc_store;
 pub mod duplicate;
+pub mod favorites;
 pub mod grant_store;
 pub mod invalidations;
 pub mod lexorank;
 pub mod markdown_cache;
+pub mod move_to_subpage;
 pub mod notifications;
 pub mod placement;
 pub mod pool;
@@ -39,6 +41,9 @@ pub use contributors::{
     Contributor, ContributorStore, ContributorStoreError, DocByline, PersonRef, PgContributorStore,
 };
 pub use doc_store::{ArchivedRoot, DocStore, DocStoreError, Document, PgDocStore, SubtreeRow};
+pub use favorites::{
+    AddOutcome, FAVORITES_LIMIT, Favorite, FavoriteStore, FavoriteStoreError, PgFavoriteStore,
+};
 pub use grant_store::{ChainNode, Grant, GrantStore, GrantStoreError, PgGrantStore};
 pub use markdown_cache::{
     MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore, PgMarkdownCache,
@@ -59,6 +64,7 @@ pub use short_links::{
 };
 pub use snapshot_store::{
     DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStamp, SnapshotStore, SnapshotStoreError,
+    ThinPolicy,
 };
 pub use suggestions::{
     NewSuggestion, PgSuggestionStore, Suggestion, SuggestionKind, SuggestionReply,

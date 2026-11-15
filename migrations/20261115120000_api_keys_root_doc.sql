@@ -12,7 +12,7 @@
 -- reads. Take it in bounded attempts (knot_lock_tables, 20261107120000).
 -- The previous release never names the column, so it keeps working.
 SET LOCAL lock_timeout = '5s';
-SELECT knot_lock_tables('20261114120000_api_keys_root_doc',
+SELECT knot_lock_tables('20261115120000_api_keys_root_doc',
                         ARRAY['api_keys']::regclass[],
                         'ACCESS EXCLUSIVE');
 

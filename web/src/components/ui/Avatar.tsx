@@ -3,7 +3,9 @@
  *
  * Matches the visual language of the WorkspaceHeader avatar and the
  * presence bar. Color is derived deterministically from the seed (usually
- * the user_id) so the same user always shows the same hue.
+ * the user_id) so the same user always shows the same hue. `muted` greys it
+ * out for a badge that stands for no known person (a history entry without
+ * an author), where any seeded hue would read as somebody.
  */
 
 type Size = "sm" | "md";
@@ -18,18 +20,20 @@ export function Avatar({
   seed,
   size = "sm",
   title,
+  muted = false,
 }: {
   name: string;
   seed: string;
   size?: Size;
   title?: string;
+  muted?: boolean;
 }) {
   return (
     <span
       aria-hidden
       title={title ?? name}
       className={`inline-flex items-center justify-center rounded-full text-white font-semibold select-none shrink-0 ${sizes[size]}`}
-      style={{ background: colorFor(seed) }}
+      style={{ background: muted ? "var(--color-fg-muted)" : colorFor(seed) }}
     >
       {(name || "?").slice(0, 1).toUpperCase()}
     </span>

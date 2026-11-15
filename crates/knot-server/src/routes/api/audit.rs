@@ -9,7 +9,7 @@
 //! page (`target_kind = 'doc'`); each is shown with a whitelisted `details`
 //! object, never its raw `data`, and every person goes through
 //! `knot_history::history_author_view`, so an anonymized person is not
-//! re-identified and no email is ever sent. Event ids and the cursor are
+//! re-identified and no email is ever sent; a bot is marked `"bot": true`. Event ids and the cursor are
 //! opaque tokens ([`EventTokens`]), never the stored ids. See
 //! docs/superpowers/specs/2026-11-13-doc-audit-page-design.md.
 
@@ -32,7 +32,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::{AuthContext, require_editor};
+use crate::auth::{ApiPrincipal, AuthContext, require_editor};
 use crate::http_error::json_err;
 use crate::routes::api::history::readable_sources;
 
@@ -43,6 +43,31 @@ pub const MAX_LIMIT: i64 = 200;
 
 /// The `doc.export` action: one row per page whose content left in a file.
 pub const EXPORT_ACTION: &str = "doc.export";
+
+/// The `doc.export` data key that holds the id of the API key the export
+/// was made with. For operators, like `export_id`: the row's actor stays
+/// the key's user, and the log shows only `details.via_api_key`.
+pub const API_KEY_ID_FIELD: &str = "api_key_id";
+
+/// The id of the API key that authenticated `req`, `None` for a cookie
+/// session. Read it before the handler consumes the request's body.
+pub fn api_key_id_of(req: &Request) -> Option<Uuid> {
+    req.extensions()
+        .get::<ApiPrincipal>()
+        .map(|principal| principal.key_id)
+}
+
+/// Adds [`API_KEY_ID_FIELD`] to an export's audit `data` (a JSON object)
+/// when it was made with an API key.
+pub fn with_api_key_id(
+    mut audit_data: serde_json::Value,
+    api_key_id: Option<Uuid>,
+) -> serde_json::Value {
+    if let (Some(api_key_id), Some(fields)) = (api_key_id, audit_data.as_object_mut()) {
+        fields.insert(API_KEY_ID_FIELD.into(), api_key_id.to_string().into());
+    }
+    audit_data
+}
 
 /// Each event category the log filters by, with the actions in it. An
 /// action in none of them (a future one) shows under `all` as `other`.
@@ -202,8 +227,13 @@ pub async fn doc_audit(
     };
 
     let person_ids = render::referenced_people(&rows, stats.as_ref());
-    let people = match knot_history::load_people(pool, &person_ids).await {
-        Ok(people) => people,
+    // `load_people` is the page history's; which of them are bots is read
+    // here, so the history's people and views stay as they are.
+    let people = match tokio::try_join!(
+        knot_history::load_people(pool, &person_ids),
+        audit::bots_among(pool, &person_ids),
+    ) {
+        Ok((people, bots)) => render::AuditPeople { people, bots },
         Err(e) => {
             tracing::error!(error = ?e, %doc_id, "audit people");
             return internal();

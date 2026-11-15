@@ -17,11 +17,15 @@
 //!   what either state shows (elements the entry removed included).
 //!
 //! [`text_chunks`] diffs every text of the union doc between `S` and
-//! `S_lo`. Word counts ([`crate::words`]) and M1.4's "Show changes" view are
-//! built on exactly this diff, so the counts match what the view highlights.
+//! `S_lo`, one text at a time through `diff_text`. Word counts
+//! ([`crate::words`]) and M1.4's "Show changes" view
+//! ([`crate::pm_json::pm_json_diff`]) are built on exactly this per-text
+//! diff, so the counts match what the view highlights. [`lo_doc`] builds
+//! the page without the entry's changes as a doc of its own, which the view
+//! compares element attributes against.
 
 use yrs::block::ClientID;
-use yrs::types::text::{ChangeKind, YChange};
+use yrs::types::text::{ChangeKind, Diff, YChange};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{
@@ -52,6 +56,10 @@ pub enum DiffError {
     /// The replay garbage-collects deleted content, so removed text is gone.
     #[error("the replay does not keep deleted content")]
     NotKeepDeleted,
+    /// The render was cancelled ([`crate::pass::Progress::cancel`]) before
+    /// it diffed every text. Only the view's render checks for it.
+    #[error("the diff was cancelled")]
+    Cancelled,
 }
 
 /// How a text chunk differs between the page without the entry's changes
@@ -86,32 +94,21 @@ pub fn entry_diff(h: &Doc, inserted: &IdSet, deleted: &IdSet) -> Result<EntryDif
         return Err(DiffError::NotKeepDeleted);
     }
     let removed = deleted.diff(inserted);
-    let (s, state) = {
+    let (s, union) = {
         let txn = h.transact();
         let s = txn.snapshot();
         let s_union = Snapshot::new(
             strip_zero_clocks(s.state_map.clone()),
             s.delete_set.diff(&removed),
         );
-        let mut encoder = EncoderV1::new();
-        txn.encode_state_from_snapshot(&s_union, &mut encoder)
-            .map_err(|e| DiffError::Encode(e.to_string()))?;
-        (s, encoder.to_vec())
+        let union = skip_gc_doc_of(&txn, &s_union)?;
+        (s, union)
     };
     let added = inserted.diff(&s.delete_set);
     let s_lo = Snapshot::new(
         s.state_map.clone(),
         s.delete_set.diff(&removed).merge(inserted),
     );
-    let union = Doc::with_options(Options {
-        skip_gc: true,
-        ..Default::default()
-    });
-    let update = Update::decode_v1(&state).map_err(|e| DiffError::Encode(e.to_string()))?;
-    union
-        .transact_mut()
-        .apply_update(update)
-        .map_err(|e| DiffError::Encode(e.to_string()))?;
     pad_short_clients(&union, &s.state_map)?;
     Ok(EntryDiff {
         s,
@@ -153,8 +150,7 @@ pub fn text_chunks(d: &EntryDiff) -> Vec<TextChunk> {
             segment += 1;
             segment_used = false;
         }
-        let mut txn = d.union.transact_mut();
-        for diff in text.diff_range(&mut txn, Some(&d.s), Some(&d.s_lo), |c: YChange| c) {
+        for diff in diff_text(d, &text) {
             match diff.insert {
                 Out::Any(Any::String(s)) => {
                     let kind = match diff.ychange.map(|c| c.kind) {
@@ -179,6 +175,61 @@ pub fn text_chunks(d: &EntryDiff) -> Vec<TextChunk> {
         }
     }
     chunks
+}
+
+/// The diff of `text`, a text of `d`'s union doc, between `s` (hi) and
+/// `s_lo` (lo): chunks visible only in `s` carry [`ChangeKind::Added`],
+/// those visible only in `s_lo` [`ChangeKind::Removed`], formatting as of
+/// `s`.
+///
+/// Each call takes a write transaction of its own on the union doc and
+/// commits it (see [`text_chunks`] for why), so the caller must not hold
+/// any transaction on the union doc: yrs 0.27.3's `transact_mut` waits for
+/// the doc's lock (`write_blocking`), and a read transaction held on the
+/// same thread would block it for good.
+pub(crate) fn diff_text(d: &EntryDiff, text: &XmlTextRef) -> Vec<Diff<YChange>> {
+    let mut txn = d.union.transact_mut();
+    text.diff_range(&mut txn, Some(&d.s), Some(&d.s_lo), |c: YChange| c)
+}
+
+/// The page at `d`'s entry's end without the entry's own changes, as a
+/// skip-GC doc of its own: `h`'s blocks with `S_lo`'s delete set
+/// (architecture view_and_diff, `D_lo`), built with
+/// `encode_state_from_snapshot` like the union doc, its zero clocks
+/// stripped. `h` is the skip-GC replay `d` was built on.
+///
+/// It is right only as an inequality test of an element's attributes: yrs
+/// keeps one current item per map key, so an attribute the entry overwrote
+/// reads as absent here (its newest item is deleted in `S_lo`), never as
+/// its old value.
+pub fn lo_doc(h: &Doc, d: &EntryDiff) -> Result<Doc, DiffError> {
+    if !h.skip_gc() {
+        return Err(DiffError::NotKeepDeleted);
+    }
+    let s_lo = Snapshot::new(
+        strip_zero_clocks(d.s_lo.state_map.clone()),
+        d.s_lo.delete_set.clone(),
+    );
+    skip_gc_doc_of(&h.transact(), &s_lo)
+}
+
+/// A fresh skip-GC doc holding what `txn`'s doc (itself skip-GC) shows at
+/// `snapshot`, whose state map must hold no zero clock
+/// ([`strip_zero_clocks`]).
+fn skip_gc_doc_of<T: ReadTxn>(txn: &T, snapshot: &Snapshot) -> Result<Doc, DiffError> {
+    let mut encoder = EncoderV1::new();
+    txn.encode_state_from_snapshot(snapshot, &mut encoder)
+        .map_err(|e| DiffError::Encode(e.to_string()))?;
+    let doc = Doc::with_options(Options {
+        skip_gc: true,
+        ..Default::default()
+    });
+    let update =
+        Update::decode_v1(&encoder.to_vec()).map_err(|e| DiffError::Encode(e.to_string()))?;
+    doc.transact_mut()
+        .apply_update(update)
+        .map_err(|e| DiffError::Encode(e.to_string()))?;
+    Ok(doc)
 }
 
 /// Pushes every text under `nodes`, depth-first in document order.

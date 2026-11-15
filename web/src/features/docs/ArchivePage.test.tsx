@@ -97,6 +97,28 @@ describe("ArchivePage", () => {
     ).toBe(true);
   });
 
+  it("refetches favorites after a restore, which may bring a starred page back", async () => {
+    vi.stubGlobal("fetch", server("editor", [folderEntry]));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    render(
+      <QueryClientProvider client={client}>
+        <SessionProvider>
+          <MemoryRouter>
+            <ArchivePage />
+          </MemoryRouter>
+        </SessionProvider>
+      </QueryClientProvider>,
+    );
+
+    const row = await screen.findByTestId("archive-row-folder");
+    await waitFor(() => expect(within(row).getByRole("button", { name: "Restore" })).toBeEnabled());
+    fireEvent.click(within(row).getByRole("button", { name: "Restore" }));
+
+    await screen.findByText("Nothing in the archive.");
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["favorites"] }));
+  });
+
   it("lets owners delete permanently after confirming", async () => {
     const fetchMock = server("owner", [folderEntry]);
     vi.stubGlobal("fetch", fetchMock);

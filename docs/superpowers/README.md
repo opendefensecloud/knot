@@ -35,6 +35,7 @@ This directory is knot's planning log. Every non-trivial change lands as a **pla
 | — | 2026-11-06 | Scoped API keys and bot accounts ([spec](specs/2026-11-06-api-keys-and-bots-design.md)) | [plans/2026-11-06-api-keys-and-bots.md](plans/2026-11-06-api-keys-and-bots.md) | [2026-11-06-api-keys-and-bots-outcome.md](research/2026-11-06-api-keys-and-bots-outcome.md) |
 | — | 2026-11-12 | Rate limits and quotas for writes (#88; [spec](specs/2026-11-12-rate-limits-design.md)) | [plans/2026-11-12-rate-limits.md](plans/2026-11-12-rate-limits.md) | [2026-11-12-rate-limits-outcome.md](research/2026-11-12-rate-limits-outcome.md) |
 | — | 2026-11-13 | Page audit log with export recording ([spec](specs/2026-11-13-doc-audit-page-design.md)) | [plans/2026-11-13-doc-audit-page.md](plans/2026-11-13-doc-audit-page.md) | [2026-11-13-doc-audit-page-outcome.md](research/2026-11-13-doc-audit-page-outcome.md) |
+| — | 2026-11-14 | Favorite pages in the sidebar ([spec](specs/2026-11-14-favorites-design.md)) | [plans/2026-11-14-favorites.md](plans/2026-11-14-favorites.md) | [2026-11-14-favorites-outcome.md](research/2026-11-14-favorites-outcome.md) |
 
 > Plan numbers reflect execution order, not always file date. Plans 1–4 predate the plan-driven workflow and don't have outcome docs.
 

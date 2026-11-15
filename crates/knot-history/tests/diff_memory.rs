@@ -8,14 +8,20 @@
 //! 500 MiB for a word count on a 4 MiB page of interleaved typing, where
 //! one author's insert set, which `S_lo` deletes, is a block per character.
 //!
+//! A version view's render (M1.4, Task 3's spike) holds the replay, the
+//! union doc, `D_lo` and the JSON at once; its factor is
+//! `view::VIEW_MEMORY_FACTOR`.
+//!
 //! This test binary has its own counting allocator, so it holds only tests
 //! that measure the heap.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use knot_history::diff::{ChunkKind, entry_diff, text_chunks};
-use knot_history::{ReplayMode, Replayer, RowOutcome};
+use knot_history::view::{RenderHooks, VIEW_MEMORY_FACTOR, ViewInput, render};
+use knot_history::{Progress, ReplayHooks, ReplayMode, Replayer, RowOutcome, WindowInput};
 use yrs::updates::decoder::Decode;
 use yrs::{
     Doc, IdSet, Text, Transact, Update, XmlElementPrelim, XmlFragment, XmlOut, XmlTextPrelim,
@@ -113,5 +119,47 @@ fn diffing_the_texts_holds_no_more_than_the_union_doc() {
     assert!(
         peak <= union,
         "text_chunks peaked {peak} bytes above its start; the union doc and snapshots hold {union}"
+    );
+}
+
+#[test]
+fn a_view_render_stays_within_its_memory_factor() {
+    let (h, inserted) = interleaved(200, 60);
+    let checkpoint_state = h.encode_state();
+    drop(h);
+    let input = checkpoint_state.len();
+    let window = WindowInput {
+        mode: ReplayMode::KeepDeleted,
+        checkpoint_state,
+        reapply: Vec::new(),
+        rows: Vec::new(),
+        gap_states: Vec::new(),
+        skip_revs: BTreeSet::new(),
+        end_rev: 0,
+        merge_gap_at_end: false,
+        progress: Progress::default(),
+        hooks: ReplayHooks::default(),
+    };
+    let changes = Some((inserted, IdSet::new()));
+
+    let start = CURRENT.load(Ordering::Relaxed);
+    PEAK.store(start, Ordering::Relaxed);
+    let rendered =
+        render(ViewInput::Window(window), changes, RenderHooks::default()).expect("the render");
+    // The view caches the serialized JSON, so it counts too.
+    let json = serde_json::to_vec(&rendered.doc).expect("the JSON");
+    let peak = PEAK.load(Ordering::Relaxed) - start;
+
+    assert!(
+        rendered.changes,
+        "the diff rendered: {:?}",
+        rendered.diff_error
+    );
+    assert!(!json.is_empty());
+    let factor = (input + peak) as f64 / input as f64;
+    assert!(
+        factor <= VIEW_MEMORY_FACTOR as f64,
+        "the view of a {input}-byte checkpoint peaked {peak} bytes above its start: \
+         F = {factor:.2} > VIEW_MEMORY_FACTOR = {VIEW_MEMORY_FACTOR}"
     );
 }

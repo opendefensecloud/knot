@@ -12,9 +12,10 @@ import {
   scopeSummary,
 } from "./auditText";
 
-const ADA: AuditAuthor = { key: "u-ada", name: "Ada", former: false };
-const CY: AuditAuthor = { key: "u-cy", name: "Cy", former: false };
-const FORMER: AuditAuthor = { key: null, name: null, former: true };
+const ADA: AuditAuthor = { key: "u-ada", name: "Ada", former: false, bot: false };
+const CY: AuditAuthor = { key: "u-cy", name: "Cy", former: false, bot: false };
+const FORMER: AuditAuthor = { key: null, name: null, former: true, bot: false };
+const CI_BOT: AuditAuthor = { key: "u-ci", name: "CI bot", former: false, bot: true };
 
 function auditEvent(
   action: string,
@@ -37,8 +38,13 @@ describe("actorLabel", () => {
   it("names a person, and a former or missing one as a former member", () => {
     expect(actorLabel(ADA, "user")).toBe("Ada");
     expect(actorLabel(FORMER, "user")).toBe("Former member");
-    expect(actorLabel({ key: "u-x", name: null, former: false }, "user")).toBe("Former member");
+    expect(actorLabel({ key: "u-x", name: null, former: false, bot: false }, "user")).toBe("Former member");
     expect(actorLabel(null, "user")).toBe("Former member");
+  });
+
+  it("marks a bot after its name, never a former member", () => {
+    expect(actorLabel(CI_BOT, "user")).toBe("CI bot (bot)");
+    expect(actorLabel({ ...FORMER, bot: true }, "user")).toBe("Former member");
   });
 
   it("labels each actor kind without a person", () => {
@@ -115,6 +121,58 @@ describe("describeAuditEvent — exports", () => {
   it("still reads when the format is unknown", () => {
     expect(describeAuditEvent(auditEvent("doc.export", {})).text).toBe("exported this page");
   });
+
+  it("says when an export was made with an API key", () => {
+    const viaKey = { via_api_key: true };
+    expect(describeAuditEvent(auditEvent("doc.export", { format: "docx", scope: "page", ...viaKey })).text).toBe(
+      "exported this page as Word (.docx), with an API key",
+    );
+    expect(
+      describeAuditEvent(auditEvent("doc.export", { format: "odt", scope: "page", diagram_pictures: 1, ...viaKey }))
+        .text,
+    ).toBe("exported this page as OpenDocument (.odt), with 1 diagram, with an API key");
+    expect(describeAuditEvent(auditEvent("doc.export", { format: "markdown_zip", scope: "workspace", ...viaKey })).text).toBe(
+      "exported the whole workspace, including this page, with an API key",
+    );
+    expect(
+      describeAuditEvent(auditEvent("doc.export", { format: "markdown_zip", scope: "subtree", ...viaKey })).text,
+    ).toBe("exported this page and its subpages as Markdown (zip), with an API key");
+    expect(
+      describeAuditEvent(
+        auditEvent("doc.export", { scope: "subtree", root: null, root_hidden: true, ...viaKey }),
+      ).text,
+    ).toBe("exported this page as part of a page you can't open and its subpages, with an API key");
+    expect(
+      describeAuditEvent(
+        auditEvent("doc.export", {
+          format: "markdown_zip",
+          scope: "subtree",
+          root: { id: "d-root", title: "Handbook" },
+          root_hidden: false,
+          ...viaKey,
+        }),
+      ),
+    ).toEqual({
+      actor: "Ada",
+      text: "exported this page as part of",
+      link: { to: "/doc/d-root", title: "Handbook" },
+      textAfterLink: "and its subpages, with an API key",
+    });
+  });
+
+  it("says nothing about a key unless via_api_key is true", () => {
+    for (const viaApiKey of [false, "yes", 1, null]) {
+      expect(
+        describeAuditEvent(auditEvent("doc.export", { format: "docx", scope: "page", via_api_key: viaApiKey })).text,
+      ).toBe("exported this page as Word (.docx)");
+    }
+  });
+
+  it("names a bot that exported as a bot", () => {
+    expect(
+      describeAuditEvent(auditEvent("doc.export", { format: "docx", scope: "page", via_api_key: true }, { actor: CI_BOT })),
+    ).toEqual({ actor: "CI bot (bot)", text: "exported this page as Word (.docx), with an API key" });
+  });
 });
 
 describe("describeAuditEvent — access", () => {
@@ -136,6 +194,26 @@ describe("describeAuditEvent — access", () => {
         auditEvent("doc.grant", { principal: { kind: "user", person: FORMER }, role: "owner", inherit: true }),
       ).text,
     ).toBe("gave a former member owner access");
+  });
+
+  it("marks a bot that got or lost access", () => {
+    const botPrincipal = { kind: "user", person: CI_BOT };
+    expect(
+      describeAuditEvent(auditEvent("doc.grant", { principal: botPrincipal, role: "editor", inherit: true })).text,
+    ).toBe("gave CI bot (bot) editor access");
+    expect(describeAuditEvent(auditEvent("doc.grant.delete", { principal: botPrincipal })).text).toBe(
+      "removed the access of CI bot (bot)",
+    );
+    // A person from a server without the mark is no bot.
+    expect(
+      describeAuditEvent(
+        auditEvent("doc.grant", {
+          principal: { kind: "user", person: { key: "u-cy", name: "Cy", former: false } },
+          role: "viewer",
+          inherit: true,
+        }),
+      ).text,
+    ).toBe("gave Cy viewer access");
   });
 
   it("reads old grant rows without data", () => {

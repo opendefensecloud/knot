@@ -56,9 +56,10 @@ function stubServer(role: Role, archivedAt: string | null = null) {
 
 const HOUR_AGO = new Date(Date.now() - 2 * 3_600_000).toISOString();
 
-const ADA = { key: "u-ada", name: "Ada", former: false };
-const BO = { key: "u-bo", name: "Bo", former: false };
-const FORMER = { key: null, name: null, former: true };
+const ADA = { key: "u-ada", name: "Ada", former: false, bot: false };
+const BO = { key: "u-bo", name: "Bo", former: false, bot: false };
+const FORMER = { key: null, name: null, former: true, bot: false };
+const CI_BOT = { key: "u-ci", name: "CI bot", former: false, bot: true };
 
 const EXPORT_EVENT: DocAuditEvent = {
   id: "5c1e9a07d3b4f268",
@@ -220,6 +221,38 @@ describe("DocAuditPage", () => {
     expect(rows[1]).toHaveTextContent("Former member");
     expect(rows[1]).toHaveTextContent("3 exports");
     expect(screen.getByText("Showing the 50 most recent exporters.")).toBeInTheDocument();
+  });
+
+  it("marks a bot among the exporters and says when a key was used", async () => {
+    stubServer("editor");
+    const botExport: DocAuditEvent = {
+      ...EXPORT_EVENT,
+      id: "7a3e5c1b9d0f2468",
+      actor: CI_BOT,
+      details: { format: "odt", scope: "page", diagram_pictures: 0, via_api_key: true },
+    };
+    serveLog(() =>
+      page([botExport, EXPORT_EVENT], null, {
+        ...STATS,
+        exports: {
+          ...STATS.exports,
+          last: { ...STATS.exports.last!, actor: CI_BOT, format: "odt" },
+          by_person: [{ actor: CI_BOT, count: 2, last_at: HOUR_AGO }, ...STATS.exports.by_person],
+        },
+      }),
+    );
+    renderPage();
+
+    const events = await screen.findAllByTestId("audit-event");
+    expect(events[0]).toHaveTextContent("CI bot (bot) exported this page as OpenDocument (.odt), with an API key");
+    expect(events[1]).toHaveTextContent("Ada exported this page as Word (.docx), with 2 diagrams");
+    expect(events[1]).not.toHaveTextContent("API key");
+    expect(events[1]).not.toHaveTextContent("(bot)");
+    const rows = within(screen.getByTestId("audit-exporters")).getAllByRole("listitem");
+    expect(rows[0]).toHaveTextContent("CI bot (bot)");
+    expect(rows[1]).toHaveTextContent("Ada");
+    expect(rows[1]).not.toHaveTextContent("(bot)");
+    expect(screen.getByTestId("audit-stat-last")).toHaveTextContent("OpenDocument · CI bot (bot)");
   });
 
   it("describes each event in a sentence with its time", async () => {

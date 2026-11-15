@@ -37,14 +37,17 @@ pub enum SnapshotWriteError {
     Other(String),
 }
 
-/// Writes the state of `doc` as a snapshot at `stamp`.
+/// Writes the state of `doc` as a snapshot at `stamp`, naming the log rows
+/// that hold its pending content (`pending_revs`). Returns whether a row was
+/// written: `false` when a stamped snapshot already held the stamp's seq.
 pub async fn write_snapshot(
     doc_id: Uuid,
     stamp: SnapshotStamp,
     engine: &dyn Engine,
     doc: &DocHandle,
     store: &dyn SnapshotStore,
-) -> Result<(), SnapshotWriteError> {
+    pending_revs: Option<&[i64]>,
+) -> Result<bool, SnapshotWriteError> {
     let state_bytes = engine
         .encode_state_as_update(doc, None)
         .map_err(|e| SnapshotWriteError::Other(e.to_string()))?;
@@ -52,7 +55,7 @@ pub async fn write_snapshot(
         .encode_state_vector(doc)
         .map_err(|e| SnapshotWriteError::Other(e.to_string()))?;
     store
-        .insert_stamped(doc_id, stamp, &state_bytes, &sv)
+        .insert_stamped(doc_id, stamp, &state_bytes, &sv, pending_revs)
         .await
         .map_err(|e| match e {
             SnapshotStoreError::EpochChanged => SnapshotWriteError::EpochChanged,
