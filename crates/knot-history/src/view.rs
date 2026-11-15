@@ -71,7 +71,7 @@ pub const BUILD_MEMORY_FACTOR: u64 = 40;
 pub const VIEW_MEMORY_FACTOR: u64 = 360;
 
 /// The plain view's and the restore's memory factor (M1.4 Task 3's spike,
-/// as [`VIEW_MEMORY_FACTOR`]), so the plain cap is the full replay cap.
+/// as [`VIEW_MEMORY_FACTOR`]; raised by M2, below).
 ///
 /// On workload 6's 4 MiB pages (interleaved typing / pastes): a plain view
 /// of a session's window measured 39.1 / 4.6; a baseline view of the state
@@ -81,7 +81,19 @@ pub const VIEW_MEMORY_FACTOR: u64 = 360;
 /// is bold, one text node per word, measured 16.4. The decoded checkpoint
 /// dominates, as in M1.3's F. Each took at most 0.14 s, well within
 /// `RESTORE_TIMEOUT` − 5 s.
-pub const PLAIN_MEMORY_FACTOR: u64 = 40;
+///
+/// M2 (Task 2's case (f), `replay_throughput 8`) raised it from 40 to 41:
+/// a restore's replay with M2's finishes (the replay, `encode_state`, the
+/// replay dropped, then `revert::target` for Restore here or
+/// `revert::copy_state` for Restore as new page) decodes the state once
+/// more while it holds that state and its copy, and peaked 3.82 MiB above
+/// the Markdown round trip. On workload 6's 4 MiB typing page, a
+/// session's window and the state as a baseline each measured 40.00 with
+/// either finish (163.02 MiB above a 4.18 MiB input; the largest 40.0041),
+/// against 6.15 / 5.15 (`target` / `copy_state`) on the pastes page. So
+/// the plain cap is `replay_max_bytes × 40 / 41`, 3.90 MiB at the default
+/// 4 MiB.
+pub const PLAIN_MEMORY_FACTOR: u64 = 41;
 
 /// The memory factor of a view or restore of a baseline that may be
 /// shifted (M1.4 Task 8's measurement, workload 7's (h) and (i)): its
@@ -91,17 +103,18 @@ pub const PLAIN_MEMORY_FACTOR: u64 = 40;
 /// fix's overlapping Skips merged into it as yrs encodes them (4.18 MiB),
 /// the view and the restore (the replay, `encode_state` and the Markdown
 /// round trip) each measured 43.40, against 39.1 for the same page's
-/// unshifted state; rounded up, 44. Only `baseline` entries pay it (the
-/// rollout entry and every window keep the plain cap):
-/// [`baseline_max_input_bytes`].
+/// unshifted state; rounded up, 44. With M2's finishes (`revert::target`,
+/// `revert::copy_state`, Task 2's case (f)) it measured 43.40 again. Only
+/// `baseline` entries pay it (the rollout entry and every window keep the
+/// plain cap): [`baseline_max_input_bytes`].
 pub const SHIFTED_MEMORY_FACTOR: u64 = 44;
 
 /// The largest baseline state a view or restore of a `baseline` entry may
 /// load, given the plain cap: `max_plain_input_bytes ×
 /// max(PLAIN_MEMORY_FACTOR, BUILD_MEMORY_FACTOR) /
 /// max(SHIFTED_MEMORY_FACTOR, BUILD_MEMORY_FACTOR)`, so cutting a shifted
-/// baseline to its prefix stays within the builder's memory rule. 3.81 MiB
-/// at the default 4 MiB replay cap.
+/// baseline to its prefix stays within the builder's memory rule.
+/// 3,813,002 bytes (3.64 MiB) at the default 4 MiB replay cap.
 pub fn baseline_max_input_bytes(max_plain_input_bytes: i64) -> i64 {
     let cap = i128::from(max_plain_input_bytes)
         * i128::from(PLAIN_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR))
@@ -123,6 +136,67 @@ pub fn view_max_input_bytes(replay_max_bytes: u64, changes: bool) -> i64 {
     };
     let cap = u128::from(replay_max_bytes) * u128::from(BUILD_MEMORY_FACTOR)
         / u128::from(f.max(BUILD_MEMORY_FACTOR));
+    i64::try_from(cap).unwrap_or(i64::MAX)
+}
+
+/// A Restore here's plan's memory factor: (input + peak heap above the
+/// start) / input of `revert::plan`, input being the version's skip-GC
+/// state plus the live page's export (`target.state.len() + live.len()`).
+/// A plan holds the live page as a GC doc throughout, the version with the
+/// live page applied in one skip-GC doc during the undo, and a GC replay
+/// of the live page plus the update with its JSON during each
+/// verification. Set by M2 Task 2's spike (`cargo run --release -p
+/// knot-history --example replay_throughput 8`).
+///
+/// On workload 6's 4 MiB pages (interleaved one-character typing /
+/// pastes), with the live page 4.18 / 4.03 MiB: (a) reverting to the
+/// version a quarter of the way in (1.01 / 1.76 MiB; the large undo)
+/// measured 50.53 / 4.96, in 0.33 / 0.04 s; (b) reverting to the version
+/// before the last session (the small undo) 38.13 / 3.82; (c) (a) by the
+/// whole-page replace alone 50.95 / 4.52; (d) the unchanged check 20.04 /
+/// 2.80; and (c′) (a) with an undo that fails its verification and then
+/// the whole-page replace 50.95 / 4.96, in 0.50 / 0.06 s. (c′)'s peak
+/// (259.21 MiB on the typing page) is the larger of (a)'s and (c)'s, not
+/// their sum: the undo's docs are dropped before the replace starts.
+/// Rounded up, 51, so the memory cap is `replay_max_bytes × 40 / 51`,
+/// 3.14 MiB at the default 4 MiB. At 1×, 2× and 4× that cap the typing
+/// page measured 49.52, 48.82 and 48.48 ((c′)): F did not grow on the
+/// smaller pages near the cap.
+pub const REVERT_MEMORY_FACTOR: u64 = 51;
+
+/// The largest revert input a plan may take whatever `replay_max_bytes`
+/// is: a time bound, so it does not scale with the replay cap. Every
+/// plan measured at it (M2 Task 2's case (e)) took under half of
+/// [`REVERT_TIMEOUT`] on both the undo path and the slowest path a plan
+/// can take (an undo that fails verification, then the whole-page
+/// replace), so a revert too slow to finish is refused as too large
+/// before it runs, not after a timeout.
+///
+/// On workload 6's pages scaled to 1×, 2× and 4× the default memory cap
+/// (3.14 MiB), (a) the large undo / (c′) the failed undo and the replace
+/// took: typing, 3.24 MiB of input 0.18 / 0.31 s, 6.58 MiB 0.38 / 0.65 s,
+/// 13.26 MiB 0.79 / 1.31 s; pastes, 3.44 MiB 0.02 / 0.04 s, 6.37 MiB
+/// 0.04 / 0.07 s, 12.43 MiB 0.08 / 0.14 s. Every size planned within 5 s,
+/// so the cap is the largest size measured on both pages (12.43 MiB),
+/// rounded down to a MiB: 12 MiB. It binds only above a replay cap of
+/// about 15.3 MiB.
+pub const REVERT_TIME_CAP_BYTES: u64 = 12 * 1024 * 1024;
+
+/// How long one plan of a revert may run (`Views::plan_revert`, per
+/// attempt, never past the restore's deadline).
+pub const REVERT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest revert input (`target.state.len() + live.len()`, and the
+/// version's state alone right after its replay) a Restore here may plan:
+/// `min(replay_max_bytes × BUILD_MEMORY_FACTOR / max(REVERT_MEMORY_FACTOR,
+/// BUILD_MEMORY_FACTOR), REVERT_TIME_CAP_BYTES)`, so a plan holding a
+/// compute permit takes no more than the builder's `40 × replay_max_bytes`
+/// and plans within half of [`REVERT_TIMEOUT`]. The time cap does not
+/// scale with `replay_max_bytes`. Saturates at `i64::MAX`.
+pub fn revert_max_input_bytes(replay_max_bytes: u64) -> i64 {
+    let by_memory = u128::from(replay_max_bytes) * u128::from(BUILD_MEMORY_FACTOR)
+        / u128::from(REVERT_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR));
+    let cap = by_memory.min(u128::from(REVERT_TIME_CAP_BYTES));
     i64::try_from(cap).unwrap_or(i64::MAX)
 }
 
@@ -389,9 +463,14 @@ pub struct ViewLimits {
     /// Every view and restore answers `TooLarge` above this input (a
     /// `baseline` entry above [`baseline_max_input_bytes`] of it).
     pub max_plain_input_bytes: i64,
+    /// A Restore here answers `OverCap` above this revert input
+    /// ([`revert_max_input_bytes`]).
+    pub max_revert_input_bytes: i64,
     pub permit_wait: Duration,
     pub timeout: Duration,
     pub restore_timeout: Duration,
+    /// How long one plan of a revert may run ([`REVERT_TIMEOUT`]).
+    pub revert_timeout: Duration,
     pub cache_bytes: u64,
     pub cache_ttl: Duration,
     #[doc(hidden)]
@@ -403,9 +482,11 @@ impl ViewLimits {
         ViewLimits {
             max_changes_input_bytes: view_max_input_bytes(cfg.history_replay_max_bytes, true),
             max_plain_input_bytes: view_max_input_bytes(cfg.history_replay_max_bytes, false),
+            max_revert_input_bytes: revert_max_input_bytes(cfg.history_replay_max_bytes),
             permit_wait: VIEW_PERMIT_WAIT,
             timeout: VIEW_TIMEOUT,
             restore_timeout: RESTORE_TIMEOUT,
+            revert_timeout: REVERT_TIMEOUT,
             cache_bytes: VIEW_CACHE_BYTES,
             cache_ttl: VIEW_CACHE_TTL,
             hooks: ViewHooks::default(),
@@ -1228,7 +1309,15 @@ mod tests {
         assert!(diff <= i64::try_from(cap).unwrap());
         // `workers × F × cap` stays what the builder's F allows.
         let baseline = baseline_max_input_bytes(plain);
-        assert_eq!(baseline, 3_813_003, "4 MiB × 40 / 44");
+        let (plain_f, shifted_f) = (
+            PLAIN_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR),
+            SHIFTED_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR),
+        );
+        assert_eq!(
+            baseline,
+            i64::try_from(u64::try_from(plain).unwrap() * plain_f / shifted_f).unwrap(),
+            "the plain cap × {plain_f} / {shifted_f}"
+        );
         assert!(baseline <= plain);
         for (f, c) in [
             (VIEW_MEMORY_FACTOR, diff),
@@ -1239,11 +1328,41 @@ mod tests {
         }
         assert_eq!(
             i128::from(baseline_max_input_bytes(i64::MAX)),
-            i128::from(i64::MAX) * 40 / 44
+            i128::from(i64::MAX) * i128::from(plain_f) / i128::from(shifted_f)
         );
         // A cap too large for the arithmetic saturates instead of wrapping.
         assert_eq!(view_max_input_bytes(u64::MAX, false), i64::MAX);
         assert!(view_max_input_bytes(u64::MAX, true) > 0);
+    }
+
+    #[test]
+    fn the_revert_cap_keeps_the_build_memory_rule() {
+        let cap = 4 * MIB;
+        let revert = revert_max_input_bytes(cap);
+        let by_memory = cap * BUILD_MEMORY_FACTOR / REVERT_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR);
+        assert_eq!(
+            revert,
+            i64::try_from(by_memory.min(REVERT_TIME_CAP_BYTES)).unwrap()
+        );
+        assert!(revert <= i64::try_from(cap).unwrap());
+        // `workers × F × cap` stays what the builder's F allows.
+        assert!(
+            u64::try_from(revert).unwrap() * REVERT_MEMORY_FACTOR.max(BUILD_MEMORY_FACTOR)
+                <= cap * BUILD_MEMORY_FACTOR
+        );
+        // The time cap is absolute: a larger replay cap does not raise it.
+        assert!(u64::try_from(revert_max_input_bytes(64 * MIB)).unwrap() <= REVERT_TIME_CAP_BYTES);
+        // A cap too large for the arithmetic saturates instead of wrapping.
+        assert_eq!(
+            revert_max_input_bytes(u64::MAX),
+            i64::try_from(REVERT_TIME_CAP_BYTES).unwrap()
+        );
+        let limits = ViewLimits::default();
+        assert_eq!(
+            limits.max_revert_input_bytes,
+            revert_max_input_bytes(knot_config::DEFAULT_HISTORY_REPLAY_MAX_BYTES)
+        );
+        assert_eq!(limits.revert_timeout, REVERT_TIMEOUT);
     }
 
     /// A doc of two paragraphs, as a state.
