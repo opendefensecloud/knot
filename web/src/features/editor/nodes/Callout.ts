@@ -1,6 +1,8 @@
 import Blockquote from "@tiptap/extension-blockquote";
+import { ReactNodeViewRenderer } from "@tiptap/react";
 
 import { calloutKind, normaliseTitle } from "../callouts";
+import { CalloutView } from "./CalloutView";
 
 /**
  * The blockquote, with the two attributes that make it a callout box:
@@ -28,5 +30,8 @@ export const KnotBlockquote = Blockquote.extend({
           typeof attrs.title === "string" && attrs.title !== "" ? { "data-title": attrs.title } : {},
       },
     };
+  },
+  addNodeView() {
+    return ReactNodeViewRenderer(CalloutView);
   },
 });
