@@ -18,15 +18,15 @@ function scrollParent(el: HTMLElement): HTMLElement | null {
   return null;
 }
 
-/** True when the heading exists in `root` (the editor it belongs to, so a
+/** The heading, when it exists in `root` (the editor it belongs to, so a
  *  version open in the history drawer scrolls its own pane) and the scroll
  *  was started. On the page itself it lands below the sticky band, which
  *  can shrink once the page scrolls (the header condenses), so the
  *  position is measured again on the next two frames and corrected; in
  *  another pane it lands below the pane's top. */
-export function scrollToHeading(slug: string, root: ParentNode = document): boolean {
+export function scrollToHeading(slug: string, root: ParentNode = document): HTMLElement | null {
   const heading = Array.from(root.querySelectorAll<HTMLElement>("[id]")).find((el) => el.id === slug);
-  if (!heading) return false;
+  if (!heading) return null;
   const doc = heading.ownerDocument;
   const pane = scrollParent(heading);
   const onPage = pane === null || pane.tagName === "MAIN";
@@ -42,5 +42,5 @@ export function scrollToHeading(slug: string, root: ParentNode = document): bool
     place();
     window.requestAnimationFrame(place);
   });
-  return true;
+  return heading;
 }

@@ -34,9 +34,52 @@ export function TableOfContentsView({ node, editor, getPos, updateAttributes }: 
   const entries: TocEntry[] = tocEntries(editor.state.doc, maxLevel);
   const editable = editor.isEditable;
 
+  // A read-only jump makes its heading focusable; once the page can be
+  // edited that would take the focus away from the editor on a click into
+  // the heading, so it goes.
+  useEffect(() => {
+    if (!editable) return;
+    editor.view.dom
+      .querySelectorAll<HTMLElement>("[data-toc-focus]")
+      .forEach((el) => {
+        el.removeAttribute("tabindex");
+        el.removeAttribute("data-toc-focus");
+      });
+  }, [editor, editable]);
+
+  /** Scrolls to the entry's heading and moves the focus there: the caret
+   *  to the heading's start when the page can be edited, the heading
+   *  itself (made focusable for it) when it cannot. The heading is looked
+   *  up again in the live document: a collaborator's edit may have moved it
+   *  since this list was drawn. */
+  const jumpTo = (entry: TocEntry) => {
+    const live = tocEntries(editor.state.doc, maxLevel).find((e) => e.slug === entry.slug);
+    if (!live) return;
+    const heading = scrollToHeading(live.slug, editor.view.dom);
+    if (!heading) return;
+    window.history.replaceState(window.history.state, "", `#${live.slug}`);
+    if (editable) {
+      editor.commands.setTextSelection(live.pos + 1);
+      editor.view.focus();
+    } else {
+      heading.tabIndex = -1;
+      heading.setAttribute("data-toc-focus", "");
+      heading.addEventListener(
+        "blur",
+        () => {
+          heading.removeAttribute("tabindex");
+          heading.removeAttribute("data-toc-focus");
+        },
+        { once: true },
+      );
+      heading.focus({ preventScroll: true });
+    }
+  };
+
   return (
     <NodeViewWrapper
-      as="div"
+      as="nav"
+      aria-label="Contents"
       data-testid="toc-box"
       data-knot-toc="true"
       data-history-change={(node.attrs.historyChange as string | null | undefined) ?? undefined}
@@ -73,9 +116,7 @@ export function TableOfContentsView({ node, editor, getPos, updateAttributes }: 
                 data-testid="toc-entry"
                 onClick={(e) => {
                   e.preventDefault();
-                  if (scrollToHeading(entry.slug, editor.view.dom)) {
-                    window.history.replaceState(window.history.state, "", `#${entry.slug}`);
-                  }
+                  jumpTo(entry);
                 }}
               >
                 {entry.text}

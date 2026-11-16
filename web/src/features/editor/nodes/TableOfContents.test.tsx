@@ -54,9 +54,9 @@ describe("table of contents box", () => {
     await screen.findByTestId("toc-box");
     expect(entries()).toEqual(["Plan", "Tasks", "Details"]);
     expect(screen.getAllByTestId("toc-entry").map((a) => a.getAttribute("href"))).toEqual([
-      "#plan",
-      "#tasks",
-      "#details",
+      "#h-plan",
+      "#h-tasks",
+      "#h-details",
     ]);
     expect(screen.getByTestId("toc-box")).toHaveTextContent("Contents");
   });
@@ -103,6 +103,68 @@ describe("table of contents box", () => {
     mount(PAGE, false);
     await screen.findByTestId("toc-box");
     expect(screen.queryByTestId("toc-levels")).toBeNull();
+  });
+
+  it("is a navigation landmark named Contents", async () => {
+    mount(PAGE);
+    const box = await screen.findByTestId("toc-box");
+    expect(box.tagName).toBe("NAV");
+    expect(box).toHaveAttribute("aria-label", "Contents");
+  });
+
+  it("a jump in an editable page puts the caret at the start of the heading", async () => {
+    mount(PAGE);
+    await screen.findByTestId("toc-box");
+    act(() => {
+      fireEvent.click(screen.getAllByTestId("toc-entry")[1]!);
+    });
+    let start = -1;
+    editorRef!.state.doc.descendants((n, pos) => {
+      if (n.type.name === "heading" && n.textContent === "Tasks") start = pos + 1;
+    });
+    expect(editorRef!.state.selection.empty).toBe(true);
+    expect(editorRef!.state.selection.from).toBe(start);
+    expect(editorRef!.isFocused).toBe(true);
+  });
+
+  it("a jump in a read-only page moves the focus to the heading", async () => {
+    mount(PAGE, false);
+    await screen.findByTestId("toc-box");
+    act(() => {
+      fireEvent.click(screen.getAllByTestId("toc-entry")[1]!);
+    });
+    expect(document.activeElement?.id).toBe("h-tasks");
+  });
+
+  it("a page switched to editing after a read-only jump leaves no focusable heading behind", async () => {
+    mount(PAGE, false);
+    await screen.findByTestId("toc-box");
+    act(() => {
+      fireEvent.click(screen.getAllByTestId("toc-entry")[1]!);
+    });
+    act(() => {
+      editorRef!.setEditable(true);
+    });
+    expect(editorRef!.view.dom.querySelectorAll("h1[tabindex], h2[tabindex], h3[tabindex]")).toHaveLength(0);
+  });
+
+  it("a jump puts the caret in the heading even after a collaborator added text above it", async () => {
+    const ydoc = mount(PAGE);
+    await screen.findByTestId("toc-box");
+    const link = screen.getAllByTestId("toc-entry")[1]!;
+    // A collaborator's paragraph lands above the headings; the click comes
+    // before the box has re-rendered.
+    const remote = new Y.Doc();
+    Y.applyUpdate(remote, Y.encodeStateAsUpdate(ydoc));
+    const p = new Y.XmlElement("paragraph");
+    p.insert(0, [new Y.XmlText("A new paragraph from someone else")]);
+    remote.getXmlFragment("default").insert(1, [p]);
+    Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(remote, Y.encodeStateVector(ydoc)), "remote");
+    fireEvent.click(link);
+    const { $from } = editorRef!.state.selection;
+    expect($from.parent.type.name).toBe("heading");
+    expect($from.parent.textContent).toBe("Tasks");
+    expect($from.parentOffset).toBe(0);
   });
 
   it("shows No headings yet", async () => {

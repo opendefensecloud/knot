@@ -52,10 +52,10 @@ test("table of contents: insert, depth, jump, export, public page", async ({ pag
   await box.getByTestId("toc-levels").selectOption("2");
   await expect(entries).toHaveText(["Plan", "Tasks", "Tasks"]);
 
-  // The second "Tasks" is #tasks-1; it lands below the sticky band.
+  // The second "Tasks" is #h-tasks-1; it lands below the sticky band.
   await entries.nth(2).click();
-  await expect(page).toHaveURL(/#tasks-1$/);
-  const heading = page.locator("h2#tasks-1");
+  await expect(page).toHaveURL(/#h-tasks-1$/);
+  const heading = page.locator("h2#h-tasks-1");
   await expect(heading).toBeVisible();
   await expect
     .poll(async () => {
@@ -78,8 +78,8 @@ test("table of contents: insert, depth, jump, export, public page", async ({ pag
     .toContain("<!-- knot:toc maxLevel=2 -->\n[[_TOC_]]");
 
   // Opening the page at the anchor scrolls there.
-  await page.goto(`${docUrl}#details`);
-  await expect(page.locator("h3#details")).toBeInViewport({ timeout: 10_000 });
+  await page.goto(`${docUrl}#h-details`);
+  await expect(page.locator("h3#h-details")).toBeInViewport({ timeout: 10_000 });
 
   // Public share link: the box with anchors, and ids on the headings.
   await page.goto(`${docUrl}/permissions`);
@@ -89,8 +89,8 @@ test("table of contents: insert, depth, jump, export, public page", async ({ pag
   const anon = await anonCtx.newPage();
   await anon.goto(shareUrl.replace(/^https?:\/\/[^/]+/, ""));
   const doc = anon.frameLocator("iframe[title='Public document']");
-  await expect(doc.locator(".knot-box a[href='#tasks-1']")).toBeVisible({ timeout: 8_000 });
-  await expect(doc.locator("h2#tasks-1")).toHaveText("Tasks");
-  await expect(doc.locator(".knot-box")).not.toContainText("Details");
+  await expect(doc.locator(".knot-box a[href='#h-tasks-1']")).toBeVisible({ timeout: 8_000 });
+  await expect(doc.locator("h2#h-tasks-1")).toHaveText("Tasks");
+  await expect(doc.locator("nav.knot-box[aria-label='Contents']")).not.toContainText("Details");
   await anonCtx.close();
 });

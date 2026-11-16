@@ -15,11 +15,11 @@ afterEach(() => {
 });
 
 describe("heading anchors", () => {
-  it("gives headings slug ids in the DOM", () => {
+  it("gives headings slug ids with the h- prefix in the DOM", () => {
     bound = mountBoundEditor();
     bound.editor.commands.setContent("<h2>Tasks</h2><p>x</p><h2>Tasks</h2><h3>Café</h3>");
     const ids = Array.from(bound.editor.view.dom.querySelectorAll("h2, h3")).map((h) => h.id);
-    expect(ids).toEqual(["tasks", "tasks-1", "cafe"]);
+    expect(ids).toEqual(["h-tasks", "h-tasks-1", "h-cafe"]);
     expect(fragmentXml(bound)).not.toContain("tasks");
   });
 
@@ -28,10 +28,10 @@ describe("heading anchors", () => {
     bound.editor.commands.setContent("<h2>B</h2><h3>C</h3><h6>F</h6><h1>A</h1>");
     const doc = bound.editor.state.doc;
     expect(tocEntries(doc, 6).map((e) => [e.level, e.text, e.slug])).toEqual([
-      [1, "B", "b"],
-      [2, "C", "c"],
-      [4, "F", "f"],
-      [0, "A", "a"],
+      [1, "B", "h-b"],
+      [2, "C", "h-c"],
+      [4, "F", "h-f"],
+      [0, "A", "h-a"],
     ]);
     expect(tocEntries(doc, 3).map((e) => [e.level, e.text])).toEqual([
       [1, "B"],
@@ -45,22 +45,22 @@ describe("heading anchors", () => {
     bound.editor.commands.setContent(
       "<table><tr><td><h2>Tasks</h2></td></tr></table><h2>Tasks</h2>",
     );
-    expect(tocEntries(bound.editor.state.doc, 3).map((e) => e.slug)).toEqual(["tasks"]);
+    expect(tocEntries(bound.editor.state.doc, 3).map((e) => e.slug)).toEqual(["h-tasks"]);
     const ids = Array.from(bound.editor.view.dom.querySelectorAll("h2")).map((h) => h.id);
-    expect(ids).toEqual(["", "tasks"]);
+    expect(ids).toEqual(["", "h-tasks"]);
   });
 
   it("ends a heading's anchor text at a hard break, as Markdown does", () => {
     bound = mountBoundEditor();
     bound.editor.commands.setContent("<h2>A<br>B</h2>");
-    expect(tocEntries(bound.editor.state.doc, 3).map((e) => [e.text, e.slug])).toEqual([["A", "a"]]);
+    expect(tocEntries(bound.editor.state.doc, 3).map((e) => [e.text, e.slug])).toEqual([["A", "h-a"]]);
   });
 
   it("skips empty headings but keeps the slugs of the rest stable", () => {
     bound = mountBoundEditor();
     bound.editor.commands.setContent("<h2></h2><h2>B</h2><h2>  </h2>");
     expect(tocEntries(bound.editor.state.doc, 3).map((e) => [e.level, e.text, e.slug])).toEqual([
-      [0, "B", "b"],
+      [0, "B", "h-b"],
     ]);
   });
 });

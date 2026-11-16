@@ -21,7 +21,7 @@ describe("scrollToHeading", () => {
     main.scrollBy = scrollBy;
     const heading = document.getElementById("tasks-1")!;
     heading.getBoundingClientRect = () => ({ top: 500 }) as DOMRect;
-    expect(scrollToHeading("tasks-1")).toBe(true);
+    expect(scrollToHeading("tasks-1")).not.toBeNull();
     expect(scrollBy).toHaveBeenCalledWith({ top: 500 - 68, behavior: "auto" });
   });
 
@@ -39,13 +39,13 @@ describe("scrollToHeading", () => {
     pane.getBoundingClientRect = () => ({ top: 100 }) as DOMRect;
     const old = document.querySelector<HTMLElement>("#old h2")!;
     old.getBoundingClientRect = () => ({ top: 400 }) as DOMRect;
-    expect(scrollToHeading("tasks", document.getElementById("old")!)).toBe(true);
+    expect(scrollToHeading("tasks", document.getElementById("old")!)).not.toBeNull();
     expect(mainScroll).not.toHaveBeenCalled();
     // Below the pane's top: the page's sticky band is not over the pane.
     expect(paneScroll).toHaveBeenCalledWith({ top: 400 - 100 - 8, behavior: "auto" });
   });
 
   it("says false when there is no such heading", () => {
-    expect(scrollToHeading("nope")).toBe(false);
+    expect(scrollToHeading("nope")).toBeNull();
   });
 });

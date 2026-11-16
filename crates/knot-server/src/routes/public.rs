@@ -135,8 +135,12 @@ struct HeadingRef {
     slug: String,
 }
 
-/// The headings of `events`, in order, with the slugs the editor gives them
-/// (`knot_markdown::slug`).
+/// Put before every heading slug, as the editor does (`headingAnchors.ts`):
+/// keeps heading ids clear of other ids on the page.
+const HEADING_ID_PREFIX: &str = "h-";
+
+/// The headings of `events`, in order, with the ids the editor gives them
+/// (`h-` and the slug of `knot_markdown::slug`).
 fn collect_headings(events: &[pulldown_cmark::Event<'_>]) -> Vec<HeadingRef> {
     use pulldown_cmark::{Event, Tag, TagEnd};
     let mut slugger = knot_markdown::slug::Slugger::default();
@@ -152,7 +156,7 @@ fn collect_headings(events: &[pulldown_cmark::Event<'_>]) -> Vec<HeadingRef> {
             }
             Event::End(TagEnd::Heading(_)) => {
                 if let Some((level, text)) = open.take() {
-                    let slug = slugger.slug(&text);
+                    let slug = format!("{HEADING_ID_PREFIX}{}", slugger.slug(&text));
                     out.push(HeadingRef { level, text, slug });
                 }
             }
@@ -168,7 +172,9 @@ fn toc_html(headings: &[HeadingRef], max_level: u8) -> String {
         .iter()
         .filter(|h| h.level <= max_level && !h.text.trim().is_empty())
         .collect();
-    let mut html = String::from(r#"<div class="knot-box"><p class="knot-box__title">Contents</p>"#);
+    let mut html = String::from(
+        r#"<nav class="knot-box" aria-label="Contents"><p class="knot-box__title">Contents</p>"#,
+    );
     if shown.is_empty() {
         html.push_str("<p>No headings yet</p>");
     } else {
@@ -184,7 +190,7 @@ fn toc_html(headings: &[HeadingRef], max_level: u8) -> String {
         }
         html.push_str("</ul>");
     }
-    html.push_str("</div>");
+    html.push_str("</nav>");
     html
 }
 
@@ -319,7 +325,8 @@ fn render_markdown(
         sanitizer.add_tag_attributes(heading, &["id"]);
     }
     sanitizer
-        .add_allowed_classes("div", &["knot-box"])
+        .add_tag_attributes("nav", &["aria-label"])
+        .add_allowed_classes("nav", &["knot-box"])
         .add_allowed_classes("p", &["knot-box__title"])
         .add_allowed_classes("ul", &["knot-box__list"])
         .add_allowed_classes("li", &TOC_LEVEL_CLASSES);
@@ -582,9 +589,9 @@ mod tests {
     #[test]
     fn headings_get_slug_ids() {
         let html = render("# Plan\n\n## Tasks\n\n## Tasks\n");
-        assert!(html.contains("<h1 id=\"plan\">Plan</h1>"), "{html}");
-        assert!(html.contains("<h2 id=\"tasks\">Tasks</h2>"), "{html}");
-        assert!(html.contains("<h2 id=\"tasks-1\">Tasks</h2>"), "{html}");
+        assert!(html.contains("<h1 id=\"h-plan\">Plan</h1>"), "{html}");
+        assert!(html.contains("<h2 id=\"h-tasks\">Tasks</h2>"), "{html}");
+        assert!(html.contains("<h2 id=\"h-tasks-1\">Tasks</h2>"), "{html}");
     }
 
     #[test]
@@ -592,7 +599,7 @@ mod tests {
         let html = render("[[_TOC_]]\n\n# Plan\n\n## Tasks\n\n### Details\n");
         assert!(html.contains("class=\"knot-box\""), "{html}");
         assert!(html.contains("class=\"knot-box__title\""), "{html}");
-        for slug in ["plan", "tasks", "details"] {
+        for slug in ["h-plan", "h-tasks", "h-details"] {
             assert!(
                 html.contains(&format!("href=\"#{slug}\"")),
                 "{slug} in {html}"
@@ -601,32 +608,47 @@ mod tests {
         assert!(!html.contains("[[_TOC_]]"), "{html}");
         assert!(!html.contains("knot://toc"), "{html}");
         // The box is not inside a paragraph.
-        assert!(!html.contains("<p><div"), "{html}");
+        assert!(!html.contains("<p><nav"), "{html}");
+    }
+
+    #[test]
+    fn toc_box_is_a_navigation_landmark() {
+        for md in [
+            "[[_TOC_]]\n\n# Plan\n",
+            "| [[_TOC_]] | b |\n| --- | --- |\n| c | d |\n\n# Plan\n",
+        ] {
+            let html = render(md);
+            assert!(
+                html.contains("<nav class=\"knot-box\" aria-label=\"Contents\">"),
+                "{html}"
+            );
+        }
     }
 
     #[test]
     fn toc_respects_max_level_comment() {
         let html = render("<!-- knot:toc maxLevel=1 -->\n[[_TOC_]]\n\n# Plan\n\n## Tasks\n");
-        assert!(html.contains("href=\"#plan\""), "{html}");
-        assert!(!html.contains("href=\"#tasks\""), "{html}");
+        assert!(html.contains("href=\"#h-plan\""), "{html}");
+        assert!(!html.contains("href=\"#h-tasks\""), "{html}");
     }
 
     #[test]
     fn expands_toc_in_a_table_cell() {
         let html = render("| [[_TOC_]] | b |\n| --- | --- |\n| c | d |\n\n# Plan\n");
         assert!(html.contains("class=\"knot-box\""), "{html}");
-        assert!(html.contains("href=\"#plan\""), "{html}");
+        assert!(html.contains("href=\"#h-plan\""), "{html}");
     }
 
     #[test]
     fn public_toc_keeps_html_sanitised() {
-        let md = "[[_TOC_]]\n\n<div class=\"evil\" id=\"x\" onclick=\"alert(1)\">hi</div>\n\n<script>alert(2)</script>\n\n# Plan\n";
+        let md = "[[_TOC_]]\n\n<div class=\"evil\" id=\"x\" onclick=\"alert(1)\">hi</div>\n\n<nav class=\"knot-box evil\" onclick=\"alert(3)\" style=\"x\">n</nav>\n\n<script>alert(2)</script>\n\n# Plan\n";
         let html = render(md);
         assert!(!html.contains("<script"), "{html}");
         assert!(!html.contains("onclick"), "{html}");
         assert!(!html.contains("evil"), "{html}");
         assert!(!html.contains("id=\"x\""), "{html}");
-        assert!(html.contains("<h1 id=\"plan\">"), "{html}");
+        assert!(!html.contains("style="), "{html}");
+        assert!(html.contains("<h1 id=\"h-plan\">"), "{html}");
     }
 
     #[test]

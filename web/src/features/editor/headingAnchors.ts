@@ -1,6 +1,7 @@
 /**
  * Heading anchors and the table of contents' entries. Every heading gets
- * the GitHub-style slug of `headingSlugs.ts` as its DOM id, through a
+ * `h-` plus the GitHub-style slug of `headingSlugs.ts` as its DOM id (the
+ * prefix keeps them clear of the app's own ids, such as `root`), through a
  * decoration: nothing is stored, so ids follow every edit and never reach
  * the shared document. The public page gives its headings the same ids
  * (`crates/knot-server/src/routes/public.rs`).
@@ -13,12 +14,15 @@ import { Decoration, DecorationSet } from "@tiptap/pm/view";
 
 import { slugger } from "./headingSlugs";
 
+/** Put before every heading slug, here and on the public page. */
+export const HEADING_ID_PREFIX = "h-";
+
 /** A heading of the page, with the id it gets. */
 type HeadingInfo = { pos: number; size: number; level: number; text: string; slug: string };
 
 /** One line of a table of contents: `level` 0–4 below the shallowest
  *  heading shown (deeper ones stay at 4). */
-export type TocEntry = { level: number; text: string; slug: string };
+export type TocEntry = { level: number; text: string; slug: string; pos: number };
 
 /** The text a heading's anchor and entry come from: up to its first hard
  *  break, as Markdown ends a heading line there. */
@@ -50,7 +54,7 @@ function headingsOf(doc: PMNode): HeadingInfo[] {
       size: node.nodeSize,
       level: Number.isInteger(level) && level >= 1 && level <= 6 ? level : 1,
       text,
-      slug: slug(text),
+      slug: HEADING_ID_PREFIX + slug(text),
     });
     return false;
   });
@@ -61,7 +65,12 @@ function headingsOf(doc: PMNode): HeadingInfo[] {
 export function tocEntries(doc: PMNode, maxLevel: number): TocEntry[] {
   const shown = headingsOf(doc).filter((h) => h.level <= maxLevel && h.text.trim() !== "");
   const top = Math.min(...shown.map((h) => h.level));
-  return shown.map((h) => ({ level: Math.min(h.level - top, 4), text: h.text, slug: h.slug }));
+  return shown.map((h) => ({
+    level: Math.min(h.level - top, 4),
+    text: h.text,
+    slug: h.slug,
+    pos: h.pos,
+  }));
 }
 
 function decorations(doc: PMNode): DecorationSet {
