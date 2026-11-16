@@ -39,6 +39,17 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   current page and links it, and you stay where you were writing. Editors
   of the page see that row; readers do not. Inside code `[[` stays text, and
   a typed `]]` closes the picker. (#110)
+- Callout boxes: note, tip, important, warning and caution, the five alerts
+  of GitHub and GitLab. Pick one from the toolbar's callout menu (in a quote
+  it turns the quote into a box; in a box it changes the kind), type
+  `> [!warning] ` at the start of a line, or paste Markdown with an alert.
+  A box shows its kind's icon and colour in a header band, with an optional
+  title of its own and a select to change the kind, and holds anything a
+  quote can. It reads well in all 13 skins. Markdown export writes GitHub's
+  `> [!WARNING]`, or GitLab's `> [!warning] Title` for a box with a title;
+  import reads both, in any case. Public share pages show the box; DOCX and
+  ODT exports show a bordered box with its title in the kind's colour.
+  (#TBD)
 
 ### Changed
 - The editor toolbar's Mermaid and Excalidraw buttons are one **Insert
@@ -55,6 +66,9 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   (#115)
 
 ### Operators — read before upgrading
+- Rolling back past this release keeps every callout box's text, but a box
+  that someone edits from an older version becomes a plain quote (it loses
+  its kind and title).
 - **Tell people to reload, and do not roll back past this release once
   pages have a table of contents.** A browser tab that does not know the new
   block removes it from the shared page as soon as it opens that page, for
