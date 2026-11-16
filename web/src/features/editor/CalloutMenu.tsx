@@ -72,7 +72,6 @@ export function CalloutMenu({ editor, btnClass }: { editor: Editor; btnClass: st
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
-        aria-pressed={current !== null}
         onClick={() => setOpen(!open)}
         className={`${btnClass} ${open || current ? "bg-muted text-fg" : ""}`}
       >
