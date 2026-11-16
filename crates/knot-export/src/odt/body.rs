@@ -122,6 +122,11 @@ fn block(cx: &mut Ctx, b: &Block, avail_cm: f64) {
             blocks(cx, inner, (avail_cm - QUOTE_INDENT_CM).max(0.0));
             cx.quote_depth -= 1;
         }
+        Block::Callout {
+            kind,
+            title,
+            blocks: inner,
+        } => table::callout(cx, *kind, title.as_deref(), inner, avail_cm),
         Block::Code { text, .. } => text_paragraph(cx, "Preformatted_20_Text", text),
         Block::Rule => {
             open_paragraph(cx, "Horizontal_20_Line");

@@ -3,10 +3,11 @@
 //! `number-columns-spanned` / `number-rows-spanned` on its cell plus a
 //! `table:covered-table-cell` for each other grid position it covers.
 
-use crate::model::{Align, Cell, Table};
+use crate::model::{Align, Block, CalloutKind, Cell, Table};
 use crate::tables::{Slot, grid_edges, header_rows, layout};
 
 use super::{CellCx, Ctx, body};
+use crate::xml::esc_text;
 
 /// Left and right padding of a table cell, in cm: what the content of a cell
 /// loses of the cell's width on each side. The cell styles below use it.
@@ -186,4 +187,70 @@ fn covered(cx: &mut Ctx, n: usize) {
     for _ in 0..n {
         cx.body.push_str("<table:covered-table-cell/>");
     }
+}
+
+/// Write a callout box `avail_cm` wide: a one-cell table bordered in the
+/// kind's colour, its first paragraph the title (bold, in that colour, on
+/// a light shade of it), then the box's blocks. The styles are written
+/// once per kind.
+pub(super) fn callout(
+    cx: &mut Ctx,
+    kind: CalloutKind,
+    title: Option<&str>,
+    blocks: &[Block],
+    avail_cm: f64,
+) {
+    let lists = body::close_lists(cx);
+    let indent_cm = body::indent_cm(cx, &lists);
+    let suffix = kind.style_suffix();
+    let cell_style = format!("Callout_{suffix}");
+    let title_style = format!("Callout_{suffix}_Title");
+    if !cx
+        .auto_styles
+        .contains(&format!(r#"style:name="{cell_style}""#))
+    {
+        let hue = kind.hue();
+        cx.auto_styles.push_str(&format!(
+            concat!(
+                r#"<style:style style:name="{cell}" style:family="table-cell">"#,
+                r##"<style:table-cell-properties fo:padding="0.19cm" fo:border="1pt solid #{hue}"/>"##,
+                r#"</style:style>"#,
+                r#"<style:style style:name="{title}" style:family="paragraph" style:parent-style-name="Standard">"#,
+                r##"<style:paragraph-properties fo:background-color="#{shade}"/>"##,
+                r##"<style:text-properties fo:font-weight="bold" fo:color="#{hue}"/>"##,
+                r#"</style:style>"#,
+            ),
+            cell = cell_style,
+            title = title_style,
+            hue = hue,
+            shade = kind.shade(),
+        ));
+    }
+    cx.last_table += 1;
+    let name = format!("Table{}", cx.last_table);
+    let width = ((avail_cm * 1000.0).round() as u32).max(1);
+    styles(cx, &name, &[1.0], &[0, width], indent_cm);
+    cx.body.push_str(&format!(
+        concat!(
+            r#"<table:table table:name="{name}" table:style-name="{name}">"#,
+            r#"<table:table-column table:style-name="{name}.C1"/><table:table-row>"#,
+            r#"<table:table-cell table:style-name="{cell}">"#,
+            r#"<text:p text:style-name="{title}">{text}</text:p>"#,
+        ),
+        name = name,
+        cell = cell_style,
+        title = title_style,
+        text = esc_text(title.unwrap_or(kind.label())),
+    ));
+    let outer = (cx.quote_depth, cx.cell);
+    cx.quote_depth = 0;
+    cx.cell = Some(CellCx {
+        header: false,
+        align: "start",
+    });
+    body::blocks(cx, blocks, (avail_cm - 2.0 * CELL_PADDING_CM).max(0.0));
+    (cx.quote_depth, cx.cell) = outer;
+    cx.body
+        .push_str("</table:table-cell></table:table-row></table:table>");
+    body::reopen_lists(cx, lists);
 }

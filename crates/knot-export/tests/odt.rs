@@ -1866,3 +1866,22 @@ fn toc_writes_contents_caption_and_indented_entries() {
     assert_eq!(toc2.attribute((STYLE, "display-name")), Some("Contents 2"));
     assert_eq!(prop(toc2, FO, "margin-left"), Some("0.5cm"));
 }
+
+#[test]
+fn callout_writes_one_cell_table_with_bold_title() {
+    for (title, shown) in [(Some("W".to_string()), "W"), (None, "Warning")] {
+        let odt = export(vec![Block::Callout {
+            kind: knot_export::CalloutKind::Warning,
+            title,
+            blocks: vec![para("body")],
+        }]);
+        parse_all(&odt);
+        let d = odt.part("content.xml");
+        assert!(d.contains("<table:table "), "{d}");
+        assert!(d.contains(&format!(">{shown}<")), "{d}");
+        assert!(d.contains(">body<"), "{d}");
+        let all = format!("{d}{}", odt.part("styles.xml"));
+        assert!(all.to_ascii_uppercase().contains("9A6700"), "{all}");
+        assert!(all.contains("fo:font-weight=\"bold\""), "{all}");
+    }
+}

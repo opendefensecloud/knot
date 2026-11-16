@@ -9,8 +9,8 @@ use yrs::types::text::YChange;
 use yrs::{Any, Out, ReadTxn, Text, Transact, Xml, XmlFragment, XmlOut, XmlTextRef};
 
 use crate::model::{
-    Align, Block, Cell, ExportDoc, ImageSource, Inline, LinkTarget, List, ListItem, Marks, Run,
-    Table, TocEntry,
+    Align, Block, CalloutKind, Cell, ExportDoc, ImageSource, Inline, LinkTarget, List, ListItem,
+    Marks, Run, Table, TocEntry,
 };
 use crate::tables::resolve_shares;
 
@@ -423,7 +423,19 @@ fn walk_single<T: ReadTxn>(
                 content: inlines(el, txn, depth),
             }
         }
-        "blockquote" => Block::Quote(walk_blocks(el, txn, tally, depth + 1)),
+        "blockquote" => {
+            let blocks = walk_blocks(el, txn, tally, depth + 1);
+            match attr(el, txn, "kind").and_then(|k| CalloutKind::parse(&k)) {
+                Some(kind) => Block::Callout {
+                    kind,
+                    title: attr(el, txn, "title")
+                        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+                        .filter(|t| !t.is_empty()),
+                    blocks,
+                },
+                None => Block::Quote(blocks),
+            }
+        }
         "code_block" => {
             let language = attr(el, txn, "language").unwrap_or_default();
             let text = flatten_text(el, txn);
@@ -696,7 +708,7 @@ fn headings(blocks: &[Block]) -> Vec<(u8, String)> {
                         out.push((*level, t));
                     }
                 }
-                Block::Quote(inner) => walk(inner, out),
+                Block::Quote(inner) | Block::Callout { blocks: inner, .. } => walk(inner, out),
                 Block::List(list) => list.items.iter().for_each(|i| walk(&i.blocks, out)),
                 _ => {}
             }
@@ -725,7 +737,7 @@ fn fill_tocs(blocks: &mut [Block]) {
                         })
                         .collect();
                 }
-                Block::Quote(inner) => fill(inner, all),
+                Block::Quote(inner) | Block::Callout { blocks: inner, .. } => fill(inner, all),
                 Block::List(list) => list.items.iter_mut().for_each(|i| fill(&mut i.blocks, all)),
                 Block::Table(table) => table
                     .rows
@@ -743,7 +755,7 @@ fn visit_blocks<'a>(blocks: &'a [Block], f: &mut impl FnMut(&'a Block)) {
     for b in blocks {
         f(b);
         match b {
-            Block::Quote(inner) => visit_blocks(inner, f),
+            Block::Quote(inner) | Block::Callout { blocks: inner, .. } => visit_blocks(inner, f),
             Block::List(list) => {
                 for item in &list.items {
                     visit_blocks(&item.blocks, f);

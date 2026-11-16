@@ -82,6 +82,11 @@ fn block(cx: &mut Ctx, b: &Block, avail_twips: u32) {
             blocks(cx, inner, avail_twips.saturating_sub(QUOTE_INDENT_TWIPS));
             cx.quote_depth -= 1;
         }
+        Block::Callout {
+            kind,
+            title,
+            blocks: inner,
+        } => table::callout(cx, *kind, title.as_deref(), inner, avail_twips),
         Block::Code { text, .. } => text_paragraph(cx, "Code", text),
         Block::Rule => {
             open_paragraph(cx, Some("HorizontalRule"));

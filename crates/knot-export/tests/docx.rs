@@ -1968,3 +1968,21 @@ fn toc_writes_contents_caption_and_indented_entries() {
         .expect("TOC2 indent");
     assert_eq!(wattr(ind, "left"), Some("220"));
 }
+
+#[test]
+fn callout_writes_bordered_table_with_bold_title() {
+    for (title, shown) in [(Some("W".to_string()), "W"), (None, "Warning")] {
+        let docx = export(vec![Block::Callout {
+            kind: knot_export::CalloutKind::Warning,
+            title,
+            blocks: vec![para("body")],
+        }]);
+        let d = docx.part("word/document.xml");
+        assert!(d.contains("<w:tbl>"), "{d}");
+        assert!(d.contains("9A6700"), "{d}");
+        assert!(d.contains("<w:b/>"), "{d}");
+        assert!(d.contains(&format!(">{shown}<")), "{d}");
+        assert!(d.contains(">body<"), "{d}");
+        xml(d);
+    }
+}
