@@ -36,12 +36,13 @@ function toolbar(b: BoundEditor) {
   );
 }
 
-function pick(kind: string) {
+/** Opens the Quote menu and picks `item` ("quote" or a kind). */
+function pick(item: string) {
   act(() => {
-    fireEvent.click(screen.getByTestId("toolbar-callout"));
+    fireEvent.click(screen.getByTestId("toolbar-blockquote"));
   });
   act(() => {
-    fireEvent.click(screen.getByTestId(`toolbar-callout-${kind}`));
+    fireEvent.click(screen.getByTestId(item === "quote" ? "toolbar-quote" : `toolbar-callout-${item}`));
   });
 }
 
@@ -50,7 +51,7 @@ function pressBackspace(b: BoundEditor): boolean {
   return b.editor.view.someProp("handleKeyDown", (fn) => fn(b.editor.view, event)) ?? false;
 }
 
-describe("toolbar callout menu", () => {
+describe("toolbar quote and callout menu", () => {
   it("wraps the paragraph at the caret in a box of the picked kind", () => {
     bound = mountBoundEditor();
     bound.editor.commands.setContent("<p>intro</p>");
@@ -78,24 +79,39 @@ describe("toolbar callout menu", () => {
     expect(quotes(bound.editor.state.doc)).toEqual([{ kind: "note", text: "x" }]);
   });
 
-  it("is a menu button, not a toggle, for screen readers", () => {
+  it("shares one menu button with Quote, not a toggle, for screen readers", () => {
     bound = mountBoundEditor();
     bound.editor.commands.setContent('<blockquote data-kind="warning"><p>x</p></blockquote>');
     placeSelection(bound, 3);
     toolbar(bound);
-    const trigger = screen.getByTestId("toolbar-callout");
+    expect(screen.queryByTestId("toolbar-callout")).toBeNull();
+    const trigger = screen.getByTestId("toolbar-blockquote");
     expect(trigger).not.toHaveAttribute("aria-pressed");
     expect(trigger).toHaveAttribute("aria-haspopup", "menu");
     expect(trigger).toHaveAttribute("aria-expanded", "false");
   });
 
-  it("the Quote button inside a box lifts the text out", () => {
+  it("Quote in the menu wraps the paragraph in a plain quote", () => {
+    bound = mountBoundEditor();
+    bound.editor.commands.setContent("<p>intro</p>");
+    placeSelection(bound, 3);
+    toolbar(bound);
+    pick("quote");
+    expect(quotes(bound.editor.state.doc)).toEqual([{ kind: null, text: "intro" }]);
+  });
+
+  it("Quote in the menu inside a box lifts the text out", () => {
     bound = mountBoundEditor();
     bound.editor.commands.setContent('<blockquote data-kind="warning"><p>keep</p></blockquote>');
     placeSelection(bound, 3);
     toolbar(bound);
     act(() => {
       fireEvent.click(screen.getByTestId("toolbar-blockquote"));
+    });
+    expect(screen.getByTestId("toolbar-quote")).toHaveTextContent("Remove quote");
+    expect(screen.getByTestId("toolbar-callout-warning")).toHaveAttribute("aria-checked", "true");
+    act(() => {
+      fireEvent.click(screen.getByTestId("toolbar-quote"));
     });
     expect(quotes(bound.editor.state.doc)).toEqual([]);
     expect(bound.editor.state.doc.textContent).toBe("keep");

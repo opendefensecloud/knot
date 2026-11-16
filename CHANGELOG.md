@@ -33,8 +33,8 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   "Contents" with Word's and LibreOffice's own table of contents styles.
   (#TBD)
 - Callout boxes: note, tip, important, warning and caution, the five alerts
-  of GitHub and GitLab. Pick one from the toolbar's callout menu (in a quote
-  it turns the quote into a box; in a box it changes the kind), type
+  of GitHub and GitLab. Pick one from the Quote button's menu (in a quote it
+  turns the quote into a box; in a box it changes the kind), type
   `> [!warning] ` at the start of a line, or paste Markdown with an alert.
   A box shows its kind's icon and colour in a header band, with an optional
   title of its own and a select to change the kind, and holds anything a
