@@ -618,6 +618,24 @@ fn main() {}
 }
 
 #[test]
+fn a_callout_keeps_kind_and_title() {
+    let doc = Doc::new();
+    let frag = doc.get_or_insert_xml_fragment("default");
+    {
+        let mut txn = doc.transact_mut();
+        let quote = frag.push_back(&mut txn, XmlElementPrelim::empty("blockquote"));
+        quote.insert_attribute(&mut txn, "kind", "warning");
+        quote.insert_attribute(&mut txn, "title", "Wartung");
+        let p = quote.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+        p.push_back(&mut txn, yrs::XmlTextPrelim::new("x"));
+    }
+    let content = &pm_json(&doc)["content"];
+    assert_eq!(content[0]["type"], json!("blockquote"), "{content}");
+    assert_eq!(content[0]["attrs"]["kind"], json!("warning"), "{content}");
+    assert_eq!(content[0]["attrs"]["title"], json!("Wartung"), "{content}");
+}
+
+#[test]
 fn a_table_of_contents_keeps_its_depth() {
     let doc = Doc::new();
     let frag = doc.get_or_insert_xml_fragment("default");

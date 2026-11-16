@@ -197,6 +197,11 @@ describe("editor schema alignment", () => {
         { type: "paragraph", content: [{ type: "text", text: "hi" }] },
         { type: "heading", attrs: { level: 1 }, content: [{ type: "text", text: "h" }] },
         { type: "blockquote", content: [{ type: "paragraph", content: [{ type: "text", text: "q" }] }] },
+        {
+          type: "blockquote",
+          attrs: { kind: "warning", title: "Wartung" },
+          content: [{ type: "paragraph", content: [{ type: "text", text: "w" }] }],
+        },
         { type: "code_block", content: [{ type: "text", text: "x" }] },
         { type: "horizontal_rule" },
         { type: "table_of_contents", attrs: { maxLevel: 2 } },
@@ -252,6 +257,11 @@ describe("editor schema alignment", () => {
     // `nodeFromJSON(...).check()` throws on schema violations such as a
     // table whose content expression doesn't accept table_row.
     expect(() => editor.schema.nodeFromJSON(sample).check()).not.toThrow();
+    // A callout's kind and title are blockquote attributes and survive.
+    expect(editor.schema.nodeFromJSON(sample).child(3).attrs).toMatchObject({
+      kind: "warning",
+      title: "Wartung",
+    });
     editor.destroy();
   });
 
@@ -345,6 +355,7 @@ const CREATE_EXTENSIONS_ORDER = [
   "knotOrderedListMarkerGutter",
   "hard_break",
   "horizontal_rule",
+  "blockquote",
   "code_block",
   "underline",
   "link",

@@ -1,5 +1,6 @@
 //! Round-trip serializer between the canonical ProseMirror schema and Markdown.
 
+pub mod callout;
 pub mod from_markdown;
 #[cfg(feature = "legacy-compat")]
 pub mod legacy;

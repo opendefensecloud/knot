@@ -15,6 +15,7 @@ import type { NavigateFunction } from "react-router-dom";
 
 import { Attachment } from "./nodes/AttachmentNode";
 import { ExcalidrawBoard } from "./nodes/ExcalidrawBoard";
+import { KnotBlockquote } from "./nodes/Callout";
 import { TableOfContents } from "./nodes/TableOfContents";
 import { HeadingAnchors } from "./headingAnchors";
 import { MermaidCodeBlock } from "./nodes/MermaidCodeBlock";
@@ -281,6 +282,8 @@ function starterKit(viewer: boolean) {
     orderedList: false,
     listItem: false,
     hardBreak: false,
+    // Re-added below with the callout attributes (nodes/Callout.ts).
+    blockquote: false,
     horizontalRule: false,
     // Bundled by StarterKit from v3 on. Link and Underline are registered
     // explicitly below, and registering either twice makes the second
@@ -346,6 +349,7 @@ export function createSchemaExtensions(opts: {
     OrderedListMarkerGutter,
     KnotHardBreak,
     KnotHorizontalRule,
+    KnotBlockquote,
     viewer ? viewerCodeBlock : MermaidCodeBlock,
     Underline,
     KnotLink.configure({
