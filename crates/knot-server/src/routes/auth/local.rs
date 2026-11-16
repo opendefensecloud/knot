@@ -473,6 +473,7 @@ mod tests {
                             user_id,
                             workspace_id: Uuid::nil(),
                             role: WorkspaceRole::Editor,
+                            root_doc_id: None,
                         });
                     }
                     next.run(request).await

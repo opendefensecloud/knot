@@ -312,7 +312,7 @@ pub(super) async fn access_inline(
             continue;
         }
         let title = match acl
-            .effective_role(ctx.workspace_id, named_id, ctx.user_id)
+            .effective_role(ctx.workspace_id, named_id, ctx.user_id, ctx.root_doc_id)
             .await
         {
             Ok(Some(_)) => match docs.get(named_id).await {

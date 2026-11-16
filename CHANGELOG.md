@@ -187,6 +187,7 @@ rebuilt once; read Upgrading first.
   (#106)
 
 ### Added
+- API keys can be limited to one page and its subpages (Settings → API keys → Pages). Such a key can't call workspace-wide endpoints.
 - Metrics `knot_room_boot_fallbacks_total{reason}`,
   `knot_room_snapshots_withheld_total{reason}`,
   `knot_room_pending_reparked_total{reason}` and

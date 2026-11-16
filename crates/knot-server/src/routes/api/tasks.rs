@@ -66,7 +66,10 @@ async fn list_mine(
     // Tasks in docs the caller can't read are left out in SQL. A cached
     // snapshot may predate a doc and miss it from the hidden set, so the
     // rows are checked again against one that covers their docs.
-    let hidden_ids = match acl.visibility(ctx.workspace_id, ctx.user_id).await {
+    let hidden_ids = match acl
+        .visibility(ctx.workspace_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(visibility) => visibility.hidden_ids(),
         Err(e) => {
             tracing::error!(error=?e, "tasks visibility");
@@ -90,7 +93,12 @@ async fn list_mine(
     };
     let listed_doc_ids: Vec<Uuid> = rows.iter().map(|row| row.task.doc_id).collect();
     let visibility = match acl
-        .visibility_covering(ctx.workspace_id, ctx.user_id, &listed_doc_ids)
+        .visibility_covering(
+            ctx.workspace_id,
+            ctx.user_id,
+            ctx.root_doc_id,
+            &listed_doc_ids,
+        )
         .await
     {
         Ok(visibility) => visibility,
@@ -140,15 +148,21 @@ async fn patch_checked(
     };
     // Editor+ on the parent doc; checking off a task is an edit.
     match acl
-        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
+        .effective_role(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
         .await
     {
         Ok(Some(knot_storage::WorkspaceRole::Owner | knot_storage::WorkspaceRole::Editor)) => {}
         Ok(_) => return json_err(StatusCode::FORBIDDEN, "acl.editor_required", ""),
         Err(_) => return internal(),
     }
-    if let Some(r) =
-        crate::archive::refuse_if_archived(&state, ctx.workspace_id, doc_id, ctx.user_id).await
+    if let Some(r) = crate::archive::refuse_if_archived(
+        &state,
+        ctx.workspace_id,
+        doc_id,
+        ctx.user_id,
+        ctx.root_doc_id,
+    )
+    .await
     {
         return r;
     }

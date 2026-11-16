@@ -3423,3 +3423,105 @@ async fn a_version_copy_copies_its_boards_and_files() {
     assert!(attr_values(live.doc(), "image", "src").is_empty());
     assert!(attr_values(live.doc(), "excalidraw_board", "board_id").is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Subtree-scoped keys (S10)
+// ---------------------------------------------------------------------------
+
+/// A built page under `parent` where the owner typed a paragraph; returns
+/// it and its session entry.
+async fn typed_child(fx: &Fixture, parent: Uuid, title: &str) -> (Uuid, i64) {
+    let n = fx.pages.fetch_add(1, Ordering::SeqCst);
+    let doc = fx
+        .state
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(
+            fx.ws_id,
+            Some(parent),
+            title,
+            &format!("k{n:06}"),
+            fx.owner.id,
+        )
+        .await
+        .unwrap()
+        .id;
+    append(
+        fx,
+        doc,
+        fx.owner.id,
+        vec![Typist::new(40 + n as u64).para(TYPED)],
+    )
+    .await;
+    build(fx, doc).await;
+    (doc, session_of(fx, doc, fx.owner.id).await)
+}
+
+/// S10: Restore as new page puts the copy beside the page, so a key rooted
+/// at `root` may copy a version of a page inside, but not of the root
+/// itself (its parent is outside: Duplicate's 404) nor of a top-level root
+/// (`api_key.subtree_denied`), and nothing is created then.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subtree_key_restores_as_new_only_inside_its_subtree() {
+    let fx = fixture().await;
+    let top = page(&fx, "Top").await;
+    let (root, root_eid) = typed_child(&fx, top, "Root").await;
+    let (inside, inside_eid) = typed_child(&fx, root, "Inside").await;
+    let key = |root: Uuid| {
+        let fx = &fx;
+        async move {
+            let a = send(
+                fx,
+                Some(&fx.owner.session),
+                "POST",
+                "/api/auth/api-keys",
+                Some(json!({"name": "s", "scopes": ["read", "create"], "root_doc_id": root})),
+            )
+            .await;
+            assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+            a.json()["key"].as_str().unwrap().to_string()
+        }
+    };
+    let with_key = |key: String, doc: Uuid, eid: i64| {
+        let app = fx.app.clone();
+        async move {
+            answer(
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(restore_as_new_uri(doc, eid))
+                        .header("authorization", format!("Bearer {key}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(labelled("v1").to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await
+        }
+    };
+    let rooted = key(root).await;
+    let before = page_count(&fx).await;
+
+    with_key(rooted.clone(), root, root_eid)
+        .await
+        .error(StatusCode::NOT_FOUND, "doc.not_found");
+    let top_rooted = key(top).await;
+    append(&fx, top, fx.owner.id, vec![Typist::new(90).para(TYPED)]).await;
+    build(&fx, top).await;
+    let top_eid = session_of(&fx, top, fx.owner.id).await;
+    with_key(top_rooted, top, top_eid)
+        .await
+        .error(StatusCode::FORBIDDEN, "api_key.subtree_denied");
+    assert_eq!(page_count(&fx).await, before, "a refused copy was created");
+
+    let copy = created(&with_key(rooted, inside, inside_eid).await);
+    let parent: Option<Uuid> = sqlx::query_scalar("SELECT parent_id FROM documents WHERE id = $1")
+        .bind(copy)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(parent, Some(root), "the copy goes beside the page");
+}

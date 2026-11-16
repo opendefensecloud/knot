@@ -53,7 +53,7 @@ async fn require_doc_role(
         return Some(internal());
     };
     match acl
-        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
+        .effective_role(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
         .await
     {
         Ok(Some(role)) => {
@@ -67,8 +67,14 @@ async fn require_doc_role(
                 Some(json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""))
             } else if editor_required {
                 // Boards in an archived doc are read-only (their SVG still renders).
-                crate::archive::refuse_if_archived(state, ctx.workspace_id, doc_id, ctx.user_id)
-                    .await
+                crate::archive::refuse_if_archived(
+                    state,
+                    ctx.workspace_id,
+                    doc_id,
+                    ctx.user_id,
+                    ctx.root_doc_id,
+                )
+                .await
             } else {
                 None
             }

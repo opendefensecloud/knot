@@ -654,6 +654,7 @@ impl World {
             user_id: who.user_id,
             workspace_id: self.workspace_id,
             role,
+            root_doc_id: None,
         }
     }
 

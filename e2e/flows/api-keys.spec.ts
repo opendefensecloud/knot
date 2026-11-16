@@ -64,12 +64,14 @@ async function createKeyInUi(
   name: string,
   scopes: ReadonlyArray<"read" | "create" | "update" | "delete">,
   expiry?: string,
+  rootTitle?: string,
 ): Promise<string> {
   await scope.getByTestId("api-key-name").fill(name);
   for (const s of ["read", "create", "update", "delete"] as const) {
     await scope.getByTestId(`api-key-scope-${s}`).setChecked(scopes.includes(s));
   }
   if (expiry) await scope.getByTestId("api-key-expiry").selectOption(expiry);
+  if (rootTitle) await scope.getByTestId("api-key-root").selectOption({ label: rootTitle });
   await scope.getByTestId("api-key-submit").click();
 
   const dialog = page.getByTestId("api-key-reveal");
@@ -244,6 +246,36 @@ test("bot key works but cannot reach owner-only actions (S4)", async ({ request 
     expect(res.status(), label).toBe(403);
     expect(await errorCode(res), label).toBe(code);
   }
+});
+
+test("a key limited to a page can't reach a page outside it (S10)", async ({ request }) => {
+  const mk = async (title: string): Promise<string> => {
+    const res = await page.request.post("/api/docs", { headers: await writeHeaders(), data: { title } });
+    expect(res.status()).toBe(201);
+    return ((await res.json()) as { id: string }).id;
+  };
+  const insideId = await mk("Inside");
+  const outsideId = await mk("Outside");
+
+  await page.goto("/settings");
+  const section = page.getByTestId("api-keys-section");
+  const key = await createKeyInUi(section, "scoped", ["read", "create"], undefined, "Inside");
+  const row = section.getByTestId("api-key-row").filter({ hasText: "scoped" });
+  await expect(row.getByTestId("api-key-root-chip")).toHaveText("Inside");
+
+  const inside = await request.get(`${SERVER}/api/docs/${insideId}`, { headers: bearer(key) });
+  expect(inside.status()).toBe(200);
+  // Outside the subtree answers like a page without access.
+  const outside = await request.get(`${SERVER}/api/docs/${outsideId}`, { headers: bearer(key) });
+  expect(outside.status()).toBe(403);
+  expect(await errorCode(outside)).toBe("acl.no_grant");
+  // No top-level pages, no workspace-wide routes.
+  const top = await request.post(`${SERVER}/api/docs`, { headers: bearer(key), data: { title: "Top" } });
+  expect(top.status()).toBe(403);
+  expect(await errorCode(top)).toBe("api_key.subtree_denied");
+  const members = await request.get(`${SERVER}/api/workspace/members`, { headers: bearer(key) });
+  expect(members.status()).toBe(403);
+  expect(await errorCode(members)).toBe("api_key.subtree_denied");
 });
 
 test("TTL below 30 days is refused by the API", async () => {

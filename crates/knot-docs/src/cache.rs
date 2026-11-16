@@ -1,8 +1,8 @@
 //! moka-backed caches around the access rule.
 //!
-//! - Per doc: `acl::resolve`, keyed `(workspace_id, doc_id, user_id)`.
+//! - Per doc: `acl::resolve`, keyed `(workspace_id, doc_id, user_id, scope_root)`.
 //!   TTL: 60 s (spec §7.5). Capacity: 100k entries.
-//! - Per workspace tree: [`Visibility`], keyed `(workspace_id, user_id)`.
+//! - Per workspace tree: [`Visibility`], keyed `(workspace_id, user_id, scope_root)`.
 //!   TTL: 60 s. Capacity: 10k entries.
 //!
 //! Invalidations: `evict_doc(doc_id)` is called by the listener task
@@ -49,8 +49,9 @@ impl Visibility {
         nodes: &[AclNode],
         grants: &[PrincipalGrant],
         workspace_role: Option<WorkspaceRole>,
+        scope_root: Option<Uuid>,
     ) -> Self {
-        let access_by_doc = rule::compute_access(nodes, grants, workspace_role);
+        let access_by_doc = rule::compute_access(nodes, grants, workspace_role, scope_root);
         let hidden_ids = nodes
             .iter()
             .map(|node| node.id)
@@ -100,8 +101,8 @@ impl Visibility {
 
 #[derive(Clone)]
 pub struct AclCache {
-    inner: Cache<(Uuid, Uuid, Uuid), Option<DocAccess>>,
-    visibility: Cache<(Uuid, Uuid), Arc<Visibility>>,
+    inner: Cache<(Uuid, Uuid, Uuid, Option<Uuid>), Option<DocAccess>>,
+    visibility: Cache<(Uuid, Uuid, Option<Uuid>), Arc<Visibility>>,
     /// Bumped by every eviction; see the module docs.
     generation: Arc<AtomicU64>,
     workspaces: Arc<dyn WorkspaceStore>,
@@ -143,9 +144,10 @@ impl AclCache {
         workspace_id: Uuid,
         doc_id: Uuid,
         user_id: Uuid,
+        scope_root: Option<Uuid>,
     ) -> Result<Option<WorkspaceRole>, ResolveError> {
         Ok(self
-            .access(workspace_id, doc_id, user_id)
+            .access(workspace_id, doc_id, user_id, scope_root)
             .await?
             .filter(|access| access.can_read())
             .map(|access| access.role))
@@ -158,9 +160,12 @@ impl AclCache {
         workspace_id: Uuid,
         doc_id: Uuid,
         user_id: Uuid,
+        scope_root: Option<Uuid>,
     ) -> Result<Option<DocAccess>, ResolveError> {
-        self.access_after_load(workspace_id, doc_id, user_id, || std::future::ready(()))
-            .await
+        self.access_after_load(workspace_id, doc_id, user_id, scope_root, || {
+            std::future::ready(())
+        })
+        .await
     }
 
     /// [`AclCache::access`] with `after_load` awaited between each resolve
@@ -171,13 +176,14 @@ impl AclCache {
         workspace_id: Uuid,
         doc_id: Uuid,
         user_id: Uuid,
+        scope_root: Option<Uuid>,
         after_load: Hook,
     ) -> Result<Option<DocAccess>, ResolveError>
     where
         Hook: FnMut() -> HookFuture,
         HookFuture: Future<Output = ()>,
     {
-        self.access_after_load(workspace_id, doc_id, user_id, after_load)
+        self.access_after_load(workspace_id, doc_id, user_id, scope_root, after_load)
             .await
     }
 
@@ -186,13 +192,14 @@ impl AclCache {
         workspace_id: Uuid,
         doc_id: Uuid,
         user_id: Uuid,
+        scope_root: Option<Uuid>,
         after_load: Hook,
     ) -> Result<Option<DocAccess>, ResolveError>
     where
         Hook: FnMut() -> HookFuture,
         HookFuture: Future<Output = ()>,
     {
-        let key = (workspace_id, doc_id, user_id);
+        let key = (workspace_id, doc_id, user_id, scope_root);
         if let Some(cached_access) = self.inner.get(&key).await {
             return Ok(cached_access);
         }
@@ -204,6 +211,7 @@ impl AclCache {
                 workspace_id,
                 doc_id,
                 user_id,
+                scope_root,
             )
         };
         self.load_guarded(&self.inner, key, load, after_load).await
@@ -211,17 +219,18 @@ impl AclCache {
 
     /// One user's access to every doc of the workspace. Three queries (the
     /// workspace tree, the user's grants, their membership) folded with
-    /// [`rule::compute_access`], cached per `(workspace_id, user_id)`.
+    /// [`rule::compute_access`], cached per `(workspace_id, user_id, scope_root)`.
     pub async fn visibility(
         &self,
         workspace_id: Uuid,
         user_id: Uuid,
+        scope_root: Option<Uuid>,
     ) -> Result<Arc<Visibility>, ResolveError> {
-        let key = (workspace_id, user_id);
+        let key = (workspace_id, user_id, scope_root);
         if let Some(cached_visibility) = self.visibility.get(&key).await {
             return Ok(cached_visibility);
         }
-        let load = || self.load_visibility(workspace_id, user_id);
+        let load = || self.load_visibility(workspace_id, user_id, scope_root);
         self.load_guarded(&self.visibility, key, load, || std::future::ready(()))
             .await
     }
@@ -234,18 +243,22 @@ impl AclCache {
         &self,
         workspace_id: Uuid,
         user_id: Uuid,
+        scope_root: Option<Uuid>,
         doc_ids: &[Uuid],
     ) -> Result<Arc<Visibility>, ResolveError> {
-        let visibility = self.visibility(workspace_id, user_id).await?;
+        let visibility = self.visibility(workspace_id, user_id, scope_root).await?;
         if doc_ids.iter().all(|doc_id| visibility.covers(*doc_id)) {
             return Ok(visibility);
         }
         // Load directly rather than through the cache, which a concurrent
         // caller may have refilled with an equally old snapshot.
-        let load = || self.load_visibility(workspace_id, user_id);
-        self.load_guarded(&self.visibility, (workspace_id, user_id), load, || {
-            std::future::ready(())
-        })
+        let load = || self.load_visibility(workspace_id, user_id, scope_root);
+        self.load_guarded(
+            &self.visibility,
+            (workspace_id, user_id, scope_root),
+            load,
+            || std::future::ready(()),
+        )
         .await
     }
 
@@ -253,6 +266,7 @@ impl AclCache {
         &self,
         workspace_id: Uuid,
         user_id: Uuid,
+        scope_root: Option<Uuid>,
     ) -> Result<Arc<Visibility>, ResolveError> {
         let principal = format!("user:{user_id}");
         let nodes: Vec<AclNode> = self
@@ -286,6 +300,7 @@ impl AclCache {
             &nodes,
             &principal_grants,
             workspace_role,
+            scope_root,
         )))
     }
 
@@ -400,11 +415,14 @@ mod tests {
         let cache = AclCache::new(Arc::new(ws_s), Arc::new(gs), Arc::new(ds));
 
         let viewer_role = cache
-            .effective_role(ws.id, doc.id, viewer.id)
+            .effective_role(ws.id, doc.id, viewer.id, None)
             .await
             .unwrap();
-        let owner_role = cache.effective_role(ws.id, doc.id, owner.id).await.unwrap();
-        let viewer_access = cache.access(ws.id, doc.id, viewer.id).await.unwrap();
+        let owner_role = cache
+            .effective_role(ws.id, doc.id, owner.id, None)
+            .await
+            .unwrap();
+        let viewer_access = cache.access(ws.id, doc.id, viewer.id, None).await.unwrap();
 
         assert_eq!(viewer_role, None);
         assert_eq!(owner_role, Some(WorkspaceRole::Owner));
@@ -494,10 +512,13 @@ mod tests {
         let cache = AclCache::new(Arc::new(ws_s), Arc::new(gs), Arc::new(ds));
 
         for user_id in [owner.id, editor.id] {
-            let visibility = cache.visibility(ws.id, user_id).await.unwrap();
+            let visibility = cache.visibility(ws.id, user_id, None).await.unwrap();
             for doc_id in all_doc_ids {
-                let per_doc_role = cache.effective_role(ws.id, doc_id, user_id).await.unwrap();
-                let per_doc_access = cache.access(ws.id, doc_id, user_id).await.unwrap();
+                let per_doc_role = cache
+                    .effective_role(ws.id, doc_id, user_id, None)
+                    .await
+                    .unwrap();
+                let per_doc_access = cache.access(ws.id, doc_id, user_id, None).await.unwrap();
                 assert_eq!(visibility.effective_role(doc_id), per_doc_role);
                 assert_eq!(visibility.access(doc_id), per_doc_access);
                 assert_eq!(visibility.readable(doc_id), per_doc_role.is_some());
@@ -507,7 +528,7 @@ mod tests {
                 );
             }
         }
-        let editor_visibility = cache.visibility(ws.id, editor.id).await.unwrap();
+        let editor_visibility = cache.visibility(ws.id, editor.id, None).await.unwrap();
         assert_eq!(
             editor_visibility.effective_role(granted.id),
             Some(WorkspaceRole::Viewer)
@@ -536,11 +557,11 @@ mod tests {
         let doc = ds.create(ws.id, None, "Doc", "m", owner.id).await.unwrap();
         let cache = AclCache::new(Arc::new(ws_s), Arc::new(gs), Arc::new(ds));
 
-        let before = cache.visibility(ws.id, owner.id).await.unwrap();
+        let before = cache.visibility(ws.id, owner.id, None).await.unwrap();
         assert!(before.readable(doc.id));
 
         restrict(&pool, doc.id).await;
-        let still_cached = cache.visibility(ws.id, owner.id).await.unwrap();
+        let still_cached = cache.visibility(ws.id, owner.id, None).await.unwrap();
         assert!(
             still_cached.readable(doc.id),
             "without an eviction the cached visibility is served"
@@ -548,7 +569,7 @@ mod tests {
 
         cache.evict_doc(doc.id);
         cache.run_pending_tasks().await;
-        let after = cache.visibility(ws.id, owner.id).await.unwrap();
+        let after = cache.visibility(ws.id, owner.id, None).await.unwrap();
         assert!(!after.readable(doc.id));
         assert_eq!(after.hidden_ids(), vec![doc.id]);
     }
@@ -572,14 +593,14 @@ mod tests {
         let ds = Arc::new(ds);
         let cache = AclCache::new(Arc::new(ws_s), Arc::new(gs), ds.clone());
 
-        let before = cache.visibility(ws.id, owner.id).await.unwrap();
+        let before = cache.visibility(ws.id, owner.id, None).await.unwrap();
         assert!(before.covers(old_doc.id));
         let new_doc = ds.create(ws.id, None, "New", "n", owner.id).await.unwrap();
         assert!(!before.covers(new_doc.id));
         assert!(!before.readable(new_doc.id));
 
         let unchanged = cache
-            .visibility_covering(ws.id, owner.id, &[old_doc.id])
+            .visibility_covering(ws.id, owner.id, None, &[old_doc.id])
             .await
             .unwrap();
         assert!(
@@ -588,7 +609,7 @@ mod tests {
         );
 
         let reloaded = cache
-            .visibility_covering(ws.id, owner.id, &[old_doc.id, new_doc.id])
+            .visibility_covering(ws.id, owner.id, None, &[old_doc.id, new_doc.id])
             .await
             .unwrap();
         assert!(reloaded.covers(new_doc.id));
@@ -596,14 +617,14 @@ mod tests {
             reloaded.effective_role(new_doc.id),
             Some(WorkspaceRole::Owner)
         );
-        let cached = cache.visibility(ws.id, owner.id).await.unwrap();
+        let cached = cache.visibility(ws.id, owner.id, None).await.unwrap();
         assert!(cached.covers(new_doc.id), "the reload is cached");
 
         // A hidden doc is covered too: it is known, just not readable.
         restrict(&pool, new_doc.id).await;
         cache.evict_doc(new_doc.id);
         cache.run_pending_tasks().await;
-        let restricted = cache.visibility(ws.id, owner.id).await.unwrap();
+        let restricted = cache.visibility(ws.id, owner.id, None).await.unwrap();
         assert!(restricted.covers(new_doc.id));
         assert!(!restricted.readable(new_doc.id));
     }
@@ -628,7 +649,7 @@ mod tests {
         let generation_before = cache.generation();
         let mut hook_calls = 0;
         let first = cache
-            .access_with_hook(ws.id, doc.id, owner.id, || {
+            .access_with_hook(ws.id, doc.id, owner.id, None, || {
                 hook_calls += 1;
                 let first_call = hook_calls == 1;
                 let pool = pool.clone();
@@ -649,7 +670,7 @@ mod tests {
         assert_eq!(hook_calls, 2, "the stale resolve is retried once");
         assert_eq!(first, None, "the retry reads the restriction");
         assert_eq!(
-            cache.access(ws.id, doc.id, owner.id).await.unwrap(),
+            cache.access(ws.id, doc.id, owner.id, None).await.unwrap(),
             None,
             "the stale Owner access must not have been cached"
         );
@@ -674,7 +695,7 @@ mod tests {
 
         let mut hook_calls = 0;
         let access = cache
-            .access_with_hook(ws.id, doc.id, owner.id, || {
+            .access_with_hook(ws.id, doc.id, owner.id, None, || {
                 hook_calls += 1;
                 cache.evict_all();
                 std::future::ready(())
@@ -685,10 +706,74 @@ mod tests {
         assert_eq!(access.map(|access| access.role), Some(WorkspaceRole::Owner));
         assert_eq!(hook_calls, 1 + MAX_STALE_RETRIES);
         cache.run_pending_tasks().await;
-        assert!(!cache.inner.contains_key(&(ws.id, doc.id, owner.id)));
+        assert!(!cache.inner.contains_key(&(ws.id, doc.id, owner.id, None)));
     }
 
-    /// Regression: the cache must be keyed by (workspace_id, doc_id, user_id).
+    /// S10: the same user with and without a root never shares a cache
+    /// entry, in either cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scope_root_is_part_of_the_cache_key() {
+        let pool = knot_test_support::fresh_db().await.pool;
+        let ws_s = PgWorkspaceStore::new(pool.clone());
+        let us = PgUserStore::new(pool.clone());
+        let ds = PgDocStore::new(pool.clone());
+        let gs = PgGrantStore::new(pool.clone());
+        let ws = ws_s.create("default", "W").await.unwrap();
+        let user = us.create_local("e@x.test", "E", "$h$").await.unwrap();
+        ws_s.add_member(ws.id, user.id, WorkspaceRole::Editor)
+            .await
+            .unwrap();
+        let top = ds.create(ws.id, None, "Top", "m", user.id).await.unwrap();
+        let root = ds
+            .create(ws.id, Some(top.id), "Root", "m", user.id)
+            .await
+            .unwrap();
+        let child = ds
+            .create(ws.id, Some(root.id), "Child", "m", user.id)
+            .await
+            .unwrap();
+        let cache = AclCache::new(Arc::new(ws_s), Arc::new(gs), Arc::new(ds));
+
+        // Warm the unscoped entries first: a key that ignored the root would
+        // now answer the scoped calls from them.
+        assert!(
+            cache
+                .effective_role(ws.id, top.id, user.id, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cache
+                .visibility(ws.id, user.id, None)
+                .await
+                .unwrap()
+                .readable(top.id)
+        );
+
+        assert!(
+            cache
+                .effective_role(ws.id, top.id, user.id, Some(root.id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .effective_role(ws.id, child.id, user.id, Some(root.id))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let scoped = cache
+            .visibility(ws.id, user.id, Some(root.id))
+            .await
+            .unwrap();
+        assert!(!scoped.readable(top.id));
+        assert!(scoped.readable(root.id) && scoped.readable(child.id));
+    }
+
+    /// Regression: the cache must be keyed by (workspace_id, doc_id, user_id, scope_root).
     /// If the key were only (doc_id, user_id), a cached role for workspace A
     /// would be returned when the same (doc_id, user_id) pair is looked up
     /// under workspace B — cross-tenant poisoning.
@@ -721,7 +806,7 @@ mod tests {
 
         // Prime the cache for workspace A — resolves to Owner.
         let r_a = cache
-            .effective_role(ws_a.id, doc.id, user.id)
+            .effective_role(ws_a.id, doc.id, user.id, None)
             .await
             .unwrap();
         assert_eq!(r_a, Some(WorkspaceRole::Owner));
@@ -731,7 +816,7 @@ mod tests {
         // Owner value; with the correct (workspace_id, doc_id, user_id) key
         // it must resolve independently and return None (user not a member of B).
         let r_b = cache
-            .effective_role(ws_b.id, doc.id, user.id)
+            .effective_role(ws_b.id, doc.id, user.id, None)
             .await
             .unwrap();
         assert_eq!(

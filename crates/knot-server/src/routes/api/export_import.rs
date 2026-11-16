@@ -208,7 +208,7 @@ async fn export_doc(
     // Reader on the root is enough to export it; subtree export inherits the
     // same per-doc ACL via filtering below.
     match acl
-        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
+        .effective_role(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
         .await
     {
         Ok(Some(_)) => {}

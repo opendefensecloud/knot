@@ -640,3 +640,70 @@ async fn foreign_anchors_are_422() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(blocks(&w.stored(source).await), [P1, P2]);
 }
+
+/// S10: a key rooted at a page may move content of a page inside its
+/// subtree into a new subpage (it lands under that page, inside); a page
+/// outside answers like one without access.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subtree_key_moves_to_a_subpage_inside_its_subtree() {
+    let w = world().await;
+    let top = w.create_doc("Top").await;
+    let child_of = |parent: Uuid, title: &'static str| {
+        let w = &w;
+        async move {
+            let doc = expect(
+                w,
+                &w.owner,
+                "POST",
+                "/api/docs",
+                Some(json!({"title": title, "parent_id": parent})),
+                StatusCode::CREATED,
+            )
+            .await;
+            doc["id"].as_str().unwrap().parse::<Uuid>().unwrap()
+        }
+    };
+    let root = child_of(top, "Root").await;
+    let source = child_of(root, "Source").await;
+    w.set_content(source, &page(&[P1, P2])).await;
+    w.set_content(top, &page(&[P1, P2])).await;
+    let minted = expect(
+        &w,
+        &w.owner,
+        "POST",
+        "/api/auth/api-keys",
+        Some(json!({"name": "s", "scopes": ["read", "create"], "root_doc_id": root})),
+        StatusCode::CREATED,
+    )
+    .await;
+    let key = minted["key"].as_str().unwrap().to_string();
+    let by_key = |doc_id: Uuid, anchors: (String, String)| {
+        let app = w.app.clone();
+        let key = key.clone();
+        async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("/api/docs/{doc_id}/move-to-subpage"))
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"start": anchors.0, "end": anchors.1, "title": "Moved"}).to_string(),
+                ))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            (status, body_json(response).await)
+        }
+    };
+
+    let outside = w.stored(top).await;
+    let (status, body) = by_key(top, whole(&outside, 1, P2)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "acl.no_grant", "{body}");
+    assert_eq!(blocks(&w.stored(top).await), [P1, P2]);
+
+    let inside = w.stored(source).await;
+    let (status, body) = by_key(source, whole(&inside, 1, P2)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["doc"]["parent_id"], source.to_string(), "{body}");
+}
