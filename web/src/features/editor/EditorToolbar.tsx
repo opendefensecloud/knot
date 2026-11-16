@@ -33,6 +33,7 @@ import { boardsApi } from "../../lib/boards.api";
 import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 import { SCOPE_TOOLTIP, suggestionScope } from "../suggestions/scope";
+import { CalloutMenu } from "./CalloutMenu";
 import { TableMenu } from "./TableMenu";
 import { ToolbarMenu } from "./ToolbarMenu";
 import { applyLinkUrl, toolbarLinkState } from "./toolbarLink";
@@ -234,6 +235,7 @@ export function EditorToolbar({
           onClick={() => c().toggleBlockquote().run()}>
           <Quote size={15} aria-hidden />
         </Btn>
+        <CalloutMenu editor={editor} btnClass={BTN_CLS} />
         <Btn testId="toolbar-code-block" label="Code block" active={editor.isActive("code_block")}
           onClick={() => c().toggleCodeBlock().run()}>
           <Code2 size={15} aria-hidden />

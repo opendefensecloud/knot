@@ -15,6 +15,7 @@
 import { marked } from "marked";
 
 import { sanitizeEditorFragment } from "../../lib/sanitize";
+import { calloutKind, normaliseTitle } from "./callouts";
 
 const HEADING = /^ {0,3}(#{1,6})[ \t]+\S/;
 const BULLET = /^ {0,3}[-*+][ \t]+\S/;
@@ -110,6 +111,7 @@ export function markdownToHtml(markdown: string): string {
   const fragment = sanitizeEditorFragment(raw);
   promoteTaskItems(fragment);
   promoteTocMarkers(fragment);
+  promoteCallouts(fragment);
   const host = document.createElement("div");
   host.appendChild(fragment);
   return host.innerHTML;
@@ -166,5 +168,50 @@ function promoteTocMarkers(fragment: DocumentFragment): void {
     box.setAttribute("data-knot-toc", "true");
     box.setAttribute("data-max-level", String(tocLevel(p.getAttribute("data-knot-toc") ?? undefined)));
     p.replaceWith(box);
+  });
+}
+
+const CALLOUT_MARKER = /^[ \t]*\[!([A-Za-z]+)\]/;
+
+/**
+ * GitHub's and GitLab's alerts: a quote whose first line is `[!WARNING]`
+ * (or `[!warning] Title`, GitLab's titled form) is a callout box. `marked`
+ * leaves the marker as text at the start of the quote's first paragraph;
+ * the marker line becomes `data-kind` (and `data-title`) and leaves the
+ * body. An unknown kind stays a plain quote with its text, as in
+ * `from_markdown.rs`.
+ */
+function promoteCallouts(fragment: DocumentFragment): void {
+  fragment.querySelectorAll("blockquote").forEach((quote) => {
+    const p = quote.firstElementChild;
+    const first = p?.tagName === "P" ? p.firstChild : null;
+    if (!p || first?.nodeType !== Node.TEXT_NODE) return;
+    const marker = CALLOUT_MARKER.exec(first.textContent ?? "");
+    const kind = calloutKind(marker?.[1]);
+    if (!marker || !kind) return;
+    first.textContent = (first.textContent ?? "").slice(marker[0].length);
+    // The rest of the marker's line is the title; it may span inline nodes.
+    let title = "";
+    while (p.firstChild) {
+      const node = p.firstChild;
+      const text = node.textContent ?? "";
+      const br = node.nodeName === "BR";
+      const nl = node.nodeType === Node.TEXT_NODE ? text.indexOf("\n") : -1;
+      if (br || nl >= 0) {
+        if (br) node.remove();
+        else node.textContent = text.slice(nl + 1);
+        if (nl >= 0) title += text.slice(0, nl);
+        break;
+      }
+      title += text;
+      node.remove();
+    }
+    quote.setAttribute("data-kind", kind);
+    const t = normaliseTitle(title);
+    if (t) quote.setAttribute("data-title", t);
+    if ((p.textContent ?? "").trim() === "" && p.children.length === 0) {
+      if (quote.children.length > 1) p.remove();
+      else p.textContent = "";
+    }
   });
 }
