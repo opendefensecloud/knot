@@ -2,7 +2,7 @@
  * Indent / Outdent in the toolbar (#78): the only way to nest a list item on
  * a touch screen, and where the Tab / Shift-Tab shortcut is spelled out.
  *
- * They take the two diagram buttons' slot while the caret is in a list item,
+ * They take the diagram menu's and the table of contents' slots while the caret is in a list item,
  * so the toolbar keeps its width and never wraps onto a second row as the
  * caret moves in and out of a list (the reason the table actions live in one
  * menu too).
@@ -57,13 +57,13 @@ describe("EditorToolbar indent and outdent", () => {
     return JSON.stringify(bound!.editor.getJSON().content?.[1], withoutAttrs);
   }
 
-  it("shows neither button outside a list, and the diagram buttons instead", () => {
+  it("shows neither button outside a list, and the diagram menu and table of contents instead", () => {
     renderToolbar();
     caretIn("intro");
     expect(screen.queryByTestId("toolbar-indent")).toBeNull();
     expect(screen.queryByTestId("toolbar-outdent")).toBeNull();
-    expect(screen.getByTestId("toolbar-mermaid")).toBeInTheDocument();
-    expect(screen.getByTestId("toolbar-excalidraw")).toBeInTheDocument();
+    expect(screen.getByTestId("toolbar-diagram")).toBeInTheDocument();
+    expect(screen.getByTestId("toolbar-toc")).toBeInTheDocument();
   });
 
   it("takes the diagram buttons' slot in a list, keeping the button count", () => {
@@ -73,8 +73,8 @@ describe("EditorToolbar indent and outdent", () => {
     caretIn("two");
     expect(screen.getByTestId("toolbar-indent")).toBeInTheDocument();
     expect(screen.getByTestId("toolbar-outdent")).toBeInTheDocument();
-    expect(screen.queryByTestId("toolbar-mermaid")).toBeNull();
-    expect(screen.queryByTestId("toolbar-excalidraw")).toBeNull();
+    expect(screen.queryByTestId("toolbar-diagram")).toBeNull();
+    expect(screen.queryByTestId("toolbar-toc")).toBeNull();
     expect(container.querySelectorAll("button")).toHaveLength(outside);
   });
 

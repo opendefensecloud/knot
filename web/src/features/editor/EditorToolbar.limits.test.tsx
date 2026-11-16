@@ -33,6 +33,7 @@ describe("EditorToolbar when a limit refuses a new diagram", () => {
         <EditorToolbar editor={bound.editor} docId="doc-1" />
       </QueryClientProvider>,
     );
+    fireEvent.click(screen.getByTestId("toolbar-diagram"));
     fireEvent.click(screen.getByTestId("toolbar-excalidraw"));
     await waitFor(() =>
       expect(useUi.getState().toasts).toMatchObject([

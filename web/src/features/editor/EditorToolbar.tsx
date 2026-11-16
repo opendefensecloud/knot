@@ -34,6 +34,7 @@ import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 import { SCOPE_TOOLTIP, suggestionScope } from "../suggestions/scope";
 import { TableMenu } from "./TableMenu";
+import { ToolbarMenu } from "./ToolbarMenu";
 import { applyLinkUrl, toolbarLinkState } from "./toolbarLink";
 
 type ToolbarBtnProps = {
@@ -237,13 +238,14 @@ export function EditorToolbar({
           onClick={() => c().toggleCodeBlock().run()}>
           <Code2 size={15} aria-hidden />
         </Btn>
-        {/* In a list item, Indent and Outdent take the two diagram buttons'
-            slot. They do what Tab and Shift-Tab do, but a touch screen has
-            no Tab, and nothing else told anyone those nest (#78). Shown next to
-            the rest, they would push the row past its width and wrap it,
-            moving the page under the caret every time it entered a list —
-            what the table actions sharing one menu avoids. A diagram can
-            still be inserted after the list. */}
+        {/* In a list item, Indent and Outdent take the slots of the diagram
+            menu and the table of contents. They do what Tab and Shift-Tab do,
+            but a touch screen has no Tab, and nothing else told anyone those
+            nest (#78). Shown next to the rest, they would push the row past
+            its width and wrap it, moving the page under the caret every time
+            it entered a list — what the table actions sharing one menu
+            avoids. A diagram or a table of contents can still be inserted
+            after the list. */}
         {inListItem ? (
           <>
             <Btn
@@ -265,56 +267,62 @@ export function EditorToolbar({
           </>
         ) : (
           <>
-            <Btn
-              testId="toolbar-mermaid"
+            <ToolbarMenu
+              editor={editor}
+              btnClass={BTN_CLS}
+              testId="toolbar-diagram"
               label="Insert diagram"
-              onClick={() =>
-                c()
-                  .insertContent({
-                    type: "code_block",
-                    attrs: { language: "mermaid" },
-                    content: [
-                      {
-                        type: "text",
-                        text: "graph TD\n  A[Start] --> B{Decision}\n  B -->|Yes| C[OK]\n  B -->|No| D[End]",
-                      },
-                    ],
-                  })
-                  .run()
-              }
-            >
-              <Network size={15} aria-hidden />
-            </Btn>
+              icon={<Network size={15} aria-hidden />}
+              items={[
+                {
+                  testId: "toolbar-mermaid",
+                  label: "Mermaid diagram",
+                  icon: <Network size={15} aria-hidden />,
+                  run: () =>
+                      c()
+                        .insertContent({
+                          type: "code_block",
+                          attrs: { language: "mermaid" },
+                          content: [
+                            {
+                              type: "text",
+                              text: "graph TD\n  A[Start] --> B{Decision}\n  B -->|Yes| C[OK]\n  B -->|No| D[End]",
+                            },
+                          ],
+                        })
+                        .run(),
+                },
+                {
+                  testId: "toolbar-excalidraw",
+                  label: "Excalidraw drawing",
+                  icon: <PenSquare size={15} aria-hidden />,
+                  run: () => {
+                      void (async () => {
+                        const res = await boardsApi.create(docId, null);
+                        if ("error" in res) {
+                          notifyFailure(notify, res.error, "Failed to create diagram.");
+                          return;
+                        }
+                        c()
+                          .insertContent({
+                            type: "excalidraw_board",
+                            attrs: { board_id: res.ok.id, label: null },
+                          })
+                          .run();
+                      })();
+                  },
+                },
+              ]}
+            />
             <Btn
-              testId="toolbar-excalidraw"
-              label="Insert Excalidraw diagram"
-              onClick={() => {
-                void (async () => {
-                  const res = await boardsApi.create(docId, null);
-                  if ("error" in res) {
-                    notifyFailure(notify, res.error, "Failed to create diagram.");
-                    return;
-                  }
-                  c()
-                    .insertContent({
-                      type: "excalidraw_board",
-                      attrs: { board_id: res.ok.id, label: null },
-                    })
-                    .run();
-                })();
-              }}
+              testId="toolbar-toc"
+              label="Table of contents"
+              onClick={() => c().insertContent({ type: "table_of_contents", attrs: { maxLevel: 3 } }).run()}
             >
-              <PenSquare size={15} aria-hidden />
+              <ListTree size={15} aria-hidden />
             </Btn>
           </>
         )}
-        <Btn
-          testId="toolbar-toc"
-          label="Table of contents"
-          onClick={() => c().insertContent({ type: "table_of_contents", attrs: { maxLevel: 3 } }).run()}
-        >
-          <ListTree size={15} aria-hidden />
-        </Btn>
         <Btn
           testId="toolbar-suggest"
           label="Suggest an insertion"
