@@ -14,6 +14,13 @@ pub enum Block {
         content: Vec<Inline>,
     },
     Quote(Vec<Block>),
+    /// A callout box: a blockquote with a known `kind`. `title` is its own
+    /// title, already one trimmed line; none shows the kind's label.
+    Callout {
+        kind: CalloutKind,
+        title: Option<String>,
+        blocks: Vec<Block>,
+    },
     Code {
         language: String,
         text: String,
@@ -127,4 +134,69 @@ pub enum Align {
     Left,
     Center,
     Right,
+}
+
+/// The five kinds of callout box (GitHub's and GitLab's alerts). The same
+/// list lives in `knot_markdown::callout`, which this crate does not depend
+/// on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalloutKind {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl CalloutKind {
+    /// The kind named `raw`, in any case; `None` for anything else.
+    pub fn parse(raw: &str) -> Option<CalloutKind> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "note" => Some(CalloutKind::Note),
+            "tip" => Some(CalloutKind::Tip),
+            "important" => Some(CalloutKind::Important),
+            "warning" => Some(CalloutKind::Warning),
+            "caution" => Some(CalloutKind::Caution),
+            _ => None,
+        }
+    }
+
+    /// The title of a box without one of its own.
+    pub fn label(self) -> &'static str {
+        match self {
+            CalloutKind::Note => "Note",
+            CalloutKind::Tip => "Tip",
+            CalloutKind::Important => "Important",
+            CalloutKind::Warning => "Warning",
+            CalloutKind::Caution => "Caution",
+        }
+    }
+
+    /// The kind's colour (GitHub's light hue), as hex without `#`: border
+    /// and title text.
+    pub fn hue(self) -> &'static str {
+        match self {
+            CalloutKind::Note => "0969DA",
+            CalloutKind::Tip => "1A7F37",
+            CalloutKind::Important => "8250DF",
+            CalloutKind::Warning => "9A6700",
+            CalloutKind::Caution => "CF222E",
+        }
+    }
+
+    /// The hue at 15% on white: the title line's shading.
+    pub fn shade(self) -> &'static str {
+        match self {
+            CalloutKind::Note => "DAE8F9",
+            CalloutKind::Tip => "DDECE1",
+            CalloutKind::Important => "ECE5FA",
+            CalloutKind::Warning => "F0E8D9",
+            CalloutKind::Caution => "F8DEE0",
+        }
+    }
+
+    /// A name for styles: `Note` … `Caution`.
+    pub fn style_suffix(self) -> &'static str {
+        self.label()
+    }
 }
