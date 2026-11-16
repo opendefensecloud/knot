@@ -28,8 +28,8 @@ type Props = {
 /**
  * A toolbar button that opens a menu: several actions in one slot, so the
  * toolbar stays one row at the default width (doc-dock.spec.ts). Arrow
- * keys, Home and End move between items; Escape closes and returns to the
- * text; a click outside or Tab closes.
+ * keys, Home and End move between items; Escape on the button or in the
+ * menu closes and returns to the text; a click outside or Tab closes.
  */
 export function ToolbarMenu({ editor, btnClass, testId, label, icon, active = false, items }: Props) {
   const [open, setOpen] = useState(false);
@@ -50,18 +50,18 @@ export function ToolbarMenu({ editor, btnClass, testId, label, icon, active = fa
       if (menuRef.current?.contains(t) || buttonRef.current?.contains(t)) return;
       setOpen(false);
     };
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      setOpen(false);
-      editor.commands.focus();
-    };
     document.addEventListener("mousedown", onDown);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDown);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [open, editor]);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  /** Escape on the trigger or in the menu (not elsewhere, e.g. a dialog
+   *  over it) closes the menu and returns to the text. */
+  function onKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    if (e.key !== "Escape" || !open) return;
+    e.preventDefault();
+    setOpen(false);
+    editor.commands.focus();
+  }
 
   function onMenuKeyDown(e: KeyboardEvent<HTMLDivElement>) {
     if (e.key === "Tab") {
@@ -81,7 +81,7 @@ export function ToolbarMenu({ editor, btnClass, testId, label, icon, active = fa
   }
 
   return (
-    <div className="relative">
+    <div className="relative" onKeyDown={onKeyDown}>
       <button
         ref={buttonRef}
         type="button"

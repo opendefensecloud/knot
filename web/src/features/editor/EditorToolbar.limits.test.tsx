@@ -41,4 +41,22 @@ describe("EditorToolbar when a limit refuses a new diagram", () => {
       ]),
     );
   });
+
+  it("puts the caret back in the text when the diagram cannot be created", async () => {
+    useUi.setState({ toasts: [] });
+    vi.spyOn(boardsApi, "create").mockResolvedValue({
+      error: { code: "quota.exceeded", message: "quota exceeded", details: {}, status: 403 },
+    });
+    bound = mountBoundEditor();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <EditorToolbar editor={bound.editor} docId="doc-1" />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByTestId("toolbar-diagram"));
+    fireEvent.click(screen.getByTestId("toolbar-excalidraw"));
+    await waitFor(() => expect(useUi.getState().toasts).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(bound.editor.view.hasFocus()).toBe(true);
+  });
 });
