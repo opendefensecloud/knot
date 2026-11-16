@@ -251,3 +251,4 @@ fn empty_box_imports_with_one_paragraph() {
     let doc = parse("> [!TIP]\n");
     assert_eq!(top(&doc), vec![boxed("tip", None, "")]);
 }
+

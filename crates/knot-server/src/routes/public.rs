@@ -194,6 +194,55 @@ fn toc_html(headings: &[HeadingRef], max_level: u8) -> String {
     html
 }
 
+/// The callout box classes the sanitizer lets through: the box, one per
+/// kind, and the title line.
+const CALLOUT_CLASSES: [&str; 6] = [
+    "knot-callout",
+    "knot-callout--note",
+    "knot-callout--tip",
+    "knot-callout--important",
+    "knot-callout--warning",
+    "knot-callout--caution",
+];
+
+/// `events` with every alert blockquote replaced by a callout box: a
+/// `div.knot-callout` whose first line is its title (from `titles`, in
+/// order, or the kind's label), escaped.
+fn with_callouts(
+    events: Vec<pulldown_cmark::Event<'_>>,
+    titles: Vec<Option<String>>,
+) -> Vec<pulldown_cmark::Event<'_>> {
+    use knot_markdown::callout::CalloutKind;
+    use pulldown_cmark::{BlockQuoteKind, Event, Tag, TagEnd};
+    let mut titles = titles.into_iter();
+    let kind_of = |k: BlockQuoteKind| match k {
+        BlockQuoteKind::Note => CalloutKind::Note,
+        BlockQuoteKind::Tip => CalloutKind::Tip,
+        BlockQuoteKind::Important => CalloutKind::Important,
+        BlockQuoteKind::Warning => CalloutKind::Warning,
+        BlockQuoteKind::Caution => CalloutKind::Caution,
+    };
+    events
+        .into_iter()
+        .map(|event| match event {
+            Event::Start(Tag::BlockQuote(Some(k))) => {
+                let kind = kind_of(k);
+                let title = titles.next().flatten();
+                Event::Html(
+                    format!(
+                        r#"<div class="knot-callout knot-callout--{}"><p class="knot-callout__title">{}</p>"#,
+                        kind.as_str(),
+                        html_escape(title.as_deref().unwrap_or(kind.label()))
+                    )
+                    .into(),
+                )
+            }
+            Event::End(TagEnd::BlockQuote(Some(_))) => Event::Html("</div>".into()),
+            other => other,
+        })
+        .collect()
+}
+
 /// The depth of the table of contents sentinel image starting at
 /// `events[i]` (`Start(Image)` then `End(Image)`), if it is one.
 fn toc_sentinel_at(events: &[pulldown_cmark::Event<'_>], i: usize) -> Option<u8> {
@@ -254,16 +303,17 @@ fn render_markdown(
     token: &str,
     doc_link_map: &HashMap<Uuid, String>,
 ) -> String {
-    use pulldown_cmark::{Event, Options, Parser, Tag, html};
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_TABLES);
-    opts.insert(Options::ENABLE_TASKLISTS);
+    use pulldown_cmark::{Event, Parser, Tag, html};
+    // The importer's options, so alerts read as callout boxes here too.
+    let opts = knot_markdown::callout::parser_options();
     // Table of contents markers become sentinel images, the same pre-pass
     // the importer uses; `with_headings` turns them into the box and gives
     // every heading the id the editor gives it.
     let marked = knot_markdown::toc::mark_toc_markers(md);
-    let events: Vec<Event<'_>> = Parser::new_ext(&marked, opts).collect();
+    // A titled callout marker becomes a bare alert, its title kept aside.
+    let callouts = knot_markdown::callout::mark_callouts(&marked);
+    let events: Vec<Event<'_>> = Parser::new_ext(&callouts.src, opts).collect();
+    let events = with_callouts(events, callouts.titles);
     let parser = with_headings(events).into_iter().map(|ev| match ev {
         Event::Start(Tag::Image {
             link_type,
@@ -329,7 +379,9 @@ fn render_markdown(
         .add_allowed_classes("nav", &["knot-box"])
         .add_allowed_classes("p", &["knot-box__title"])
         .add_allowed_classes("ul", &["knot-box__list"])
-        .add_allowed_classes("li", &TOC_LEVEL_CLASSES);
+        .add_allowed_classes("li", &TOC_LEVEL_CLASSES)
+        .add_allowed_classes("div", &CALLOUT_CLASSES)
+        .add_allowed_classes("p", &["knot-callout__title"]);
     let body = sanitizer.clean(&raw).to_string();
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title>\
@@ -345,7 +397,13 @@ fn render_markdown(
 .knot-box__title{{margin:0 0 6px;font-size:.85em;font-weight:600;color:#666}}\
 .knot-box__list{{list-style:none;margin:0;padding:0}}\
 .knot-box__l1{{padding-left:1em}}.knot-box__l2{{padding-left:2em}}\
-.knot-box__l3{{padding-left:3em}}.knot-box__l4{{padding-left:4em}}</style></head>\
+.knot-box__l3{{padding-left:3em}}.knot-box__l4{{padding-left:4em}}\
+.knot-callout{{--h:#0969DA;border:1px solid color-mix(in oklab,var(--h) 45%,#fff);border-radius:6px;margin:1em 0;overflow:hidden}}\
+.knot-callout--tip{{--h:#1A7F37}}.knot-callout--important{{--h:#8250DF}}\
+.knot-callout--warning{{--h:#9A6700}}.knot-callout--caution{{--h:#CF222E}}\
+.knot-callout__title{{margin:0;padding:6px 12px;font-weight:600;font-size:.9em;\
+background:color-mix(in oklab,var(--h) 14%,#fff);color:color-mix(in oklab,var(--h) 80%,#222)}}\
+.knot-callout>:not(.knot-callout__title){{margin-left:12px;margin-right:12px}}</style></head>\
          <body><article>{}</article></body></html>",
         html_escape(title),
         body,
@@ -609,6 +667,62 @@ mod tests {
         assert!(!html.contains("knot://toc"), "{html}");
         // The box is not inside a paragraph.
         assert!(!html.contains("<p><nav"), "{html}");
+    }
+
+    #[test]
+    fn renders_callout_box_with_label() {
+        let html = render("> [!WARNING]\n> x\n");
+        assert!(
+            html.contains("<div class=\"knot-callout knot-callout--warning\">"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<p class=\"knot-callout__title\">Warning</p>"),
+            "{html}"
+        );
+        assert!(html.contains(">x<"), "{html}");
+        assert!(!html.contains("<blockquote"), "{html}");
+    }
+
+    #[test]
+    fn renders_custom_title() {
+        let html = render("> [!tip] Wartung am Freitag\n> x\n");
+        assert!(html.contains("knot-callout--tip"), "{html}");
+        assert!(
+            html.contains("<p class=\"knot-callout__title\">Wartung am Freitag</p>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn callout_title_is_escaped() {
+        let html = render("> [!note] <img src=x onerror=alert(1)> & \\*x\\*\n> body\n");
+        assert!(!html.contains("<img"), "{html}");
+        assert!(
+            html.contains(
+                "<p class=\"knot-callout__title\">&lt;img src=x onerror=alert(1)&gt; &amp; *x*</p>"
+            ),
+            "{html}"
+        );
+        assert!(html.contains(">body<"), "{html}");
+    }
+
+    #[test]
+    fn plain_quote_stays_blockquote() {
+        let html = render("> just a quote\n");
+        assert!(html.contains("<blockquote>"), "{html}");
+        assert!(!html.contains("class=\"knot-callout"), "{html}");
+    }
+
+    #[test]
+    fn raw_html_cannot_forge_callout_classes_beyond_allowed() {
+        let html = render(
+            "<div class=\"knot-callout evil\" onclick=\"alert(1)\" style=\"x\">hi</div>\n\n<p class=\"knot-callout__title other\">t</p>\n",
+        );
+        assert!(!html.contains("evil"), "{html}");
+        assert!(!html.contains("other"), "{html}");
+        assert!(!html.contains("onclick"), "{html}");
+        assert!(!html.contains("style=\"x\""), "{html}");
     }
 
     #[test]
