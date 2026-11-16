@@ -18,20 +18,20 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   the heading (on a read-only page the heading takes the focus), and screen
   readers announce the box as the page's "Contents" navigation. The box
   works anywhere a block does, including a table cell, and looks the same
-  in every skin. (#TBD)
+  in every skin. (#111)
 - Headings have anchor ids built the way GitHub builds them, behind an
   `h-` prefix that keeps them clear of the app's own ids (`#h-tasks`,
   `#h-tasks-1` for a second "Tasks", `#h-cafe` for "Café"), in the editor
   and on public pages alike. Opening a page with a link written without the
   prefix, as GitLab writes them (`#tasks`), still lands on the heading.
-  (#TBD)
+  (#111)
 - Markdown: a table of contents is GitLab's own `[[_TOC_]]`, with
   `<!-- knot:toc maxLevel=N -->` on the line before it when its depth is not
   3, so an exported page shows a real table of contents in GitLab. Import
   and Markdown paste read both forms back. Public share pages show the box
   with working links; DOCX and ODT exports list the headings under
   "Contents" with Word's and LibreOffice's own table of contents styles.
-  (#TBD)
+  (#111)
 - Callout boxes: note, tip, important, warning and caution, the five alerts
   of GitHub and GitLab. Pick one from the Quote button's menu (in a quote it
   turns the quote into a box; in a box it changes the kind), type
@@ -43,6 +43,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   import reads both, in any case. Public share pages show the box; DOCX and
   ODT exports show a bordered box with its title in the kind's colour.
   (#112)
+
+### Changed
+- The editor toolbar's Mermaid and Excalidraw buttons are one **Insert
+  diagram** menu now, so the toolbar keeps to one row with the new table of
+  contents button. In a list item, Indent and Outdent take the places of
+  the diagram menu and the table of contents button. (#111)
 
 ### Operators — read before upgrading
 - Rolling back past this release keeps every callout box's text, but a box

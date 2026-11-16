@@ -331,6 +331,8 @@ export function EditorToolbar({
                       void (async () => {
                         const res = await boardsApi.create(docId, null);
                         if ("error" in res) {
+                          // The menu item that had the focus is gone.
+                          editor.commands.focus();
                           notifyFailure(notify, res.error, "Failed to create diagram.");
                           return;
                         }
