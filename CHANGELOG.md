@@ -42,7 +42,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   `> [!WARNING]`, or GitLab's `> [!warning] Title` for a box with a title;
   import reads both, in any case. Public share pages show the box; DOCX and
   ODT exports show a bordered box with its title in the kind's colour.
-  (#TBD)
+  (#112)
 
 ### Operators — read before upgrading
 - Rolling back past this release keeps every callout box's text, but a box
