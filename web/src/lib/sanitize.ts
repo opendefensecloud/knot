@@ -41,6 +41,9 @@ const EDITOR_ALLOWED_ATTR = [
   "type", "checked", "data-checked",
   // A pasted `[[_TOC_]]`, until `markdownToHtml` makes it a table of contents.
   "data-knot-toc",
+  // A callout box: blockquote[data-kind][data-title] (nodes/Callout.ts).
+  "data-kind",
+  "data-title",
 ];
 
 /**
