@@ -695,6 +695,16 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_pulldown_does_not_read_gives_no_title_to_the_next_box() {
+        let html = render(">  [!note] Lost\n> a\n\n> [!WARNING]\n> b\n");
+        assert!(
+            html.contains("<p class=\"knot-callout__title\">Warning</p>"),
+            "{html}"
+        );
+        assert!(html.contains("[!note] Lost"), "{html}");
+    }
+
+    #[test]
     fn callout_title_is_escaped() {
         let html = render("> [!note] <img src=x onerror=alert(1)> & \\*x\\*\n> body\n");
         assert!(!html.contains("<img"), "{html}");

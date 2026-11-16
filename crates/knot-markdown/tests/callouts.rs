@@ -251,3 +251,38 @@ fn empty_box_imports_with_one_paragraph() {
     let doc = parse("> [!TIP]\n");
     assert_eq!(top(&doc), vec![boxed("tip", None, "")]);
 }
+
+#[test]
+fn a_marker_pulldown_does_not_read_keeps_its_text_and_its_title() {
+    // Two spaces after `>`: not an alert for pulldown-cmark, so the quote
+    // stays a quote with its whole first line, and the box after it keeps
+    // its own (empty) title.
+    let doc = parse(">  [!note] Lost\n> a\n\n> [!WARNING]\n> b\n");
+    let tops = top(&doc);
+    assert_eq!(tops[0].1.kind, None, "{tops:?}");
+    assert!(tops[0].1.text.contains("[!note] Lost"), "{tops:?}");
+    assert_eq!(tops[1], boxed("warning", None, "b"));
+}
+
+#[test]
+fn an_indented_code_line_in_a_quote_is_not_a_marker() {
+    let doc = parse(">      [!note] code\n\n> [!TIP]\n> h\n");
+    let tops = top(&doc);
+    assert!(tops[0].1.text.contains("[!note] code"), "{tops:?}");
+    assert_eq!(tops[1], boxed("tip", None, "h"));
+}
+
+#[test]
+fn plain_quote_with_a_space_before_marker_text_stays_a_quote() {
+    let md = markdown(&doc_with_box(None, None, " [!note] x"));
+    let tops = top(&parse(&md));
+    assert_eq!(tops.len(), 1, "{md}");
+    assert_eq!(tops[0].1.kind, None, "{md}");
+    assert_eq!(tops[0].1.text.trim(), "[!note] x", "{md}");
+}
+
+#[test]
+fn plain_quote_starting_with_a_link_keeps_the_link() {
+    let md = markdown(&parse("> [!x](https://e.com) rest\n"));
+    assert_eq!(md, "> [!x](https://e.com) rest\n");
+}

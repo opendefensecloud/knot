@@ -791,9 +791,9 @@ fn write_quote<T: ReadTxn>(
     // A plain quote whose text starts like a marker stays a plain quote.
     if callout.is_none()
         && let Some(Line::Text { text, .. }) = lines.first_mut()
-        && text.starts_with("[!")
+        && let Some(at) = crate::callout::marker_start(text)
     {
-        text.insert(0, '\\');
+        text.insert(at, '\\');
     }
     buf.extend(lines.into_iter().map(|line| match line {
         Line::Text { text, open } if !text.is_empty() => Line::Text {

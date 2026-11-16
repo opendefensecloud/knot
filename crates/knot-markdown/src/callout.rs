@@ -143,39 +143,81 @@ pub fn parser_options() -> Options {
 /// blocks and inline text are left alone) and prepares it for import: see
 /// [`CalloutMarks`].
 pub fn mark_callouts(src: &str) -> CalloutMarks<'_> {
-    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
-    let mut titles = Vec::new();
+    // Each titled marker: the blockquote's start (its `>`), the marker's
+    // range, the bare marker that replaces it, and the title.
+    let mut edits: Vec<(usize, Range<usize>, String, String)> = Vec::new();
     for (event, range) in Parser::new_ext(src, parser_options()).into_offset_iter() {
-        let Event::Start(Tag::BlockQuote(kind)) = event else {
-            continue;
-        };
-        if kind.is_some() {
-            titles.push(None);
-            continue;
-        }
-        if let Some((at, kind, title)) = titled_marker(src, range.start) {
-            edits.push((at, format!("[!{}]", kind.as_str().to_ascii_uppercase())));
-            titles.push(Some(title));
+        if let Event::Start(Tag::BlockQuote(None)) = event
+            && let Some((at, kind, title)) = titled_marker(src, range.start)
+        {
+            let bare = format!("[!{}]", kind.as_str().to_ascii_uppercase());
+            edits.push((range.start, at, bare, title));
         }
     }
-    if edits.is_empty() {
-        return CalloutMarks {
-            src: Cow::Borrowed(src),
-            titles,
-        };
+    // The titles go to the alerts pulldown-cmark reports in the rewritten
+    // source, matched by where each starts; an edit that does not come out
+    // as an alert (a case the line check above misjudged) is dropped, so a
+    // title can never land on another box.
+    loop {
+        let (out, starts) = apply(src, &edits);
+        let mut titles = Vec::new();
+        let mut alerts = std::collections::HashSet::new();
+        for (event, range) in Parser::new_ext(&out, parser_options()).into_offset_iter() {
+            if let Event::Start(Tag::BlockQuote(Some(_))) = event {
+                alerts.insert(range.start);
+                titles.push(
+                    starts
+                        .iter()
+                        .position(|&s| s == range.start)
+                        .map(|i| edits[i].3.clone()),
+                );
+            }
+        }
+        let before = edits.len();
+        let mut i = 0;
+        edits.retain(|_| {
+            let keep = alerts.contains(&starts[i]);
+            i += 1;
+            keep
+        });
+        if edits.len() == before {
+            let src = if edits.is_empty() {
+                Cow::Borrowed(src)
+            } else {
+                Cow::Owned(out)
+            };
+            return CalloutMarks { src, titles };
+        }
     }
+}
+
+/// `src` with each edit's marker replaced, and where each edit's
+/// blockquote starts in the result.
+fn apply(src: &str, edits: &[(usize, Range<usize>, String, String)]) -> (String, Vec<usize>) {
     let mut out = String::with_capacity(src.len());
+    let mut starts = Vec::with_capacity(edits.len());
     let mut last = 0;
-    for (at, text) in edits {
+    for (quote, at, bare, _) in edits {
+        starts.push(out.len() + (quote - last));
         out.push_str(&src[last..at.start]);
-        out.push_str(&text);
+        out.push_str(bare);
         last = at.end;
     }
     out.push_str(&src[last..]);
-    CalloutMarks {
-        src: Cow::Owned(out),
-        titles,
-    }
+    (out, starts)
+}
+
+/// Whether `text`, the first line of a plain quote, would read back as a
+/// box marker (`[!kind]` followed by a space or the line's end, after any
+/// leading spaces): such a line needs escaping on export. Returns the byte
+/// offset of its `[`.
+pub fn marker_start(text: &str) -> Option<usize> {
+    let lead = text.len() - text.trim_start_matches([' ', '\t']).len();
+    let inner = text[lead..].strip_prefix("[!")?;
+    let close = inner.find(']')?;
+    CalloutKind::parse(&inner[..close])?;
+    let tail = &inner[close + 1..];
+    (tail.is_empty() || tail.starts_with(char::is_whitespace)).then_some(lead)
 }
 
 /// The titled marker `[!kind] Title` on the first line of the blockquote
@@ -185,7 +227,9 @@ fn titled_marker(src: &str, start: usize) -> Option<(Range<usize>, CalloutKind, 
     let line_end = src[start..].find('\n').map_or(src.len(), |n| start + n);
     let line = &src[start..line_end];
     let after = line.strip_prefix('>')?;
-    let lead = 1 + (after.len() - after.trim_start_matches([' ', '\t']).len());
+    // At most one space or tab, as pulldown-cmark reads an alert; more
+    // makes the line plain text or code.
+    let lead = 1 + usize::from(after.starts_with([' ', '\t']));
     let rest = &line[lead..];
     let inner = rest.strip_prefix("[!")?;
     let close = inner.find(']')?;
