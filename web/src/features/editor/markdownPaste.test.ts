@@ -161,6 +161,16 @@ describe("table of contents in pasted Markdown", () => {
     expect(parse("> [!FOO]\n> z\n")?.getAttribute("data-kind")).toBeNull();
   });
 
+  it("keeps an escaped marker, and one glued to its text, a plain quote", () => {
+    const parse = (md: string) =>
+      new DOMParser().parseFromString(markdownToHtml(md), "text/html").querySelector("blockquote");
+    // What knot's own export writes for a plain quote that starts with `[!NOTE]`.
+    const escaped = parse("> \\[!NOTE] just text\n");
+    expect(escaped?.getAttribute("data-kind")).toBeNull();
+    expect(escaped?.textContent?.trim()).toBe("[!NOTE] just text");
+    expect(parse("> [!NOTE]text\n")?.getAttribute("data-kind")).toBeNull();
+  });
+
   it("pastes [[_TOC_]] as a table of contents", () => {
     const html = markdownToHtml("[[_TOC_]]\n\n# Plan\n");
     const box = new DOMParser().parseFromString(html, "text/html").querySelector("[data-knot-toc]");
