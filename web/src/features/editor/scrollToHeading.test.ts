@@ -45,7 +45,32 @@ describe("scrollToHeading", () => {
     expect(paneScroll).toHaveBeenCalledWith({ top: 400 - 100 - 8, behavior: "auto" });
   });
 
-  it("says false when there is no such heading", () => {
+  it("says null when there is no such heading", () => {
     expect(scrollToHeading("nope")).toBeNull();
+  });
+
+  it("finds a heading from a GitLab-style link without the h- prefix", () => {
+    document.body.innerHTML = `<main><h2 id="h-tasks">Tasks</h2></main>`;
+    const main = document.querySelector("main")!;
+    const scrollBy = vi.fn();
+    main.scrollBy = scrollBy;
+    const heading = document.getElementById("h-tasks")!;
+    heading.getBoundingClientRect = () => ({ top: 300 }) as DOMRect;
+    expect(scrollToHeading("tasks")).toBe(heading);
+    expect(scrollBy).toHaveBeenCalledWith({ top: 300 - 68, behavior: "auto" });
+  });
+
+  it("prefers an exact id over the prefixed one", () => {
+    document.body.innerHTML = `<main><h2 id="h-h-tasks">A</h2><h2 id="h-tasks">B</h2></main>`;
+    document.querySelector("main")!.scrollBy = vi.fn();
+    expect(scrollToHeading("h-tasks")?.textContent).toBe("B");
+    expect(scrollToHeading("h-nope")).toBeNull();
+  });
+
+  it("finds a GitLab link to a heading whose own text starts with H-", () => {
+    // "H-Bridge": GitLab writes #h-bridge, knot gives the id h-h-bridge.
+    document.body.innerHTML = `<main><h2 id="h-h-bridge">H-Bridge</h2></main>`;
+    document.querySelector("main")!.scrollBy = vi.fn();
+    expect(scrollToHeading("h-bridge")?.id).toBe("h-h-bridge");
   });
 });

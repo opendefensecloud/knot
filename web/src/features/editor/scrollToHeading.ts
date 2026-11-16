@@ -5,6 +5,7 @@
  */
 
 import { stickyCoverBottom } from "../docs/readingAnchor";
+import { HEADING_ID_PREFIX } from "./headingAnchors";
 
 /** Gap between the band and the heading, in px. */
 const GAP = 8;
@@ -18,6 +19,18 @@ function scrollParent(el: HTMLElement): HTMLElement | null {
   return null;
 }
 
+/** The element with id `slug` in `root`, or else, for a link written
+ *  without knot's `h-` prefix (GitLab and GitHub style, as in an imported
+ *  page), the one with id `h-<slug>`. A slug that starts with `h-`
+ *  itself ("H-Bridge" is `#h-bridge` in GitLab, `h-h-bridge` here) gets
+ *  the fallback too; an exact id always wins. */
+function findHeading(slug: string, root: ParentNode): HTMLElement | null {
+  const withId = Array.from(root.querySelectorAll<HTMLElement>("[id]"));
+  const exact = withId.find((el) => el.id === slug);
+  if (exact) return exact;
+  return withId.find((el) => el.id === HEADING_ID_PREFIX + slug) ?? null;
+}
+
 /** The heading, when it exists in `root` (the editor it belongs to, so a
  *  version open in the history drawer scrolls its own pane) and the scroll
  *  was started. On the page itself it lands below the sticky band, which
@@ -25,7 +38,7 @@ function scrollParent(el: HTMLElement): HTMLElement | null {
  *  position is measured again on the next two frames and corrected; in
  *  another pane it lands below the pane's top. */
 export function scrollToHeading(slug: string, root: ParentNode = document): HTMLElement | null {
-  const heading = Array.from(root.querySelectorAll<HTMLElement>("[id]")).find((el) => el.id === slug);
+  const heading = findHeading(slug, root);
   if (!heading) return null;
   const doc = heading.ownerDocument;
   const pane = scrollParent(heading);
