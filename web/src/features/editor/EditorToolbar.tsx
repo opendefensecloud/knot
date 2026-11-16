@@ -33,7 +33,7 @@ import { boardsApi } from "../../lib/boards.api";
 import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 import { SCOPE_TOOLTIP, suggestionScope } from "../suggestions/scope";
-import { CalloutMenu } from "./CalloutMenu";
+import { CALLOUT_ICON, CALLOUT_KINDS, CALLOUT_LABEL, calloutKind } from "./callouts";
 import { TableMenu } from "./TableMenu";
 import { ToolbarMenu } from "./ToolbarMenu";
 import { applyLinkUrl, toolbarLinkState } from "./toolbarLink";
@@ -136,6 +136,8 @@ export function EditorToolbar({
   const canSuggest = Boolean(onSuggest) && scope.ok && scope.kind === "insert";
   const suggestTitle = onSuggest && !scope.ok ? SCOPE_TOOLTIP[scope.reason] : undefined;
   const inListItem = editor.isActive("list_item");
+  const inQuote = editor.isActive("blockquote");
+  const quoteKind = inQuote ? calloutKind(editor.getAttributes("blockquote").kind) : null;
 
   return (
     // The band spans the full shell so wide content scrolling under it is
@@ -231,11 +233,38 @@ export function EditorToolbar({
         >
           <ListChecks size={15} aria-hidden />
         </Btn>
-        <Btn testId="toolbar-blockquote" label="Quote" active={editor.isActive("blockquote")}
-          onClick={() => c().toggleBlockquote().run()}>
-          <Quote size={15} aria-hidden />
-        </Btn>
-        <CalloutMenu editor={editor} btnClass={BTN_CLS} />
+        {/* Quote and the five callout boxes share one slot. In a quote a kind
+            turns it into a box; in a box, a kind changes it and Quote lifts
+            the text out. */}
+        <ToolbarMenu
+          editor={editor}
+          btnClass={BTN_CLS}
+          testId="toolbar-blockquote"
+          label="Quote or callout"
+          icon={<Quote size={15} aria-hidden />}
+          active={inQuote}
+          items={[
+            {
+              testId: "toolbar-quote",
+              // In a quote or box it lifts the text out, so it says so
+              // rather than showing as the selected choice.
+              label: inQuote ? "Remove quote" : "Quote",
+              icon: <Quote size={15} aria-hidden />,
+              checked: false,
+              run: () => c().toggleBlockquote().run(),
+            },
+            ...CALLOUT_KINDS.map((kind) => {
+              const Icon = CALLOUT_ICON[kind];
+              return {
+                testId: `toolbar-callout-${kind}`,
+                label: CALLOUT_LABEL[kind],
+                icon: <Icon size={15} aria-hidden />,
+                checked: quoteKind === kind,
+                run: () => c().setCallout(kind).run(),
+              };
+            }),
+          ]}
+        />
         <Btn testId="toolbar-code-block" label="Code block" active={editor.isActive("code_block")}
           onClick={() => c().toggleCodeBlock().run()}>
           <Code2 size={15} aria-hidden />

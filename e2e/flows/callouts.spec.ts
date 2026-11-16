@@ -26,7 +26,7 @@ test("callouts: insert, title, kind, export, public page", async ({ page, browse
 
   const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
   await editor.click();
-  await page.getByTestId("toolbar-callout").click();
+  await page.getByTestId("toolbar-blockquote").click();
   await page.getByTestId("toolbar-callout-warning").click();
 
   const box = editor.getByTestId("callout");
