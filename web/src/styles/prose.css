@@ -703,6 +703,7 @@
    "Kopfzeile": a header tinted with the kind's hue, a border in it, the
    body on the page surface. Hues are GitHub's, light and dark; everything
    else comes from the skin's tokens. */
+/* The kind rules carry .ProseMirror so they outrank this default. */
 .ProseMirror .knot-callout {
   --callout-hue: #0969DA;
   margin: 0.8em 0;
@@ -712,15 +713,15 @@
   border-radius: calc(var(--radius-unit) * 3);
   overflow: hidden;
 }
-.knot-callout--tip { --callout-hue: #1A7F37; }
-.knot-callout--important { --callout-hue: #8250DF; }
-.knot-callout--warning { --callout-hue: #9A6700; }
-.knot-callout--caution { --callout-hue: #CF222E; }
-[data-theme="dark"] .knot-callout--note { --callout-hue: #4493F8; }
-[data-theme="dark"] .knot-callout--tip { --callout-hue: #3FB950; }
-[data-theme="dark"] .knot-callout--important { --callout-hue: #AB7DF8; }
-[data-theme="dark"] .knot-callout--warning { --callout-hue: #D29922; }
-[data-theme="dark"] .knot-callout--caution { --callout-hue: #F85149; }
+.ProseMirror .knot-callout--tip { --callout-hue: #1A7F37; }
+.ProseMirror .knot-callout--important { --callout-hue: #8250DF; }
+.ProseMirror .knot-callout--warning { --callout-hue: #9A6700; }
+.ProseMirror .knot-callout--caution { --callout-hue: #CF222E; }
+[data-theme="dark"] .ProseMirror .knot-callout--note { --callout-hue: #4493F8; }
+[data-theme="dark"] .ProseMirror .knot-callout--tip { --callout-hue: #3FB950; }
+[data-theme="dark"] .ProseMirror .knot-callout--important { --callout-hue: #AB7DF8; }
+[data-theme="dark"] .ProseMirror .knot-callout--warning { --callout-hue: #D29922; }
+[data-theme="dark"] .ProseMirror .knot-callout--caution { --callout-hue: #F85149; }
 [data-skin="high-contrast"] .knot-callout {
   --callout-hue-strong: color-mix(in oklab, var(--callout-hue) 70%, #000);
   border-color: var(--callout-hue-strong);
@@ -731,9 +732,15 @@
   gap: 8px;
   padding: 6px 12px;
   background: color-mix(in oklab, var(--callout-hue) 14%, var(--color-surface));
-  color: color-mix(in oklab, var(--callout-hue) 80%, var(--color-fg));
+  /* 60% hue keeps the title at 4.5:1 or more in every skin (nord and
+     everforest fall short at 80%). */
+  color: color-mix(in oklab, var(--callout-hue) 60%, var(--color-fg));
   font-weight: 600;
   font-size: 0.9em;
+}
+/* Dark skins with a mid-tone surface (nord, everforest) need more fg. */
+[data-theme="dark"] .knot-callout__head {
+  color: color-mix(in oklab, var(--callout-hue) 45%, var(--color-fg));
 }
 [data-skin="high-contrast"] .knot-callout__head {
   color: var(--callout-hue-strong);
@@ -753,9 +760,11 @@
   font: inherit;
   padding: 0;
 }
+/* Muted by weight, not opacity, so it keeps the title's contrast. */
 .knot-callout__title::placeholder {
   color: inherit;
-  opacity: 0.75;
+  opacity: 1;
+  font-weight: 400;
 }
 .knot-callout__title:focus-visible {
   text-decoration: underline;
