@@ -35,6 +35,16 @@ test("callouts: insert, title, kind, export, public page", async ({ page, browse
   await page.keyboard.type("Am Freitag ist der Dienst kurz weg.");
   await expect(box.locator(".knot-callout__body")).toHaveText("Am Freitag ist der Dienst kurz weg.");
 
+  // The title field shows a visible focus ring when reached by keyboard.
+  await box.getByTestId("callout-kind").focus();
+  await page.keyboard.press("Shift+Tab");
+  await expect(box.getByTestId("callout-title")).toBeFocused();
+  const ring = await box
+    .getByTestId("callout-title")
+    .evaluate((el) => ({ style: getComputedStyle(el).outlineStyle, width: getComputedStyle(el).outlineWidth }));
+  expect(ring.style).not.toBe("none");
+  expect(parseFloat(ring.width)).toBeGreaterThanOrEqual(2);
+
   await box.getByTestId("callout-title").fill("Wartung");
   // Each kind has its own colour, in the light skins too.
   const headColour = () => box.locator(".knot-callout__head").evaluate((h) => getComputedStyle(h).backgroundColor);

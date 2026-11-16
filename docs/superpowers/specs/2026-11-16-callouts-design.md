@@ -107,6 +107,11 @@ Import (`from_markdown.rs`), all of these become a box:
 - An unknown marker (`> [!FOO]`) stays a plain quote with that text.
 - A box with no content after the marker gets one empty paragraph
   (`block+`).
+- A line `> ---` right after a titled marker is a horizontal rule in the
+  box's body, not a setext underline of the title (Marco, 2026-11-16; how
+  GitLab shows it is unverified).
+- The title is plain text: Markdown in it (`> [!note] **wichtig**`) shows
+  its characters as typed, and export escapes them (Marco, 2026-11-16).
 
 Markdown paste in the editor (`markdownPaste.ts`, uses `marked`) must
 produce the same boxes.

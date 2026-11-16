@@ -767,8 +767,11 @@
   font-weight: 400;
 }
 .knot-callout__title:focus-visible {
-  text-decoration: underline;
-  text-underline-offset: 3px;
+  /* The title colour: ≥ 4.5:1 on the band in every skin (the bare hue
+     drops below 3:1 in nord). */
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+  border-radius: calc(var(--radius-unit) * 1);
 }
 .knot-callout__kind {
   flex: none;

@@ -78,6 +78,17 @@ describe("toolbar callout menu", () => {
     expect(quotes(bound.editor.state.doc)).toEqual([{ kind: "note", text: "x" }]);
   });
 
+  it("is a menu button, not a toggle, for screen readers", () => {
+    bound = mountBoundEditor();
+    bound.editor.commands.setContent('<blockquote data-kind="warning"><p>x</p></blockquote>');
+    placeSelection(bound, 3);
+    toolbar(bound);
+    const trigger = screen.getByTestId("toolbar-callout");
+    expect(trigger).not.toHaveAttribute("aria-pressed");
+    expect(trigger).toHaveAttribute("aria-haspopup", "menu");
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+  });
+
   it("the Quote button inside a box lifts the text out", () => {
     bound = mountBoundEditor();
     bound.editor.commands.setContent('<blockquote data-kind="warning"><p>keep</p></blockquote>');

@@ -286,3 +286,18 @@ fn plain_quote_starting_with_a_link_keeps_the_link() {
     let md = markdown(&parse("> [!x](https://e.com) rest\n"));
     assert_eq!(md, "> [!x](https://e.com) rest\n");
 }
+
+#[test]
+fn a_rule_under_a_titled_marker_is_a_rule_in_the_box() {
+    let doc = parse("> [!note] T\n> ---\n");
+    let tops = top(&doc);
+    assert_eq!(tops.len(), 1, "{tops:?}");
+    assert_eq!(tops[0].1.kind.as_deref(), Some("note"));
+    assert_eq!(tops[0].1.title.as_deref(), Some("T"));
+    assert!(
+        markdown(&doc).starts_with("> [!note] T\n>"),
+        "{}",
+        markdown(&doc)
+    );
+    assert!(markdown(&doc).contains("---"), "{}", markdown(&doc));
+}
