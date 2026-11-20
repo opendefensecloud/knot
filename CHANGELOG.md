@@ -17,6 +17,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   of the page see that row; readers do not. Inside code `[[` stays text, and
   a typed `]]` closes the picker. (#TBD)
 
+### Security
+- RUSTSEC-2026-0543 (`chrono` unmaintained) is acknowledged in `deny.toml`.
+  It has no known vulnerability and no fixed release, and it cannot leave
+  the dependency tree: `oauth2` 5.0.0 and `openidconnect` 4.0.1, the latest
+  releases, require it.
+
 ## [0.10.0] - 2026-11-15
 
 A page history release, with a fix for pages that lost an edit: their

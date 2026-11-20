@@ -77,6 +77,18 @@ ignore = [
     { id = "RUSTSEC-2026-0367", reason = "zip extract() keeps SUID/SGID bits; fix only in zip 9; knot reads archives in memory and never extracts" },
     { id = "RUSTSEC-2026-0368", reason = "zip extract() symlinks escape the destination; fix only in zip 9; knot reads archives in memory and never extracts" },
     { id = "RUSTSEC-2026-0369", reason = "zip extract() chmods through symlinks; fix only in zip 9; knot reads archives in memory and never extracts" },
+
+    # chrono is unmaintained (https://github.com/chronotope/chrono/issues/1768);
+    # every version is affected and no successor release exists. It is a
+    # workspace dependency used for timestamps across knot-auth, knot-docs,
+    # knot-history, knot-markdown, knot-server and knot-storage, and sqlx
+    # maps TIMESTAMPTZ to it via its "chrono" feature. Moving knot to jiff or
+    # time would not remove it: oauth2 5.0.0 and openidconnect 4.0.1 (both
+    # the current latest) depend on chrono non-optionally.
+    # Unmaintained-only: no known vulnerability.
+    # Drop when: openidconnect/oauth2 move off chrono AND knot has migrated
+    # its own timestamps (and the sqlx feature) to jiff or time.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; non-optional dep of oauth2 5.0.0 / openidconnect 4.0.1; no vulnerability, no upstream fix" },
 ]
 
 [licenses]
