@@ -118,7 +118,10 @@ async fn resolve(
     };
     // `can_read` is false for restricted pages without a grant and for a
     // viewer on an archived page, the same rule `/api/docs/{id}` applies.
-    match acl.access(ctx.workspace_id, link.doc_id, ctx.user_id).await {
+    match acl
+        .access(ctx.workspace_id, link.doc_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(Some(access)) if access.can_read() => Json(ResolveResponse {
             doc_id: link.doc_id.to_string(),
         })

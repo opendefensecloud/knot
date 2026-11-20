@@ -82,6 +82,7 @@ pub async fn resolve(
     workspace_id: Uuid,
     doc_id: Uuid,
     user_id: Uuid,
+    scope_root: Option<Uuid>,
 ) -> Result<Option<DocAccess>, ResolveError> {
     // Tenancy guard: the document must belong to the caller's workspace.
     // Without this, `get_member_role(workspace_id, user_id)` returns the
@@ -89,7 +90,7 @@ pub async fn resolve(
     // of one workspace read/write access to documents in every other workspace
     // by UUID. The chain query filters every step by `workspace_id`, so a
     // missing or foreign doc yields an empty chain and no access. The cache
-    // key is (workspace_id, doc_id, user_id), so a `None` cached for a
+    // key is (workspace_id, doc_id, user_id, scope_root), so a `None` cached for a
     // foreign workspace never shadows the doc's real workspace.
     let principal = format!("user:{user_id}");
     let (chain, principal_grants) = grants
@@ -126,6 +127,7 @@ pub async fn resolve(
         &path,
         &principal_grants,
         workspace_role,
+        scope_root,
     ))
 }
 
@@ -201,8 +203,12 @@ mod tests {
         let gone = ds.create(ws, None, "Gone", "n", user).await.unwrap();
         ds.archive(ws, gone.id, user).await.unwrap();
 
-        let live_access = resolve(&ws_s, &gs, &ds, ws, live.id, user).await.unwrap();
-        let gone_access = resolve(&ws_s, &gs, &ds, ws, gone.id, user).await.unwrap();
+        let live_access = resolve(&ws_s, &gs, &ds, ws, live.id, user, None)
+            .await
+            .unwrap();
+        let gone_access = resolve(&ws_s, &gs, &ds, ws, gone.id, user, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             live_access,
@@ -226,7 +232,9 @@ mod tests {
     async fn workspace_role_used_when_no_grant() {
         let (ws_s, gs, ds, ws, user) = ctx().await;
         let d = ds.create(ws, None, "X", "m", user).await.unwrap();
-        let r = resolve(&ws_s, &gs, &ds, ws, d.id, user).await.unwrap();
+        let r = resolve(&ws_s, &gs, &ds, ws, d.id, user, None)
+            .await
+            .unwrap();
         assert_eq!(r.map(|a| a.role), Some(WorkspaceRole::Viewer));
     }
 
@@ -244,7 +252,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = resolve(&ws_s, &gs, &ds, ws, d.id, user).await.unwrap();
+        let r = resolve(&ws_s, &gs, &ds, ws, d.id, user, None)
+            .await
+            .unwrap();
         assert_eq!(r.map(|a| a.role), Some(WorkspaceRole::Owner));
     }
 
@@ -263,7 +273,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = resolve(&ws_s, &gs, &ds, ws, child.id, user).await.unwrap();
+        let r = resolve(&ws_s, &gs, &ds, ws, child.id, user, None)
+            .await
+            .unwrap();
         assert_eq!(r.map(|a| a.role), Some(WorkspaceRole::Editor));
     }
 
@@ -272,7 +284,9 @@ mod tests {
         let (ws_s, gs, ds, ws, owner) = ctx().await;
         let d = ds.create(ws, None, "X", "m", owner).await.unwrap();
         let other = Uuid::new_v4();
-        let r = resolve(&ws_s, &gs, &ds, ws, d.id, other).await.unwrap();
+        let r = resolve(&ws_s, &gs, &ds, ws, d.id, other, None)
+            .await
+            .unwrap();
         assert_eq!(r, None);
     }
 
@@ -308,13 +322,13 @@ mod tests {
 
         // user_a (Owner of A, NOT a member of B) asks for doc_b using their
         // own workspace A — must be denied by the tenancy guard.
-        let r = resolve(&ws_s, &gs, &ds, a.id, doc_b.id, user_a.id)
+        let r = resolve(&ws_s, &gs, &ds, a.id, doc_b.id, user_a.id, None)
             .await
             .unwrap();
         assert_eq!(r, None, "cross-workspace read must be denied");
 
         // Sanity: even scoped to B, a non-member of B has no access.
-        let r2 = resolve(&ws_s, &gs, &ds, b.id, doc_b.id, user_a.id)
+        let r2 = resolve(&ws_s, &gs, &ds, b.id, doc_b.id, user_a.id, None)
             .await
             .unwrap();
         assert_eq!(r2, None, "non-member of B has no access even in B's scope");
@@ -338,7 +352,7 @@ mod tests {
         mark_restricted(&pool, boundary.id).await;
 
         for doc_id in [boundary.id, child.id] {
-            let access = resolve(&ws_s, &gs, &ds, ws, doc_id, workspace_owner.id)
+            let access = resolve(&ws_s, &gs, &ds, ws, doc_id, workspace_owner.id, None)
                 .await
                 .unwrap();
             assert_eq!(access, None, "workspace owner must not see {doc_id}");
@@ -366,7 +380,9 @@ mod tests {
         .unwrap();
 
         for doc_id in [boundary.id, child.id] {
-            let access = resolve(&ws_s, &gs, &ds, ws, doc_id, user).await.unwrap();
+            let access = resolve(&ws_s, &gs, &ds, ws, doc_id, user, None)
+                .await
+                .unwrap();
             assert_eq!(
                 access,
                 Some(DocAccess {
@@ -394,7 +410,27 @@ mod tests {
         .unwrap();
         ws_s.remove_member(ws, user).await.unwrap();
 
-        let access = resolve(&ws_s, &gs, &ds, ws, doc.id, user).await.unwrap();
+        let access = resolve(&ws_s, &gs, &ds, ws, doc.id, user, None)
+            .await
+            .unwrap();
         assert_eq!(access, None, "a grant alone must not outlive membership");
+    }
+
+    /// S10: with a scope root, docs outside its subtree resolve to `None`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_honours_scope_root() {
+        let (ws_s, gs, ds, ws, user) = ctx().await;
+        let top = ds.create(ws, None, "T", "m", user).await.unwrap();
+        let root = ds.create(ws, Some(top.id), "R", "m", user).await.unwrap();
+        let child = ds.create(ws, Some(root.id), "C", "m", user).await.unwrap();
+
+        let outside = resolve(&ws_s, &gs, &ds, ws, top.id, user, Some(root.id))
+            .await
+            .unwrap();
+        let inside = resolve(&ws_s, &gs, &ds, ws, child.id, user, Some(root.id))
+            .await
+            .unwrap();
+        assert_eq!(outside, None);
+        assert!(inside.is_some());
     }
 }

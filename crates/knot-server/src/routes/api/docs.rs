@@ -198,7 +198,7 @@ pub(super) async fn visibility_covering_ids(
     let Some(acl) = state.acl.as_ref() else {
         return Err(internal());
     };
-    acl.visibility_covering(ctx.workspace_id, ctx.user_id, doc_ids)
+    acl.visibility_covering(ctx.workspace_id, ctx.user_id, ctx.root_doc_id, doc_ids)
         .await
         .map_err(|e| {
             tracing::error!(error=?e, "visibility");
@@ -257,7 +257,7 @@ async fn caller_doc_response(
         return Err(internal());
     };
     match acl
-        .effective_role(ctx.workspace_id, parent_id, ctx.user_id)
+        .effective_role(ctx.workspace_id, parent_id, ctx.user_id, ctx.root_doc_id)
         .await
     {
         Ok(Some(_)) => {}
@@ -329,6 +329,8 @@ async fn require_editable_destination(
 ) -> Result<(), Response> {
     match parent_id {
         Some(parent_id) => crate::restricted::require_editable_parent(state, ctx, parent_id).await,
+        // S10: a top-level page is outside every subtree.
+        None if ctx.root_doc_id.is_some() => Err(crate::auth::scope::subtree_denied()),
         None if ctx.role == WorkspaceRole::Viewer => {
             Err(json_err(StatusCode::FORBIDDEN, "acl.editor_required", ""))
         }
@@ -454,7 +456,10 @@ async fn get_one(
         archive: ArchiveInfo,
     }
     // Cached by the middleware's lookup a moment ago.
-    let access = match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
+    let access = match acl
+        .access(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(Some(access)) => access,
         Ok(None) => return json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""),
         Err(e) => {
@@ -474,7 +479,7 @@ async fn get_one(
     let readable = |other_id: Uuid| {
         let acl = acl.clone();
         async move {
-            acl.effective_role(ctx.workspace_id, other_id, ctx.user_id)
+            acl.effective_role(ctx.workspace_id, other_id, ctx.user_id, ctx.root_doc_id)
                 .await
                 .map(|other_role| other_role.is_some())
         }
@@ -1001,6 +1006,24 @@ async fn restore(
     let Some(docs) = state.docs.clone() else {
         return internal();
     };
+    // S10: with the parent archived, restore puts the page at the top level,
+    // outside every subtree.
+    if ctx.root_doc_id.is_some() {
+        let parent_live = match docs.get(doc_id).await {
+            Ok(Some(doc)) => match doc.parent_id {
+                Some(parent_id) => match docs.get(parent_id).await {
+                    Ok(parent) => parent.is_some_and(|p| p.archived_at.is_none()),
+                    Err(_) => return internal(),
+                },
+                None => false,
+            },
+            Ok(None) => return json_err(StatusCode::NOT_FOUND, "doc.not_found", ""),
+            Err(_) => return internal(),
+        };
+        if !parent_live {
+            return crate::auth::scope::subtree_denied();
+        }
+    }
     match docs.restore(ctx.workspace_id, doc_id, ctx.user_id).await {
         Ok(restored_ids) => {
             crate::archive::evict_local(&state, &restored_ids).await;
@@ -1508,6 +1531,7 @@ mod tests {
             user_id: bot,
             workspace_id: Uuid::new_v4(),
             role: WorkspaceRole::Editor,
+            root_doc_id: None,
         });
         req.extensions_mut()
             .insert(EffectiveDocRole(WorkspaceRole::Owner));

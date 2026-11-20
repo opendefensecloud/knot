@@ -634,7 +634,7 @@ pub async fn entries(
         state
             .acl
             .as_ref()
-            .map(|acl| move |id| acl.access(ctx.workspace_id, id, ctx.user_id)),
+            .map(|acl| move |id| acl.access(ctx.workspace_id, id, ctx.user_id, ctx.root_doc_id)),
     )
     .await;
 

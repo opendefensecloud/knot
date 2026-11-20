@@ -15,6 +15,9 @@ const apiKeySchema = v.object({
   expires_at: v.nullable(v.string()),
   last_used_at: v.nullable(v.string()),
   revoked_at: v.nullable(v.string()),
+  root_doc_id: v.fallback(v.nullable(v.string()), null),
+  /** null when the key has no root or the viewer can't read it. */
+  root_title: v.fallback(v.nullable(v.string()), null),
 });
 export type ApiKey = v.InferOutput<typeof apiKeySchema>;
 
@@ -24,6 +27,7 @@ const createdApiKeySchema = v.object({
   name: v.string(),
   scopes: v.array(v.string()),
   expires_at: v.nullable(v.string()),
+  root_doc_id: v.fallback(v.nullable(v.string()), null),
 });
 /** Carries the plaintext key. Never put this into the query cache or a log. */
 export type CreatedApiKey = v.InferOutput<typeof createdApiKeySchema>;
@@ -34,6 +38,8 @@ export type CreateApiKeyInput = {
   /** null = never expires (only when neither the key's user nor its minter is capped). */
   expiresInDays: number | null;
   userId?: string;
+  /** Limit the key to this page and its subpages (S10). */
+  rootDocId?: string | null;
 };
 
 /** Prefix of every key list's query key: invalidating it refreshes them all. */
@@ -57,6 +63,7 @@ export const apiKeysApi = {
       expires_in_days: input.expiresInDays,
     };
     if (input.userId) body.user_id = input.userId;
+    if (input.rootDocId) body.root_doc_id = input.rootDocId;
     const r = await apiFetch<unknown>("/api/auth/api-keys", { method: "POST", body });
     if ("error" in r) return r;
     return { ok: parse(createdApiKeySchema, r.ok) };

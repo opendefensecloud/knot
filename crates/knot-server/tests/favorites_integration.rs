@@ -199,6 +199,7 @@ async fn mint_key(w: &World, user_id: Uuid, scopes: &[&str]) -> String {
             created_by: user_id,
             expires_at: None,
             session_hash: None,
+            root_doc_id: None,
         })
         .await
         .unwrap();

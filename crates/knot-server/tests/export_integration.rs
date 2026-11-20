@@ -560,7 +560,7 @@ async fn resolve_assets_checks_blob_access_and_budget() {
     };
     let user = world.owner.user_id;
 
-    let assets = export::resolve_assets(&world.state, user, &doc, HashMap::new())
+    let assets = export::resolve_assets(&world.state, user, None, &doc, HashMap::new())
         .await
         .unwrap();
     assert!(matches!(
@@ -581,7 +581,7 @@ async fn resolve_assets_checks_blob_access_and_budget() {
 
     let budget = PNG_3X2.len() as i64 - 1;
     let assets =
-        export::resolve_assets_with_budget(&world.state, user, &doc, HashMap::new(), budget)
+        export::resolve_assets_with_budget(&world.state, user, None, &doc, HashMap::new(), budget)
             .await
             .unwrap();
     assert!(matches!(
@@ -610,7 +610,7 @@ async fn image_budget_is_a_running_total() {
 
     let user = world.owner.user_id;
     let assets =
-        export::resolve_assets_with_budget(&world.state, user, &doc, HashMap::new(), budget)
+        export::resolve_assets_with_budget(&world.state, user, None, &doc, HashMap::new(), budget)
             .await
             .unwrap();
     assert!(
@@ -658,7 +658,7 @@ async fn build_counts_each_fallback_kind() {
     assert_eq!(walked.unknown_elements, ["callout"]);
 
     for format in [Format::Docx, Format::Odt] {
-        let built = export::build(&world.state, owner, page, format, HashMap::new())
+        let built = export::build(&world.state, owner, None, page, format, HashMap::new())
             .await
             .unwrap();
         let fallbacks = built.fallbacks;
@@ -704,7 +704,7 @@ async fn resolve_assets_keeps_page_diagrams_and_names_mentions() {
         ("mermaid-not-on-page".to_string(), TINY_PNG.to_vec()),
     ]);
 
-    let assets = export::resolve_assets(&world.state, owner, &doc, pictures)
+    let assets = export::resolve_assets(&world.state, owner, None, &doc, pictures)
         .await
         .unwrap();
     let keys: Vec<&String> = assets.diagrams.keys().collect();
@@ -738,14 +738,14 @@ async fn converted_webp_is_charged_at_its_prepared_size() {
     let budget = WEBP_2X2.len() as i64;
     let user = world.owner.user_id;
     let assets =
-        export::resolve_assets_with_budget(&world.state, user, &doc, HashMap::new(), budget)
+        export::resolve_assets_with_budget(&world.state, user, None, &doc, HashMap::new(), budget)
             .await
             .unwrap();
     assert!(matches!(assets.images[&id], ImageAsset::OverBudget));
 
     let budget = prepared.bytes.len() as i64;
     let assets =
-        export::resolve_assets_with_budget(&world.state, user, &doc, HashMap::new(), budget)
+        export::resolve_assets_with_budget(&world.state, user, None, &doc, HashMap::new(), budget)
             .await
             .unwrap();
     assert!(matches!(assets.images[&id], ImageAsset::Embedded(_)));
@@ -761,6 +761,7 @@ async fn webp_blob_is_converted_to_png() {
     let built = export::build(
         &world.state,
         world.owner.user_id,
+        None,
         page,
         Format::Docx,
         HashMap::new(),
@@ -784,6 +785,7 @@ async fn page_links_use_base_url() {
     let built = export::build(
         &world.state,
         world.owner.user_id,
+        None,
         page,
         Format::Docx,
         HashMap::new(),
@@ -808,7 +810,7 @@ async fn build_uses_live_state_and_current_display_names() {
         .await;
 
     for format in [Format::Docx, Format::Odt] {
-        let built = export::build(&world.state, owner, page, format, HashMap::new())
+        let built = export::build(&world.state, owner, None, page, format, HashMap::new())
             .await
             .unwrap();
         assert!(built.bytes.starts_with(b"PK"), "{format:?}");

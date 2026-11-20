@@ -33,6 +33,7 @@ import { docsApi } from "../docs/docs.api";
 import { SELECTION_FLOAT_WIDTH, computeAddCommentPos } from "./addCommentPos";
 import { createExtensions } from "./extensions";
 import { scrollToHeading } from "./scrollToHeading";
+import { subpageCreator } from "./pageLinkCreate";
 import {
   type HighlightedComment,
   refreshHighlights,
@@ -350,6 +351,28 @@ function EditorBody({
             display_name: m.display_name,
             email: m.email,
           }));
+        },
+        // `[[` page links: the sidebar's doc list (readable, not archived,
+        // no templates), and for editors of this page a subpage on the fly.
+        // The server checks the right to add a subpage here either way.
+        pageLinks: {
+          listPages: async () => {
+            const r = await qc.fetchQuery({
+              queryKey: ["docs"],
+              queryFn: () => docsApi.list(),
+              staleTime: 30_000,
+            });
+            if ("error" in r) return [];
+            return r.ok.map(({ id, title, parent_id }) => ({ id, title, parent_id }));
+          },
+          currentDocId: docId,
+          createSubpage: role === "viewer"
+            ? null
+            : subpageCreator(docId, {
+              create: (body) => docsApi.create(body),
+              refreshDocs: () => void qc.invalidateQueries({ queryKey: ["docs"] }),
+              notify,
+            }),
         },
       }),
       editable: canEdit,

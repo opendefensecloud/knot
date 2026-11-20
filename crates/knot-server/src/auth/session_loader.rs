@@ -56,6 +56,7 @@ pub async fn session_loader_mw(
                 user_id: s.user_id,
                 workspace_id: s.workspace_id,
                 role,
+                root_doc_id: None,
             });
             req.extensions_mut().insert(SessionHash(id.clone()));
             // Fire-and-forget touch (using the hashed id).

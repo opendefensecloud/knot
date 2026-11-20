@@ -13,6 +13,11 @@ use uuid::Uuid;
 /// SQLSTATE raised by the `api_keys_sso_ttl_guard` trigger.
 const SSO_TTL_ERRCODE: &str = "KB003";
 
+/// SQLSTATE raised by the `api_keys_root_doc_guard` trigger.
+const ROOT_ERRCODE: &str = "KB005";
+const FK_ERRCODE: &str = "23503";
+const ROOT_FK: &str = "api_keys_root_doc_id_fkey";
+
 /// Most live (not revoked, not expired) keys one user may hold. Minting
 /// more answers [`ApiKeyStoreError::LimitReached`].
 pub const MAX_LIVE_KEYS_PER_USER: i64 = 50;
@@ -111,6 +116,8 @@ pub struct ApiKey {
     /// Last authenticated, so it includes requests later denied by scope.
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// S10: the page whose subtree the key is limited to; `None` = no limit.
+    pub root_doc_id: Option<Uuid>,
 }
 
 /// Insert payload. `key_hash` is the keyed HMAC of the secret, never the
@@ -128,6 +135,8 @@ pub struct NewApiKey<'a> {
     /// `created_by` in `workspace_id`, checked inside the insert's
     /// transaction.
     pub session_hash: Option<&'a [u8]>,
+    /// S10: limit the key to this page and its subpages; `None` = no limit.
+    pub root_doc_id: Option<Uuid>,
 }
 
 impl std::fmt::Debug for NewApiKey<'_> {
@@ -141,6 +150,7 @@ impl std::fmt::Debug for NewApiKey<'_> {
             .field("created_by", &self.created_by)
             .field("expires_at", &self.expires_at)
             .field("session_hash", &self.session_hash.map(|_| "<redacted>"))
+            .field("root_doc_id", &self.root_doc_id)
             .finish()
     }
 }
@@ -153,6 +163,9 @@ pub enum ApiKeyStoreError {
     /// The user already holds [`MAX_LIVE_KEYS_PER_USER`] live keys.
     #[error("api key limit reached")]
     LimitReached,
+    /// The KB005 trigger refused the root: not in the key's workspace.
+    #[error("api key root page rejected")]
+    RootRejected,
     /// The minting session is gone, or its user is no longer a member of
     /// the workspace.
     #[error("api key minting session ended")]
@@ -179,7 +192,8 @@ pub trait ApiKeyStore: Send + Sync + 'static {
     /// [`ApiKeyStoreError::SessionEnded`], [`ApiKeyStoreError::NotPermitted`]
     /// or [`ApiKeyStoreError::LimitReached`] (the user holds
     /// [`MAX_LIVE_KEYS_PER_USER`] live keys); KB003 from the SSO trigger
-    /// maps to [`ApiKeyStoreError::TtlRejected`].
+    /// maps to [`ApiKeyStoreError::TtlRejected`], KB005 from the root
+    /// trigger to [`ApiKeyStoreError::RootRejected`].
     async fn create(&self, k: NewApiKey<'_>) -> Result<ApiKey, ApiKeyStoreError>;
 
     /// Find a non-revoked, non-expired key by its hash.
@@ -221,7 +235,7 @@ impl PgApiKeyStore {
 
 /// Column list shared by every read. Never includes `key_hash`.
 const COLUMNS: &str = "id, workspace_id, user_id, name, scopes, created_by, created_at, \
-                       expires_at, last_used_at, revoked_at";
+                       expires_at, last_used_at, revoked_at, root_doc_id";
 
 type ApiKeyRow = (
     Uuid,
@@ -234,6 +248,7 @@ type ApiKeyRow = (
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
+    Option<Uuid>,
 );
 
 fn api_key_from_row(r: ApiKeyRow) -> Result<ApiKey, ApiKeyStoreError> {
@@ -248,14 +263,22 @@ fn api_key_from_row(r: ApiKeyRow) -> Result<ApiKey, ApiKeyStoreError> {
         expires_at: r.7,
         last_used_at: r.8,
         revoked_at: r.9,
+        root_doc_id: r.10,
     })
 }
 
 fn map_insert_err(e: sqlx::Error) -> ApiKeyStoreError {
-    if let sqlx::Error::Database(db) = &e
-        && db.code().as_deref() == Some(SSO_TTL_ERRCODE)
-    {
-        return ApiKeyStoreError::TtlRejected;
+    if let sqlx::Error::Database(db) = &e {
+        match db.code().as_deref() {
+            Some(SSO_TTL_ERRCODE) => return ApiKeyStoreError::TtlRejected,
+            Some(ROOT_ERRCODE) => return ApiKeyStoreError::RootRejected,
+            // A purge of the root still in flight: the trigger saw the page,
+            // the FK did not. Other FKs (user, workspace) stay errors.
+            Some(FK_ERRCODE) if db.constraint() == Some(ROOT_FK) => {
+                return ApiKeyStoreError::RootRejected;
+            }
+            _ => {}
+        }
     }
     ApiKeyStoreError::Sqlx(e)
 }
@@ -320,8 +343,8 @@ impl ApiKeyStore for PgApiKeyStore {
         }
         let row = sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO api_keys
-                 (workspace_id, user_id, name, key_hash, scopes, created_by, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 (workspace_id, user_id, name, key_hash, scopes, created_by, expires_at, root_doc_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING {COLUMNS}"
         )))
         .bind(k.workspace_id)
@@ -331,6 +354,7 @@ impl ApiKeyStore for PgApiKeyStore {
         .bind(k.scopes.names())
         .bind(k.created_by)
         .bind(k.expires_at)
+        .bind(k.root_doc_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(map_insert_err)?;

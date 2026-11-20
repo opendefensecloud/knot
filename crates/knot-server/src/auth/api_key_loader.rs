@@ -204,6 +204,7 @@ async fn lookup(
             user_id: key.user_id,
             workspace_id: key.workspace_id,
             role,
+            root_doc_id: key.root_doc_id,
         },
         ApiPrincipal {
             key_id,
@@ -279,6 +280,7 @@ mod tests {
                 created_by: fx.user,
                 expires_at: None,
                 session_hash: None,
+                root_doc_id: None,
             })
             .await
             .unwrap();
