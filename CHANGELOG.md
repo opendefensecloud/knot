@@ -8,6 +8,15 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Fixed
+- Mermaid flowcharts (and other diagrams with HTML labels, such as class
+  and state diagrams) showed empty boxes in the editor preview: box and
+  arrow labels were drawn as HTML inside `<foreignObject>`, which the SVG
+  sanitizer removes. Diagrams now draw their labels as SVG text, even when
+  their own `init` directive or frontmatter asks for HTML labels, and a
+  `<br/>` in a label still breaks the line. The export also gets SVG text
+  for swimlanes and triangle shapes now (#113).
+
 ## [0.10.0] - 2026-11-15
 
 A page history release, with a fix for pages that lost an edit: their

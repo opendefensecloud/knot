@@ -8,7 +8,7 @@ import {
 import { Eye, Pencil } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 
-import { getMermaid } from "../../../lib/mermaid";
+import { renderMermaidSvg } from "../../../lib/mermaid";
 import { sanitizeSvg } from "../../../lib/sanitize";
 
 /**
@@ -113,10 +113,9 @@ function MermaidPreview(props: ReactNodeViewProps) {
         return;
       }
       try {
-        const m = await getMermaid();
-        const out = await m.render(callId, trimmed);
+        const out = await renderMermaidSvg(callId, trimmed);
         if (cancelled) return;
-        setSvg(out.svg);
+        setSvg(out);
         setError(null);
       } catch (e) {
         if (cancelled) return;

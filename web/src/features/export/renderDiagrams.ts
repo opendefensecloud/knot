@@ -1,5 +1,5 @@
 import { boardsApi } from "../../lib/boards.api";
-import { getMermaid } from "../../lib/mermaid";
+import { renderMermaidSvg } from "../../lib/mermaid";
 
 export type DiagramLimits = {
   max_body_bytes: number;
@@ -122,9 +122,7 @@ function rasterizeToPng(svg: SizedSvg, scale: number, maxSide: number): Promise<
 
 export const defaultRenderDeps: RenderDeps = {
   async renderMermaid(source) {
-    const m = await getMermaid();
-    const id = `knot-export-mermaid-${++renderSeq}`;
-    return (await m.render(id, source + '\n%%{init: {"htmlLabels": false}}%%')).svg;
+    return renderMermaidSvg(`knot-export-mermaid-${++renderSeq}`, source);
   },
   async fetchBoardSvg(boardId) {
     const res = await boardsApi.getSvg(boardId);
