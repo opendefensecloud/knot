@@ -68,7 +68,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   arrow labels were drawn as HTML inside `<foreignObject>`, which the SVG
   sanitizer removes. Diagrams now draw their labels as SVG text, and a
   `<br/>` in a label still breaks the line. Sequence diagrams and the
-  export were not affected.
+  export were not affected (#113).
 
 ## [0.10.0] - 2026-11-15
 
