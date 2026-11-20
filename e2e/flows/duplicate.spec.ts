@@ -324,6 +324,7 @@ test("duplicate_with_subpages", async ({ page, browser }) => {
   await expect(prose.locator("img")).toBeVisible({ timeout: 8_000 });
 
   await newLineAfterIntro();
+  await page.getByTestId("toolbar-diagram").click();
   await page.getByTestId("toolbar-excalidraw").click();
   await expect(page.getByTestId("excalidraw-board")).toBeVisible({ timeout: 8_000 });
   await openBoard(page);

@@ -145,3 +145,23 @@ describe("pasting a nested Markdown list", () => {
     );
   });
 });
+
+describe("table of contents in pasted Markdown", () => {
+  it("pastes [[_TOC_]] as a table of contents", () => {
+    const html = markdownToHtml("[[_TOC_]]\n\n# Plan\n");
+    const box = new DOMParser().parseFromString(html, "text/html").querySelector("[data-knot-toc]");
+    expect(box).not.toBeNull();
+    expect(box!.getAttribute("data-max-level")).toBe("3");
+  });
+
+  it("keeps the depth comment", () => {
+    const html = markdownToHtml("<!-- knot:toc maxLevel=2 -->\n[[_TOC_]]\n");
+    const box = new DOMParser().parseFromString(html, "text/html").querySelector("[data-knot-toc]");
+    expect(box?.getAttribute("data-max-level")).toBe("2");
+    expect(html).not.toContain("[[_TOC_]]");
+  });
+
+  it("leaves the marker inside text alone", () => {
+    expect(markdownToHtml("see [[_TOC_]] here\n")).not.toContain("data-knot-toc");
+  });
+});

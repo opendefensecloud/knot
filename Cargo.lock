@@ -2106,8 +2106,11 @@ dependencies = [
  "knot-crdt",
  "knot-markdown",
  "pulldown-cmark",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tracing",
+ "unicode-normalization",
  "uuid",
  "yrs",
 ]

@@ -26,6 +26,7 @@ test("mermaid: insert diagram, render svg, toggle source, edit", async ({ page }
   await page.keyboard.type("Hello");
 
   // Click toolbar "Insert diagram"
+  await page.getByTestId("toolbar-diagram").click();
   await page.getByTestId("toolbar-mermaid").click();
 
   // Mermaid node + rendered SVG should appear
