@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { getMermaid } from "./mermaid";
+import { getMermaid, renderMermaidSvg } from "./mermaid";
 import { sanitizeSvg } from "./sanitize";
 
 // jsdom does no layout: Mermaid measures label text with these, so give it
@@ -53,5 +53,20 @@ describe("Mermaid flowchart in the editor preview", () => {
     // <br/> splits the label into two drawn lines
     expect(lines).toContain("Runner-Manager");
     expect(lines).toContain("Pod in GKE");
+  });
+});
+
+describe("a diagram that asks for HTML labels itself", () => {
+  const flowchart = ['flowchart LR', '  A["Erster Schritt"] -->|"weiter"| B["Zweiter Schritt"]'].join("\n");
+
+  it.each([
+    ["directive", '%%{init: {"htmlLabels": true, "flowchart": {"htmlLabels": true}}}%%\n' + flowchart],
+    ["frontmatter", "---\nconfig:\n  htmlLabels: true\n  flowchart:\n    htmlLabels: true\n---\n" + flowchart],
+  ])("still keeps its labels after sanitizeSvg (set in %s)", async (how, source) => {
+    const lines = drawnLines(sanitizeSvg(await renderMermaidSvg(`knot-test-own-${how}`, source)));
+
+    expect(lines).toContain("Erster Schritt");
+    expect(lines).toContain("Zweiter Schritt");
+    expect(lines).toContain("weiter");
   });
 });
