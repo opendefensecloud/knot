@@ -31,6 +31,7 @@ import { TaskListExtension } from "./TaskListExtension";
 import { InternalLinkExtension } from "./InternalLinkExtension";
 import { MentionExtension, type MentionMember } from "./MentionExtension";
 import { DateTimeExtension } from "./DateTimeExtension";
+import { PageLinkExtension, type PageLinkOptions } from "./PageLinkExtension";
 import { LineBoundaryKeys } from "./LineBoundaryKeys";
 import {
   KnotTable,
@@ -331,6 +332,7 @@ const viewerCodeBlock = MermaidCodeBlock.extend({ marks: "historyInsert historyD
 export function createSchemaExtensions(opts: {
   navigate?: NavigateFunction;
   fetchMembers?: () => Promise<MentionMember[]>;
+  pageLinks?: PageLinkOptions;
   viewer?: boolean;
 }): AnyExtension[] {
   const viewer = opts.viewer === true;
@@ -361,6 +363,9 @@ export function createSchemaExtensions(opts: {
       fetchMembers: opts.fetchMembers ?? (() => Promise.resolve([])),
     }),
     DateTimeExtension,
+    PageLinkExtension.configure(
+      opts.pageLinks ?? { listPages: () => Promise.resolve([]), currentDocId: null, createSubpage: null },
+    ),
     // End/Home move within the line on a Mac too, instead of scrolling.
     LineBoundaryKeys,
     KnotTable,
@@ -383,10 +388,12 @@ export function createExtensions(opts: {
   onSelectSuggestion?: (id: string) => void;
   navigate?: NavigateFunction;
   fetchMembers?: () => Promise<MentionMember[]>;
+  pageLinks?: PageLinkOptions;
 }): AnyExtension[] {
   const content = createSchemaExtensions({
     navigate: opts.navigate,
     fetchMembers: opts.fetchMembers,
+    pageLinks: opts.pageLinks,
   });
   const afterLink = content.findIndex((e) => e.name === "link") + 1;
   return [
