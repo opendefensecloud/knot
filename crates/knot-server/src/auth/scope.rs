@@ -220,6 +220,12 @@ pub fn subtree_denied() -> Response {
 /// The ONLY place scope exceptions live.
 pub const OVERRIDES: &[(Method, &str, Scope)] = &[
     (Method::POST, "/api/docs/{id}/move", Scope::Update),
+    // Cuts blocks out of an existing page; the new subpage only holds them.
+    (
+        Method::POST,
+        "/api/docs/{id}/move-to-subpage",
+        Scope::Update,
+    ),
     (Method::POST, "/api/docs/{id}/markdown", Scope::Update),
     (Method::POST, "/api/docs/{id}/restore", Scope::Update),
     (
@@ -413,6 +419,10 @@ mod tests {
         assert_eq!(up("/api/docs/{id}/move"), Scope::Update);
     }
     #[test]
+    fn move_to_subpage_requires_update() {
+        assert_eq!(up("/api/docs/{id}/move-to-subpage"), Scope::Update);
+    }
+    #[test]
     fn markdown_import_requires_update() {
         assert_eq!(up("/api/docs/{id}/markdown"), Scope::Update);
     }
@@ -588,7 +598,7 @@ mod tests {
     #[test]
     fn every_override_row_is_covered_by_a_test_above() {
         // Guards against adding a row without its dedicated test.
-        assert_eq!(OVERRIDES.len(), 15);
+        assert_eq!(OVERRIDES.len(), 16);
     }
 
     #[test]
