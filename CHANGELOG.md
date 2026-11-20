@@ -62,6 +62,14 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   client after a rollback. The box can be inserted again; nothing else on
   the page is affected.
 
+### Fixed
+- Mermaid flowcharts (and other diagrams with HTML labels, such as class
+  and state diagrams) showed empty boxes in the editor preview: box and
+  arrow labels were drawn as HTML inside `<foreignObject>`, which the SVG
+  sanitizer removes. Diagrams now draw their labels as SVG text, and a
+  `<br/>` in a label still breaks the line. Sequence diagrams and the
+  export were not affected.
+
 ## [0.10.0] - 2026-11-15
 
 A page history release, with a fix for pages that lost an edit: their
