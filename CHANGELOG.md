@@ -12,6 +12,14 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - An API key needs `update`, not `create`, for
   `POST /api/docs/{id}/move-to-subpage`: it cuts blocks out of an
   existing page, so a `create`-only key could change that page.
+### Added
+- Page links by typing `[[` in the editor. A picker lists the pages you can
+  open, filtered by title as you type, each with its place in the tree
+  (Team › Urlaub). Enter or a click inserts a link to the page. The last
+  row, `Create subpage "…"`, adds the typed title as a subpage of the
+  current page and links it, and you stay where you were writing. Editors
+  of the page see that row; readers do not. Inside code `[[` stays text, and
+  a typed `]]` closes the picker. (#TBD)
 
 ## [0.10.0] - 2026-11-15
 
@@ -192,6 +200,7 @@ rebuilt once; read Upgrading first.
   (#106)
 
 ### Added
+- API keys can be limited to one page and its subpages (Settings → API keys → Pages). Such a key can't call workspace-wide endpoints.
 - Metrics `knot_room_boot_fallbacks_total{reason}`,
   `knot_room_snapshots_withheld_total{reason}`,
   `knot_room_pending_reparked_total{reason}` and

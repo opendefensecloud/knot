@@ -98,7 +98,10 @@ async fn list(State(state): State<AppState>, Query(q): Query<ListQuery>, req: Re
     // isn't cut short by them. A cached snapshot may predate a doc and miss
     // it from the hidden set, so the rows are checked again against one
     // that covers their docs.
-    let hidden_ids = match acl.visibility(ctx.workspace_id, ctx.user_id).await {
+    let hidden_ids = match acl
+        .visibility(ctx.workspace_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(visibility) => visibility.hidden_ids(),
         Err(e) => {
             tracing::error!(error=?e, "notifications visibility");
@@ -129,7 +132,12 @@ async fn list(State(state): State<AppState>, Query(q): Query<ListQuery>, req: Re
     };
     let listed_doc_ids: Vec<Uuid> = rows.iter().filter_map(|r| r.doc_id).collect();
     let visibility = match acl
-        .visibility_covering(ctx.workspace_id, ctx.user_id, &listed_doc_ids)
+        .visibility_covering(
+            ctx.workspace_id,
+            ctx.user_id,
+            ctx.root_doc_id,
+            &listed_doc_ids,
+        )
         .await
     {
         Ok(visibility) => visibility,
@@ -169,7 +177,10 @@ async fn unread_count(State(state): State<AppState>, req: Request) -> Response {
     let (Some(notifications), Some(acl)) = (state.notifications.clone(), state.acl.clone()) else {
         return internal();
     };
-    let hidden_ids = match acl.visibility(ctx.workspace_id, ctx.user_id).await {
+    let hidden_ids = match acl
+        .visibility(ctx.workspace_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(visibility) => visibility.hidden_ids(),
         Err(e) => {
             tracing::error!(error=?e, "notifications visibility");

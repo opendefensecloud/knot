@@ -27,7 +27,10 @@ pub async fn require_editable_parent(
     let Some(acl) = state.acl.as_ref() else {
         return Err(internal());
     };
-    let access = match acl.access(ctx.workspace_id, parent_id, ctx.user_id).await {
+    let access = match acl
+        .access(ctx.workspace_id, parent_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(Some(access)) if access.can_read() => access,
         Ok(_) => return Err(json_err(StatusCode::NOT_FOUND, "doc.not_found", "")),
         Err(e) => {
@@ -57,7 +60,7 @@ pub async fn require_readable_anchors(
     };
     for anchor_id in anchors.iter().flatten() {
         match acl
-            .effective_role(ctx.workspace_id, *anchor_id, ctx.user_id)
+            .effective_role(ctx.workspace_id, *anchor_id, ctx.user_id, ctx.root_doc_id)
             .await
         {
             Ok(Some(_)) => {}
@@ -135,7 +138,7 @@ pub async fn ensure_creator_can_edit(
         })
         .collect();
     let can_write = |path: &[AclNode]| {
-        rule::access_along_path(path, &creator_grants, workspace_role)
+        rule::access_along_path(path, &creator_grants, workspace_role, None)
             .is_some_and(|access| access.can_write())
     };
     // An empty chain: the doc is gone already.

@@ -1607,6 +1607,7 @@ async fn mint_key(fx: &Fixture, user_id: Uuid, minter: Uuid, scopes: &[&str]) ->
             created_by: minter,
             expires_at: None,
             session_hash: None,
+            root_doc_id: None,
         })
         .await
         .unwrap();

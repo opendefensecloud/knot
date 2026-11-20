@@ -97,7 +97,7 @@ async fn creator_who_lost_the_parent_gets_no_owner_grant() {
     // Eve's pre-check reads P as editable and caches it.
     let acl = fx.state.acl.clone().unwrap();
     let parent_access = acl
-        .access(fx.workspace_id, parent_id, fx.eve)
+        .access(fx.workspace_id, parent_id, fx.eve, None)
         .await
         .unwrap()
         .unwrap();
@@ -110,7 +110,10 @@ async fn creator_who_lost_the_parent_gets_no_owner_grant() {
         .expect("no error");
 
     assert_eq!(fx.grant_of(child_id, fx.eve).await, None);
-    let child_access = acl.access(fx.workspace_id, child_id, fx.eve).await.unwrap();
+    let child_access = acl
+        .access(fx.workspace_id, child_id, fx.eve, None)
+        .await
+        .unwrap();
     assert_eq!(child_access, None, "Eve can't reach the page inside P");
 }
 
@@ -149,7 +152,7 @@ async fn creator_with_a_non_inheriting_grant_gets_owner() {
         .acl
         .as_ref()
         .unwrap()
-        .access(fx.workspace_id, child_id, fx.eve)
+        .access(fx.workspace_id, child_id, fx.eve, None)
         .await
         .unwrap()
         .expect("Eve reaches her page");

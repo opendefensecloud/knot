@@ -137,11 +137,12 @@ pub async fn refuse_if_archived(
     workspace_id: Uuid,
     doc_id: Uuid,
     user_id: Uuid,
+    scope_root: Option<Uuid>,
 ) -> Option<Response> {
     let Some(acl) = state.acl.as_ref() else {
         return Some(json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", ""));
     };
-    match acl.access(workspace_id, doc_id, user_id).await {
+    match acl.access(workspace_id, doc_id, user_id, scope_root).await {
         Ok(Some(access)) if access.archived => Some(doc_archived()),
         Ok(_) => None,
         Err(e) => {

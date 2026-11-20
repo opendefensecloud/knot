@@ -441,6 +441,7 @@ async fn guards_mint_all_scopes_key(state: &AppState, user_id: uuid::Uuid) -> St
             created_by: user_id,
             expires_at: None,
             session_hash: None,
+            root_doc_id: None,
         })
         .await
         .unwrap();
@@ -3231,6 +3232,7 @@ async fn owner_cannot_manage_the_keys_of_another_workspaces_bot() {
             created_by: other_owner,
             expires_at: None,
             session_hash: None,
+            root_doc_id: None,
         })
         .await
         .unwrap();
@@ -3644,4 +3646,487 @@ async fn a_key_stays_limited_by_its_users_role_and_page_acl() {
     assert_eq!(st, StatusCode::NO_CONTENT, "{body}");
     let (st, body) = guards_bearer(&app, &key, "GET", &secret_uri, None).await;
     assert_eq!(st, StatusCode::OK, "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// Subtree-scoped keys (S10)
+// ---------------------------------------------------------------------------
+
+/// A key limited to `root` with the given scopes.
+async fn subtree_key(app: &axum::Router, s: &Session, root: &str, scopes: &[&str]) -> String {
+    let (st, body) = send(
+        app,
+        s,
+        "POST",
+        "/api/auth/api-keys",
+        Some(serde_json::json!({"name": "subtree", "scopes": scopes, "root_doc_id": root})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    assert_eq!(body["root_doc_id"], root);
+    body["key"].as_str().unwrap().to_string()
+}
+
+/// A page under `parent`, created through the session.
+async fn child_doc(app: &axum::Router, s: &Session, parent: &str, title: &str) -> String {
+    let (st, body) = send(
+        app,
+        s,
+        "POST",
+        "/api/docs",
+        Some(serde_json::json!({ "title": title, "parent_id": parent })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    body["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_key_reaches_only_its_subtree() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let top = matrix_doc(&app, &s, "top").await;
+    let root = child_doc(&app, &s, &top, "root").await;
+    let child = child_doc(&app, &s, &root, "child").await;
+    let sibling = child_doc(&app, &s, &top, "sibling").await;
+    let key = subtree_key(&app, &s, &root, &["read", "create", "update"]).await;
+
+    for inside in [&root, &child] {
+        let (st, body) =
+            guards_bearer(&app, &key, "GET", &format!("/api/docs/{inside}"), None).await;
+        assert_eq!(st, StatusCode::OK, "{inside}: {body}");
+    }
+    for outside in [&top, &sibling] {
+        let (st, body) =
+            guards_bearer(&app, &key, "GET", &format!("/api/docs/{outside}"), None).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{outside}: {body}");
+    }
+    // The root's parent is outside: blanked, not leaked.
+    let (_, body) = guards_bearer(&app, &key, "GET", &format!("/api/docs/{root}"), None).await;
+    assert!(body["parent_id"].is_null(), "{body}");
+
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "PATCH",
+        &format!("/api/docs/{child}"),
+        Some(serde_json::json!({"title": "renamed"})),
+    )
+    .await;
+    assert!(st.is_success(), "{body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "PATCH",
+        &format!("/api/docs/{sibling}"),
+        Some(serde_json::json!({"title": "renamed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        "/api/docs",
+        Some(serde_json::json!({"title": "new", "parent_id": child})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        "/api/docs",
+        Some(serde_json::json!({"title": "new", "parent_id": sibling})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+
+    // The tree lists the subtree only.
+    let (st, body) = guards_bearer(&app, &key, "GET", "/api/docs", None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let listed: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        listed.contains(&root.as_str()) && listed.contains(&child.as_str()),
+        "{body}"
+    );
+    assert!(
+        !listed.contains(&top.as_str()) && !listed.contains(&sibling.as_str()),
+        "{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_key_mint_needs_a_readable_root_and_lists_it() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let root = matrix_doc(&app, &s, "Project X").await;
+
+    let (st, body) = send(
+        &app,
+        &s,
+        "POST",
+        "/api/auth/api-keys",
+        Some(serde_json::json!({"name": "k", "scopes": ["read"],
+                                "root_doc_id": uuid::Uuid::new_v4()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "doc.not_found");
+
+    subtree_key(&app, &s, &root, &["read"]).await;
+    let (st, body) = send(&app, &s, "GET", "/api/auth/api-keys", None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let listed = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["name"] == "subtree")
+        .unwrap();
+    assert_eq!(listed["root_doc_id"], root);
+    assert_eq!(listed["root_title"], "Project X");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_subtree_key_needs_a_root_the_bot_can_read() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let bot = invite_bot(&app, &s, &state, "bot@example.com").await;
+    let secret = matrix_doc(&app, &s, "secret").await;
+    restrict_doc(&app, &s, &secret).await;
+    let open = matrix_doc(&app, &s, "open").await;
+
+    let mint = |root: String| {
+        send(
+            &app,
+            &s,
+            "POST",
+            "/api/auth/api-keys",
+            Some(serde_json::json!({"name": "b", "scopes": ["read"],
+                                "user_id": bot, "root_doc_id": root})),
+        )
+    };
+    let (st, body) = mint(secret).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "doc.not_found");
+    let (st, body) = mint(open).await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+}
+
+/// S10: every SUBTREE_DENIED path names a real route and refuses a subtree
+/// key with every scope, whatever the method.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_subtree_denied_route_refuses_a_subtree_key() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let root = matrix_doc(&app, &s, "root").await;
+    let key = subtree_key(&app, &s, &root, &ALL_SCOPES).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    for template in knot_server::auth::scope::SUBTREE_DENIED {
+        let uri = template.replace("{id}", &id);
+        for method in ["GET", "POST", "PATCH", "DELETE"] {
+            let body = (method != "GET").then(|| serde_json::json!({}));
+            let (st, body) = guards_bearer(&app, &key, method, &uri, body).await;
+            if st == StatusCode::METHOD_NOT_ALLOWED {
+                continue;
+            }
+            assert_eq!(st, StatusCode::FORBIDDEN, "{method} {template}: {body}");
+            assert!(
+                body["error"]["code"] == "api_key.subtree_denied"
+                    || body["error"]["code"] == "api_key.session_required",
+                "{method} {template}: {body}"
+            );
+        }
+    }
+    // An unscoped key still reaches them, as before.
+    let unscoped = matrix_key(&app, &s, &["read"]).await;
+    let (st, body) = guards_bearer(&app, &unscoped, "GET", "/api/workspace/templates", None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+}
+
+/// S10: `SUBTREE_OK` is keyed by method and enforced as an allow-list, and the
+/// real router is the source of truth. For every path in the table and each
+/// of GET/POST/PUT/PATCH/DELETE, with a key WITHOUT a root: a method without
+/// a row has no handler (405), so nothing new can appear unnoticed; a method
+/// with a row is a real route (not 405, which also catches stale rows). With
+/// a subtree key: a method without a row is `403 api_key.subtree_denied`
+/// (before the router sees it), a listed row never is.
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_ok_rows_match_the_real_router_methods() {
+    use axum::http::Method;
+    use knot_server::auth::scope::SUBTREE_OK;
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let root = matrix_doc(&app, &s, "root").await;
+    let key = subtree_key(&app, &s, &root, &ALL_SCOPES).await;
+    let plain = matrix_key(&app, &s, &ALL_SCOPES).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut paths: Vec<&str> = SUBTREE_OK.iter().map(|(_, p)| *p).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    for template in paths {
+        let uri_for = |inner: &str| {
+            template
+                .replace("{id}", inner)
+                .replace("{doc_id}", inner)
+                .replace("{principal}", &format!("user:{id}"))
+                .replace("{seq}", "1")
+                .replace("{eid}", "1")
+                .replace("{item_index}", "0")
+                .replace("{format}", "md")
+                .replace("{emoji}", "x")
+                .replace("{code}", "abc")
+                .replace("{thread_id}", &id)
+                .replace("{comment_id}", &id)
+                .replace("{share_id}", &id)
+                .replace("{suggestion_id}", &id)
+                .replace("{reply_id}", &id)
+        };
+        assert!(
+            !uri_for(&id).contains('{'),
+            "unsubstituted parameter in {template}"
+        );
+        for method in [
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            // A fresh page each time: archive, purge and restore would
+            // otherwise change what the next request meets.
+            let inner = child_doc(&app, &s, &root, "inner").await;
+            let uri = uri_for(&inner);
+            let other = child_doc(&app, &s, &root, "other").await;
+            let other_uri = uri_for(&other);
+            let listed = SUBTREE_OK
+                .iter()
+                .any(|(m, p)| *m == method && *p == template);
+            // A create needs a parent inside the subtree: at the top level the
+            // handler itself answers `subtree_denied`, not the middleware
+            // under test.
+            let body = (method != Method::GET).then(|| serde_json::json!({ "parent_id": root }));
+            let (st, sub_body) =
+                guards_bearer(&app, &key, method.as_str(), &uri, body.clone()).await;
+            let denied = sub_body["error"]["code"] == "api_key.subtree_denied";
+            if listed {
+                assert!(
+                    !denied,
+                    "{method} {template} is a SUBTREE_OK row: {st} {sub_body}"
+                );
+            } else if matches!(template, "/api/healthz" | "/api/readyz" | "/api/version") {
+                // Mounted outside the scope layer (see `lib.rs`), so the
+                // router answers: no handler, 405.
+                assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED, "{method} {template}");
+            } else {
+                assert!(
+                    st == StatusCode::FORBIDDEN && denied,
+                    "{method} {template} has no SUBTREE_OK row: {st} {sub_body}"
+                );
+            }
+            let (st, body) = guards_bearer(&app, &plain, method.as_str(), &other_uri, body).await;
+            if listed {
+                assert_ne!(
+                    st,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "stale SUBTREE_OK row {method} {template}: {body}"
+                );
+            } else {
+                assert_eq!(
+                    st,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {template} has a handler but no SUBTREE_OK row: {body}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_key_cannot_reach_the_top_level_or_move_its_root() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let top = matrix_doc(&app, &s, "top").await;
+    let root = child_doc(&app, &s, &top, "root").await;
+    let child = child_doc(&app, &s, &root, "child").await;
+    let key = subtree_key(&app, &s, &root, &ALL_SCOPES).await;
+    let denied = |st: StatusCode, body: &serde_json::Value| {
+        st == StatusCode::FORBIDDEN && body["error"]["code"] == "api_key.subtree_denied"
+    };
+
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        "/api/docs",
+        Some(serde_json::json!({"title": "top-level"})),
+    )
+    .await;
+    assert!(denied(st, &body), "create at top level: {st} {body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{child}/move"),
+        Some(serde_json::json!({"parent_id": null})),
+    )
+    .await;
+    assert!(denied(st, &body), "move to top level: {st} {body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{root}/move"),
+        Some(serde_json::json!({"parent_id": top})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "move root under its parent: {body}"
+    );
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{root}/duplicate"),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "duplicate root next to itself: {body}"
+    );
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{child}/duplicate"),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert!(st.is_success(), "duplicate inside: {body}");
+
+    // A key rooted at a top-level page cannot copy it either.
+    let top_key = subtree_key(&app, &s, &top, &ALL_SCOPES).await;
+    let (st, body) = guards_bearer(
+        &app,
+        &top_key,
+        "POST",
+        &format!("/api/docs/{top}/duplicate"),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert!(denied(st, &body), "duplicate a top-level root: {st} {body}");
+
+    // Search stays inside too.
+    let (st, body) = guards_bearer(&app, &key, "GET", "/api/search?q=top", None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(
+        !body.to_string().contains(&top),
+        "search leaked the parent: {body}"
+    );
+}
+
+/// S10: restore puts a page at the top level when its parent is still
+/// archived; a subtree key may not do that, but restores under a live parent.
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_key_cannot_restore_a_page_to_the_top_level() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let top = matrix_doc(&app, &s, "top").await;
+    let root = child_doc(&app, &s, &top, "root").await;
+    let a = child_doc(&app, &s, &root, "a").await;
+    let b = child_doc(&app, &s, &a, "b").await;
+    let key = subtree_key(&app, &s, &root, &ALL_SCOPES).await;
+
+    for id in [&b, &a] {
+        let (st, body) =
+            guards_bearer(&app, &key, "DELETE", &format!("/api/docs/{id}"), None).await;
+        assert!(st.is_success(), "archive: {st} {body}");
+    }
+    let (st, body) =
+        guards_bearer(&app, &key, "POST", &format!("/api/docs/{b}/restore"), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "api_key.subtree_denied", "{body}");
+    // B is still archived: its restore as the owner is still a restore root.
+    let (st, body) = send(&app, &s, "GET", &format!("/api/docs/{b}"), None).await;
+    assert!(
+        st == StatusCode::OK && !body["archived_at"].is_null(),
+        "B must stay archived: {st} {body}"
+    );
+
+    // With the parent live again, the key restores under it.
+    let (st, body) =
+        guards_bearer(&app, &key, "POST", &format!("/api/docs/{a}/restore"), None).await;
+    assert!(st.is_success(), "restore under a live parent: {st} {body}");
+}
+
+/// S10: Restore as new page runs Duplicate's destination check before any
+/// replay, so with no entry to copy the answer still shows where the copy
+/// would go: beside the root is outside (404), beside a top-level root is
+/// the top level (403 `api_key.subtree_denied`), beside a page inside
+/// passes and only the missing entry answers. The 201 cases live in
+/// `history_view_integration.rs` and `move_to_subpage_integration.rs`.
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_key_restores_as_new_only_beside_pages_inside() {
+    let state = state_with_owner("owner@example.com", "ownerpass1").await;
+    let app = router_with_state(state.clone());
+    let s = login(&app, "owner@example.com", "ownerpass1").await;
+    let top = matrix_doc(&app, &s, "top").await;
+    let root = child_doc(&app, &s, &top, "root").await;
+    let inside = child_doc(&app, &s, &root, "inside").await;
+    let key = subtree_key(&app, &s, &root, &ALL_SCOPES).await;
+    let top_key = subtree_key(&app, &s, &top, &ALL_SCOPES).await;
+    let restore_as_new = |key: String, doc: String| {
+        let app = app.clone();
+        async move {
+            guards_bearer(
+                &app,
+                &key,
+                "POST",
+                &format!("/api/docs/{doc}/history/entries/1/restore-as-new"),
+                Some(serde_json::json!({"version_label": "x"})),
+            )
+            .await
+        }
+    };
+
+    let (st, body) = restore_as_new(key.clone(), root.clone()).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "doc.not_found", "{body}");
+    let (st, body) = restore_as_new(top_key, top.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "api_key.subtree_denied", "{body}");
+    let (st, body) = restore_as_new(key.clone(), inside).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "history.not_found", "{body}");
+    // A page outside is out of reach before any of that.
+    let (st, body) = restore_as_new(key.clone(), top.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "acl.no_grant", "{body}");
+    let (st, body) = guards_bearer(
+        &app,
+        &key,
+        "POST",
+        &format!("/api/docs/{top}/move-to-subpage"),
+        Some(serde_json::json!({"start": "", "end": "", "title": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "acl.no_grant", "{body}");
 }

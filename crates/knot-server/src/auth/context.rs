@@ -8,6 +8,9 @@ pub struct AuthContext {
     pub user_id: Uuid,
     pub workspace_id: Uuid,
     pub role: WorkspaceRole,
+    /// S10: the API key's scope root; `None` for cookie sessions and
+    /// unscoped keys. Pass it to every `AclCache` call made for this request.
+    pub root_doc_id: Option<Uuid>,
 }
 
 /// The hashed id (the `sessions` primary key) of the cookie session that

@@ -1,8 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useId, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { useSession } from "../../auth/SessionContext";
 import { useUi } from "../../stores/ui";
+import { docsApi } from "../docs/docs.api";
+import { buildTree, flattenVisible } from "../docs/tree";
 import { workspaceApi } from "../workspace/workspace.api";
 
 import { API_KEY_SCOPES, type ApiKey, type ApiKeyScope, apiKeysApi, apiKeysQueryKey } from "./apiKeys.api";
@@ -27,6 +30,8 @@ export function apiKeyErrorMessage(code: string): string {
     case "api_key.foreign_forbidden": return "You can't manage keys for this user.";
     case "api_key.not_found": return "That key no longer exists.";
     case "api_key.limit_reached": return "This account already has 50 active keys. Revoke one before creating another.";
+    case "doc.not_found": return "You or the bot can't read that page, or it no longer exists.";
+    case "api_key.subtree_denied": return "This key is limited to one page and its subpages.";
     default: return "Something went wrong with the API key request.";
   }
 }
@@ -70,6 +75,14 @@ export function ApiKeysSection({ targetUserId }: Props) {
   const expiryOptions = EXPIRY_DAYS.filter((d) => maxTtl === null || d <= maxTtl);
   const neverAllowed = maxTtl === null;
 
+  // Same query key as the sidebar tree, so the cache is shared.
+  const docs = useQuery({ queryKey: ["docs"], queryFn: () => docsApi.list() });
+  const pageRows = (() => {
+    if (!docs.data || !("ok" in docs.data)) return [];
+    const tree = buildTree(docs.data.ok.filter((d) => !d.archived));
+    return flattenVisible([...tree.roots, ...tree.shared], new Set());
+  })();
+  const [rootDocId, setRootDocId] = useState<string>("");
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState<Set<ApiKeyScope>>(() => new Set(["read"]));
   const [expiry, setExpiry] = useState<string>("90");
@@ -92,6 +105,7 @@ export function ApiKeysSection({ targetUserId }: Props) {
         scopes: API_KEY_SCOPES.filter((s) => scopes.has(s)),
         expiresInDays: effectiveExpiry === NEVER ? null : Number(effectiveExpiry),
         userId: targetUserId,
+        rootDocId: rootDocId || null,
       });
       if ("error" in r) return { error: r.error.code };
       setRevealed({ name: r.ok.name, key: r.ok.key });
@@ -105,6 +119,7 @@ export function ApiKeysSection({ targetUserId }: Props) {
       }
       setName("");
       setScopes(new Set(["read"]));
+      setRootDocId("");
       await qc.invalidateQueries({ queryKey });
     },
     onError: () => setFormError(apiKeyErrorMessage("")),
@@ -140,7 +155,7 @@ export function ApiKeysSection({ targetUserId }: Props) {
       <p className="text-[13px] text-fg-muted m-0 mb-3">
         {targetUserId
           ? "Keys this bot uses to call the API."
-          : "Keys let scripts and agents call the API as you. Each key is limited to the scopes you pick."}
+          : "Keys let scripts and agents call the API as you. Each key is limited to the scopes you pick, and optionally to one page and its subpages."}
       </p>
 
       {listError && <p role="alert" className="text-destructive text-[13px] m-0 mb-3">{listError}</p>}
@@ -169,6 +184,17 @@ export function ApiKeysSection({ targetUserId }: Props) {
                       {k.scopes.map((s) => (
                         <span key={s} className="px-1.5 py-0.5 rounded bg-muted text-fg text-[11px]">{s}</span>
                       ))}
+                      {k.root_doc_id && (
+                        k.root_title !== null ? (
+                          <Link to={`/doc/${k.root_doc_id}`} className="px-1.5 py-0.5 rounded bg-muted text-fg text-[11px] underline">
+                            <span data-testid="api-key-root-chip">{k.root_title}</span>
+                          </Link>
+                        ) : (
+                          <span data-testid="api-key-root-chip" className="px-1.5 py-0.5 rounded bg-muted text-fg-muted text-[11px]">
+                            a page you can't see
+                          </span>
+                        )
+                      )}
                     </span>
                   </td>
                   <td className="py-1.5 text-fg-muted">{fmtDate(k.created_at)}</td>
@@ -259,6 +285,21 @@ export function ApiKeysSection({ targetUserId }: Props) {
             {expiryOptions.map((d) => <option key={d} value={String(d)}>{d} days</option>)}
             {neverAllowed && <option value={NEVER}>Never</option>}
           </select>
+        </label>
+        <label className="grid gap-1 text-[13px] text-fg-muted">
+          Pages
+          <select
+            data-testid="api-key-root"
+            value={rootDocId}
+            onChange={(e) => setRootDocId(e.target.value)}
+            className="h-9 px-2 rounded border border-border bg-bg text-fg text-sm"
+          >
+            <option value="">All pages</option>
+            {pageRows.map((r) => (
+              <option key={r.id} value={r.id}>{"  ".repeat(r.depth) + r.title}</option>
+            ))}
+          </select>
+          {rootDocId && <span>The key sees only this page and its subpages.</span>}
         </label>
         {formError && <p data-testid="api-key-error" role="alert" className="text-destructive text-[13px] m-0">{formError}</p>}
         <button
