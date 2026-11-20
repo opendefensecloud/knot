@@ -15,6 +15,9 @@ import type { NavigateFunction } from "react-router-dom";
 
 import { Attachment } from "./nodes/AttachmentNode";
 import { ExcalidrawBoard } from "./nodes/ExcalidrawBoard";
+import { KnotBlockquote } from "./nodes/Callout";
+import { TableOfContents } from "./nodes/TableOfContents";
+import { HeadingAnchors } from "./headingAnchors";
 import { MermaidCodeBlock } from "./nodes/MermaidCodeBlock";
 import { CommentsHighlightExtension } from "./CommentsHighlightExtension";
 import { SuggestionsHighlightExtension } from "./SuggestionsHighlightExtension";
@@ -280,6 +283,8 @@ function starterKit(viewer: boolean) {
     orderedList: false,
     listItem: false,
     hardBreak: false,
+    // Re-added below with the callout attributes (nodes/Callout.ts).
+    blockquote: false,
     horizontalRule: false,
     // Bundled by StarterKit from v3 on. Link and Underline are registered
     // explicitly below, and registering either twice makes the second
@@ -346,6 +351,7 @@ export function createSchemaExtensions(opts: {
     OrderedListMarkerGutter,
     KnotHardBreak,
     KnotHorizontalRule,
+    KnotBlockquote,
     viewer ? viewerCodeBlock : MermaidCodeBlock,
     Underline,
     KnotLink.configure({
@@ -357,6 +363,8 @@ export function createSchemaExtensions(opts: {
     KnotImage.configure({ inline: false, allowBase64: false }),
     Attachment,
     viewer ? ExcalidrawBoard.configure({ readOnly: true }) : ExcalidrawBoard,
+    TableOfContents,
+    HeadingAnchors,
     viewer ? TaskListExtension.configure({ readOnly: true }) : TaskListExtension,
     InternalLinkExtension.configure({ navigate: opts.navigate ?? null }),
     MentionExtension.configure({

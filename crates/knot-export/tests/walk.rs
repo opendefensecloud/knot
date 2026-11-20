@@ -868,3 +868,116 @@ fn walk_glue_merges_equal_marks() {
         ])]
     );
 }
+
+fn toc_entries(blocks: &[Block]) -> Vec<(u8, String)> {
+    match blocks {
+        [Block::Toc { entries, .. }, ..] => {
+            entries.iter().map(|e| (e.level, e.text.clone())).collect()
+        }
+        other => panic!("no table of contents first: {other:?}"),
+    }
+}
+
+#[test]
+fn toc_lists_headings_up_to_max_level() {
+    let w = walk(&build(vec![
+        el(
+            "table_of_contents",
+            vec![("maxLevel", Any::Number(2.0))],
+            vec![],
+        ),
+        h(1, "A"),
+        h(2, "B"),
+        h(3, "C"),
+    ]));
+    assert_eq!(
+        toc_entries(&w.doc.blocks),
+        vec![(0, "A".into()), (1, "B".into())]
+    );
+    assert!(w.unknown_elements.is_empty(), "{:?}", w.unknown_elements);
+}
+
+#[test]
+fn toc_indents_relative_to_the_shallowest_and_caps_at_4() {
+    let w = walk(&build(vec![
+        el("table_of_contents", vec![("maxLevel", "6".into())], vec![]),
+        h(2, "B"),
+        h(3, ""),
+        el("blockquote", vec![], vec![h(3, "C")]),
+        h(6, "F"),
+    ]));
+    assert_eq!(
+        toc_entries(&w.doc.blocks),
+        vec![(0, "B".into()), (1, "C".into()), (4, "F".into())]
+    );
+}
+
+#[test]
+fn toc_without_max_level_lists_three_levels() {
+    let w = walk(&build(vec![
+        el("table_of_contents", vec![], vec![]),
+        h(1, "A"),
+        h(4, "D"),
+    ]));
+    assert_eq!(toc_entries(&w.doc.blocks), vec![(0, "A".into())]);
+}
+
+#[test]
+fn toc_leaves_out_headings_in_table_cells() {
+    let cell = |children| el("table_cell", vec![], children);
+    let w = walk(&build(vec![
+        el("table_of_contents", vec![], vec![]),
+        el(
+            "table",
+            vec![],
+            vec![el("table_row", vec![], vec![cell(vec![h(2, "In cell")])])],
+        ),
+        h(2, "B"),
+    ]));
+    assert_eq!(toc_entries(&w.doc.blocks), vec![(0, "B".into())]);
+}
+
+#[test]
+fn a_blockquote_with_a_kind_is_a_callout() {
+    let w = walk(&build(vec![el(
+        "blockquote",
+        vec![("kind", "warning".into()), ("title", " W \n".into())],
+        vec![p("x")],
+    )]));
+    assert_eq!(
+        w.doc.blocks,
+        vec![Block::Callout {
+            kind: knot_export::CalloutKind::Warning,
+            title: Some("W".into()),
+            blocks: vec![Block::Paragraph(vec![Inline::Run(run("x"))])],
+        }]
+    );
+}
+
+#[test]
+fn a_blockquote_with_an_unknown_kind_is_a_quote() {
+    let w = walk(&build(vec![el(
+        "blockquote",
+        vec![("kind", "danger".into())],
+        vec![p("x")],
+    )]));
+    assert_eq!(
+        w.doc.blocks,
+        vec![Block::Quote(vec![Block::Paragraph(vec![Inline::Run(
+            run("x")
+        )])])]
+    );
+}
+
+#[test]
+fn toc_lists_headings_inside_a_callout() {
+    let w = walk(&build(vec![
+        el("table_of_contents", vec![], vec![]),
+        el(
+            "blockquote",
+            vec![("kind", "note".into())],
+            vec![h(2, "Inside")],
+        ),
+    ]));
+    assert_eq!(toc_entries(&w.doc.blocks), vec![(0, "Inside".into())]);
+}

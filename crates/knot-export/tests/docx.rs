@@ -1936,3 +1936,53 @@ fn output_buffer_is_sized_up_front() {
     let spare = out.bytes.capacity() - out.bytes.len();
     assert!(spare < 256 * 1024, "{spare} bytes spare");
 }
+
+#[test]
+fn toc_writes_contents_caption_and_indented_entries() {
+    let entry = |level, text: &str| knot_export::TocEntry {
+        level,
+        text: text.into(),
+    };
+    let docx = export(vec![Block::Toc {
+        max_level: 3,
+        entries: vec![entry(0, "A"), entry(1, "B")],
+    }]);
+    let d = xml(docx.part("word/document.xml"));
+    let got: Vec<(Option<&str>, String)> = content(&d)
+        .into_iter()
+        .map(|p| (p_style(p), text(p)))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Some("Caption"), "Contents".to_owned()),
+            (Some("TOC1"), "A".to_owned()),
+            (Some("TOC2"), "B".to_owned()),
+        ]
+    );
+    let styles = xml(docx.part("word/styles.xml"));
+    let toc2 = style(&styles, "TOC2");
+    assert_eq!(style_name(toc2), "toc 2");
+    let ind = child(toc2, "pPr")
+        .and_then(|p| child(p, "ind"))
+        .expect("TOC2 indent");
+    assert_eq!(wattr(ind, "left"), Some("220"));
+}
+
+#[test]
+fn callout_writes_bordered_table_with_bold_title() {
+    for (title, shown) in [(Some("W".to_string()), "W"), (None, "Warning")] {
+        let docx = export(vec![Block::Callout {
+            kind: knot_export::CalloutKind::Warning,
+            title,
+            blocks: vec![para("body")],
+        }]);
+        let d = docx.part("word/document.xml");
+        assert!(d.contains("<w:tbl>"), "{d}");
+        assert!(d.contains("9A6700"), "{d}");
+        assert!(d.contains("<w:b/>"), "{d}");
+        assert!(d.contains(&format!(">{shown}<")), "{d}");
+        assert!(d.contains(">body<"), "{d}");
+        xml(d);
+    }
+}

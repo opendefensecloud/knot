@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use knot_crdt::{DocHandle, Engine, YrsEngine};
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
 use thiserror::Error;
 use uuid::Uuid;
 use yrs::types::Attrs;
@@ -89,11 +89,16 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
         // deep, which is read as its text.
         let mut flattened: Option<Flattened> = None;
 
-        let mut opts = Options::empty();
-        opts.insert(Options::ENABLE_STRIKETHROUGH);
-        opts.insert(Options::ENABLE_TASKLISTS);
-        opts.insert(Options::ENABLE_TABLES);
-        let parser = TightParagraphs::new(Parser::new_ext(src, opts));
+        // GitHub's alerts are callout boxes (`crate::callout`).
+        let opts = crate::callout::parser_options();
+        // A table of contents marker becomes a sentinel image first, which
+        // the image handling below turns into the block (`crate::toc`).
+        let toc_marked = crate::toc::mark_toc_markers(src);
+        // A titled box marker becomes a bare one; its title comes back in
+        // order at each alert below.
+        let callouts = crate::callout::mark_callouts(&toc_marked);
+        let mut callout_titles = callouts.titles.into_iter();
+        let parser = TightParagraphs::new(Parser::new_ext(&callouts.src, opts));
 
         // Per-table alignment carried by `Tag::Table(Vec<Alignment>)`. We
         // stash it on table entry and consume per-cell via a column index.
@@ -145,8 +150,15 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
                         );
                         stack.push(el);
                     }
-                    Tag::BlockQuote(_) => {
-                        let el = push_block(&frag, &stack, &mut txn, "blockquote", &[]);
+                    Tag::BlockQuote(kind) => {
+                        let mut attrs = Vec::new();
+                        if let Some(kind) = kind {
+                            attrs.push(("kind", callout_kind(kind).as_str().to_string()));
+                            if let Some(Some(title)) = callout_titles.next() {
+                                attrs.push(("title", title));
+                            }
+                        }
+                        let el = push_block(&frag, &stack, &mut txn, "blockquote", &attrs);
                         stack.push(el);
                     }
                     Tag::CodeBlock(kind) => {
@@ -673,6 +685,19 @@ fn remove_last_child(
     }
 }
 
+/// pulldown-cmark's alert kind as knot's callout kind.
+fn callout_kind(kind: pulldown_cmark::BlockQuoteKind) -> crate::callout::CalloutKind {
+    use crate::callout::CalloutKind;
+    use pulldown_cmark::BlockQuoteKind;
+    match kind {
+        BlockQuoteKind::Note => CalloutKind::Note,
+        BlockQuoteKind::Tip => CalloutKind::Tip,
+        BlockQuoteKind::Important => CalloutKind::Important,
+        BlockQuoteKind::Warning => CalloutKind::Warning,
+        BlockQuoteKind::Caution => CalloutKind::Caution,
+    }
+}
+
 fn push_block(
     frag: &yrs::XmlFragmentRef,
     stack: &[XmlElementRef],
@@ -736,6 +761,11 @@ impl ImageBlock {
                     attrs.push(("label", alt));
                 }
                 ("excalidraw_board", attrs)
+            }
+            ImageBlock::Image { src, .. } if crate::toc::toc_sentinel_level(&src).is_some() => {
+                let level =
+                    crate::toc::toc_sentinel_level(&src).unwrap_or(crate::toc::TOC_DEFAULT_LEVEL);
+                ("table_of_contents", vec![("maxLevel", level.to_string())])
             }
             ImageBlock::Image { src, alt, title } => {
                 let mut attrs = vec![("src", src)];

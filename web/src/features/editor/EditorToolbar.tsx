@@ -19,10 +19,11 @@ import {
   ListIndentDecrease,
   ListIndentIncrease,
   ListOrdered,
+  ListTree,
   Lock,
   MessageSquarePlus,
-  Paperclip,
   Network,
+  Paperclip,
   PenSquare,
   Quote,
   Strikethrough,
@@ -32,7 +33,9 @@ import { boardsApi } from "../../lib/boards.api";
 import { notifyFailure } from "../../lib/limitErrors";
 import { useUi } from "../../stores/ui";
 import { SCOPE_TOOLTIP, suggestionScope } from "../suggestions/scope";
+import { CALLOUT_ICON, CALLOUT_KINDS, CALLOUT_LABEL, calloutKind } from "./callouts";
 import { TableMenu } from "./TableMenu";
+import { ToolbarMenu } from "./ToolbarMenu";
 import { applyLinkUrl, toolbarLinkState } from "./toolbarLink";
 
 type ToolbarBtnProps = {
@@ -133,6 +136,8 @@ export function EditorToolbar({
   const canSuggest = Boolean(onSuggest) && scope.ok && scope.kind === "insert";
   const suggestTitle = onSuggest && !scope.ok ? SCOPE_TOOLTIP[scope.reason] : undefined;
   const inListItem = editor.isActive("list_item");
+  const inQuote = editor.isActive("blockquote");
+  const quoteKind = inQuote ? calloutKind(editor.getAttributes("blockquote").kind) : null;
 
   return (
     // The band spans the full shell so wide content scrolling under it is
@@ -228,21 +233,50 @@ export function EditorToolbar({
         >
           <ListChecks size={15} aria-hidden />
         </Btn>
-        <Btn testId="toolbar-blockquote" label="Quote" active={editor.isActive("blockquote")}
-          onClick={() => c().toggleBlockquote().run()}>
-          <Quote size={15} aria-hidden />
-        </Btn>
+        {/* Quote and the five callout boxes share one slot. In a quote a kind
+            turns it into a box; in a box, a kind changes it and Quote lifts
+            the text out. */}
+        <ToolbarMenu
+          editor={editor}
+          btnClass={BTN_CLS}
+          testId="toolbar-blockquote"
+          label="Quote or callout"
+          icon={<Quote size={15} aria-hidden />}
+          active={inQuote}
+          items={[
+            {
+              testId: "toolbar-quote",
+              // In a quote or box it lifts the text out, so it says so
+              // rather than showing as the selected choice.
+              label: inQuote ? "Remove quote" : "Quote",
+              icon: <Quote size={15} aria-hidden />,
+              checked: false,
+              run: () => c().toggleBlockquote().run(),
+            },
+            ...CALLOUT_KINDS.map((kind) => {
+              const Icon = CALLOUT_ICON[kind];
+              return {
+                testId: `toolbar-callout-${kind}`,
+                label: CALLOUT_LABEL[kind],
+                icon: <Icon size={15} aria-hidden />,
+                checked: quoteKind === kind,
+                run: () => c().setCallout(kind).run(),
+              };
+            }),
+          ]}
+        />
         <Btn testId="toolbar-code-block" label="Code block" active={editor.isActive("code_block")}
           onClick={() => c().toggleCodeBlock().run()}>
           <Code2 size={15} aria-hidden />
         </Btn>
-        {/* In a list item, Indent and Outdent take the two diagram buttons'
-            slot. They do what Tab and Shift-Tab do, but a touch screen has
-            no Tab, and nothing else told anyone those nest (#78). Shown next to
-            the rest, they would push the row past its width and wrap it,
-            moving the page under the caret every time it entered a list —
-            what the table actions sharing one menu avoids. A diagram can
-            still be inserted after the list. */}
+        {/* In a list item, Indent and Outdent take the slots of the diagram
+            menu and the table of contents. They do what Tab and Shift-Tab do,
+            but a touch screen has no Tab, and nothing else told anyone those
+            nest (#78). Shown next to the rest, they would push the row past
+            its width and wrap it, moving the page under the caret every time
+            it entered a list — what the table actions sharing one menu
+            avoids. A diagram or a table of contents can still be inserted
+            after the list. */}
         {inListItem ? (
           <>
             <Btn
@@ -264,46 +298,61 @@ export function EditorToolbar({
           </>
         ) : (
           <>
-            <Btn
-              testId="toolbar-mermaid"
+            <ToolbarMenu
+              editor={editor}
+              btnClass={BTN_CLS}
+              testId="toolbar-diagram"
               label="Insert diagram"
-              onClick={() =>
-                c()
-                  .insertContent({
-                    type: "code_block",
-                    attrs: { language: "mermaid" },
-                    content: [
-                      {
-                        type: "text",
-                        text: "graph TD\n  A[Start] --> B{Decision}\n  B -->|Yes| C[OK]\n  B -->|No| D[End]",
-                      },
-                    ],
-                  })
-                  .run()
-              }
-            >
-              <Network size={15} aria-hidden />
-            </Btn>
+              icon={<Network size={15} aria-hidden />}
+              items={[
+                {
+                  testId: "toolbar-mermaid",
+                  label: "Mermaid diagram",
+                  icon: <Network size={15} aria-hidden />,
+                  run: () =>
+                      c()
+                        .insertContent({
+                          type: "code_block",
+                          attrs: { language: "mermaid" },
+                          content: [
+                            {
+                              type: "text",
+                              text: "graph TD\n  A[Start] --> B{Decision}\n  B -->|Yes| C[OK]\n  B -->|No| D[End]",
+                            },
+                          ],
+                        })
+                        .run(),
+                },
+                {
+                  testId: "toolbar-excalidraw",
+                  label: "Excalidraw drawing",
+                  icon: <PenSquare size={15} aria-hidden />,
+                  run: () => {
+                      void (async () => {
+                        const res = await boardsApi.create(docId, null);
+                        if ("error" in res) {
+                          // The menu item that had the focus is gone.
+                          editor.commands.focus();
+                          notifyFailure(notify, res.error, "Failed to create diagram.");
+                          return;
+                        }
+                        c()
+                          .insertContent({
+                            type: "excalidraw_board",
+                            attrs: { board_id: res.ok.id, label: null },
+                          })
+                          .run();
+                      })();
+                  },
+                },
+              ]}
+            />
             <Btn
-              testId="toolbar-excalidraw"
-              label="Insert Excalidraw diagram"
-              onClick={() => {
-                void (async () => {
-                  const res = await boardsApi.create(docId, null);
-                  if ("error" in res) {
-                    notifyFailure(notify, res.error, "Failed to create diagram.");
-                    return;
-                  }
-                  c()
-                    .insertContent({
-                      type: "excalidraw_board",
-                      attrs: { board_id: res.ok.id, label: null },
-                    })
-                    .run();
-                })();
-              }}
+              testId="toolbar-toc"
+              label="Table of contents"
+              onClick={() => c().insertContent({ type: "table_of_contents", attrs: { maxLevel: 3 } }).run()}
             >
-              <PenSquare size={15} aria-hidden />
+              <ListTree size={15} aria-hidden />
             </Btn>
           </>
         )}

@@ -75,6 +75,8 @@ const REGISTERED_EXTENSIONS = [
   "italic",
   "keymap",
   "knotDateTime",
+  // Decorations only: GitHub-style ids on headings; no document change.
+  "knotHeadingAnchors",
   "knotInternalLink",
   // Input rules that nest list items on a typed indent, and a paste transform
   // that nests aria-level list items. Both produce ordinary nested lists.
@@ -106,6 +108,7 @@ const REGISTERED_EXTENSIONS = [
   "table",
   "table_cell",
   "table_header",
+  "table_of_contents",
   "table_row",
   "text",
   // v3 core. addGlobalAttributes() returns [] unless `direction` is
@@ -196,8 +199,14 @@ describe("editor schema alignment", () => {
         { type: "paragraph", content: [{ type: "text", text: "hi" }] },
         { type: "heading", attrs: { level: 1 }, content: [{ type: "text", text: "h" }] },
         { type: "blockquote", content: [{ type: "paragraph", content: [{ type: "text", text: "q" }] }] },
+        {
+          type: "blockquote",
+          attrs: { kind: "warning", title: "Wartung" },
+          content: [{ type: "paragraph", content: [{ type: "text", text: "w" }] }],
+        },
         { type: "code_block", content: [{ type: "text", text: "x" }] },
         { type: "horizontal_rule" },
+        { type: "table_of_contents", attrs: { maxLevel: 2 } },
         {
           type: "bullet_list",
           content: [
@@ -250,6 +259,11 @@ describe("editor schema alignment", () => {
     // `nodeFromJSON(...).check()` throws on schema violations such as a
     // table whose content expression doesn't accept table_row.
     expect(() => editor.schema.nodeFromJSON(sample).check()).not.toThrow();
+    // A callout's kind and title are blockquote attributes and survive.
+    expect(editor.schema.nodeFromJSON(sample).child(3).attrs).toMatchObject({
+      kind: "warning",
+      title: "Wartung",
+    });
     editor.destroy();
   });
 
@@ -343,6 +357,7 @@ const CREATE_EXTENSIONS_ORDER = [
   "knotOrderedListMarkerGutter",
   "hard_break",
   "horizontal_rule",
+  "blockquote",
   "code_block",
   "underline",
   "link",
@@ -351,6 +366,8 @@ const CREATE_EXTENSIONS_ORDER = [
   "image",
   "attachment",
   "excalidraw_board",
+  "table_of_contents",
+  "knotHeadingAnchors",
   "knotTaskList",
   "knotInternalLink",
   "knotMention",

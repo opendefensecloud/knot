@@ -17,6 +17,7 @@ export const NODE_KINDS = [
   "excalidraw_board",
   "image",
   "attachment",
+  "table_of_contents",
   "table",
   "table_row",
   "table_cell",

@@ -81,6 +81,16 @@ pub(super) fn blocks(cx: &mut Ctx, items: &[Block], avail_cm: f64) {
     }
 }
 
+/// The paragraph styles of table of contents entries, by level below the
+/// shallowest heading shown.
+const CONTENTS: [&str; 5] = [
+    "Contents_20_1",
+    "Contents_20_2",
+    "Contents_20_3",
+    "Contents_20_4",
+    "Contents_20_5",
+];
+
 fn block(cx: &mut Ctx, b: &Block, avail_cm: f64) {
     if cx.full() {
         return;
@@ -112,6 +122,11 @@ fn block(cx: &mut Ctx, b: &Block, avail_cm: f64) {
             blocks(cx, inner, (avail_cm - QUOTE_INDENT_CM).max(0.0));
             cx.quote_depth -= 1;
         }
+        Block::Callout {
+            kind,
+            title,
+            blocks: inner,
+        } => table::callout(cx, *kind, title.as_deref(), inner, avail_cm),
         Block::Code { text, .. } => text_paragraph(cx, "Preformatted_20_Text", text),
         Block::Rule => {
             open_paragraph(cx, "Horizontal_20_Line");
@@ -122,6 +137,12 @@ fn block(cx: &mut Ctx, b: &Block, avail_cm: f64) {
         Block::Image { source, alt } => picture::image(cx, source, alt, avail_cm),
         Block::Mermaid { key, source } => picture::mermaid(cx, key, source, avail_cm),
         Block::Board { key, label, .. } => picture::board(cx, key, label, avail_cm),
+        Block::Toc { entries, .. } => {
+            text_paragraph(cx, "Caption", "Contents");
+            for entry in entries {
+                text_paragraph(cx, CONTENTS[usize::from(entry.level.min(4))], &entry.text);
+            }
+        }
         Block::Attachment { url, name, size } => picture::attachment(cx, url, name, *size),
     }
 }

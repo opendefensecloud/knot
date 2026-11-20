@@ -1837,3 +1837,51 @@ fn odt_external_images_and_attachments_are_links() {
     let texts: Vec<_> = content(&d).into_iter().map(text).collect();
     assert_eq!(texts[3], "\u{1F4CE} odd");
 }
+
+#[test]
+fn toc_writes_contents_caption_and_indented_entries() {
+    let entry = |level, text: &str| knot_export::TocEntry {
+        level,
+        text: text.into(),
+    };
+    let odt = export(vec![Block::Toc {
+        max_level: 3,
+        entries: vec![entry(0, "A"), entry(1, "B")],
+    }]);
+    let d = xml(odt.part("content.xml"));
+    let got: Vec<(String, String)> = content(&d)
+        .into_iter()
+        .map(|p| (style_name(p).unwrap_or_default().to_owned(), text(p)))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("Caption".to_owned(), "Contents".to_owned()),
+            ("Contents_20_1".to_owned(), "A".to_owned()),
+            ("Contents_20_2".to_owned(), "B".to_owned()),
+        ]
+    );
+    let styles = xml(odt.part("styles.xml"));
+    let toc2 = style(&styles, "Contents_20_2");
+    assert_eq!(toc2.attribute((STYLE, "display-name")), Some("Contents 2"));
+    assert_eq!(prop(toc2, FO, "margin-left"), Some("0.5cm"));
+}
+
+#[test]
+fn callout_writes_one_cell_table_with_bold_title() {
+    for (title, shown) in [(Some("W".to_string()), "W"), (None, "Warning")] {
+        let odt = export(vec![Block::Callout {
+            kind: knot_export::CalloutKind::Warning,
+            title,
+            blocks: vec![para("body")],
+        }]);
+        parse_all(&odt);
+        let d = odt.part("content.xml");
+        assert!(d.contains("<table:table "), "{d}");
+        assert!(d.contains(&format!(">{shown}<")), "{d}");
+        assert!(d.contains(">body<"), "{d}");
+        let all = format!("{d}{}", odt.part("styles.xml"));
+        assert!(all.to_ascii_uppercase().contains("9A6700"), "{all}");
+        assert!(all.contains("fo:font-weight=\"bold\""), "{all}");
+    }
+}

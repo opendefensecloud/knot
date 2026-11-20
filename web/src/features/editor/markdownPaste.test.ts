@@ -145,3 +145,47 @@ describe("pasting a nested Markdown list", () => {
     );
   });
 });
+
+describe("table of contents in pasted Markdown", () => {
+  it("pastes GitHub and GitLab alerts as callout boxes", () => {
+    const parse = (md: string) =>
+      new DOMParser().parseFromString(markdownToHtml(md), "text/html").querySelector("blockquote");
+    const plain = parse("> [!WARNING]\n> x\n");
+    expect(plain?.getAttribute("data-kind")).toBe("warning");
+    expect(plain?.getAttribute("data-title")).toBeNull();
+    expect(plain?.textContent?.trim()).toBe("x");
+    const titled = parse("> [!tip] Wartung am Freitag\n> y\n");
+    expect(titled?.getAttribute("data-kind")).toBe("tip");
+    expect(titled?.getAttribute("data-title")).toBe("Wartung am Freitag");
+    expect(titled?.textContent?.trim()).toBe("y");
+    expect(parse("> [!FOO]\n> z\n")?.getAttribute("data-kind")).toBeNull();
+  });
+
+  it("keeps an escaped marker, and one glued to its text, a plain quote", () => {
+    const parse = (md: string) =>
+      new DOMParser().parseFromString(markdownToHtml(md), "text/html").querySelector("blockquote");
+    // What knot's own export writes for a plain quote that starts with `[!NOTE]`.
+    const escaped = parse("> \\[!NOTE] just text\n");
+    expect(escaped?.getAttribute("data-kind")).toBeNull();
+    expect(escaped?.textContent?.trim()).toBe("[!NOTE] just text");
+    expect(parse("> [!NOTE]text\n")?.getAttribute("data-kind")).toBeNull();
+  });
+
+  it("pastes [[_TOC_]] as a table of contents", () => {
+    const html = markdownToHtml("[[_TOC_]]\n\n# Plan\n");
+    const box = new DOMParser().parseFromString(html, "text/html").querySelector("[data-knot-toc]");
+    expect(box).not.toBeNull();
+    expect(box!.getAttribute("data-max-level")).toBe("3");
+  });
+
+  it("keeps the depth comment", () => {
+    const html = markdownToHtml("<!-- knot:toc maxLevel=2 -->\n[[_TOC_]]\n");
+    const box = new DOMParser().parseFromString(html, "text/html").querySelector("[data-knot-toc]");
+    expect(box?.getAttribute("data-max-level")).toBe("2");
+    expect(html).not.toContain("[[_TOC_]]");
+  });
+
+  it("leaves the marker inside text alone", () => {
+    expect(markdownToHtml("see [[_TOC_]] here\n")).not.toContain("data-knot-toc");
+  });
+});
