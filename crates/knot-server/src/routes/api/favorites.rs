@@ -57,7 +57,10 @@ async fn list(State(state): State<AppState>, req: Request) -> Response {
     // Pages the caller can't read are left out in SQL. A cached snapshot
     // may predate a page and miss it from the hidden set, so the rows are
     // checked again against one that covers them.
-    let hidden_ids = match acl.visibility(ctx.workspace_id, ctx.user_id).await {
+    let hidden_ids = match acl
+        .visibility(ctx.workspace_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(visibility) => visibility.hidden_ids(),
         Err(e) => {
             tracing::error!(error=?e, "favorites visibility");
@@ -76,7 +79,12 @@ async fn list(State(state): State<AppState>, req: Request) -> Response {
     };
     let listed_doc_ids: Vec<Uuid> = rows.iter().map(|r| r.doc_id).collect();
     let visibility = match acl
-        .visibility_covering(ctx.workspace_id, ctx.user_id, &listed_doc_ids)
+        .visibility_covering(
+            ctx.workspace_id,
+            ctx.user_id,
+            ctx.root_doc_id,
+            &listed_doc_ids,
+        )
         .await
     {
         Ok(visibility) => visibility,
@@ -112,7 +120,10 @@ async fn add(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Reque
     };
 
     // Same codes, same order as `require_doc_role_mw`.
-    let access = match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
+    let access = match acl
+        .access(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(Some(access)) => access,
         Ok(None) => return json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""),
         Err(e) => {

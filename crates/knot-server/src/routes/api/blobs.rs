@@ -68,7 +68,7 @@ async fn upload(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Re
         return internal();
     };
     match acl
-        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
+        .effective_role(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
         .await
     {
         Ok(Some(knot_storage::WorkspaceRole::Owner | knot_storage::WorkspaceRole::Editor)) => {}
@@ -81,8 +81,14 @@ async fn upload(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Re
         }
         Err(_) => return internal(),
     }
-    if let Some(r) =
-        crate::archive::refuse_if_archived(&state, ctx.workspace_id, doc_id, ctx.user_id).await
+    if let Some(r) = crate::archive::refuse_if_archived(
+        &state,
+        ctx.workspace_id,
+        doc_id,
+        ctx.user_id,
+        ctx.root_doc_id,
+    )
+    .await
     {
         return r;
     }
@@ -206,7 +212,7 @@ async fn download(State(state): State<AppState>, Path(id): Path<Uuid>, req: Requ
         Err(_) => return internal(),
     };
     match acl
-        .effective_role(meta.workspace_id, meta.doc_id, ctx.user_id)
+        .effective_role(meta.workspace_id, meta.doc_id, ctx.user_id, ctx.root_doc_id)
         .await
     {
         Ok(Some(_)) => {}
@@ -294,7 +300,7 @@ async fn delete_blob(
         Err(_) => return internal(),
     };
     match acl
-        .effective_role(meta.workspace_id, meta.doc_id, ctx.user_id)
+        .effective_role(meta.workspace_id, meta.doc_id, ctx.user_id, ctx.root_doc_id)
         .await
     {
         Ok(Some(knot_storage::WorkspaceRole::Owner | knot_storage::WorkspaceRole::Editor)) => {}
@@ -306,9 +312,14 @@ async fn delete_blob(
             );
         }
     }
-    if let Some(r) =
-        crate::archive::refuse_if_archived(&state, meta.workspace_id, meta.doc_id, ctx.user_id)
-            .await
+    if let Some(r) = crate::archive::refuse_if_archived(
+        &state,
+        meta.workspace_id,
+        meta.doc_id,
+        ctx.user_id,
+        ctx.root_doc_id,
+    )
+    .await
     {
         return r;
     }

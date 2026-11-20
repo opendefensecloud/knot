@@ -58,7 +58,10 @@ pub async fn require_doc_role_mw(
     let Some(acl) = state.acl.clone() else {
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "");
     };
-    let access = match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
+    let access = match acl
+        .access(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(Some(access)) => access,
         Ok(None) => return json_err(StatusCode::FORBIDDEN, "acl.no_grant", ""),
         Err(e) => {

@@ -10,6 +10,10 @@
 //! Two evaluators share the one `step` function, so they cannot drift:
 //! [`access_along_path`] folds a single ancestor chain (for `acl::resolve`)
 //! and [`compute_access`] folds a whole workspace tree (for listings).
+//!
+//! A key's scope root (S10) masks the result: only the root and its
+//! descendants get access; the fold above it is unchanged, so inherited
+//! grants still count.
 
 use std::collections::{HashMap, HashSet};
 
@@ -45,14 +49,20 @@ struct FoldState {
     inherited: Option<WorkspaceRole>,
     /// The nearest restricted ancestor-or-self.
     boundary: Option<Uuid>,
+    /// S10: true at and below the key's scope root; always true without one.
+    /// Only masks the result: grants and boundaries fold as without a root.
+    in_scope: bool,
 }
 
 impl FoldState {
-    const ROOT: FoldState = FoldState {
-        workspace_role_applies: true,
-        inherited: None,
-        boundary: None,
-    };
+    fn start(scope_root: Option<Uuid>) -> FoldState {
+        FoldState {
+            workspace_role_applies: true,
+            inherited: None,
+            boundary: None,
+            in_scope: scope_root.is_none(),
+        }
+    }
 }
 
 /// The user's grants on one doc, folded to the two maxima the rule needs.
@@ -91,16 +101,21 @@ fn step(
     node: &AclNode,
     grants: &HashMap<Uuid, DocGrants>,
     workspace_role: WorkspaceRole,
+    scope_root: Option<Uuid>,
 ) -> (Option<DocAccess>, FoldState) {
     let mut state = if node.restricted {
         FoldState {
             workspace_role_applies: false,
             inherited: None,
             boundary: Some(node.id),
+            in_scope: parent_state.in_scope,
         }
     } else {
         parent_state
     };
+    if scope_root == Some(node.id) {
+        state.in_scope = true;
+    }
     let node_grants = grants.get(&node.id).copied().unwrap_or_default();
     let workspace_contribution = state.workspace_role_applies.then_some(workspace_role);
     let role = max_option(
@@ -108,7 +123,7 @@ fn step(
         workspace_contribution,
     );
     state.inherited = max_option(state.inherited, node_grants.inheriting);
-    let access = role.map(|role| DocAccess {
+    let access = role.filter(|_| state.in_scope).map(|role| DocAccess {
         role,
         archived: node.archived,
         restriction_root: state.boundary,
@@ -125,13 +140,14 @@ pub fn access_along_path(
     path: &[AclNode],
     grants: &[PrincipalGrant],
     workspace_role: Option<WorkspaceRole>,
+    scope_root: Option<Uuid>,
 ) -> Option<DocAccess> {
     let workspace_role = workspace_role?;
     let grants = grants_by_doc(grants);
-    let mut state = FoldState::ROOT;
+    let mut state = FoldState::start(scope_root);
     let mut access = None;
     for node in path {
-        (access, state) = step(state, node, &grants, workspace_role);
+        (access, state) = step(state, node, &grants, workspace_role, scope_root);
     }
     access
 }
@@ -145,6 +161,7 @@ pub fn compute_access(
     nodes: &[AclNode],
     grants: &[PrincipalGrant],
     workspace_role: Option<WorkspaceRole>,
+    scope_root: Option<Uuid>,
 ) -> HashMap<Uuid, DocAccess> {
     let mut access_by_doc = HashMap::new();
     let Some(workspace_role) = workspace_role else {
@@ -159,7 +176,7 @@ pub fn compute_access(
             Some(parent_id) if node_ids.contains(&parent_id) => {
                 children_by_parent.entry(parent_id).or_default().push(node);
             }
-            _ => stack.push((node, FoldState::ROOT)),
+            _ => stack.push((node, FoldState::start(scope_root))),
         }
     }
     // Guards against revisiting a node, which duplicate ids could otherwise
@@ -169,7 +186,7 @@ pub fn compute_access(
         if !visited.insert(node.id) {
             continue;
         }
-        let (access, state) = step(parent_state, node, &grants, workspace_role);
+        let (access, state) = step(parent_state, node, &grants, workspace_role, scope_root);
         if let Some(access) = access {
             access_by_doc.insert(node.id, access);
         }
@@ -213,7 +230,7 @@ mod tests {
         let child = node(id(2), Some(root.id), false);
         let grants = [grant(root.id, Editor, true)];
 
-        let child_access = access_along_path(&[root, child], &grants, Some(Viewer)).unwrap();
+        let child_access = access_along_path(&[root, child], &grants, Some(Viewer), None).unwrap();
 
         assert_eq!(child_access.role, Editor);
         assert_eq!(child_access.restriction_root, None);
@@ -223,7 +240,7 @@ mod tests {
     fn restricted_boundary_ignores_workspace_role() {
         let root = node(id(1), None, true);
 
-        assert_eq!(access_along_path(&[root], &[], Some(Owner)), None);
+        assert_eq!(access_along_path(&[root], &[], Some(Owner), None), None);
     }
 
     #[test]
@@ -232,7 +249,8 @@ mod tests {
         let child = node(id(2), Some(boundary.id), false);
         let grants = [grant(boundary.id, Owner, true)];
 
-        let child_access = access_along_path(&[boundary, child], &grants, Some(Viewer)).unwrap();
+        let child_access =
+            access_along_path(&[boundary, child], &grants, Some(Viewer), None).unwrap();
 
         assert_eq!(child_access.role, Owner);
         assert_eq!(child_access.restriction_root, Some(boundary.id));
@@ -244,8 +262,8 @@ mod tests {
         let boundary = node(id(2), Some(root.id), true);
         let grants = [grant(root.id, Editor, true)];
 
-        let boundary_access = access_along_path(&[root, boundary], &grants, Some(Viewer));
-        let root_access = access_along_path(&[root], &grants, Some(Viewer)).unwrap();
+        let boundary_access = access_along_path(&[root, boundary], &grants, Some(Viewer), None);
+        let root_access = access_along_path(&[root], &grants, Some(Viewer), None).unwrap();
 
         assert_eq!(boundary_access, None);
         assert_eq!(root_access.role, Editor);
@@ -259,9 +277,9 @@ mod tests {
         let plain_child = node(id(3), Some(outer.id), false);
         let grants = [grant(outer.id, Owner, true)];
 
-        let inner_access = access_along_path(&[outer, inner], &grants, Some(Editor));
+        let inner_access = access_along_path(&[outer, inner], &grants, Some(Editor), None);
         let plain_child_access =
-            access_along_path(&[outer, plain_child], &grants, Some(Editor)).unwrap();
+            access_along_path(&[outer, plain_child], &grants, Some(Editor), None).unwrap();
 
         assert_eq!(inner_access, None);
         assert_eq!(plain_child_access.role, Owner);
@@ -274,8 +292,8 @@ mod tests {
         let child = node(id(2), Some(boundary.id), false);
         let grants = [grant(boundary.id, Editor, false)];
 
-        let boundary_access = access_along_path(&[boundary], &grants, Some(Viewer)).unwrap();
-        let child_access = access_along_path(&[boundary, child], &grants, Some(Viewer));
+        let boundary_access = access_along_path(&[boundary], &grants, Some(Viewer), None).unwrap();
+        let child_access = access_along_path(&[boundary, child], &grants, Some(Viewer), None);
 
         assert_eq!(boundary_access.role, Editor);
         assert_eq!(boundary_access.restriction_root, Some(boundary.id));
@@ -287,8 +305,8 @@ mod tests {
         let root = node(id(1), None, false);
         let grants = [grant(root.id, Owner, true)];
 
-        assert_eq!(access_along_path(&[root], &grants, None), None);
-        assert!(compute_access(&[root], &grants, None).is_empty());
+        assert_eq!(access_along_path(&[root], &grants, None, None), None);
+        assert!(compute_access(&[root], &grants, None, None).is_empty());
     }
 
     #[test]
@@ -299,8 +317,9 @@ mod tests {
             ..node(id(2), Some(root.id), false)
         };
 
-        let child_access = access_along_path(&[root, archived_child], &[], Some(Editor)).unwrap();
-        let batched = compute_access(&[root, archived_child], &[], Some(Editor));
+        let child_access =
+            access_along_path(&[root, archived_child], &[], Some(Editor), None).unwrap();
+        let batched = compute_access(&[root, archived_child], &[], Some(Editor), None);
 
         assert!(child_access.archived);
         assert_eq!(child_access.role, Editor);
@@ -315,7 +334,7 @@ mod tests {
         let orphan = node(id(1), Some(missing_parent), false);
         let orphan_child = node(id(2), Some(orphan.id), false);
 
-        let access = compute_access(&[orphan_child, orphan], &[], Some(Viewer));
+        let access = compute_access(&[orphan_child, orphan], &[], Some(Viewer), None);
 
         assert_eq!(access[&orphan.id].role, Viewer);
         assert_eq!(access[&orphan.id].restriction_root, None);
@@ -331,7 +350,12 @@ mod tests {
         let below_cycle = node(id(4), Some(cycle_a.id), false);
         let grants = [grant(cycle_a.id, Owner, true)];
 
-        let access = compute_access(&[root, cycle_a, cycle_b, below_cycle], &grants, Some(Owner));
+        let access = compute_access(
+            &[root, cycle_a, cycle_b, below_cycle],
+            &grants,
+            Some(Owner),
+            None,
+        );
 
         assert_eq!(access[&root.id].role, Owner);
         assert!(!access.contains_key(&cycle_a.id));
@@ -409,11 +433,21 @@ mod tests {
                 Some(random_role(&mut generator))
             };
 
-            let batched = compute_access(&nodes, &grants, workspace_role);
+            let scope_root = if generator.below(3) == 0 {
+                None
+            } else {
+                Some(nodes[generator.below(nodes.len() as u64) as usize].id)
+            };
+
+            let batched = compute_access(&nodes, &grants, workspace_role, scope_root);
 
             for tree_node in &nodes {
-                let along_path =
-                    access_along_path(&path_to(&nodes, tree_node.id), &grants, workspace_role);
+                let along_path = access_along_path(
+                    &path_to(&nodes, tree_node.id),
+                    &grants,
+                    workspace_role,
+                    scope_root,
+                );
                 assert_eq!(
                     batched.get(&tree_node.id).copied(),
                     along_path,
@@ -422,5 +456,145 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// S10: a root narrows access to itself and its descendants; grants and
+    /// the workspace role still decide the role inside.
+    #[test]
+    fn scope_root_limits_access_to_its_subtree() {
+        let top = node(id(1), None, false);
+        let root = node(id(2), Some(top.id), false);
+        let child = node(id(3), Some(root.id), false);
+        let grandchild = node(id(4), Some(child.id), false);
+        let sibling = node(id(5), Some(top.id), false);
+        let nodes = [top, root, child, grandchild, sibling];
+        let scope = Some(root.id);
+
+        assert_eq!(access_along_path(&[top], &[], Some(Editor), scope), None);
+        assert_eq!(
+            access_along_path(&[top, sibling], &[], Some(Editor), scope),
+            None
+        );
+        for path in [
+            &[top, root][..],
+            &[top, root, child],
+            &[top, root, child, grandchild],
+        ] {
+            let access = access_along_path(path, &[], Some(Editor), scope).unwrap();
+            assert_eq!(access.role, Editor);
+        }
+
+        let batched = compute_access(&nodes, &[], Some(Editor), scope);
+        let mut reachable: Vec<Uuid> = batched.keys().copied().collect();
+        reachable.sort();
+        assert_eq!(reachable, vec![root.id, child.id, grandchild.id]);
+    }
+
+    /// An inheriting grant above the root still flows into the subtree:
+    /// the root masks, it doesn't reset the fold.
+    #[test]
+    fn scope_root_keeps_grants_inherited_from_above() {
+        let top = node(id(1), None, false);
+        let root = node(id(2), Some(top.id), false);
+        let grants = [grant(top.id, Owner, true)];
+
+        let access = access_along_path(&[top, root], &grants, Some(Viewer), Some(root.id)).unwrap();
+
+        assert_eq!(access.role, Owner);
+    }
+
+    /// A restricted page inside the subtree stays closed without a grant on
+    /// it, and opens with one.
+    #[test]
+    fn scope_root_respects_restriction_inside() {
+        let root = node(id(1), None, false);
+        let locked = node(id(2), Some(root.id), true);
+        let scope = Some(root.id);
+
+        assert_eq!(
+            access_along_path(&[root, locked], &[], Some(Owner), scope),
+            None
+        );
+        let grants = [grant(locked.id, Editor, false)];
+        let access = access_along_path(&[root, locked], &grants, Some(Viewer), scope).unwrap();
+        assert_eq!(access.role, Editor);
+        assert_eq!(access.restriction_root, Some(locked.id));
+    }
+
+    /// A root the user can't reach grants nothing below it.
+    #[test]
+    fn scope_root_never_grants() {
+        let root = node(id(1), None, true);
+        let child = node(id(2), Some(root.id), false);
+
+        assert_eq!(
+            access_along_path(&[root, child], &[], Some(Owner), Some(root.id)),
+            None
+        );
+        assert!(compute_access(&[root, child], &[], Some(Owner), Some(root.id)).is_empty());
+    }
+
+    /// A restricted page above the root: only the user's inheriting grant on
+    /// it opens the subtree (with that role); the page itself and its other
+    /// children stay masked. Without the grant the restriction closes the
+    /// subtree.
+    #[test]
+    fn scope_root_below_a_restricted_page_needs_that_pages_grant() {
+        let locked = node(id(1), None, true);
+        let root = node(id(2), Some(locked.id), false);
+        let child = node(id(3), Some(root.id), false);
+        let sibling = node(id(4), Some(locked.id), false);
+        let nodes = [locked, root, child, sibling];
+        let scope = Some(root.id);
+        let grants = [grant(locked.id, Editor, true)];
+
+        let batched = compute_access(&nodes, &grants, Some(Viewer), scope);
+        assert_eq!(batched.len(), 2);
+        assert_eq!(batched[&root.id].role, Editor);
+        assert_eq!(batched[&child.id].role, Editor);
+        for (path, expected) in [
+            (&[locked][..], None),
+            (&[locked, sibling], None),
+            (&[locked, root], Some(Editor)),
+            (&[locked, root, child], Some(Editor)),
+        ] {
+            let along = access_along_path(path, &grants, Some(Viewer), scope).map(|a| a.role);
+            assert_eq!(along, expected, "{path:?}");
+        }
+
+        assert!(compute_access(&nodes, &[], Some(Owner), scope).is_empty());
+        for path in [&[locked, root][..], &[locked, root, child]] {
+            assert_eq!(access_along_path(path, &[], Some(Owner), scope), None);
+        }
+    }
+
+    /// A parent cycle through the root fails closed, key or no key. A path
+    /// cannot express a cycle, so the chain of a cyclic page is empty.
+    #[test]
+    fn parent_cycle_through_the_scope_root_fails_closed() {
+        let root = node(id(1), Some(id(2)), false);
+        let other = node(id(2), Some(id(1)), false);
+        let child = node(id(3), Some(root.id), false);
+        let grants = [grant(root.id, Owner, true)];
+
+        assert!(
+            compute_access(&[root, other, child], &grants, Some(Owner), Some(root.id)).is_empty()
+        );
+        assert_eq!(
+            access_along_path(&[], &grants, Some(Owner), Some(root.id)),
+            None
+        );
+    }
+
+    /// A root that is not in the tree at all (deleted, foreign) reaches nothing.
+    #[test]
+    fn unknown_scope_root_reaches_nothing() {
+        let top = node(id(1), None, false);
+
+        assert_eq!(
+            access_along_path(&[top], &[], Some(Owner), Some(id(99))),
+            None
+        );
+        assert!(compute_access(&[top], &[], Some(Owner), Some(id(99))).is_empty());
     }
 }

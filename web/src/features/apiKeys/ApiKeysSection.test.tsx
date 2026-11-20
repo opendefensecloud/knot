@@ -2,11 +2,15 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { MemoryRouter } from "react-router-dom";
+
+import type { Doc } from "../../lib/validators";
 import { useUi } from "../../stores/ui";
+import { docsApi } from "../docs/docs.api";
 import { workspaceApi } from "../workspace/workspace.api";
 
 import { type ApiKey, apiKeysApi } from "./apiKeys.api";
-import { ApiKeysSection } from "./ApiKeysSection";
+import { ApiKeysSection, apiKeyErrorMessage } from "./ApiKeysSection";
 
 let maxTtl: number | null = null;
 let list: ReturnType<typeof vi.fn>;
@@ -38,12 +42,31 @@ const KEYS: ApiKey[] = [
     expires_at: null,
     last_used_at: "2026-10-15T12:00:00Z",
     revoked_at: null,
+    root_doc_id: null,
+    root_title: null,
   },
 ];
 
 const MEMBERS = [
   { user_id: "owner1", email: "olive@example.org", display_name: "Olive Owner", role: "owner" as const, kind: "human" as const },
 ];
+
+const mkDoc = (id: string, title: string, parent_id: string | null) =>
+  ({
+    id,
+    workspace_id: "w1",
+    parent_id,
+    title,
+    sort_key: id,
+    icon: null,
+    created_by: "me",
+    archived: false,
+    is_template: false,
+    restricted: false,
+    within_restricted: false,
+    parent_hidden: false,
+  }) as Doc;
+const DOCS: Doc[] = [mkDoc("p1", "Project", null), mkDoc("p2", "Notes", "p1")];
 
 /** One key listed, with the fields that decide its state and columns overridden. */
 function listOne(fields: Partial<ApiKey>) {
@@ -53,7 +76,7 @@ function listOne(fields: Partial<ApiKey>) {
 /** Creates a key through the form, leaving the one-time reveal dialog open. */
 async function openReveal() {
   vi.spyOn(apiKeysApi, "create").mockResolvedValue({
-    ok: { id: "k2", key: "knot_SECRET", name: "deploy", scopes: ["read"], expires_at: null },
+    ok: { id: "k2", key: "knot_SECRET", name: "deploy", scopes: ["read"], expires_at: null, root_doc_id: null },
   });
   renderSection();
   fireEvent.change(await screen.findByTestId("api-key-name"), { target: { value: "deploy" } });
@@ -74,7 +97,9 @@ function renderSection(props: { targetUserId?: string } = {}) {
   const invalidate = vi.spyOn(qc, "invalidateQueries");
   render(
     <QueryClientProvider client={qc}>
-      <ApiKeysSection {...props} />
+      <MemoryRouter>
+        <ApiKeysSection {...props} />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
   return { qc, invalidate };
@@ -85,6 +110,7 @@ beforeEach(() => {
   useUi.setState({ toasts: [] });
   list = vi.spyOn(apiKeysApi, "list").mockResolvedValue({ ok: KEYS });
   listMembers = vi.spyOn(workspaceApi, "listMembers").mockResolvedValue({ ok: MEMBERS });
+  vi.spyOn(docsApi, "list").mockResolvedValue({ ok: DOCS });
 });
 
 afterEach(() => {
@@ -185,7 +211,7 @@ describe("ApiKeysSection", () => {
 
   it("posts name, scopes and expires_in_days, then reveals the key once without caching it", async () => {
     const create = vi.spyOn(apiKeysApi, "create").mockResolvedValue({
-      ok: { id: "k2", key: "knot_SECRET", name: "deploy", scopes: ["read", "delete"], expires_at: null },
+      ok: { id: "k2", key: "knot_SECRET", name: "deploy", scopes: ["read", "delete"], expires_at: null, root_doc_id: null },
     });
     const { qc } = renderSection();
     await screen.findByTestId("api-key-row");
@@ -202,6 +228,7 @@ describe("ApiKeysSection", () => {
       scopes: ["read", "delete"],
       expiresInDays: null,
       userId: undefined,
+      rootDocId: null,
     });
     expect(within(reveal).getByDisplayValue("knot_SECRET")).toBeInTheDocument();
     expect(reveal).toHaveTextContent("shown once");
@@ -363,5 +390,37 @@ describe("ApiKeysSection", () => {
     fireEvent.click(screen.getByTestId("api-key-submit"));
     expect(await screen.findByTestId("api-key-error")).toHaveTextContent("50 active keys");
     expect(screen.queryByTestId("api-key-reveal")).not.toBeInTheDocument();
+  });
+
+  it("sends the chosen page as root_doc_id", async () => {
+    const create = vi.spyOn(apiKeysApi, "create").mockResolvedValue({
+      ok: { id: "k2", key: "knot_X", name: "agent", scopes: ["read"], expires_at: null, root_doc_id: "p1" },
+    });
+    renderSection();
+    fireEvent.change(await screen.findByTestId("api-key-name"), { target: { value: "agent" } });
+    const select = await screen.findByTestId("api-key-root");
+    await waitFor(() => expect(within(select).getAllByRole("option")).toHaveLength(3));
+    expect(within(select).getAllByRole("option")[2]).toHaveTextContent("Notes");
+    fireEvent.change(select, { target: { value: "p1" } });
+    fireEvent.click(screen.getByTestId("api-key-submit"));
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({ rootDocId: "p1" })));
+  });
+
+  it("shows the root page of a subtree key, or that it is hidden", async () => {
+    list.mockResolvedValue({
+      ok: [
+        { ...KEYS[0]!, root_doc_id: "p1", root_title: "Project" },
+        { ...KEYS[0]!, id: "k3", root_doc_id: "p9", root_title: null },
+      ],
+    });
+    renderSection();
+    const chips = await screen.findAllByTestId("api-key-root-chip");
+    expect(chips[0]).toHaveTextContent("Project");
+    expect(chips[0]!.closest("a")).toHaveAttribute("href", "/doc/p1");
+    expect(chips[1]).toHaveTextContent("a page you can't see");
+  });
+
+  it("explains a root the key's user can't read", () => {
+    expect(apiKeyErrorMessage("doc.not_found")).toBe("You or the bot can't read that page, or it no longer exists.");
   });
 });

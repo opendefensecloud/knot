@@ -12,6 +12,7 @@
 //! The required scope comes from the HTTP method, except for the routes in
 //! [`OVERRIDES`]: that table is the single auditable place for exceptions.
 //! Routes in [`SESSION_ONLY`] refuse every key, whatever its scopes.
+//! Routes in [`SUBTREE_DENIED`] refuse every key that has a scope root (S10).
 
 use axum::{
     Json,
@@ -25,6 +26,7 @@ use knot_storage::Scope;
 use serde_json::json;
 
 use super::api_key_loader::ApiPrincipal;
+use super::context::AuthContext;
 use crate::http_error::json_err;
 
 /// Routes no API key may call, keyed by the exact axum `MatchedPath`: they
@@ -53,6 +55,166 @@ pub const SESSION_ONLY: &[(Method, &str)] = &[
     (Method::DELETE, "/api/docs/{id}/grants/{principal}"),
     (Method::PUT, "/api/docs/{id}/restricted"),
 ];
+
+/// S10: routes a key with a scope root may not call, whatever the method:
+/// they are workspace-wide, or they change the user's own state. Keyed by
+/// the exact axum `MatchedPath`. Routes that filter through the doc ACL
+/// narrow on their own and are listed in [`SUBTREE_OK`].
+pub const SUBTREE_DENIED: &[&str] = &[
+    // Who is in the workspace is not page content.
+    "/api/workspace/members",
+    "/api/workspace/members/{id}",
+    // Workspace-wide by definition.
+    "/api/workspace/templates",
+    "/api/workspace/export",
+    "/api/workspace/import",
+    "/api/workspace/archive",
+    // The user's inbox: doc-less notifications pass the visibility filter,
+    // and marking read checks no ACL.
+    "/api/notifications",
+    "/api/notifications/unread_count",
+    "/api/notifications/read",
+    // Changes the user's own state.
+    "/api/whats-new/seen",
+    // The user's stars across the workspace: per-user state, and DELETE
+    // checks no ACL.
+    "/api/me/favorites",
+    "/api/me/favorites/{doc_id}",
+];
+
+/// S10: routes open to a subtree key, each with why that is safe. Every
+/// `/api` route path is in SUBTREE_DENIED or has a row here (tested). Rows
+/// carry the method. The list is an allow-list enforced at runtime (fail
+/// closed): `scope_mw` refuses a subtree key on any route or method not
+/// listed, and an integration test pins the rows against the real router.
+pub const SUBTREE_OK: &[(Method, &str)] = &[
+    // Resolved through the doc ACL (route layer or handler), which masks
+    // everything outside the root. Destinations are checked separately.
+    (Method::GET, "/api/docs/{id}"),
+    (Method::PATCH, "/api/docs/{id}"),
+    (Method::DELETE, "/api/docs/{id}"),
+    (Method::POST, "/api/docs/{id}/purge"),
+    // The handler refuses a restore that would land at the top level.
+    (Method::POST, "/api/docs/{id}/restore"),
+    (Method::POST, "/api/docs/{id}/template"),
+    (Method::POST, "/api/docs/{id}/duplicate"),
+    (Method::POST, "/api/docs/{id}/move"),
+    (Method::GET, "/api/docs/{id}/markdown"),
+    (Method::POST, "/api/docs/{id}/markdown"),
+    (Method::POST, "/api/docs/from-template/{id}"),
+    (Method::GET, "/api/docs/{id}/grants"),
+    (Method::PUT, "/api/docs/{id}/grants/{principal}"),
+    (Method::DELETE, "/api/docs/{id}/grants/{principal}"),
+    (Method::PUT, "/api/docs/{id}/restricted"),
+    (Method::GET, "/api/docs/{id}/access"),
+    (Method::GET, "/api/docs/{id}/history"),
+    (Method::GET, "/api/docs/{id}/history/entries"),
+    (Method::GET, "/api/docs/{id}/history/{seq}/markdown"),
+    (Method::POST, "/api/docs/{id}/history/{seq}/restore"),
+    (Method::GET, "/api/docs/{id}/history/entries/{eid}/view"),
+    (Method::POST, "/api/docs/{id}/history/entries/{eid}/restore"),
+    // Duplicate's checks: the copy goes beside the page, so a parent
+    // outside the root is refused by the ACL and the top level here.
+    (
+        Method::POST,
+        "/api/docs/{id}/history/entries/{eid}/restore-as-new",
+    ),
+    // The new page goes under `{id}`, inside the root.
+    (Method::POST, "/api/docs/{id}/move-to-subpage"),
+    (Method::GET, "/api/docs/{id}/contributors"),
+    (Method::GET, "/api/docs/{id}/audit"),
+    (Method::GET, "/api/docs/{id}/short-link"),
+    (Method::POST, "/api/docs/{id}/short-link"),
+    (Method::GET, "/api/docs/{id}/export/diagrams"),
+    (Method::POST, "/api/docs/{id}/export/{format}"),
+    (Method::GET, "/api/docs/{doc_id}/export"),
+    (Method::GET, "/api/docs/{doc_id}/shares"),
+    (Method::POST, "/api/docs/{doc_id}/shares"),
+    (Method::DELETE, "/api/docs/{doc_id}/shares/{share_id}"),
+    (Method::PATCH, "/api/docs/{doc_id}/tasks/{item_index}"),
+    // Comments and suggestions of a page: same doc ACL.
+    (Method::GET, "/api/docs/{id}/comments"),
+    (Method::POST, "/api/docs/{id}/comments"),
+    (Method::POST, "/api/docs/{id}/comments/{thread_id}/replies"),
+    (Method::POST, "/api/docs/{id}/comments/{thread_id}/resolve"),
+    (
+        Method::POST,
+        "/api/docs/{id}/comments/{thread_id}/unresolve",
+    ),
+    (
+        Method::POST,
+        "/api/docs/{id}/comments/{comment_id}/reactions",
+    ),
+    (
+        Method::DELETE,
+        "/api/docs/{id}/comments/{comment_id}/reactions/{emoji}",
+    ),
+    (Method::PATCH, "/api/docs/{id}/comments/{comment_id}"),
+    (Method::DELETE, "/api/docs/{id}/comments/{comment_id}"),
+    (Method::GET, "/api/docs/{id}/suggestions"),
+    (Method::POST, "/api/docs/{id}/suggestions"),
+    (
+        Method::POST,
+        "/api/docs/{id}/suggestions/{suggestion_id}/accept",
+    ),
+    (
+        Method::POST,
+        "/api/docs/{id}/suggestions/{suggestion_id}/reject",
+    ),
+    (
+        Method::POST,
+        "/api/docs/{id}/suggestions/{suggestion_id}/withdraw",
+    ),
+    (
+        Method::POST,
+        "/api/docs/{id}/suggestions/{suggestion_id}/replies",
+    ),
+    (
+        Method::PATCH,
+        "/api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id}",
+    ),
+    (
+        Method::DELETE,
+        "/api/docs/{id}/suggestions/{suggestion_id}/replies/{reply_id}",
+    ),
+    // Blobs, boards and short links resolve to their page's ACL.
+    (Method::POST, "/api/docs/{doc_id}/blobs"),
+    (Method::GET, "/api/blobs/{id}"),
+    (Method::DELETE, "/api/blobs/{id}"),
+    (Method::GET, "/api/docs/{doc_id}/boards"),
+    (Method::POST, "/api/docs/{doc_id}/boards"),
+    (Method::DELETE, "/api/boards/{id}"),
+    (Method::GET, "/api/boards/{id}/svg"),
+    (Method::PUT, "/api/boards/{id}/svg"),
+    (Method::GET, "/api/short-links/{code}"),
+    // Filtered by Visibility or the doc ACL; every row has a doc.
+    (Method::GET, "/api/docs"),
+    (Method::POST, "/api/docs"),
+    (Method::GET, "/api/search"),
+    (Method::GET, "/api/workspace/tasks"),
+    // Workspace id, slug, name, role, retention: no page content.
+    (Method::GET, "/api/workspace"),
+    // Key management is SESSION_ONLY anyway; the handlers refuse keys.
+    (Method::GET, "/api/auth/api-keys"),
+    (Method::POST, "/api/auth/api-keys"),
+    (Method::DELETE, "/api/auth/api-keys/{id}"),
+    // No page content. GET /api/whats-new initialises the user's
+    // `last_seen_version` once (harmless); POST /api/whats-new/seen is denied.
+    (Method::GET, "/api/version"),
+    (Method::GET, "/api/release-notes"),
+    (Method::GET, "/api/whats-new"),
+    (Method::GET, "/api/healthz"),
+    (Method::GET, "/api/readyz"),
+];
+
+/// The answer to a subtree key on a workspace-wide route or destination.
+pub fn subtree_denied() -> Response {
+    json_err(
+        StatusCode::FORBIDDEN,
+        "api_key.subtree_denied",
+        "this API key is limited to one page and its subpages",
+    )
+}
 
 /// POST routes that are not creates, keyed by the exact axum `MatchedPath`.
 /// The ONLY place scope exceptions live.
@@ -125,14 +287,27 @@ pub fn required_scope(method: &Method, matched: &str) -> Scope {
         .unwrap_or_else(|| method_default(method))
 }
 
-/// Whether `method` on the route template `matched` refuses API keys. axum
-/// answers HEAD with the GET handler, so a GET row covers HEAD as well.
-pub fn session_only(method: &Method, matched: &str) -> bool {
-    let method = if method == Method::HEAD {
+/// axum answers HEAD with the GET handler, so HEAD is looked up as GET.
+fn head_as_get(method: &Method) -> &Method {
+    if method == Method::HEAD {
         &Method::GET
     } else {
         method
-    };
+    }
+}
+
+/// Whether a key with a scope root may call `method` on `matched`: only the
+/// rows of [`SUBTREE_OK`] (an allow-list, so a route or method added later
+/// is refused until listed).
+fn subtree_ok(method: &Method, matched: &str) -> bool {
+    let method = head_as_get(method);
+    SUBTREE_OK.iter().any(|(m, p)| m == method && *p == matched)
+}
+
+/// Whether `method` on the route template `matched` refuses API keys. axum
+/// answers HEAD with the GET handler, so a GET row covers HEAD as well.
+pub fn session_only(method: &Method, matched: &str) -> bool {
+    let method = head_as_get(method);
     SESSION_ONLY
         .iter()
         .any(|(m, p)| m == method && *p == matched)
@@ -166,6 +341,20 @@ pub async fn scope_mw(req: Request<Body>, next: Next) -> Response {
             "api_key.session_required",
             "this route needs a signed-in session, not an API key",
         );
+    }
+    let has_root = req
+        .extensions()
+        .get::<AuthContext>()
+        .is_some_and(|ctx| ctx.root_doc_id.is_some());
+    if has_root && matched.is_some_and(|m| SUBTREE_DENIED.contains(&m) || !subtree_ok(&method, m)) {
+        tracing::info!(
+            %key_id,
+            %method,
+            %route,
+            required = %"subtree",
+            "api key refused outside its subtree"
+        );
+        return subtree_denied();
     }
     // Without a MatchedPath (no route matched) the override table cannot
     // apply, so only the method default counts.
@@ -403,6 +592,76 @@ mod tests {
     }
 
     #[test]
+    fn subtree_tables_have_their_rows() {
+        assert_eq!(SUBTREE_DENIED.len(), 12);
+        assert!(
+            SUBTREE_DENIED
+                .iter()
+                .all(|p| SUBTREE_OK.iter().all(|(_, o)| o != p))
+        );
+    }
+
+    /// S10: every `/api` route is classified for subtree keys. A new route
+    /// fails here until it is added to SUBTREE_DENIED or SUBTREE_OK.
+    #[test]
+    fn every_api_route_is_classified_for_subtree_keys() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut routes = Vec::new();
+        collect_route_paths(&src, &mut routes);
+        assert!(routes.len() > 40, "route scan found too little: {routes:?}");
+        // Routes mounted through constants count, test-only routers do not.
+        for p in ["/api/docs/{id}/restore", "/api/docs/{id}/purge"] {
+            assert!(routes.iter().any(|r| r == p), "scan missed {p}");
+        }
+        let unclassified: Vec<_> = routes
+            .iter()
+            .filter(|p| {
+                !SUBTREE_DENIED.contains(&p.as_str()) && !SUBTREE_OK.iter().any(|(_, o)| o == p)
+            })
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "classify for subtree keys: {unclassified:?}"
+        );
+    }
+
+    /// The first string argument of every `.route(` call under `dir`, when
+    /// it starts with `/api/`.
+    fn collect_route_paths(dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_route_paths(&path, out);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            // Test modules sit at the end of a file, at column 0.
+            let text = text.split("\n#[cfg(test)]").next().unwrap();
+            for opener in [".route(", ": &str = "] {
+                for (at, _) in text.match_indices(opener) {
+                    let rest = text[at + opener.len()..].trim_start();
+                    let Some(rest) = rest.strip_prefix('"') else {
+                        continue;
+                    };
+                    let Some(end) = rest.find('"') else {
+                        continue;
+                    };
+                    let literal = &rest[..end];
+                    if literal.len() > "/api/".len()
+                        && literal.starts_with("/api/")
+                        && !out.iter().any(|p| p == literal)
+                    {
+                        out.push(literal.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn method_defaults_apply_outside_the_table() {
         let p = "/api/docs/{id}";
         assert_eq!(required_scope(&Method::GET, p), Scope::Read);
@@ -439,6 +698,10 @@ mod tests {
     }
 
     fn keyed(routes: Router, scopes: &[&str]) -> Router {
+        keyed_with_root(routes, scopes, None)
+    }
+
+    fn keyed_with_root(routes: Router, scopes: &[&str], root_doc_id: Option<Uuid>) -> Router {
         let scopes =
             Scopes::from_names(&scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
         routes
@@ -450,6 +713,7 @@ mod tests {
                         user_id: Uuid::nil(),
                         workspace_id: Uuid::nil(),
                         role: WorkspaceRole::Editor,
+                        root_doc_id,
                     });
                     req.extensions_mut().insert(ApiPrincipal {
                         key_id: Uuid::nil(),
@@ -594,6 +858,40 @@ mod tests {
         assert_eq!(logs.text(), "");
     }
 
+    /// S10: a route or method outside SUBTREE_OK is refused for a key with a
+    /// root, at runtime; a key without one reaches the handler.
+    #[tokio::test]
+    async fn subtree_key_is_refused_outside_subtree_ok() {
+        let routes = || Router::new().route("/api/not-listed", post(|| async { "ran" }));
+        let (status, v) = call(
+            keyed_with_root(routes(), &["create"], Some(Uuid::nil())),
+            "/api/not-listed",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(v["error"]["code"], "api_key.subtree_denied");
+        let (status, _) = call(keyed(routes(), &["create"]), "/api/not-listed").await;
+        assert_eq!(status, StatusCode::OK);
+        // A listed row passes; the same path with another method does not.
+        let listed = || {
+            Router::new().route(
+                "/api/docs",
+                post(|| async { "ran" })
+                    .get(|| async { "ran" })
+                    .delete(|| async { "ran" }),
+            )
+        };
+        let root = Some(Uuid::nil());
+        let (status, _) = call(keyed_with_root(listed(), &["create"], root), "/api/docs").await;
+        assert_eq!(status, StatusCode::OK);
+        let req = request(Method::DELETE, "/api/docs");
+        let resp = keyed_with_root(listed(), &["delete"], root)
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn cookie_session_without_principal_is_not_scope_limited_but_csrf_checked() {
         let app = Router::new()
@@ -606,6 +904,7 @@ mod tests {
                         user_id: Uuid::nil(),
                         workspace_id: Uuid::nil(),
                         role: WorkspaceRole::Editor,
+                        root_doc_id: None,
                     });
                     next.run(req).await
                 },

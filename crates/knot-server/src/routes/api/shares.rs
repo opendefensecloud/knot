@@ -42,7 +42,7 @@ async fn require_owner(state: &AppState, ctx: &AuthContext, doc_id: Uuid) -> Opt
         return Some(json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", ""));
     };
     match acl
-        .effective_role(ctx.workspace_id, doc_id, ctx.user_id)
+        .effective_role(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
         .await
     {
         Ok(Some(knot_storage::WorkspaceRole::Owner)) => None,
@@ -65,7 +65,10 @@ async fn refuse_if_restricted(
     let Some(acl) = state.acl.clone() else {
         return Some(json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", ""));
     };
-    match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
+    match acl
+        .access(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(Some(access)) if access.restriction_root.is_some() => Some(json_err(
             StatusCode::CONFLICT,
             "share.restricted",
@@ -89,8 +92,14 @@ async fn create(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Re
     }
     // No new public links to an archived doc; existing ones stop resolving
     // (see `ShareTokenStore::find_alive`) and can still be listed and revoked.
-    if let Some(r) =
-        crate::archive::refuse_if_archived(&state, ctx.workspace_id, doc_id, ctx.user_id).await
+    if let Some(r) = crate::archive::refuse_if_archived(
+        &state,
+        ctx.workspace_id,
+        doc_id,
+        ctx.user_id,
+        ctx.root_doc_id,
+    )
+    .await
     {
         return r;
     }

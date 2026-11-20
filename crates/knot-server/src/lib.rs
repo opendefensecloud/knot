@@ -475,7 +475,10 @@ async fn collab_upgrade(
     // Before the access check: a revoke after this read and before the
     // join, which could miss the connection, changes it (`room::serve`).
     let acl_epoch_at_check = rooms.acl_epoch(doc_id);
-    let can_write = match acl.access(ctx.workspace_id, doc_id, ctx.user_id).await {
+    let can_write = match acl
+        .access(ctx.workspace_id, doc_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(access) => match collab_write_access(access) {
             Ok(can_write) => can_write,
             Err(status) => return (status, "acl.no_grant").into_response(),
@@ -546,7 +549,7 @@ async fn collab_board_upgrade(
     // refused for viewers and for every board of an archived doc (whose
     // read-only preview shows boards through their cached SVG).
     match acl
-        .access(ctx.workspace_id, board.doc_id, ctx.user_id)
+        .access(ctx.workspace_id, board.doc_id, ctx.user_id, ctx.root_doc_id)
         .await
     {
         Ok(Some(access)) if access.can_write() => {}

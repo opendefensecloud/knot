@@ -63,7 +63,10 @@ async fn search(
 
     // A cached snapshot may predate a doc, which is then not in the hidden
     // set; the per-hit re-check below still drops it if unreadable.
-    let hidden_ids = match acl.visibility(ctx.workspace_id, ctx.user_id).await {
+    let hidden_ids = match acl
+        .visibility(ctx.workspace_id, ctx.user_id, ctx.root_doc_id)
+        .await
+    {
         Ok(visibility) => visibility.hidden_ids(),
         Err(e) => {
             tracing::error!(error=?e, "search visibility");
@@ -86,7 +89,7 @@ async fn search(
             continue;
         }
         match acl
-            .effective_role(ctx.workspace_id, hit.doc_id, ctx.user_id)
+            .effective_role(ctx.workspace_id, hit.doc_id, ctx.user_id, ctx.root_doc_id)
             .await
         {
             Ok(Some(_)) => allowed.push(hit),
@@ -104,7 +107,7 @@ async fn search(
         .flat_map(|hit| std::iter::once(hit.doc_id).chain(hit.parent_id))
         .collect();
     let visibility = match acl
-        .visibility_covering(ctx.workspace_id, ctx.user_id, &listed_ids)
+        .visibility_covering(ctx.workspace_id, ctx.user_id, ctx.root_doc_id, &listed_ids)
         .await
     {
         Ok(visibility) => visibility,

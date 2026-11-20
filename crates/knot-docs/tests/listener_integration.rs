@@ -43,7 +43,7 @@ async fn grant_change_evicts_cache_entry() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Prime the cache via a read.
-    let r1 = cache.effective_role(ws.id, d.id, u.id).await.unwrap();
+    let r1 = cache.effective_role(ws.id, d.id, u.id, None).await.unwrap();
     assert_eq!(r1, Some(WorkspaceRole::Viewer));
 
     // Grant upgrade emits NOTIFY (via GrantStore::put → invalidations::record_in_tx).
@@ -62,7 +62,7 @@ async fn grant_change_evicts_cache_entry() {
 
     // Re-resolve — the cache entry for (doc, user) should have been evicted,
     // so the read goes back to GrantStore and sees the new role.
-    let r2 = cache.effective_role(ws.id, d.id, u.id).await.unwrap();
+    let r2 = cache.effective_role(ws.id, d.id, u.id, None).await.unwrap();
     assert_eq!(r2, Some(WorkspaceRole::Owner));
 }
 
@@ -101,11 +101,17 @@ async fn grant_change_on_parent_evicts_descendants() {
 
     // Prime BOTH cache entries.
     assert_eq!(
-        cache.effective_role(ws.id, parent.id, u.id).await.unwrap(),
+        cache
+            .effective_role(ws.id, parent.id, u.id, None)
+            .await
+            .unwrap(),
         Some(WorkspaceRole::Viewer)
     );
     assert_eq!(
-        cache.effective_role(ws.id, child.id, u.id).await.unwrap(),
+        cache
+            .effective_role(ws.id, child.id, u.id, None)
+            .await
+            .unwrap(),
         Some(WorkspaceRole::Viewer)
     );
 
@@ -125,11 +131,17 @@ async fn grant_change_on_parent_evicts_descendants() {
     // Both parent AND child should now resolve to Owner. If subtree
     // eviction failed, the child entry would still serve the cached Viewer.
     assert_eq!(
-        cache.effective_role(ws.id, parent.id, u.id).await.unwrap(),
+        cache
+            .effective_role(ws.id, parent.id, u.id, None)
+            .await
+            .unwrap(),
         Some(WorkspaceRole::Owner)
     );
     assert_eq!(
-        cache.effective_role(ws.id, child.id, u.id).await.unwrap(),
+        cache
+            .effective_role(ws.id, child.id, u.id, None)
+            .await
+            .unwrap(),
         Some(WorkspaceRole::Owner),
         "child entry must be evicted on parent grant change"
     );
@@ -176,14 +188,14 @@ async fn restrict_toggle_evicts_descendants_and_calls_on_invalidate() {
     // Prime the per-doc and the batched caches with the unrestricted state.
     assert_eq!(
         cache
-            .effective_role(ws.id, child.id, owner.id)
+            .effective_role(ws.id, child.id, owner.id, None)
             .await
             .unwrap(),
         Some(WorkspaceRole::Owner)
     );
     assert!(
         cache
-            .visibility(ws.id, owner.id)
+            .visibility(ws.id, owner.id, None)
             .await
             .unwrap()
             .readable(child.id)
@@ -216,12 +228,12 @@ async fn restrict_toggle_evicts_descendants_and_calls_on_invalidate() {
     // caches now hide the subtree.
     assert_eq!(
         cache
-            .effective_role(ws.id, child.id, owner.id)
+            .effective_role(ws.id, child.id, owner.id, None)
             .await
             .unwrap(),
         None
     );
-    let visibility = cache.visibility(ws.id, owner.id).await.unwrap();
+    let visibility = cache.visibility(ws.id, owner.id, None).await.unwrap();
     assert!(!visibility.readable(parent.id));
     assert!(!visibility.readable(child.id));
 }
@@ -327,7 +339,7 @@ async fn lost_connection_evicts_all_and_rechecks_every_socket() {
     wait_for_listener(&pool).await;
     assert_eq!(
         cache
-            .effective_role(workspace_id, doc_id, member_id)
+            .effective_role(workspace_id, doc_id, member_id, None)
             .await
             .unwrap(),
         Some(WorkspaceRole::Owner)
@@ -351,7 +363,7 @@ async fn lost_connection_evicts_all_and_rechecks_every_socket() {
     wait_for_invalidate_all(&invalidate_all_calls, calls_before_loss).await;
     assert_eq!(
         cache
-            .effective_role(workspace_id, doc_id, member_id)
+            .effective_role(workspace_id, doc_id, member_id, None)
             .await
             .unwrap(),
         Some(WorkspaceRole::Viewer),
@@ -410,7 +422,7 @@ async fn role_change_evicts_all_and_rechecks_every_socket() {
     wait_for_listener(&pool).await;
     assert_eq!(
         cache
-            .effective_role(workspace_id, doc_id, member_id)
+            .effective_role(workspace_id, doc_id, member_id, None)
             .await
             .unwrap(),
         Some(WorkspaceRole::Owner)
@@ -425,7 +437,7 @@ async fn role_change_evicts_all_and_rechecks_every_socket() {
     wait_for_invalidate_all(&invalidate_all_calls, calls_before_demotion).await;
     assert_eq!(
         cache
-            .effective_role(workspace_id, doc_id, member_id)
+            .effective_role(workspace_id, doc_id, member_id, None)
             .await
             .unwrap(),
         Some(WorkspaceRole::Viewer),

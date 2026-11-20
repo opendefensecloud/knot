@@ -11,8 +11,8 @@ workspace a credential-less member (a bot) for automation. Nothing a key can
 do may outlive the key, take over the account, or widen its own access.
 
 **Not in scope:** token exchange for OIDC, per-document scoping of a key
-(a key acts with the full page access of its user, narrowed only by HTTP
-scope), key rotation, `POST /auth/*` with a key, and the live-editing
+(since added as subtree scoping, see
+[2026-11-13-subtree-scoped-api-keys-design.md](2026-11-13-subtree-scoped-api-keys-design.md)), key rotation, `POST /auth/*` with a key, and the live-editing
 websocket.
 
 ## Threat model

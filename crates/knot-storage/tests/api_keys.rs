@@ -2,8 +2,9 @@
 
 use chrono::{Duration, Utc};
 use knot_storage::{
-    ApiKey, ApiKeyStore, ApiKeyStoreError, NewApiKey, PgApiKeyStore, PgSessionStore, PgUserStore,
-    PgWorkspaceStore, Scope, Scopes, SessionStore, UserStore, WorkspaceRole, WorkspaceStore,
+    ApiKey, ApiKeyStore, ApiKeyStoreError, DocStore, NewApiKey, PgApiKeyStore, PgDocStore,
+    PgSessionStore, PgUserStore, PgWorkspaceStore, Scope, Scopes, SessionStore, UserStore,
+    WorkspaceRole, WorkspaceStore,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -74,6 +75,7 @@ async fn mint_by(
             created_by,
             expires_at,
             session_hash,
+            root_doc_id: None,
         })
         .await
 }
@@ -142,6 +144,7 @@ async fn create_then_list_round_trips_without_hash_leak() {
         expires_at: _,
         last_used_at: _,
         revoked_at: _,
+        root_doc_id: _,
     } = first;
     assert_eq!(created_by, fx.alice);
     // And the hash bytes never appear in the Debug rendering of a row.
@@ -596,6 +599,7 @@ async fn mint_waits_for_an_inflight_removal_and_is_refused() {
                 created_by: alice,
                 expires_at: None,
                 session_hash: None,
+                root_doc_id: None,
             })
             .await
     });
@@ -655,6 +659,7 @@ async fn mint_waits_for_an_inflight_password_change_and_is_refused() {
                 created_by: bob,
                 expires_at: None,
                 session_hash: Some(&[7u8; 32]),
+                root_doc_id: None,
             })
             .await
     });
@@ -713,4 +718,117 @@ async fn removal_waits_for_an_inflight_mint_and_revokes_its_key() {
             .await
             .unwrap();
     assert!(revoked.is_some(), "the key minted under the lock survived");
+}
+
+async fn create_doc(fx: &Fx, parent: Option<Uuid>, title: &str) -> Uuid {
+    create_doc_in(fx, fx.ws, parent, title).await
+}
+
+async fn create_doc_in(fx: &Fx, ws: Uuid, parent: Option<Uuid>, title: &str) -> Uuid {
+    PgDocStore::new(fx.pool.clone())
+        .create(ws, parent, title, title, fx.alice)
+        .await
+        .unwrap()
+        .id
+}
+
+async fn mint_rooted(
+    fx: &Fx,
+    user_id: Uuid,
+    hash: &[u8],
+    root: Option<Uuid>,
+) -> Result<ApiKey, ApiKeyStoreError> {
+    let s = scopes(&["read"]);
+    fx.store
+        .create(NewApiKey {
+            workspace_id: fx.ws,
+            user_id,
+            name: "rooted",
+            key_hash: hash,
+            scopes: &s,
+            created_by: user_id,
+            expires_at: None,
+            session_hash: None,
+            root_doc_id: root,
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn root_doc_round_trips_and_is_found_by_hash() {
+    let fx = setup().await;
+    let root = create_doc(&fx, None, "Project").await;
+    let k = mint_rooted(&fx, fx.alice, b"h-root", Some(root))
+        .await
+        .unwrap();
+    assert_eq!(k.root_doc_id, Some(root));
+    let found = fx
+        .store
+        .find_live_by_hash(b"h-root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.root_doc_id, Some(root));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn purging_the_root_deletes_the_key() {
+    let fx = setup().await;
+    let root = create_doc(&fx, None, "Project").await;
+    mint_rooted(&fx, fx.alice, b"h-purge", Some(root))
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(root)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    assert!(
+        fx.store
+            .find_live_by_hash(b"h-purge")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM api_keys WHERE key_hash = $1")
+        .bind(b"h-purge".as_slice())
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "SET NULL would have widened the key to the workspace"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kb005_refuses_a_foreign_root_and_any_root_change() {
+    let fx = setup().await;
+    let other_ws = PgWorkspaceStore::new(fx.pool.clone())
+        .create("other", "Other")
+        .await
+        .unwrap();
+    let foreign = create_doc_in(&fx, other_ws.id, None, "Foreign").await;
+    let err = mint_rooted(&fx, fx.alice, b"h-foreign", Some(foreign))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiKeyStoreError::RootRejected), "{err:?}");
+
+    let root = create_doc(&fx, None, "A").await;
+    let other = create_doc(&fx, None, "B").await;
+    let k = mint_rooted(&fx, fx.alice, b"h-change", Some(root))
+        .await
+        .unwrap();
+    for new_root in [Some(other), None] {
+        let err = sqlx::query("UPDATE api_keys SET root_doc_id = $1 WHERE id = $2")
+            .bind(new_root)
+            .bind(k.id)
+            .execute(&fx.pool)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_database_error().unwrap().code().as_deref(),
+            Some("KB005")
+        );
+    }
 }

@@ -26,7 +26,7 @@ import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import { type NavigateFunction } from "react-router-dom";
 
-const DOC_HREF_PREFIX = "knot://doc/";
+export const DOC_HREF_PREFIX = "knot://doc/";
 const USER_HREF_PREFIX = "knot://user/";
 const TIME_HREF_PREFIX = "knot://time/";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

@@ -85,6 +85,8 @@ const REGISTERED_EXTENSIONS = [
   // Plugin-only: node decorations giving each <ol> its widest marker's digit
   // count, for the stylesheet's marker gutter. View-only; no document change.
   "knotOrderedListMarkerGutter",
+  // Suggestion-only: `[[` inserts the ordinary link mark; no document change.
+  "knotPageLink",
   "knotTaskList",
   // Keymap-only: End/Home move the DOM selection on a Mac; no document change.
   "lineBoundaryKeys",
@@ -359,6 +361,7 @@ const CREATE_EXTENSIONS_ORDER = [
   "knotInternalLink",
   "knotMention",
   "knotDateTime",
+  "knotPageLink",
   "lineBoundaryKeys",
   "table",
   "table_row",
