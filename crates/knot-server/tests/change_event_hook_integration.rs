@@ -321,28 +321,33 @@ async fn reconnects_after_each_drop_and_streams_page_ids() {
 
             // (at, doc_id, kind) — one window shares one `at`.
             let mut seen: HashSet<(String, Uuid, String)> = HashSet::new();
+            // Keep reading until a full window plus the start of the next
+            // were seen (two distinct `at`) and a known page id arrived.
+            let mut ats: HashSet<String> = HashSet::new();
+            let mut saw_known = false;
             timeout(CYCLE, async {
                 loop {
                     let ev = next_json(&mut ws).await;
                     assert_eq!(ev["type"], "page_changed", "{ev}");
                     assert_eq!(uuid_of(&ev, "workspace_id"), workspace_id);
                     let doc = uuid_of(&ev, "doc_id");
-                    let key = (
-                        ev["at"].as_str().unwrap().to_string(),
-                        doc,
-                        ev["kind"].as_str().unwrap().to_string(),
-                    );
+                    let at = ev["at"].as_str().unwrap().to_string();
+                    ats.insert(at.clone());
+                    let key = (at, doc, ev["kind"].as_str().unwrap().to_string());
                     assert!(
                         seen.insert(key.clone()),
                         "cycle {cycle}: {key:?} twice in one window"
                     );
-                    if known.contains(&doc) {
+                    saw_known |= known.contains(&doc);
+                    if saw_known && ats.len() >= 2 {
                         break;
                     }
                 }
             })
             .await
-            .unwrap_or_else(|_| panic!("cycle {cycle}: no page id in time"));
+            .unwrap_or_else(|_| {
+                panic!("cycle {cycle}: no page id / second window in time (ats {ats:?})")
+            });
 
             if cycle % 2 == 0 {
                 // Abrupt: the TCP connection goes away without a close frame.
