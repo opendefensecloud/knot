@@ -717,3 +717,60 @@ async fn purge_inside_window_drops_content_event() {
         "content of a purged page: {kinds:?}"
     );
 }
+
+/// Spec D5: two replicas on one database, each with its own hook
+/// connection. An edit is reported by the replica it happened on only,
+/// although the other replica's room receives it over the bus.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_pod_reports_only_its_own_edits() {
+    let window = Duration::from_millis(200);
+    let db = knot_test_support::fresh_db().await;
+    seed(&db.pool).await;
+    let (listener_a, url_a) = receiver().await;
+    let (listener_b, url_b) = receiver().await;
+    let (dirty_b_tx, mut dirty_b) = tokio::sync::mpsc::channel(64);
+    let a = pod(&db, Some(test_hook(&url_a).window(window))).await;
+    let b = pod_with(
+        &db,
+        Some(test_hook(&url_b).window(window)),
+        Some(dirty_b_tx),
+    )
+    .await;
+    let mut ws_a = accept(&listener_a).await;
+    let mut ws_b = accept(&listener_b).await;
+    assert_ne!(
+        expect_hello(&mut ws_a).await,
+        expect_hello(&mut ws_b).await,
+        "two processes"
+    );
+
+    let doc = create_doc(&a, "shared", None).await;
+    expect_kinds(&mut ws_a, "created", &[doc]).await;
+    // B has the page open, so it receives A's rows over the bus.
+    let _room_b = b
+        .state
+        .rooms_v2
+        .as_ref()
+        .unwrap()
+        .acquire(doc)
+        .await
+        .unwrap();
+
+    edit(&a.app, &a.session, doc, "from A").await;
+    expect_kinds(&mut ws_a, "content", &[doc]).await;
+    let got = timeout(CYCLE, dirty_b.recv())
+        .await
+        .expect("B's room received A's edit");
+    assert_eq!(got, Some(doc));
+    assert!(
+        timeout(window * 3, next_json(&mut ws_b)).await.is_err(),
+        "B must not report A's edit"
+    );
+
+    edit(&b.app, &b.session, doc, "from B").await;
+    expect_kinds(&mut ws_b, "content", &[doc]).await;
+    assert!(
+        timeout(window * 3, next_json(&mut ws_a)).await.is_err(),
+        "A must not report B's edit"
+    );
+}
