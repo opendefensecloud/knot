@@ -51,7 +51,7 @@ then `page_changed` frames.
 | `doc_id` | UUID of the page. |
 | `workspace_id` | UUID of the workspace the page belongs to. Events cover every workspace. |
 | `kind` | What happened; see below. |
-| `at` | Time the batch was sent (RFC 3339, UTC). All events sent from one window share it. |
+| `at` | Time the coalescing window closed (RFC 3339, UTC). All events from one window share it. |
 
 `kind` is one of:
 
@@ -141,7 +141,7 @@ Log lines, from the `knot-server` process:
 
 | Level | Message | Meaning |
 |-------|---------|---------|
-| info | `change event hook: connected` | A connection is open and `hello` is sent. |
+| info | `change event hook: connected` | A connection is open. The line is logged just before `hello` is sent. |
 | warn | `change event hook: connect failed` | The attempt failed; the line carries the error. A timeout logs `connect timed out`. |
 | warn | `change event hook: connection lost, reconnecting` | An open connection ended. |
 | warn | `change event hook: receiver stopped answering pings` | Two pings went unanswered. |

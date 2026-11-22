@@ -193,6 +193,8 @@ async fn session(
         tokio::time::Instant::now() + cfg.ping_interval,
         cfg.ping_interval,
     );
+    // A slow send must not make missed ticks fire back to back.
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut unanswered = 0u32;
     loop {
         tokio::select! {
