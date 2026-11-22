@@ -45,6 +45,19 @@ pub enum WireMessage {
     },
 }
 
+/// One window's events, tagged with the connection they were flushed for.
+///
+/// `epoch` is the connection generation the coalescer saw when it checked
+/// that the hook is connected (`conn::run` numbers its connections from 1;
+/// 0 means disconnected). A session sends only batches of its own epoch, so
+/// a batch flushed for a connection that dropped meanwhile is never sent on
+/// the next one (spec D8: nothing buffered across a reconnect).
+#[derive(Debug)]
+pub(super) struct Batch {
+    pub epoch: u64,
+    pub messages: Vec<WireMessage>,
+}
+
 /// A lifecycle change as handlers report it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Lifecycle {
@@ -120,8 +133,8 @@ impl Hook {
         let instance_id = Uuid::new_v4();
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(self.queue_capacity);
         let (content_tx, content_rx) = mpsc::channel(self.queue_capacity);
-        let (batch_tx, batch_rx) = mpsc::channel::<Vec<WireMessage>>(16);
-        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (batch_tx, batch_rx) = mpsc::channel::<Batch>(16);
+        let connected = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let auth = self.token.as_deref().and_then(|t| {
             tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!("Bearer {t}"))
                 .map_err(|_| {

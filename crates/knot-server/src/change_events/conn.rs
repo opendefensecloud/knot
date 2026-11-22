@@ -2,7 +2,7 @@
 //! reconnect with backoff.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -17,7 +17,7 @@ use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::WireMessage;
+use super::{Batch, WireMessage};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -77,9 +77,10 @@ enum End {
     Shutdown,
 }
 
-fn set_connected(flag: &AtomicBool, up: bool) {
-    flag.store(up, Ordering::Release);
-    metrics::gauge!("knot_change_event_hook_connected").set(if up { 1.0 } else { 0.0 });
+/// Publish the current connection generation (0: disconnected).
+fn set_connected(flag: &AtomicU64, epoch: u64) {
+    flag.store(epoch, Ordering::Release);
+    metrics::gauge!("knot_change_event_hook_connected").set(if epoch != 0 { 1.0 } else { 0.0 });
 }
 
 async fn connect(cfg: &ConnConfig) -> Result<Socket, tokio_tungstenite::tungstenite::Error> {
@@ -99,12 +100,14 @@ async fn connect(cfg: &ConnConfig) -> Result<Socket, tokio_tungstenite::tungsten
 
 pub(super) async fn run(
     cfg: ConnConfig,
-    mut batches: mpsc::Receiver<Vec<WireMessage>>,
-    connected: Arc<AtomicBool>,
+    mut batches: mpsc::Receiver<Batch>,
+    connected: Arc<AtomicU64>,
     shutdown: CancellationToken,
 ) {
     let mut backoff = Backoff::new(cfg.backoff_min, cfg.backoff_max);
-    set_connected(&connected, false);
+    // Connection generations, from 1; each connection gets a fresh one.
+    let mut epoch = 0u64;
+    set_connected(&connected, 0);
     loop {
         let attempt = tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -116,13 +119,16 @@ pub(super) async fn run(
                     .increment(1);
                 tracing::info!("change event hook: connected");
                 backoff.reset();
-                set_connected(&connected, true);
-                let end = session(socket, &cfg, &mut batches, &shutdown).await;
-                set_connected(&connected, false);
-                // Nothing is carried over to the next connection.
+                epoch += 1;
+                set_connected(&connected, epoch);
+                let end = session(socket, epoch, &cfg, &mut batches, &shutdown).await;
+                set_connected(&connected, 0);
+                // Nothing is carried over to the next connection. A batch the
+                // coalescer is still flushing for this epoch can land after
+                // this drain; the next session drops it by its epoch.
                 let mut lost = 0usize;
                 while let Ok(batch) = batches.try_recv() {
-                    lost += batch.len();
+                    lost += batch.messages.len();
                 }
                 if lost > 0 {
                     metrics::counter!(
@@ -170,8 +176,9 @@ async fn goodbye(mut socket: Socket) -> End {
 
 async fn session(
     mut socket: Socket,
+    epoch: u64,
     cfg: &ConnConfig,
-    batches: &mut mpsc::Receiver<Vec<WireMessage>>,
+    batches: &mut mpsc::Receiver<Batch>,
     shutdown: &CancellationToken,
 ) -> End {
     let hello = WireMessage::Hello {
@@ -194,8 +201,17 @@ async fn session(
                 // The coalescer ends on shutdown too, so this races the arm
                 // above: say goodbye either way.
                 let Some(batch) = batch else { return goodbye(socket).await };
-                let total = batch.len();
-                for (i, msg) in batch.into_iter().enumerate() {
+                let total = batch.messages.len();
+                if batch.epoch != epoch {
+                    // Flushed for an earlier connection: never sent on this one.
+                    metrics::counter!(
+                        "knot_change_event_hook_events_dropped_total",
+                        "reason" => "disconnected"
+                    )
+                    .increment(total as u64);
+                    continue;
+                }
+                for (i, msg) in batch.messages.into_iter().enumerate() {
                     let text = serde_json::to_string(&msg).expect("event serializes");
                     if !send(&mut socket, Message::text(text), cfg).await {
                         metrics::counter!(
@@ -249,5 +265,87 @@ mod tests {
         }
         b.reset();
         assert!(b.next() <= min);
+    }
+
+    async fn next_text(ws: &mut WebSocketStream<TcpStream>) -> serde_json::Value {
+        loop {
+            match ws.next().await.expect("open").expect("frame") {
+                Message::Text(t) => return serde_json::from_str(t.as_str()).unwrap(),
+                Message::Ping(_) | Message::Pong(_) => continue,
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    }
+
+    async fn accept(listener: &tokio::net::TcpListener) -> WebSocketStream<TcpStream> {
+        let (tcp, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("hook connected in time")
+            .unwrap();
+        tokio_tungstenite::accept_async(tcp).await.unwrap()
+    }
+
+    fn event(doc_id: Uuid) -> WireMessage {
+        WireMessage::PageChanged {
+            doc_id,
+            workspace_id: Uuid::nil(),
+            kind: super::super::ChangeKind::Content,
+            at: chrono::Utc::now(),
+        }
+    }
+
+    /// Spec D8: a batch the coalescer flushed for a connection that has
+    /// dropped since (it checked `connected` before the drop, sent after the
+    /// drain) is not sent on the next connection.
+    #[tokio::test]
+    async fn a_batch_of_an_earlier_connection_is_not_sent_on_the_next() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = ConnConfig {
+            url: format!("ws://{}", listener.local_addr().unwrap()),
+            auth: None,
+            instance_id: Uuid::new_v4(),
+            backoff_min: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(10),
+            ping_interval: Duration::from_secs(3600),
+            connect_timeout: Duration::from_secs(5),
+            send_timeout: Duration::from_secs(5),
+            tls: tls_config(),
+        };
+        let (tx, rx) = mpsc::channel(16);
+        let connected = Arc::new(AtomicU64::new(0));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run(cfg, rx, connected.clone(), shutdown.clone()));
+
+        let mut first = accept(&listener).await;
+        assert_eq!(next_text(&mut first).await["type"], "hello");
+        let stale = connected.load(Ordering::Acquire);
+        assert_ne!(stale, 0, "connected during the first session");
+        drop(first);
+
+        let mut second = accept(&listener).await;
+        assert_eq!(next_text(&mut second).await["type"], "hello");
+        let current = connected.load(Ordering::Acquire);
+        assert!(current != 0 && current != stale, "{stale} -> {current}");
+
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        tx.send(Batch {
+            epoch: stale,
+            messages: vec![event(old)],
+        })
+        .await
+        .unwrap();
+        tx.send(Batch {
+            epoch: current,
+            messages: vec![event(new)],
+        })
+        .await
+        .unwrap();
+        let got = timeout(Duration::from_secs(5), next_text(&mut second))
+            .await
+            .expect("event in time");
+        assert_eq!(got["doc_id"], new.to_string(), "{got}");
+
+        shutdown.cancel();
+        task.await.unwrap();
     }
 }

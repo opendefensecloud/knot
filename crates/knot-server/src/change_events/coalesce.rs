@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use knot_storage::DocStore;
@@ -12,7 +12,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{ChangeKind, Lifecycle, WireMessage};
+use super::{Batch, ChangeKind, Lifecycle, WireMessage};
 
 /// The changes of the open window, in arrival order, one per (doc, kind).
 pub(super) struct Pending {
@@ -78,14 +78,17 @@ fn dropped(reason: &'static str, n: usize) {
 }
 
 /// Close the window: resolve workspaces of content changes (a page gone
-/// by now, e.g. purged, is skipped) and hand the batch to the connection.
+/// by now, e.g. purged, is skipped) and hand the batch to the connection,
+/// tagged with the connection generation checked here: should that
+/// connection end while this awaits, its successor drops the batch.
 async fn flush(
     batch: Vec<(Uuid, ChangeKind, Option<Uuid>)>,
-    out: &mpsc::Sender<Vec<WireMessage>>,
-    connected: &AtomicBool,
+    out: &mpsc::Sender<Batch>,
+    connected: &AtomicU64,
     docs: &dyn DocStore,
 ) {
-    if !connected.load(Ordering::Acquire) {
+    let epoch = connected.load(Ordering::Acquire);
+    if epoch == 0 {
         dropped("disconnected", batch.len());
         return;
     }
@@ -118,7 +121,7 @@ async fn flush(
         return;
     }
     let n = messages.len();
-    match out.try_send(messages) {
+    match out.try_send(Batch { epoch, messages }) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => dropped("queue_full", n),
         Err(mpsc::error::TrySendError::Closed(_)) => dropped("disconnected", n),
@@ -128,8 +131,8 @@ async fn flush(
 pub(super) async fn run(
     mut lifecycle_rx: mpsc::Receiver<Lifecycle>,
     mut content_rx: mpsc::Receiver<Uuid>,
-    out: mpsc::Sender<Vec<WireMessage>>,
-    connected: Arc<AtomicBool>,
+    out: mpsc::Sender<Batch>,
+    connected: Arc<AtomicU64>,
     docs: Arc<dyn DocStore>,
     window: Duration,
     shutdown: CancellationToken,
@@ -160,6 +163,41 @@ mod tests {
     use uuid::Uuid;
 
     use crate::change_events::ChangeKind;
+
+    /// The batch carries the connection generation `flush` checked, and
+    /// nothing is handed over while disconnected (generation 0).
+    #[tokio::test]
+    async fn flush_tags_the_batch_with_the_connection_epoch() {
+        // Never queried: every change below knows its workspace.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .unwrap();
+        let docs = knot_storage::PgDocStore::new(pool);
+        let (tx, mut rx) = mpsc::channel(4);
+        let connected = AtomicU64::new(7);
+        let (doc, ws) = (Uuid::new_v4(), Uuid::new_v4());
+
+        flush(
+            vec![(doc, ChangeKind::Created, Some(ws))],
+            &tx,
+            &connected,
+            &docs,
+        )
+        .await;
+        let batch = rx.try_recv().expect("a batch");
+        assert_eq!(batch.epoch, 7);
+        assert_eq!(batch.messages.len(), 1);
+
+        connected.store(0, Ordering::Release);
+        flush(
+            vec![(doc, ChangeKind::Created, Some(ws))],
+            &tx,
+            &connected,
+            &docs,
+        )
+        .await;
+        assert!(rx.try_recv().is_err(), "nothing sent while disconnected");
+    }
 
     #[test]
     fn dedupes_per_doc_and_kind_and_keeps_order() {
