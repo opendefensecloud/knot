@@ -452,6 +452,9 @@ pub struct Room {
     /// Fires after the writer confirms a successful persist; consumers
     /// debounce + reindex tasks for the doc.
     dirty_tx: Option<mpsc::Sender<Uuid>>,
+    /// Change event hook notifier (see [`crate::Rooms::with_local_change_tx`]).
+    /// Fires only in [`Room::on_applied`]: updates this replica persisted.
+    local_change_tx: Option<mpsc::Sender<Uuid>>,
     /// Set when the room evicts itself after applying an update it then
     /// refused: one that nested the page past
     /// [`crate::nesting::MAX_NESTING`] (the authoritative post-apply check),
@@ -527,6 +530,7 @@ struct RoomDeps {
     snapshots: Arc<dyn knot_storage::SnapshotStore>,
     policy: crate::snapshot::SnapshotPolicy,
     dirty_tx: Option<mpsc::Sender<Uuid>>,
+    local_change_tx: Option<mpsc::Sender<Uuid>>,
 }
 
 impl Room {
@@ -554,6 +558,7 @@ impl Room {
             snapshots,
             policy,
             dirty_tx,
+            None,
             WriterLimits::default(),
         )
         .await
@@ -570,6 +575,7 @@ impl Room {
         snapshots: Arc<dyn knot_storage::SnapshotStore>,
         policy: crate::snapshot::SnapshotPolicy,
         dirty_tx: Option<mpsc::Sender<Uuid>>,
+        local_change_tx: Option<mpsc::Sender<Uuid>>,
         limits: WriterLimits,
     ) -> Result<RoomHandle, BootError> {
         let deps = RoomDeps {
@@ -581,6 +587,7 @@ impl Room {
             snapshots,
             policy,
             dirty_tx,
+            local_change_tx,
         };
         let booted = Self::boot(&deps).await?;
         let (persist_tx, persist_rx) = mpsc::channel::<PersistJob>(1024);
@@ -636,6 +643,7 @@ impl Room {
             snapshots,
             policy,
             dirty_tx,
+            local_change_tx: None,
         };
         let booted = Self::boot(&deps).await?;
         let (persist_tx, persist_rx) = mpsc::channel::<PersistJob>(1024);
@@ -723,6 +731,7 @@ impl Room {
             policy: deps.policy,
             snap_state,
             dirty_tx: deps.dirty_tx,
+            local_change_tx: deps.local_change_tx,
             evicted: false,
             parked: booted.parked,
             in_flight_parked: VecDeque::new(),
@@ -1344,6 +1353,12 @@ impl Room {
         // content. `try_send` so a full channel is dropped — the next
         // applied update will refire.
         if let Some(tx) = &self.dirty_tx {
+            let _ = tx.try_send(self.doc_id);
+        }
+        // The change event hook: only this replica's own persists, so a
+        // change is reported by the pod it happened on (spec D5). Not in
+        // the bus path below.
+        if let Some(tx) = &self.local_change_tx {
             let _ = tx.try_send(self.doc_id);
         }
         if self.snap_state.updates_since_snapshot >= self.policy.every_n {
@@ -5124,6 +5139,7 @@ pub(crate) mod tests {
             log.clone(),
             Arc::new(Stamps::default()),
             IDLE,
+            None,
             None,
             WriterLimits {
                 server_job_deadline: std::time::Duration::from_millis(300),

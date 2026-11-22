@@ -126,8 +126,6 @@ pub struct Rooms {
     /// Optional notifier fired with the room's `doc_id` after each persist
     /// of an update applied **on this replica** (never for rows received
     /// over the bus). Feeds the change event hook in knot-server.
-    // read in Task 2
-    #[allow(dead_code)]
     local_change_tx: Option<mpsc::Sender<Uuid>>,
     acl_epochs: AclEpochs,
     writer_limits: WriterLimits,
@@ -242,6 +240,7 @@ impl Rooms {
             self.snapshots.clone(),
             self.policy,
             self.dirty_tx.clone(),
+            self.local_change_tx.clone(),
             self.writer_limits,
         )
         .await?;

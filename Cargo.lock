@@ -2025,6 +2025,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "knot-history",
+ "knot-markdown",
  "knot-storage",
  "knot-test-support",
  "metrics",
