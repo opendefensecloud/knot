@@ -70,8 +70,8 @@ mod tests {
             tracing::trace!(target: "tokio_tungstenite", "TT_TRACE");
             tracing::trace!(target: "knot_server", "KNOT_TRACE");
         });
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        out
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
     }
 
     #[test]
