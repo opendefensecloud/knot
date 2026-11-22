@@ -32,12 +32,24 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   with working links; DOCX and ODT exports list the headings under
   "Contents" with Word's and LibreOffice's own table of contents styles.
   (#111)
+- Page links by typing `[[` in the editor. A picker lists the pages you can
+  open, filtered by title as you type, each with its place in the tree
+  (Team › Urlaub). Enter or a click inserts a link to the page. The last
+  row, `Create subpage "…"`, adds the typed title as a subpage of the
+  current page and links it, and you stay where you were writing. Editors
+  of the page see that row; readers do not. Inside code `[[` stays text, and
+  a typed `]]` closes the picker. (#110)
 
 ### Changed
 - The editor toolbar's Mermaid and Excalidraw buttons are one **Insert
   diagram** menu now, so the toolbar keeps to one row with the new table of
   contents button. In a list item, Indent and Outdent take the places of
   the diagram menu and the table of contents button. (#111)
+
+### Fixed
+- url 2.5.9 fixes RUSTSEC-2026-0592 (a stack overflow in `Url::origin()`
+  on deeply nested `blob:` URLs). knot was not affected: it never calls
+  `Url::origin()`. (#111)
 
 ### Operators — read before upgrading
 - **Tell people to reload, and do not roll back past this release once
@@ -46,13 +58,6 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   everyone. That is any tab left open from before the upgrade, and any
   client after a rollback. The box can be inserted again; nothing else on
   the page is affected.
-- Page links by typing `[[` in the editor. A picker lists the pages you can
-  open, filtered by title as you type, each with its place in the tree
-  (Team › Urlaub). Enter or a click inserts a link to the page. The last
-  row, `Create subpage "…"`, adds the typed title as a subpage of the
-  current page and links it, and you stay where you were writing. Editors
-  of the page see that row; readers do not. Inside code `[[` stays text, and
-  a typed `]]` closes the picker. (#TBD)
 
 ## [0.10.0] - 2026-11-15
 
