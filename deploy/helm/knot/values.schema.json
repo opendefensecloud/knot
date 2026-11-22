@@ -55,6 +55,14 @@
       }
     },
     "baseUrl": { "type": "string" },
+    "changeEventHook": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "pattern": "^(wss?://.+)?$" },
+        "tokenSecretName": { "type": "string" },
+        "tokenSecretKey": { "type": "string" }
+      }
+    },
     "logLevel": { "enum": ["trace", "debug", "info", "warn", "error"] },
     "logFormat": { "enum": ["json", "pretty"] },
     "service": {

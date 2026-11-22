@@ -69,6 +69,13 @@ spec:
                   name: {{ .Values.oidc.existingSecretName | default (include "knot.fullname" .) }}
                   key: KNOT_OIDC_CLIENT_SECRET
             {{- end }}
+            {{- if .Values.changeEventHook.tokenSecretName }}
+            - name: KNOT_CHANGE_EVENT_HOOK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.changeEventHook.tokenSecretName }}
+                  key: {{ .Values.changeEventHook.tokenSecretKey }}
+            {{- end }}
             {{- if .Values.metrics.enabled }}
             - name: KNOT_METRICS_ADDR
               value: ":{{ .Values.metrics.port }}"

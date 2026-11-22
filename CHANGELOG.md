@@ -9,6 +9,12 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 ## [Unreleased]
 
 ### Added
+- Change event hook: set `KNOT_CHANGE_EVENT_HOOK_URL` to a `ws://` or
+  `wss://` receiver and every pod keeps a WebSocket connection to it,
+  sending one JSON event per changed page (content, created, renamed,
+  moved, archived, restored, purged) about once a second, and reconnecting
+  when the connection drops. Delivery is at most once; read
+  docs/change-event-hook.md before building a receiver. (#TBD)
 - Page links by typing `[[` in the editor. A picker lists the pages you can
   open, filtered by title as you type, each with its place in the tree
   (Team › Urlaub). Enter or a click inserts a link to the page. The last

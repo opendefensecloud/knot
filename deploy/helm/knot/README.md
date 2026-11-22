@@ -72,6 +72,14 @@ oidc:
 
 > When `existingSecretName` is set the chart will **not** render its own Secret — you take full responsibility for providing all required `KNOT_*` keys.
 
+## Change event hook
+
+`changeEventHook.url` (a `ws://` or `wss://` receiver) makes every pod stream
+page changes to that receiver; `changeEventHook.tokenSecretName` and
+`tokenSecretKey` name a Secret holding an optional bearer token. See
+[docs/change-event-hook.md](../../../docs/change-event-hook.md). The receiver
+must accept one connection per replica, plus the surge during rollouts.
+
 ## OIDC
 
 > **First run:** knot needs a workspace before anyone can log in. Bootstrap one
