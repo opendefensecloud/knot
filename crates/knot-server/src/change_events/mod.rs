@@ -86,10 +86,16 @@ impl Hook {
         if cfg.change_event_hook_url.is_empty() {
             return None;
         }
-        Some(
-            Self::new(cfg.change_event_hook_url.clone())
-                .token(Some(cfg.change_event_hook_token.clone())),
-        )
+        // Validation normalises the URL (scheme case, whitespace); the
+        // connector needs the normalised form.
+        let url = match url::Url::parse(&cfg.change_event_hook_url) {
+            Ok(url) => url,
+            Err(e) => {
+                tracing::warn!(error = %e, "change event hook: unusable URL, hook disabled");
+                return None;
+            }
+        };
+        Some(Self::new(url.as_str()).token(Some(cfg.change_event_hook_token.clone())))
     }
 
     pub fn new(url: impl Into<String>) -> Self {
@@ -237,8 +243,18 @@ mod tests {
             ..Default::default()
         };
         let hook = Hook::from_config(&cfg).expect("on");
-        assert_eq!(hook.url, "ws://localhost:9000");
+        assert_eq!(hook.url, "ws://localhost:9000/");
         assert_eq!(hook.token, None);
+    }
+
+    #[test]
+    fn url_is_normalised_like_validation_does() {
+        let cfg = knot_config::Config {
+            change_event_hook_url: "  WS://localhost:9000/x ".into(),
+            ..Default::default()
+        };
+        let hook = Hook::from_config(&cfg).expect("on");
+        assert_eq!(hook.url, "ws://localhost:9000/x");
     }
 
     #[test]
