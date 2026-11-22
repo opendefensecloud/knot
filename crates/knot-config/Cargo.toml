@@ -11,6 +11,7 @@ serde_json.workspace = true
 figment.workspace = true
 thiserror.workspace = true
 ipnet.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 figment = { version = "0.10", features = ["env", "toml", "yaml", "test"] }

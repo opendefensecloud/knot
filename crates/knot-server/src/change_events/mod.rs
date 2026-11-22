@@ -81,6 +81,17 @@ pub struct Hook {
 }
 
 impl Hook {
+    /// The hook as configured; `None` (feature off) without a URL.
+    pub fn from_config(cfg: &knot_config::Config) -> Option<Self> {
+        if cfg.change_event_hook_url.is_empty() {
+            return None;
+        }
+        Some(
+            Self::new(cfg.change_event_hook_url.clone())
+                .token(Some(cfg.change_event_hook_token.clone())),
+        )
+    }
+
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -207,5 +218,53 @@ impl ChangeEvents {
     }
     pub fn instance_id(&self) -> Uuid {
         self.instance_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn off_without_url() {
+        assert!(Hook::from_config(&knot_config::Config::default()).is_none());
+    }
+
+    #[test]
+    fn on_with_url_and_empty_token_is_no_token() {
+        let cfg = knot_config::Config {
+            change_event_hook_url: "ws://localhost:9000".into(),
+            ..Default::default()
+        };
+        let hook = Hook::from_config(&cfg).expect("on");
+        assert_eq!(hook.url, "ws://localhost:9000");
+        assert_eq!(hook.token, None);
+    }
+
+    #[test]
+    fn wire_format_matches_the_spec() {
+        let id = Uuid::nil();
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-22T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let v = serde_json::to_value(WireMessage::PageChanged {
+            doc_id: id,
+            workspace_id: id,
+            kind: ChangeKind::Purged,
+            at,
+        })
+        .unwrap();
+        assert_eq!(v["type"], "page_changed");
+        assert_eq!(v["kind"], "purged");
+        assert_eq!(v["at"], "2026-11-22T10:00:00Z");
+        let v = serde_json::to_value(WireMessage::Hello {
+            instance_id: id,
+            version: "1.2.3",
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"type": "hello", "instance_id": id, "version": "1.2.3"})
+        );
     }
 }
