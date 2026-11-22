@@ -7,6 +7,7 @@ use knot_storage::{BlobStoreError, DocStoreError};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::change_events::ChangeKind;
 use crate::http_error::{doc_archived, json_err};
 
 /// How long a doc stays restorable, from `KNOT_ARCHIVE_RETENTION_DAYS`.
@@ -109,6 +110,7 @@ pub async fn purge_doc(
         }
     }
     let deleted = docs.purge(workspace_id, doc_id, actor).await?;
+    state.emit_changes(workspace_id, &deleted, ChangeKind::Purged);
     evict_local(state, &deleted).await;
     if let Some(rooms) = state.rooms_v2.as_ref() {
         for id in &deleted {

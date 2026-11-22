@@ -367,20 +367,13 @@ async fn reconnects_after_each_drop_and_streams_page_ids() {
 async fn one_event_per_page_per_window() {
     let window = Duration::from_secs(2);
     let db = knot_test_support::fresh_db().await;
-    let workspace_id = seed(&db.pool).await;
+    seed(&db.pool).await;
     let (listener, url) = receiver().await;
     let pod = pod(&db, Some(test_hook(&url).window(window))).await;
     let mut ws = accept(&listener).await;
     expect_hello(&mut ws).await;
 
     let doc = create_doc(&pod, "once", None).await;
-    // Stands in for the create handler's emit until Task 5 wires it; after
-    // that the two `Created`s coalesce into the one event asserted below.
-    pod.state.emit_change(
-        workspace_id,
-        doc,
-        knot_server::change_events::ChangeKind::Created,
-    );
     let created = timeout(CYCLE, next_json(&mut ws))
         .await
         .expect("created event");
@@ -560,5 +553,167 @@ async fn shutdown_closes_and_stays_closed() {
             .await
             .is_err(),
         "no reconnect after shutdown"
+    );
+}
+
+/// Read until `kind` arrives for every page in `docs` (other events skipped).
+async fn expect_kinds(ws: &mut Ws, kind: &str, docs: &[Uuid]) {
+    let mut missing: HashSet<Uuid> = docs.iter().copied().collect();
+    timeout(CYCLE, async {
+        while !missing.is_empty() {
+            let ev = next_json(ws).await;
+            if ev["kind"] == kind {
+                missing.remove(&uuid_of(&ev, "doc_id"));
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {kind} for {missing:?}"));
+}
+
+/// Spec D3 + D12: every lifecycle change reports its kind, bulk operations
+/// one event per page.
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_changes_report_their_kind() {
+    let db = knot_test_support::fresh_db().await;
+    seed(&db.pool).await;
+    let (listener, url) = receiver().await;
+    let pod = pod(&db, Some(test_hook(&url))).await;
+    let mut ws = accept(&listener).await;
+    expect_hello(&mut ws).await;
+    let (app, s) = (&pod.app, pod.session.as_str());
+
+    let parent = create_doc(&pod, "parent", None).await;
+    expect_kinds(&mut ws, "created", &[parent]).await;
+    let child = create_doc(&pod, "child", Some(parent)).await;
+    expect_kinds(&mut ws, "created", &[child]).await;
+
+    let (st, body) = send(
+        app,
+        s,
+        "POST",
+        &format!("/api/docs/{parent}/duplicate"),
+        Some(json!({"include_subpages": true})),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body:?}");
+    let top: Uuid = serde_json::from_slice::<Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let copies = pod
+        .state
+        .docs
+        .as_ref()
+        .unwrap()
+        .subtree_ids(top)
+        .await
+        .unwrap();
+    assert_eq!(copies.len(), 2, "copy of parent and child");
+    expect_kinds(&mut ws, "created", &copies).await;
+
+    let (st, _) = send(app, s, "DELETE", &format!("/api/docs/{parent}"), None, None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    expect_kinds(&mut ws, "archived", &[parent, child]).await;
+
+    let (st, _) = send(
+        app,
+        s,
+        "POST",
+        &format!("/api/docs/{parent}/restore"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    expect_kinds(&mut ws, "restored", &[parent, child]).await;
+
+    let (st, _) = send(
+        app,
+        s,
+        "PATCH",
+        &format!("/api/docs/{child}"),
+        Some(json!({"title": "renamed"})),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    expect_kinds(&mut ws, "renamed", &[child]).await;
+
+    let (st, _) = send(
+        app,
+        s,
+        "POST",
+        &format!("/api/docs/{child}/move"),
+        Some(json!({"parent_id": null})),
+        None,
+    )
+    .await;
+    assert!(st.is_success(), "move {st}");
+    expect_kinds(&mut ws, "moved", &[child]).await;
+
+    let (st, _) = send(app, s, "DELETE", &format!("/api/docs/{parent}"), None, None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    expect_kinds(&mut ws, "archived", &[parent]).await;
+    let (st, _) = send(
+        app,
+        s,
+        "POST",
+        &format!("/api/docs/{parent}/purge"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    expect_kinds(&mut ws, "purged", &[parent]).await;
+}
+
+/// Review Focus 5: a page purged inside the window of a content edit yields
+/// `purged`, and no `content` event with a missing workspace.
+#[tokio::test(flavor = "multi_thread")]
+async fn purge_inside_window_drops_content_event() {
+    let window = Duration::from_secs(2);
+    let db = knot_test_support::fresh_db().await;
+    seed(&db.pool).await;
+    let (listener, url) = receiver().await;
+    let pod = pod(&db, Some(test_hook(&url).window(window))).await;
+    let mut ws = accept(&listener).await;
+    expect_hello(&mut ws).await;
+    let doc = create_doc(&pod, "doomed", None).await;
+    expect_kinds(&mut ws, "created", &[doc]).await;
+
+    edit(&pod.app, &pod.session, doc, "last words").await;
+    let (st, _) = send(
+        &pod.app,
+        &pod.session,
+        "DELETE",
+        &format!("/api/docs/{doc}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _) = send(
+        &pod.app,
+        &pod.session,
+        "POST",
+        &format!("/api/docs/{doc}/purge"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    let mut kinds = Vec::new();
+    while let Ok(ev) = timeout(window * 2, next_json(&mut ws)).await {
+        assert!(ev["workspace_id"].as_str().is_some(), "{ev}");
+        kinds.push(ev["kind"].as_str().unwrap().to_string());
+    }
+    assert!(kinds.contains(&"purged".to_string()), "{kinds:?}");
+    assert!(
+        !kinds.contains(&"content".to_string()),
+        "content of a purged page: {kinds:?}"
     );
 }

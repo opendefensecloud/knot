@@ -467,7 +467,10 @@ pub async fn restore_as_new(
         Some(copy),
     );
     match answer.await {
-        Ok(Ok(top)) => doc_answer(&state, &ctx, StatusCode::CREATED, &top).await,
+        Ok(Ok(top)) => {
+            crate::routes::api::docs::emit_copy_created(&state, ctx.workspace_id, top.id).await;
+            doc_answer(&state, &ctx, StatusCode::CREATED, &top).await
+        }
         Ok(Err(e)) => duplicate_error(e),
         Err(_) => {
             tracing::error!("restore as new task ended without an answer");
