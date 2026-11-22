@@ -6,6 +6,7 @@
 //!
 //! The three modules are independent; a binary can opt into any subset.
 
+pub mod filter;
 pub mod logging;
 pub mod metrics;
 pub mod tracing;

@@ -146,6 +146,8 @@ Log lines, from the `knot-server` process:
 | warn | `change event hook: connection lost, reconnecting` | An open connection ended. |
 | warn | `change event hook: receiver stopped answering pings` | Two pings went unanswered. |
 
+The token is never logged, not even at `trace` level.
+
 ## Minimal receiver
 
 This receiver uses the Python

@@ -3,7 +3,7 @@
 use std::str::FromStr;
 
 use ::tracing::Level;
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoggingError {
@@ -22,8 +22,7 @@ pub enum LoggingError {
 /// uses the passed level as the floor.
 pub fn init(level: &str, format: &str) -> Result<(), LoggingError> {
     let lvl = Level::from_str(level).map_err(|_| LoggingError::Level(level.into()))?;
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(lvl.to_string()));
+    let filter = crate::filter::env_filter(&lvl.to_string());
 
     let registry = tracing_subscriber::registry().with(filter);
     match format {
