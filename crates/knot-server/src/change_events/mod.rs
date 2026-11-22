@@ -4,10 +4,8 @@
 //!
 //! Off unless `KNOT_CHANGE_EVENT_HOOK_URL` is set. Delivery is at most once.
 
-// Skeleton: fields are read once Tasks 2-3 land.
-#![allow(dead_code)]
-
 mod coalesce;
+mod conn;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,16 +114,48 @@ impl Hook {
     /// Start the hook's tasks. They end when `shutdown` is cancelled.
     pub fn spawn(
         self,
-        _docs: Arc<dyn knot_storage::DocStore>,
-        _shutdown: CancellationToken,
+        docs: Arc<dyn knot_storage::DocStore>,
+        shutdown: CancellationToken,
     ) -> ChangeEvents {
-        // Skeleton (Task 1): channels exist, nothing consumes them yet.
-        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(self.queue_capacity);
-        let (content_tx, _content_rx) = mpsc::channel(self.queue_capacity);
+        let instance_id = Uuid::new_v4();
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(self.queue_capacity);
+        let (content_tx, content_rx) = mpsc::channel(self.queue_capacity);
+        let (batch_tx, batch_rx) = mpsc::channel::<Vec<WireMessage>>(16);
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let auth = self.token.as_deref().and_then(|t| {
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!("Bearer {t}"))
+                .map_err(|_| {
+                    tracing::error!(
+                        "change event hook: token is not a valid header value; sending none"
+                    )
+                })
+                .ok()
+        });
+        let cfg = conn::ConnConfig {
+            url: self.url,
+            auth,
+            instance_id,
+            backoff_min: self.backoff_min,
+            backoff_max: self.backoff_max,
+            ping_interval: self.ping_interval,
+            connect_timeout: self.connect_timeout,
+            send_timeout: self.send_timeout,
+            tls: conn::tls_config(),
+        };
+        tokio::spawn(coalesce::run(
+            lifecycle_rx,
+            content_rx,
+            batch_tx,
+            connected.clone(),
+            docs,
+            self.window,
+            shutdown.clone(),
+        ));
+        tokio::spawn(conn::run(cfg, batch_rx, connected, shutdown));
         ChangeEvents {
             lifecycle_tx,
             content_tx,
-            instance_id: Uuid::new_v4(),
+            instance_id,
         }
     }
 }

@@ -55,6 +55,7 @@ impl Pending {
         self.opened_at.map(|t| t + window)
     }
 
+    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
@@ -95,7 +96,10 @@ async fn flush(
             Some(ws) => ws,
             None => match docs.get(doc_id).await {
                 Ok(Some(doc)) => doc.workspace_id,
-                Ok(None) => continue,
+                Ok(None) => {
+                    tracing::debug!(%doc_id, "change event hook: page gone before flush; skipping");
+                    continue;
+                }
                 Err(e) => {
                     tracing::warn!(error = ?e, %doc_id, "change event hook: workspace lookup failed");
                     dropped("send_failed", 1);

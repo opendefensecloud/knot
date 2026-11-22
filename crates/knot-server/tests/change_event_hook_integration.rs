@@ -2,9 +2,6 @@
 //! docs/superpowers/specs/2026-11-22-change-event-hook-design.md).
 //! knot connects out to a WebSocket receiver the test runs on its own port.
 
-// Helpers are used by tests added in Tasks 4-6.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +22,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
 use uuid::Uuid;
+use yrs::{Doc, ReadTxn, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
 
 const EMAIL: &str = "alice@hook.test";
 const PASSWORD: &str = "password1";
@@ -361,4 +359,206 @@ async fn reconnects_after_each_drop_and_streams_page_ids() {
     })
     .await
     .expect("whole test within 30 s");
+}
+
+/// Spec D4: 20 edits to one page inside one window → exactly one content
+/// event, and nothing after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_event_per_page_per_window() {
+    let window = Duration::from_secs(2);
+    let db = knot_test_support::fresh_db().await;
+    let workspace_id = seed(&db.pool).await;
+    let (listener, url) = receiver().await;
+    let pod = pod(&db, Some(test_hook(&url).window(window))).await;
+    let mut ws = accept(&listener).await;
+    expect_hello(&mut ws).await;
+
+    let doc = create_doc(&pod, "once", None).await;
+    // Stands in for the create handler's emit until Task 5 wires it; after
+    // that the two `Created`s coalesce into the one event asserted below.
+    pod.state.emit_change(
+        workspace_id,
+        doc,
+        knot_server::change_events::ChangeKind::Created,
+    );
+    let created = timeout(CYCLE, next_json(&mut ws))
+        .await
+        .expect("created event");
+    assert_eq!(
+        (created["kind"].as_str(), uuid_of(&created, "doc_id")),
+        (Some("created"), doc)
+    );
+
+    // The burst goes straight into the room as a collab client's typing
+    // does (`Event::Inbound` from a joined connection): 20 HTTP markdown
+    // imports each wait for their persist, which the writer batches every
+    // 250 ms, so they take ~5 s, longer than any window a test can afford.
+    let room = pod
+        .state
+        .rooms_v2
+        .as_ref()
+        .unwrap()
+        .acquire(doc)
+        .await
+        .unwrap();
+    let conn_id = Uuid::new_v4();
+    // Keep the receiving end: fan-out to this connection must not fail.
+    let (conn_tx, _conn_rx) = tokio::sync::mpsc::channel(256);
+    let (reply, joined) = tokio::sync::oneshot::channel();
+    room.tx
+        .send(knot_crdt::Event::Join {
+            conn_id,
+            handle: knot_crdt::ConnHandle::new(conn_tx),
+            reply,
+        })
+        .await
+        .unwrap();
+    joined.await.unwrap().expect("join the room");
+    let typist = Doc::with_client_id(7);
+    let frag = typist.get_or_insert_xml_fragment("default");
+    for i in 0..20 {
+        let before = typist.transact().state_vector();
+        {
+            let mut txn = typist.transact_mut();
+            let p = frag.push_back(&mut txn, XmlElementPrelim::empty("paragraph"));
+            p.push_back(&mut txn, XmlTextPrelim::new(format!("burst {i}")));
+        }
+        let bytes = typist.transact().encode_state_as_update_v1(&before);
+        room.tx
+            .send(knot_crdt::Event::Inbound(knot_crdt::InMsg {
+                from: conn_id,
+                by_user: None,
+                bytes,
+            }))
+            .await
+            .unwrap();
+    }
+
+    let ev = timeout(window * 2 + Duration::from_secs(1), next_json(&mut ws))
+        .await
+        .expect("content event");
+    assert_eq!(
+        (ev["kind"].as_str(), uuid_of(&ev, "doc_id")),
+        (Some("content"), doc),
+        "{ev}"
+    );
+    assert!(
+        timeout(window * 2, next_json(&mut ws)).await.is_err(),
+        "no second event for the same burst"
+    );
+}
+
+/// Review Focus 1: a receiver that accepts TCP but never answers the
+/// handshake does not hang the hook; it times out and retries.
+#[tokio::test(flavor = "multi_thread")]
+async fn hangs_in_handshake_then_retries() {
+    let db = knot_test_support::fresh_db().await;
+    seed(&db.pool).await;
+    let (listener, url) = receiver().await;
+    let _pod = pod(
+        &db,
+        Some(test_hook(&url).connect_timeout(Duration::from_millis(300))),
+    )
+    .await;
+    let (_silent, _) = timeout(CYCLE, listener.accept())
+        .await
+        .expect("first attempt")
+        .unwrap();
+    // Hold `_silent` open without a handshake; the next attempt must come.
+    let mut ws = accept(&listener).await;
+    expect_hello(&mut ws).await;
+}
+
+/// Review Focus 2: a receiver that stops reading (no pongs) is dropped
+/// after two unanswered pings, and the hook reconnects.
+#[tokio::test(flavor = "multi_thread")]
+async fn silent_receiver_is_dropped_and_reconnected() {
+    let db = knot_test_support::fresh_db().await;
+    seed(&db.pool).await;
+    let (listener, url) = receiver().await;
+    let _pod = pod(
+        &db,
+        Some(test_hook(&url).ping_interval(Duration::from_millis(100))),
+    )
+    .await;
+    let mut first = accept(&listener).await;
+    let a = expect_hello(&mut first).await;
+    // Stop reading `first`: tungstenite answers pings only while reading.
+    let mut second = accept(&listener).await;
+    assert_eq!(expect_hello(&mut second).await, a);
+    drop(first);
+}
+
+/// Review Focus 3: a refused handshake is retried after a backoff, not in a
+/// tight loop, and every attempt carries the bearer token.
+#[tokio::test(flavor = "multi_thread")]
+// tungstenite's handshake `Callback` fixes the `ErrorResponse` error type.
+#[allow(clippy::result_large_err)]
+async fn rejected_handshake_backs_off_and_sends_token() {
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        ErrorResponse, Request as HsReq, Response as HsResp,
+    };
+
+    let db = knot_test_support::fresh_db().await;
+    seed(&db.pool).await;
+    let (listener, url) = receiver().await;
+    let _pod = pod(&db, Some(test_hook(&url).token(Some("s3cret".into())))).await;
+
+    let mut last: Option<tokio::time::Instant> = None;
+    for attempt in 0..3 {
+        let (tcp, _) = timeout(CYCLE, listener.accept())
+            .await
+            .expect("attempt")
+            .unwrap();
+        let now = tokio::time::Instant::now();
+        if let Some(prev) = last {
+            assert!(
+                now - prev >= Duration::from_millis(20),
+                "attempt {attempt} came after {:?}",
+                now - prev
+            );
+        }
+        last = Some(now);
+        let refuse = attempt < 2;
+        let result = tokio_tungstenite::accept_hdr_async(tcp, move |req: &HsReq, resp: HsResp| {
+            assert_eq!(req.headers().get("authorization").unwrap(), "Bearer s3cret");
+            if refuse {
+                let mut err = ErrorResponse::new(None);
+                *err.status_mut() = StatusCode::UNAUTHORIZED;
+                Err(err)
+            } else {
+                Ok(resp)
+            }
+        })
+        .await;
+        if !refuse {
+            let mut ws = result.unwrap();
+            expect_hello(&mut ws).await;
+        }
+    }
+}
+
+/// Review Focus 4: on shutdown the hook says goodbye and stays away.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_closes_and_stays_closed() {
+    let db = knot_test_support::fresh_db().await;
+    seed(&db.pool).await;
+    let (listener, url) = receiver().await;
+    let pod = pod(&db, Some(test_hook(&url))).await;
+    let mut ws = accept(&listener).await;
+    expect_hello(&mut ws).await;
+    pod.state.shutdown.cancel();
+    let frame = timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("close in time");
+    assert!(
+        matches!(frame, Some(Ok(Message::Close(_)))),
+        "got {frame:?}"
+    );
+    assert!(
+        timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .is_err(),
+        "no reconnect after shutdown"
+    );
 }
