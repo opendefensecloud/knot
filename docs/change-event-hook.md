@@ -89,7 +89,10 @@ changed, not as a log of what happened.
 
 So read the current state when an event arrives: `GET /api/docs/{id}` for
 metadata and `GET /api/docs/{id}/markdown` for the body, with a scoped API
-key. A `404` after a `purged` or `archived` event is expected. If you need a
+key. A `404` after a `purged` event is expected: the page is gone. After an
+`archived` event `GET /api/docs/{id}` still answers 200, with the archive
+fields `archived_at` (set), `archived_by`, `purge_at` and `archive_root_id`;
+check `archived_at` to tell an archived page from a live one. If you need a
 complete picture, reconcile through the API, for example with a full
 listing, after a connection opens and whenever you see a new `instance_id`.
 A periodic reconcile also covers events lost to a full queue.
