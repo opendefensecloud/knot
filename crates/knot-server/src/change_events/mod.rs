@@ -7,6 +7,8 @@
 // Skeleton: fields are read once Tasks 2-3 land.
 #![allow(dead_code)]
 
+mod coalesce;
+
 use std::sync::Arc;
 use std::time::Duration;
 
