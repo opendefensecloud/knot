@@ -14,7 +14,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   sending one JSON event per changed page (content, created, renamed,
   moved, archived, restored, purged) about once a second, and reconnecting
   when the connection drops. Delivery is at most once; read
-  docs/change-event-hook.md before building a receiver. (#TBD)
+  docs/change-event-hook.md before building a receiver. (#114)
 - Table of contents block. Insert it from the editor toolbar (the list-tree
   button) and it lists the page's headings in a box, kept current as
   anyone edits, without writing to the page itself. **Levels** sets how deep
