@@ -409,7 +409,7 @@ fn assert_parity(file: &str, cases: &[Case]) {
 #[test]
 fn pm_json_matches_y_tiptap_on_the_golden_corpus() {
     let cases = read_cases("pm_json_golden.json");
-    assert_eq!(cases.len(), 21);
+    assert_eq!(cases.len(), 22);
     assert_parity("pm_json_golden.json", &cases);
 }
 
@@ -615,4 +615,18 @@ fn main() {}
         texts.iter().all(|t| !t.contains("Unsupported content")),
         "a placeholder in {rendered}"
     );
+}
+
+#[test]
+fn a_table_of_contents_keeps_its_depth() {
+    let doc = Doc::new();
+    let frag = doc.get_or_insert_xml_fragment("default");
+    {
+        let mut txn = doc.transact_mut();
+        let toc = frag.push_back(&mut txn, XmlElementPrelim::empty("table_of_contents"));
+        toc.insert_attribute(&mut txn, "maxLevel", Any::Number(2.0));
+    }
+    let content = &pm_json(&doc)["content"];
+    assert_eq!(content[0]["type"], json!("table_of_contents"), "{content}");
+    assert_eq!(content[0]["attrs"]["maxLevel"], json!(2), "{content}");
 }

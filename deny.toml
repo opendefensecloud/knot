@@ -53,6 +53,19 @@ ignore = [
     # Drop when: yrs replaces or vendors smallstr.
     { id = "RUSTSEC-2026-0215", reason = "smallstr unmaintained; pinned at ^0.3 by yrs through 0.27.3; no vulnerability, no successor crate" },
 
+    # chrono is unmaintained (informational advisory, all versions, no patched
+    # release). knot uses it directly in knot-auth, knot-history,
+    # knot-markdown, knot-server and knot-storage (plus sqlx-core/sqlx-postgres
+    # 0.9.0 through knot's own sqlx "chrono" feature), and oauth2 5.0.0 and
+    # openidconnect 4.0.1 require it non-optionally, so moving knot's own code
+    # to jiff or time would not remove it from the tree.
+    # Unmaintained-only: no known vulnerability.
+    # Tracked: https://github.com/chronotope/chrono/issues/1768
+    # Drop when: oauth2 and openidconnect have moved off chrono and knot has
+    # dropped chrono and sqlx's "chrono" feature, or chrono gets a maintainer
+    # again.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; direct dep and non-optional via oauth2 5 / openidconnect 4; no vulnerability, no patched release" },
+
     # unsafe-libyaml is unmaintained (repository archived; it is a c2rust
     # translation of libyaml). Path: knot-config -> figment 0.10.19 (feature
     # "yaml") -> serde_yaml 0.9.34 (itself deprecated) -> unsafe-libyaml

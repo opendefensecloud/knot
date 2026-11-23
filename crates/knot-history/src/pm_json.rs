@@ -72,6 +72,7 @@ pub const KNOWN_NODES: &[&str] = &[
     "excalidraw_board",
     "image",
     "attachment",
+    "table_of_contents",
     "table",
     "table_row",
     "table_cell",

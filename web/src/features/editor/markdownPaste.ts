@@ -104,9 +104,12 @@ export function looksLikeMarkdown(text: string): boolean {
  * through the Markdown to start loading.
  */
 export function markdownToHtml(markdown: string): string {
-  const raw = marked.parse(markdown, { async: false, gfm: true });
+  const tokens = marked.lexer(markdown, { gfm: true });
+  markTocParagraphs(tokens);
+  const raw = marked.parser(tokens, { async: false, gfm: true });
   const fragment = sanitizeEditorFragment(raw);
   promoteTaskItems(fragment);
+  promoteTocMarkers(fragment);
   const host = document.createElement("div");
   host.appendChild(fragment);
   return host.innerHTML;
@@ -125,5 +128,43 @@ function promoteTaskItems(fragment: DocumentFragment): void {
     if (!li) return;
     li.setAttribute("data-checked", input.hasAttribute("checked") ? "true" : "false");
     input.remove();
+  });
+}
+
+const TOC_MARKER = "[[_TOC_]]";
+const TOC_COMMENT = /^<!--\s*knot:toc\s+maxLevel=([^\s>]*)\s*-->\s*$/;
+
+/** The depth a `<!-- knot:toc maxLevel=N -->` comment names: N when 1–6,
+ *  else 3. */
+function tocLevel(raw: string | undefined): number {
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 1 && n <= 6 ? n : 3;
+}
+
+/**
+ * A top-level paragraph holding just GitLab's `[[_TOC_]]` is a table of
+ * contents (with the depth of a `knot:toc` comment right before it). It
+ * becomes a `<p data-knot-toc>` here, which survives sanitizing, and a
+ * table of contents block in [`promoteTocMarkers`]. Only top-level
+ * paragraphs count, so a marker inside text or code stays as it is.
+ */
+function markTocParagraphs(tokens: ReturnType<typeof marked.lexer>): void {
+  tokens.forEach((token, i) => {
+    if (token.type !== "paragraph" || token.raw.trim() !== TOC_MARKER) return;
+    const before = tokens[i - 1];
+    const comment = before?.type === "html" ? TOC_COMMENT.exec(before.raw.trim()) : null;
+    const level = comment ? tocLevel(comment[1]) : 3;
+    tokens[i] = { type: "html", block: true, pre: false, raw: token.raw, text: `<p data-knot-toc="${level}"></p>` };
+  });
+}
+
+/** Turns the paragraphs [`markTocParagraphs`] marked into the element the
+ *  table of contents node parses (`div[data-knot-toc]`). */
+function promoteTocMarkers(fragment: DocumentFragment): void {
+  fragment.querySelectorAll("p[data-knot-toc]").forEach((p) => {
+    const box = document.createElement("div");
+    box.setAttribute("data-knot-toc", "true");
+    box.setAttribute("data-max-level", String(tocLevel(p.getAttribute("data-knot-toc") ?? undefined)));
+    p.replaceWith(box);
   });
 }

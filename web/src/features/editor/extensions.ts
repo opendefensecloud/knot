@@ -15,6 +15,8 @@ import type { NavigateFunction } from "react-router-dom";
 
 import { Attachment } from "./nodes/AttachmentNode";
 import { ExcalidrawBoard } from "./nodes/ExcalidrawBoard";
+import { TableOfContents } from "./nodes/TableOfContents";
+import { HeadingAnchors } from "./headingAnchors";
 import { MermaidCodeBlock } from "./nodes/MermaidCodeBlock";
 import { CommentsHighlightExtension } from "./CommentsHighlightExtension";
 import { SuggestionsHighlightExtension } from "./SuggestionsHighlightExtension";
@@ -357,6 +359,8 @@ export function createSchemaExtensions(opts: {
     KnotImage.configure({ inline: false, allowBase64: false }),
     Attachment,
     viewer ? ExcalidrawBoard.configure({ readOnly: true }) : ExcalidrawBoard,
+    TableOfContents,
+    HeadingAnchors,
     viewer ? TaskListExtension.configure({ readOnly: true }) : TaskListExtension,
     InternalLinkExtension.configure({ navigate: opts.navigate ?? null }),
     MentionExtension.configure({

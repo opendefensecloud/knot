@@ -93,7 +93,10 @@ pub fn parse(src: &str) -> Result<(DocHandle, Vec<u8>), ParseError> {
         opts.insert(Options::ENABLE_STRIKETHROUGH);
         opts.insert(Options::ENABLE_TASKLISTS);
         opts.insert(Options::ENABLE_TABLES);
-        let parser = TightParagraphs::new(Parser::new_ext(src, opts));
+        // A table of contents marker becomes a sentinel image first, which
+        // the image handling below turns into the block (`crate::toc`).
+        let marked = crate::toc::mark_toc_markers(src);
+        let parser = TightParagraphs::new(Parser::new_ext(&marked, opts));
 
         // Per-table alignment carried by `Tag::Table(Vec<Alignment>)`. We
         // stash it on table entry and consume per-cell via a column index.
@@ -736,6 +739,11 @@ impl ImageBlock {
                     attrs.push(("label", alt));
                 }
                 ("excalidraw_board", attrs)
+            }
+            ImageBlock::Image { src, .. } if crate::toc::toc_sentinel_level(&src).is_some() => {
+                let level =
+                    crate::toc::toc_sentinel_level(&src).unwrap_or(crate::toc::TOC_DEFAULT_LEVEL);
+                ("table_of_contents", vec![("maxLevel", level.to_string())])
             }
             ImageBlock::Image { src, alt, title } => {
                 let mut attrs = vec![("src", src)];
