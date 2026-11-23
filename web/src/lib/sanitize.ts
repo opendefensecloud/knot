@@ -39,6 +39,8 @@ const EDITOR_ALLOWED_ATTR = [
   "href", "title", "alt", "src", "class", "start",
   "colspan", "rowspan", "align",
   "type", "checked", "data-checked",
+  // A pasted `[[_TOC_]]`, until `markdownToHtml` makes it a table of contents.
+  "data-knot-toc",
 ];
 
 /**

@@ -93,6 +93,13 @@ fn block(cx: &mut Ctx, b: &Block, avail_twips: u32) {
         Block::Image { source, alt } => picture::image(cx, source, alt, avail_twips),
         Block::Board { key, label, .. } => picture::board(cx, key, label, avail_twips),
         Block::Attachment { url, name, size } => picture::attachment(cx, url, name, *size),
+        Block::Toc { entries, .. } => {
+            text_paragraph(cx, "Caption", "Contents");
+            for entry in entries {
+                let style = format!("TOC{}", entry.level.min(4) + 1);
+                text_paragraph(cx, &style, &entry.text);
+            }
+        }
     }
 }
 

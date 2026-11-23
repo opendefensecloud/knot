@@ -80,6 +80,7 @@ test("excalidraw: insert board, draw rectangle, inline preview renders", async (
   await editor.click();
 
   // Insert a board via toolbar.
+  await page.getByTestId("toolbar-diagram").click();
   await page.getByTestId("toolbar-excalidraw").click();
 
   // Inline NodeView appears.
@@ -123,6 +124,7 @@ test("excalidraw: two contexts converge on a shared board", async ({ browser }) 
   });
   const aliceEditor = alice.locator("[data-testid='editor-host'] .ProseMirror");
   await aliceEditor.click();
+  await alice.getByTestId("toolbar-diagram").click();
   await alice.getByTestId("toolbar-excalidraw").click();
   await expect(alice.getByTestId("excalidraw-board").first()).toBeVisible({ timeout: 8_000 });
 
@@ -203,6 +205,7 @@ test("excalidraw: markdown export references board sentinel", async ({ page, req
 
   const editor = page.locator("[data-testid='editor-host'] .ProseMirror");
   await editor.click();
+  await page.getByTestId("toolbar-diagram").click();
   await page.getByTestId("toolbar-excalidraw").click();
   await expect(page.getByTestId("excalidraw-board").first()).toBeVisible({ timeout: 8_000 });
 

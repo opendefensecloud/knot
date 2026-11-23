@@ -118,6 +118,136 @@ async fn public_doc(State(state): State<AppState>, Path(token): Path<String>) ->
         .unwrap()
 }
 
+/// The classes of a table of contents entry, by its level below the
+/// shallowest heading shown (deeper ones stay at 4).
+const TOC_LEVEL_CLASSES: [&str; 5] = [
+    "knot-box__l0",
+    "knot-box__l1",
+    "knot-box__l2",
+    "knot-box__l3",
+    "knot-box__l4",
+];
+
+/// A heading of the page: its level, text and anchor id.
+struct HeadingRef {
+    level: u8,
+    text: String,
+    slug: String,
+}
+
+/// Put before every heading slug, as the editor does (`headingAnchors.ts`):
+/// keeps heading ids clear of other ids on the page.
+const HEADING_ID_PREFIX: &str = "h-";
+
+/// The headings of `events`, in order, with the ids the editor gives them
+/// (`h-` and the slug of `knot_markdown::slug`).
+fn collect_headings(events: &[pulldown_cmark::Event<'_>]) -> Vec<HeadingRef> {
+    use pulldown_cmark::{Event, Tag, TagEnd};
+    let mut slugger = knot_markdown::slug::Slugger::default();
+    let mut out = Vec::new();
+    let mut open: Option<(u8, String)> = None;
+    for event in events {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => open = Some((*level as u8, String::new())),
+            Event::Text(t) | Event::Code(t) => {
+                if let Some((_, text)) = open.as_mut() {
+                    text.push_str(t);
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, text)) = open.take() {
+                    let slug = format!("{HEADING_ID_PREFIX}{}", slugger.slug(&text));
+                    out.push(HeadingRef { level, text, slug });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The table of contents box for `headings` down to `max_level`.
+fn toc_html(headings: &[HeadingRef], max_level: u8) -> String {
+    let shown: Vec<&HeadingRef> = headings
+        .iter()
+        .filter(|h| h.level <= max_level && !h.text.trim().is_empty())
+        .collect();
+    let mut html = String::from(
+        r#"<nav class="knot-box" aria-label="Contents"><p class="knot-box__title">Contents</p>"#,
+    );
+    if shown.is_empty() {
+        html.push_str("<p>No headings yet</p>");
+    } else {
+        let top = shown.iter().map(|h| h.level).min().unwrap_or(1);
+        html.push_str(r#"<ul class="knot-box__list">"#);
+        for h in shown {
+            let class = TOC_LEVEL_CLASSES[usize::from((h.level - top).min(4))];
+            html.push_str(&format!(
+                r##"<li class="{class}"><a href="#{}">{}</a></li>"##,
+                h.slug,
+                html_escape(&h.text)
+            ));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str("</nav>");
+    html
+}
+
+/// The depth of the table of contents sentinel image starting at
+/// `events[i]` (`Start(Image)` then `End(Image)`), if it is one.
+fn toc_sentinel_at(events: &[pulldown_cmark::Event<'_>], i: usize) -> Option<u8> {
+    use pulldown_cmark::{Event, Tag, TagEnd};
+    match (events.get(i), events.get(i + 1)) {
+        (Some(Event::Start(Tag::Image { dest_url, .. })), Some(Event::End(TagEnd::Image))) => {
+            knot_markdown::toc::toc_sentinel_level(dest_url)
+        }
+        _ => None,
+    }
+}
+
+/// `events` with ids on the headings and every table of contents sentinel
+/// (alone in a paragraph, or in a table cell) replaced by its box.
+fn with_headings(events: Vec<pulldown_cmark::Event<'_>>) -> Vec<pulldown_cmark::Event<'_>> {
+    use pulldown_cmark::{Event, Tag, TagEnd};
+    let headings = collect_headings(&events);
+    let mut next_heading = headings.iter();
+    let mut out = Vec::with_capacity(events.len());
+    let mut i = 0;
+    while i < events.len() {
+        if matches!(events[i], Event::Start(Tag::Paragraph))
+            && let Some(level) = toc_sentinel_at(&events, i + 1)
+            && matches!(events.get(i + 3), Some(Event::End(TagEnd::Paragraph)))
+        {
+            out.push(Event::Html(toc_html(&headings, level).into()));
+            i += 4;
+            continue;
+        }
+        if let Some(level) = toc_sentinel_at(&events, i) {
+            out.push(Event::InlineHtml(toc_html(&headings, level).into()));
+            i += 2;
+            continue;
+        }
+        let event = match &events[i] {
+            Event::Start(Tag::Heading {
+                level,
+                classes,
+                attrs,
+                ..
+            }) => Event::Start(Tag::Heading {
+                level: *level,
+                id: next_heading.next().map(|h| h.slug.clone().into()),
+                classes: classes.clone(),
+                attrs: attrs.clone(),
+            }),
+            other => other.clone(),
+        };
+        out.push(event);
+        i += 1;
+    }
+    out
+}
+
 fn render_markdown(
     title: &str,
     md: &str,
@@ -129,7 +259,12 @@ fn render_markdown(
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_TASKLISTS);
-    let parser = Parser::new_ext(md, opts).map(|ev| match ev {
+    // Table of contents markers become sentinel images, the same pre-pass
+    // the importer uses; `with_headings` turns them into the box and gives
+    // every heading the id the editor gives it.
+    let marked = knot_markdown::toc::mark_toc_markers(md);
+    let events: Vec<Event<'_>> = Parser::new_ext(&marked, opts).collect();
+    let parser = with_headings(events).into_iter().map(|ev| match ev {
         Event::Start(Tag::Image {
             link_type,
             dest_url,
@@ -182,10 +317,20 @@ fn render_markdown(
     // unsafe link schemes (`javascript:`) verbatim. This page is served to
     // ANONYMOUS visitors, so sanitize before embedding. Relative URLs are the
     // rewritten board/blob links (`/p/<token>/...`) and must pass through.
-    let body = ammonia::Builder::default()
-        .url_relative(ammonia::UrlRelative::PassThrough)
-        .clean(&raw)
-        .to_string();
+    // On top of the defaults: the heading ids and the table of contents
+    // box's own classes, nothing else (see `with_headings`).
+    let mut sanitizer = ammonia::Builder::default();
+    sanitizer.url_relative(ammonia::UrlRelative::PassThrough);
+    for heading in ["h1", "h2", "h3", "h4", "h5", "h6"] {
+        sanitizer.add_tag_attributes(heading, &["id"]);
+    }
+    sanitizer
+        .add_tag_attributes("nav", &["aria-label"])
+        .add_allowed_classes("nav", &["knot-box"])
+        .add_allowed_classes("p", &["knot-box__title"])
+        .add_allowed_classes("ul", &["knot-box__list"])
+        .add_allowed_classes("li", &TOC_LEVEL_CLASSES);
+    let body = sanitizer.clean(&raw).to_string();
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title>\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -195,7 +340,12 @@ fn render_markdown(
          pre,code{{font-family:ui-monospace,monospace;background:#f5f5f5;padding:2px 4px;border-radius:3px}}\
          pre{{padding:12px;overflow:auto}}\
          h1,h2,h3{{margin-top:1.5em}}\
-         img{{max-width:100%}}</style></head>\
+         img{{max-width:100%}}\
+.knot-box{{background:#f4f5f7;border:1px solid #d9dde3;border-radius:6px;padding:12px 16px;margin:1em 0}}\
+.knot-box__title{{margin:0 0 6px;font-size:.85em;font-weight:600;color:#666}}\
+.knot-box__list{{list-style:none;margin:0;padding:0}}\
+.knot-box__l1{{padding-left:1em}}.knot-box__l2{{padding-left:2em}}\
+.knot-box__l3{{padding-left:3em}}.knot-box__l4{{padding-left:4em}}</style></head>\
          <body><article>{}</article></body></html>",
         html_escape(title),
         body,
@@ -430,6 +580,75 @@ mod tests {
         let md = "![alt](https://example.com/cat.png)\n";
         let html = render_markdown("Hello", md, "tok123", &HashMap::new());
         assert!(html.contains("https://example.com/cat.png"));
+    }
+
+    fn render(md: &str) -> String {
+        render_markdown("T", md, "tok", &HashMap::new())
+    }
+
+    #[test]
+    fn headings_get_slug_ids() {
+        let html = render("# Plan\n\n## Tasks\n\n## Tasks\n");
+        assert!(html.contains("<h1 id=\"h-plan\">Plan</h1>"), "{html}");
+        assert!(html.contains("<h2 id=\"h-tasks\">Tasks</h2>"), "{html}");
+        assert!(html.contains("<h2 id=\"h-tasks-1\">Tasks</h2>"), "{html}");
+    }
+
+    #[test]
+    fn expands_toc_marker_into_box() {
+        let html = render("[[_TOC_]]\n\n# Plan\n\n## Tasks\n\n### Details\n");
+        assert!(html.contains("class=\"knot-box\""), "{html}");
+        assert!(html.contains("class=\"knot-box__title\""), "{html}");
+        for slug in ["h-plan", "h-tasks", "h-details"] {
+            assert!(
+                html.contains(&format!("href=\"#{slug}\"")),
+                "{slug} in {html}"
+            );
+        }
+        assert!(!html.contains("[[_TOC_]]"), "{html}");
+        assert!(!html.contains("knot://toc"), "{html}");
+        // The box is not inside a paragraph.
+        assert!(!html.contains("<p><nav"), "{html}");
+    }
+
+    #[test]
+    fn toc_box_is_a_navigation_landmark() {
+        for md in [
+            "[[_TOC_]]\n\n# Plan\n",
+            "| [[_TOC_]] | b |\n| --- | --- |\n| c | d |\n\n# Plan\n",
+        ] {
+            let html = render(md);
+            assert!(
+                html.contains("<nav class=\"knot-box\" aria-label=\"Contents\">"),
+                "{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn toc_respects_max_level_comment() {
+        let html = render("<!-- knot:toc maxLevel=1 -->\n[[_TOC_]]\n\n# Plan\n\n## Tasks\n");
+        assert!(html.contains("href=\"#h-plan\""), "{html}");
+        assert!(!html.contains("href=\"#h-tasks\""), "{html}");
+    }
+
+    #[test]
+    fn expands_toc_in_a_table_cell() {
+        let html = render("| [[_TOC_]] | b |\n| --- | --- |\n| c | d |\n\n# Plan\n");
+        assert!(html.contains("class=\"knot-box\""), "{html}");
+        assert!(html.contains("href=\"#h-plan\""), "{html}");
+    }
+
+    #[test]
+    fn public_toc_keeps_html_sanitised() {
+        let md = "[[_TOC_]]\n\n<div class=\"evil\" id=\"x\" onclick=\"alert(1)\">hi</div>\n\n<nav class=\"knot-box evil\" onclick=\"alert(3)\" style=\"x\">n</nav>\n\n<script>alert(2)</script>\n\n# Plan\n";
+        let html = render(md);
+        assert!(!html.contains("<script"), "{html}");
+        assert!(!html.contains("onclick"), "{html}");
+        assert!(!html.contains("evil"), "{html}");
+        assert!(!html.contains("id=\"x\""), "{html}");
+        assert!(!html.contains("style="), "{html}");
+        assert!(html.contains("<h1 id=\"h-plan\">"), "{html}");
     }
 
     #[test]

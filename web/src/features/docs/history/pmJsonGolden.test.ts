@@ -163,6 +163,7 @@ const SCHEMA_CASES: [string, JSONContent[]][] = [
     [{ type: "attachment", attrs: { url: BLOB_URL, name: "report.pdf", size: 2048, contentType: "application/pdf" } }],
   ],
   ["excalidraw-board", [{ type: "excalidraw_board", attrs: { board_id: BOARD_ID, label: "Architecture" } }]],
+  ["table-of-contents", [{ type: "table_of_contents", attrs: { maxLevel: 2 } }]],
   ["empty-paragraph", [p()]],
   ["empty-doc", []],
 ];
@@ -267,7 +268,7 @@ describe("pm_json parity fixtures", () => {
       const divergence = previous.find((old) => old.name === c.name)?.divergence;
       if (divergence !== undefined) c.divergence = divergence;
     }
-    expect(cases).toHaveLength(21);
+    expect(cases).toHaveLength(22);
     if (UPDATE) {
       writeFileSync(GOLDEN, JSON.stringify(cases, null, 2) + "\n");
       return;
