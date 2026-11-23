@@ -20,22 +20,27 @@ pub fn env_filter(level: &str) -> EnvFilter {
 const CAPPED: [&str; 2] = ["tungstenite", "tokio_tungstenite"];
 
 fn capped_spec(spec: &str) -> String {
-    let mut default_trace = false;
-    let mut explicit = false;
-    for d in spec.split(',').map(str::trim) {
-        if !d.contains('=') {
-            default_trace |= d.eq_ignore_ascii_case("trace");
+    let directives: Vec<&str> = spec.split(',').map(str::trim).collect();
+    // A bare directive is the default level; "5" is tracing's numeric trace.
+    let default_trace = directives
+        .iter()
+        .any(|d| !d.contains('=') && (d.eq_ignore_ascii_case("trace") || *d == "5"));
+    if !default_trace {
+        return spec.to_string();
+    }
+    // Cap each target on its own: an explicit directive for one of them
+    // (honoured as written) must not leave the other at trace.
+    let mut out = spec.to_string();
+    for c in CAPPED {
+        let explicit = directives.iter().any(|d| {
+            let target = d.split(['=', '[']).next().unwrap_or("");
+            target == c || target.starts_with(&format!("{c}::"))
+        });
+        if !explicit {
+            out.push_str(&format!(",{c}=debug"));
         }
-        let target = d.split(['=', '[']).next().unwrap_or("");
-        explicit |= CAPPED
-            .iter()
-            .any(|c| target == *c || target.starts_with(&format!("{c}::")));
     }
-    if default_trace && !explicit {
-        format!("{spec},tungstenite=debug,tokio_tungstenite=debug")
-    } else {
-        spec.to_string()
-    }
+    out
 }
 
 #[cfg(test)]
@@ -93,6 +98,28 @@ mod tests {
         assert!(!out.contains("TW_") && !out.contains("KNOT_TRACE"), "{out}");
         let out = run("info,knot_server=trace");
         assert!(!out.contains("TW_") && out.contains("KNOT_TRACE"), "{out}");
+    }
+
+    #[test]
+    fn explicit_directive_for_one_target_still_caps_the_other() {
+        let out = run("trace,tokio_tungstenite=info");
+        assert!(!out.contains("TW_TRACE"), "{out}");
+        assert!(!out.contains("TT_TRACE"), "{out}");
+        let out = run("trace,tungstenite=info");
+        assert!(
+            !out.contains("TT_TRACE") && !out.contains("TW_TRACE"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn numeric_trace_level_is_capped() {
+        let out = run("5");
+        assert!(
+            !out.contains("TW_TRACE") && !out.contains("TT_TRACE"),
+            "{out}"
+        );
+        assert!(out.contains("KNOT_TRACE"), "{out}");
     }
 
     #[test]
