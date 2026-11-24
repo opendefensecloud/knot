@@ -52,7 +52,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   `Url::origin()`. (#111)
 - cookie 0.18.3 fixes RUSTSEC-2026-0594 (private cookie nonces can repeat
   in processes that fork). knot was not affected: it never forks.
-  (#TBD)
+  (#115)
 
 ### Operators — read before upgrading
 - **Tell people to reload, and do not roll back past this release once
