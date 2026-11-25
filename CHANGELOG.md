@@ -50,6 +50,9 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - url 2.5.9 fixes RUSTSEC-2026-0592 (a stack overflow in `Url::origin()`
   on deeply nested `blob:` URLs). knot was not affected: it never calls
   `Url::origin()`. (#111)
+- cookie 0.18.3 fixes RUSTSEC-2026-0594 (private cookie nonces can repeat
+  in processes that fork). knot was not affected: it never forks.
+  (#115)
 
 ### Operators — read before upgrading
 - **Tell people to reload, and do not roll back past this release once
