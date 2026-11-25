@@ -72,24 +72,60 @@ impl Default for TocBudget {
 }
 
 impl TocBudget {
-    /// Takes a box listing `texts` from the budget and says so, or leaves
-    /// the budget as it is and says the box does not fit (it then lists
-    /// [`TOC_TOO_MANY_HEADINGS`]).
-    pub fn take<'a>(&mut self, texts: impl ExactSizeIterator<Item = &'a str>) -> bool {
-        let entries = texts.len();
-        if entries > self.entries {
+    /// Takes a box of depth `max_level` from the budget and says so, or
+    /// leaves the budget as it is and says the box does not fit (it then
+    /// lists [`TOC_TOO_MANY_HEADINGS`]). It reads only `index`'s totals, so
+    /// a box costs the same whatever the page holds. A depth outside 1–6
+    /// counts as the nearest of them.
+    pub fn take(&mut self, index: &TocIndex, max_level: u8) -> bool {
+        let d = TocIndex::slot(max_level);
+        let (entries, bytes) = (index.shown[d].len(), index.text_bytes[d]);
+        if entries > self.entries || bytes > self.text_bytes {
             return false;
-        }
-        let mut bytes = 0usize;
-        for t in texts {
-            bytes = bytes.saturating_add(t.len());
-            if bytes > self.text_bytes {
-                return false;
-            }
         }
         self.entries -= entries;
         self.text_bytes -= bytes;
         true
+    }
+}
+
+/// A page's headings grouped once by the depths 1–6 a table of contents can
+/// have, so every box finds what it lists (and its size) without going
+/// through all the headings again.
+#[derive(Debug, Clone, Default)]
+pub struct TocIndex {
+    /// For each depth, the positions of the headings a box of that depth
+    /// lists, in document order.
+    shown: [Vec<usize>; 6],
+    /// For each depth, the bytes of heading text a box of that depth lists.
+    text_bytes: [usize; 6],
+}
+
+impl TocIndex {
+    /// The index of `headings` (level and text, in document order). A
+    /// heading of a level outside 1–6 is never listed.
+    pub fn new<'a>(headings: impl IntoIterator<Item = (u8, &'a str)>) -> Self {
+        let mut index = Self::default();
+        for (i, (level, text)) in headings.into_iter().enumerate() {
+            if !(1..=6).contains(&level) {
+                continue;
+            }
+            for d in Self::slot(level)..6 {
+                index.shown[d].push(i);
+                index.text_bytes[d] = index.text_bytes[d].saturating_add(text.len());
+            }
+        }
+        index
+    }
+
+    /// The positions of the headings a box of depth `max_level` lists, in
+    /// document order. A depth outside 1–6 counts as the nearest of them.
+    pub fn shown(&self, max_level: u8) -> &[usize] {
+        &self.shown[Self::slot(max_level)]
+    }
+
+    fn slot(max_level: u8) -> usize {
+        usize::from(max_level.clamp(1, 6)) - 1
     }
 }
 
@@ -779,45 +815,53 @@ fn headings(blocks: &[Block]) -> Vec<(u8, String)> {
 /// that would go past what is left lists [`TOC_TOO_MANY_HEADINGS`].
 fn fill_tocs(blocks: &mut [Block]) {
     let all = headings(blocks);
-    fn fill(blocks: &mut [Block], all: &[(u8, String)], budget: &mut TocBudget) {
+    let index = TocIndex::new(all.iter().map(|(l, t)| (*l, t.as_str())));
+    struct Page<'a> {
+        all: &'a [(u8, String)],
+        index: &'a TocIndex,
+        budget: TocBudget,
+    }
+    fn fill(blocks: &mut [Block], page: &mut Page<'_>) {
         for b in blocks {
             match b {
                 Block::Toc { max_level, entries } => {
-                    let shown: Vec<&(u8, String)> =
-                        all.iter().filter(|(l, _)| l <= max_level).collect();
-                    if !budget.take(shown.iter().map(|(_, t)| t.as_str())) {
+                    if !page.budget.take(page.index, *max_level) {
                         *entries = vec![TocEntry {
                             level: 0,
                             text: TOC_TOO_MANY_HEADINGS.into(),
                         }];
                         continue;
                     }
-                    let top = shown.iter().map(|(l, _)| *l).min().unwrap_or(1);
+                    let shown = page.index.shown(*max_level);
+                    let top = shown.iter().map(|&i| page.all[i].0).min().unwrap_or(1);
                     *entries = shown
-                        .into_iter()
-                        .map(|(l, text)| TocEntry {
-                            level: (l - top).min(4),
-                            text: text.clone(),
+                        .iter()
+                        .map(|&i| TocEntry {
+                            level: (page.all[i].0 - top).min(4),
+                            text: page.all[i].1.clone(),
                         })
                         .collect();
                 }
-                Block::Quote(inner) | Block::Callout { blocks: inner, .. } => {
-                    fill(inner, all, budget)
-                }
+                Block::Quote(inner) | Block::Callout { blocks: inner, .. } => fill(inner, page),
                 Block::List(list) => list
                     .items
                     .iter_mut()
-                    .for_each(|i| fill(&mut i.blocks, all, budget)),
+                    .for_each(|i| fill(&mut i.blocks, page)),
                 Block::Table(table) => table
                     .rows
                     .iter_mut()
                     .flatten()
-                    .for_each(|c| fill(&mut c.blocks, all, budget)),
+                    .for_each(|c| fill(&mut c.blocks, page)),
                 _ => {}
             }
         }
     }
-    fill(blocks, &all, &mut TocBudget::default());
+    let mut page = Page {
+        all: &all,
+        index: &index,
+        budget: TocBudget::default(),
+    };
+    fill(blocks, &mut page);
 }
 
 fn visit_blocks<'a>(blocks: &'a [Block], f: &mut impl FnMut(&'a Block)) {

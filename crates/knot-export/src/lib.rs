@@ -18,5 +18,5 @@ pub use odt::write_odt;
 pub use walk::{
     DiagramRef, MAX_DEPTH, MAX_PAGE_GRID_CELLS, MAX_PAGE_TOC_ENTRIES, MAX_PAGE_TOC_TEXT_BYTES,
     MAX_SPAN, MAX_TABLE_COLUMNS, MAX_TABLE_GRID_CELLS, TABLE_COLUMN_ROWS, TOC_TOO_MANY_HEADINGS,
-    TocBudget, Walked, blob_ids, diagrams, user_ids, walk,
+    TocBudget, TocIndex, Walked, blob_ids, diagrams, user_ids, walk,
 };
