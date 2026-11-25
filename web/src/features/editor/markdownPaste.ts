@@ -15,6 +15,7 @@
 import { marked } from "marked";
 
 import { sanitizeEditorFragment } from "../../lib/sanitize";
+import { calloutKind, normaliseTitle } from "./callouts";
 
 const HEADING = /^ {0,3}(#{1,6})[ \t]+\S/;
 const BULLET = /^ {0,3}[-*+][ \t]+\S/;
@@ -106,6 +107,7 @@ export function looksLikeMarkdown(text: string): boolean {
 export function markdownToHtml(markdown: string): string {
   const tokens = marked.lexer(markdown, { gfm: true });
   markTocParagraphs(tokens);
+  markCallouts(tokens);
   const raw = marked.parser(tokens, { async: false, gfm: true });
   const fragment = sanitizeEditorFragment(raw);
   promoteTaskItems(fragment);
@@ -167,4 +169,52 @@ function promoteTocMarkers(fragment: DocumentFragment): void {
     box.setAttribute("data-max-level", String(tocLevel(p.getAttribute("data-knot-toc") ?? undefined)));
     p.replaceWith(box);
   });
+}
+
+/**
+ * A box marker on a quote's first line, as `from_markdown.rs` reads it:
+ * `[!KIND]` alone, or `[!kind] Title` (GitLab). Checked on the Markdown
+ * source, where `\\[!NOTE]` (a plain quote, escaped by knot's export) is
+ * still told apart from a marker; `marked`'s HTML has dropped the escape.
+ */
+const CALLOUT_MARKER = /^\[!([A-Za-z]+)\](?:[ \t]+(.*?))?[ \t]*\r?$/;
+
+type Tokens = ReturnType<typeof marked.lexer>;
+
+/** `markdown` as HTML, with its boxes made (see [`markCallouts`]). */
+function render(markdown: string): string {
+  const tokens = marked.lexer(markdown, { gfm: true });
+  markCallouts(tokens);
+  return marked.parser(tokens, { async: false, gfm: true });
+}
+
+/**
+ * GitHub's and GitLab's alerts: every quote whose first line is a marker
+ * becomes a `<blockquote data-kind data-title>` holding the rest of the
+ * quote; an unknown kind stays a plain quote with its text. Nested quotes
+ * and quotes in lists are handled too. The result is sanitized with the
+ * rest, so the title only ever reaches the editor as an attribute value.
+ */
+function markCallouts(tokens: Tokens | Tokens[number][]): void {
+  tokens.forEach((token, i) => {
+    if (token.type === "blockquote") {
+      const [first = "", ...rest] = (token.text as string).split("\n");
+      const marker = CALLOUT_MARKER.exec(first);
+      const kind = calloutKind(marker?.[1]);
+      if (marker && kind) {
+        const title = normaliseTitle((marker[2] ?? "").replace(/\\([!-/:-@[-`{-~])/g, "$1"));
+        const body = render(rest.join("\n")).trim() || "<p></p>";
+        const attrs = `data-kind="${kind}"${title ? ` data-title="${escapeAttr(title)}"` : ""}`;
+        tokens[i] = { type: "html", block: true, pre: false, raw: token.raw, text: `<blockquote ${attrs}>${body}</blockquote>` };
+        return;
+      }
+    }
+    const nested = token as { tokens?: Tokens[number][]; items?: { tokens?: Tokens[number][] }[] };
+    if (nested.tokens) markCallouts(nested.tokens);
+    nested.items?.forEach((item) => item.tokens && markCallouts(item.tokens));
+  });
+}
+
+function escapeAttr(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }

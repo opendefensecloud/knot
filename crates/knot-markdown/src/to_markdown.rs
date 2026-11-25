@@ -778,8 +778,23 @@ fn write_quote<T: ReadTxn>(
     report: &mut Report,
 ) -> Result<(), SerError> {
     let mut lines = Vec::new();
+    // A callout box opens with its marker line (`crate::callout`).
+    let callout = crate::callout::callout_of(txn, quote);
+    if let Some((kind, title)) = &callout {
+        lines.push(Line::Text {
+            text: crate::callout::marker_line(*kind, title.as_deref()),
+            open: false,
+        });
+    }
     let children = written_children(txn, quote);
     write_container(&mut lines, txn, &children, true, depth + 1, purpose, report)?;
+    // A plain quote whose text starts like a marker stays a plain quote.
+    if callout.is_none()
+        && let Some(Line::Text { text, .. }) = lines.first_mut()
+        && let Some(at) = crate::callout::marker_start(text)
+    {
+        text.insert(at, '\\');
+    }
     buf.extend(lines.into_iter().map(|line| match line {
         Line::Text { text, open } if !text.is_empty() => Line::Text {
             text: format!("> {text}"),

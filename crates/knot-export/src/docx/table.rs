@@ -1,8 +1,9 @@
 //! Tables: a fixed grid of `w:gridCol`s from the column shares, every row
 //! filled out to that grid, and spans as `w:gridSpan` and `w:vMerge`.
 
-use crate::model::{Align, Cell, Table};
+use crate::model::{Align, Block, CalloutKind, Cell, Table};
 use crate::tables::{Slot, grid_edges, header_rows, layout};
+use crate::xml::esc_text;
 
 use super::body::QUOTE_INDENT_TWIPS;
 use super::{Ctx, body};
@@ -151,4 +152,59 @@ fn tc_pr(out: &mut String, twips: u32, span: usize, v_merge: Option<&str>, heade
         out.push_str(r#"<w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/>"#);
     }
     out.push_str("</w:tcPr>");
+}
+
+/// Write a callout box `avail_twips` wide: a one-cell table bordered in the
+/// kind's colour, its first paragraph the title (bold, in that colour, on
+/// a light shade of it), then the box's blocks. A table keeps the box
+/// together and readable in grey print, in Word and LibreOffice alike.
+pub(super) fn callout(
+    cx: &mut Ctx,
+    kind: CalloutKind,
+    title: Option<&str>,
+    blocks: &[Block],
+    avail_twips: u32,
+) {
+    if cx.xml.ends_with("</w:tbl>") {
+        cx.xml.push_str("<w:p/>");
+    }
+    let indent = cx.block_indent + cx.quote_depth * QUOTE_INDENT_TWIPS;
+    let tbl_ind = if indent > 0 {
+        format!(r#"<w:tblInd w:w="{indent}" w:type="dxa"/>"#)
+    } else {
+        String::new()
+    };
+    let hue = kind.hue();
+    let border =
+        |side: &str| format!(r#"<w:{side} w:val="single" w:sz="8" w:space="0" w:color="{hue}"/>"#);
+    cx.xml.push_str(&format!(
+        concat!(
+            r#"<w:tbl><w:tblPr><w:tblW w:w="{avail}" w:type="dxa"/>{tbl_ind}"#,
+            r#"<w:tblBorders>{top}{left}{bottom}{right}</w:tblBorders>"#,
+            r#"<w:tblLayout w:type="fixed"/></w:tblPr>"#,
+            r#"<w:tblGrid><w:gridCol w:w="{avail}"/></w:tblGrid><w:tr><w:tc>"#,
+            r#"<w:tcPr><w:tcW w:w="{avail}" w:type="dxa"/></w:tcPr>"#,
+            r#"<w:p><w:pPr><w:shd w:val="clear" w:color="auto" w:fill="{shade}"/></w:pPr>"#,
+            r#"<w:r><w:rPr><w:b/><w:color w:val="{hue}"/></w:rPr>"#,
+            r#"<w:t xml:space="preserve">{title}</w:t></w:r></w:p>"#,
+        ),
+        avail = avail_twips,
+        tbl_ind = tbl_ind,
+        top = border("top"),
+        left = border("left"),
+        bottom = border("bottom"),
+        right = border("right"),
+        shade = kind.shade(),
+        hue = hue,
+        title = esc_text(title.unwrap_or(kind.label())),
+    ));
+    // The content starts at the cell's edge, as in a table cell.
+    let outer = (cx.quote_depth, cx.list_depth, cx.block_indent);
+    (cx.quote_depth, cx.list_depth, cx.block_indent) = (0, 0, 0);
+    body::blocks(cx, blocks, avail_twips.saturating_sub(CELL_MARGINS_TWIPS));
+    (cx.quote_depth, cx.list_depth, cx.block_indent) = outer;
+    if !(cx.xml.ends_with("</w:p>") || cx.xml.ends_with("<w:p/>")) {
+        cx.xml.push_str("<w:p/>");
+    }
+    cx.xml.push_str("</w:tc></w:tr></w:tbl>");
 }
