@@ -981,3 +981,69 @@ fn toc_lists_headings_inside_a_callout() {
     ]));
     assert_eq!(toc_entries(&w.doc.blocks), vec![(0, "Inside".into())]);
 }
+
+#[test]
+fn tables_of_contents_stop_listing_at_the_page_entry_budget() {
+    use knot_export::{MAX_PAGE_TOC_ENTRIES, TOC_TOO_MANY_HEADINGS};
+    // Each box lists every heading, so two boxes fit the budget and the
+    // third would go past it.
+    let headings = MAX_PAGE_TOC_ENTRIES / 3 + 1;
+    let toc = || el("table_of_contents", vec![], vec![]);
+    let mut children = vec![toc(), toc(), toc()];
+    children.extend((0..headings).map(|i| h(2, &format!("H{i}"))));
+    let w = walk(&build(children));
+    let lens: Vec<usize> = w.doc.blocks[..3]
+        .iter()
+        .map(|b| match b {
+            Block::Toc { entries, .. } => entries.len(),
+            other => panic!("not a table of contents: {other:?}"),
+        })
+        .collect();
+    assert_eq!(lens, vec![headings, headings, 1]);
+    assert_eq!(
+        toc_entries(&w.doc.blocks[2..]),
+        vec![(0, TOC_TOO_MANY_HEADINGS.into())]
+    );
+}
+
+#[test]
+fn tables_of_contents_stop_listing_at_the_page_text_budget() {
+    use knot_export::{MAX_PAGE_TOC_TEXT_BYTES, TOC_TOO_MANY_HEADINGS};
+    // One heading just over half the budget: the first box lists it, a
+    // second one would go past the budget.
+    let long = "a".repeat(MAX_PAGE_TOC_TEXT_BYTES / 2 + 1);
+    let toc = || el("table_of_contents", vec![], vec![]);
+    let w = walk(&build(vec![toc(), toc(), h(1, &long)]));
+    assert_eq!(toc_entries(&w.doc.blocks), vec![(0, long.clone())]);
+    assert_eq!(
+        toc_entries(&w.doc.blocks[1..]),
+        vec![(0, TOC_TOO_MANY_HEADINGS.into())]
+    );
+}
+
+#[test]
+fn a_table_of_contents_in_a_table_cell_spends_the_same_budget_up_to_its_last_entry() {
+    use knot_export::{MAX_PAGE_TOC_ENTRIES, TOC_TOO_MANY_HEADINGS};
+    // Two boxes of half the budget each fill it exactly, the one in the
+    // table cell included; the third box finds nothing left.
+    let headings = MAX_PAGE_TOC_ENTRIES / 2;
+    let toc = || el("table_of_contents", vec![], vec![]);
+    let cell = el("table_cell", vec![], vec![toc()]);
+    let mut children = vec![
+        toc(),
+        el("table", vec![], vec![el("table_row", vec![], vec![cell])]),
+        toc(),
+    ];
+    children.extend((0..headings).map(|i| h(2, &format!("H{i}"))));
+    let w = walk(&build(children));
+    let in_cell = match &w.doc.blocks[1] {
+        Block::Table(t) => t.rows[0][0].blocks.clone(),
+        other => panic!("not a table: {other:?}"),
+    };
+    assert_eq!(toc_entries(&w.doc.blocks).len(), headings);
+    assert_eq!(toc_entries(&in_cell).len(), headings);
+    assert_eq!(
+        toc_entries(&w.doc.blocks[2..]),
+        vec![(0, TOC_TOO_MANY_HEADINGS.into())]
+    );
+}
