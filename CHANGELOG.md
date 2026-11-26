@@ -8,6 +8,10 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Fixed
+- An API key needs `update`, not `create`, for
+  `POST /api/docs/{id}/move-to-subpage`: it cuts blocks out of an
+  existing page, so a `create`-only key could change that page.
 ### Added
 - Table of contents block. Insert it from the editor toolbar (the list-tree
   button) and it lists the page's headings in a box, kept current as
