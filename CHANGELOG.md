@@ -64,6 +64,9 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - cookie 0.18.3 fixes RUSTSEC-2026-0594 (private cookie nonces can repeat
   in processes that fork). knot was not affected: it never forks.
   (#115)
+- The sidebar's row menu stays inside the window. Opened on a page near
+  the bottom of the sidebar, it ran past the bottom edge and its lower
+  items were out of reach; now it moves up until it fits.
 
 ### Operators — read before upgrading
 - Rolling back past this release keeps every callout box's text, but a box
