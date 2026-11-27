@@ -66,7 +66,7 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   (#115)
 - The sidebar's row menu stays inside the window. Opened on a page near
   the bottom of the sidebar, it ran past the bottom edge and its lower
-  items were out of reach; now it moves up until it fits.
+  items were out of reach; now it moves up until it fits. (#117)
 
 ### Operators — read before upgrading
 - Rolling back past this release keeps every callout box's text, but a box
