@@ -167,8 +167,8 @@ fn collect_headings(events: &[pulldown_cmark::Event<'_>]) -> Vec<HeadingRef> {
 }
 
 /// The table of contents box for `headings` down to `max_level`, which
-/// `index` sorts by depth. It lists them only when they fit in what is
-/// left of the page's `budget`, and takes them from it; otherwise it says
+/// `index` sorts by depth. It lists them while they fit in what is left of
+/// the page's `budget`, taking them from it, and then says
 /// [`knot_export::TOC_TOO_MANY_HEADINGS`].
 fn toc_html(
     headings: &[HeadingRef],
@@ -182,23 +182,47 @@ fn toc_html(
     );
     if shown.is_empty() {
         html.push_str("<p>No headings yet</p>");
-    } else if !budget.take(index, max_level) {
-        html.push_str(&format!("<p>{}</p>", knot_export::TOC_TOO_MANY_HEADINGS));
     } else {
-        let top = shown.iter().map(|&i| headings[i].level).min().unwrap_or(1);
-        html.push_str(r#"<ul class="knot-box__list">"#);
-        for h in shown.iter().map(|&i| &headings[i]) {
-            let class = TOC_LEVEL_CLASSES[usize::from((h.level - top).min(4))];
-            html.push_str(&format!(
-                r##"<li class="{class}"><a href="#{}">{}</a></li>"##,
-                h.slug,
-                html_escape(&h.text)
-            ));
+        let listed = budget.take(index, max_level);
+        if listed > 0 {
+            let top = shown.iter().map(|&i| headings[i].level).min().unwrap_or(1);
+            html.push_str(r#"<ul class="knot-box__list">"#);
+            for h in shown[..listed].iter().map(|&i| &headings[i]) {
+                let class = TOC_LEVEL_CLASSES[usize::from((h.level - top).min(4))];
+                html.push_str(&toc_entry_html(class, h));
+            }
+            html.push_str("</ul>");
         }
-        html.push_str("</ul>");
+        if listed < shown.len() {
+            html.push_str(&format!("<p>{}</p>", knot_export::TOC_TOO_MANY_HEADINGS));
+        }
     }
     html.push_str("</nav>");
     html
+}
+
+/// The line of a table of contents that links to `h`.
+fn toc_entry_html(class: &str, h: &HeadingRef) -> String {
+    format!(
+        r##"<li class="{class}"><a href="#{}">{}</a></li>"##,
+        h.slug,
+        html_escape(&h.text)
+    )
+}
+
+/// What [`toc_entry_html`] writes for `h`, counted without writing it, for
+/// the page's [`knot_export::TocBudget`]. Every level class is as long.
+fn toc_entry_bytes(h: &HeadingRef) -> usize {
+    const MARKUP: usize = r##"<li class=""><a href="#"></a></li>"##.len();
+    const CLASS: usize = TOC_LEVEL_CLASSES[0].len();
+    const _: () = {
+        let mut i = 1;
+        while i < TOC_LEVEL_CLASSES.len() {
+            assert!(TOC_LEVEL_CLASSES[i].len() == CLASS);
+            i += 1;
+        }
+    };
+    MARKUP + CLASS + h.slug.len() + html_escape_len(&h.text)
 }
 
 /// The callout box classes the sanitizer lets through: the box, one per
@@ -269,11 +293,15 @@ fn with_headings(events: Vec<pulldown_cmark::Event<'_>>) -> Vec<pulldown_cmark::
     use pulldown_cmark::{Event, Tag, TagEnd};
     let headings = collect_headings(&events);
     let mut next_heading = headings.iter();
-    // Empty headings get an id but no line in a table of contents.
-    let index = knot_export::TocIndex::new(headings.iter().map(|h| {
-        let level = if h.text.trim().is_empty() { 0 } else { h.level };
-        (level, h.text.as_str())
-    }));
+    // Built at the first box, so a page without one never pays for it.
+    let mut index: Option<knot_export::TocIndex> = None;
+    let index_of = |headings: &[HeadingRef]| {
+        // Empty headings get an id but no line in a table of contents.
+        knot_export::TocIndex::new(headings.iter().map(|h| {
+            let level = if h.text.trim().is_empty() { 0 } else { h.level };
+            (level, toc_entry_bytes(h))
+        }))
+    };
     let mut budget = knot_export::TocBudget::default();
     let mut out = Vec::with_capacity(events.len());
     let mut i = 0;
@@ -282,15 +310,17 @@ fn with_headings(events: Vec<pulldown_cmark::Event<'_>>) -> Vec<pulldown_cmark::
             && let Some(level) = toc_sentinel_at(&events, i + 1)
             && matches!(events.get(i + 3), Some(Event::End(TagEnd::Paragraph)))
         {
+            let index = index.get_or_insert_with(|| index_of(&headings));
             out.push(Event::Html(
-                toc_html(&headings, &index, level, &mut budget).into(),
+                toc_html(&headings, index, level, &mut budget).into(),
             ));
             i += 4;
             continue;
         }
         if let Some(level) = toc_sentinel_at(&events, i) {
+            let index = index.get_or_insert_with(|| index_of(&headings));
             out.push(Event::InlineHtml(
-                toc_html(&headings, &index, level, &mut budget).into(),
+                toc_html(&headings, index, level, &mut budget).into(),
             ));
             i += 2;
             continue;
@@ -576,6 +606,18 @@ fn not_found() -> Response {
         .unwrap()
 }
 
+/// Bytes [`html_escape`] makes of `s`, without making them.
+fn html_escape_len(s: &str) -> usize {
+    s.bytes()
+        .map(|b| match b {
+            b'&' => "&amp;".len(),
+            b'<' | b'>' => "&lt;".len(),
+            b'"' => "&quot;".len(),
+            _ => 1,
+        })
+        .sum()
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -778,26 +820,69 @@ mod tests {
     fn tables_of_contents_stop_listing_at_the_page_entry_budget() {
         use knot_export::{MAX_PAGE_TOC_ENTRIES, TOC_TOO_MANY_HEADINGS};
         // Each box lists every heading, so two boxes fit the budget and the
-        // third would go past it.
+        // third lists what is left, one short, and then the notice.
         let headings = MAX_PAGE_TOC_ENTRIES / 3 + 1;
         let mut md = String::from("[[_TOC_]]\n\n[[_TOC_]]\n\n[[_TOC_]]\n\n");
         for i in 0..headings {
             md.push_str(&format!("## H{i}\n\n"));
         }
         let html = render(&md);
-        assert_eq!(html.matches("href=\"#h-h").count(), 2 * headings, "entries");
+        assert_eq!(
+            html.matches("href=\"#h-h").count(),
+            MAX_PAGE_TOC_ENTRIES,
+            "entries"
+        );
         assert_eq!(html.matches(TOC_TOO_MANY_HEADINGS).count(), 1, "notice");
     }
 
     #[test]
-    fn tables_of_contents_stop_listing_at_the_page_text_budget() {
-        use knot_export::{MAX_PAGE_TOC_TEXT_BYTES, TOC_TOO_MANY_HEADINGS};
-        // One heading just over half the budget: the first box lists it, a
-        // second one would go past the budget.
-        let long = "a".repeat(MAX_PAGE_TOC_TEXT_BYTES / 2 + 1);
-        let html = render(&format!("[[_TOC_]]\n\n[[_TOC_]]\n\n# {long}\n"));
-        assert_eq!(html.matches("href=\"#h-a").count(), 1, "entries");
+    fn one_box_past_the_entry_budget_lists_what_fits_then_says_so() {
+        use knot_export::{MAX_PAGE_TOC_ENTRIES, TOC_TOO_MANY_HEADINGS};
+        let mut md = String::from("[[_TOC_]]\n\n");
+        for i in 0..=MAX_PAGE_TOC_ENTRIES {
+            md.push_str(&format!("## H{i}\n\n"));
+        }
+        let html = render(&md);
+        assert_eq!(
+            html.matches("href=\"#h-h").count(),
+            MAX_PAGE_TOC_ENTRIES,
+            "entries"
+        );
+        assert!(
+            html.contains(&format!("</ul><p>{TOC_TOO_MANY_HEADINGS}</p></nav>")),
+            "notice after the list"
+        );
+    }
+
+    #[test]
+    fn the_page_byte_budget_counts_escaped_text_not_raw_text() {
+        use knot_export::{MAX_PAGE_TOC_BYTES, TOC_TOO_MANY_HEADINGS};
+        // An eighth of the budget in `&`, which each escape to five bytes:
+        // the first box writes more than half the budget, so a second one
+        // finds too little left.
+        let amps = "&".repeat(MAX_PAGE_TOC_BYTES / 8);
+        let html = render(&format!("[[_TOC_]]\n\n[[_TOC_]]\n\n# {amps}\n"));
+        assert_eq!(html.matches("href=\"#h-section\"").count(), 1, "entries");
         assert_eq!(html.matches(TOC_TOO_MANY_HEADINGS).count(), 1, "notice");
+    }
+
+    #[test]
+    fn toc_entry_bytes_is_what_the_entry_writes() {
+        let mut slugger = knot_markdown::slug::Slugger::default();
+        for text in ["Plan", "a \"quoted\" <b> & c", "\u{FDFA}\u{FDFA}", ""] {
+            let h = HeadingRef {
+                level: 2,
+                text: text.into(),
+                slug: format!("{HEADING_ID_PREFIX}{}", slugger.slug(text)),
+            };
+            for class in TOC_LEVEL_CLASSES {
+                assert_eq!(
+                    toc_entry_bytes(&h),
+                    toc_entry_html(class, &h).len(),
+                    "{text}"
+                );
+            }
+        }
     }
 
     #[test]

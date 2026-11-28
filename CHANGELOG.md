@@ -64,11 +64,13 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 - cookie 0.18.3 fixes RUSTSEC-2026-0594 (private cookie nonces can repeat
   in processes that fork). knot was not affected: it never forks.
   (#115)
-- Tables of contents list at most 5,000 entries and 1 MiB of heading text
-  per page together, on public share pages and in DOCX and ODT exports. A
-  page with many boxes and many or very long headings could otherwise make
-  share pages and exports very large; a box past that shows "Too many
-  headings to list". (#116)
+- Tables of contents list at most 5,000 entries and write at most 1 MiB
+  per page together, on public share pages and in DOCX and ODT exports,
+  counting each entry as written (escaped, and on share pages with its
+  link). A page with many boxes and many or very long headings could
+  otherwise make share pages and exports very large; a box that reaches
+  the limit lists the headings that fit and then "Too many headings to
+  list". (#116)
 
 ### Operators — read before upgrading
 - Rolling back past this release keeps every callout box's text, but a box

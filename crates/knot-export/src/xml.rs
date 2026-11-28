@@ -50,6 +50,19 @@ pub fn esc_text(s: &str) -> String {
     esc(s, false)
 }
 
+/// Bytes [`esc_text`] makes of `s`, without making them.
+pub fn esc_text_len(s: &str) -> usize {
+    s.chars()
+        .filter(|&c| !invalid_xml_char(c))
+        .map(|c| match c {
+            '&' => "&amp;".len(),
+            '<' => "&lt;".len(),
+            '>' => "&gt;".len(),
+            _ => c.len_utf8(),
+        })
+        .sum()
+}
+
 /// Escape an attribute value, dropping characters XML 1.0 forbids. Tabs and
 /// line breaks become character references so they survive parsing.
 pub fn esc_attr(s: &str) -> String {

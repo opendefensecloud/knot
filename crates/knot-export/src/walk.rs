@@ -44,48 +44,50 @@ pub const MAX_SPAN: usize = 64;
 
 /// Entries all the tables of contents of a page list together. Every box
 /// lists the whole page's headings, so boxes × headings would otherwise
-/// grow without bound; a box that would go past it lists
-/// [`TOC_TOO_MANY_HEADINGS`] instead.
+/// grow without bound; a box lists headings while they fit and then
+/// [`TOC_TOO_MANY_HEADINGS`].
 pub const MAX_PAGE_TOC_ENTRIES: usize = 5_000;
 
-/// Bytes of heading text all the tables of contents of a page list
-/// together, so one very long heading cannot be repeated by many boxes
-/// either; a box that would go past it lists [`TOC_TOO_MANY_HEADINGS`].
-pub const MAX_PAGE_TOC_TEXT_BYTES: usize = 1 << 20;
+/// Bytes all the tables of contents of a page write together, so one very
+/// long heading cannot be repeated by many boxes either. Each listed
+/// heading costs what its line writes, as the caller of [`TocIndex::new`]
+/// counts it: escaped text in exports, and escaped text, anchor and markup
+/// on share pages.
+pub const MAX_PAGE_TOC_BYTES: usize = 1 << 20;
 
 /// What the tables of contents of one page may still list: entries
-/// against [`MAX_PAGE_TOC_ENTRIES`] and heading text against
-/// [`MAX_PAGE_TOC_TEXT_BYTES`]. Boxes take from it in document order.
+/// against [`MAX_PAGE_TOC_ENTRIES`] and bytes against
+/// [`MAX_PAGE_TOC_BYTES`]. Boxes take from it in document order.
 #[derive(Debug, Clone)]
 pub struct TocBudget {
     entries: usize,
-    text_bytes: usize,
+    bytes: usize,
 }
 
 impl Default for TocBudget {
     fn default() -> Self {
         Self {
             entries: MAX_PAGE_TOC_ENTRIES,
-            text_bytes: MAX_PAGE_TOC_TEXT_BYTES,
+            bytes: MAX_PAGE_TOC_BYTES,
         }
     }
 }
 
 impl TocBudget {
-    /// Takes a box of depth `max_level` from the budget and says so, or
-    /// leaves the budget as it is and says the box does not fit (it then
-    /// lists [`TOC_TOO_MANY_HEADINGS`]). It reads only `index`'s totals, so
-    /// a box costs the same whatever the page holds. A depth outside 1–6
-    /// counts as the nearest of them.
-    pub fn take(&mut self, index: &TocIndex, max_level: u8) -> bool {
+    /// How many of the headings a box of depth `max_level` lists (from the
+    /// start of [`TocIndex::shown`]) fit in what is left, taking them from
+    /// the budget. Fewer than all of them means the box lists those and
+    /// then [`TOC_TOO_MANY_HEADINGS`]. It costs a binary search, whatever
+    /// the page holds. A depth outside 1–6 counts as the nearest of them.
+    pub fn take(&mut self, index: &TocIndex, max_level: u8) -> usize {
         let d = TocIndex::slot(max_level);
-        let (entries, bytes) = (index.shown[d].len(), index.text_bytes[d]);
-        if entries > self.entries || bytes > self.text_bytes {
-            return false;
-        }
-        self.entries -= entries;
-        self.text_bytes -= bytes;
-        true
+        let ends = &index.ends[d];
+        let room = &ends[..ends.len().min(self.entries)];
+        let listed = room.partition_point(|&end| end <= self.bytes);
+        let spent = listed.checked_sub(1).map_or(0, |last| ends[last]);
+        self.entries -= listed;
+        self.bytes -= spent;
+        listed
     }
 }
 
@@ -97,22 +99,31 @@ pub struct TocIndex {
     /// For each depth, the positions of the headings a box of that depth
     /// lists, in document order.
     shown: [Vec<usize>; 6],
-    /// For each depth, the bytes of heading text a box of that depth lists.
-    text_bytes: [usize; 6],
+    /// For each depth, the bytes a box of that depth writes up to and
+    /// including each of its headings (`shown`'s running total of cost).
+    ends: [Vec<usize>; 6],
 }
 
 impl TocIndex {
-    /// The index of `headings` (level and text, in document order). A
-    /// heading of a level outside 1–6 is never listed.
-    pub fn new<'a>(headings: impl IntoIterator<Item = (u8, &'a str)>) -> Self {
+    /// The index of `headings` (level and the bytes its line in a table of
+    /// contents writes, in document order). A heading of a level outside
+    /// 1–6 is never listed.
+    pub fn new(headings: impl IntoIterator<Item = (u8, usize)>) -> Self {
         let mut index = Self::default();
-        for (i, (level, text)) in headings.into_iter().enumerate() {
+        let mut totals = [0usize; 6];
+        for (i, (level, cost)) in headings.into_iter().enumerate() {
             if !(1..=6).contains(&level) {
                 continue;
             }
-            for d in Self::slot(level)..6 {
-                index.shown[d].push(i);
-                index.text_bytes[d] = index.text_bytes[d].saturating_add(text.len());
+            let from = Self::slot(level);
+            let depths = totals[from..]
+                .iter_mut()
+                .zip(&mut index.shown[from..])
+                .zip(&mut index.ends[from..]);
+            for ((total, shown), ends) in depths {
+                *total = total.saturating_add(cost);
+                shown.push(i);
+                ends.push(*total);
             }
         }
         index
@@ -129,8 +140,8 @@ impl TocIndex {
     }
 }
 
-/// The one line of a table of contents past what is left of the page's
-/// [`TocBudget`].
+/// The last line of a table of contents that lists fewer than all its
+/// headings, having reached what is left of the page's [`TocBudget`].
 pub const TOC_TOO_MANY_HEADINGS: &str = "Too many headings to list";
 
 /// Result of walking a document.
@@ -812,35 +823,40 @@ fn headings(blocks: &[Block]) -> Vec<(u8, String)> {
 
 /// Fills every [`Block::Toc`] with the headings down to its depth, in
 /// document order, each taking from one [`TocBudget`] for the page; a box
-/// that would go past what is left lists [`TOC_TOO_MANY_HEADINGS`].
+/// that reaches what is left lists the headings that fit and then
+/// [`TOC_TOO_MANY_HEADINGS`].
 fn fill_tocs(blocks: &mut [Block]) {
     let all = headings(blocks);
-    let index = TocIndex::new(all.iter().map(|(l, t)| (*l, t.as_str())));
     struct Page<'a> {
         all: &'a [(u8, String)],
-        index: &'a TocIndex,
+        /// Built at the first box, so a page without one never pays for it.
+        index: Option<TocIndex>,
         budget: TocBudget,
     }
     fn fill(blocks: &mut [Block], page: &mut Page<'_>) {
         for b in blocks {
             match b {
                 Block::Toc { max_level, entries } => {
-                    if !page.budget.take(page.index, *max_level) {
-                        *entries = vec![TocEntry {
-                            level: 0,
-                            text: TOC_TOO_MANY_HEADINGS.into(),
-                        }];
-                        continue;
-                    }
-                    let shown = page.index.shown(*max_level);
-                    let top = shown.iter().map(|&i| page.all[i].0).min().unwrap_or(1);
-                    *entries = shown
+                    let all = page.all;
+                    let index = page.index.get_or_insert_with(|| {
+                        TocIndex::new(all.iter().map(|(l, t)| (*l, crate::xml::esc_text_len(t))))
+                    });
+                    let shown = index.shown(*max_level);
+                    let listed = page.budget.take(index, *max_level);
+                    let top = shown.iter().map(|&i| all[i].0).min().unwrap_or(1);
+                    *entries = shown[..listed]
                         .iter()
                         .map(|&i| TocEntry {
-                            level: (page.all[i].0 - top).min(4),
-                            text: page.all[i].1.clone(),
+                            level: (all[i].0 - top).min(4),
+                            text: all[i].1.clone(),
                         })
                         .collect();
+                    if listed < shown.len() {
+                        entries.push(TocEntry {
+                            level: 0,
+                            text: TOC_TOO_MANY_HEADINGS.into(),
+                        });
+                    }
                 }
                 Block::Quote(inner) | Block::Callout { blocks: inner, .. } => fill(inner, page),
                 Block::List(list) => list
@@ -858,7 +874,7 @@ fn fill_tocs(blocks: &mut [Block]) {
     }
     let mut page = Page {
         all: &all,
-        index: &index,
+        index: None,
         budget: TocBudget::default(),
     };
     fill(blocks, &mut page);
