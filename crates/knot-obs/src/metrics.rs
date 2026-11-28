@@ -122,6 +122,7 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     describe_history_metrics();
     describe_limit_metrics();
     describe_audit_metrics();
+    describe_change_event_hook_metrics();
 
     // Notifications
     describe_counter!(
@@ -274,6 +275,25 @@ fn describe_audit_metrics() {
     describe_counter!(
         "knot_audit_write_failures_total",
         "Failed audit writes, by action: one per failed insert, however many rows it held. For doc.export each is one refused export (503 audit.unavailable, no file sent), however many pages it covered, including an insert given up on after 5 s; for other actions the writer is best effort and the request went on"
+    );
+}
+
+fn describe_change_event_hook_metrics() {
+    describe_gauge!(
+        "knot_change_event_hook_connected",
+        "1 while the change event hook is connected to its receiver"
+    );
+    describe_counter!(
+        "knot_change_event_hook_events_sent_total",
+        "Change events sent to the receiver"
+    );
+    describe_counter!(
+        "knot_change_event_hook_events_dropped_total",
+        "Change events dropped (reason: queue_full, disconnected, send_failed)"
+    );
+    describe_counter!(
+        "knot_change_event_hook_connects_total",
+        "Change event hook connection attempts (result: ok, error)"
     );
 }
 

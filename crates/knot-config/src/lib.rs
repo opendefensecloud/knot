@@ -187,6 +187,10 @@ pub struct Config {
     /// Pages one user may create in the workspace (`documents.created_by`),
     /// archived ones included until purged. `0` turns the quota off.
     pub quota_pages_per_user: u64,
+    /// Change event hook receiver (`ws://` or `wss://`). Empty = off.
+    pub change_event_hook_url: String,
+    /// Optional bearer token sent on the hook's WebSocket handshake.
+    pub change_event_hook_token: String,
     /// Pages the workspace may hold, archived ones included until purged.
     /// `0` turns the quota off.
     pub quota_pages_per_workspace: u64,
@@ -241,6 +245,8 @@ impl Default for Config {
             rate_limit_collab_max_sockets: 64,
             trusted_proxies: String::new(),
             quota_pages_per_user: 0,
+            change_event_hook_url: String::new(),
+            change_event_hook_token: String::new(),
             quota_pages_per_workspace: 0,
             quota_blob_bytes_per_user: 0,
             quota_blob_bytes_per_workspace: 0,
@@ -392,6 +398,25 @@ impl Config {
             .map_err(|e| {
                 ConfigError::Invalid(format!("oidc_role_from_groups not valid JSON: {e}"))
             })?;
+        }
+        if !self.change_event_hook_url.is_empty() {
+            match url::Url::parse(&self.change_event_hook_url) {
+                Ok(u) if matches!(u.scheme(), "ws" | "wss") && u.host().is_some() => {}
+                _ => {
+                    return Err(ConfigError::Invalid(
+                        "KNOT_CHANGE_EVENT_HOOK_URL must be a ws:// or wss:// URL".into(),
+                    ));
+                }
+            }
+        }
+        if self
+            .change_event_hook_token
+            .bytes()
+            .any(|b| !(0x20..0x7f).contains(&b))
+        {
+            return Err(ConfigError::Invalid(
+                "KNOT_CHANGE_EVENT_HOOK_TOKEN must be printable ASCII".into(),
+            ));
         }
         Ok(())
     }
@@ -644,6 +669,7 @@ mod tests {
     fn rate_limit_and_quota_defaults() {
         let defaults = Config::default();
         assert!(defaults.rate_limit_enabled);
+        assert!(defaults.change_event_hook_url.is_empty());
         assert_eq!(defaults.rate_limit_scale, 1.0);
         assert_eq!(defaults.rate_limit_collab_max_sockets, 64);
         assert!(defaults.trusted_proxies.is_empty());

@@ -56,6 +56,8 @@ helm install knot ./deploy/helm/knot \
 
 See `deploy/helm/knot/README.md` for the full install guide, the external-secret pattern, and OIDC setup.
 
+To stream page changes to another system, see [docs/change-event-hook.md](docs/change-event-hook.md).
+
 ## Observability
 
 - `/api/healthz` — liveness

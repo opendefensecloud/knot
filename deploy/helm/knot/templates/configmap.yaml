@@ -32,6 +32,9 @@ data:
   {{- /* a list or one comma-separated string; join passes a string through */}}
   KNOT_TRUSTED_PROXIES: {{ join "," . | quote }}
   {{- end }}
+  {{- with .Values.changeEventHook.url }}
+  KNOT_CHANGE_EVENT_HOOK_URL: {{ . | quote }}
+  {{- end }}
   KNOT_QUOTA_PAGES_PER_USER: {{ .Values.quotas.pagesPerUser | int64 | quote }}
   KNOT_QUOTA_PAGES_PER_WORKSPACE: {{ .Values.quotas.pagesPerWorkspace | int64 | quote }}
   KNOT_QUOTA_BLOB_BYTES_PER_USER: {{ .Values.quotas.blobBytesPerUser | int64 | quote }}

@@ -123,6 +123,10 @@ pub struct Rooms {
     /// notification is fine because the next applied update will
     /// re-fire it.
     dirty_tx: Option<mpsc::Sender<Uuid>>,
+    /// Optional notifier fired with the room's `doc_id` after each persist
+    /// of an update applied **on this replica** (never for rows received
+    /// over the bus). Feeds the change event hook in knot-server.
+    local_change_tx: Option<mpsc::Sender<Uuid>>,
     acl_epochs: AclEpochs,
     writer_limits: WriterLimits,
 }
@@ -147,6 +151,7 @@ impl Rooms {
             policy,
             idle_evict,
             dirty_tx: None,
+            local_change_tx: None,
             acl_epochs: AclEpochs::new(),
             writer_limits: WriterLimits::default(),
         }
@@ -157,6 +162,13 @@ impl Rooms {
     /// owns the receiver and runs the reindex worker.
     pub fn with_dirty_tx(mut self, tx: mpsc::Sender<Uuid>) -> Self {
         self.dirty_tx = Some(tx);
+        self
+    }
+
+    /// Builder: attach a notifier for updates applied and persisted on this
+    /// replica only (see the field). `try_send`; a full channel drops.
+    pub fn with_local_change_tx(mut self, tx: mpsc::Sender<Uuid>) -> Self {
+        self.local_change_tx = Some(tx);
         self
     }
 
@@ -228,6 +240,7 @@ impl Rooms {
             self.snapshots.clone(),
             self.policy,
             self.dirty_tx.clone(),
+            self.local_change_tx.clone(),
             self.writer_limits,
         )
         .await?;

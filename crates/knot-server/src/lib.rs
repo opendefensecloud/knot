@@ -31,6 +31,7 @@ pub mod archive;
 pub mod auth;
 pub mod board_room_shim;
 pub mod bots;
+pub mod change_events;
 pub mod client_ip;
 pub mod comments_listener;
 pub mod duplicate;
@@ -90,6 +91,8 @@ pub struct AppState {
     /// The pages each user starred.
     pub favorites: Option<Arc<dyn knot_storage::FavoriteStore>>,
     pub contributors: Option<Arc<dyn knot_storage::ContributorStore>>,
+    /// The change event hook; `None` when `KNOT_CHANGE_EVENT_HOOK_URL` is unset.
+    pub change_events: Option<change_events::ChangeEvents>,
     pub hasher: Arc<Hasher>,
     pub throttle: Arc<Throttle>,
     pub session_key: Vec<u8>,
@@ -145,6 +148,25 @@ fn constructor_config() -> Arc<Config> {
 }
 
 impl AppState {
+    /// Report a page change to the change event hook (no-op when off).
+    pub fn emit_change(&self, workspace_id: Uuid, doc_id: Uuid, kind: change_events::ChangeKind) {
+        if let Some(events) = &self.change_events {
+            events.emit(workspace_id, doc_id, kind);
+        }
+    }
+
+    /// [`Self::emit_change`] for each page of a bulk operation.
+    pub fn emit_changes(
+        &self,
+        workspace_id: Uuid,
+        doc_ids: &[Uuid],
+        kind: change_events::ChangeKind,
+    ) {
+        if let Some(events) = &self.change_events {
+            events.emit_many(workspace_id, doc_ids, kind);
+        }
+    }
+
     pub fn in_memory() -> Self {
         Self {
             pool: None,
@@ -172,6 +194,7 @@ impl AppState {
             notifications: None,
             favorites: None,
             contributors: None,
+            change_events: None,
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
@@ -268,6 +291,7 @@ impl AppState {
             notifications: Some(notifications),
             favorites: Some(favorites),
             contributors: Some(contributors),
+            change_events: None,
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),

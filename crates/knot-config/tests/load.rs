@@ -309,3 +309,58 @@ fn invalid_rate_limit_settings_fail_to_load_naming_the_env_var() {
         });
     }
 }
+
+#[test]
+fn change_event_hook_is_off_by_default() {
+    figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
+        let cfg = Config::load::<&str>(None).expect("load");
+        assert!(cfg.change_event_hook_url.is_empty());
+        assert!(cfg.change_event_hook_token.is_empty());
+        Ok(())
+    });
+}
+
+#[test]
+fn change_event_hook_from_env() {
+    figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
+        jail.set_env("KNOT_CHANGE_EVENT_HOOK_URL", "wss://hooks.example/knot");
+        jail.set_env("KNOT_CHANGE_EVENT_HOOK_TOKEN", "s3cret");
+        let cfg = Config::load::<&str>(None).expect("load");
+        assert_eq!(cfg.change_event_hook_url, "wss://hooks.example/knot");
+        assert_eq!(cfg.change_event_hook_token, "s3cret");
+        Ok(())
+    });
+}
+
+#[test]
+fn change_event_hook_rejects_bad_urls() {
+    for bad in ["http://hooks.example", "not a url", "ws//missing-colon"] {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
+            jail.set_env("KNOT_CHANGE_EVENT_HOOK_URL", bad);
+            let err = Config::load::<&str>(None).expect_err(bad);
+            assert!(
+                err.to_string().contains("KNOT_CHANGE_EVENT_HOOK_URL"),
+                "{bad}: {err}"
+            );
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn change_event_hook_rejects_a_token_that_is_no_header_value() {
+    figment::Jail::expect_with(|jail| {
+        jail.set_env("KNOT_SESSION_KEY", "0123456789abcdef0123456789abcdef");
+        jail.set_env("KNOT_CHANGE_EVENT_HOOK_URL", "ws://localhost:9000");
+        jail.set_env("KNOT_CHANGE_EVENT_HOOK_TOKEN", "line\nbreak");
+        let err = Config::load::<&str>(None).expect_err("token");
+        assert!(
+            err.to_string().contains("KNOT_CHANGE_EVENT_HOOK_TOKEN"),
+            "{err}"
+        );
+        Ok(())
+    });
+}

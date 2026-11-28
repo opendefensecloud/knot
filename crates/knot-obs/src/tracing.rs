@@ -17,7 +17,7 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TracingError {
@@ -57,7 +57,7 @@ pub fn init_with_otlp(
     opentelemetry::global::set_tracer_provider(provider.clone());
 
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let env_filter = crate::filter::env_filter(level);
 
     let registry = tracing_subscriber::registry()
         .with(env_filter)

@@ -159,29 +159,42 @@ async fn run_server(cfg: Config) {
         None
     };
 
+    // The process's one shutdown token: drives the change event hook, the
+    // collab sockets and the graceful shutdown (assigned to AppState below).
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
     // 3b. CRDT bus + Rooms registry (only when a real pool exists).
-    let (bus, rooms_v2, reindex_rx, history_updates) = if let Some(pool) = pool.clone() {
-        match knot_crdt::PgBus::connect(&cfg.database_url).await {
-            Ok(b) => {
-                let bus: std::sync::Arc<dyn knot_crdt::Bus> = std::sync::Arc::new(b);
-                let updates: std::sync::Arc<dyn knot_storage::UpdatesStore> =
-                    std::sync::Arc::new(knot_storage::PgUpdatesStore::new(pool.clone()));
-                // The history builder reads the same log (spawned below,
-                // once the shutdown token exists).
-                let history_updates = updates.clone();
-                let snapshots: std::sync::Arc<dyn knot_storage::SnapshotStore> =
-                    std::sync::Arc::new(knot_storage::PgSnapshotStore::new(pool.clone()));
-                let policy = knot_crdt::SnapshotPolicy {
-                    every_n: cfg.snapshot_every_n,
-                    idle: std::time::Duration::from_secs(cfg.snapshot_idle_sec as u64),
-                };
-                // Channel feeding the reindex worker. Bounded so a
-                // pathological burst can't pile up unbounded; if it
-                // fills, the room actor's try_send drops the
-                // notification (next applied update will refire).
-                let (dirty_tx, dirty_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(4096);
-                let rooms = std::sync::Arc::new(
-                    knot_crdt::Rooms::new(
+    let (bus, rooms_v2, reindex_rx, history_updates, change_events) =
+        if let Some(pool) = pool.clone() {
+            match knot_crdt::PgBus::connect(&cfg.database_url).await {
+                Ok(b) => {
+                    let bus: std::sync::Arc<dyn knot_crdt::Bus> = std::sync::Arc::new(b);
+                    let updates: std::sync::Arc<dyn knot_storage::UpdatesStore> =
+                        std::sync::Arc::new(knot_storage::PgUpdatesStore::new(pool.clone()));
+                    // The history builder reads the same log (spawned below,
+                    // once the shutdown token exists).
+                    let history_updates = updates.clone();
+                    let snapshots: std::sync::Arc<dyn knot_storage::SnapshotStore> =
+                        std::sync::Arc::new(knot_storage::PgSnapshotStore::new(pool.clone()));
+                    let policy = knot_crdt::SnapshotPolicy {
+                        every_n: cfg.snapshot_every_n,
+                        idle: std::time::Duration::from_secs(cfg.snapshot_idle_sec as u64),
+                    };
+                    // Channel feeding the reindex worker. Bounded so a
+                    // pathological burst can't pile up unbounded; if it
+                    // fills, the room actor's try_send drops the
+                    // notification (next applied update will refire).
+                    let (dirty_tx, dirty_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(4096);
+                    // Spawned before `Rooms` so the rooms get the content sender.
+                    let change_events =
+                        knot_server::change_events::Hook::from_config(&cfg).map(|hook| {
+                            tracing::info!("change event hook enabled");
+                            hook.spawn(
+                                std::sync::Arc::new(knot_storage::PgDocStore::new(pool.clone())),
+                                shutdown.clone(),
+                            )
+                        });
+                    let mut rooms = knot_crdt::Rooms::new(
                         std::sync::Arc::new(knot_crdt::YrsEngine),
                         bus.clone(),
                         updates,
@@ -189,31 +202,36 @@ async fn run_server(cfg: Config) {
                         policy,
                         std::time::Duration::from_secs(cfg.room_idle_evict_sec as u64),
                     )
-                    .with_dirty_tx(dirty_tx),
-                );
-                knot_crdt::spawn_gc(pool.clone(), snapshots, knot_history::BUILDER_VERSION);
-                (
-                    Some(bus),
-                    Some(rooms),
-                    Some(dirty_rx),
-                    Some(history_updates),
-                )
+                    .with_dirty_tx(dirty_tx);
+                    if let Some(events) = &change_events {
+                        rooms = rooms.with_local_change_tx(events.content_sender());
+                    }
+                    let rooms = std::sync::Arc::new(rooms);
+                    knot_crdt::spawn_gc(pool.clone(), snapshots, knot_history::BUILDER_VERSION);
+                    (
+                        Some(bus),
+                        Some(rooms),
+                        Some(dirty_rx),
+                        Some(history_updates),
+                        change_events,
+                    )
+                }
+                Err(e) => {
+                    tracing::error!(error=?e, "PgBus connect failed");
+                    process::exit(2);
+                }
             }
-            Err(e) => {
-                tracing::error!(error=?e, "PgBus connect failed");
-                process::exit(2);
-            }
-        }
-    } else {
-        #[allow(clippy::type_complexity)]
-        let none: (
-            Option<std::sync::Arc<dyn knot_crdt::Bus>>,
-            Option<std::sync::Arc<knot_crdt::Rooms>>,
-            Option<tokio::sync::mpsc::Receiver<uuid::Uuid>>,
-            Option<std::sync::Arc<dyn knot_storage::UpdatesStore>>,
-        ) = (None, None, None, None);
-        none
-    };
+        } else {
+            #[allow(clippy::type_complexity)]
+            let none: (
+                Option<std::sync::Arc<dyn knot_crdt::Bus>>,
+                Option<std::sync::Arc<knot_crdt::Rooms>>,
+                Option<tokio::sync::mpsc::Receiver<uuid::Uuid>>,
+                Option<std::sync::Arc<dyn knot_storage::UpdatesStore>>,
+                Option<knot_server::change_events::ChangeEvents>,
+            ) = (None, None, None, None, None);
+            none
+        };
 
     // 3c. BoardRooms registry — wired to the same Bus as the document Rooms
     //     so board edits converge across pods via Postgres LISTEN/NOTIFY.
@@ -252,6 +270,8 @@ async fn run_server(cfg: Config) {
             s.bus = bus;
             s.rooms_v2 = rooms_v2;
             s.board_rooms = board_rooms;
+            s.change_events = change_events;
+            s.shutdown = shutdown.clone();
 
             // Optional S3 blob backend (default: Postgres bytea, already wired
             // by AppState::with_pool).
@@ -288,6 +308,7 @@ async fn run_server(cfg: Config) {
         None => {
             let mut s = knot_server::AppState::in_memory();
             s.config = cfg.clone();
+            s.shutdown = shutdown.clone();
             s
         }
     };
@@ -344,7 +365,6 @@ async fn run_server(cfg: Config) {
 
     // Token shared with every collab socket; cancelled on SIGTERM so they
     // send a clean 1001 Close and drain instead of being severed mid-rollout.
-    let shutdown = state.shutdown.clone();
     // Kept for the page-writer drain once HTTP has drained.
     let rooms = state.rooms_v2.clone();
     let app = knot_server::router_with_state(state);

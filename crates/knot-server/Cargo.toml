@@ -65,6 +65,11 @@ semver = { version = "1", features = ["serde"] }
 zip = { version = "9.2", default-features = false, features = ["deflate"] }
 # Validates suggestion anchors (Yjs RelativePositions) before they are stored.
 yrs.workspace = true
+# Change event hook: knot is a WebSocket client of the receiver.
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+rustls.workspace = true
+webpki-roots = "1"
 
 # Allocator: mimalloc on all platforms knot actually runs on.
 # musl's default mallocng has known throughput cliffs under multi-threaded

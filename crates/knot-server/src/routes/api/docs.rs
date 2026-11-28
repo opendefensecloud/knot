@@ -34,6 +34,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::archive::{PurgeError, PurgeTrigger};
 use crate::auth::{ApiPrincipal, AuthContext, DocArchived, EffectiveDocRole, require_doc_role_mw};
+use crate::change_events::ChangeKind;
 use crate::duplicate::{BUSY_WAIT, DuplicateError, MAX_DUPLICATE_BLOB_BYTES, MAX_DUPLICATE_PAGES};
 use crate::http_error::{doc_archived, json_err};
 
@@ -400,6 +401,7 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
             {
                 return response;
             }
+            state.emit_change(ctx.workspace_id, d.id, ChangeKind::Created);
             doc_answer(&state, &ctx, StatusCode::CREATED, &d).await
         }
         // The key collided with one written outside placement, such as by
@@ -612,7 +614,10 @@ async fn rename(State(state): State<AppState>, Path(doc_id): Path<Uuid>, req: Re
         )
         .await
     {
-        Ok(d) => doc_answer(&state, &ctx, StatusCode::OK, &d).await,
+        Ok(d) => {
+            state.emit_change(ctx.workspace_id, d.id, ChangeKind::Renamed);
+            doc_answer(&state, &ctx, StatusCode::OK, &d).await
+        }
         Err(knot_storage::DocStoreError::NotFound) => {
             json_err(StatusCode::NOT_FOUND, "doc.not_found", "")
         }
@@ -697,6 +702,7 @@ async fn move_doc(
             // asynchronously; evict here too, so a move into or out of a
             // restricted subtree shows in this replica's next answer.
             crate::archive::evict_local_subtree(&state, doc_id).await;
+            state.emit_change(ctx.workspace_id, d.id, ChangeKind::Moved);
             doc_answer(&state, &ctx, StatusCode::OK, &d).await
         }
         Err(knot_storage::DocStoreError::RestrictionBoundary) => match api_key {
@@ -795,7 +801,10 @@ async fn duplicate(
         None,
     );
     match answer.await {
-        Ok(Ok(top)) => doc_answer(&state, &ctx, StatusCode::CREATED, &top).await,
+        Ok(Ok(top)) => {
+            emit_copy_created(&state, ctx.workspace_id, top.id).await;
+            doc_answer(&state, &ctx, StatusCode::CREATED, &top).await
+        }
         Ok(Err(e)) => duplicate_error(e),
         Err(_) => {
             tracing::error!("duplicate task ended without an answer");
@@ -857,6 +866,9 @@ async fn move_to_subpage(
         },
         Err(e) => Err(e),
     };
+    if let Ok(moved) = &result {
+        state.emit_change(ctx.workspace_id, moved.doc.id, ChangeKind::Created);
+    }
     match result {
         Ok(moved) => match caller_doc_response(&state, &ctx, &moved.doc).await {
             Ok(doc) => (
@@ -975,6 +987,7 @@ async fn archive(
     match docs.archive(ctx.workspace_id, doc_id, ctx.user_id).await {
         Ok(archived_ids) => {
             crate::archive::evict_local(&state, &archived_ids).await;
+            state.emit_changes(ctx.workspace_id, &archived_ids, ChangeKind::Archived);
             StatusCode::NO_CONTENT.into_response()
         }
         Err(knot_storage::DocStoreError::NotFound) => {
@@ -1027,6 +1040,7 @@ async fn restore(
     match docs.restore(ctx.workspace_id, doc_id, ctx.user_id).await {
         Ok(restored_ids) => {
             crate::archive::evict_local(&state, &restored_ids).await;
+            state.emit_changes(ctx.workspace_id, &restored_ids, ChangeKind::Restored);
             StatusCode::NO_CONTENT.into_response()
         }
         Err(knot_storage::DocStoreError::NotFound) => {
@@ -1478,12 +1492,30 @@ async fn create_from_template_inline(
         return internal();
     }
     match rx.await {
-        Ok(Ok(_)) => doc_answer(&state, &ctx, StatusCode::CREATED, &new_doc).await,
+        Ok(Ok(_)) => {
+            state.emit_change(ctx.workspace_id, new_doc.id, ChangeKind::Created);
+            doc_answer(&state, &ctx, StatusCode::CREATED, &new_doc).await
+        }
         Ok(Err(e)) => {
             tracing::warn!(error=?e, "from_template apply");
             json_err(StatusCode::UNPROCESSABLE_ENTITY, "markdown.apply", "")
         }
         Err(_) => internal(),
+    }
+}
+
+/// Reports every page of a fresh duplicate (the copy's top and its subpages)
+/// as created.
+pub(crate) async fn emit_copy_created(state: &AppState, workspace_id: Uuid, top: Uuid) {
+    let Some(docs) = state.docs.as_ref() else {
+        return;
+    };
+    match docs.subtree_ids(top).await {
+        Ok(ids) => state.emit_changes(workspace_id, &ids, ChangeKind::Created),
+        Err(e) => {
+            tracing::warn!(error = ?e, "change event: duplicate subtree");
+            state.emit_change(workspace_id, top, ChangeKind::Created);
+        }
     }
 }
 

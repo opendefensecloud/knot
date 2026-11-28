@@ -56,6 +56,14 @@ oidc:
   # Zitadel use '^\d{18}$' rather than listing each id.
   extraAudiences: ""
 
+# Change event hook: knot connects to this WebSocket receiver and streams
+# changed page ids (docs/change-event-hook.md). Empty = off.
+changeEventHook:
+  url: ""
+  # Optional bearer token, read from an existing Secret.
+  tokenSecretName: ""
+  tokenSecretKey: KNOT_CHANGE_EVENT_HOOK_TOKEN
+
 baseUrl: ""
 
 logLevel: info

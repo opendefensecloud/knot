@@ -36,6 +36,7 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 
 use crate::AppState;
 use crate::auth::AuthContext;
+use crate::change_events::ChangeKind;
 use crate::http_error::{audit_unavailable, json_err, json_err_with_details};
 
 pub fn router() -> Router<AppState> {
@@ -889,6 +890,9 @@ async fn import(
              or unreadable"
         );
     }
+
+    let imported_ids: Vec<Uuid> = doc_remap.values().copied().collect();
+    state.emit_changes(ctx.workspace_id, &imported_ids, ChangeKind::Created);
 
     Response::builder()
         .status(StatusCode::OK)
