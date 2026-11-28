@@ -122,4 +122,28 @@ describe("ContextMenu", () => {
     fireEvent.mouseDown(screen.getByTestId("outside"));
     expect(onClose).toHaveBeenCalled();
   });
+  // Opened on a row at the bottom of the sidebar, a menu placed at the click
+  // ran past the bottom of the window and its lower items were out of reach.
+  it("moves up so it stays inside the window when opened near the bottom", () => {
+    const innerHeight = window.innerHeight;
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 800 });
+    const rect = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue({ width: 160, height: 200, top: 0, left: 0, right: 160, bottom: 200, x: 0, y: 0, toJSON: () => ({}) });
+    try {
+      render(
+        <ContextMenu
+          x={40}
+          y={780}
+          onClose={() => {}}
+          items={[{ label: "Rename", testId: "ctx-rename", onSelect: () => {} }]}
+        />,
+      );
+      const top = parseFloat(screen.getByTestId("context-menu").style.top);
+      expect(top).toBe(800 - 200 - 8);
+    } finally {
+      rect.mockRestore();
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: innerHeight });
+    }
+  });
 });

@@ -1,5 +1,5 @@
 import { createPortal } from "react-dom";
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 export type ContextMenuItem = {
   label: string;
@@ -8,6 +8,9 @@ export type ContextMenuItem = {
   disabled?: boolean;
   onSelect: () => void;
 };
+
+/** Space kept between a menu moved up and the bottom of the window, in px. */
+const VIEWPORT_GAP = 8;
 
 export function ContextMenu({
   x,
@@ -21,6 +24,15 @@ export function ContextMenu({
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  // Opened near the bottom of the window (the last rows of the sidebar), the
+  // menu would run past it and its lower items would be out of reach: measure
+  // it before paint and move it up until it fits, keeping a small gap.
+  const [top, setTop] = useState(y);
+  useLayoutEffect(() => {
+    const height = ref.current?.getBoundingClientRect().height ?? 0;
+    const overflow = y + height + VIEWPORT_GAP - window.innerHeight;
+    setTop(overflow > 0 ? Math.max(VIEWPORT_GAP, y - overflow) : y);
+  }, [y, items.length]);
 
   useEffect(() => {
     const onDoc = (e: MouseEvent) => {
@@ -57,8 +69,8 @@ export function ContextMenu({
       ref={ref}
       role="menu"
       data-testid="context-menu"
-      className="fixed z-50 min-w-[160px] py-1 rounded-md bg-surface border border-border shadow-lg"
-      style={{ top: y, left: x }}
+      className="fixed z-50 min-w-[160px] max-h-[calc(100vh-16px)] overflow-y-auto py-1 rounded-md bg-surface border border-border shadow-lg"
+      style={{ top, left: x }}
       // The portal moves the menu in the DOM, not in the React tree: its
       // events still bubble through the components that rendered it. The
       // sidebar renders it next to its draggable row, not inside it, so they
